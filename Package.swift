@@ -21,7 +21,7 @@ let package = Package(
         .target(
             name: "JsBaoClient",
             dependencies: [
-                .product(name: "YSwift", package: "yswift"),
+                .product(name: "YSwift", package: "yswift-fork"),
             ],
             path: "Sources/JsBaoClient",
             linkerSettings: [

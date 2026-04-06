@@ -101,7 +101,7 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Accept a pending invitation to a document.
     public func acceptInvitation(documentId: String) async throws -> [String: Any] {
-        let result = try await makeRequest("POST", "/documents/\(documentId)/accept-invitation", nil)
+        let result = try await makeRequest("POST", "/documents/\(documentId)/validate-access", nil)
         return result as? [String: Any] ?? [:]
     }
 
