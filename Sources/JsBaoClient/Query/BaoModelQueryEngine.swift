@@ -1,14 +1,14 @@
 import Foundation
 import SQLite3
 
-/// SQLite-backed query engine that mirrors Y.Map collection data for fast queries.
+/// SQLite-backed query engine that mirrors Y.Map model data for fast queries.
 ///
-/// Each collection gets its own table in an in-memory SQLite database.
+/// Each model gets its own table in an in-memory SQLite database.
 /// Records are synced from Y.Map on initial load and kept in sync via
 /// explicit calls to `sync()` after mutations.
 ///
 /// This replaces the JS client's IndexedDB/sql.js approach with native SQLite.
-public class CollectionQueryEngine {
+public class BaoModelQueryEngine {
 
     private var db: OpaquePointer?
     private let lock = NSLock()
@@ -18,9 +18,13 @@ public class CollectionQueryEngine {
         // Use in-memory SQLite for query indexing (separate from persistence)
         if sqlite3_open(":memory:", &db) == SQLITE_OK {
             self.db = db
-            // Enable WAL for concurrent reads
+            // Enable WAL for concurrent reads.
             execute("PRAGMA journal_mode=WAL")
-            execute("PRAGMA synchronous=OFF")
+            // NORMAL is a good balance: skips fsync on every commit (fast)
+            // but still syncs at WAL checkpoints (durable enough). OFF
+            // disables fsync entirely and risks file-level corruption on
+            // a crash, which is rarely a worthwhile trade for user data.
+            execute("PRAGMA synchronous=NORMAL")
         }
     }
 
@@ -32,12 +36,12 @@ public class CollectionQueryEngine {
 
     // MARK: - Table Management
 
-    /// Create or update a table for a collection, with columns for each field.
-    public func ensureTable(collectionName: String, fields: [(name: String, type: FieldType)]) {
+    /// Create or update a table for a model, with columns for each field.
+    public func ensureTable(modelName: String, fields: [(name: String, type: FieldType)]) {
         lock.lock()
         defer { lock.unlock() }
 
-        let tableName = sanitizedTableName(collectionName)
+        let tableName = sanitizedTableName(modelName)
         var columns = ["\"id\" TEXT PRIMARY KEY"]
 
         for field in fields where field.name != "id" {
@@ -61,13 +65,13 @@ public class CollectionQueryEngine {
 
     // MARK: - Data Sync
 
-    /// Sync all records from a collection into the SQLite table.
+    /// Sync all records from a model into the SQLite table.
     /// Call this after opening a document or after batch mutations.
-    public func syncRecords(collectionName: String, records: [[String: Any]]) {
+    public func syncRecords(modelName: String, records: [[String: Any]]) {
         lock.lock()
         defer { lock.unlock() }
 
-        let tableName = sanitizedTableName(collectionName)
+        let tableName = sanitizedTableName(modelName)
 
         // Clear existing data
         execute("DELETE FROM \"\(tableName)\"")
@@ -95,11 +99,11 @@ public class CollectionQueryEngine {
     }
 
     /// Insert or update a single record.
-    public func upsertRecord(collectionName: String, record: [String: Any]) {
+    public func upsertRecord(modelName: String, record: [String: Any]) {
         lock.lock()
         defer { lock.unlock() }
 
-        let tableName = sanitizedTableName(collectionName)
+        let tableName = sanitizedTableName(modelName)
         let columnNames = getColumnNames(tableName)
         guard !columnNames.isEmpty else { return }
 
@@ -116,11 +120,11 @@ public class CollectionQueryEngine {
     }
 
     /// Delete a record by ID.
-    public func deleteRecord(collectionName: String, id: String) {
+    public func deleteRecord(modelName: String, id: String) {
         lock.lock()
         defer { lock.unlock() }
 
-        let tableName = sanitizedTableName(collectionName)
+        let tableName = sanitizedTableName(modelName)
         let sql = "DELETE FROM \"\(tableName)\" WHERE \"id\" = ?"
         guard let stmt = prepare(sql) else { return }
         sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
@@ -132,14 +136,14 @@ public class CollectionQueryEngine {
 
     /// Execute a query with filter and options, returning raw dictionaries.
     public func query(
-        collectionName: String,
+        modelName: String,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
     ) -> [[String: Any]] {
         lock.lock()
         defer { lock.unlock() }
 
-        let tableName = sanitizedTableName(collectionName)
+        let tableName = sanitizedTableName(modelName)
         var sql = "SELECT * FROM \"\(tableName)\""
         var params: [Any] = []
 
@@ -162,11 +166,11 @@ public class CollectionQueryEngine {
     }
 
     /// Count records matching a filter.
-    public func count(collectionName: String, filter: DocumentFilter? = nil) -> Int {
+    public func count(modelName: String, filter: DocumentFilter? = nil) -> Int {
         lock.lock()
         defer { lock.unlock() }
 
-        let tableName = sanitizedTableName(collectionName)
+        let tableName = sanitizedTableName(modelName)
         var sql = "SELECT COUNT(*) FROM \"\(tableName)\""
         var params: [Any] = []
 
@@ -182,13 +186,13 @@ public class CollectionQueryEngine {
 
     /// Execute an aggregation query.
     public func aggregate(
-        collectionName: String,
+        modelName: String,
         options: AggregateOptions
     ) -> [[String: Any]] {
         lock.lock()
         defer { lock.unlock() }
 
-        let tableName = sanitizedTableName(collectionName)
+        let tableName = sanitizedTableName(modelName)
         let (sql, params) = QueryTranslator.buildAggregation(tableName: tableName, options: options)
         return executeQuery(sql, params: params)
     }

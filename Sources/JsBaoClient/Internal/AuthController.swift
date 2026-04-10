@@ -145,8 +145,16 @@ public final class AuthController: @unchecked Sendable {
 
         // Persist JWT if configured
         if persistConfig.persistJwtInStorage, let token = newToken {
-            Task {
-                try? await persistJwt(token: token)
+            Task { [logger] in
+                do {
+                    try await persistJwt(token: token)
+                } catch {
+                    // Don't swallow persistence errors silently — without this
+                    // log, a disk-full or SQLite-corruption issue would leave
+                    // the user appearing logged in until restart, with no clue
+                    // why they were unexpectedly logged out the next session.
+                    logger.warn("Failed to persist JWT:", error.localizedDescription)
+                }
             }
         }
     }

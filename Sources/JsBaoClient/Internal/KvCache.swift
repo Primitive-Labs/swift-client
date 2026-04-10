@@ -89,11 +89,18 @@ public final class KvCache: @unchecked Sendable {
         }
 
         let task = Task<Any?, Error> { [weak self] in
+            // Always remove the inflight entry on completion, regardless of
+            // success or failure. Without this `defer`, a thrown error from
+            // `fetcher()` would leave a stale entry in the dictionary that
+            // makes every subsequent call for the same key re-throw the
+            // original error forever.
+            defer {
+                self?.lock.lock()
+                self?.inflightRequests.removeValue(forKey: key)
+                self?.lock.unlock()
+            }
             let value = try await fetcher()
             await self?.set(key: key, value: value)
-            self?.lock.lock()
-            self?.inflightRequests.removeValue(forKey: key)
-            self?.lock.unlock()
             return value
         }
         inflightRequests[key] = task

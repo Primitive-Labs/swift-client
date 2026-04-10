@@ -77,7 +77,8 @@ Reads server URL and admin JWT from environment variables. Defaults to `http://l
 | Reconnection | `DisconnectReconnectTests.swift` | Backoff, session recovery, state after reconnect |
 | Auth | `OAuthTests.swift`, `RefreshTests.swift`, `SessionTests.swift` | OAuth, token refresh, session info |
 | Permissions | `DocumentPermissionsTests.swift`, `InvitationTests.swift`, `InviteOnlyTests.swift` | Sharing, access control, invitations |
-| Collections | `CollectionsTests.swift` | Collection CRUD, queries, aggregations |
+| Collections | `CollectionsTests.swift` | Primitive Collections API (document grouping), permissions, members |
+| BaoModels | `BaoModelDirtyFlagTests.swift` | Typed `BaoModel<T>` CRUD, query engine dirty-flag short-circuit, aggregations |
 | Databases | `DatabaseTests.swift` | Database CRUD and permissions |
 | Blobs | `BlobTests.swift` | Upload, download, queue management |
 | Awareness | `AwarenessTests.swift` | Presence state sync between clients |

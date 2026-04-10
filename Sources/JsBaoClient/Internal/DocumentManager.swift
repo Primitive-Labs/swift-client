@@ -121,12 +121,16 @@ public final class DocumentManager: @unchecked Sendable {
         let docId = documentId
         let subscription = doc.observeUpdate { [weak self] update in
             guard let self = self else { return }
-            // Skip if we're applying a remote update (server sync)
+            // Atomically read the isRemote flag AND snapshot the callback while
+            // holding the lock, so a remote-update apply that arrives between
+            // the read and the dispatch can't reclassify a local update as
+            // remote (or vice-versa).
             self.lock.lock()
             let isRemote = self.applyingRemoteUpdate[docId] == true
+            let callback = self.onLocalUpdate
             self.lock.unlock()
             if !isRemote {
-                self.onLocalUpdate?(docId, update)
+                callback?(docId, update)
             }
         }
         lock.lock()
@@ -696,11 +700,10 @@ public final class DocumentManager: @unchecked Sendable {
         lock.unlock()
 
         // Get full document state as an update.
-        // Use transactionEncodeStateAsUpdate (no state vector param) to get the
-        // complete document state, avoiding the empty-state-vector crash in yrs.
-        let state: [UInt8] = doc.transactSync { txn in
-            txn.transactionEncodeStateAsUpdate()
-        }
+        // Use raw YrsDoc to avoid blocking the cooperative thread pool on syncQueue.
+        let txn = doc.document.transact(origin: nil)
+        let state: [UInt8] = txn.transactionEncodeStateAsUpdate()
+        txn.free()
 
         if let persistence = docPersistence[documentId] {
             try? await persistence.saveDocument(data: Data(state))

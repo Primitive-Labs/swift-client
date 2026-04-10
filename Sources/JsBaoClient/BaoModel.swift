@@ -2,17 +2,17 @@ import Foundation
 import YSwift
 import Yniffi
 
-private enum CollectionDebug {
+private enum BaoModelDebug {
     static var hasLogged = false
 }
 
 // MARK: - Protocol
 
-/// A type that can be stored as a record in a Y.Map-backed collection.
-/// Each record is a nested Y.Map within a top-level Y.Map named after the collection.
-public protocol CollectionRecord: Identifiable where ID == String {
-    /// The collection name (e.g., "pages", "blocks"). Maps to yDoc.getMap(name).
-    static var collectionName: String { get }
+/// A type that can be stored as a record in a Y.Map-backed model.
+/// Each record is a nested Y.Map within a top-level Y.Map named after the model.
+public protocol BaoModelRecord: Identifiable where ID == String {
+    /// The model name (e.g., "pages", "blocks"). Maps to yDoc.getMap(name).
+    static var modelName: String { get }
 
     /// Field definitions for reading/writing to Y.Maps.
     static var fields: [FieldDefinition] { get }
@@ -49,46 +49,104 @@ public enum FieldType {
     case json  // stored as JSON string, parsed as Any
 }
 
-// MARK: - Collection
+// MARK: - BaoModel
 
-/// Typed access to a Y.Map-backed collection within a YDocument.
+/// Typed access to a Y.Map-backed model within a YDocument.
 ///
-/// Structure: `yDoc.getMap("collectionName")` contains nested Y.Maps keyed by record ID.
+/// Mirrors the JS client's `BaseModel` from `js-bao` — a typed record store
+/// layered on top of a single Y.Doc. Named `BaoModel` to avoid clashing with
+/// Swift's standard library `Collection` protocol and with `CollectionsAPI`
+/// (the Primitive platform feature for grouping documents, a different concept).
+///
+/// Structure: `yDoc.getMap("modelName")` contains nested Y.Maps keyed by record ID.
 /// Each nested Y.Map holds the record's fields as JSON-encoded values.
 ///
 /// Supports rich queries via a SQLite mirror:
 /// ```swift
-/// let tasks = collection.query(["status": "done"], options: QueryOptions(sort: ["priority": -1]))
-/// let count = collection.count(["completed": true])
-/// let stats = collection.aggregate(AggregateOptions(
+/// let tasks = model.query(["status": "done"], options: QueryOptions(sort: ["priority": -1]))
+/// let count = model.count(["completed": true])
+/// let stats = model.aggregate(AggregateOptions(
 ///     groupBy: ["status"],
 ///     operations: [.init(type: .count), .init(type: .avg, field: "priority")]
 /// ))
 /// ```
-public final class Collection<T: CollectionRecord> {
+public final class BaoModel<T: BaoModelRecord> {
     private let doc: YDocument
     private let client: JsBaoClient?
     private let documentId: String?
-    private lazy var queryEngine: CollectionQueryEngine = {
-        let engine = CollectionQueryEngine()
+    private lazy var queryEngine: BaoModelQueryEngine = {
+        let engine = BaoModelQueryEngine()
         let fieldTuples = T.fields.map { (name: $0.name, type: $0.type) }
-        engine.ensureTable(collectionName: T.collectionName, fields: fieldTuples)
+        engine.ensureTable(modelName: T.modelName, fields: fieldTuples)
         return engine
     }()
-    private var queryIndexSynced = false
 
-    /// The root Y.Map for this collection. Created once on init via get-or-create.
+    /// True when the SQLite mirror may be out of sync with the Y.Doc.
+    /// Initially true so the first query triggers a full sync.
+    /// Set to true by an `observeUpdate` subscription on the doc whenever
+    /// any transaction commits (local or remote). Cleared inside
+    /// `syncToQueryEngine()` once the rebuild has been claimed.
+    private var queryIndexDirty: Bool = true
+    private let dirtyLock = NSLock()
+    // Disambiguate from `Yniffi.YSubscription` — `doc.observeUpdate` returns
+    // the YSwift wrapper, which auto-cancels on deinit.
+    private var docUpdateSubscription: YSwift.YSubscription?
+
+    /// Test-only counter incremented every time the SQLite mirror is rebuilt.
+    /// Allows tests to verify that the dirty-flag short-circuit avoids
+    /// unnecessary rebuilds.
+    internal private(set) var syncCallCount: Int = 0
+
+    /// The root Y.Map for this model. Created once on init via get-or-create.
     private let rootMap: YrsMap
 
-    /// Create a collection bound to a YDocument.
+    /// Create a model bound to a YDocument.
     /// Pass `client` and `documentId` to enable network sync on writes.
     public init(doc: YDocument, client: JsBaoClient? = nil, documentId: String? = nil) {
         self.doc = doc
         self.client = client
         self.documentId = documentId
-        // Get or create the root map OUTSIDE any transaction to avoid deadlocks.
-        // YrsDoc.getMap(name:) is a get-or-create operation that's safe to call freely.
-        self.rootMap = doc.document.getMap(name: T.collectionName)
+        // Cache the root YrsMap once at init time. We use the doc-level
+        // get-or-create here, which is safe BECAUSE we're not inside a
+        // transaction. (Historically this was a strict requirement: yrs's
+        // RwLock isn't reentrant and the doc-level getter re-acquires it,
+        // so calling getMap() inside an open transact() would deadlock the
+        // calling thread. The deadlock-safe alternative is now exposed as
+        // `YDocument.getOrInsertMap(named:transaction:)`, which routes
+        // through the held TransactionMut. We still cache here purely as a
+        // perf win: a stored MapRef avoids redoing the named lookup on
+        // every find/query/create/update/delete.)
+        self.rootMap = doc.document.getMap(name: T.modelName)
+
+        // Subscribe to all doc updates (local + remote) and mark the SQLite
+        // mirror dirty whenever anything commits. The callback fires
+        // synchronously inside the transaction commit, so we only do a tiny
+        // bool write under a lock — no doc reads or new transactions.
+        self.docUpdateSubscription = doc.observeUpdate { [weak self] _ in
+            self?.markQueryIndexDirty()
+        }
+    }
+
+    deinit {
+        docUpdateSubscription?.cancel()
+    }
+
+    // MARK: - Dirty flag
+
+    private func markQueryIndexDirty() {
+        dirtyLock.lock()
+        queryIndexDirty = true
+        dirtyLock.unlock()
+    }
+
+    /// Returns true (and clears the flag) if the index needs rebuilding.
+    /// Returns false if the index is already in sync.
+    private func claimDirtyForRebuild() -> Bool {
+        dirtyLock.lock()
+        defer { dirtyLock.unlock() }
+        guard queryIndexDirty else { return false }
+        queryIndexDirty = false
+        return true
     }
 
     // MARK: - Read
@@ -103,7 +161,7 @@ public final class Collection<T: CollectionRecord> {
         }
     }
 
-    /// Return all records in the collection.
+    /// Return all records in the model.
     public func findAll() -> [T] {
         return doc.transactSync { txn in
             let outerMap = self.rootMap
@@ -135,38 +193,38 @@ public final class Collection<T: CollectionRecord> {
     ///
     /// ```swift
     /// // All done tasks sorted by priority descending
-    /// let tasks = collection.query(["status": "done"], options: QueryOptions(sort: ["priority": -1]))
+    /// let tasks = model.query(["status": "done"], options: QueryOptions(sort: ["priority": -1]))
     ///
     /// // High priority tasks
-    /// let urgent = collection.query(["priority": ["$gte": 4]])
+    /// let urgent = model.query(["priority": ["$gte": 4]])
     ///
     /// // Text search
-    /// let results = collection.query(["title": ["$containsText": "review"]])
+    /// let results = model.query(["title": ["$containsText": "review"]])
     ///
     /// // Logical operators
-    /// let filtered = collection.query(["$or": [["status": "done"], ["priority": ["$gte": 5]]]])
+    /// let filtered = model.query(["$or": [["status": "done"], ["priority": ["$gte": 5]]]])
     /// ```
     public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [T] {
         syncToQueryEngine()
-        let rows = queryEngine.query(collectionName: T.collectionName, filter: filter, options: options)
+        let rows = queryEngine.query(modelName: T.modelName, filter: filter, options: options)
         return rows.map { T(fields: $0) }
     }
 
     /// Count records matching a filter.
     ///
     /// ```swift
-    /// let doneCount = collection.count(["status": "done"])
-    /// let total = collection.count()
+    /// let doneCount = model.count(["status": "done"])
+    /// let total = model.count()
     /// ```
     public func count(_ filter: DocumentFilter? = nil) -> Int {
         syncToQueryEngine()
-        return queryEngine.count(collectionName: T.collectionName, filter: filter)
+        return queryEngine.count(modelName: T.modelName, filter: filter)
     }
 
-    /// Run aggregations on the collection.
+    /// Run aggregations on the model.
     ///
     /// ```swift
-    /// let stats = collection.aggregate(AggregateOptions(
+    /// let stats = model.aggregate(AggregateOptions(
     ///     groupBy: ["status"],
     ///     operations: [
     ///         .init(type: .count),
@@ -177,21 +235,27 @@ public final class Collection<T: CollectionRecord> {
     /// ```
     public func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
         syncToQueryEngine()
-        return queryEngine.aggregate(collectionName: T.collectionName, options: options)
+        return queryEngine.aggregate(modelName: T.modelName, options: options)
     }
 
     /// Force re-sync the SQLite query index from the Y.Map data.
-    /// Call this if you've made external changes to the Y.Doc.
+    /// Call this if you've made external changes to the Y.Doc that bypassed
+    /// the doc's update notifications (rare — `observeUpdate` already covers
+    /// every committed transaction).
     public func refreshQueryIndex() {
-        queryIndexSynced = false
+        markQueryIndexDirty()
         syncToQueryEngine()
     }
 
-    /// Sync all Y.Map records into the SQLite query engine.
+    /// Sync all Y.Map records into the SQLite query engine, but only if the
+    /// dirty flag is set. The flag is marked by an `observeUpdate`
+    /// subscription on the doc, so we skip work entirely when nothing has
+    /// changed since the last rebuild.
     private func syncToQueryEngine() {
+        guard claimDirtyForRebuild() else { return }
         let records = findAll().map { $0.toFields() }
-        queryEngine.syncRecords(collectionName: T.collectionName, records: records)
-        queryIndexSynced = true
+        queryEngine.syncRecords(modelName: T.modelName, records: records)
+        syncCallCount += 1
     }
 
     // MARK: - Write
@@ -241,11 +305,8 @@ public final class Collection<T: CollectionRecord> {
                 self.writeFields(fields, to: recordMap, txn: txn)
             }
         }
-
-        // Keep SQLite index in sync
-        if queryIndexSynced {
-            queryEngine.upsertRecord(collectionName: T.collectionName, record: fields)
-        }
+        // No incremental SQLite update needed: the transaction commit fires
+        // `observeUpdate` which marks the index dirty for the next query.
     }
 
     /// Delete a record by ID.
@@ -261,11 +322,8 @@ public final class Collection<T: CollectionRecord> {
                 _ = try? outerMap.remove(tx: txn, key: id)
             }
         }
-
-        // Keep SQLite index in sync
-        if queryIndexSynced {
-            queryEngine.deleteRecord(collectionName: T.collectionName, id: id)
-        }
+        // No incremental SQLite update needed: the transaction commit fires
+        // `observeUpdate` which marks the index dirty for the next query.
     }
 
     // MARK: - Internal
@@ -274,17 +332,22 @@ public final class Collection<T: CollectionRecord> {
         var result: [String: Any] = [:]
         for field in T.fields {
             guard let jsonVal = try? recordMap.get(tx: txn, key: field.name) else { continue }
-            // Log first record's raw values for debugging
-            if !CollectionDebug.hasLogged && (field.name == "content" || field.name == "title") {
-                print("[Collection-DEBUG] \(T.collectionName).\(field.name) raw from Yrs (\(field.type)): \(jsonVal.prefix(150))")
+            #if DEBUG
+            // Log first record's raw values for debugging — gated to debug
+            // builds so it stays out of Console.app on shipped apps.
+            if !BaoModelDebug.hasLogged && (field.name == "content" || field.name == "title") {
+                print("[BaoModel-DEBUG] \(T.modelName).\(field.name) raw from Yrs (\(field.type)): \(jsonVal.prefix(150))")
             }
+            #endif
             result[field.name] = decodeFieldValue(jsonVal, type: field.type)
-            if !CollectionDebug.hasLogged && (field.name == "content" || field.name == "title") {
-                print("[Collection-DEBUG] \(T.collectionName).\(field.name) after decode: \(String(describing: result[field.name]).prefix(150))")
+            #if DEBUG
+            if !BaoModelDebug.hasLogged && (field.name == "content" || field.name == "title") {
+                print("[BaoModel-DEBUG] \(T.modelName).\(field.name) after decode: \(String(describing: result[field.name]).prefix(150))")
             }
+            #endif
         }
-        if !CollectionDebug.hasLogged && !result.isEmpty {
-            CollectionDebug.hasLogged = true
+        if !BaoModelDebug.hasLogged && !result.isEmpty {
+            BaoModelDebug.hasLogged = true
         }
         return result
     }

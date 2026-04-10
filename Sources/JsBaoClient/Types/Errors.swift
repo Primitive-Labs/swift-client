@@ -27,9 +27,13 @@ public enum JsBaoErrorCode: String, Sendable {
 public struct JsBaoError: Error, Sendable {
     public let code: JsBaoErrorCode
     public let message: String
-    public let details: [String: Any]?
+    /// Optional structured diagnostic details. Typed as `[String: String]?`
+    /// rather than `[String: Any]?` so the struct's `Sendable` conformance is
+    /// real (not just nominally declared) — the previous `Any` value was
+    /// quietly violating it.
+    public let details: [String: String]?
 
-    public init(code: JsBaoErrorCode, message: String? = nil, details: [String: Any]? = nil) {
+    public init(code: JsBaoErrorCode, message: String? = nil, details: [String: String]? = nil) {
         self.code = code
         self.message = message ?? code.rawValue
         self.details = details

@@ -2,9 +2,13 @@ import Foundation
 
 /// Thread-safe event emitter supporting typed event handlers
 public final class EventEmitter: @unchecked Sendable {
+    private struct Entry {
+        let id: UInt64
+        let handler: (Any) -> Void
+    }
+
     private let lock = NSLock()
-    private var handlers: [String: [ObjectIdentifier: AnyObject]] = [:]
-    private var closureHandlers: [String: [(Any) -> Void]] = [:]
+    private var closureHandlers: [String: [Entry]] = [:]
     private var nextHandlerId: UInt64 = 0
 
     public init() {}
@@ -13,32 +17,32 @@ public final class EventEmitter: @unchecked Sendable {
     @discardableResult
     public func on<T>(_ event: JsBaoEvent, handler: @escaping (T) -> Void) -> EventSubscription {
         let id = allocateId()
-        let wrapper = ClosureWrapper(id: id, handler: handler)
-        lock.lock()
-        var list = closureHandlers[event.rawValue] ?? []
-        list.append { value in
+        let wrapped: (Any) -> Void = { value in
             if let typed = value as? T {
                 handler(typed)
             }
         }
+        lock.lock()
+        var list = closureHandlers[event.rawValue] ?? []
+        list.append(Entry(id: id, handler: wrapped))
         closureHandlers[event.rawValue] = list
         lock.unlock()
         return EventSubscription { [weak self] in
-            self?.removeClosure(event: event.rawValue, at: list.count - 1)
+            self?.removeClosure(event: event.rawValue, id: id)
         }
     }
 
     /// Subscribe to an event, receiving the raw Any payload
     @discardableResult
     public func onAny(_ event: JsBaoEvent, handler: @escaping (Any) -> Void) -> EventSubscription {
+        let id = allocateId()
         lock.lock()
         var list = closureHandlers[event.rawValue] ?? []
-        let index = list.count
-        list.append(handler)
+        list.append(Entry(id: id, handler: handler))
         closureHandlers[event.rawValue] = list
         lock.unlock()
         return EventSubscription { [weak self] in
-            self?.removeClosure(event: event.rawValue, at: index)
+            self?.removeClosure(event: event.rawValue, id: id)
         }
     }
 
@@ -47,8 +51,8 @@ public final class EventEmitter: @unchecked Sendable {
         lock.lock()
         let list = closureHandlers[event.rawValue] ?? []
         lock.unlock()
-        for handler in list {
-            handler(payload)
+        for entry in list {
+            entry.handler(payload)
         }
     }
 
@@ -80,14 +84,12 @@ public final class EventEmitter: @unchecked Sendable {
         return nextHandlerId
     }
 
-    private func removeClosure(event: String, at index: Int) {
+    private func removeClosure(event: String, id: UInt64) {
         lock.lock()
-        guard var list = closureHandlers[event], index < list.count else {
-            lock.unlock()
-            return
+        if var list = closureHandlers[event] {
+            list.removeAll { $0.id == id }
+            closureHandlers[event] = list
         }
-        list.remove(at: index)
-        closureHandlers[event] = list
         lock.unlock()
     }
 }
@@ -155,13 +157,3 @@ public func waitForEvent(
     }
 }
 
-// MARK: - Internal helpers
-
-private final class ClosureWrapper<T> {
-    let id: UInt64
-    let handler: (T) -> Void
-    init(id: UInt64, handler: @escaping (T) -> Void) {
-        self.id = id
-        self.handler = handler
-    }
-}

@@ -4,6 +4,11 @@ import Foundation
 public final class AnalyticsQueue: @unchecked Sendable {
     public static let unauthenticatedUser = "UNAUTHENTICATED"
 
+    /// Shared formatter — `ISO8601DateFormatter` is expensive to construct,
+    /// so we reuse one instance instead of allocating per event. The class
+    /// is documented as thread-safe for `string(from:)` calls.
+    private static let timestampFormatter = ISO8601DateFormatter()
+
     private let lock = NSLock()
     private let logger: Logger
 
@@ -64,7 +69,7 @@ public final class AnalyticsQueue: @unchecked Sendable {
         if preparedEvent["user_ulid"] == nil {
             preparedEvent["user_ulid"] = getUserId?() ?? Self.unauthenticatedUser
         }
-        preparedEvent["timestamp"] = ISO8601DateFormatter().string(from: Date())
+        preparedEvent["timestamp"] = Self.timestampFormatter.string(from: Date())
 
         // Apply overrides
         lock.lock()
@@ -168,6 +173,15 @@ public final class AnalyticsQueue: @unchecked Sendable {
         flushTimer?.cancel()
         flushTimer = nil
         flush()
+    }
+
+    deinit {
+        // Final safety net: if the owning client was destroyed without
+        // calling destroy() (and therefore without flushing), we still cancel
+        // the timer here. We can't await in a deinit, so we cannot call the
+        // async persistBuffer() — callers should call destroy() explicitly
+        // before letting the queue go out of scope to guarantee persistence.
+        flushTimer?.cancel()
     }
 
     // MARK: - Private

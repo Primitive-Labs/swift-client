@@ -88,19 +88,19 @@ public struct QueryTranslator {
 
         case "$containsText":
             if let text = value as? String {
-                return ("\(col) LIKE ? COLLATE NOCASE", ["%\(escapeLike(text))%"])
+                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(text))%"])
             }
             return ("1=1", [])
 
         case "$startsWith":
             if let text = value as? String {
-                return ("\(col) LIKE ? COLLATE NOCASE", ["\(escapeLike(text))%"])
+                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["\(escapeLike(text))%"])
             }
             return ("1=1", [])
 
         case "$endsWith":
             if let text = value as? String {
-                return ("\(col) LIKE ? COLLATE NOCASE", ["%\(escapeLike(text))"])
+                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(text))"])
             }
             return ("1=1", [])
 
@@ -109,8 +109,14 @@ public struct QueryTranslator {
             return (exists ? "\(col) IS NOT NULL" : "\(col) IS NULL", [])
 
         default:
-            // Unknown operator, ignore
-            return ("1=1", [])
+            // Unknown operator: trap in debug builds so typos surface during
+            // development, and in release builds fall back to "0" (matches
+            // nothing). Returning "1=1" (the previous behavior) silently
+            // matched all rows, which produced very confusing query results
+            // when the caller had a typo.
+            assertionFailure("QueryTranslator: unknown operator '\(op)' on field '\(field)'")
+            NSLog("[QueryTranslator] WARNING: unknown operator '\(op)' on field '\(field)' — filter dropped")
+            return ("0", [])
         }
     }
 
@@ -196,7 +202,10 @@ public struct QueryTranslator {
     }
 
     private static func escapeLike(_ text: String) -> String {
-        text.replacingOccurrences(of: "%", with: "\\%")
+        // Escape backslash first so subsequent replacements don't double-escape.
+        // The corresponding LIKE clause uses ESCAPE '\' to recognise this.
+        text.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
             .replacingOccurrences(of: "_", with: "\\_")
     }
 

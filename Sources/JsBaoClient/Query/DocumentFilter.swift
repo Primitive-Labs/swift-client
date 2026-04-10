@@ -1,6 +1,6 @@
 import Foundation
 
-/// MongoDB-style filter operators for querying Collection records.
+/// MongoDB-style filter operators for querying BaoModel records.
 ///
 /// Usage:
 /// ```swift

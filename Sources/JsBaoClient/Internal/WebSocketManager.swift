@@ -42,14 +42,31 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     public let connectionId: String = UUID().uuidString
 
-    // Connect continuation
+    // Connect continuation (the in-flight connect() call's own continuation)
     private var connectContinuation: CheckedContinuation<Void, Error>?
     private var hasActiveConnectContinuation = false
 
-    // Disconnect continuation
+    // Additional callers that hit connect() while one is already in flight.
+    // They are all resumed atomically when the in-flight attempt finishes —
+    // success resumes them with `()`, failure with the same error. Using an
+    // explicit list (instead of polling state) eliminates the race where the
+    // in-flight attempt completes in the gap between releasing the lock and
+    // a secondary caller starting to wait.
+    private var pendingConnectWaiters: [CheckedContinuation<Void, Error>] = []
+
+    // Disconnect continuation (the in-flight disconnect() call's own continuation)
     private var disconnectContinuation: CheckedContinuation<Void, Never>?
     private var isDisconnecting = false
     private var disconnectTimeoutWorkItem: DispatchWorkItem?
+
+    // Additional callers that hit disconnect() / setDesiredConnection() while a
+    // disconnect is already in flight. Same pattern as `pendingConnectWaiters`:
+    // they register atomically under the lock and are drained when the
+    // disconnect resolves (success path in handleConnectionClosed, fallback
+    // path in the disconnect() timeout work item, or the synchronous no-task
+    // path in disconnect()). Polling `isDisconnecting` from outside the lock
+    // is a data race even though Apple's memory model usually papers over it.
+    private var disconnectWaiters: [CheckedContinuation<Void, Never>] = []
 
     // Receive loop task
     private var receiveLoopTask: Task<Void, Never>?
@@ -102,12 +119,15 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
             return
         }
 
-        // Already connecting - wait on the existing continuation
+        // Already connecting — atomically register ourselves as a waiter
+        // before releasing the lock, so the in-flight attempt cannot complete
+        // and forget about us.
         if _connecting && hasActiveConnectContinuation {
             logger.debug("[WSM][debug] connect: waiting on existing connect attempt")
-            lock.unlock()
-            // We cannot share the same continuation, so just poll until done
-            try await waitForConnection()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                self.pendingConnectWaiters.append(continuation)
+                self.lock.unlock()
+            }
             return
         }
 
@@ -203,11 +223,16 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         let continuation = connectContinuation
         connectContinuation = nil
         hasActiveConnectContinuation = false
+        let waiters = pendingConnectWaiters
+        pendingConnectWaiters.removeAll()
         lock.unlock()
 
         delegate?.webSocketManagerOnStatusChange(.connected)
         delegate?.webSocketManagerOnConnected()
         continuation?.resume()
+        for waiter in waiters {
+            waiter.resume()
+        }
 
         // Start the receive loop
         startReceiveLoop(webSocketTask)
@@ -252,12 +277,17 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         let continuation = connectContinuation
         connectContinuation = nil
         hasActiveConnectContinuation = false
+        let waiters = pendingConnectWaiters
+        pendingConnectWaiters.removeAll()
         _connecting = false
         _connected = false
         lock.unlock()
 
         if let continuation = continuation {
             continuation.resume(throwing: error)
+        }
+        for waiter in waiters {
+            waiter.resume(throwing: error)
         }
         handleConnectionClosed(code: nil, reason: error.localizedDescription)
     }
@@ -342,16 +372,20 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
 
-        // Reject pending connect continuation
+        // Reject pending connect continuation and any extra waiters
         let pendingConnect = connectContinuation
         connectContinuation = nil
         hasActiveConnectContinuation = false
+        let drainedWaiters = pendingConnectWaiters
+        pendingConnectWaiters.removeAll()
 
-        // Check for disconnect continuation
+        // Check for disconnect continuation + drain any extra disconnect waiters.
         let pendingDisconnect = disconnectContinuation
         let wasDisconnecting = isDisconnecting
         let shouldReconnectNow = shouldConnect
         let manualPending = manualReconnectPending
+        let drainedDisconnectWaiters = disconnectWaiters
+        disconnectWaiters.removeAll()
 
         if pendingDisconnect != nil {
             disconnectContinuation = nil
@@ -371,9 +405,13 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         delegate?.webSocketManagerOnStatusChange(.disconnected)
         delegate?.webSocketManagerOnClose(code: code, reason: reason)
 
-        pendingConnect?.resume(throwing: WebSocketError.connectionFailed(
+        let closeError = WebSocketError.connectionFailed(
             "WebSocket closed before connected: code=\(code.map(String.init) ?? "nil")"
-        ))
+        )
+        pendingConnect?.resume(throwing: closeError)
+        for waiter in drainedWaiters {
+            waiter.resume(throwing: closeError)
+        }
 
         // Clean up session
         if wasTask != nil {
@@ -386,6 +424,11 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         if wasDisconnecting {
             delegate?.webSocketManagerOnDisconnectResolved()
             pendingDisconnect?.resume()
+            // Drain any callers parked in disconnect()/setDesiredConnection()
+            // waiting for this disconnect to finish.
+            for waiter in drainedDisconnectWaiters {
+                waiter.resume()
+            }
             return
         }
 
@@ -458,18 +501,13 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
     public func disconnect() async {
         lock.lock()
 
-        // Already disconnecting
-        if isDisconnecting, disconnectContinuation != nil {
-            lock.unlock()
-            // Wait for existing disconnect
+        // Already disconnecting — register atomically as a waiter under the
+        // lock so the in-flight disconnect can't resolve and forget about us
+        // in the gap before we start awaiting.
+        if isDisconnecting {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                // Poll until disconnect resolves
-                Task {
-                    while self.isDisconnecting {
-                        try? await Task.sleep(nanoseconds: 50_000_000)
-                    }
-                    continuation.resume()
-                }
+                self.disconnectWaiters.append(continuation)
+                self.lock.unlock()
             }
             return
         }
@@ -480,24 +518,28 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
 
+        // Take a snapshot of any state we might pass to the delegate, then
+        // finish all internal mutations BEFORE releasing the lock and calling
+        // the delegate. This avoids any window where the delegate observes
+        // inconsistent state via the manager.
         let hadTask = task != nil
-
-        if hadTask {
-            lock.unlock()
-            delegate?.webSocketManagerOnDisconnectInitiated()
-            lock.lock()
-        }
-
-        guard let currentTask = task else {
+        let currentTask = task
+        if currentTask != nil {
+            isDisconnecting = true
+        } else {
             _connected = false
             isDisconnecting = false
-            lock.unlock()
+        }
+        lock.unlock()
+
+        if hadTask {
+            delegate?.webSocketManagerOnDisconnectInitiated()
+        }
+
+        guard let currentTask = currentTask else {
             delegate?.webSocketManagerOnDisconnectResolved()
             return
         }
-
-        isDisconnecting = true
-        lock.unlock()
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.lock.lock()
@@ -515,10 +557,15 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
                 self.isDisconnecting = false
                 self.task = nil
                 self._connected = false
+                let drainedWaiters = self.disconnectWaiters
+                self.disconnectWaiters.removeAll()
                 self.lock.unlock()
 
                 self.delegate?.webSocketManagerOnDisconnectResolved()
                 pendingContinuation.resume()
+                for waiter in drainedWaiters {
+                    waiter.resume()
+                }
             }
             self.disconnectTimeoutWorkItem = timeoutWork
             self.lock.unlock()
@@ -542,15 +589,17 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         logger.debug("[WSM][debug] setDesiredConnection", shouldConnect, "connected:", _connected, "connecting:", _connecting)
 
         if shouldConnect {
-            // Wait for any pending disconnect
-            lock.lock()
-            let wasDisconnecting = isDisconnecting
-            lock.unlock()
-
-            if wasDisconnecting {
-                // Poll until disconnect finishes
-                while isDisconnecting {
-                    try? await Task.sleep(nanoseconds: 50_000_000)
+            // Wait for any pending disconnect to finish, registering as a
+            // waiter atomically under the lock instead of polling
+            // `isDisconnecting` from outside the lock (which is a data race).
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                self.lock.lock()
+                if self.isDisconnecting {
+                    self.disconnectWaiters.append(continuation)
+                    self.lock.unlock()
+                } else {
+                    self.lock.unlock()
+                    continuation.resume()
                 }
             }
 
@@ -636,12 +685,24 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         receiveLoopTask?.cancel()
         task?.cancel(with: .goingAway, reason: initiator.data(using: .utf8))
 
-        // Resume any pending connect continuation to avoid leaked continuations
+        // Resume any pending connect continuation and drained waiters to
+        // avoid leaked continuations (waiters would otherwise hang forever).
+        let waiters = pendingConnectWaiters
+        pendingConnectWaiters.removeAll()
         if let continuation = connectContinuation {
             connectContinuation = nil
             hasActiveConnectContinuation = false
             _connecting = false
-            continuation.resume(throwing: WebSocketError.connectionFailed("Connection closed: \(initiator)"))
+            let err = WebSocketError.connectionFailed("Connection closed: \(initiator)")
+            continuation.resume(throwing: err)
+            for waiter in waiters {
+                waiter.resume(throwing: err)
+            }
+        } else if !waiters.isEmpty {
+            let err = WebSocketError.connectionFailed("Connection closed: \(initiator)")
+            for waiter in waiters {
+                waiter.resume(throwing: err)
+            }
         }
     }
 

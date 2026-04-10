@@ -487,6 +487,48 @@ public final class JsBaoClient: @unchecked Sendable {
         return result
     }
 
+    /// Async version of `transactAndSync` — bypasses syncQueue entirely using the raw YrsDoc
+    /// to avoid deadlocking with the WebSocket message handler. Safe to call from `@MainActor`.
+    @discardableResult
+    public func transactAndSyncAsync<T: Sendable>(_ documentId: String, _ changes: @escaping @Sendable (YrsTransaction) -> T) async -> T {
+        guard let doc = documentManager.getDocument(documentId) else {
+            fatalError("Document \(documentId) is not open")
+        }
+
+        let result: (T, [UInt8]) = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Use raw YrsDoc to bypass syncQueue entirely
+                let rawDoc = doc.document
+
+                // 1. Get state vector before write
+                let svTxn = rawDoc.transact(origin: nil)
+                let svBefore = svTxn.transactionStateVector()
+                svTxn.free()
+
+                // 2. Apply changes
+                let writeTxn = rawDoc.transact(origin: nil)
+                let result = changes(writeTxn)
+                writeTxn.free()
+
+                // 3. Compute diff
+                let diffTxn = rawDoc.transact(origin: nil)
+                var update: [UInt8] = []
+                do {
+                    update = try diffTxn.transactionEncodeStateAsUpdateFromSv(stateVector: svBefore)
+                } catch {}
+                diffTxn.free()
+
+                continuation.resume(returning: (result, update))
+            }
+        }
+
+        if !result.1.isEmpty {
+            queueOutboundUpdate(documentId: documentId, update: result.1)
+        }
+
+        return result.0
+    }
+
     /// Check if a document is synced
     public func isSynced(_ documentId: String) -> Bool {
         documentManager.isSynced(documentId)
@@ -833,7 +875,11 @@ public final class JsBaoClient: @unchecked Sendable {
         groupTypeConfigs = GroupTypeConfigsAPI(makeRequest: request)
         integrations = IntegrationsAPI(makeRequest: request)
         prompts = PromptsAPI(makeRequest: request)
-        workflows = WorkflowsAPI(makeRequest: request)
+        workflows = WorkflowsAPI(
+            makeRequest: request,
+            getConnectionId: { [weak self] in self?.wsManager.connectionId ?? "" },
+            logger: logger
+        )
     }
 
     private func setupStorage() {
@@ -936,12 +982,32 @@ public final class JsBaoClient: @unchecked Sendable {
             documentManager.setPermission(roomId, permission: perm)
 
         case "workflowStatus":
-            guard let roomId = roomId else { return }
-            events.emit(.workflowStatus, WorkflowStatusEvent(
-                documentId: roomId,
-                workflowRunId: json["workflowRunId"] as? String ?? "",
-                status: json["status"] as? String ?? ""
-            ))
+            // workflowStatus messages are user-scoped, not document-scoped —
+            // the server's WorkflowStatusPayload has no `documentId` /
+            // `roomId`. The previous handler `guard let roomId` dropped
+            // every message before it could be delivered. Decode the full
+            // payload (matching JS) and route to the apply flow if needed.
+            let event = WorkflowStatusEvent(
+                workflowKey: json["workflowKey"] as? String ?? "",
+                workflowId: json["workflowId"] as? String ?? "",
+                runKey: json["runKey"] as? String ?? "",
+                runId: json["runId"] as? String ?? "",
+                status: json["status"] as? String ?? "",
+                output: json["output"] is NSNull ? nil : json["output"],
+                error: json["error"] as? String,
+                contextDocId: json["contextDocId"] as? String,
+                needsApply: json["needsApply"] as? Bool ?? false,
+                meta: json["meta"] as? [String: Any],
+                startedByUserId: json["startedByUserId"] as? String
+            )
+            events.emit(.workflowStatus, event)
+            // If the workflow needs client-side apply and a handler is
+            // registered, run the claim → apply → confirm flow.
+            if event.needsApply {
+                Task { [weak self] in
+                    await self?.workflows.handleApplyEvent(event)
+                }
+            }
 
         case "invitation":
             events.emit(.invitation, json)
@@ -997,6 +1063,15 @@ extension JsBaoClient: WebSocketManagerDelegate {
     public func webSocketManagerBuildConnectionRequest(connectionId: String) -> (url: URL, headers: [String: String]) {
         // The server expects the token as a query parameter, not an Authorization header.
         // This matches the JS client's buildWebSocketRequest() behavior.
+        //
+        // SECURITY NOTE: Tokens in URL query parameters can leak into server access
+        // logs, proxy/CDN logs, and (in WKWebView contexts) browser history. The
+        // browser-based JS client has no choice — the WebSocket spec forbids custom
+        // headers on the upgrade request from JS — but native clients (Swift) can
+        // use Authorization headers. Migrating away from query-param auth requires
+        // a coordinated server + JS client change (the server must accept either
+        // form during the rollout); tracked as a follow-up rather than fixed here
+        // so the Swift client stays protocol-compatible with the existing server.
         var components = URLComponents(string: "\(options.wsUrl)/app/\(options.appId)/ws")!
         var queryItems = [
             URLQueryItem(name: "connectionId", value: connectionId),

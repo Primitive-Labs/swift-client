@@ -162,11 +162,91 @@ public struct BlobUploadFailedEvent: Sendable {
     public let willRetry: Bool
 }
 
-public struct WorkflowStatusEvent: Sendable {
-    public let documentId: String
-    public let workflowRunId: String
-    public let status: String
+/// Server-pushed workflow status event. Mirrors the JS client's
+/// `WorkflowStatusEvent` payload field-for-field — matches the
+/// `WorkflowStatusPayload` the server emits in
+/// `src/app-api/services/websocket-notifier.ts`.
+///
+/// The server only fires this for terminal statuses (`completed`, `failed`,
+/// `terminated`). When `needsApply == true` and the workflow has a handler
+/// registered via `client.workflows.define(...)`, the client triggers the
+/// claim → apply → confirm flow automatically.
+public struct WorkflowStatusEvent: @unchecked Sendable {
+    public let workflowKey: String
+    public let workflowId: String
+    public let runKey: String
+    public let runId: String
+    public let status: String   // "completed" | "failed" | "terminated"
+    public let output: Any?
+    public let error: String?
+    public let contextDocId: String?
+    public let needsApply: Bool
+    public let meta: [String: Any]?
+    public let startedByUserId: String?
+
+    public init(
+        workflowKey: String,
+        workflowId: String,
+        runKey: String,
+        runId: String,
+        status: String,
+        output: Any? = nil,
+        error: String? = nil,
+        contextDocId: String? = nil,
+        needsApply: Bool = false,
+        meta: [String: Any]? = nil,
+        startedByUserId: String? = nil
+    ) {
+        self.workflowKey = workflowKey
+        self.workflowId = workflowId
+        self.runKey = runKey
+        self.runId = runId
+        self.status = status
+        self.output = output
+        self.error = error
+        self.contextDocId = contextDocId
+        self.needsApply = needsApply
+        self.meta = meta
+        self.startedByUserId = startedByUserId
+    }
 }
+
+/// Context delivered to the user's `onApply` handler registered via
+/// `client.workflows.define(...)`. Mirrors the JS client's apply context.
+public struct WorkflowApplyContext: @unchecked Sendable {
+    public let workflowKey: String
+    public let runKey: String
+    public let runId: String
+    public let contextDocId: String?
+    public let output: Any?
+    public let startedByUserId: String?
+    public let meta: [String: Any]?
+
+    public init(
+        workflowKey: String,
+        runKey: String,
+        runId: String,
+        contextDocId: String? = nil,
+        output: Any? = nil,
+        startedByUserId: String? = nil,
+        meta: [String: Any]? = nil
+    ) {
+        self.workflowKey = workflowKey
+        self.runKey = runKey
+        self.runId = runId
+        self.contextDocId = contextDocId
+        self.output = output
+        self.startedByUserId = startedByUserId
+        self.meta = meta
+    }
+}
+
+/// Closure type for the user's apply handler registered via
+/// `client.workflows.define(workflowKey, onApply: ...)`. The closure runs
+/// after the client successfully claims the apply lease and fetches the
+/// workflow output. Throw to cause the claim to be released so another
+/// client (or a retry) can pick it up.
+public typealias WorkflowApplyHandler = @Sendable (WorkflowApplyContext) async throws -> Void
 
 // MARK: - Auth State
 

@@ -6,19 +6,22 @@ public struct JsBaoClientOptions: Sendable {
     public let apiUrl: String
     public let wsUrl: String
     public let appId: String
-    public var token: String?
-    public var offline: Bool
-    public var maxReconnectDelay: TimeInterval
-    public var globalAdminAppId: String
-    public var wsHeaders: [String: String]
-    public var blobUploadConcurrency: Int
-    public var logLevel: LogLevel
-    public var storageConfig: StorageConfig
-    public var auth: AuthConfig
-    public var sync: SyncConfig
-    public var commitRetryBackoff: CommitRetryBackoff
-    public var autoNetwork: Bool
-    public var connectivityProbeTimeoutMs: Int
+    /// Initial token. Immutable after construction so the value-type
+    /// `JsBaoClientOptions` is safely `Sendable`. To change tokens at runtime,
+    /// use the auth controller (e.g., `client.auth.updateToken(...)`).
+    public let token: String?
+    public let offline: Bool
+    public let maxReconnectDelay: TimeInterval
+    public let globalAdminAppId: String
+    public let wsHeaders: [String: String]
+    public let blobUploadConcurrency: Int
+    public let logLevel: LogLevel
+    public let storageConfig: StorageConfig
+    public let auth: AuthConfig
+    public let sync: SyncConfig
+    public let commitRetryBackoff: CommitRetryBackoff
+    public let autoNetwork: Bool
+    public let connectivityProbeTimeoutMs: Int
 
     public init(
         apiUrl: String,
@@ -60,9 +63,9 @@ public struct JsBaoClientOptions: Sendable {
 // MARK: - Auth Config
 
 public struct AuthConfig: Sendable {
-    public var persistJwtInStorage: Bool
-    public var storageKeyPrefix: String?
-    public var refreshProxy: RefreshProxyConfig?
+    public let persistJwtInStorage: Bool
+    public let storageKeyPrefix: String?
+    public let refreshProxy: RefreshProxyConfig?
 
     public init(
         persistJwtInStorage: Bool = false,
@@ -77,8 +80,8 @@ public struct AuthConfig: Sendable {
 
 public struct RefreshProxyConfig: Sendable {
     public let baseUrl: String
-    public var cookieMaxAgeSeconds: Int?
-    public var enabled: Bool
+    public let cookieMaxAgeSeconds: Int?
+    public let enabled: Bool
 
     public init(baseUrl: String, cookieMaxAgeSeconds: Int? = nil, enabled: Bool = true) {
         self.baseUrl = baseUrl

@@ -58,7 +58,7 @@ Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource
 
 | File | Description |
 |------|-------------|
-| `CollectionQueryEngine.swift` | Mirrors Y.Map collection data into an in-memory SQLite database for relational queries |
+| `BaoModelQueryEngine.swift` | Mirrors Y.Map model data into an in-memory SQLite database for relational queries. **Uses a dirty-flag full rebuild on each query** rather than the JS client's per-record incremental updates — see [js-client-comparison.md](js-client-comparison.md#query-indexing-full-rebuild-vs-incremental-updates) for the trade-off. |
 | `QueryTranslator.swift` | Converts MongoDB-style `DocumentFilter` dictionaries into SQL `WHERE` clauses with parameterized bindings |
 | `DocumentFilter.swift` | Filter types and operators (`$eq`, `$gt`, `$in`, `$containsText`, `$or`, etc.) |
 
@@ -81,6 +81,33 @@ Key concurrency patterns:
 - **SQLiteStorageProvider**: A serial `DispatchQueue` serializes all database access
 - **DocumentManager**: Lock-protected dictionaries for open documents and sync state
 - **Task-based timers**: Reconnect delays and retry backoff use `Task.sleep` with cancellation
+
+### YDocument transactions: the non-reentrant lock rule
+
+There is **one concurrency footgun** worth knowing about up front, because it doesn't surface as an exception or a test failure — it surfaces as a hung thread with no diagnostic.
+
+yrs (the Rust CRDT under yswift) protects each `Doc` with a non-reentrant `RwLock`. The doc-level factory methods on `YDocument` — `getOrCreateText/Array/Map(named:)` — internally call `transact_mut()` to take that lock. **Calling them from inside an already-open `transactSync { ... }` closure on the same thread deadlocks the calling thread against itself.**
+
+```swift
+// ⚠️ DEADLOCKS — hung thread, no error
+doc.transactSync { txn in
+    let map = doc.getOrCreateMap(named: "myData")  // ← hangs forever here
+    map.updateValue("v", forKey: "k", transaction: txn)
+}
+
+// ✅ Safe — use the transaction-aware variant
+doc.transactSync { txn in
+    let map: YMap<String> = doc.getOrInsertMap(named: "myData", transaction: txn)
+    map.updateValue("v", forKey: "k", transaction: txn)
+}
+```
+
+**Rules of thumb:**
+- **Inside a `transactSync` closure:** use `doc.getOrInsertText/Array/Map(named:transaction:)`. These take an explicit transaction and route through the held `TransactionMut`, sidestepping the lock.
+- **Outside any transaction (e.g. cached at object init time):** the doc-level `getOrCreateText/Array/Map(named:)` are fine.
+- **Most code shouldn't deal with raw Y.Maps at all** — use [`BaoModel<T>`](baomodels-and-queries.md), which handles this rule internally so you never have to think about it.
+
+Full technical history, the rebuild procedure for the yswift fork, and the regression tests are in [yswift-fork.md](yswift-fork.md#transaction-aware-get-or-insert-deadlock-fix).
 
 ## Yjs Sync Protocol
 

@@ -43,7 +43,11 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                     let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
                     let rc = sqlite3_open_v2(resolvedPath, &dbPointer, flags, nil)
                     guard rc == SQLITE_OK, let dbPointer else {
-                        let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
+                        // Per the SQLite docs, dbPointer may be set even when open fails,
+                        // in which case it carries the error message. Read it from dbPointer
+                        // (not self.db, which has not been assigned yet) and close it.
+                        let msg = dbPointer.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
+                        if let dbPointer { sqlite3_close_v2(dbPointer) }
                         throw SQLiteStorageError.openFailed(message: msg)
                     }
                     self.db = dbPointer
