@@ -407,28 +407,6 @@ public final class JsBaoClient: @unchecked Sendable {
             options: options
         )
 
-        // Populate the local metadata cache for docs we don't have a
-        // title for yet. `GET /documents` only returns docs with a
-        // direct `DocumentPermission` row, so cascade-accessible docs
-        // (e.g. via a collection's `_col-reader` / `_col-writer` group)
-        // never make it into the cache via `fetchDocuments` /
-        // `syncMetadata`. `client.documents.get(documentId)` resolves
-        // effective permission server-side (direct OR group) and
-        // returns the title, so it's the canonical lookup. Fire-and-
-        // forget — open shouldn't block on a metadata round-trip, and
-        // the `.documentMetadataChanged` emit downstream of
-        // `handleServerDocuments` lets reactive consumers
-        // (`PrimitiveAppState`, the inspector) refresh.
-        let needsMetadataFetch = documentManager.getLocalMetadata(documentId)?.title == nil
-        if needsMetadataFetch {
-            Task { [weak self] in
-                guard let self else { return }
-                if let response = try? await self.documents.get(documentId: documentId) {
-                    await self.documentManager.handleServerDocuments([response])
-                }
-            }
-        }
-
         // Start network sync if requested
         if options.enableNetworkSync && isOnline() {
             await startNetworkSync(documentId: documentId)
@@ -605,22 +583,6 @@ public final class JsBaoClient: @unchecked Sendable {
     /// List open document IDs
     public func listOpenDocuments() -> [String] {
         documentManager.listOpenDocuments()
-    }
-
-    /// Local metadata cache for a single document. Populated by REST
-    /// list responses, by the `documents.create` callback, by the WS
-    /// `docMetadata` handler, and by the auto-fetch in `openDocument`
-    /// (for cascade-accessible docs that `GET /documents` doesn't
-    /// return). Returns `nil` for docs the client has never seen.
-    public func getLocalDocumentMetadata(_ documentId: String) -> LocalMetadataEntry? {
-        documentManager.getLocalMetadata(documentId)
-    }
-
-    /// Snapshot of every entry in the local metadata cache. Useful for
-    /// building a unified "documents I know about" view that includes
-    /// cascade-accessible docs which `documents.list` doesn't return.
-    public func getAllLocalDocumentMetadata() -> [String: LocalMetadataEntry] {
-        documentManager.getMetadataIndex()
     }
 
     /// Check if document is read-only
@@ -941,50 +903,7 @@ public final class JsBaoClient: @unchecked Sendable {
         )
         self.cache = cacheFacade
 
-        // Define `documents` against an explicit DocumentManager + EventEmitter
-        // capture so the REST create path can populate the local metadata
-        // cache and emit `.documentMetadataChanged`. Without this, a doc
-        // created via `documents.create(...)` is invisible to
-        // `getLocalMetadata(...)` until the next REST list refresh, and
-        // consumers like the debug inspector render it as "(untitled)".
-        let docManagerRef = self.documentManager
-        let eventsRef = self.events
-        documents = DocumentsAPI(
-            makeRequest: request,
-            blobManager: blobManager,
-            onDocumentCreated: { response in
-                // Reuse the same parse path the server-side doc list uses.
-                // The create-response shape (documentId/title/createdBy/
-                // createdAt/modifiedAt/tags) matches what `handleServerDocuments`
-                // already understands — no field mapping needed. The
-                // `handleServerDocuments` emit fires `.documentMetadataChanged`
-                // with an empty payload, which listeners treat as
-                // "refresh metadata."
-                await docManagerRef.handleServerDocuments([response])
-                // Owner-perm fallback: the create response doesn't carry
-                // a `permission` field, but a freshly-created doc's
-                // creator is always the owner. Stamp it so `getLocalMetadata`
-                // returns a useful perm immediately.
-                if let docId = response["documentId"] as? String,
-                   var entry = docManagerRef.getLocalMetadata(docId),
-                   entry.permission == nil {
-                    entry.permission = DocumentPermission.owner.rawValue
-                    docManagerRef.setMetadata(docId, entry: entry)
-                    eventsRef.emit(.documentMetadataChanged, [:] as [String: Any])
-                }
-            },
-            onDocumentsFetched: { items in
-                // Route every REST `documents.list` / `documents.get`
-                // response through the same cache-update path so
-                // `getLocalDocumentMetadata` and `getAllLocalDocumentMetadata`
-                // stay current. Reactive consumers (e.g.
-                // `PrimitiveAppState`) then see the new titles via
-                // `.documentMetadataChanged` without having to mirror
-                // the REST response shape themselves.
-                guard !items.isEmpty else { return }
-                await docManagerRef.handleServerDocuments(items)
-            }
-        )
+        documents = DocumentsAPI(makeRequest: request, blobManager: blobManager)
         collections = CollectionsAPI(makeRequest: request)
         databases = DatabasesAPI(makeRequest: request)
         me = MeAPI(makeRequest: request, cache: cacheFacade)
@@ -1192,54 +1111,6 @@ public final class JsBaoClient: @unchecked Sendable {
 
         case "meUpdated":
             events.emit(.meUpdated, json)
-
-        case "docMetadata":
-            // Server-pushed document metadata change (create / update /
-            // delete on another device or by another user with effective
-            // access). The server excludes the originating connectionId,
-            // so this fires on every OTHER connection of the same user
-            // and on other users' connections that gained or lost
-            // access. Mirrors `handleDocumentMetadataUpdate` in the JS
-            // client at `src/client/JsBaoClient.ts`.
-            //
-            // Payload shape (per `DocMetadataPayload` in
-            // `src/app-api/services/websocket-notifier.ts`):
-            //   { type: "docMetadata", documentId, metadata,
-            //     changedFields, action: "created"|"updated"|"deleted",
-            //     source: "server" }
-            //
-            // For `created` / `updated`, splice the metadata block into
-            // a server-doc shape and run it through `handleServerDocuments`
-            // so the local metadata cache reflects the new title /
-            // permission / tags. For `deleted`, leave cache eviction to
-            // the existing access-loss path (this is best-effort signal
-            // for UIs; `client.documents.get` will surface the 404 on
-            // next access).
-            guard let documentId = json["documentId"] as? String else { break }
-            let action = json["action"] as? String ?? "updated"
-            if action == "deleted" {
-                events.emit(.documentMetadataChanged, json)
-                break
-            }
-            let metaBlock = (json["metadata"] as? [String: Any]) ?? [:]
-            // Translate the WS metadata block into the same shape
-            // `handleServerDocuments` expects. `lastModified` maps to
-            // `modifiedAt`; everything else passes through.
-            var docPayload: [String: Any] = ["documentId": documentId]
-            if let v = metaBlock["title"]        { docPayload["title"] = v }
-            if let v = metaBlock["permission"]   { docPayload["permission"] = v }
-            if let v = metaBlock["createdBy"]    { docPayload["createdBy"] = v }
-            if let v = metaBlock["createdAt"]    { docPayload["createdAt"] = v }
-            if let v = metaBlock["lastModified"] { docPayload["modifiedAt"] = v }
-            else if let v = metaBlock["modifiedAt"] { docPayload["modifiedAt"] = v }
-            if let v = metaBlock["tags"]         { docPayload["tags"] = v }
-            await documentManager.handleServerDocuments([docPayload])
-            // Re-emit with the rich server payload so consumers that want
-            // the changedFields / action / source can read them.
-            // `handleServerDocuments` itself emits an empty payload to
-            // signal "metadata changed, refresh"; this richer emit is
-            // additive so listeners can opt into either.
-            events.emit(.documentMetadataChanged, json)
 
         default:
             logger.debug("Unhandled WS message:", action)
