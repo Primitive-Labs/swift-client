@@ -16,12 +16,14 @@ let package = Package(
     dependencies: [
         // Local fork of yswift with observe_update_v1 support
         .package(url: "https://github.com/Primitive-Labs/yswift-fork.git", branch: "main"),
+        .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
     ],
     targets: [
         .target(
             name: "JsBaoClient",
             dependencies: [
                 .product(name: "YSwift", package: "yswift-fork"),
+                .product(name: "TOMLKit", package: "TOMLKit"),
             ],
             path: "Sources/JsBaoClient",
             linkerSettings: [

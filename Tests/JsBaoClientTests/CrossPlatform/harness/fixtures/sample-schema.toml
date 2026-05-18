@@ -1,0 +1,128 @@
+# Fixture for cross-platform TOML schema parity tests.
+#
+# Loaded by BOTH the Swift side (`TomlSchemaLoader`) and the js-bao
+# side (`loadSchemaFromTomlString`). The parity test normalizes both
+# outputs and asserts logical equality — any divergence means the
+# two loaders disagree on the schema and Swift/JS clients would drift
+# at runtime.
+#
+# Coverage goals:
+#   - Every supported field type (string, number, boolean, date, id, stringset)
+#   - Every boolean flag (indexed, unique, required, auto_assign)
+#   - Scalar defaults (string, number, boolean)
+#   - max_length + max_count
+#   - Compound unique_constraints
+#   - All three relationship kinds: refersTo, hasMany, hasManyThrough
+
+[models.User]
+
+[models.User.fields.id]
+type = "id"
+auto_assign = true
+indexed = true
+
+[models.User.fields.email]
+type = "string"
+indexed = true
+required = true
+max_length = 256
+
+[models.User.fields.name]
+type = "string"
+default = "guest"
+
+[models.User.fields.tenantId]
+type = "id"
+indexed = true
+
+[models.User.fields.createdAt]
+type = "date"
+
+[models.User.fields.active]
+type = "boolean"
+default = true
+
+[[models.User.unique_constraints]]
+name = "email_per_tenant"
+fields = ["email", "tenantId"]
+
+[models.User.relationships.posts]
+type = "hasMany"
+model = "Post"
+related_id_field = "userId"
+order_by_field = "createdAt"
+order_direction = "DESC"
+
+[models.User.relationships.tags]
+type = "hasManyThrough"
+model = "Tag"
+join_model = "UserTag"
+join_model_local_field = "userId"
+join_model_related_field = "tagId"
+join_model_order_by_field = "position"
+join_model_order_direction = "ASC"
+
+
+[models.Post]
+
+[models.Post.fields.id]
+type = "id"
+auto_assign = true
+
+[models.Post.fields.userId]
+type = "id"
+indexed = true
+
+[models.Post.fields.title]
+type = "string"
+required = true
+
+[models.Post.fields.body]
+type = "string"
+max_length = 10000
+
+[models.Post.fields.score]
+type = "number"
+default = 0
+
+[models.Post.fields.tagIds]
+type = "stringset"
+max_count = 20
+
+[models.Post.relationships.author]
+type = "refersTo"
+model = "User"
+related_id_field = "userId"
+
+
+[models.Tag]
+
+[models.Tag.fields.id]
+type = "id"
+auto_assign = true
+
+[models.Tag.fields.name]
+type = "string"
+unique = true
+
+
+[models.UserTag]
+
+[models.UserTag.fields.id]
+type = "id"
+auto_assign = true
+
+[models.UserTag.fields.userId]
+type = "id"
+indexed = true
+
+[models.UserTag.fields.tagId]
+type = "id"
+indexed = true
+
+[models.UserTag.fields.position]
+type = "number"
+
+[[models.UserTag.unique_constraints]]
+name = "user_tag_unique"
+fields = ["userId", "tagId"]

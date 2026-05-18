@@ -1,5 +1,7 @@
 # Architecture
 
+> **For the parity-with-JS-client view, see [`parity/`](parity/).** This document covers the *internals* of the Swift client — how the layers fit together. Parity is a separate concern.
+
 ## Overview
 
 The Swift client mirrors the JS client's layered design but uses platform-native primitives: `URLSession` for HTTP, `URLSessionWebSocketTask` for WebSocket, SQLite (via C API) for persistence, and Swift concurrency (`async/await`) throughout.
@@ -58,7 +60,7 @@ Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource
 
 | File | Description |
 |------|-------------|
-| `BaoModelQueryEngine.swift` | Mirrors Y.Map model data into an in-memory SQLite database for relational queries. **Uses a dirty-flag full rebuild on each query** rather than the JS client's per-record incremental updates — see [js-client-comparison.md](js-client-comparison.md#query-indexing-full-rebuild-vs-incremental-updates) for the trade-off. |
+| `BaoModelQueryEngine.swift` | In-memory SQLite mirror of Y.Map model data for relational queries. **Kept incrementally consistent** via the observer hooks installed by `DynamicModel` (see Schema/ below) — local writes mutate the SQLite mirror inline; remote writes flow in via the root-map + per-record observer pipeline. The dirty-flag rebuild path is a fallback (e.g., engine attach for an already-populated doc), not the steady-state strategy. See [`parity/query-engine.md`](parity/query-engine.md) for operator-by-operator parity. |
 | `QueryTranslator.swift` | Converts MongoDB-style `DocumentFilter` dictionaries into SQL `WHERE` clauses with parameterized bindings |
 | `DocumentFilter.swift` | Filter types and operators (`$eq`, `$gt`, `$in`, `$containsText`, `$or`, etc.) |
 
@@ -105,7 +107,7 @@ doc.transactSync { txn in
 **Rules of thumb:**
 - **Inside a `transactSync` closure:** use `doc.getOrInsertText/Array/Map(named:transaction:)`. These take an explicit transaction and route through the held `TransactionMut`, sidestepping the lock.
 - **Outside any transaction (e.g. cached at object init time):** the doc-level `getOrCreateText/Array/Map(named:)` are fine.
-- **Most code shouldn't deal with raw Y.Maps at all** — use [`BaoModel<T>`](baomodels-and-queries.md), which handles this rule internally so you never have to think about it.
+- **Most code shouldn't deal with raw Y.Maps at all** — use [`TypedModel<T>` / `DynamicModel`](baomodels.md), which handles this rule internally so you never have to think about it.
 
 Full technical history, the rebuild procedure for the yswift fork, and the regression tests are in [yswift-fork.md](yswift-fork.md#transaction-aware-get-or-insert-deadlock-fix).
 

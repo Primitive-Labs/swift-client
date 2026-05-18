@@ -1,0 +1,138 @@
+# Fixture for type-conversion edge cases across the Swift + js-bao
+# TOML loaders. Every field in `DefaultsScalar` targets a specific
+# coercion boundary — the parity test runs the whole file through both
+# loaders and asserts logical equality.
+#
+# The sister test (big-ints) lives in-process only: values beyond
+# JS's `Number.MAX_SAFE_INTEGER` (2^53 − 1) can't round-trip through
+# the JSON subprocess harness, so we assert the Swift side's
+# behavior directly rather than comparing.
+
+# ---------------------------------------------------------------------
+# (1)/(2) Default scalar across field types
+# ---------------------------------------------------------------------
+[models.DefaultsScalar]
+
+[models.DefaultsScalar.fields.id]
+type = "id"
+
+# Number defaults — the original bug site: `0` and `1` bridge as both
+# NSNumber-int and NSNumber-bool on the Swift side.
+[models.DefaultsScalar.fields.n_zero]
+type = "number"
+default = 0
+
+[models.DefaultsScalar.fields.n_one]
+type = "number"
+default = 1
+
+[models.DefaultsScalar.fields.n_neg]
+type = "number"
+default = -1
+
+[models.DefaultsScalar.fields.n_float]
+type = "number"
+default = 3.14
+
+[models.DefaultsScalar.fields.n_sci]
+type = "number"
+default = 1e10
+
+# Boolean defaults — the other side of the 0/1 ↔ bool ambiguity.
+[models.DefaultsScalar.fields.b_true]
+type = "boolean"
+default = true
+
+[models.DefaultsScalar.fields.b_false]
+type = "boolean"
+default = false
+
+# String that *looks* like a bool — must stay a string.
+[models.DefaultsScalar.fields.s_bool_like]
+type = "string"
+default = "true"
+
+# String that looks like a number — must stay a string.
+[models.DefaultsScalar.fields.s_int_like]
+type = "string"
+default = "42"
+
+# Empty string default — not null, not omitted.
+[models.DefaultsScalar.fields.s_empty]
+type = "string"
+default = ""
+
+# (4) Date-like ISO string on a date field.
+[models.DefaultsScalar.fields.d_iso]
+type = "date"
+default = "2026-01-01"
+
+# (5) Id literal default — used by tests that want a stable sentinel id.
+[models.DefaultsScalar.fields.i_literal]
+type = "id"
+default = "fixed-id-ulid"
+
+
+# ---------------------------------------------------------------------
+# (6) Self-referential relationship (Node.children → Node)
+# ---------------------------------------------------------------------
+[models.Node]
+
+[models.Node.fields.id]
+type = "id"
+
+[models.Node.fields.parentId]
+type = "id"
+indexed = true
+
+[models.Node.relationships.children]
+type = "hasMany"
+model = "Node"
+related_id_field = "parentId"
+
+
+# ---------------------------------------------------------------------
+# (7) Forward reference — `Post` references `User`, but the `[models.User]`
+# table appears later in the file.
+# ---------------------------------------------------------------------
+[models.Post]
+
+[models.Post.fields.id]
+type = "id"
+
+[models.Post.fields.userId]
+type = "id"
+indexed = true
+
+[models.Post.relationships.author]
+type = "refersTo"
+model = "User"
+related_id_field = "userId"
+
+
+# ---------------------------------------------------------------------
+# (8) Unicode in default values
+# ---------------------------------------------------------------------
+[models.Greeting]
+
+[models.Greeting.fields.id]
+type = "id"
+
+[models.Greeting.fields.rocket]
+type = "string"
+default = "🚀"
+
+[models.Greeting.fields.japanese]
+type = "string"
+default = "こんにちは"
+
+[models.Greeting.fields.accented]
+type = "string"
+default = "café"
+
+
+# Target of the forward reference above.
+[models.User]
+
+[models.User.fields.id]
+type = "id"

@@ -36,7 +36,10 @@ public final class JsBaoClient: @unchecked Sendable {
     private let logger: Logger
     private let httpClient: HttpClient
     private let wsManager: WebSocketManager
-    private let authController: AuthController
+    /// `internal` (not `private`) so `@testable import JsBaoClient`
+    /// tests can drive auth flows directly (e.g., concurrent-refresh
+    /// coalescing tests). Not part of the public surface.
+    internal let authController: AuthController
     let documentManager: DocumentManager
     private let blobManager: BlobManager
     private let offlineStore: OfflineStore
@@ -404,9 +407,69 @@ public final class JsBaoClient: @unchecked Sendable {
             options: options
         )
 
+        // Populate the local metadata cache for docs we don't have a
+        // title for yet. `GET /documents` only returns docs with a
+        // direct `DocumentPermission` row, so cascade-accessible docs
+        // (e.g. via a collection's `_col-reader` / `_col-writer` group)
+        // never make it into the cache via `fetchDocuments` /
+        // `syncMetadata`. `client.documents.get(documentId)` resolves
+        // effective permission server-side (direct OR group) and
+        // returns the title, so it's the canonical lookup. Fire-and-
+        // forget — open shouldn't block on a metadata round-trip, and
+        // the `.documentMetadataChanged` emit downstream of
+        // `handleServerDocuments` lets reactive consumers
+        // (`PrimitiveAppState`, the inspector) refresh.
+        let needsMetadataFetch = documentManager.getLocalMetadata(documentId)?.title == nil
+        if needsMetadataFetch {
+            Task { [weak self] in
+                guard let self else { return }
+                if let response = try? await self.documents.get(documentId: documentId) {
+                    await self.documentManager.handleServerDocuments([response])
+                }
+            }
+        }
+
         // Start network sync if requested
         if options.enableNetworkSync && isOnline() {
             await startNetworkSync(documentId: documentId)
+
+            // If waitForLoad is .network, actually wait for the sync to
+            // complete before returning. Without this, callers get an empty
+            // YDocument and have to race against the .sync event.
+            if options.waitForLoad == .network && !documentManager.isSynced(documentId) {
+                let syncDocId = documentId
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    // Class-boxed so the sync handler and timeout Task share
+                    // the flag without an UnsafeMutablePointer leak.
+                    final class ResumedFlag { var value: Bool = false }
+                    let resumed = ResumedFlag()
+                    let resumedLock = NSLock()
+
+                    func resumeOnce() {
+                        resumedLock.lock()
+                        let alreadyResumed = resumed.value
+                        resumed.value = true
+                        resumedLock.unlock()
+                        if !alreadyResumed {
+                            cont.resume()
+                        }
+                    }
+
+                    var sub: EventSubscription?
+                    sub = self.events.on(.sync) { (event: SyncEvent) in
+                        if event.documentId == syncDocId && event.synced {
+                            sub?.cancel()
+                            resumeOnce()
+                        }
+                    }
+                    // Timeout after 15s to avoid hanging forever
+                    Task {
+                        try? await Task.sleep(nanoseconds: 15_000_000_000)
+                        sub?.cancel()
+                        resumeOnce()
+                    }
+                }
+            }
         }
 
         return doc
@@ -542,6 +605,22 @@ public final class JsBaoClient: @unchecked Sendable {
     /// List open document IDs
     public func listOpenDocuments() -> [String] {
         documentManager.listOpenDocuments()
+    }
+
+    /// Local metadata cache for a single document. Populated by REST
+    /// list responses, by the `documents.create` callback, by the WS
+    /// `docMetadata` handler, and by the auto-fetch in `openDocument`
+    /// (for cascade-accessible docs that `GET /documents` doesn't
+    /// return). Returns `nil` for docs the client has never seen.
+    public func getLocalDocumentMetadata(_ documentId: String) -> LocalMetadataEntry? {
+        documentManager.getLocalMetadata(documentId)
+    }
+
+    /// Snapshot of every entry in the local metadata cache. Useful for
+    /// building a unified "documents I know about" view that includes
+    /// cascade-accessible docs which `documents.list` doesn't return.
+    public func getAllLocalDocumentMetadata() -> [String: LocalMetadataEntry] {
+        documentManager.getMetadataIndex()
     }
 
     /// Check if document is read-only
@@ -862,7 +941,50 @@ public final class JsBaoClient: @unchecked Sendable {
         )
         self.cache = cacheFacade
 
-        documents = DocumentsAPI(makeRequest: request, blobManager: blobManager)
+        // Define `documents` against an explicit DocumentManager + EventEmitter
+        // capture so the REST create path can populate the local metadata
+        // cache and emit `.documentMetadataChanged`. Without this, a doc
+        // created via `documents.create(...)` is invisible to
+        // `getLocalMetadata(...)` until the next REST list refresh, and
+        // consumers like the debug inspector render it as "(untitled)".
+        let docManagerRef = self.documentManager
+        let eventsRef = self.events
+        documents = DocumentsAPI(
+            makeRequest: request,
+            blobManager: blobManager,
+            onDocumentCreated: { response in
+                // Reuse the same parse path the server-side doc list uses.
+                // The create-response shape (documentId/title/createdBy/
+                // createdAt/modifiedAt/tags) matches what `handleServerDocuments`
+                // already understands — no field mapping needed. The
+                // `handleServerDocuments` emit fires `.documentMetadataChanged`
+                // with an empty payload, which listeners treat as
+                // "refresh metadata."
+                await docManagerRef.handleServerDocuments([response])
+                // Owner-perm fallback: the create response doesn't carry
+                // a `permission` field, but a freshly-created doc's
+                // creator is always the owner. Stamp it so `getLocalMetadata`
+                // returns a useful perm immediately.
+                if let docId = response["documentId"] as? String,
+                   var entry = docManagerRef.getLocalMetadata(docId),
+                   entry.permission == nil {
+                    entry.permission = DocumentPermission.owner.rawValue
+                    docManagerRef.setMetadata(docId, entry: entry)
+                    eventsRef.emit(.documentMetadataChanged, [:] as [String: Any])
+                }
+            },
+            onDocumentsFetched: { items in
+                // Route every REST `documents.list` / `documents.get`
+                // response through the same cache-update path so
+                // `getLocalDocumentMetadata` and `getAllLocalDocumentMetadata`
+                // stay current. Reactive consumers (e.g.
+                // `PrimitiveAppState`) then see the new titles via
+                // `.documentMetadataChanged` without having to mirror
+                // the REST response shape themselves.
+                guard !items.isEmpty else { return }
+                await docManagerRef.handleServerDocuments(items)
+            }
+        )
         collections = CollectionsAPI(makeRequest: request)
         databases = DatabasesAPI(makeRequest: request)
         me = MeAPI(makeRequest: request, cache: cacheFacade)
@@ -873,7 +995,22 @@ public final class JsBaoClient: @unchecked Sendable {
         groups = GroupsAPI(makeRequest: request)
         ruleSets = RuleSetsAPI(makeRequest: request)
         groupTypeConfigs = GroupTypeConfigsAPI(makeRequest: request)
-        integrations = IntegrationsAPI(makeRequest: request)
+        // IntegrationsAPI needs the raw HttpClientResponse to surface
+        // upstream status / headers / typed error mapping (the proxy
+        // envelope puts the upstream status in the body and the proxy's
+        // OWN status in the response status). Plumb it directly to
+        // httpClient.requestRaw rather than the regular request closure.
+        integrations = IntegrationsAPI(
+            makeRawRequest: { [weak self] method, path, data in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.httpClient.requestRaw(
+                    method: method,
+                    path: path,
+                    data: data,
+                    options: nil
+                )
+            }
+        )
         prompts = PromptsAPI(makeRequest: request)
         workflows = WorkflowsAPI(
             makeRequest: request,
@@ -886,23 +1023,37 @@ public final class JsBaoClient: @unchecked Sendable {
         Task {
             do {
                 let provider: StorageProvider
+                let authProvider: StorageProvider
                 switch options.storageConfig {
                 case .sqlite(let directory):
                     provider = try SQLiteStorageProvider(path: directory)
+                    // OfflineStore + JWT persistence both call
+                    // `provider.initialize(namespace:)` with different namespaces.
+                    // SQLiteStorageProvider re-binds `self.db` on every initialize
+                    // call when no explicit path is set, so a single provider
+                    // ends up pointing at whichever namespace was initialized
+                    // most recently — and writes to yjs_docs / metadata silently
+                    // land in the auth-namespace file. Use a dedicated provider
+                    // for JWT storage to keep the two DBs from colliding.
+                    authProvider = try SQLiteStorageProvider(path: directory)
                 case .memory:
                     provider = MemoryStorageProvider()
+                    authProvider = MemoryStorageProvider()
                 }
 
                 offlineStore.setStorageProvider(provider)
+                offlineStore.setAuthStorageProvider(authProvider)
                 kvCache.setStorageProvider(provider)
 
                 // Bootstrap auth
                 if let token = options.token {
                     authController.bootstrapToken(token)
                 } else {
-                    // Try loading persisted JWT
-                    let persisted = await authController.tryLoadPersistedJwt()
-                    authController.bootstrapToken(persisted)
+                    // Restore from persisted JWT — and, if it's aged out,
+                    // attempt a cookie-based refresh before declaring the
+                    // session dead. Access tokens live 1h; the refresh cookie
+                    // persisted by URLSession lives 7d.
+                    await authController.tryRestoreSession()
                 }
 
                 // Set userId on kvCache
@@ -937,7 +1088,19 @@ public final class JsBaoClient: @unchecked Sendable {
             return
         }
 
-        let action = json["action"] as? String ?? json["type"] as? String ?? ""
+        // The server uses `type` as the message category (what we're
+        // switching on) and `action` as a sub-action within that
+        // category (e.g. `{type: "invitation", action: "created"}`).
+        // This reads as `action` in the local var for historical
+        // naming reasons, but it's a message *type* dispatch. Preferring
+        // `action` over `type` (the previous implementation) meant
+        // every message carrying both fields matched on its sub-action
+        // string ("created", "updated", "accepted", …) and silently
+        // fell through the switch — so `invitation` events, `docMetadata`
+        // events, etc. never reached their subscribers. The JS client at
+        // `src/client/JsBaoClient.ts` routes on `data.type` for exactly
+        // this reason.
+        let action = json["type"] as? String ?? json["action"] as? String ?? ""
         let roomId = json["roomId"] as? String ?? json["documentId"] as? String
 
         switch action {
@@ -1007,6 +1170,21 @@ public final class JsBaoClient: @unchecked Sendable {
                 Task { [weak self] in
                     await self?.workflows.handleApplyEvent(event)
                 }
+            } else {
+                // Terminal states without needsApply — route to
+                // runAndApply/awaitRun waiters so they resolve without
+                // hanging until their timeout. Covers `completed`
+                // (another client already applied), as well as `failed`
+                // / `terminated` / `error`.
+                let status = event.status.lowercased()
+                if status == "completed"
+                    || status == "failed"
+                    || status == "terminated"
+                    || status == "error" {
+                    Task { [weak self] in
+                        await self?.workflows.handleTerminalEvent(event)
+                    }
+                }
             }
 
         case "invitation":
@@ -1014,6 +1192,54 @@ public final class JsBaoClient: @unchecked Sendable {
 
         case "meUpdated":
             events.emit(.meUpdated, json)
+
+        case "docMetadata":
+            // Server-pushed document metadata change (create / update /
+            // delete on another device or by another user with effective
+            // access). The server excludes the originating connectionId,
+            // so this fires on every OTHER connection of the same user
+            // and on other users' connections that gained or lost
+            // access. Mirrors `handleDocumentMetadataUpdate` in the JS
+            // client at `src/client/JsBaoClient.ts`.
+            //
+            // Payload shape (per `DocMetadataPayload` in
+            // `src/app-api/services/websocket-notifier.ts`):
+            //   { type: "docMetadata", documentId, metadata,
+            //     changedFields, action: "created"|"updated"|"deleted",
+            //     source: "server" }
+            //
+            // For `created` / `updated`, splice the metadata block into
+            // a server-doc shape and run it through `handleServerDocuments`
+            // so the local metadata cache reflects the new title /
+            // permission / tags. For `deleted`, leave cache eviction to
+            // the existing access-loss path (this is best-effort signal
+            // for UIs; `client.documents.get` will surface the 404 on
+            // next access).
+            guard let documentId = json["documentId"] as? String else { break }
+            let action = json["action"] as? String ?? "updated"
+            if action == "deleted" {
+                events.emit(.documentMetadataChanged, json)
+                break
+            }
+            let metaBlock = (json["metadata"] as? [String: Any]) ?? [:]
+            // Translate the WS metadata block into the same shape
+            // `handleServerDocuments` expects. `lastModified` maps to
+            // `modifiedAt`; everything else passes through.
+            var docPayload: [String: Any] = ["documentId": documentId]
+            if let v = metaBlock["title"]        { docPayload["title"] = v }
+            if let v = metaBlock["permission"]   { docPayload["permission"] = v }
+            if let v = metaBlock["createdBy"]    { docPayload["createdBy"] = v }
+            if let v = metaBlock["createdAt"]    { docPayload["createdAt"] = v }
+            if let v = metaBlock["lastModified"] { docPayload["modifiedAt"] = v }
+            else if let v = metaBlock["modifiedAt"] { docPayload["modifiedAt"] = v }
+            if let v = metaBlock["tags"]         { docPayload["tags"] = v }
+            await documentManager.handleServerDocuments([docPayload])
+            // Re-emit with the rich server payload so consumers that want
+            // the changedFields / action / source can read them.
+            // `handleServerDocuments` itself emits an empty payload to
+            // signal "metadata changed, refresh"; this richer emit is
+            // additive so listeners can opt into either.
+            events.emit(.documentMetadataChanged, json)
 
         default:
             logger.debug("Unhandled WS message:", action)
@@ -1111,6 +1337,10 @@ extension JsBaoClient: WebSocketManagerDelegate {
             }
             // Flush analytics
             analyticsQueue.flush()
+            // Any per-run waiter installed by runAndApply/awaitRun may
+            // have missed its workflowStatus event while we were
+            // offline. Re-check each against server state.
+            await workflows.recheckPendingRuns()
         }
     }
 

@@ -122,7 +122,7 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         // Already connecting — atomically register ourselves as a waiter
         // before releasing the lock, so the in-flight attempt cannot complete
         // and forget about us.
-        if _connecting && hasActiveConnectContinuation {
+        if _connecting {
             logger.debug("[WSM][debug] connect: waiting on existing connect attempt")
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 self.pendingConnectWaiters.append(continuation)

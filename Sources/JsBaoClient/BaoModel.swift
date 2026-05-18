@@ -81,6 +81,10 @@ public final class BaoModel<T: BaoModelRecord> {
         return engine
     }()
 
+    /// Internal accessor for the underlying SQLite mirror — used by tests
+    /// and by the schema layer's observer plumbing.
+    internal var queryEngineInternal: BaoModelQueryEngine { queryEngine }
+
     /// True when the SQLite mirror may be out of sync with the Y.Doc.
     /// Initially true so the first query triggers a full sync.
     /// Set to true by an `observeUpdate` subscription on the doc whenever
@@ -156,7 +160,8 @@ public final class BaoModel<T: BaoModelRecord> {
         return doc.transactSync { txn in
             let outerMap = self.rootMap
             guard let recordMap = outerMap.getMap(tx: txn, key: id) else { return nil }
-            let fields = self.readFields(from: recordMap, txn: txn)
+            var fields = self.readFields(from: recordMap, txn: txn)
+            fields["id"] = id
             return T(fields: fields)
         }
     }
@@ -174,7 +179,8 @@ public final class BaoModel<T: BaoModelRecord> {
             var results: [T] = []
             for key in kc.keys {
                 guard let recordMap = outerMap.getMap(tx: txn, key: key) else { continue }
-                let fields = self.readFields(from: recordMap, txn: txn)
+                var fields = self.readFields(from: recordMap, txn: txn)
+                fields["id"] = key
                 let record = T(fields: fields)
                 results.append(record)
             }
@@ -296,12 +302,14 @@ public final class BaoModel<T: BaoModelRecord> {
                 // Use doc.document.getMap to ensure the root map exists (creates if needed)
                 let outerMap = self.rootMap
                 let recordMap = outerMap.getOrInsertMap(tx: txn, key: record.id)
+                self.writeIdField(record.id, to: recordMap, txn: txn)
                 self.writeFields(fields, to: recordMap, txn: txn)
             }
         } else {
             doc.transactSync { txn in
                 let outerMap = self.rootMap
                 let recordMap = outerMap.getOrInsertMap(tx: txn, key: record.id)
+                self.writeIdField(record.id, to: recordMap, txn: txn)
                 self.writeFields(fields, to: recordMap, txn: txn)
             }
         }
@@ -359,6 +367,23 @@ public final class BaoModel<T: BaoModelRecord> {
             let jsonValue = encodeFieldValue(value, type: fieldDef.type)
             recordMap.insert(tx: txn, key: key, value: jsonValue)
         }
+    }
+
+    /// Write the record's `id` as a field inside the nested Y.Map.
+    ///
+    /// The outer map is already keyed by the id, but js-bao (the TypeScript
+    /// reader) also requires the id to appear as a field *inside* the nested
+    /// map — its `extractItemData` returns `null` without one, which drops
+    /// the whole record from the reader's SQLite mirror and makes it
+    /// invisible to `Model.query`. The TS writer does the same thing at
+    /// `js-bao/src/models/BaseModel.ts` (search for
+    /// "required for database sync"). Called from `create()` so every
+    /// record produced by swift-client satisfies the cross-client contract
+    /// without requiring every BaoModelRecord definition to declare `id` as
+    /// an explicit FieldDefinition.
+    private func writeIdField(_ id: String, to recordMap: YrsMap, txn: YrsTransaction) {
+        let encoded = encodeFieldValue(id, type: .string)
+        recordMap.insert(tx: txn, key: "id", value: encoded)
     }
 
     private func decodeFieldValue(_ jsonVal: String, type: FieldType) -> Any {

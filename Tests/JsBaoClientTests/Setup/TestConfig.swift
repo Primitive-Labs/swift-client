@@ -20,6 +20,16 @@ struct TestConfig {
         ProcessInfo.processInfo.environment["TEST_SUPERADMIN_JWT"]
     }()
 
+    /// Shared secret used by the local dev server to sign JWTs. Only needed
+    /// by tests that forge their own refresh tokens (see RefreshTests cold
+    /// start). Defaults to the dev-server's documented test secret so
+    /// running `./run-tests.sh` works without extra env setup; prod servers
+    /// use a distinct secret and this default would not verify against them.
+    static let jwtSecret: String = {
+        ProcessInfo.processInfo.environment["TEST_JWT_SECRET"]
+            ?? "test-jwt-secret-only-for-tests"
+    }()
+
     static let globalAdminAppId: String = {
         ProcessInfo.processInfo.environment["TEST_GLOBAL_ADMIN_APP_ID"] ?? "global-admin-app"
     }()

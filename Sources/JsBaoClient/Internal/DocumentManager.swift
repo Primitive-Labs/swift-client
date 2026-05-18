@@ -14,6 +14,14 @@ public final class DocumentManager: @unchecked Sendable {
 
     // Open documents
     private var openDocs: [String: YDocument] = [:]
+    /// In-flight `openDocument(...)` Tasks keyed by `documentId`.
+    /// Coalesces concurrent opens for the same id so all callers
+    /// receive the SAME `YDocument` instance — without this, two
+    /// callers racing on `openDocument(id)` for an unopened doc would
+    /// each construct a new `YDocument` and the second insert into
+    /// `openDocs` would silently clobber the first, leaving the loser
+    /// caller holding an orphaned doc with no observer wiring.
+    private var pendingOpens: [String: Task<YDocument, Error>] = [:]
     private var docSyncStates: [String: Bool] = [:]
     private var docPermissions: [String: DocumentPermission] = [:]
     private var docOpenStartTime: [String: CFAbsoluteTime] = [:]
@@ -58,18 +66,61 @@ public final class DocumentManager: @unchecked Sendable {
 
     // MARK: - Document Lifecycle
 
-    /// Open a document, restoring from local persistence if available
+    /// Open a document, restoring from local persistence if available.
+    ///
+    /// Concurrent calls for the same `documentId` are coalesced through
+    /// `pendingOpens` so every caller receives the *same* `YDocument`
+    /// instance — preventing the open-race regression where two
+    /// concurrent callers each constructed their own `YDocument` and
+    /// the second `openDocs[documentId] = ...` clobbered the first,
+    /// orphaning the loser.
     public func openDocument(
         documentId: String,
         options: OpenDocumentOptions
     ) async throws -> YDocument {
+        // Fast path: already fully open
         lock.lock()
         if let existing = openDocs[documentId] {
             lock.unlock()
             return existing
         }
+        // Coalesce: another caller is already opening this docId — await
+        // their Task instead of starting a duplicate open.
+        if let inFlight = pendingOpens[documentId] {
+            lock.unlock()
+            return try await inFlight.value
+        }
+        // Claim the slot atomically by registering a Task that will
+        // run the full open lifecycle. Subsequent callers in the
+        // window before this Task completes will see `pendingOpens`
+        // and await it.
+        let task = Task<YDocument, Error> { [weak self] in
+            guard let self = self else {
+                throw NSError(
+                    domain: "DocumentManager",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "DocumentManager deallocated mid-open"]
+                )
+            }
+            return try await self._openDocumentImpl(documentId: documentId, options: options)
+        }
+        pendingOpens[documentId] = task
         lock.unlock()
 
+        defer {
+            lock.lock()
+            pendingOpens.removeValue(forKey: documentId)
+            lock.unlock()
+        }
+        return try await task.value
+    }
+
+    /// Actual open-document implementation. Always runs inside the
+    /// `pendingOpens` Task so it's serialized per-`documentId`.
+    private func _openDocumentImpl(
+        documentId: String,
+        options: OpenDocumentOptions
+    ) async throws -> YDocument {
         let doc = YDocument()
         let startTime = CFAbsoluteTimeGetCurrent()
 
@@ -86,14 +137,64 @@ public final class DocumentManager: @unchecked Sendable {
         syncProtocols[documentId] = syncProtocol
         lock.unlock()
 
-        // Restore from local persistence if offline enabled
-        if let offlineStore = offlineStore {
-            if let persistence = docPersistence[documentId] {
-                let data = try await persistence.loadDocument()
-                if let data = data, !data.isEmpty {
-                    doc.transactSync { txn in
-                        // Apply stored update
+        // Wire up SQLite-backed Y.Doc persistence for this document.
+        // Previously `docPersistence` was declared but never populated —
+        // both the save block (in `persistDocumentToLocal`) and the
+        // restore block below silently no-op'd, so every launch started
+        // with an empty Y.Doc regardless of `waitForLoad` mode. That
+        // forced every consumer to wait for the `.sync` event (WS
+        // handshake + full-doc sync) before any local query returned
+        // data, adding seconds of skeleton time to every launch.
+        //
+        // Note on the race: `setupStorage()` runs as a Task on the main
+        // client and can finish *after* the first `openDocument` call.
+        // If `getStorageProvider()` is still nil here, we skip the
+        // wiring and `persistDocumentToLocal` will late-bind on the
+        // first save attempt instead. Logging makes that path visible.
+        if let offlineStore = offlineStore,
+           let storageProvider = offlineStore.getStorageProvider() {
+            let persistence = YjsSQLitePersistence(
+                storageProvider: storageProvider,
+                documentId: documentId
+            )
+            lock.lock()
+            docPersistence[documentId] = persistence
+            lock.unlock()
+
+            // Restore from SQLite: load the serialized Y.Doc state and
+            // apply it inside a transaction so BaoModel<T> queries work
+            // synchronously after open, before any network sync arrives.
+            //
+            // Previously the load was wrapped in `try?` which swallowed
+            // every failure mode — provider not initialized, decode
+            // failure, etc. Now we log the cause and proceed without
+            // local data (the network sync still runs).
+            let loaded: Data?
+            do {
+                loaded = try await persistence.loadDocument()
+            } catch {
+                logger.warn(
+                    "openDocument: loadDocument failed for",
+                    documentId,
+                    error.localizedDescription
+                )
+                loaded = nil
+            }
+            if let data = loaded, !data.isEmpty {
+                var applied = false
+                doc.transactSync { txn in
+                    do {
+                        try txn.transactionApplyUpdate(update: Array(data))
+                        applied = true
+                    } catch {
+                        self.logger.warn(
+                            "Failed to apply persisted Y.Doc state:",
+                            documentId,
+                            error.localizedDescription
+                        )
                     }
+                }
+                if applied {
                     let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                     emitter?.emit(.documentLoaded, DocumentLoadedEvent(
                         documentId: documentId,
@@ -104,6 +205,15 @@ public final class DocumentManager: @unchecked Sendable {
                     ))
                 }
             }
+        } else {
+            // Storage provider isn't ready yet. Persist will late-bind
+            // on the first save; this log makes the deferred path
+            // visible so we don't silently miss the first-open case.
+            logger.log(
+                "openDocument: storage provider not yet ready for",
+                documentId,
+                "(offlineStore=\(offlineStore == nil ? "nil" : "set")) — persistence will late-bind"
+            )
         }
 
         // Load metadata
@@ -142,6 +252,15 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Close a document and optionally evict local data
     public func closeDocument(documentId: String, options: CloseDocumentOptions = CloseDocumentOptions()) async {
+        // Persist before tearing down: if the app is being backgrounded
+        // or the doc is being closed between server syncs, this flushes
+        // any local updates that `handleSyncComplete` hasn't captured.
+        // Skipped when `evictLocal` is set — that branch is deleting
+        // the data on purpose.
+        if !options.evictLocal {
+            await persistDocumentToLocal(documentId: documentId)
+        }
+
         lock.lock()
         let doc = openDocs.removeValue(forKey: documentId)
         docSyncStates.removeValue(forKey: documentId)
@@ -150,6 +269,7 @@ public final class DocumentManager: @unchecked Sendable {
         syncProtocols.removeValue(forKey: documentId)
         updateSubscriptions.removeValue(forKey: documentId)?.cancel()
         docAwareness.removeValue(forKey: documentId)
+        docPersistence.removeValue(forKey: documentId)
         lock.unlock()
 
         if options.evictLocal {
@@ -702,11 +822,68 @@ public final class DocumentManager: @unchecked Sendable {
         // Get full document state as an update.
         // Use raw YrsDoc to avoid blocking the cooperative thread pool on syncQueue.
         let txn = doc.document.transact(origin: nil)
+        defer { txn.free() }
         let state: [UInt8] = txn.transactionEncodeStateAsUpdate()
-        txn.free()
 
-        if let persistence = docPersistence[documentId] {
-            try? await persistence.saveDocument(data: Data(state))
+        // Resolve persistence lazily. `openDocument` wires `docPersistence`
+        // up-front, but only if `offlineStore.getStorageProvider()` was
+        // already non-nil at that moment — and `setupStorage()` runs as a
+        // Task that can land *after* the first doc opens. Without this
+        // late-bind, the very first sync of the very first doc silently
+        // skipped persistence, and every subsequent save+sync looked
+        // identical from the outside (nothing in `kv_store`, no error
+        // because the original code wrapped the whole thing in `try?`).
+        let persistence: YjsSQLitePersistence? = {
+            lock.lock()
+            if let existing = docPersistence[documentId] {
+                lock.unlock()
+                return existing
+            }
+            lock.unlock()
+            guard let offlineStore = offlineStore,
+                  let provider = offlineStore.getStorageProvider() else {
+                return nil
+            }
+            let p = YjsSQLitePersistence(storageProvider: provider, documentId: documentId)
+            // Re-check under the lock — concurrent persists for the same
+            // documentId could both reach this point and double-late-bind.
+            // The instances would share a backing store and last-writer-
+            // wins (no data loss), but log noise + redundant work. Keep
+            // the first one that won the race.
+            lock.lock()
+            if let winner = docPersistence[documentId] {
+                lock.unlock()
+                return winner
+            }
+            docPersistence[documentId] = p
+            lock.unlock()
+            logger.log(
+                "persistDocumentToLocal: late-bound persistence for",
+                documentId,
+                "(storageProvider became available after openDocument)"
+            )
+            return p
+        }()
+
+        guard let persistence else {
+            logger.warn(
+                "persistDocumentToLocal: no persistence available for",
+                documentId,
+                "(offlineStore=\(offlineStore == nil ? "nil" : "set"))"
+            )
+            return
+        }
+
+        do {
+            try await persistence.saveDocument(data: Data(state))
+        } catch {
+            // Surface the real reason. Previously this was `try?`, so any
+            // failure looked exactly like a silent no-op.
+            logger.error(
+                "persistDocumentToLocal: saveDocument failed for",
+                documentId,
+                error.localizedDescription
+            )
         }
     }
 

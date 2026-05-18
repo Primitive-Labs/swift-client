@@ -161,7 +161,39 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - Token Refresh
 
+    /// In-flight refresh Task. When non-nil, concurrent refresh callers
+    /// await *this* Task instead of starting a duplicate refresh — so a
+    /// burst of N concurrent 401s on the wire produces exactly **one**
+    /// `POST /auth/refresh` round trip, not N. Mirrors the JS client's
+    /// refresh-coalescing behavior, and on servers that rotate refresh
+    /// cookies (revoking the prior refresh JWT after each successful
+    /// refresh) prevents the "first call wins, others see 401, cascade
+    /// of auth-failed events" failure mode.
+    private var pendingRefresh: Task<RefreshOutcome, Never>?
+
     public func refreshAccessToken(cause: String? = nil) async -> RefreshOutcome {
+        // Coalesce: if another caller is already running a refresh,
+        // await its outcome instead of starting a new round trip.
+        lock.lock()
+        if let inFlight = pendingRefresh {
+            lock.unlock()
+            return await inFlight.value
+        }
+        let task = Task<RefreshOutcome, Never> { [weak self] in
+            guard let self = self else { return .network }
+            return await self._refreshAccessTokenImpl(cause: cause)
+        }
+        pendingRefresh = task
+        lock.unlock()
+
+        let outcome = await task.value
+        lock.lock()
+        pendingRefresh = nil
+        lock.unlock()
+        return outcome
+    }
+
+    private func _refreshAccessTokenImpl(cause: String? = nil) async -> RefreshOutcome {
         logger.debug("Refreshing access token", "cause:", cause ?? "unknown")
 
         do {
@@ -483,6 +515,52 @@ public final class AuthController: @unchecked Sendable {
             return nil
         }
         return record.token
+    }
+
+    /// Restore an authenticated session on startup:
+    ///   1. Prefer a persisted access token that's still valid.
+    ///   2. If the persisted access token has aged out, attempt a cookie-based
+    ///      refresh — the `rt-{appId}` refresh cookie persists in
+    ///      `HTTPCookieStorage.shared` across app launches and lives up to 7d,
+    ///      so a user reopening the app after the 1h access-token TTL
+    ///      shouldn't be forced back through login.
+    ///   3. Otherwise bootstrap as unauthenticated.
+    ///
+    /// Marks auth ready once the attempt completes, regardless of outcome.
+    public func tryRestoreSession() async {
+        defer { markAuthReady() }
+
+        guard persistConfig.persistJwtInStorage else { return }
+
+        let namespace = persistConfig.storageKeyPrefix ?? "default"
+        guard let record = try? await offlineStore.loadPersistedJwt(appId: appId, namespace: namespace) else {
+            // No prior session on disk; don't waste a refresh round-trip on
+            // first install.
+            return
+        }
+
+        let expiredAt: Date? = record.expiresAt.flatMap { ISO8601DateFormatter().date(from: $0) }
+        let isExpired = expiredAt.map { $0 < Date() } ?? false
+
+        if !isExpired {
+            applyToken(record.token, previous: nil, cause: "bootstrap")
+            return
+        }
+
+        logger.debug("Persisted JWT expired; attempting cookie-based refresh")
+        let outcome = await refreshAccessToken(cause: "startup")
+        switch outcome {
+        case .success:
+            break // applyToken has already set the new token
+        case .invalid:
+            // Refresh cookie is gone or the session was revoked. Clear the
+            // stale persisted record so we don't keep retrying.
+            try? await clearPersistedJwt()
+        case .network:
+            // Transient. Leave the stale record in place so the next launch
+            // (or an online-again trigger) can try again.
+            break
+        }
     }
 
     // MARK: - Offline Access Grants

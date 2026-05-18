@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(OSLog)
+import OSLog
+#endif
 
 public enum LogLevel: Int, Sendable, Comparable {
     case verbose = 0
@@ -81,7 +84,64 @@ public final class Logger: @unchecked Sendable {
         lock.lock()
         print(output)
         lock.unlock()
+
+        // Also emit via os_log on Apple platforms so iOS Simulator log
+        // streams (which only see os_log, not stdout) can pick it up.
+        #if canImport(OSLog)
+        Logger.osLog(scope: scope, level: level, message: message)
+        #endif
     }
+
+    #if canImport(OSLog)
+    private static let osLoggerLock = NSLock()
+    nonisolated(unsafe) private static var osLoggers: [String: os.Logger] = [:]
+
+    private static func osLog(scope: String, level: LogLevel, message: String) {
+        let category = scope.isEmpty ? "JsBaoClient" : scope
+        osLoggerLock.lock()
+        let logger: os.Logger
+        if let existing = osLoggers[category] {
+            logger = existing
+        } else {
+            logger = os.Logger(subsystem: "com.primitivelabs.JsBaoClient", category: category)
+            osLoggers[category] = logger
+        }
+        osLoggerLock.unlock()
+
+        // Privacy: in DEBUG we want full message visibility so devs
+        // running `Console.app` / `simctl spawn log stream` can read
+        // the output. In release builds, default to `.private` so the
+        // SDK doesn't leak document IDs, user IDs, file paths, etc. to
+        // anyone with Console access on a non-developer-mode device.
+        #if DEBUG
+        switch level {
+        case .verbose, .debug:
+            logger.debug("\(message, privacy: .public)")
+        case .info:
+            logger.info("\(message, privacy: .public)")
+        case .warn:
+            logger.warning("\(message, privacy: .public)")
+        case .error:
+            logger.error("\(message, privacy: .public)")
+        case .none:
+            break
+        }
+        #else
+        switch level {
+        case .verbose, .debug:
+            logger.debug("\(message, privacy: .private)")
+        case .info:
+            logger.info("\(message, privacy: .private)")
+        case .warn:
+            logger.warning("\(message, privacy: .private)")
+        case .error:
+            logger.error("\(message, privacy: .private)")
+        case .none:
+            break
+        }
+        #endif
+    }
+    #endif
 }
 
 public func createLogger(level: LogLevel, scope: String = "") -> Logger {

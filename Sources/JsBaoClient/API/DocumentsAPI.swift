@@ -5,16 +5,35 @@ import Foundation
 public final class DocumentsAPI: @unchecked Sendable {
     private let makeRequest: (String, String, Any?) async throws -> Any
     private let blobManager: BlobManager
+    /// Invoked after a successful `create` or `createWithAlias` call so the
+    /// owning `JsBaoClient` can populate the local metadata cache from the
+    /// server response and emit `.documentMetadataChanged`. Without this,
+    /// REST-created docs are absent from `getLocalMetadata(...)` and from
+    /// `PrimitiveAppState.documents` (which only refreshes at `connectClient`
+    /// time) — the inspector then renders them as "(untitled)" until the
+    /// next reconnect.
+    private let onDocumentCreated: (([String: Any]) async -> Void)?
+    /// Invoked after a successful `list` or `get` call so the cache stays
+    /// in sync with REST responses. The callback receives the array of
+    /// doc rows from the response (one element for `get`). Without this,
+    /// the cache only updates via WS or via the `onDocumentCreated` hook
+    /// — leaving consumers stale after a refresh that didn't go through
+    /// the WS path.
+    private let onDocumentsFetched: (([[String: Any]]) async -> Void)?
 
     public let aliases: DocumentAliasesAPI
 
     public init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        blobManager: BlobManager
+        blobManager: BlobManager,
+        onDocumentCreated: (([String: Any]) async -> Void)? = nil,
+        onDocumentsFetched: (([[String: Any]]) async -> Void)? = nil
     ) {
         self.makeRequest = makeRequest
         self.blobManager = blobManager
         self.aliases = DocumentAliasesAPI(makeRequest: makeRequest)
+        self.onDocumentCreated = onDocumentCreated
+        self.onDocumentsFetched = onDocumentsFetched
     }
 
     // MARK: - CRUD
@@ -22,7 +41,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Create a new document.
     public func create(options: [String: Any]? = nil) async throws -> [String: Any] {
         let result = try await makeRequest("POST", "/documents", options)
-        return result as? [String: Any] ?? [:]
+        let response = result as? [String: Any] ?? [:]
+        await onDocumentCreated?(response)
+        return response
     }
 
     /// List documents accessible to the current user.
@@ -35,13 +56,22 @@ public final class DocumentsAPI: @unchecked Sendable {
             if !params.isEmpty { qs = "?\(params.joined(separator: "&"))" }
         }
         let result = try await makeRequest("GET", "/documents\(qs)", nil)
-        return result as? [String: Any] ?? [:]
+        let response = result as? [String: Any] ?? [:]
+        if let cb = onDocumentsFetched {
+            let items = (response["items"] ?? response["documents"]) as? [[String: Any]] ?? []
+            await cb(items)
+        }
+        return response
     }
 
     /// Get a document by ID.
     public func get(documentId: String) async throws -> [String: Any] {
         let result = try await makeRequest("GET", "/documents/\(documentId)", nil)
-        return result as? [String: Any] ?? [:]
+        let response = result as? [String: Any] ?? [:]
+        if !response.isEmpty {
+            await onDocumentsFetched?([response])
+        }
+        return response
     }
 
     /// Update a document's metadata.
@@ -181,7 +211,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Create a document with an alias atomically.
     public func createWithAlias(options: [String: Any]) async throws -> [String: Any] {
         let result = try await makeRequest("POST", "/documents/create-with-alias", options)
-        return result as? [String: Any] ?? [:]
+        let response = result as? [String: Any] ?? [:]
+        await onDocumentCreated?(response)
+        return response
     }
 
     // MARK: - Blob Context

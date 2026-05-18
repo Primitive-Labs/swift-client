@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 @testable import JsBaoClient
 
 struct TestApp {
@@ -184,6 +185,53 @@ final class TestContext {
         )
     }
 
+    // MARK: - Workflow Operations
+    //
+    // Thin helpers over the admin workflow CRUD used by integration tests
+    // that exercise `runAndApply` / `awaitRun`. Mirrors the JS test
+    // helpers in sample-app/src/pages/Tests.tsx.
+
+    /// Create a workflow draft, publish a revision, and activate it.
+    /// Returns the workflowId. `requiresClientApply` defaults to true so
+    /// the run parks in `apply_pending` until a client claims and applies.
+    @discardableResult
+    func setupWorkflow(
+        appId: String,
+        workflowKey: String,
+        steps: [[String: Any]],
+        requiresClientApply: Bool = true
+    ) async throws -> String {
+        let createRes = try await adminPost(
+            "/admin/api/apps/\(appId)/workflows",
+            body: [
+                "workflowKey": workflowKey,
+                "name": workflowKey,
+                "description": "Swift test workflow",
+                "steps": steps,
+            ]
+        )
+        guard let workflow = createRes["workflow"] as? [String: Any],
+              let workflowId = workflow["workflowId"] as? String else {
+            throw TestSetupError("Failed to create workflow: \(createRes)")
+        }
+
+        _ = try await adminPost(
+            "/admin/api/apps/\(appId)/workflows/\(workflowId)/publish",
+            body: [:]
+        )
+
+        _ = try await adminRequest(
+            method: "PATCH",
+            path: "/admin/api/apps/\(appId)/workflows/\(workflowId)",
+            body: [
+                "status": "active",
+                "requiresClientApply": requiresClientApply,
+            ]
+        )
+
+        return workflowId
+    }
+
     // MARK: - Cleanup
 
     func cleanup() async {
@@ -204,6 +252,83 @@ final class TestContext {
             throw TestSetupError("Failed to mint JWT: missing token in response \(result)")
         }
         return token
+    }
+
+    /// Forge a refresh JWT for an existing access token, signed with the
+    /// dev-server's test secret. Used by the cold-start refresh-cookie test.
+    ///
+    /// We do this client-side rather than via the server because the server's
+    /// `mint-test-jwt` admin endpoint only returns an access token — there's
+    /// no public route for minting a refresh token for test purposes. See
+    /// `docs/feedback/swift-client.md` entry 2026-04-21: the upstream ask is
+    /// for that endpoint to return both. Until then, we sign here using the
+    /// shared test secret that the dev server's .dev.vars already pins.
+    ///
+    /// This is strictly test infrastructure — it requires JWT_SECRET (or its
+    /// dev-server default "test-jwt-secret-only-for-tests") and cannot impact
+    /// production.
+    func forgeRefreshJwt(fromAccessToken accessToken: String) throws -> String {
+        let secret = TestConfig.jwtSecret
+        guard !secret.isEmpty else {
+            throw TestSetupError(
+                "TEST_JWT_SECRET env var is required for refresh-cookie tests."
+            )
+        }
+
+        let parts = accessToken.split(separator: ".")
+        guard parts.count == 3 else {
+            throw TestSetupError("Access token is not a JWT")
+        }
+        guard var payload = TestContext.decodeJwtPayload(String(parts[1])) else {
+            throw TestSetupError("Failed to decode access-token payload")
+        }
+
+        // Switch type to "refresh" and give it a 7-day lifetime, matching
+        // what the server's /auth/refresh flow normally issues.
+        payload["type"] = "refresh"
+        payload["iat"] = Int(Date().timeIntervalSince1970)
+        payload["exp"] = Int(Date().addingTimeInterval(7 * 24 * 60 * 60).timeIntervalSince1970)
+
+        return try TestContext.signHS256Jwt(payload: payload, secret: secret)
+    }
+
+    private static func decodeJwtPayload(_ segment: String) -> [String: Any]? {
+        var base64 = segment
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64.append("=") }
+        guard let data = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json
+    }
+
+    private static func signHS256Jwt(payload: [String: Any], secret: String) throws -> String {
+        let header: [String: Any] = ["alg": "HS256", "typ": "JWT"]
+        // sort_keys: false — jsonwebtoken doesn't sort, and though signature
+        // verification only cares about the exact bytes being re-encoded
+        // consistently, we preserve whatever ordering JSONSerialization emits.
+        let headerData = try JSONSerialization.data(withJSONObject: header, options: [])
+        let payloadData = try JSONSerialization.data(withJSONObject: payload, options: [])
+        let headerSegment = TestContext.base64UrlEncode(headerData)
+        let payloadSegment = TestContext.base64UrlEncode(payloadData)
+        let signingInput = "\(headerSegment).\(payloadSegment)"
+
+        let key = SymmetricKey(data: Data(secret.utf8))
+        let signature = HMAC<SHA256>.authenticationCode(
+            for: Data(signingInput.utf8),
+            using: key
+        )
+        let signatureSegment = TestContext.base64UrlEncode(Data(signature))
+        return "\(signingInput).\(signatureSegment)"
+    }
+
+    private static func base64UrlEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
     @discardableResult

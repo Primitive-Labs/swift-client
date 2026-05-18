@@ -277,7 +277,19 @@ public final class HttpClient: @unchecked Sendable {
         }
         components.path = "/app/\(config.appId)/api\(purePath)"
         if let query = query {
-            components.query = query
+            // Use `.percentEncodedQuery` so the caller's pre-encoded
+            // query string passes through verbatim. The `.query` setter
+            // treats input as *not* percent-encoded and re-encodes —
+            // which turns a caller's `%2B` into `%252B` on the wire,
+            // the server decodes once back to the literal string `%2B`
+            // (never to `+`), and lookups of values containing a
+            // percent-escaped reserved char silently fail to match.
+            // Observed concretely on `/users/lookup?email=a%2Bb@…` —
+            // server saw `a%2Bb@…` instead of `a+b@…`, returned
+            // `{exists: false}` for a user that was clearly a member.
+            // Callers are expected to pass a properly percent-encoded
+            // query string (all SharingService callers already do).
+            components.percentEncodedQuery = query
         }
 
         guard let url = components.url else {

@@ -14,6 +14,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.jsbao.sqlite-storage", qos: .userInitiated)
     private let databasePath: String?
     private var _isReady = false
+    private var resolvedPath: String?
 
     // MARK: - Init
 
@@ -30,14 +31,32 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
                 do {
-                    let resolvedPath: String
+                    let candidatePath: String
                     if let databasePath {
-                        resolvedPath = databasePath
+                        candidatePath = databasePath
                     } else {
                         let dir = Self.defaultDirectory(namespace: namespace)
                         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                        resolvedPath = (dir as NSString).appendingPathComponent("jsbao_storage.sqlite")
+                        candidatePath = (dir as NSString).appendingPathComponent("jsbao_storage.sqlite")
                     }
+
+                    // Idempotent: if already initialized to this exact path, no-op.
+                    // If a caller is trying to re-bind us to a *different* file (auth
+                    // namespace vs. offline namespace, etc.), refuse — the SQLite
+                    // connection is single-DB and silently swapping it out of under
+                    // existing callers leads to data going to the wrong file.
+                    if let existing = self.resolvedPath {
+                        if existing == candidatePath {
+                            continuation.resume()
+                            return
+                        } else {
+                            throw SQLiteStorageError.openFailed(message:
+                                "SQLiteStorageProvider already initialized to \(existing); refusing to re-bind to \(candidatePath). " +
+                                "Use a separate SQLiteStorageProvider instance for each distinct namespace/path."
+                            )
+                        }
+                    }
+                    let resolvedPath = candidatePath
 
                     var dbPointer: OpaquePointer?
                     let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
@@ -67,6 +86,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                         """)
 
                     self._isReady = true
+                    self.resolvedPath = resolvedPath
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
@@ -83,6 +103,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                     self.db = nil
                 }
                 self._isReady = false
+                self.resolvedPath = nil
                 continuation.resume()
             }
         }

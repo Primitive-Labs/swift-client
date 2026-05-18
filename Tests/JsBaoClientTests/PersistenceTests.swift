@@ -130,6 +130,88 @@ final class PersistenceTests: XCTestCase {
         await client2.destroy()
     }
 
+    /// Regression test for the DocumentManager persistence bug (2026-04-17):
+    /// `docPersistence` was declared but never populated, and the restore
+    /// block in `openDocument` was an empty comment. That combination meant
+    /// Y.Doc state was never saved to or loaded from SQLite, so warm launches
+    /// always started with an empty doc and every consumer had to wait for
+    /// the `.sync` event (WS handshake + full doc sync) to get usable data.
+    ///
+    /// Pure unit test — two `DocumentManager` instances share the same
+    /// `SQLiteStorageProvider` and mimic "close app, reopen". No dev server
+    /// required. If the save side isn't wired up, session 2 sees nothing.
+    /// If the restore side's transactSync body is still an empty comment,
+    /// session 2 also sees nothing. Either failure mode fails this test.
+    func testLocalHydrationReturnsDataAcrossDocumentManagers() async throws {
+        let dbPath = tempDir + "local-hydration-unit-\(UUID().uuidString.prefix(6)).sqlite"
+        let storageProvider = SQLiteStorageProvider(path: dbPath)
+        try await storageProvider.initialize(namespace: "hydration-test")
+
+        let offlineStore = OfflineStore()
+        offlineStore.setStorageProvider(storageProvider)
+
+        let docId = "test-doc-\(UUID().uuidString.prefix(6))"
+
+        // --- Session 1: open, write, close. Exercises the save path
+        // (populate `docPersistence[docId]` in openDocument + flush via
+        // the close-time `persistDocumentToLocal` call).
+        let mgr1 = DocumentManager(logger: Logger(level: .warn, scope: "test"))
+        mgr1.offlineStore = offlineStore
+        mgr1.appId = "test-app"
+        mgr1.userId = "test-user"
+
+        let ydoc1 = try await mgr1.openDocument(
+            documentId: docId,
+            options: OpenDocumentOptions(
+                waitForLoad: .localIfAvailableElseNetwork,
+                enableNetworkSync: false
+            )
+        )
+
+        let writeMap: YMap<String> = ydoc1.getOrCreateMap(named: "hydration")
+        ydoc1.transactSync { txn in
+            writeMap.updateValue("local-val", forKey: "k", transaction: txn)
+        }
+
+        // closeDocument flushes the Y.Doc state to SQLite before tearing
+        // down the in-memory doc.
+        await mgr1.closeDocument(documentId: docId)
+
+        // --- Session 2: fresh DocumentManager, same storage. Exercises
+        // the restore path (populate `docPersistence[docId]` in openDocument
+        // and actually apply the loaded update inside transactSync).
+        let mgr2 = DocumentManager(logger: Logger(level: .warn, scope: "test"))
+        mgr2.offlineStore = offlineStore
+        mgr2.appId = "test-app"
+        mgr2.userId = "test-user"
+
+        let ydoc2 = try await mgr2.openDocument(
+            documentId: docId,
+            options: OpenDocumentOptions(
+                waitForLoad: .localIfAvailableElseNetwork,
+                enableNetworkSync: false
+            )
+        )
+
+        // Before the fix: readMap.get(...) returns nil because either the
+        // save side skipped SQLite (nil `docPersistence[docId]`) or the
+        // restore side didn't apply the loaded update (empty transactSync).
+        // After the fix: returns "local-val".
+        let readMap: YMap<String> = ydoc2.getOrCreateMap(named: "hydration")
+        let value = ydoc2.transactSync { txn -> String? in
+            return readMap.get(key: "k", transaction: txn)
+        }
+
+        XCTAssertEqual(
+            value,
+            "local-val",
+            "openDocument(.localIfAvailableElseNetwork) should restore Y.Doc state from SQLite synchronously."
+        )
+
+        await mgr2.closeDocument(documentId: docId)
+        await storageProvider.close()
+    }
+
     func testJwtPersistence() async throws {
         let dbPath = tempDir + "jwt-test.sqlite"
 

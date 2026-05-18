@@ -1,0 +1,188 @@
+import XCTest
+@testable import JsBaoClient
+import YSwift
+
+/// `Model.subscribe(callback)` — change-listener API. Matches js-bao
+/// browser.js:3628 (`BaseModel.subscribe`). Callback fires after any
+/// add / update / delete on the model; returns an unsubscribe closure.
+///
+/// `MultiDocModel.subscribe` fans out across every connected doc's
+/// `DynamicModel`; a write through any one of them fires once on the
+/// aggregator's listeners.
+///
+/// Closes gap (C) from the browser-vs-Swift audit.
+final class SubscribeTests: XCTestCase {
+
+    private let schema = PrimitiveSchema(
+        name: "sub_rows",
+        fields: [
+            "id":    FieldDescriptor(type: .id),
+            "label": FieldDescriptor(type: .string),
+        ]
+    )
+
+    // MARK: - DynamicModel.subscribe
+
+    func testSubscribeFiresOnCreate() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+        let fired = NSCountedSet()
+        let unsub = model.subscribe { fired.add("x") }
+
+        _ = try model.create(id: "r1", values: ["label": .string("one")])
+
+        // Observer drains are async on remote changes but direct
+        // writes hit the listener synchronously via the write path's
+        // observer chain.
+        awaitListenerDrain(model: model)
+        XCTAssertGreaterThanOrEqual(
+            fired.count(for: "x"), 1,
+            "Create should have fired at least once"
+        )
+        unsub()
+    }
+
+    func testSubscribeFiresOnUpdateAndDelete() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+        _ = try model.create(id: "r1", values: ["label": .string("one")])
+
+        let fired = NSCountedSet()
+        let unsub = model.subscribe { fired.add("x") }
+
+        try model.update(id: "r1", values: ["label": .string("updated")])
+        awaitListenerDrain(model: model)
+        let afterUpdate = fired.count(for: "x")
+        XCTAssertGreaterThanOrEqual(afterUpdate, 1, "Update should fire")
+
+        model.delete(id: "r1")
+        awaitListenerDrain(model: model)
+        XCTAssertGreaterThan(fired.count(for: "x"), afterUpdate,
+                             "Delete should fire on top of update")
+        unsub()
+    }
+
+    func testUnsubscribeStopsNotifications() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+        let fired = NSCountedSet()
+        let unsub = model.subscribe { fired.add("x") }
+
+        _ = try model.create(id: "r1", values: ["label": .string("one")])
+        awaitListenerDrain(model: model)
+        let countBefore = fired.count(for: "x")
+
+        unsub()
+
+        _ = try model.create(id: "r2", values: ["label": .string("two")])
+        awaitListenerDrain(model: model)
+        XCTAssertEqual(
+            fired.count(for: "x"), countBefore,
+            "No new fires after unsubscribe"
+        )
+    }
+
+    func testMultipleSubscribersAllFire() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+        var firedA = 0
+        var firedB = 0
+        let unsubA = model.subscribe { firedA += 1 }
+        let unsubB = model.subscribe { firedB += 1 }
+
+        _ = try model.create(id: "r1", values: ["label": .string("one")])
+        awaitListenerDrain(model: model)
+
+        XCTAssertGreaterThanOrEqual(firedA, 1)
+        XCTAssertGreaterThanOrEqual(firedB, 1)
+        unsubA()
+        unsubB()
+    }
+
+    // MARK: - MultiDocModel.subscribe
+
+    /// Subscribing BEFORE any docs are connected. When the first
+    /// `connect` installs a new DynamicModel, every active subscriber
+    /// should follow to it automatically — without this, long-lived
+    /// aggregators that attach docs dynamically would silently miss
+    /// events from newly-connected docs.
+    func testMultiDocSubscribeBeforeConnectStillFires() throws {
+        SchemaSync.clearCache()
+        let multi = MultiDocModel(schema: schema)
+
+        var fired = 0
+        let unsub = multi.subscribe { fired += 1 }
+
+        // Connect AFTER subscribing. Subsequent writes must reach the
+        // subscriber.
+        let a = multi.connect(docId: "docA", doc: YDocument())
+        _ = try a.create(id: "a1", values: ["label": .string("a")])
+        a.awaitObserverDrain()
+        XCTAssertGreaterThan(fired, 0,
+                             "Write on a doc connected after subscribe should still notify")
+        unsub()
+    }
+
+    /// Disconnect stops notifications from the disconnected doc but
+    /// other connected docs keep firing the subscriber.
+    func testMultiDocDisconnectStopsThatDocOnly() throws {
+        SchemaSync.clearCache()
+        let multi = MultiDocModel(schema: schema)
+        let a = multi.connect(docId: "docA", doc: YDocument())
+        SchemaSync.clearCache()
+        let b = multi.connect(docId: "docB", doc: YDocument())
+
+        var fired = 0
+        let unsub = multi.subscribe { fired += 1 }
+
+        _ = try a.create(id: "a1", values: ["label": .string("a")])
+        a.awaitObserverDrain()
+        let afterFirst = fired
+
+        multi.disconnect(docId: "docA")
+
+        // b keeps firing
+        _ = try b.create(id: "b1", values: ["label": .string("b")])
+        b.awaitObserverDrain()
+        XCTAssertGreaterThan(fired, afterFirst,
+                             "Remaining connected doc must still fire the subscriber")
+
+        unsub()
+    }
+
+    func testMultiDocModelSubscribeFiresForAnyConnectedDoc() throws {
+        SchemaSync.clearCache()
+        let multi = MultiDocModel(schema: schema)
+
+        let a = multi.connect(docId: "docA", doc: YDocument())
+        SchemaSync.clearCache()
+        let b = multi.connect(docId: "docB", doc: YDocument())
+
+        var fired = 0
+        let unsub = multi.subscribe { fired += 1 }
+
+        _ = try a.create(id: "a1", values: ["label": .string("a")])
+        a.awaitObserverDrain()
+        let afterA = fired
+
+        _ = try b.create(id: "b1", values: ["label": .string("b")])
+        b.awaitObserverDrain()
+
+        XCTAssertGreaterThan(afterA, 0, "docA write should fire")
+        XCTAssertGreaterThan(fired, afterA, "docB write should fire too")
+        unsub()
+    }
+
+    // MARK: - Helpers
+
+    /// Swift's root-map / per-record observers dispatch async work
+    /// for remote updates; local writes are direct. We nudge both
+    /// paths before assertions.
+    private func awaitListenerDrain(model: DynamicModel) {
+        model.awaitObserverDrain()
+    }
+}

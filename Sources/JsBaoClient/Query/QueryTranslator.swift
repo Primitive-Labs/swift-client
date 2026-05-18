@@ -3,25 +3,40 @@ import Foundation
 /// Translates MongoDB-style DocumentFilter into SQL WHERE clauses.
 ///
 /// Supports: $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin,
-///           $containsText, $startsWith, $endsWith, $exists, $and, $or
+///           $containsText, $startsWith, $endsWith, $exists, $and, $or,
+///           $contains (stringset-only)
+///
+/// Stringset fields need special handling because the SQLite mirror
+/// stores them as a comma-joined CSV string in a TEXT column. The
+/// translator detects stringset columns via the `stringsetFields`
+/// set passed by the engine and routes `$contains` through a
+/// delimiter-padded LIKE so we get boundary-safe membership checks.
 public struct QueryTranslator {
 
     /// Translate a DocumentFilter into a SQL WHERE clause and parameter bindings.
     /// Returns (whereClause, parameters). The whereClause does NOT include "WHERE".
-    public static func translate(_ filter: DocumentFilter) -> (String, [Any]) {
+    ///
+    /// - Parameter stringsetFields: names of fields whose column stores a
+    ///   comma-joined stringset. The `$contains` operator dispatches
+    ///   differently for these.
+    public static func translate(
+        _ filter: DocumentFilter,
+        stringsetFields: Set<String> = [],
+        tableName: String? = nil
+    ) -> (String, [Any]) {
         var conditions: [String] = []
         var params: [Any] = []
 
         for (key, value) in filter {
             if key == "$and", let arr = value as? [DocumentFilter] {
-                let sub = arr.map { translate($0) }
+                let sub = arr.map { translate($0, stringsetFields: stringsetFields, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " AND ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
             } else if key == "$or", let arr = value as? [DocumentFilter] {
-                let sub = arr.map { translate($0) }
+                let sub = arr.map { translate($0, stringsetFields: stringsetFields, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " OR ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
@@ -30,7 +45,11 @@ public struct QueryTranslator {
             } else if let ops = value as? [String: Any] {
                 // Operator expression: { "field": { "$gt": 5 } }
                 for (op, opVal) in ops {
-                    let (cond, p) = translateOperator(field: key, op: op, value: opVal)
+                    let (cond, p) = translateOperator(
+                        field: key, op: op, value: opVal,
+                        stringsetFields: stringsetFields,
+                        tableName: tableName
+                    )
                     conditions.append(cond)
                     params.append(contentsOf: p)
                 }
@@ -51,7 +70,13 @@ public struct QueryTranslator {
         return (conditions.joined(separator: " AND "), params)
     }
 
-    private static func translateOperator(field: String, op: String, value: Any) -> (String, [Any]) {
+    private static func translateOperator(
+        field: String,
+        op: String,
+        value: Any,
+        stringsetFields: Set<String> = [],
+        tableName: String? = nil
+    ) -> (String, [Any]) {
         let col = quoted(field)
 
         switch op {
@@ -87,18 +112,37 @@ public struct QueryTranslator {
             return ("1", []) // empty $nin matches everything
 
         case "$containsText":
+            // On a stringset field the substring ops match ANY member
+            // via EXISTS against the junction — mirrors js-bao
+            // browser.js:703-769. On a scalar string column they
+            // continue to match the column value directly.
+            if stringsetFields.contains(field) {
+                return stringsetSubstringSQL(field: field, value: value,
+                                              pattern: .contains,
+                                              tableName: tableName)
+            }
             if let text = value as? String {
                 return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(text))%"])
             }
             return ("1=1", [])
 
         case "$startsWith":
+            if stringsetFields.contains(field) {
+                return stringsetSubstringSQL(field: field, value: value,
+                                              pattern: .startsWith,
+                                              tableName: tableName)
+            }
             if let text = value as? String {
                 return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["\(escapeLike(text))%"])
             }
             return ("1=1", [])
 
         case "$endsWith":
+            if stringsetFields.contains(field) {
+                return stringsetSubstringSQL(field: field, value: value,
+                                              pattern: .endsWith,
+                                              tableName: tableName)
+            }
             if let text = value as? String {
                 return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(text))"])
             }
@@ -107,6 +151,48 @@ public struct QueryTranslator {
         case "$exists":
             let exists = (value as? Bool) ?? true
             return (exists ? "\(col) IS NOT NULL" : "\(col) IS NULL", [])
+
+        case "$contains":
+            // Stringset membership via EXISTS against the per-field
+            // junction table `{main}__{field}`. Exact equality on
+            // `value`, so any member alphabet works (commas, unicode,
+            // etc.). Matches js-bao's browser.js design.
+            guard stringsetFields.contains(field) else {
+                assertionFailure("QueryTranslator: $contains is only valid on stringset fields (got '\(field)')")
+                NSLog("[QueryTranslator] WARNING: $contains on non-stringset field '\(field)' — filter dropped")
+                return ("0", [])
+            }
+            guard let member = value as? String, !member.isEmpty else {
+                assertionFailure("QueryTranslator: $contains requires a non-empty string value (field '\(field)')")
+                return ("0", [])
+            }
+            guard let tableName else {
+                // Engine didn't supply the main-table name — can't
+                // reference the outer row's id in the EXISTS subquery.
+                assertionFailure("QueryTranslator: $contains needs tableName context from the caller")
+                return ("0", [])
+            }
+            let junction = "\(tableName)__\(field)"
+            // Correlated EXISTS against the junction. Outer query is
+            // `SELECT ... FROM "{tableName}"` unaliased, so we
+            // reference `"{tableName}".id` directly. Also correlate on
+            // `_meta_doc_id` so a shared-engine (multi-doc) query
+            // can't match a different doc's junction rows whose
+            // `parent_id` happens to collide. DynamicModel and
+            // MultiDocModel always ensure the junction with
+            // `_meta_doc_id` (via withDocIdColumn: true), so this is
+            // always safe.
+            return (
+                """
+                EXISTS (
+                    SELECT 1 FROM \(quoted(junction))
+                    WHERE \(quoted(junction))."parent_id" = \(quoted(tableName))."id"
+                      AND \(quoted(junction))."_meta_doc_id" = \(quoted(tableName))."_meta_doc_id"
+                      AND \(quoted(junction))."value" = ?
+                )
+                """,
+                [member]
+            )
 
         default:
             // Unknown operator: trap in debug builds so typos surface during
@@ -140,7 +226,8 @@ public struct QueryTranslator {
     /// Build a full aggregation query.
     public static func buildAggregation(
         tableName: String,
-        options: AggregateOptions
+        options: AggregateOptions,
+        stringsetFields: Set<String> = []
     ) -> (String, [Any]) {
         var selectClauses: [String] = []
         var params: [Any] = []
@@ -182,7 +269,10 @@ public struct QueryTranslator {
 
         // WHERE clause from filter
         if let filter = options.filter, !filter.isEmpty {
-            let (where_, whereParams) = translate(filter)
+            let (where_, whereParams) = translate(
+                filter, stringsetFields: stringsetFields,
+                tableName: tableName
+            )
             sql += " WHERE \(where_)"
             params.append(contentsOf: whereParams)
         }
@@ -192,10 +282,71 @@ public struct QueryTranslator {
             sql += " GROUP BY \(options.groupBy.map { quoted($0) }.joined(separator: ", "))"
         }
 
+        // ORDER BY. Aggregate sort can reference either a group-by
+        // field or an operation's output alias — we sort on the alias
+        // directly; SQLite resolves the identifier either way.
+        if let sort = options.sort {
+            let dir = sort.direction == -1 ? "DESC" : "ASC"
+            sql += " ORDER BY \(quoted(sort.field)) \(dir)"
+        }
+
+        if let limit = options.limit, limit >= 0 {
+            sql += " LIMIT \(limit)"
+        }
+
         return (sql, params)
     }
 
     // MARK: - Helpers
+
+    /// How a substring op wraps the search text as a `LIKE` pattern.
+    private enum SubstringPattern {
+        case startsWith, endsWith, contains
+
+        func likeValue(_ text: String) -> String {
+            let e = escapeLikeStatic(text)
+            switch self {
+            case .startsWith: return "\(e)%"
+            case .endsWith:   return "%\(e)"
+            case .contains:   return "%\(e)%"
+            }
+        }
+    }
+
+    /// EXISTS subquery against the stringset junction table: matches
+    /// when ANY member's `value` column satisfies the LIKE pattern.
+    /// Correlates on both `parent_id` and `_meta_doc_id` so a shared-
+    /// engine multi-doc query can't match a different doc's rows.
+    private static func stringsetSubstringSQL(
+        field: String,
+        value: Any,
+        pattern: SubstringPattern,
+        tableName: String?
+    ) -> (String, [Any]) {
+        guard let tableName else {
+            assertionFailure("QueryTranslator: substring op on stringset needs tableName context")
+            return ("0", [])
+        }
+        guard let text = value as? String, !text.isEmpty else {
+            return ("1=1", [])
+        }
+        let junction = "\(tableName)__\(field)"
+        let sql = """
+        EXISTS (
+            SELECT 1 FROM \(quoted(junction))
+            WHERE \(quoted(junction))."parent_id" = \(quoted(tableName))."id"
+              AND \(quoted(junction))."_meta_doc_id" = \(quoted(tableName))."_meta_doc_id"
+              AND \(quoted(junction))."value" LIKE ? ESCAPE '\\' COLLATE NOCASE
+        )
+        """
+        return (sql, [pattern.likeValue(text)])
+    }
+
+    /// `escapeLike` is a static helper on the type; the nested
+    /// `SubstringPattern` enum needs a callable form without `self`.
+    private static func escapeLikeStatic(_ text: String) -> String {
+        escapeLike(text)
+    }
 
     private static func quoted(_ name: String) -> String {
         "\"\(name.replacingOccurrences(of: "\"", with: "\"\""))\""
