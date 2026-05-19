@@ -826,8 +826,18 @@ public final class JsBaoClient: @unchecked Sendable {
 
         await disconnect()
         await documentManager.destroy()
+        // Cancel the periodic flush timer and trigger a final flush
+        // before closing storage. The flush is async (fires a Task),
+        // so we then await any pending persistence to drain — without
+        // this, the SQLite close races the in-flight write and a
+        // subsequent client opening the same DB hits SQLITE_BUSY.
         analyticsQueue.destroy()
-        offlineStore.closeStorage()
+        await analyticsQueue.awaitPendingPersistence()
+        // JWT persistence (AuthController.applyToken) also runs in a
+        // detached Task — wait for any outstanding write before the
+        // storage layer pulls the connection out from under it.
+        await authController.awaitPendingPersistence()
+        await offlineStore.closeStorage()
         events.removeAll()
     }
 
@@ -945,16 +955,26 @@ public final class JsBaoClient: @unchecked Sendable {
                 let authProvider: StorageProvider
                 switch options.storageConfig {
                 case .sqlite(let directory):
-                    provider = try SQLiteStorageProvider(path: directory)
-                    // OfflineStore + JWT persistence both call
-                    // `provider.initialize(namespace:)` with different namespaces.
-                    // SQLiteStorageProvider re-binds `self.db` on every initialize
-                    // call when no explicit path is set, so a single provider
-                    // ends up pointing at whichever namespace was initialized
-                    // most recently — and writes to yjs_docs / metadata silently
-                    // land in the auth-namespace file. Use a dedicated provider
-                    // for JWT storage to keep the two DBs from colliding.
-                    authProvider = try SQLiteStorageProvider(path: directory)
+                    // One provider, shared across general + auth namespaces.
+                    //
+                    // Two providers pointing at the same file would each open
+                    // their own SQLite handle. WAL mode allows concurrent
+                    // reads, but a JWT write running on the auth provider
+                    // while the general provider writes (analytics queue
+                    // restore, doc metadata, etc.) hits the file lock and
+                    // returns SQLITE_BUSY ("database is locked"). The
+                    // historical motivation for two providers was that
+                    // `initialize(namespace:)` used to silently re-bind the
+                    // open DB when namespaces differed — that was fixed in
+                    // the same commit (initialize is now idempotent for the
+                    // same path, throws on re-bind), and with `databasePath`
+                    // explicitly set, every initialize call resolves to the
+                    // same file and the second is a no-op. The kv_store
+                    // `store` column already namespaces auth records vs
+                    // everything else, so they don't collide on rows either.
+                    let sqlite = try SQLiteStorageProvider(path: directory)
+                    provider = sqlite
+                    authProvider = sqlite
                 case .memory:
                     provider = MemoryStorageProvider()
                     authProvider = MemoryStorageProvider()

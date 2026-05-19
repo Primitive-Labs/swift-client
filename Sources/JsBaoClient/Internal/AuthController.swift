@@ -27,6 +27,13 @@ public final class AuthController: @unchecked Sendable {
     private let refreshBackoffMax: Int = 300_000
     private var lastRefreshAttempt: Date?
 
+    // In-flight JWT persistence task. Tracked so destroy() can await
+    // outstanding writes before the storage layer closes the SQLite
+    // connection — without this, a fresh client opening the same DB file
+    // races against the prior session's write and hits SQLITE_BUSY
+    // ("database is locked").
+    private var pendingPersistTask: Task<Void, Never>?
+
     // Offline access grant
     private let keychainHelper: KeychainHelper
     private var offlineIdentity: OfflineIdentity?
@@ -145,7 +152,7 @@ public final class AuthController: @unchecked Sendable {
 
         // Persist JWT if configured
         if persistConfig.persistJwtInStorage, let token = newToken {
-            Task { [logger] in
+            let task: Task<Void, Never> = Task { [logger] in
                 do {
                     try await persistJwt(token: token)
                 } catch {
@@ -156,7 +163,21 @@ public final class AuthController: @unchecked Sendable {
                     logger.warn("Failed to persist JWT:", error.localizedDescription)
                 }
             }
+            lock.lock()
+            pendingPersistTask = task
+            lock.unlock()
         }
+    }
+
+    /// Wait for any in-flight JWT persistence to drain. Called from
+    /// `JsBaoClient.destroy()` so the storage layer doesn't close the
+    /// SQLite connection out from under a queued write. Safe to call
+    /// when no Task is in flight (no-op).
+    public func awaitPendingPersistence() async {
+        lock.lock()
+        let task = pendingPersistTask
+        lock.unlock()
+        await task?.value
     }
 
     // MARK: - Token Refresh

@@ -1,0 +1,188 @@
+# Shared TOML schema driving BOTH the Swift mini-app and the JS
+# mini-app in the cross-language E2E parity harness.
+#
+# Both sides consume this file through their respective codegen tools:
+#
+#   Swift: `swift-bao-codegen` (build-time, via the `JsBaoCodegenPlugin`
+#          attached to `E2EMiniApp` in `Package.swift`) → emits one
+#          struct per [models.X] into the plugin work dir.
+#
+#   JS:    `js-bao-codegen-v2` (run before `swift test` via the JS
+#          package's `prepare` script) → emits one
+#          `<ClassName>.generated.ts` per [models.X] plus an `index.ts`
+#          barrel into `E2E/js/generated/`. The JS CLI is run under
+#          `vite-node` so the barrel's `import models.toml?raw` works.
+#
+# Every model below carries an explicit `class_name = "..."` so the two
+# codegens emit *identical* class names from the same TOML — required
+# anyway for `everything` (no plural-`s` suffix → js-bao-codegen-v2
+# can't derive a singular), and worth setting on every model so a
+# reader can see the cross-language identity at a glance.
+#
+# Field set is small but representative — one of every TOML field
+# type, plus an `indexed` numeric, a `required` string, and a
+# `stringset`. Every query operator the test exercises hits at
+# least one of these fields.
+
+[models.tasks]
+class_name = "TaskRecord"
+
+[models.tasks.fields.id]
+type = "id"
+
+[models.tasks.fields.title]
+type = "string"
+required = true
+
+[models.tasks.fields.priority]
+type = "number"
+indexed = true
+
+[models.tasks.fields.completed]
+type = "boolean"
+
+[models.tasks.fields.tags]
+type = "stringset"
+
+[models.tasks.fields.createdAt]
+type = "date"
+
+# ──────────────────────────────────────────────────────────────────
+# Comprehensive field-type model — drives the cross-language
+# everything-survives tests in `E2EQueryParityTests`.
+#
+# One example of every TOML field type, plus several edge-case
+# inhabitants per type:
+#
+#   - intSmall / intLarge: small int + a value at the JSON Number
+#                          safe-integer boundary (2^53-1) plus one
+#                          past it
+#   - floatPrecise / floatNeg: 0.1 + 0.2 (canonical fp lol value),
+#                              negative fractional
+#   - flag: boolean, both values
+#   - textChinese / textEmoji / textSpecial: Unicode survival —
+#                          BMP CJK, multi-codepoint emoji,
+#                          embedded quotes + newlines
+#   - tsZ / tsOffset / tsFractional: ISO date variants
+#   - tags: stringset with mixed-script members
+#
+# Dynamic-mode CLI exercises this model; no codegen wrapper.
+# ──────────────────────────────────────────────────────────────────
+
+[models.everything]
+class_name = "Everything"
+
+[models.everything.fields.id]
+type = "id"
+
+[models.everything.fields.label]
+type = "string"
+
+[models.everything.fields.intSmall]
+type = "number"
+
+[models.everything.fields.intLarge]
+type = "number"
+
+[models.everything.fields.floatPrecise]
+type = "number"
+
+[models.everything.fields.floatNeg]
+type = "number"
+
+[models.everything.fields.flag]
+type = "boolean"
+
+[models.everything.fields.textChinese]
+type = "string"
+
+[models.everything.fields.textEmoji]
+type = "string"
+
+[models.everything.fields.textSpecial]
+type = "string"
+
+[models.everything.fields.tsZ]
+type = "date"
+
+[models.everything.fields.tsOffset]
+type = "date"
+
+[models.everything.fields.tsFractional]
+type = "date"
+
+[models.everything.fields.tags]
+type = "stringset"
+
+# ──────────────────────────────────────────────────────────────────
+# Relationship parity models — `users` ←→ `posts` ←→ `tags`
+# (via `post_tag_links` join). Drive the cross-language relationship
+# resolution tests in `E2EQueryParityTests`.
+#
+# Every relationship type gets one example: refersTo (post→author),
+# hasMany w/ ordering (user→posts), hasManyThrough (post→tags via
+# post_tag_links). Both languages walk these against the same Y.Doc
+# bytes; the asserted invariant is "same input, same resolved set
+# in the same order".
+# ──────────────────────────────────────────────────────────────────
+
+[models.users]
+class_name = "User"
+[models.users.fields.id]
+type = "id"
+[models.users.fields.name]
+type = "string"
+required = true
+
+[models.users.relationships.posts]
+type = "hasMany"
+model = "posts"
+related_id_field = "userId"
+order_by_field = "createdAt"
+# js-bao's hasMany resolver compares `orderDirection === "ASC"`
+# case-sensitively (relationshipManager.ts:68); Swift's resolver
+# is more lenient (`== "DESC"` check, anything else = ascending).
+# Use uppercase here so both sides agree on direction. (Worth a
+# separate issue — TOML's lowercase convention should round-trip.)
+order_direction = "ASC"
+
+[models.posts]
+class_name = "Post"
+[models.posts.fields.id]
+type = "id"
+[models.posts.fields.title]
+type = "string"
+required = true
+[models.posts.fields.userId]
+type = "string"
+[models.posts.fields.createdAt]
+type = "string"
+
+[models.posts.relationships.author]
+type = "refersTo"
+model = "users"
+related_id_field = "userId"
+
+[models.posts.relationships.tags]
+type = "hasManyThrough"
+model = "tags"
+join_model = "post_tag_links"
+join_model_local_field = "postId"
+join_model_related_field = "tagId"
+
+[models.tags]
+class_name = "Tag"
+[models.tags.fields.id]
+type = "id"
+[models.tags.fields.name]
+type = "string"
+required = true
+
+[models.post_tag_links]
+class_name = "PostTagLink"
+[models.post_tag_links.fields.id]
+type = "id"
+[models.post_tag_links.fields.postId]
+type = "string"
+[models.post_tag_links.fields.tagId]
+type = "string"

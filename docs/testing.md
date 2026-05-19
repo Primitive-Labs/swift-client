@@ -13,6 +13,25 @@ There are no mocks per the project's "live APIs only" policy in CLAUDE.md — te
 
 For test coverage parity vs the JS client, see [`parity/test-coverage.md`](parity/test-coverage.md).
 
+## Two flavors of tests
+
+Not every test needs the dev server. The suite splits into two categories:
+
+| Category | Needs backend? | Where it lives | What it does |
+|---|---|---|---|
+| **Pure-Swift unit tests** | No | `Tests/SwiftBaoCodegenTests/`, most of `Tests/JsBaoClientTests/Schema/` (e.g. `PrimitiveSchemaTests`, `TomlSchemaLoaderTests`, `PrimitiveValueTests`, `TypedModelTests`, `CodegenAcceptanceTests`, `CodegenGauntletTests`) | Exercise schema parsing, value coding, codegen output, in-memory `YDocument` round-trips. No HTTP, no WebSocket, no SQLite file. The codegen suite — `CodegenAcceptanceTests` + `CodegenGauntletTests` — is documented in detail in [`codegen.md` → Testing](codegen.md#testing). |
+| **Backend integration tests** | Yes — dev server + `.env.tests` | The rest of `Tests/JsBaoClientTests/` (everything in the suite table at the bottom of this doc) | Hit the live dev server over HTTP/WS, mint test apps and users via the admin API. |
+
+To run only the no-backend tests (handy in CI or in a fresh worktree where the dev server isn't wired up):
+
+```bash
+swift test --filter "SwiftBaoCodegenTests|Schema\."
+```
+
+The backend integration tests require the setup below.
+
+> **Note on `swift-testing` output.** Both XCTest and the new `swift-testing` framework run by default. If you only have XCTest tests in scope (which is the case for everything in this repo today), you'll see a trailing `✔ Test run with 0 tests in 0 suites passed` line — that's `swift-testing` reporting it found nothing to do, not a failure.
+
 ## Prerequisites
 
 1. **Dev server running on HTTP** — the Swift client's `URLSession` does not trust self-signed certs, so run the dev server without `LOCAL_HTTPS`:
@@ -91,6 +110,8 @@ Reads server URL and admin JWT from environment variables. Defaults to `http://l
 | Awareness | `AwarenessTests.swift` |
 | Y.Text semantics | `YTextSemanticsTests.swift` |
 | Per-doc deadlocks | `YDocumentDeadlockTests.swift` — guards against the lock issue that drove the YSwift fork |
+| Codegen acceptance | `Schema/CodegenAcceptanceTests.swift` — TaskRecord golden compiles + round-trips through `TypedModel`. See [`codegen.md` → Testing](codegen.md#testing). |
+| Codegen gauntlet | `Schema/CodegenGauntletTests.swift` — 35 tests stressing every TOML knob the emitter touches (stringsets, unique constraints, defaults, relationships literal, reserved keyword fields, `init?(row:)` vs `init?(record:)`, codegen-emitted Equatable/Hashable/Codable, free-function helper pattern, `dynamic.update`). See [`codegen.md` → Testing](codegen.md#testing). |
 
 ## Schema test directory (38 files)
 

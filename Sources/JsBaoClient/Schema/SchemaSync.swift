@@ -209,11 +209,15 @@ public enum SchemaSync {
         _ = map.tryUpdate(tx: tx, key: key, value: value ? "true" : "false")
     }
 
-    /// Set a Double value.
+    /// Set a Double value. Skip non-finite values (NaN, ±Infinity)
+    /// since they can't be JSON-encoded — yrs FFI parses every
+    /// scalar as JSON and would panic. Schema-default validation
+    /// keeps this path from seeing non-finite inputs in practice.
     private static func setScalar(
         _ map: YrsMap, key: String, value: Double, tx: YrsTransaction
     ) {
-        _ = map.tryUpdate(tx: tx, key: key, value: PrimitiveValue.encodeNumber(value))
+        guard let encoded = PrimitiveValue.encodeNumber(value) else { return }
+        _ = map.tryUpdate(tx: tx, key: key, value: encoded)
     }
 
     /// Set a heterogeneous `Any` value produced by `DefaultValue.encodedForMeta()`.

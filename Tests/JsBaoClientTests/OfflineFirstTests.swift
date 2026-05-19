@@ -19,8 +19,14 @@ final class OfflineFirstTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        await ctx.cleanup()
-        try? FileManager.default.removeItem(atPath: tempDir)
+        // setUp may throw before these are assigned (e.g. when the
+        // dev-server / JWT env vars aren't set). Read through Optional
+        // semantics so a nil here can't crash the test process and
+        // prevent later suites from running.
+        if let ctx: TestContext = ctx { await ctx.cleanup() }
+        if let tempDir: String = tempDir {
+            try? FileManager.default.removeItem(atPath: tempDir)
+        }
     }
 
     func testOfflineCreateThenOnlineSync() async throws {

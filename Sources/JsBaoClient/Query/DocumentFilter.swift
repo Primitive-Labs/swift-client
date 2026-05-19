@@ -36,8 +36,17 @@ public struct QueryOptions: Sendable {
     public var sortOrder: [(String, Int)]?
     /// Maximum number of results per page.
     public var limit: Int?
-    /// Offset-based pagination (kept for simple "skip N" cases —
-    /// mutually exclusive with cursor pagination in practice).
+    /// Offset-based pagination — DEPRECATED.
+    ///
+    /// Offset is unstable in CRDT-backed datasets: concurrent inserts
+    /// from another client can shift the rows that come "before
+    /// offset N" between two queries, causing the same row to appear
+    /// twice (insert) or be skipped (delete) across page boundaries.
+    /// Use `cursor` + `direction` instead — the cursor anchors to a
+    /// unique key value and survives concurrent mutations to other
+    /// rows. js-bao deliberately doesn't expose offset for the same
+    /// reason; this field is the only cross-language outlier.
+    @available(*, deprecated, message: "Offset is unstable under concurrent inserts in CRDT-backed docs. Use `cursor` + `direction` for stable pagination.")
     public var offset: Int?
 
     /// Opaque cursor from a previous `queryPaged` call. Pass

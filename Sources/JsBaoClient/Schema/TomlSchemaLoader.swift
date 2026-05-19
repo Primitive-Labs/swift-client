@@ -53,6 +53,14 @@ import TOMLKit
 ///    `.unknownJoinModel`.
 ///  - Every field in a unique constraint must exist on its model →
 ///    `.uniqueConstraintUnknownField`.
+/// > **Codegen is the recommended path.** Prefer `swift-bao-codegen` at
+/// > build time — see [`docs/codegen.md`](../../../docs/codegen.md). The
+/// > runtime TOML loader is fully supported and kept as public API for
+/// > the cases where build-time codegen doesn't fit (loading schemas
+/// > you don't own, programmatic / dynamic schema construction, tests,
+/// > tooling). For inspecting docs whose schema you don't own at build
+/// > time, `SchemaDiscovery` (reads `_meta_<modelName>` Y.Maps written
+/// > by other clients) is usually a better fit than runtime TOML.
 public enum TomlSchemaLoader {
 
     /// Parse a TOML string and return one `PrimitiveSchema` per

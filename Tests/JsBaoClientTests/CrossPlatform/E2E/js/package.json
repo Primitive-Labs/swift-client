@@ -1,0 +1,15 @@
+{
+  "name": "e2e-mini-app-js",
+  "version": "1.0.0",
+  "private": true,
+  "description": "JS mini-app CLI for the cross-language E2E parity harness. Mirrors swift/main.swift; both speak the same JSON-on-stdin / JSON-on-stdout protocol. Runs under vite-node so the v2-generated barrel's `?raw` import works.",
+  "type": "module",
+  "main": "main.ts",
+  "scripts": {
+    "codegen": "node ./codegen.mjs"
+  },
+  "dependencies": {
+    "js-bao": "*",
+    "yjs": "*"
+  }
+}

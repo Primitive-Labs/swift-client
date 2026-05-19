@@ -1,0 +1,3 @@
+# js-bao-codegen-v2 emits these on every test run; never commit them.
+generated/
+node_modules/

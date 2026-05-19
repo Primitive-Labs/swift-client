@@ -74,7 +74,7 @@ internal enum UniqueIndex {
         case let .id(s):        return s
         case let .date(s):      return s
         case let .boolean(b):   return b ? "true" : "false"
-        case let .number(n):    return PrimitiveValue.encodeNumber(n)
+        case let .number(n):    return PrimitiveValue.encodeNumber(n) ?? "null"
         case let .stringset(s): return "[" + s.sorted().joined(separator: ",") + "]"
         case .json:             return ""  // no js-bao precedent; avoid key collisions
         }
@@ -87,7 +87,7 @@ internal enum UniqueIndex {
         case let .id(s):        return PrimitiveValue.jsonEncodeString(s)
         case let .date(s):      return PrimitiveValue.jsonEncodeString(s)
         case let .boolean(b):   return b ? "true" : "false"
-        case let .number(n):    return PrimitiveValue.encodeNumber(n)
+        case let .number(n):    return PrimitiveValue.encodeNumber(n) ?? "null"
         case let .stringset(s):
             let parts = s.sorted().map { PrimitiveValue.jsonEncodeString($0) }
             return "[" + parts.joined(separator: ",") + "]"

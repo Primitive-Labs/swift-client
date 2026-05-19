@@ -101,6 +101,9 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         case let .string(s):
             return PrimitiveValue.jsonEncodeString(s)
         case let .number(n):
+            // nil for non-finite values (NaN, ±Infinity) — the runtime
+            // skips the field on write rather than crashing the
+            // Rust FFI with invalid JSON.
             return PrimitiveValue.encodeNumber(n)
         case let .boolean(b):
             return b ? "true" : "false"
@@ -236,8 +239,17 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     /// Encode a `Double` the way JSON.stringify in JS does: integer values
     /// have no trailing `.0`, everything else uses the shortest roundtrip
     /// decimal. Swift's `"\(n)"` prints `42.0` for `42`; strip that.
-    static func encodeNumber(_ n: Double) -> String {
-        if n.isFinite, n == n.rounded(), abs(n) < 1e16 {
+    ///
+    /// Returns `nil` for **non-finite** values (NaN, ±Infinity). Those
+    /// don't have a valid JSON representation, and the yrs FFI parses
+    /// every `map.set(key, value)` write as JSON — so emitting "nan"
+    /// or "inf" panics the underlying Rust process. Callers must
+    /// route around the field (the runtime treats nil as "skip this
+    /// field on write"), or validate at the application layer
+    /// before reaching the encoder.
+    static func encodeNumber(_ n: Double) -> String? {
+        guard n.isFinite else { return nil }
+        if n == n.rounded(), abs(n) < 1e16 {
             return String(Int64(n))
         }
         return String(n)

@@ -1,0 +1,140 @@
+# Fixture for the codegen acceptance test. Touch this if you want to
+# exercise additional surface area in `Generated/`. Edit the file, then
+# run `./swift-client/run-tests.sh CodegenAcceptanceTests` — the test
+# regenerates and golden-compares.
+
+[models.tasks]
+class_name = "TaskRecord"
+
+[models.tasks.fields.id]
+type = "id"
+
+[models.tasks.fields.title]
+type = "string"
+required = true
+
+[models.tasks.fields.priority]
+type = "number"
+indexed = true
+
+[models.tasks.fields.tags]
+type = "stringset"
+
+[models.tasks.fields.createdAt]
+type = "date"
+
+# ══════════════════════════════════════════════════════════════════
+# Codegen gauntlet models — exercise every TOML knob the emitter
+# touches plus a few intentionally weird shapes (snake_case model
+# name, empty-field model, reserved Swift keywords as field names,
+# all three relationship kinds). Driven by `CodegenGauntletTests`.
+# ══════════════════════════════════════════════════════════════════
+
+# Kitchen-sink: optional + required stringset, max_count, single-field
+# unique, max_length, three default values (string/number/bool),
+# indexed numeric, two reserved-keyword field names, and a compound
+# unique constraint on (boundedName, score). The compound is
+# intentionally chosen on fields that don't overlap the single-field
+# unique on email so each can be tested independently.
+[models.crashTest]
+class_name = "CrashTestRecord"
+
+[models.crashTest.fields.id]
+type = "id"
+
+[models.crashTest.fields.tags]
+type = "stringset"
+max_count = 5
+
+[models.crashTest.fields.requiredTags]
+type = "stringset"
+required = true
+
+[models.crashTest.fields.email]
+type = "string"
+unique = true
+
+[models.crashTest.fields.boundedName]
+type = "string"
+max_length = 20
+
+[models.crashTest.fields.default]
+type = "string"
+default = "fallback"
+
+[models.crashTest.fields.where]
+type = "string"
+
+[models.crashTest.fields.score]
+type = "number"
+default = 100
+indexed = true
+
+[models.crashTest.fields.active]
+type = "boolean"
+default = true
+
+[[models.crashTest.unique_constraints]]
+name = "name_score_combo"
+fields = ["boundedName", "score"]
+
+# Snake_case model name → default rule produces `UserProfileRecord`.
+# No `class_name` override on purpose — exercises the default-name
+# path in addition to the override path used elsewhere.
+[models.user_profile]
+
+[models.user_profile.fields.id]
+type = "id"
+
+[models.user_profile.fields.displayName]
+type = "string"
+required = true
+
+# Back-pointer used by `relTest.profile` (hasMany, related_id_field =
+# "ownerId"). Optional so existing UserProfileRecord constructions
+# don't need to set it.
+[models.user_profile.fields.ownerId]
+type = "string"
+
+# Empty-fields model — only `id`. Generated `primitiveValues()`
+# returns the `[:]` literal; `init?(row:)` guards only on `id`.
+[models.barebones]
+class_name = "BareBonesRecord"
+
+[models.barebones.fields.id]
+type = "id"
+
+# Relationship literal emission (compile-check). All three kinds
+# attached to one model so the emitter has to fold them into a
+# single `relationships:` block. The runtime semantics aren't
+# exercised here — that's the IncludeResolver tests' job.
+[models.relTest]
+class_name = "RelTestRecord"
+
+[models.relTest.fields.id]
+type = "id"
+
+[models.relTest.fields.taskId]
+type = "string"
+
+[models.relTest.fields.profileId]
+type = "string"
+
+[models.relTest.relationships.task]
+type = "refersTo"
+model = "tasks"
+related_id_field = "taskId"
+
+[models.relTest.relationships.profile]
+type = "hasMany"
+model = "user_profile"
+related_id_field = "ownerId"
+order_by_field = "displayName"
+order_direction = "asc"
+
+[models.relTest.relationships.viaJoin]
+type = "hasManyThrough"
+model = "user_profile"
+join_model = "barebones"
+join_model_local_field = "id"
+join_model_related_field = "id"

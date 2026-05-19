@@ -18,6 +18,12 @@ public final class AnalyticsQueue: @unchecked Sendable {
     private var rateCounter = 0
     private var rateWindowStart: Date = Date()
 
+    // In-flight flush task (send + persist-on-failure). Tracked so
+    // destroy() can await any final flush before the storage layer
+    // closes — see AuthController.pendingPersistTask for the same
+    // pattern's motivation.
+    private var pendingFlushTask: Task<Void, Never>?
+
     // Overrides
     private var planOverride: String?
     private var appVersionOverride: String?
@@ -122,7 +128,7 @@ public final class AnalyticsQueue: @unchecked Sendable {
             return
         }
 
-        Task {
+        let task: Task<Void, Never> = Task {
             do {
                 try await sendMessage?(jsonString)
             } catch {
@@ -133,6 +139,20 @@ public final class AnalyticsQueue: @unchecked Sendable {
                 await persistBuffer()
             }
         }
+        lock.lock()
+        pendingFlushTask = task
+        lock.unlock()
+    }
+
+    /// Wait for any in-flight flush task to drain. Called from
+    /// `JsBaoClient.destroy()` after `destroy()` cancels the periodic
+    /// flush timer and triggers the final flush — without awaiting,
+    /// the persist-on-failure path could race the SQLite close.
+    public func awaitPendingPersistence() async {
+        lock.lock()
+        let task = pendingFlushTask
+        lock.unlock()
+        await task?.value
     }
 
     // MARK: - Persistence

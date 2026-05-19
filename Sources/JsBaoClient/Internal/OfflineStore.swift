@@ -201,7 +201,7 @@ public final class OfflineStore: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    public func closeStorage() {
+    public func closeStorage() async {
         lock.lock()
         let provider = storageProvider
         let authProvider = authStorageProvider
@@ -209,10 +209,12 @@ public final class OfflineStore: @unchecked Sendable {
         currentNamespace = nil
         lock.unlock()
 
-        Task {
-            await provider?.close()
-            await authProvider?.close()
-        }
+        // Await both closes so the SQLite handles are fully released
+        // before this returns. A subsequent client that opens the same
+        // database file would otherwise race the close and hit
+        // SQLITE_BUSY ("database is locked").
+        await provider?.close()
+        await authProvider?.close()
     }
 }
 
