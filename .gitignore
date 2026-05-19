@@ -5,3 +5,9 @@ Package.resolved
 *.xcodeproj/
 xcuserdata/
 DerivedData/
+
+# Local-only secrets (test JWTs, credentials). Never commit.
+.env
+.env.*
+!.env.example
+!.env.tests.example
