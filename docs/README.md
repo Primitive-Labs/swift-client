@@ -61,8 +61,17 @@ try await client.connect()
 // Open a document for real-time editing
 let doc = try await client.openDocument(docId: documentId)
 
-// Most apps work through BaoModel — typed records, MongoDB-style queries.
-// See baomodels.md for the full authoring story.
+// Most apps work through TypedModel<T> + codegen — define your schema in
+// schema.toml, let swift-bao-codegen emit the record struct, then go through
+// the typed wrapper:
+//
+//     let tasks = TypedModel<TaskRecord>(doc: doc)
+//     try tasks.create(TaskRecord(id: "t1", title: "Write docs"))
+//     for t in tasks.findAll() { print(t.title) }
+//
+// See baomodels.md (typed model authoring) and codegen.md (the schema.toml +
+// build-plugin flow) for the full story. The legacy untyped BaoModel<T> API
+// from earlier releases still ships, but new apps should start with TypedModel.
 
 // For raw Y.Map access (e.g. text editors), use the YDocument API directly.
 // IMPORTANT: inside an open transaction, use getOrInsertMap(named:transaction:),

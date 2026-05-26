@@ -6,8 +6,6 @@ Package.resolved
 xcuserdata/
 DerivedData/
 
-# Local-only secrets (test JWTs, credentials). Never commit.
-.env
-.env.*
-!.env.example
-!.env.tests.example
+# Test config — holds a super-admin JWT; use .env.tests.example as the template.
+# The nightly release (pl-nightly-release) mints this for the Swift test step.
+.env.tests

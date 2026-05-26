@@ -724,6 +724,85 @@ For non-SPM Xcode projects, add a Run Script build phase that runs
 Then commit `Generated/` (it changes only when the TOML changes) and
 add the directory to the Compile Sources phase.
 
+### C. iOS apps with xcodegen + SPM dependency — the dual-path pattern
+
+iOS app targets are the tricky case: you usually want SPM's `JsBaoClient`
+dependency wired in (so the library is on the build graph), but the
+`JsBaoCodegenPlugin` declared under `plugins:` in `Package.swift`
+**does not fire on `xcodebuild`**. SwiftPM's build-tool plugins only
+run during `swift build` — Xcode app targets compile from the source
+list in `.pbxproj`, and that source list never includes the plugin's
+output directory. The failure mode is silent: the app builds fine
+until you reference your codegen-emitted type, at which point Xcode
+emits `cannot find type 'TaskRecord' in scope` with no breadcrumb
+back to "you forgot to run codegen."
+
+The fix is a dual-path setup. Run codegen explicitly into a directory
+that xcodegen scans into the `.pbxproj`, **and** exclude that same
+directory from the SPM target so `swift test` / `swift build` don't
+double-compile the same struct.
+
+1. **Add codegen invocation to your build script** (e.g. `run-ios.sh`).
+   Run it before `xcodebuild` / `xcodegen generate`:
+
+    ```sh
+    swift run --package-path . swift-bao-codegen \
+      --input  Sources/MyApp/Models/schema.toml \
+      --output Sources/MyApp/Models/Generated
+    ```
+
+    Or, if you want it tied to every Xcode build instead of being script-driven,
+    add a Run Script build phase that does the same — the trade-off is that the
+    phase runs *inside* every Xcode build (always up-to-date but noisier on every
+    keystroke).
+
+2. **Tell xcodegen to pick up `Generated/`**. With a default xcodegen `sources:`
+   entry pointing at `Sources/MyApp/`, this happens automatically —
+   `Generated/` lives under your sources tree, so xcodegen rolls it into the
+   `.pbxproj` Compile Sources phase next time it regenerates the project.
+   (If you have a more restrictive `includes:` filter, add `**/Generated/*.swift`
+   explicitly.) Re-run `xcodegen generate` whenever the file *set* changes;
+   re-codegenning the same file set requires no xcodegen run.
+
+3. **Gitignore the output directory.** It's reproducible from the TOML;
+   committing it just creates merge-conflict surface area:
+
+    ```gitignore
+    Sources/MyApp/Models/Generated/
+    ```
+
+4. **Exclude `Generated/` from the SPM target** so `swift build` / `swift test`
+   don't try to compile the same files the iOS path emits there (otherwise
+   SPM rebuilds them under the plugin and the duplicate-symbol error is
+   noisy). In `Package.swift`:
+
+    ```swift
+    .target(
+        name: "MyApp",
+        dependencies: [
+            .product(name: "JsBaoClient", package: "JsBaoClient"),
+        ],
+        exclude: ["Models/Generated"],
+        plugins: [
+            .plugin(name: "JsBaoCodegenPlugin", package: "JsBaoClient"),
+        ]
+    ),
+    ```
+
+    SPM still runs the plugin (emitting into `.build/plugins/…`), so `swift test`
+    keeps codegen-emitted types available; iOS Xcode builds compile the
+    checked-out `Generated/` instead. Each path codegens once.
+
+**Net effect**: `swift test` works (SPM plugin path), `./run-ios.sh` works
+(manual codegen path), and there's no path that builds the codegen-emitted
+types twice. The price of admission is the dual-step setup; both options above
+are covered in `primitive-app-template`'s
+[`run-ios.sh`](https://github.com/Primitive-Labs/swift-primitive-app-dev/blob/main/primitive-app-template/run-ios.sh)
+(codegen invocation + xcodegen regenerate)
+and
+[`Package.swift`](https://github.com/Primitive-Labs/swift-primitive-app-dev/blob/main/primitive-app-template/Package.swift)
+(the `exclude:` rule). Copy from there if you want a working reference.
+
 ## Naming
 
 Default Swift type name: `<PascalCase(modelName)>Record`.
