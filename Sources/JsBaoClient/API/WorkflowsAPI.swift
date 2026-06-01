@@ -54,14 +54,21 @@ public final class WorkflowsAPI: @unchecked Sendable {
         case resolvedOrInFlight
     }
 
+    /// Optional emitter for `workflowStarted` events. Wired by
+    /// `JsBaoClient.setupSubApis`; `nil` when WorkflowsAPI is
+    /// constructed directly (tests / standalone usage).
+    private weak var events: EventEmitter?
+
     public init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         getConnectionId: @escaping () -> String = { "" },
-        logger: Logger? = nil
+        logger: Logger? = nil,
+        events: EventEmitter? = nil
     ) {
         self.makeRequest = makeRequest
         self.getConnectionId = getConnectionId
         self.logger = logger
+        self.events = events
     }
 
     // MARK: - Workflow Execution
@@ -83,14 +90,32 @@ public final class WorkflowsAPI: @unchecked Sendable {
         if let runKey = options?.runKey { body["runKey"] = runKey }
         if let contextDocId = options?.contextDocId { body["contextDocId"] = contextDocId }
         if let meta = options?.meta { body["meta"] = meta }
+        if options?.forceRerun == true { body["forceRerun"] = true }
 
         let result = try await makeRequest("POST", "/workflows/\(encodedKey)/start", body)
-        return result as? [String: Any] ?? [:]
+        let dict = result as? [String: Any] ?? [:]
+        // Fire `workflowStarted` so cross-platform subscribers can
+        // observe successful starts without polling. Same shape as
+        // the JS event.
+        if let runId = dict["runId"] as? String {
+            events?.emit(.workflowStarted, WorkflowStartedEvent(
+                workflowKey: workflowKey, runId: runId
+            ))
+        }
+        return dict
     }
 
-    /// Gets the status of a workflow run. Mirrors the JS client. The
-    /// response shape is `{ status: <CF status with output/stepResults>,
-    /// run: <DB record with status: "apply_pending" | ... > }`.
+    /// Gets the status of a workflow run. Mirrors the JS client.
+    /// Returns the raw envelope with one normalized field added:
+    ///
+    ///   `["normalizedStatus": ...]` — one of `apply_pending`,
+    ///   `apply_claimed`, `complete`, `failed`, `terminated`, or
+    ///   `running`. The DB record's `apply_*` states take precedence
+    ///   over the CF workflow's terminal states (matches js-bao's
+    ///   `getWorkflowStatus`).
+    ///
+    /// The raw envelope (`status`, `run`) is still in the returned
+    /// dict for callers that need the CF/DB shapes directly.
     public func getStatus(
         workflowKey: String,
         runKey: String,
@@ -104,17 +129,55 @@ public final class WorkflowsAPI: @unchecked Sendable {
             path += "?contextDocId=\(encoded)"
         }
         let result = try await makeRequest("GET", path, nil)
-        return result as? [String: Any] ?? [:]
+        var dict = result as? [String: Any] ?? [:]
+        dict["normalizedStatus"] = Self.normalizeWorkflowStatus(envelope: dict)
+        return dict
+    }
+
+    /// CF/DB status reconciliation. Lifted out of `getStatus` so the
+    /// `awaitRun` waiter (and future callers) can apply the same
+    /// rules to either an arrived event or a polled envelope.
+    internal static func normalizeWorkflowStatus(envelope: [String: Any]) -> String {
+        let rawStatus = envelope["status"] as? [String: Any]
+        let run = envelope["run"] as? [String: Any]
+        let cfStatus = (rawStatus?["status"] as? String)?.lowercased() ?? ""
+        let dbStatus = run?["status"] as? String
+        if dbStatus == "apply_pending" { return "apply_pending" }
+        if dbStatus == "apply_claimed" { return "apply_claimed" }
+        if cfStatus == "complete" { return "complete" }
+        if cfStatus == "errored" { return "failed" }
+        if cfStatus == "terminated" { return "terminated" }
+        return "running"
     }
 
     /// Terminates a running workflow.
+    ///
+    /// - Parameter contextDocId: optional doc-scope for the terminate
+    ///   call (matches js-bao's `terminate(runKey, opts: {contextDocId})`).
+    ///   Required for workflows that were started with a `contextDocId`
+    ///   so the server can route to the right per-doc DO.
     public func terminate(
         workflowKey: String,
-        runKey: String
+        runKey: String,
+        contextDocId: String? = nil
     ) async throws -> [String: Any] {
         let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
         let encodedRunKey = runKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runKey
-        let result = try await makeRequest("POST", "/workflows/\(encodedKey)/instances/\(encodedRunKey)/terminate", nil)
+        var path = "/workflows/\(encodedKey)/instances/\(encodedRunKey)/terminate"
+        if let contextDocId,
+           let encoded = contextDocId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            path += "?contextDocId=\(encoded)"
+        }
+        let result = try await makeRequest("POST", path, nil)
+        return result as? [String: Any] ?? [:]
+    }
+
+    /// List the per-step runs of a single workflow run. Useful for
+    /// debugging UIs that want to surface the apply-pending /
+    /// apply-applied state of each step.
+    public func listStepRuns(runId: String) async throws -> [String: Any] {
+        let encoded = runId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runId
+        let result = try await makeRequest("GET", "/workflows/runs/\(encoded)/steps", nil)
         return result as? [String: Any] ?? [:]
     }
 
@@ -132,6 +195,13 @@ public final class WorkflowsAPI: @unchecked Sendable {
         }
         if let cursor = options?.cursor {
             queryParts.append("cursor=\(cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cursor)")
+        }
+        if let forward = options?.forward {
+            queryParts.append("forward=\(forward ? "true" : "false")")
+        }
+        if let contextDocId = options?.contextDocId,
+           let encoded = contextDocId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            queryParts.append("contextDocId=\(encoded)")
         }
         let query = queryParts.isEmpty ? "" : "?\(queryParts.joined(separator: "&"))"
         let result = try await makeRequest("GET", "/workflows/runs\(query)", nil)

@@ -64,9 +64,91 @@ final class SwiftEmitterTests: XCTestCase {
         XCTAssertTrue(body.contains("public func primitiveValues"))
     }
 
-    func testIdComesFirstInInitSignature() throws {
-        // TOMLKit hands keys back alphabetically — emitter must pin
-        // `id` to the front so callers get the natural shape.
+    func testDefaultAccessIsPublic() throws {
+        // The default access modifier emitted by codegen must be
+        // `public` — app code typically adds a companion extension
+        // (`public extension TodoItem { init(text: String) { ... } }`),
+        // which the compiler rejects on internal types ("public
+        // modifier cannot be used in extensions that declare members
+        // on an internal type"). Pin the default so future refactors
+        // can't silently regress.
+        let src = try emit("""
+        [models.tasks]
+        [models.tasks.fields.id]
+        type = "id"
+        """)
+        let body = try XCTUnwrap(src["TasksRecord"])
+        XCTAssertTrue(body.contains("public struct TasksRecord"),
+                      "default emitter access should be `public`")
+        XCTAssertTrue(body.contains("public var id: String"))
+        XCTAssertTrue(body.contains("public init("))
+    }
+
+    func testPrimitiveValuesUsesLetWhenNoOptionalFields() throws {
+        // No optional fields → `values` is never mutated, so the
+        // emitter must use `let` to avoid the per-build
+        // "variable 'values' was never mutated" warning.
+        let src = try emit("""
+        [models.t]
+        [models.t.fields.id]
+        type = "id"
+        [models.t.fields.title]
+        type = "string"
+        required = true
+        """)
+        let body = try XCTUnwrap(src["TRecord"])
+        XCTAssertTrue(body.contains("let values: [String: PrimitiveValue] = ["),
+                      "expected `let values` when no optional fields are present")
+        XCTAssertFalse(body.contains("var values: [String: PrimitiveValue]"),
+                       "should not emit `var values` when nothing mutates it")
+    }
+
+    func testPrimitiveValuesUsesVarWhenOptionalFieldsPresent() throws {
+        // Optional fields → `values` is conditionally extended via
+        // `values["x"] = ...`, so `var` is required.
+        let src = try emit("""
+        [models.t]
+        [models.t.fields.id]
+        type = "id"
+        [models.t.fields.title]
+        type = "string"
+        required = true
+        [models.t.fields.note]
+        type = "string"
+        """)
+        let body = try XCTUnwrap(src["TRecord"])
+        XCTAssertTrue(body.contains("var values: [String: PrimitiveValue]"),
+                      "expected `var values` when there's at least one optional field")
+    }
+
+    func testBooleanRowReadUsesNonTrailingClosure() throws {
+        // `(row[..] as? Int).map { ... }` triggers the "trailing
+        // closure in this context is confusable with the body of the
+        // statement" warning when it sits inside a `guard let ... else
+        // { return nil }` chain. The emitter must use the
+        // non-trailing form `.map({ ... })`.
+        let src = try emit("""
+        [models.t]
+        [models.t.fields.id]
+        type = "id"
+        [models.t.fields.done]
+        type = "boolean"
+        required = true
+        """)
+        let body = try XCTUnwrap(src["TRecord"])
+        XCTAssertTrue(body.contains(".map({ $0 != 0 })"),
+                      "boolean row-read should use non-trailing closure")
+        XCTAssertFalse(body.contains(".map { $0 != 0 }"),
+                       "no trailing-closure form for boolean row-read")
+    }
+
+    func testInitParameterOrderMatchesSchemaDeclarationOrder() throws {
+        // The parser recovers field declaration order from the TOML
+        // source — a schema written `zzz, id, aaa` emits an init in
+        // that *same* order, not alphabetical (which would silently
+        // re-shuffle a caller's positional args). The runtime never
+        // depends on init parameter order, so source-order is purely
+        // a developer-ergonomics fix.
         let src = try emit("""
         [models.tasks]
         [models.tasks.fields.zzz]
@@ -81,11 +163,13 @@ final class SwiftEmitterTests: XCTestCase {
             return XCTFail("no init found")
         }
         let initBody = body[initRange.upperBound...]
-        let firstParamLine = initBody.split(separator: "\n").first ?? ""
-        XCTAssertTrue(
-            firstParamLine.contains("id: String"),
-            "expected id to be the first init param, got: \(firstParamLine)"
-        )
+        let paramLines = initBody.split(separator: "\n").prefix(3).map(String.init)
+        XCTAssertTrue(paramLines[0].contains("zzz:"),
+                      "expected zzz first, got: \(paramLines[0])")
+        XCTAssertTrue(paramLines[1].contains("id:"),
+                      "expected id second, got: \(paramLines[1])")
+        XCTAssertTrue(paramLines[2].contains("aaa:"),
+                      "expected aaa third, got: \(paramLines[2])")
     }
 
     func testRequiredFieldGuardsInRecordInit() throws {
@@ -355,27 +439,29 @@ final class SwiftEmitterTests: XCTestCase {
                         "expected CaféRecord, got keys: \(Array(src.keys))")
     }
 
-    func testUnquotedUnicodeKey_isRejectedByTomlParser() throws {
-        // Documents the TOML-spec reject — calling code can rely on
-        // a clear `CodegenError.parse` rather than emitting weird
-        // names from a half-parsed TOML.
-        XCTAssertThrowsError(
-            try emit("""
+    func testUnquotedUnicodeKey_doesNotEmitAModel() throws {
+        // TOML spec rejects unquoted non-ASCII bare keys. Two valid
+        // outcomes here:
+        //   • TOMLKit raises a parse error → `.parse` is thrown.
+        //   • TOMLKit truncates `[models.café]` to a bare `[models]`
+        //     header with no children → we successfully parse an empty
+        //     schema list (since a comment-only / model-less TOML is
+        //     valid input for fresh-template onboarding).
+        // The user-visible failure mode in the second case is "my
+        // generated type is missing", which they'll hit immediately at
+        // compile time — quoting the key fixes it.
+        do {
+            let src = try emit("""
             [models.café]
             [models.café.fields.id]
             type = "id"
             """)
-        ) { error in
-            // Either the parser surfaces a `.parse` error, or the
-            // models-table check fails because `[models.café]` was
-            // truncated to `[models]` after rejection. Both are
-            // legitimate "you have to quote this" signals.
-            switch error {
-            case CodegenError.parse, CodegenError.missingModelsTable:
-                break
-            default:
-                XCTFail("expected CodegenError.parse or .missingModelsTable, got \(error)")
-            }
+            XCTAssertTrue(src.isEmpty,
+                          "expected zero emitted records, got keys: \(Array(src.keys))")
+        } catch CodegenError.parse {
+            // Acceptable: TOMLKit surfaced a parse error.
+        } catch {
+            XCTFail("expected CodegenError.parse or empty output, got \(error)")
         }
     }
 }

@@ -112,7 +112,7 @@ public struct CommitRetryBackoff: Sendable {
     public var maxAttempts: Int
 
     public init(
-        baseMs: Int = 2000,
+        baseMs: Int = 1000,
         factor: Double = 2.0,
         maxMs: Int = 60000,
         jitter: Bool = true,
@@ -251,15 +251,93 @@ public struct NetworkStatus: Sendable {
 
 // MARK: - Workflow Options
 
+/// Options for `client.setNetworkMode(_:options:)`. Matches the JS
+/// client's options bag passed as the second argument.
+public struct SetNetworkModeOptions: Sendable {
+    /// Reason string surfaced on the emitted `networkMode` event so
+    /// subscribers can distinguish user-initiated from
+    /// system-initiated transitions.
+    public var reason: String?
+    public init(reason: String? = nil) {
+        self.reason = reason
+    }
+}
+
+/// Retention budget for the local document store. Mirrors js-bao's
+/// `setRetentionPolicy(opts)` shape field-for-field.
+public struct RetentionPolicy: Sendable {
+    public enum DefaultMode: String, Sendable {
+        case persist
+        case session
+    }
+    /// Default persistence mode for newly-opened docs. Stored for
+    /// shape parity with js-bao; not yet consumed by enforcement
+    /// (matches JS — same field is set but unused in enforcement).
+    public var `default`: DefaultMode
+    /// Evict docs whose `lastOpenedAt` age exceeds this (ms).
+    public var ttlMs: Int?
+    /// Cap on local-doc count; oldest-first eviction when exceeded.
+    public var maxDocs: Int?
+    /// Cap on total `localBytes`; oldest-first eviction when exceeded.
+    public var maxBytes: Int?
+    /// Stored for parity with js-bao; not yet consumed.
+    public var preserveOnSignOut: Bool?
+
+    public init(
+        default: DefaultMode = .persist,
+        ttlMs: Int? = nil,
+        maxDocs: Int? = nil,
+        maxBytes: Int? = nil,
+        preserveOnSignOut: Bool? = nil
+    ) {
+        self.default = `default`
+        self.ttlMs = ttlMs
+        self.maxDocs = maxDocs
+        self.maxBytes = maxBytes
+        self.preserveOnSignOut = preserveOnSignOut
+    }
+}
+
+/// Options for `client.syncMetadata(options:)`. Matches the JS
+/// client's options bag.
+public struct SyncMetadataOptions: Sendable {
+    /// Restrict the sync to a single document. `nil` syncs all open
+    /// docs (default).
+    public var documentId: String?
+    /// `"ids"` (default) syncs only the doc ID list; `"full"` syncs
+    /// every doc's full metadata blob. js-bao name parity.
+    public var payloadType: String?
+    /// When true, the sync runs without blocking the caller.
+    public var background: Bool?
+    public init(
+        documentId: String? = nil,
+        payloadType: String? = nil,
+        background: Bool? = nil
+    ) {
+        self.documentId = documentId
+        self.payloadType = payloadType
+        self.background = background
+    }
+}
+
 public struct StartWorkflowOptions: @unchecked Sendable {
     public var runKey: String?
     public var contextDocId: String?
     public var meta: [String: Any]?
+    /// When true, re-runs a workflow even if a prior run with the same
+    /// `runKey` exists. Matches js-bao's `StartWorkflowOptions.forceRerun`.
+    public var forceRerun: Bool?
 
-    public init(runKey: String? = nil, contextDocId: String? = nil, meta: [String: Any]? = nil) {
+    public init(
+        runKey: String? = nil,
+        contextDocId: String? = nil,
+        meta: [String: Any]? = nil,
+        forceRerun: Bool? = nil
+    ) {
         self.runKey = runKey
         self.contextDocId = contextDocId
         self.meta = meta
+        self.forceRerun = forceRerun
     }
 }
 
@@ -268,12 +346,29 @@ public struct ListWorkflowRunsOptions: Sendable {
     public var status: String?
     public var limit: Int?
     public var cursor: String?
+    /// Walk-direction for cursor pagination. `true` = forward (default),
+    /// `false` = backward. Matches js-bao's `forward` flag on the same
+    /// options object.
+    public var forward: Bool?
+    /// Restrict to runs scoped to a particular document (multi-doc
+    /// workflows fan out per `contextDocId`). Matches js-bao's
+    /// `ListWorkflowRunsOptions.contextDocId`.
+    public var contextDocId: String?
 
-    public init(workflowKey: String? = nil, status: String? = nil, limit: Int? = nil, cursor: String? = nil) {
+    public init(
+        workflowKey: String? = nil,
+        status: String? = nil,
+        limit: Int? = nil,
+        cursor: String? = nil,
+        forward: Bool? = nil,
+        contextDocId: String? = nil
+    ) {
         self.workflowKey = workflowKey
         self.status = status
         self.limit = limit
         self.cursor = cursor
+        self.forward = forward
+        self.contextDocId = contextDocId
     }
 }
 

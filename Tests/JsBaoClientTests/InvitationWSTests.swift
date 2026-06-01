@@ -38,10 +38,16 @@ final class InvitationWSTests: XCTestCase {
         // Create a document
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Invitation WS Doc")
 
-        // Listen for invitation events on the invitee client
+        // Listen for invitation events on the invitee client. NSLock is
+        // overkill but it's the simplest way to share a mutable flag
+        // between the event-emitter callback (called off the main
+        // thread) and the assertion below.
+        let lock = NSLock()
         var invitationReceived = false
         let sub = inviteeClient.events.onAny(.invitation) { _ in
+            lock.lock()
             invitationReceived = true
+            lock.unlock()
         }
 
         // Send invitation
@@ -53,9 +59,25 @@ final class InvitationWSTests: XCTestCase {
 
         // Wait for WS event
         try await delay(3)
-
-        // The invitation event may or may not be received depending on server config
-        // At minimum, verify no crash occurred
         sub.cancel()
+
+        lock.lock()
+        let received = invitationReceived
+        lock.unlock()
+
+        // Previous version of this test cancelled the subscription and
+        // returned without asserting. That made it a no-op smoke test
+        // ("didn't crash"). The actual server contract guarantees an
+        // invitation WS event lands on the invitee within a few
+        // seconds, so we assert it.
+        XCTAssertTrue(
+            received,
+            "Expected an invitation WS event on the invitee client " +
+            "within 3 seconds of `documents.sendInvitation`. If this " +
+            "starts failing, check whether the server-side notifier " +
+            "is still wired to forward invitation events to the " +
+            "invitee's session — same place WorkflowStatusEvent is " +
+            "delivered."
+        )
     }
 }

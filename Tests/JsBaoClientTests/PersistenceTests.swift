@@ -24,6 +24,62 @@ final class PersistenceTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: tempDir)
     }
 
+    /// #853: with `.sqlite()` (no explicit directory), the auth flow
+    /// used to initialize the provider at
+    /// `~/Library/Application Support/JsBaoClient/auth:<appId>:<appId>/…`
+    /// and `createLocalDocument` tried to initialize the same provider
+    /// at `~/…/JsBaoClient/<appId>:<userId>/…` — different files →
+    /// `SQLiteStorageProvider` refused to re-bind and threw
+    /// "SQLiteStorageProvider already initialized…". After the fix the
+    /// JsBaoClient resolves a stable per-appId path once, so every
+    /// namespace shares the same file and the second initialize is a
+    /// no-op.
+    func testCreateDocumentLocalOnlyAfterAuthShareDefaultSqlitePath() async throws {
+        // Best-effort cleanup of the default per-appId directory the
+        // SDK writes to when no path is supplied.
+        let appSupport = NSSearchPathForDirectoriesInDomains(
+            .applicationSupportDirectory, .userDomainMask, true
+        ).first!
+        let appDir = (appSupport as NSString)
+            .appendingPathComponent("JsBaoClient/\(testApp.appId)")
+        defer { try? FileManager.default.removeItem(atPath: appDir) }
+
+        let client = JsBaoClient(options: JsBaoClientOptions(
+            apiUrl: TestConfig.httpUrl,
+            wsUrl: TestConfig.wsUrl,
+            appId: testApp.appId,
+            token: testApp.ownerJWT,
+            offline: false,
+            globalAdminAppId: TestConfig.globalAdminAppId,
+            wsHeaders: ["X-Global-Admin-App-Id": TestConfig.globalAdminAppId],
+            storageConfig: .sqlite(),
+            auth: AuthConfig(persistJwtInStorage: true),
+            autoNetwork: false
+        ))
+        defer { Task { await client.destroy() } }
+
+        // setupStorage runs as a Task — give it room to wire the
+        // providers and bootstrap auth.
+        try await delay(0.5)
+
+        // Re-apply the token through `updateToken` so the auth
+        // controller takes the persist path (bootstrap doesn't
+        // necessarily fire a write). This is the call that initializes
+        // the provider with the auth namespace.
+        client.updateToken(testApp.ownerJWT)
+        try await delay(0.3)
+
+        // Now createLocalDocument → ensureMetadataDb tries to
+        // initialize the same provider with the user namespace.
+        // Without the #853 fix this throws "SQLiteStorageProvider
+        // already initialized".
+        let (docId, _) = try await client.createDocument(
+            options: CreateDocumentOptions(localOnly: true)
+        )
+        XCTAssertFalse(docId.isEmpty,
+                       "Local-only create must succeed under .sqlite() default path")
+    }
+
     func testPersistAndRetrieveMetadataUsingSQLite() async throws {
         let dbPath = tempDir + "storage-test.sqlite"
 

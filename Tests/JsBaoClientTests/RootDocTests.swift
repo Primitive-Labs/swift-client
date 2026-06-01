@@ -40,18 +40,60 @@ final class RootDocTests: XCTestCase {
     }
 
     func testGetRootDocIdViaClient() async throws {
-        // getRootDocId may return nil or throw 404 if no root doc exists
-        do {
-            let rootDocId = try await client.getRootDocId()
-            // Just verify it doesn't crash -- value may be nil
-            _ = rootDocId
-        } catch {
-            // 404 is expected for a freshly created app with no root doc
-            let msg = String(describing: error)
-            XCTAssertTrue(
-                msg.contains("404") || msg.contains("not found"),
-                "Unexpected error: \(msg)"
-            )
+        // After #849: getRootDocId reads from the parsed JWT payload
+        // (no HTTP call). The test-mint endpoint stuffs rootDocId into
+        // `payload.user.rootDocId`, so getRootDocId() must return that
+        // exact value without throwing.
+        let rootDocId = try await client.getRootDocId()
+        XCTAssertNotNil(rootDocId, "Test JWT should carry a rootDocId")
+
+        let payload = client.getJwtPayload()
+        let userClaims = payload?["user"] as? [String: Any]
+        let expected = userClaims?["rootDocId"] as? String
+            ?? payload?["rootDocId"] as? String
+        XCTAssertEqual(rootDocId, expected,
+                       "getRootDocId() must mirror the JWT payload's rootDocId")
+    }
+
+    @available(*, deprecated, message: "exercises deprecated documents.list intentionally")
+    func testListFiltersRootByDefault() async throws {
+        // #848: documents.list() defaults to includeRoot=false. We
+        // assert the filtering contract directly — the items returned
+        // with includeRoot:false are exactly the includeRoot:true set
+        // minus any entry whose documentId equals the JWT's rootDocId.
+        guard let root = try await client.getRootDocId() else {
+            return XCTFail("Test JWT must include rootDocId for this test")
         }
+        // Make sure the root doc has been materialized server-side so
+        // there's something to filter (mint-test-jwt + ensureRootDocAssigned
+        // can race against the list's DynamoDB index — getRoot() forces
+        // a server-side resolve that warms the permission row).
+        _ = try? await client.documents.getRoot()
+
+        let withRoot = try await client.documents.list(includeRoot: true)
+        let withRootItems = (withRoot["items"] ?? withRoot["documents"]) as? [[String: Any]] ?? []
+        let withoutRoot = try await client.documents.list()
+        let withoutRootItems = (withoutRoot["items"] ?? withoutRoot["documents"]) as? [[String: Any]] ?? []
+
+        let expectedAfterFilter = withRootItems.filter { ($0["documentId"] as? String) != root }
+        XCTAssertEqual(
+            withoutRootItems.count,
+            expectedAfterFilter.count,
+            "includeRoot:false should drop exactly the root doc"
+        )
+        XCTAssertFalse(
+            withoutRootItems.contains { ($0["documentId"] as? String) == root },
+            "Root doc \(root) must be filtered when includeRoot is false"
+        )
+    }
+
+    func testIsRootDocumentMatchesJwt() async throws {
+        // isRootDocument should also resolve from the JWT payload, not
+        // a separate HTTP-backed cache that has to warm up first.
+        guard let rootDocId = try await client.getRootDocId() else {
+            return XCTFail("Test JWT should carry a rootDocId")
+        }
+        XCTAssertTrue(client.isRootDocument(rootDocId))
+        XCTAssertFalse(client.isRootDocument("not-the-root-doc"))
     }
 }

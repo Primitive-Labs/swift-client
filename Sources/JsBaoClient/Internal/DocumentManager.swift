@@ -49,6 +49,25 @@ public final class DocumentManager: @unchecked Sendable {
     // Flag to suppress update observer during remote update application
     private var applyingRemoteUpdate: [String: Bool] = [:]
 
+    /// Per-doc debounce tasks for local-first SQLite persistence. Every
+    /// YDoc update (local edit OR remote-applied sync) reschedules a
+    /// `persistDocumentToLocal` call after a short delay so bursty
+    /// writes collapse into one SQLite snapshot instead of N. Mirrors
+    /// js-bao's `y-indexeddb` integration, which writes on every update
+    /// — without this, swift-client's SQLite mirror only got refreshed
+    /// when a sync round-trip completed (`handleSyncComplete`) or the
+    /// doc was explicitly closed, so any writes that arrived while
+    /// sync wasn't completing (server rejection, transient offline,
+    /// app force-quit between rounds) were lost on restart.
+    private var persistDebounceTasks: [String: Task<Void, Never>] = [:]
+
+    /// How long to wait after the last update before flushing the
+    /// YDoc state to SQLite. Trades a small window of crash-loss risk
+    /// (250ms of in-memory edits) against I/O thrashing during bursty
+    /// editing — `persistDocumentToLocal` serialises the whole doc
+    /// state on each call, so coalescing matters.
+    private static let persistDebounceNanos: UInt64 = 250_000_000 // 250ms
+
     // Dependencies (set externally)
     var offlineStore: OfflineStore?
     var appId: String = ""
@@ -59,6 +78,9 @@ public final class DocumentManager: @unchecked Sendable {
     var fetchDocumentInfo: ((String) async throws -> DocumentInfo)?
     var createRemoteDocument: (([String: Any]) async throws -> [String: Any])?
     var commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff()
+    /// Online-state probe used to gate background-commit retries (mirrors
+    /// js-bao's `ctx.isOnline()`). When nil, retries assume online.
+    var isOnlineProvider: (() -> Bool)?
 
     public init(logger: Logger) {
         self.logger = logger.forScope(scope: "docMgr")
@@ -197,8 +219,16 @@ public final class DocumentManager: @unchecked Sendable {
                 if applied {
                     let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                     emitter?.emit(.documentLoaded, DocumentLoadedEvent(
+                        // Matches js-bao's `documentLoaded.source` value
+                        // for offline-store hydration. JS emits one of
+                        // `"local"` (offline store), `"server"` (fresh
+                        // sync), or `"indexeddb"` (browser only). Swift
+                        // uses `"local"` for both SQLite-backed and
+                        // memory-backed stores, so cross-platform
+                        // subscribers can `switch source { case "local",
+                        // "server" }` consistently.
                         documentId: documentId,
-                        source: "sqlite",
+                        source: "local",
                         hadData: true,
                         bytes: data.count,
                         elapsedMs: elapsed
@@ -226,6 +256,18 @@ public final class DocumentManager: @unchecked Sendable {
             lock.unlock()
         }
 
+        // Stamp `lastOpenedAt` so retention policy enforcement can
+        // sort and TTL-evict by recency. Mirrors js-bao
+        // `documentManager._openCore` line 676.
+        let nowIso = ISO8601DateFormatter().string(from: Date())
+        lock.lock()
+        var meta = metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
+        meta.lastOpenedAt = nowIso
+        metadataIndex[documentId] = meta
+        let metaSnapshot = meta
+        lock.unlock()
+        try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
+
         // Register update observer — equivalent to JS `doc.on("update", handler)`.
         // This captures ALL writes and forwards local ones for WebSocket sync.
         let docId = documentId
@@ -242,6 +284,14 @@ public final class DocumentManager: @unchecked Sendable {
             if !isRemote {
                 callback?(docId, update)
             }
+            // Persist to local SQLite on EVERY update — local edits and
+            // remote-applied updates alike. Debounced so a burst of
+            // updates only triggers one snapshot write. Independent of
+            // sync round-trip: even if `handleSyncComplete` never fires
+            // (server rejection, intermittent disconnect, doc whose
+            // sync hangs), the local mirror still reflects the latest
+            // YDoc state. Closes the durability gap left by #852.
+            self.schedulePersist(documentId: docId)
         }
         lock.lock()
         updateSubscriptions[documentId] = subscription
@@ -252,6 +302,10 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Close a document and optionally evict local data
     public func closeDocument(documentId: String, options: CloseDocumentOptions = CloseDocumentOptions()) async {
+        // Cancel any pending debounced persist for this doc — we're
+        // about to flush immediately (or evict), and letting a
+        // delayed task fire afterwards would race the close logic.
+        cancelPendingPersist(documentId: documentId)
         // Persist before tearing down: if the app is being backgrounded
         // or the doc is being closed between server syncs, this flushes
         // any local updates that `handleSyncComplete` hasn't captured.
@@ -585,12 +639,21 @@ public final class DocumentManager: @unchecked Sendable {
         return localOnlyDocs.contains(documentId)
     }
 
-    /// Create a document locally (offline or local-only)
-    public func createLocalDocument(documentId: String, title: String?, localOnly: Bool) async throws -> YDocument {
+    /// Create a document locally (offline or local-only). Pass
+    /// `tags` to carry them through the eventual server commit
+    /// (`commitOfflineCreate`) — mirrors js-bao's local-first create
+    /// path (#852).
+    public func createLocalDocument(
+        documentId: String,
+        title: String?,
+        localOnly: Bool,
+        tags: [String]? = nil
+    ) async throws -> YDocument {
         let doc = YDocument()
 
         var metadata = LocalMetadataEntry(documentId: documentId)
         metadata.title = title
+        metadata.tags = tags
         metadata.pendingCreate = !localOnly
         metadata.localOnly = localOnly
         metadata.createdAt = ISO8601DateFormatter().string(from: Date())
@@ -626,10 +689,11 @@ public final class DocumentManager: @unchecked Sendable {
         let metadata = getLocalMetadata(documentId)
 
         do {
-            let body: [String: Any] = [
-                "documentId": documentId,
-                "title": metadata?.title as Any,
-            ]
+            var body: [String: Any] = ["documentId": documentId]
+            if let title = metadata?.title { body["title"] = title }
+            if let tags = metadata?.tags, !tags.isEmpty {
+                body["tags"] = tags
+            }
 
             guard let createRemote = createRemoteDocument else {
                 throw JsBaoError(code: .unavailable, message: "Remote create not configured")
@@ -683,6 +747,102 @@ public final class DocumentManager: @unchecked Sendable {
 
             emitter?.emit(.pendingCreateFailed, ["documentId": documentId, "error": error.localizedDescription] as [String: Any])
             throw error
+        }
+    }
+
+    /// Background commit with exponential-backoff retry. Mirrors js-bao's
+    /// `DocumentManager.scheduleCommitRetry` (`documentManager.ts`): attempts
+    /// `commitOfflineCreate(onExists: "fail")`; on a transient failure it
+    /// records `commitError` / `commitRetryCount` / `nextCommitAttemptAt`,
+    /// emits `documentCreateCommitFailed`, and reschedules after
+    /// `min(maxMs, baseMs * factor^attempt)` (optionally jittered) up to
+    /// `maxAttempts`. Stops once the doc is no longer a pending create
+    /// (committed elsewhere / cancelled) or we've gone offline.
+    func scheduleCommitRetry(documentId: String, attempt: Int = 0) {
+        if let isOnlineProvider, !isOnlineProvider() { return }
+        let backoff = commitRetryBackoff
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await self.commitOfflineCreate(documentId: documentId, onExists: "fail")
+                // created / linked / already-exists → committed, no retry.
+                if result["created"] != nil || result["linked"] != nil { return }
+                if (result["reason"] as? String) == "exists" { return }
+            } catch {
+                // Doc is no longer pending (committed or cancelled mid-flight) → stop.
+                guard self.isPendingCreate(documentId) else { return }
+
+                let message = error.localizedDescription
+                let nowIso = ISO8601DateFormatter().string(from: Date())
+
+                // Record the error + bump the retry counter, then persist.
+                self.lock.lock()
+                if var meta = self.metadataIndex[documentId] {
+                    meta.commitError = CommitError(message: message, at: nowIso)
+                    meta.commitRetryCount = (meta.commitRetryCount ?? 0) + 1
+                    self.metadataIndex[documentId] = meta
+                    self.lock.unlock()
+                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: meta)
+                } else {
+                    self.lock.unlock()
+                }
+
+                self.emitter?.emit(
+                    .documentCreateCommitFailed,
+                    DocumentCreateCommitFailedEvent(documentId: documentId, reason: message)
+                )
+
+                // Exponential backoff: min(maxMs, baseMs * factor^attempt), jittered.
+                var delayMs = min(
+                    backoff.maxMs,
+                    Int(Double(backoff.baseMs) * pow(backoff.factor, Double(attempt)))
+                )
+                if backoff.jitter, delayMs > 0 {
+                    delayMs = Int.random(in: 0...delayMs)
+                }
+
+                // Persist the next-attempt timestamp.
+                let nextAtIso = ISO8601DateFormatter().string(
+                    from: Date().addingTimeInterval(Double(delayMs) / 1000.0)
+                )
+                self.lock.lock()
+                if var meta = self.metadataIndex[documentId] {
+                    meta.nextCommitAttemptAt = nextAtIso
+                    self.metadataIndex[documentId] = meta
+                    self.lock.unlock()
+                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: meta)
+                } else {
+                    self.lock.unlock()
+                }
+
+                // Give up after maxAttempts.
+                if attempt >= backoff.maxAttempts {
+                    self.emitter?.emit(
+                        .documentCreateCommitFailed,
+                        DocumentCreateCommitFailedEvent(
+                            documentId: documentId,
+                            reason: "max retries exceeded (\(backoff.maxAttempts))"
+                        )
+                    )
+                    return
+                }
+
+                // Schedule the next attempt.
+                self.lock.lock()
+                self.pendingCreateRetryTimers[documentId]?.cancel()
+                let timer = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, delayMs)) * 1_000_000)
+                    if Task.isCancelled { return }
+                    guard let self else { return }
+                    self.lock.lock()
+                    self.pendingCreateRetryTimers.removeValue(forKey: documentId)
+                    self.lock.unlock()
+                    self.scheduleCommitRetry(documentId: documentId, attempt: attempt + 1)
+                }
+                self.pendingCreateRetryTimers[documentId] = timer
+                self.lock.unlock()
+            }
         }
     }
 
@@ -765,6 +925,7 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     public func evictLocalData(documentId: String) async {
+        cancelPendingPersist(documentId: documentId)
         lock.lock()
         metadataIndex.removeValue(forKey: documentId)
         docPersistence.removeValue(forKey: documentId)
@@ -785,10 +946,109 @@ public final class DocumentManager: @unchecked Sendable {
         localOnlyDocs.removeAll()
         pendingCreateRetryTimers.values.forEach { $0.cancel() }
         pendingCreateRetryTimers.removeAll()
+        persistDebounceTasks.values.forEach { $0.cancel() }
+        persistDebounceTasks.removeAll()
         lock.unlock()
 
         for docId in docIds {
             try? await offlineStore?.deleteMetadata(appId: appId, userId: userId, documentId: docId)
+        }
+    }
+
+    // MARK: - Retention Policy
+
+    /// Apply a retention policy to the local metadata index. Mirrors
+    /// js-bao `documentManager.enforceRetentionPolicy`:
+    ///  - `ttlMs`: evict any doc whose `lastOpenedAt` age exceeds the TTL.
+    ///  - `maxDocs`: evict the oldest-by-`lastOpenedAt` docs until count fits.
+    ///  - `maxBytes`: evict the oldest-by-`lastOpenedAt` docs until total
+    ///    `localBytes` fits.
+    ///
+    /// Open docs are skipped (eviction while open would corrupt the
+    /// in-memory Y.Doc); pending-create docs are skipped (unsynced
+    /// local state). Order of enforcement matches JS: TTL first, then
+    /// maxDocs, then maxBytes.
+    public func enforceRetentionPolicy(
+        ttlMs: Int? = nil,
+        maxDocs: Int? = nil,
+        maxBytes: Int? = nil
+    ) async {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let formatter = ISO8601DateFormatter()
+
+        // Snapshot the metadata under the lock; eviction itself is
+        // async and takes the lock, so we can't hold it across the
+        // whole loop.
+        lock.lock()
+        let entries = Array(metadataIndex.values)
+        let openSet = Set(openDocs.keys)
+        let pendingSet = pendingCreates
+        lock.unlock()
+
+        // TTL: evict any doc whose lastOpenedAt is older than ttlMs.
+        if let ttlMs {
+            for meta in entries {
+                guard let lastOpenedAt = meta.lastOpenedAt,
+                      let date = formatter.date(from: lastOpenedAt) else { continue }
+                let ageMs = nowMs - (date.timeIntervalSince1970 * 1000)
+                if ageMs > Double(ttlMs),
+                   !openSet.contains(meta.documentId),
+                   !pendingSet.contains(meta.documentId) {
+                    await evictLocalData(documentId: meta.documentId)
+                }
+            }
+        }
+
+        // Re-snapshot after TTL pass; we may have evicted some entries.
+        lock.lock()
+        var remaining = Array(metadataIndex.values)
+        let openSet2 = Set(openDocs.keys)
+        let pendingSet2 = pendingCreates
+        lock.unlock()
+
+        // Sort oldest-first by lastOpenedAt; treat missing as epoch.
+        remaining.sort { a, b in
+            let aTs = a.lastOpenedAt.flatMap { formatter.date(from: $0)?.timeIntervalSince1970 } ?? 0
+            let bTs = b.lastOpenedAt.flatMap { formatter.date(from: $0)?.timeIntervalSince1970 } ?? 0
+            return aTs < bTs
+        }
+
+        // Skip open + pending-create docs in retention math; evicting
+        // them out from under their callers would corrupt local state.
+        let evictable = remaining.filter {
+            !openSet2.contains($0.documentId) && !pendingSet2.contains($0.documentId)
+        }
+
+        // maxDocs: drop the oldest until count fits.
+        if let maxDocs, evictable.count > maxDocs {
+            let toEvict = evictable.prefix(evictable.count - maxDocs)
+            for meta in toEvict {
+                await evictLocalData(documentId: meta.documentId)
+            }
+        }
+
+        // maxBytes: drop the oldest until total bytes fits.
+        if let maxBytes {
+            // Re-snapshot post-maxDocs pass.
+            lock.lock()
+            var after = Array(metadataIndex.values)
+            let openSet3 = Set(openDocs.keys)
+            let pendingSet3 = pendingCreates
+            lock.unlock()
+            after.sort { a, b in
+                let aTs = a.lastOpenedAt.flatMap { formatter.date(from: $0)?.timeIntervalSince1970 } ?? 0
+                let bTs = b.lastOpenedAt.flatMap { formatter.date(from: $0)?.timeIntervalSince1970 } ?? 0
+                return aTs < bTs
+            }
+            var total = after.reduce(0) { $0 + ($1.localBytes ?? 0) }
+            for meta in after {
+                if total <= maxBytes { break }
+                if openSet3.contains(meta.documentId) || pendingSet3.contains(meta.documentId) {
+                    continue
+                }
+                await evictLocalData(documentId: meta.documentId)
+                total -= (meta.localBytes ?? 0)
+            }
         }
     }
 
@@ -810,6 +1070,41 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     // MARK: - Persistence
+
+    /// Schedule a debounced `persistDocumentToLocal` call. Cancels any
+    /// previously-scheduled task for the same doc so a continuous
+    /// stream of updates only flushes once after the burst settles.
+    ///
+    /// Lock semantics: the cancel-and-replace happens under `lock` so
+    /// two concurrent updates can't both win the race and leave an
+    /// orphaned task running. The completed task does NOT remove its
+    /// own dict entry — that would race against the next
+    /// `schedulePersist`'s cancel-and-replace and could wrongly drop
+    /// a newer task. Stale dict entries holding finished `Task` values
+    /// are cheap and get replaced on the next update; full cleanup
+    /// happens in `closeDocument` / `evictLocalData` / `evictAllLocalData`.
+    private func schedulePersist(documentId: String) {
+        lock.lock()
+        persistDebounceTasks[documentId]?.cancel()
+        let task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.persistDebounceNanos)
+            if Task.isCancelled { return }
+            guard let self = self else { return }
+            await self.persistDocumentToLocal(documentId: documentId)
+        }
+        persistDebounceTasks[documentId] = task
+        lock.unlock()
+    }
+
+    /// Cancel a pending debounced persist for one doc, if any. Called
+    /// from the explicit-flush paths (`closeDocument`,
+    /// `evictLocalData`) so we don't race the immediate save / delete
+    /// against the debounce.
+    private func cancelPendingPersist(documentId: String) {
+        lock.lock()
+        persistDebounceTasks.removeValue(forKey: documentId)?.cancel()
+        lock.unlock()
+    }
 
     private func persistDocumentToLocal(documentId: String) async {
         lock.lock()
@@ -885,6 +1180,20 @@ public final class DocumentManager: @unchecked Sendable {
                 error.localizedDescription
             )
         }
+
+        // Record the on-disk size + open-recency on the metadata entry
+        // so `setRetentionPolicy` can enforce `maxBytes` / TTL / LRU.
+        // Mirrors js-bao `documentManager._closeDocCore` lines 945–953.
+        let bytes = state.count
+        let nowIso = ISO8601DateFormatter().string(from: Date())
+        lock.lock()
+        var meta = metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
+        meta.localBytes = bytes
+        meta.lastOpenedAt = nowIso
+        metadataIndex[documentId] = meta
+        let metaSnapshot = meta
+        lock.unlock()
+        try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
     }
 
     /// Load all local metadata from storage

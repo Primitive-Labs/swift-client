@@ -26,6 +26,11 @@ public final class JsBaoClient: @unchecked Sendable {
     public private(set) var integrations: IntegrationsAPI!
     public private(set) var prompts: PromptsAPI!
     public private(set) var workflows: WorkflowsAPI!
+    public private(set) var invitations: InvitationsAPI!
+    public private(set) var blobBuckets: BlobBucketsAPI!
+    public private(set) var cronTriggers: CronTriggersAPI!
+    public private(set) var collectionTypeConfigs: CollectionTypeConfigsAPI!
+    public private(set) var databaseTypeConfigs: DatabaseTypeConfigsAPI!
 
     /// Cache facade for general-purpose caching
     public private(set) var cache: CacheFacade!
@@ -151,6 +156,45 @@ public final class JsBaoClient: @unchecked Sendable {
         return token
     }
 
+    // MARK: - Auth / OAuth config (gap P1)
+
+    /// Returns the raw `/oauth-config` envelope: `appId`, `name`, `mode`,
+    /// `waitlistEnabled`, `googleOAuthEnabled`, `googleClientId`,
+    /// `hasOAuth`, `redirectUris`, `passkeyEnabled`, `passkeyRpId`,
+    /// `passkeyRpName`, `hasPasskey`, `magicLinkEnabled`, `otpEnabled`.
+    /// Mirrors js-bao's `client.getAuthConfig()`.
+    public func getAuthConfig() async throws -> [String: Any] {
+        let result = try await makeRequest("GET", "/oauth-config", nil)
+        return result as? [String: Any] ?? [:]
+    }
+
+    /// App-level config bundle (`appId`, `name`, `mode`,
+    /// `waitlistEnabled`, `hasOAuth`, `hasPasskey`, `magicLinkEnabled`).
+    /// Subset of `getAuthConfig()` shaped for the app-launch UI.
+    /// Matches js-bao's `client.getAppConfig()`.
+    public func getAppConfig() async throws -> [String: Any] {
+        let cfg = try await getAuthConfig()
+        return [
+            "appId": cfg["appId"] ?? "",
+            "name": cfg["name"] ?? "",
+            "mode": cfg["mode"] ?? "public",
+            "waitlistEnabled": cfg["waitlistEnabled"] ?? false,
+            "hasOAuth": cfg["hasOAuth"] ?? false,
+            "hasPasskey": cfg["hasPasskey"] ?? false,
+            "magicLinkEnabled": cfg["magicLinkEnabled"] ?? false,
+        ]
+    }
+
+    /// Boolean predicate: is OAuth set up + configured for this app?
+    /// Mirrors js-bao's `client.checkOAuthAvailable()` — wraps
+    /// `getAuthConfig` and checks `hasOAuth && googleClientId`.
+    public func checkOAuthAvailable() async -> Bool {
+        guard let cfg = try? await getAuthConfig() else { return false }
+        let hasOAuth = cfg["hasOAuth"] as? Bool ?? false
+        let googleClientId = cfg["googleClientId"] as? String
+        return hasOAuth && googleClientId?.isEmpty == false
+    }
+
     // MARK: - Connection
 
     /// Connect to the WebSocket server
@@ -186,8 +230,14 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - Authentication
 
-    /// Wait for authentication to be ready
-    public func waitForAuthReady(timeout: TimeInterval = 10) async throws {
+    /// Wait for authentication to be ready. Mirrors js-bao's
+    /// `client.waitForAuthReady()` return shape: `(userId, mode)`.
+    /// The previous Void return matched neither the JS surface nor
+    /// the cross-platform code that switches on `mode`.
+    @discardableResult
+    public func waitForAuthReady(
+        timeout: TimeInterval = 10
+    ) async throws -> (userId: String?, mode: NetworkMode) {
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 await self.authController.waitForAuthReady()
@@ -199,6 +249,8 @@ public final class JsBaoClient: @unchecked Sendable {
             try await group.next()
             group.cancelAll()
         }
+        let state = authController.getAuthState()
+        return (userId: state.userId, mode: state.mode)
     }
 
     /// Wait for user ID to be available
@@ -208,6 +260,359 @@ public final class JsBaoClient: @unchecked Sendable {
             throw AuthError(code: .unauthorized, message: "Not authenticated")
         }
         return userId
+    }
+
+    // MARK: - Predicates + getters (P2)
+
+    /// `true` iff `documentId` is the app's root doc. Mirrors js-bao's
+    /// `client.isRootDocument(documentId)`. Local-only — reads
+    /// `rootDocId` straight from the JWT payload (no network, no
+    /// async).
+    public func isRootDocument(_ documentId: String) -> Bool {
+        guard let root = rootDocIdFromJwt() else { return false }
+        return root == documentId
+    }
+
+    /// Sync read of `rootDocId` from the parsed JWT payload, matching
+    /// js-bao's `payload.user.rootDocId || payload.rootDocId` lookup.
+    /// `nil` if no token is loaded or neither field is set. Internal
+    /// helper used by `getRootDocId(refresh:)` and `isRootDocument`.
+    private func rootDocIdFromJwt() -> String? {
+        guard let payload = authController.getJwtPayload() else { return nil }
+        if let user = payload["user"] as? [String: Any],
+           let root = user["rootDocId"] as? String, !root.isEmpty {
+            return root
+        }
+        if let root = payload["rootDocId"] as? String, !root.isEmpty {
+            return root
+        }
+        return nil
+    }
+
+    /// Y.Doc state hash for an open document. Used for cache-validity
+    /// checks (the WebSocket sync protocol echoes this hash). Throws
+    /// `notFound` if the doc isn't open. Matches js-bao's
+    /// `client.getDocHash(documentId)`.
+    public func getDocHash(documentId: String) throws -> String {
+        guard let hash = documentManager.getDocHash(documentId: documentId) else {
+            throw JsBaoError(
+                code: .notFound,
+                message: "Document `\(documentId)` is not open"
+            )
+        }
+        return hash
+    }
+
+    /// Top-level convenience wrapper around
+    /// `documents.getDocumentPermission(documentId:)`. js-bao exposes
+    /// this on the client root, which is the call site cross-platform
+    /// code tends to use.
+    public func getDocumentPermission(_ documentId: String) -> DocumentPermission? {
+        documentManager.getPermission(documentId)
+    }
+
+    /// Discover the `PrimitiveSchema`s present in an open doc, keyed
+    /// by model name. Walks the `_meta_*` Y.Maps the SchemaSync layer
+    /// reads.
+    ///
+    /// **Swift-specific shape**: js-bao calls this with just a doc id
+    /// and enumerates every top-level shared type. The current Yrs FFI
+    /// on Swift doesn't expose `Doc.root_refs()`, so callers have to
+    /// supply the candidate `modelNames` list. Names without `_meta_*`
+    /// data simply don't appear in the result.
+    ///
+    /// Returns `nil` if the doc isn't open.
+    public func getDocumentSchema(
+        documentId: String,
+        modelNames: [String]
+    ) -> [String: PrimitiveSchema]? {
+        guard let doc = documentManager.getDocument(documentId) else { return nil }
+        return SchemaDiscovery.discoverSchema(
+            doc: doc, modelNames: modelNames
+        ).models
+    }
+
+    // MARK: - Model mappings + default doc (P2)
+    //
+    // Swift's `BaoModel<T>` and `DynamicModel` take the YDocument
+    // explicitly, so the JS-style "default doc + model registry" isn't
+    // strictly needed — but cross-platform code that calls
+    // `setDefaultDocumentId` / `addDocumentModelMapping` should still
+    // work. We store the mappings on the client and expose them to
+    // callers that want to consult the registry; nothing else in Swift
+    // reads them automatically.
+
+    private var modelToDocumentId: [String: String] = [:]
+    private var defaultDocumentId: String?
+
+    /// Register `modelName → documentId` so a later
+    /// `getDocumentModelMapping(modelName)` returns this doc. Throws
+    /// `notFound` if the doc isn't open. Mirrors js-bao's
+    /// `client.addDocumentModelMapping(modelName, documentId)`.
+    public func addDocumentModelMapping(
+        modelName: String, documentId: String
+    ) throws {
+        guard documentManager.isOpen(documentId) else {
+            throw JsBaoError(
+                code: .notFound,
+                message: "Document `\(documentId)` is not open. " +
+                         "Open the document before mapping a model to it."
+            )
+        }
+        lock.lock()
+        modelToDocumentId[modelName] = documentId
+        lock.unlock()
+    }
+
+    /// Remove a `modelName → documentId` mapping. No-op if none exists.
+    public func clearDocumentModelMapping(modelName: String) {
+        lock.lock()
+        modelToDocumentId.removeValue(forKey: modelName)
+        lock.unlock()
+    }
+
+    /// Resolve a `modelName` to its registered doc, or the default
+    /// doc if no per-model mapping exists. Returns `nil` if neither
+    /// is set. Matches js-bao's `getDocumentIdForModel` /
+    /// `getDocumentModelMapping`.
+    public func getDocumentModelMapping(modelName: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return modelToDocumentId[modelName] ?? defaultDocumentId
+    }
+
+    /// Set the doc used as a fallback when no per-model mapping
+    /// applies. Throws `notFound` if the doc isn't open.
+    public func setDefaultDocumentId(_ documentId: String) throws {
+        guard documentManager.isOpen(documentId) else {
+            throw JsBaoError(
+                code: .notFound,
+                message: "Document `\(documentId)` is not open. " +
+                         "Open the document before setting it as the default."
+            )
+        }
+        lock.lock()
+        defaultDocumentId = documentId
+        lock.unlock()
+    }
+
+    public func clearDefaultDocumentId() {
+        lock.lock()
+        defaultDocumentId = nil
+        lock.unlock()
+    }
+
+    public func getDefaultDocumentId() -> String? {
+        lock.lock()
+        let id = defaultDocumentId
+        lock.unlock()
+        return id
+    }
+
+    // MARK: - Analytics context helpers (P2)
+    //
+    // js-bao exposes per-feature analytics context bundles so the LLM
+    // / Gemini call paths can log structured events. On Swift those
+    // sites just delegate to `logAnalyticsEvent` directly today; the
+    // bundles below are wrappers that match the JS shape so cross-
+    // platform code can call `client.getLlmAnalyticsContext()?.logEvent(...)`
+    // identically.
+
+    /// Returns a logger handle for LLM analytics, or `nil` when the
+    /// auto-events config for `llm` is fully disabled. The handle has
+    /// the same shape as js-bao's: `logEvent(event)` and
+    /// `isEnabled(phase?)`.
+    public func getLlmAnalyticsContext() -> AnalyticsContext? {
+        // Auto-events config isn't a typed option on Swift yet; if it
+        // lands, swap this for the real flag-walk. For now always
+        // return a context so cross-platform callers don't no-op.
+        return AnalyticsContext { [weak self] event in
+            self?.logAnalyticsEvent(event)
+        }
+    }
+
+    /// Returns a logger handle for Gemini analytics — same shape as
+    /// `getLlmAnalyticsContext()`.
+    public func getGeminiAnalyticsContext() -> AnalyticsContext? {
+        return AnalyticsContext { [weak self] event in
+            self?.logAnalyticsEvent(event)
+        }
+    }
+
+    // MARK: - Top-level offline-metadata browsing (gap 14)
+
+    /// List metadata for all docs the local store has persisted.
+    /// Returns one entry per documentId. Matches js-bao's
+    /// `client.listLocalDocuments()`.
+    public func listLocalDocuments() -> [String: LocalMetadataEntry] {
+        documentManager.getMetadataIndex()
+    }
+
+    /// Evict a single doc's local data from this device. Background;
+    /// the call returns once the eviction task is scheduled.
+    public func evictLocalDocument(_ documentId: String) async {
+        await documentManager.evictLocalData(documentId: documentId)
+    }
+
+    /// Storage for the active retention policy. Applied immediately
+    /// when set; subsequent doc opens / persists update the
+    /// `lastOpenedAt` and `localBytes` fields that enforcement reads.
+    private var retentionPolicy: RetentionPolicy = .init()
+
+    /// Apply a retention policy that bounds the local document store.
+    ///
+    /// - `ttlMs`: docs whose `lastOpenedAt` is older than this are
+    ///   evicted on the next enforcement pass.
+    /// - `maxDocs`: only the most-recently-opened N docs are kept.
+    /// - `maxBytes`: oldest docs are evicted until total `localBytes`
+    ///   fits the budget.
+    /// - `default`/`preserveOnSignOut`: stored for parity with js-bao's
+    ///   shape; not yet enforced (matches JS — those fields are set
+    ///   but not consumed by `enforceRetentionPolicy` either).
+    ///
+    /// Enforcement runs immediately and again as docs open/close
+    /// (which is when `lastOpenedAt` / `localBytes` shift).
+    public func setRetentionPolicy(_ policy: RetentionPolicy) {
+        lock.lock()
+        retentionPolicy = policy
+        lock.unlock()
+        Task { [policy, weak self] in
+            await self?.documentManager.enforceRetentionPolicy(
+                ttlMs: policy.ttlMs,
+                maxDocs: policy.maxDocs,
+                maxBytes: policy.maxBytes
+            )
+        }
+    }
+
+    /// Inspect the active retention policy.
+    public func getRetentionPolicy() -> RetentionPolicy {
+        lock.lock()
+        defer { lock.unlock() }
+        return retentionPolicy
+    }
+
+    /// Mark a doc as deleted locally — wipes the in-memory metadata
+    /// entry and removes the persisted offline-store record.
+    ///
+    /// **Note on JS parity:** js-bao's `client.markMetadataDeleted`
+    /// only records a dedup-tombstone timestamp and does NOT wipe
+    /// local data (that's done separately via `evictLocalDocument`).
+    /// Swift intentionally diverges here: callers want data actually
+    /// gone, not just marked. If you only need the dedup signal in
+    /// cross-platform code, call this method conditionally on the
+    /// platform.
+    public func markMetadataDeleted(_ documentId: String) async {
+        await documentManager.evictLocalData(documentId: documentId)
+    }
+
+    // MARK: - waitFor* family (gap 12)
+    //
+    // Mirrors the JS client's UX waiters. Implementations poll the
+    // underlying state on a short interval rather than installing
+    // dedicated subscribers — the JS counterparts use the same
+    // pattern internally, just with a Promise/observable wrapper.
+    // Polling cap defaults to 200ms; callers that need finer granularity
+    // can drop the interval.
+
+    /// Wait until `isSynced(documentId)` reports true (initial sync
+    /// completed for the doc). Throws `unavailable` on timeout.
+    public func waitForInitialSync(
+        documentId: String,
+        timeoutMs: Int = 10_000,
+        pollMs: Int = 200
+    ) async throws {
+        try await pollUntil(timeoutMs: timeoutMs, pollMs: pollMs) {
+            self.documentManager.isSynced(documentId)
+        }
+    }
+
+    /// One-shot sync gate: returns as soon as the doc reports synced
+    /// once. Alias for `waitForInitialSync` in this Swift surface —
+    /// JS treats them slightly differently around reconnect (JS resets
+    /// the gate on disconnect; Swift's `isSynced` already does), so
+    /// they're behaviorally identical here.
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `waitForSync`.
+    @available(*, deprecated, message: "Use waitForInitialSync(documentId:timeoutMs:pollMs:) instead.")
+    public func waitForSync(
+        documentId: String,
+        timeoutMs: Int = 10_000,
+        pollMs: Int = 200
+    ) async throws {
+        try await waitForInitialSync(
+            documentId: documentId, timeoutMs: timeoutMs, pollMs: pollMs
+        )
+    }
+
+    /// Continuous sync gate: waits until the doc is synced *and stays
+    /// synced* through one poll cycle past the first true reading.
+    /// Matches js-bao's `waitForInSync` semantics where the consumer
+    /// needs to be sure the doc isn't about to flip back to syncing.
+    public func waitForInSync(
+        documentId: String,
+        timeoutMs: Int = 10_000,
+        pollMs: Int = 200
+    ) async throws {
+        var stableReadings = 0
+        let stableTarget = 2  // two consecutive true readings
+        try await pollUntil(timeoutMs: timeoutMs, pollMs: pollMs) {
+            if self.documentManager.isSynced(documentId) {
+                stableReadings += 1
+                return stableReadings >= stableTarget
+            }
+            stableReadings = 0
+            return false
+        }
+    }
+
+    /// Wait until any pending local writes for the doc have been
+    /// acknowledged by the server. Implementation: a sync gate, since
+    /// `isSynced` flips to true only after both inbound and outbound
+    /// sync drains. Mirrors js-bao's
+    /// `waitForWriteConfirmation(docId, timeoutMs)`.
+    public func waitForWriteConfirmation(
+        documentId: String,
+        timeoutMs: Int = 10_000,
+        pollMs: Int = 200
+    ) async throws {
+        try await waitForInSync(
+            documentId: documentId, timeoutMs: timeoutMs, pollMs: pollMs
+        )
+    }
+
+    /// Initial-auth-flow handoff. Returns once the auth controller's
+    /// bootstrap settles (either authenticated or the offline grace
+    /// window confirms the user can keep going). Differs from
+    /// `waitForAuthReady` in that `waitForAuthReady` returns on
+    /// *online* readiness; `waitForAuthBootstrap` returns on either
+    /// online OR offline-with-grant.
+    public func waitForAuthBootstrap(timeout: TimeInterval = 10) async throws {
+        try await pollUntil(
+            timeoutMs: Int(timeout * 1000), pollMs: 100
+        ) {
+            let state = self.authController.getAuthState()
+            return state.authenticated || state.mode == .offline
+        }
+    }
+
+    /// Common polling loop used by every `waitFor*` above. Returns when
+    /// `predicate()` first returns true. Throws `unavailable` if the
+    /// timeout elapses first.
+    private func pollUntil(
+        timeoutMs: Int,
+        pollMs: Int,
+        predicate: @escaping @Sendable () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        while Date() < deadline {
+            if predicate() { return }
+            try await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
+        }
+        throw JsBaoError(
+            code: .unavailable,
+            message: "waitFor* timeout after \(timeoutMs)ms"
+        )
     }
 
     /// Get current auth state
@@ -336,8 +741,14 @@ public final class JsBaoClient: @unchecked Sendable {
         await disconnect()
     }
 
-    /// Set network mode
-    public func setNetworkMode(_ mode: NetworkMode) {
+    /// Set network mode. The optional `reason` is included in the
+    /// emitted `networkMode` event so subscribers can distinguish
+    /// user-initiated from system-initiated mode changes. Matches
+    /// js-bao's `setNetworkMode(mode, opts)` shape.
+    public func setNetworkMode(
+        _ mode: NetworkMode,
+        options: SetNetworkModeOptions = SetNetworkModeOptions()
+    ) {
         lock.lock()
         networkMode = mode
         lock.unlock()
@@ -345,7 +756,7 @@ public final class JsBaoClient: @unchecked Sendable {
         events.emit(.networkMode, NetworkModeEvent(
             mode: mode,
             isOnline: mode != .offline,
-            reason: "user_set"
+            reason: options.reason ?? "user_set"
         ))
     }
 
@@ -466,25 +877,47 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Create a new document
+    /// Create a document. Local-first by default — mirrors js-bao's
+    /// `DocumentManager.createDocument` flow (#852). The returned
+    /// `YDocument` is immediately writable; when `options.localOnly`
+    /// is false (the default), a server commit is scheduled in the
+    /// background and the `pendingCreate` metadata flag is cleared on
+    /// success. On failure the `pendingCreateFailed` event fires and
+    /// the metadata's `commitError` carries the reason.
+    ///
+    /// Before #852, this method blocked on `POST /documents` when
+    /// online and returned `(id, nil)` — apps had to pass
+    /// `localOnly: true` and call `commitOfflineCreate` manually to
+    /// get a usable doc.
     public func createDocument(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> (documentId: String, doc: YDocument?) {
-        let documentId = UUID().uuidString.lowercased()
+        // The server's `POST /documents` route validates documentId
+        // against `^[0-9A-HJKMNP-TV-Z]{26}$` (Crockford ULID). Pre-#852
+        // this method generated a UUID, which the server quietly
+        // rejected on the legacy blocking path — switch to the
+        // existing in-tree `ULID` helper so the background commit
+        // succeeds.
+        let documentId = ULID.generate()
 
-        if options.localOnly || !isOnline() {
-            let doc = try await documentManager.createLocalDocument(
-                documentId: documentId,
-                title: options.title,
-                localOnly: options.localOnly
-            )
-            return (documentId, doc)
+        let doc = try await documentManager.createLocalDocument(
+            documentId: documentId,
+            title: options.title,
+            localOnly: options.localOnly,
+            tags: options.tags
+        )
+
+        // Schedule the server commit in the background. `localOnly`
+        // docs stay local forever; everything else races up to the
+        // server while the caller is already writing into `doc`.
+        // `scheduleCommitRetry` mirrors js-bao: it retries with
+        // exponential backoff on a transient failure (persisting
+        // `commitError` / `commitRetryCount` / `nextCommitAttemptAt`
+        // and emitting `documentCreateCommitFailed` each round) rather
+        // than stranding the doc in `pendingCreate` after a single blip.
+        if !options.localOnly && isOnline() {
+            documentManager.scheduleCommitRetry(documentId: documentId)
         }
 
-        // Create on server
-        var body: [String: Any] = ["documentId": documentId]
-        if let title = options.title { body["title"] = title }
-        if let tags = options.tags { body["tags"] = tags }
-
-        let _ = try await makeRequest("POST", "/documents", body)
-        return (documentId, nil)
+        return (documentId, doc)
     }
 
     /// Get a Y.Doc for an open document
@@ -590,11 +1023,41 @@ public final class JsBaoClient: @unchecked Sendable {
         documentManager.isReadOnly(documentId)
     }
 
-    /// Get root document ID
-    public func getRootDocId() async throws -> String? {
-        let result = try await makeRequest("GET", "/documents/root", nil)
-        guard let dict = result as? [String: Any] else { return nil }
-        return dict["documentId"] as? String
+    /// Get root document ID from the parsed JWT payload. Matches
+    /// js-bao's `authController.getRootDocId()` (reads
+    /// `payload.user.rootDocId || payload.rootDocId`), with the offline
+    /// identity as a final fallback. No HTTP call — the value is
+    /// available immediately after sign-in in any auth flow
+    /// (OTP / OAuth / magic link / offline grant). `refresh` is kept
+    /// for source compatibility and is a no-op now that there's
+    /// nothing to refetch.
+    public func getRootDocId(refresh: Bool = false) async throws -> String? {
+        if let root = rootDocIdFromJwt() { return root }
+        return authController.getOfflineIdentity()?.rootDocId
+    }
+
+    /// Open a document by URL alias. Resolves the alias to a
+    /// documentId via the server, then opens it via the standard
+    /// `openDocument` path. Mirrors js-bao's
+    /// `client.openDocumentByAlias(alias)`.
+    public func openDocumentByAlias(
+        _ alias: String,
+        options: OpenDocumentOptions = OpenDocumentOptions()
+    ) async throws -> YDocument {
+        let escaped = alias.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? alias
+        let result = try await makeRequest(
+            "GET", "/document-aliases/\(escaped)/resolve", nil
+        )
+        guard let dict = result as? [String: Any],
+              let documentId = dict["documentId"] as? String else {
+            throw JsBaoError(
+                code: .aliasNotFound,
+                message: "Alias `\(alias)` did not resolve to a document"
+            )
+        }
+        return try await openDocument(documentId, options: options)
     }
 
     /// Check if a document is a pending create
@@ -762,9 +1225,40 @@ public final class JsBaoClient: @unchecked Sendable {
         ]
     }
 
-    /// Sync metadata
-    public func syncMetadata() async throws {
-        let result = try await makeRequest("GET", "/documents", nil)
+    /// Sync metadata. With no options, refreshes the full doc list.
+    /// `options.documentId` restricts to one doc;
+    /// `options.payloadType` (`"ids"` | `"full"`) controls the wire
+    /// shape; `options.background` runs without blocking. Matches
+    /// js-bao's `syncMetadata(opts)` shape.
+    public func syncMetadata(
+        options: SyncMetadataOptions = SyncMetadataOptions()
+    ) async throws {
+        var path = "/documents"
+        var qs: [String] = []
+        if let docId = options.documentId,
+           let escaped = docId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            qs.append("documentId=\(escaped)")
+        }
+        if let payloadType = options.payloadType {
+            qs.append("payloadType=\(payloadType)")
+        }
+        if !qs.isEmpty {
+            path += "?\(qs.joined(separator: "&"))"
+        }
+
+        if options.background == true {
+            // Fire-and-forget; caller wants the sync to run but doesn't
+            // want to await its completion.
+            Task { [weak self] in
+                guard let self = self else { return }
+                if let result = try? await self.makeRequest("GET", path, nil),
+                   let docs = result as? [[String: Any]] {
+                    await self.documentManager.handleServerDocuments(docs)
+                }
+            }
+            return
+        }
+        let result = try await makeRequest("GET", path, nil)
         guard let docs = result as? [[String: Any]] else { return }
         await documentManager.handleServerDocuments(docs)
     }
@@ -870,6 +1364,7 @@ public final class JsBaoClient: @unchecked Sendable {
             self?.queueOutboundUpdate(documentId: documentId, update: update)
         }
         documentManager.commitRetryBackoff = options.commitRetryBackoff
+        documentManager.isOnlineProvider = { [weak self] in self?.isOnline() ?? false }
 
         // Wire blob manager dependencies
         blobManager.makeRequest = { [weak self] method, path, data in
@@ -913,10 +1408,39 @@ public final class JsBaoClient: @unchecked Sendable {
         )
         self.cache = cacheFacade
 
-        documents = DocumentsAPI(makeRequest: request, blobManager: blobManager)
+        documents = DocumentsAPI(
+            makeRequest: request,
+            blobManager: blobManager,
+            documentManager: documentManager,
+            client: self
+        )
         collections = CollectionsAPI(makeRequest: request)
         databases = DatabasesAPI(makeRequest: request)
-        me = MeAPI(makeRequest: request, cache: cacheFacade)
+        // Raw HTTP closure for endpoints that need to send raw bytes
+        // with custom Content-Type (e.g. avatar upload). Defined here
+        // so MeAPI and BlobBucketsAPI both reuse the same plumbing.
+        let rawRequestForRaw: (String, String, Data?, [String: String]) async throws -> (Data, Int) = {
+            [weak self] method, path, data, headers in
+            guard let self = self else { throw JsBaoError(code: .unavailable) }
+            let options = RequestOptions(rawBody: true, customHeaders: headers)
+            let response = try await self.httpClient.requestRaw(
+                method: method, path: path, data: data, options: options
+            )
+            let bodyData: Data
+            if let raw = response.data as? Data {
+                bodyData = raw
+            } else if let text = response.text {
+                bodyData = Data(text.utf8)
+            } else {
+                bodyData = Data()
+            }
+            return (bodyData, response.status)
+        }
+        me = MeAPI(
+            makeRequest: request,
+            cache: cacheFacade,
+            makeRawRequest: rawRequestForRaw
+        )
         session = SessionAPI(makeRequest: request)
         llm = LlmAPI(makeRequest: request)
         gemini = GeminiAPI(makeRequest: request)
@@ -944,8 +1468,16 @@ public final class JsBaoClient: @unchecked Sendable {
         workflows = WorkflowsAPI(
             makeRequest: request,
             getConnectionId: { [weak self] in self?.wsManager.connectionId ?? "" },
-            logger: logger
+            logger: logger,
+            events: events
         )
+        invitations = InvitationsAPI(makeRequest: request)
+        // BlobBuckets reuses the same raw HTTP closure defined above
+        // for MeAPI — both need raw bodies with custom Content-Type.
+        blobBuckets = BlobBucketsAPI(makeRequest: request, makeRawRequest: rawRequestForRaw)
+        cronTriggers = CronTriggersAPI(makeRequest: request)
+        collectionTypeConfigs = CollectionTypeConfigsAPI(makeRequest: request)
+        databaseTypeConfigs = DatabaseTypeConfigsAPI(makeRequest: request)
     }
 
     private func setupStorage() {
@@ -972,7 +1504,18 @@ public final class JsBaoClient: @unchecked Sendable {
                     // same file and the second is a no-op. The kv_store
                     // `store` column already namespaces auth records vs
                     // everything else, so they don't collide on rows either.
-                    let sqlite = try SQLiteStorageProvider(path: directory)
+                    //
+                    // #853: when the app passes `.sqlite()` (no
+                    // directory), resolve a stable per-appId path here
+                    // rather than letting `SQLiteStorageProvider` fall
+                    // back to namespace-derived directories. Without
+                    // this, the auth namespace (`auth:<appId>:…`) and
+                    // the user namespace (`<appId>:<userId>`) resolved
+                    // to different files and the second `initialize`
+                    // tripped the re-bind guard mid-`createDocument`.
+                    let resolvedPath = directory
+                        ?? SQLiteStorageProvider.defaultDatabasePath(appId: options.appId)
+                    let sqlite = try SQLiteStorageProvider(path: resolvedPath)
                     provider = sqlite
                     authProvider = sqlite
                 case .memory:
@@ -1132,6 +1675,32 @@ public final class JsBaoClient: @unchecked Sendable {
         case "meUpdated":
             events.emit(.meUpdated, json)
 
+        case "docMetadata":
+            // Server-pushed metadata change. Carries `action` ∈ {created,
+            // updated, deleted, evicted}, plus the new metadata blob (nil
+            // on delete/revoke). Emit the typed event for general
+            // subscribers; derive `documentDeleted` for the common
+            // "detail view needs to pop" case so subscribers don't have
+            // to filter the action string themselves.
+            guard let docId = roomId else { return }
+            let actionStr = json["action"] as? String ?? "updated"
+            let metadata = json["metadata"] as? [String: Any]
+            let changedFields = json["changedFields"] as? [String]
+            let event = DocumentMetadataChangedEvent(
+                documentId: docId,
+                action: actionStr,
+                metadata: metadata,
+                changedFields: changedFields,
+                source: "remote"
+            )
+            events.emit(.documentMetadataChanged, event)
+            if actionStr == "deleted" {
+                events.emit(
+                    .documentDeleted,
+                    DocumentDeletedEvent(documentId: docId, source: "server-push")
+                )
+            }
+
         default:
             logger.debug("Unhandled WS message:", action)
         }
@@ -1248,10 +1817,15 @@ extension JsBaoClient: WebSocketManagerDelegate {
     public func webSocketManagerOnClose(code: Int?, reason: String?) {
         logger.log("WebSocket closed:", code ?? 0, reason ?? "")
         events.emit(.status, StatusChangedEvent(status: .disconnected))
+        events.emit(.connectionClose, ConnectionCloseEvent(code: code, reason: reason))
     }
 
     public func webSocketManagerOnError(_ error: Error) {
         logger.warn("WebSocket error:", error.localizedDescription)
+        events.emit(.connectionError, ConnectionErrorEvent(message: error.localizedDescription))
+        events.emit(.error, GenericErrorEvent(
+            scope: "websocket", message: error.localizedDescription
+        ))
     }
 
     public func webSocketManagerOnReconnectScheduled(delayMs: Int) {

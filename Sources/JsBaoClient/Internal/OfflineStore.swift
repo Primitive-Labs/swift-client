@@ -232,6 +232,20 @@ public struct LocalMetadataEntry: Codable, Sendable {
     public var localOnly: Bool?
     public var commitError: CommitError?
     public var metadataSyncedAt: String?
+    /// ISO-8601 timestamp of the most recent `openDocument` / persist
+    /// for this doc. Drives `setRetentionPolicy` TTL and LRU eviction.
+    /// Mirrors js-bao `LocalMetadataEntry.lastOpenedAt`.
+    public var lastOpenedAt: String?
+    /// Byte length of the doc's Yjs state-as-update at the most recent
+    /// persist. Drives `setRetentionPolicy` `maxBytes` enforcement.
+    /// Mirrors js-bao `LocalMetadataEntry.localBytes`.
+    public var localBytes: Int?
+    /// Number of failed background-commit attempts for a pending create.
+    /// Mirrors js-bao `LocalMetadataEntry.commitRetryCount`.
+    public var commitRetryCount: Int?
+    /// ISO-8601 timestamp of the next scheduled background-commit retry.
+    /// Mirrors js-bao `LocalMetadataEntry.nextCommitAttemptAt`.
+    public var nextCommitAttemptAt: String?
 
     public init(
         documentId: String,
@@ -244,7 +258,11 @@ public struct LocalMetadataEntry: Codable, Sendable {
         pendingCreate: Bool? = nil,
         localOnly: Bool? = nil,
         commitError: CommitError? = nil,
-        metadataSyncedAt: String? = nil
+        metadataSyncedAt: String? = nil,
+        lastOpenedAt: String? = nil,
+        localBytes: Int? = nil,
+        commitRetryCount: Int? = nil,
+        nextCommitAttemptAt: String? = nil
     ) {
         self.documentId = documentId
         self.title = title
@@ -257,6 +275,10 @@ public struct LocalMetadataEntry: Codable, Sendable {
         self.localOnly = localOnly
         self.commitError = commitError
         self.metadataSyncedAt = metadataSyncedAt
+        self.lastOpenedAt = lastOpenedAt
+        self.localBytes = localBytes
+        self.commitRetryCount = commitRetryCount
+        self.nextCommitAttemptAt = nextCommitAttemptAt
     }
 }
 

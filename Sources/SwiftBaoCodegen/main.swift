@@ -7,7 +7,12 @@ import Foundation
 struct CLIArgs {
     var input: String = ""
     var output: String = ""
-    var accessLevel: String = "internal"
+    // Default `public` so an app-side companion file can extend the
+    // generated type with `public extension TodoItem { ... }` (the shape
+    // the agent guide demonstrates) without hitting Swift's "public
+    // modifier cannot be used in extensions that declare members on an
+    // internal type" diagnostic. Pass `--access internal` to opt out.
+    var accessLevel: String = "public"
     var moduleImport: String = "JsBaoClient"
     var swiftNameSuffix: String = "Record"
 
@@ -62,7 +67,7 @@ func usage() {
     OPTIONS:
       --input <file>          Input TOML schema (required)
       --output <dir>          Output directory; one .swift file per [models.X] (required)
-      --access <level>        internal | public  (default: internal)
+      --access <level>        internal | public  (default: public)
       --module-import <name>  Module exporting PrimitiveModel/PrimitiveSchema/etc.
                               (default: JsBaoClient)
       --name-suffix <suffix>  Default suffix appended to PascalCase(model name).

@@ -57,10 +57,10 @@ This is the highest-risk parity surface. The Swift `Sources/JsBaoClient/Schema/`
 
 | Concept | js-bao | Swift | Status |
 |---|---|---|---|
-| Strict-by-default (rejects unknown keys) | ✅ since the v2 codegen change | ⚠️ permissive | ⚠️ P1 — flip the default |
-| `hasMany.related_id_field` required | ✅ | ⚠️ optional | ⚠️ P2 |
-| `hasManyThrough.join_model_local_field` required | ✅ | ⚠️ optional | ⚠️ P2 |
-| `hasManyThrough.join_model_related_field` required | ✅ | ⚠️ optional | ⚠️ P2 |
+| Strict-by-default (rejects unknown keys) | ✅ since the v2 codegen change | ✅ since [#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789) | ✅ — `strict: false` is the legacy escape hatch |
+| `hasMany.related_id_field` required | ✅ | ✅ | ✅ ([#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789)) |
+| `hasManyThrough.join_model_local_field` required | ✅ | ✅ | ✅ ([#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789)) |
+| `hasManyThrough.join_model_related_field` required | ✅ | ✅ | ✅ ([#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789)) |
 | `class_name` override | ✅ | ✅ | ✅ — both codegens use this |
 | Field-type validation | ✅ | ✅ | ✅ |
 | Compound unique constraints | ✅ | ✅ | ✅ |
@@ -111,16 +111,16 @@ Concurrent-write safety story:
 
 ## Known divergences in summary
 
-| # | Issue | Severity |
-|---|---|---|
-| 1 | TOML loader not strict-by-default | P1 |
-| 2 | TOML loader missing required-field validation for hasMany / hasManyThrough | P2 |
-| 3 | Stringset wire format (see wire-format.md) | P1 |
-| 4 | Stringset full-replace semantics (CRDT-unfriendly under offline writes) | P2 architectural |
-| 5 | `TypedModel<T>` minimal — no `update`, `queryOne`, `findByUnique`, `queryPaged` | ⛔ v1, P2 v1.1 |
-| 6 | `record.hasMany()` lazy path is `findAll().filter`, no pagination | ⚠️ P2 perf |
-| 7 | `notifyListeners()` fires inside write tx | ⚠️ P3 |
-| 8 | DynamicModel's 1,431 lines bundle 7 concerns | P3 cleanup |
+| # | Issue | Severity | Status |
+|---|---|---|---|
+| 1 | TOML loader not strict-by-default | P1 | ✅ closed ([#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789)) |
+| 2 | TOML loader missing required-field validation for hasMany / hasManyThrough | P2 | ✅ closed ([#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789)) |
+| 3 | Stringset wire format (see wire-format.md) | P1 | ⚠️ open |
+| 4 | Stringset full-replace semantics (CRDT-unfriendly under offline writes) | P2 architectural | ⚠️ open |
+| 5 | `TypedModel<T>` minimal — no `update`, `queryOne`, `findByUnique`, `queryPaged` | ⛔ v1, P2 v1.1 | ⚠️ open |
+| 6 | `record.hasMany()` lazy path is `findAll().filter`, no pagination | ⚠️ P2 perf | ⚠️ open |
+| 7 | `notifyListeners()` fires inside write tx | ⚠️ P3 | ⚠️ open |
+| 8 | DynamicModel's 1,431 lines bundle 7 concerns | P3 cleanup | ⚠️ open |
 
 ## Notes for maintainers
 

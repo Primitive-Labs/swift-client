@@ -241,4 +241,46 @@ public final class IntegrationsAPI: @unchecked Sendable {
         if let upstreamCode = upstreamCode { details["upstreamCode"] = upstreamCode }
         return JsBaoError(code: code, message: message, details: details)
     }
+
+    // MARK: - Catalog (list / get)
+    //
+    // The JS client's `list()` / `get()` go through the standard JSON
+    // path, not the raw-response one used by `call`. We piggy-back on
+    // the raw closure (the only one we have) and decode the body
+    // ourselves, mapping non-2xx to a `JsBaoError`.
+
+    /// List integrations configured for the current app.
+    public func list() async throws -> [[String: Any]] {
+        let response = try await makeRawRequest("GET", "/integrations", nil)
+        guard let json = decodeJsonBody(response: response) else { return [] }
+        if let dict = json as? [String: Any],
+           let items = dict["integrations"] as? [[String: Any]] {
+            return items
+        }
+        return json as? [[String: Any]] ?? []
+    }
+
+    /// Get a single integration by id or key.
+    public func get(integrationIdOrKey: String) async throws -> [String: Any] {
+        let escaped = integrationIdOrKey.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? integrationIdOrKey
+        let response = try await makeRawRequest("GET", "/integrations/\(escaped)", nil)
+        if let json = decodeJsonBody(response: response) as? [String: Any] {
+            return json
+        }
+        return [:]
+    }
+
+    private func decodeJsonBody(response: HttpClientResponse) -> Any? {
+        if (200..<300).contains(response.status) {
+            if let data = response.data { return data }
+            if let text = response.text,
+               let raw = text.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: raw) {
+                return json
+            }
+        }
+        return nil
+    }
 }

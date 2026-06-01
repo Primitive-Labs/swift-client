@@ -331,6 +331,123 @@ public final class DynamicModel {
         try applyWrite(id: id, values: values, isUpdate: true)
     }
 
+    /// Add a single member to a stringset field WITHOUT replacing the
+    /// rest of the set. The underlying Y.Map is updated with one
+    /// `insert(member, "true")` op — concurrent offline writes from
+    /// other clients adding *different* members will all union when
+    /// the docs reconcile (CRDT-friendly).
+    ///
+    /// This is the path to use for "add this tag", "add this user to
+    /// the participants set", etc. The full-replace path
+    /// (`update(id:, values: [field: .stringset([...])])`) overwrites
+    /// the entire nested Y.Map, which loses concurrent adds.
+    ///
+    /// Throws if `fieldName` isn't a `.stringset` in the schema, the
+    /// record doesn't exist, or the `maxCount` constraint would be
+    /// violated.
+    public func addStringsetMember(
+        id: String,
+        fieldName: String,
+        member: String
+    ) throws {
+        guard let desc = schema.fields[fieldName] else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "Unknown field `\(fieldName)` on model `\(schema.name)`"
+            )
+        }
+        guard desc.type == .stringset else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "Field `\(fieldName)` is type `\(desc.type)`, not stringset"
+            )
+        }
+        if let maxLen = desc.maxLength, member.count > maxLen {
+            throw FieldValidationError.stringsetMemberTooLong(
+                field: fieldName, modelName: schema.name,
+                limit: maxLen, member: member
+            )
+        }
+        try withThrowingTx { tx in
+            guard let root = tx.transactionGetOrInsertMap(name: schema.name)
+                    as YrsMap? else {
+                throw JsBaoError(
+                    code: .notFound,
+                    message: "Record `\(id)` not found on model `\(schema.name)`"
+                )
+            }
+            guard let rec = root.getMap(tx: tx, key: id) else {
+                throw JsBaoError(
+                    code: .notFound,
+                    message: "Record `\(id)` not found on model `\(schema.name)`"
+                )
+            }
+            // Get-or-create the nested member map. Returns the existing
+            // map when present, so we don't clobber concurrent members.
+            let nested = rec.getOrInsertMap(tx: tx, key: fieldName)
+            if let max = desc.maxCount {
+                let collector = KeyCollector()
+                nested.keys(tx: tx, delegate: collector)
+                let willHaveCount = collector.keys.contains(member)
+                    ? collector.keys.count
+                    : collector.keys.count + 1
+                if willHaveCount > max {
+                    throw FieldValidationError.stringsetMaxCountExceeded(
+                        field: fieldName, modelName: schema.name,
+                        limit: max, got: willHaveCount
+                    )
+                }
+            }
+            nested.insert(tx: tx, key: member, value: "true")
+        }
+    }
+
+    /// Remove a single member from a stringset field WITHOUT touching
+    /// other members. Concurrent offline removes converge to "the
+    /// member is gone"; concurrent adds of the same member after a
+    /// remove follow yrs's standard last-writer-wins on the per-key
+    /// position.
+    ///
+    /// No-ops if the member wasn't present. Throws if the record
+    /// doesn't exist or the field isn't a stringset.
+    public func removeStringsetMember(
+        id: String,
+        fieldName: String,
+        member: String
+    ) throws {
+        guard let desc = schema.fields[fieldName] else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "Unknown field `\(fieldName)` on model `\(schema.name)`"
+            )
+        }
+        guard desc.type == .stringset else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "Field `\(fieldName)` is type `\(desc.type)`, not stringset"
+            )
+        }
+        try withThrowingTx { tx in
+            guard let root = tx.transactionGetOrInsertMap(name: schema.name)
+                    as YrsMap? else {
+                throw JsBaoError(
+                    code: .notFound,
+                    message: "Record `\(id)` not found on model `\(schema.name)`"
+                )
+            }
+            guard let rec = root.getMap(tx: tx, key: id) else {
+                throw JsBaoError(
+                    code: .notFound,
+                    message: "Record `\(id)` not found on model `\(schema.name)`"
+                )
+            }
+            guard let nested = rec.getMap(tx: tx, key: fieldName) else {
+                return // no-op: field absent
+            }
+            _ = try? nested.remove(tx: tx, key: member)
+        }
+    }
+
     /// Insert-or-update by a single-field unique value. Mirrors
     /// js-bao's `save({ upsertOn: field })`.
     ///
@@ -1210,13 +1327,25 @@ public final class DynamicModel {
         tx: YrsTransaction
     ) {
         if case let .stringset(items) = value {
-            // Replace the nested Y.Map wholesale: remove first (so old
-            // entries drop), then insert a fresh map and populate it.
+            // Per-member layout: each member is a key in the nested
+            // Y.Map with value `true`. Mirrors js-bao's wire format
+            // (browser.ts `setStringSet`). Previously Swift wrote the
+            // JSON-encoded member name as the value — both clients
+            // could read either shape, but byte-equality assertions
+            // failed and downstream tooling that inspects the raw
+            // Y.Doc saw different content.
+            //
+            // We still replace the nested Y.Map wholesale here — this
+            // is the full-set-replace write path (`create`/`update`
+            // with a stringset value). Per-member add/remove without
+            // overwriting the whole map goes through
+            // `addStringsetMember(_:)` / `removeStringsetMember(_:)`,
+            // which keeps the CRDT-union semantics intact under
+            // concurrent offline writes.
             _ = try? rec.remove(tx: tx, key: fieldName)
             let nested = rec.insertMap(tx: tx, key: fieldName)
             for item in items {
-                nested.insert(tx: tx, key: item,
-                              value: PrimitiveValue.jsonEncodeString(item))
+                nested.insert(tx: tx, key: item, value: "true")
             }
             return
         }

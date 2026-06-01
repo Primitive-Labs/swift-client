@@ -4,16 +4,19 @@ import Foundation
 
 public final class MeAPI: @unchecked Sendable {
     private let makeRequest: (String, String, Any?) async throws -> Any
+    private let makeRawRequest: ((String, String, Data?, [String: String]) async throws -> (Data, Int))?
     private let cache: CacheFacade?
 
     private static let defaultRefreshIfOlderThanMs = 5 * 60 * 1000 // 5 minutes
 
     public init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        cache: CacheFacade? = nil
+        cache: CacheFacade? = nil,
+        makeRawRequest: ((String, String, Data?, [String: String]) async throws -> (Data, Int))? = nil
     ) {
         self.makeRequest = makeRequest
         self.cache = cache
+        self.makeRawRequest = makeRawRequest
     }
 
     /// Retrieves the current user's profile, using the cache when available.
@@ -52,6 +55,63 @@ public final class MeAPI: @unchecked Sendable {
         await cache.clear(key: "me")
     }
 
+    /// List documents the current user has access to but doesn't own
+    /// (the "shared with me" filter). Mirrors js-bao's
+    /// `client.me.sharedDocuments(options)`. Response shape:
+    /// `{ "items": [...], "cursor"?: String }`.
+    ///
+    /// - Parameters:
+    ///   - cursor: opaque pagination cursor returned by the previous call
+    ///   - limit: page size
+    ///   - tag: filter to documents bearing this tag
+    public func sharedDocuments(
+        cursor: String? = nil,
+        limit: Int? = nil,
+        tag: String? = nil
+    ) async throws -> [String: Any] {
+        var qs: [String] = []
+        if let cursor,
+           let escaped = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            qs.append("cursor=\(escaped)")
+        }
+        if let limit { qs.append("limit=\(limit)") }
+        if let tag,
+           let escaped = tag.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            qs.append("tag=\(escaped)")
+        }
+        let path = qs.isEmpty
+            ? "/me/shared-documents"
+            : "/me/shared-documents?\(qs.joined(separator: "&"))"
+        let result = try await makeRequest("GET", path, nil)
+        return result as? [String: Any] ?? [:]
+    }
+
+    /// List documents the current user owns (live owner, not creator —
+    /// ownership transfer is reflected here). Mirrors js-bao's
+    /// `client.me.ownedDocuments(options)`. Same response shape as
+    /// `sharedDocuments`.
+    public func ownedDocuments(
+        cursor: String? = nil,
+        limit: Int? = nil,
+        tag: String? = nil
+    ) async throws -> [String: Any] {
+        var qs: [String] = []
+        if let cursor,
+           let escaped = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            qs.append("cursor=\(escaped)")
+        }
+        if let limit { qs.append("limit=\(limit)") }
+        if let tag,
+           let escaped = tag.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            qs.append("tag=\(escaped)")
+        }
+        let path = qs.isEmpty
+            ? "/me/owned-documents"
+            : "/me/owned-documents?\(qs.joined(separator: "&"))"
+        let result = try await makeRequest("GET", path, nil)
+        return result as? [String: Any] ?? [:]
+    }
+
     /// Lists pending document invitations for the current user.
     public func pendingDocumentInvitations() async throws -> [[String: Any]] {
         let result = try await makeRequest("GET", "/me/document-invitations", nil)
@@ -65,10 +125,35 @@ public final class MeAPI: @unchecked Sendable {
         return result as? [String: Any] ?? [:]
     }
 
-    /// Upload an avatar image for the current user.
-    /// Note: The caller is responsible for setting appropriate Content-Type headers
-    /// via custom request options on the underlying HTTP client.
+    /// Upload an avatar image for the current user. Sends the bytes as
+    /// the raw HTTP body with the supplied `Content-Type` header (matches
+    /// js-bao's `me.uploadAvatar(blob, contentType)` shape). Returns
+    /// `{ "avatarUrl": String }`.
+    ///
+    /// - Parameter contentType: One of `image/png`, `image/jpeg`,
+    ///   `image/gif`, `image/webp`. Routed via the `Content-Type` header
+    ///   when the raw HTTP closure is wired (always in production); the
+    ///   previous build silently dropped this argument, so any server
+    ///   that strictly validated `Content-Type` would reject the upload.
     public func uploadAvatar(imageData: Data, contentType: String) async throws -> [String: Any] {
+        if let makeRawRequest {
+            let headers = ["Content-Type": contentType]
+            let (body, status) = try await makeRawRequest("POST", "/me/avatar", imageData, headers)
+            guard (200..<300).contains(status) else {
+                throw HttpError(
+                    status: status, message: "Avatar upload failed",
+                    body: String(data: body, encoding: .utf8)
+                )
+            }
+            await clearCache()
+            guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+                return [:]
+            }
+            return json
+        }
+        // Fallback when no raw closure is wired (tests that construct
+        // MeAPI directly): use the JSON path. The server typically
+        // accepts the bytes either way for the avatar endpoint.
         let result = try await makeRequest("POST", "/me/avatar", imageData)
         await clearCache()
         return result as? [String: Any] ?? [:]

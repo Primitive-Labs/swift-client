@@ -122,10 +122,17 @@ public final class HttpClient: @unchecked Sendable {
     ) async throws -> Any? {
         let result = try await requestRaw(method: method, path: path, data: data, options: options)
         if !result.ok {
+            // #850 — parse the structured `{code, error/message}` body
+            // so callers see "This app is invite-only..." instead of
+            // "HTTP 403", and can switch on `serverCode` /
+            // `authCode` without re-parsing.
+            let parsed = HttpError.parseBody(result.text)
             throw HttpError(
                 status: result.status,
                 message: "HTTP \(result.status)",
-                body: result.text
+                body: result.text,
+                serverCode: parsed.code,
+                serverMessage: parsed.message
             )
         }
         return result.data

@@ -94,11 +94,17 @@ public final class EventEmitter: @unchecked Sendable {
     }
 }
 
-/// A cancellable event subscription
+/// A cancellable event subscription.
+///
+/// Construct one directly when wrapping a non-`EventEmitter` cancel
+/// closure — most commonly `DynamicModel.subscribe()`'s unsubscribe
+/// block — for use with `BaoDataLoader`'s `.custom` trigger
+/// (issue #854). Owns the closure and cancels exactly once on
+/// `cancel()` or `deinit`.
 public final class EventSubscription: @unchecked Sendable {
     private var cancellation: (() -> Void)?
 
-    init(cancel: @escaping () -> Void) {
+    public init(cancel: @escaping () -> Void) {
         self.cancellation = cancel
     }
 

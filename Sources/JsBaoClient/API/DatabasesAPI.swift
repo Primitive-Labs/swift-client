@@ -36,6 +36,9 @@ public final class DatabasesAPI: @unchecked Sendable {
     }
 
     /// Update a database's custom metadata.
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.updateMetadata`.
+    @available(*, deprecated, message: "Use databases.updateCelContext(databaseId:celContext:) instead.")
     public func updateMetadata(databaseId: String, metadata: [String: Any]) async throws -> [String: Any] {
         let result = try await makeRequest("PATCH", "/databases/\(databaseId)/metadata", metadata)
         return result as? [String: Any] ?? [:]
@@ -56,12 +59,18 @@ public final class DatabasesAPI: @unchecked Sendable {
     }
 
     /// Grant a user permission to access a database.
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.grantPermission`.
+    @available(*, deprecated, message: "Use databases.addManager(databaseId:params:) instead.")
     public func grantPermission(databaseId: String, params: [String: Any]) async throws -> [String: Any] {
         let result = try await makeRequest("PUT", "/databases/\(databaseId)/permissions", params)
         return result as? [String: Any] ?? [:]
     }
 
     /// Revoke a user's permission to a database.
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.revokePermission`.
+    @available(*, deprecated, message: "Use databases.removeManager(databaseId:userId:) instead.")
     public func revokePermission(databaseId: String, userId: String) async throws -> [String: Any] {
         let result = try await makeRequest("DELETE", "/databases/\(databaseId)/permissions/\(userId)", nil)
         return result as? [String: Any] ?? [:]
@@ -120,6 +129,9 @@ public final class DatabasesAPI: @unchecked Sendable {
     // MARK: - Bulk Import
 
     /// Import a batch of records using a named mutation operation.
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.importBulk`.
+    @available(*, deprecated, message: "Use databases.executeBatch(databaseId:operations:) instead.")
     public func importBulk(databaseId: String, operationName: String, batch: [[String: Any]]) async throws -> [String: Any] {
         let encodedName = operationName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? operationName
         let body: [String: Any] = ["batch": batch]
@@ -137,5 +149,182 @@ public final class DatabasesAPI: @unchecked Sendable {
             return fields
         }
         return result as? [[String: Any]] ?? []
+    }
+
+    // MARK: - CEL Context
+
+    /// Read a database's CEL context dict. Values are referenced from
+    /// CEL access rules as `database.celContext.<key>` and from filter
+    /// JSON as `$database.celContext.<key>`.
+    ///
+    /// Response payload includes the same dict under both `metadata`
+    /// (legacy wire name) and `celContext` (current name).
+    public func getCelContext(databaseId: String) async throws -> [String: Any] {
+        let result = try await makeRequest("GET", "/databases/\(databaseId)/metadata", nil)
+        return result as? [String: Any] ?? [:]
+    }
+
+    /// Merge new key-value pairs into a database's CEL context dict.
+    public func updateCelContext(
+        databaseId: String,
+        celContext: [String: Any]
+    ) async throws -> [String: Any] {
+        let result = try await makeRequest(
+            "PATCH", "/databases/\(databaseId)/metadata", celContext
+        )
+        return result as? [String: Any] ?? [:]
+    }
+
+    // MARK: - Managers
+
+    /// List a database's managers (permissions entries with manager grants).
+    /// Convenience wrapper over `listPermissions` that filters to the
+    /// `manager` rows. js-bao counterpart: `listManagers(databaseId)`.
+    public func listManagers(databaseId: String) async throws -> [[String: Any]] {
+        let perms = try await listPermissions(databaseId: databaseId)
+        return perms.filter { ($0["permission"] as? String) == "manager" }
+    }
+
+    /// Add a user as a manager of a database.
+    public func addManager(
+        databaseId: String,
+        userId: String
+    ) async throws -> [String: Any] {
+        let body: [String: Any] = [
+            "userId": userId,
+            "permission": "manager",
+        ]
+        let result = try await makeRequest(
+            "PUT", "/databases/\(databaseId)/permissions", body
+        )
+        return result as? [String: Any] ?? [:]
+    }
+
+    /// Remove a manager from a database.
+    public func removeManager(
+        databaseId: String,
+        userId: String
+    ) async throws -> [String: Any] {
+        let escapedId = userId.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? userId
+        let result = try await makeRequest(
+            "DELETE", "/databases/\(databaseId)/permissions/\(escapedId)", nil
+        )
+        return result as? [String: Any] ?? [:]
+    }
+
+    // MARK: - Group Permissions
+
+    /// List the group permissions configured on a database.
+    /// Platform-managed groups (whose `groupType` starts with `_`) are
+    /// excluded unless `includeSystem: true`.
+    public func listGroupPermissions(
+        databaseId: String,
+        includeSystem: Bool = false
+    ) async throws -> [[String: Any]] {
+        let qs = includeSystem ? "?includeSystem=true" : ""
+        let result = try await makeRequest(
+            "GET", "/databases/\(databaseId)/group-permissions\(qs)", nil
+        )
+        return result as? [[String: Any]] ?? []
+    }
+
+    /// Grant a group permission on a database. Members of the
+    /// specified group gain `params["permission"]` on the database.
+    ///
+    /// - Parameter params: Expected keys:
+    ///   - `groupType` (String, required)
+    ///   - `groupId` (String, required)
+    ///   - `permission` (String, required)
+    public func grantGroupPermission(
+        databaseId: String,
+        params: [String: Any]
+    ) async throws -> [String: Any] {
+        let result = try await makeRequest(
+            "POST", "/databases/\(databaseId)/group-permissions", params
+        )
+        return result as? [String: Any] ?? [:]
+    }
+
+    /// Revoke a group's permission on a database.
+    public func revokeGroupPermission(
+        databaseId: String,
+        groupType: String,
+        groupId: String
+    ) async throws -> [String: Any] {
+        let gType = groupType.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? groupType
+        let gId = groupId.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? groupId
+        let result = try await makeRequest(
+            "DELETE",
+            "/databases/\(databaseId)/group-permissions/\(gType)/\(gId)",
+            nil
+        )
+        return result as? [String: Any] ?? [:]
+    }
+
+    // MARK: - Batch operations
+
+    /// Execute a batch of records via a named mutation operation.
+    /// Returns `{ "imported": Int, "failed": Int }`.
+    ///
+    /// - Parameter batch: Each element should be `["params": [String: Any]]`.
+    public func executeBatch(
+        databaseId: String,
+        operationName: String,
+        batch: [[String: Any]]
+    ) async throws -> [String: Any] {
+        let encodedName = operationName.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? operationName
+        let body: [String: Any] = ["batch": batch]
+        let result = try await makeRequest(
+            "POST",
+            "/databases/\(databaseId)/operations/\(encodedName)/batch",
+            body
+        )
+        return result as? [String: Any] ?? [:]
+    }
+
+    /// Import a parsed list of row dicts into a database via a named
+    /// mutation operation. Thin wrapper over `executeBatch` that wraps
+    /// each row as `{params: row}` and batches in groups of
+    /// `batchSize` records (defaults to 5000 — matches js-bao).
+    ///
+    /// - Note: js-bao's `importCsv` also handles raw CSV parsing,
+    ///   schema-aware type coercion, and progress callbacks. Those
+    ///   higher-level conveniences are deferred to a v1.1 polish; the
+    ///   Swift surface starts with pre-parsed rows for simplicity. To
+    ///   import a CSV string, parse it with a third-party parser
+    ///   (e.g. `CodableCSV`) before calling.
+    public func importRows(
+        databaseId: String,
+        operationName: String = "save",
+        rows: [[String: Any]],
+        batchSize: Int = 5000
+    ) async throws -> [String: Any] {
+        guard !rows.isEmpty else {
+            return ["imported": 0, "failed": 0]
+        }
+        var imported = 0
+        var failed = 0
+        var i = 0
+        while i < rows.count {
+            let end = min(i + batchSize, rows.count)
+            let slice = rows[i..<end].map { ["params": $0] }
+            let result = try await executeBatch(
+                databaseId: databaseId,
+                operationName: operationName,
+                batch: Array(slice)
+            )
+            imported += result["imported"] as? Int ?? 0
+            failed += result["failed"] as? Int ?? 0
+            i = end
+        }
+        return ["imported": imported, "failed": failed]
     }
 }

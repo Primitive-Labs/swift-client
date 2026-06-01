@@ -16,7 +16,7 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | `client.databases` | ✅ | `client.databases` (DatabasesAPI) |
 | `client.collections` | ✅ | `client.collections` (CollectionsAPI) |
 | `client.me` | ✅ | `client.me` (MeAPI) |
-| `client.session` | ⚠️ | `client.session` (SessionAPI) — **wrong endpoint:** SessionAPI.swift:14 calls `GET /me` instead of `GET /session` |
+| `client.session` | ✅ | `client.session` (SessionAPI) — endpoint fixed in #789's predecessor commit |
 | `client.users` | ✅ | `client.users` (UsersAPI) |
 | `client.groups` | ✅ | `client.groups` (GroupsAPI) |
 | `client.groupTypeConfigs` | ✅ | `client.groupTypeConfigs` (GroupTypeConfigsAPI) |
@@ -25,12 +25,12 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | `client.llm` | ✅ | `client.llm` (LlmAPI) |
 | `client.prompts` | ✅ | `client.prompts` (PromptsAPI) |
 | `client.workflows` | ✅ | `client.workflows` (WorkflowsAPI) |
-| `client.integrations` | ⚠️ | `client.integrations` (IntegrationsAPI) — **broken contract:** missing structured `IntegrationCallRequest`, response unwrapping, and structured error throwing |
-| `client.invitations` | 🔀 | App-level invitations not exposed. Per-document invitations live on `client.documents` (acceptInvitation, declineInvitation, listInvitations, inviteUser, getInvitationByEmail, updateInvitation, deleteInvitation) and `client.me.pendingDocumentInvitations()`. **App-level invite quota / deferred-grant flow is NOT present.** |
-| `client.blobBuckets` | ⛔ | App-level blob buckets not exposed. Per-document blobs are on `client.document(id).blobs()` (separate feature — not equivalent). |
-| `client.cronTriggers` | ⛔ | Not exposed |
-| `client.collectionTypeConfigs` | ⛔ | Not exposed |
-| `client.databaseTypeConfigs` | ⛔ | Not exposed |
+| `client.integrations` | ✅ | `client.integrations` (IntegrationsAPI) — structured request/response/error contract restored in a predecessor commit. |
+| `client.invitations` | ✅ | `client.invitations` (InvitationsAPI) — added in the API-parity pass. Per-document invitation methods stay on `client.documents.*` (acceptInvitation, declineInvitation, listInvitations, inviteUser, …). |
+| `client.blobBuckets` | ✅ | `client.blobBuckets` (BlobBucketsAPI) — added in the API-parity pass; raw upload/download routed through the same closure pattern as `BlobManager`. |
+| `client.cronTriggers` | ✅ | `client.cronTriggers` (CronTriggersAPI) — added. |
+| `client.collectionTypeConfigs` | ✅ | `client.collectionTypeConfigs` (CollectionTypeConfigsAPI) — added. |
+| `client.databaseTypeConfigs` | ✅ | `client.databaseTypeConfigs` (DatabaseTypeConfigsAPI) — added. |
 
 **Top-level methods on `JsBaoClient` itself** (not under a sub-API namespace):
 
@@ -59,7 +59,7 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | `client.setRetentionPolicy(...)` | — | ⛔ | |
 | `client.getLocalMetadata(id)` | — | ⛔ | |
 | `client.markMetadataDeleted(id)` | — | ⛔ | |
-| `client.getDocumentPermission(...)` | — | ⛔ | |
+| `client.getDocumentPermission(...)` | `client.documents.getDocumentPermission(documentId:)` | 🔀 | Exposed via DocumentsAPI rather than top-level. Closed in #790. |
 | `client.events.on(...)` / `off(...)` | `client.events.on(...) / off(...)` | ✅ | See [events.md](events.md) for event-name parity |
 | `passkey*` (7 methods) | — | ⛔ | iOS has its own passkey/AuthorizationServices flow |
 
@@ -82,21 +82,21 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | `getInvitationByEmail(...)` | `getInvitationByEmail(documentId:, email:)` | ✅ | client-side filter from list |
 | `updateInvitation(...)` | `updateInvitation(...)` | ✅ | |
 | `deleteInvitation(...)` | `deleteInvitation(documentId:, invitationId:)` | ✅ | |
-| `isOpen(id)` | — | ⛔ | open-state check |
-| `requestAccess(id)` | — | ⛔ | |
-| `cancelAccessRequest(id)` | — | ⛔ | |
-| `listAccessRequests(id)` | — | ⛔ | |
-| `approveAccessRequest(id, requestId)` | — | ⛔ | |
-| `rejectAccessRequest(id, requestId)` | — | ⛔ | |
-| `getPendingCreate(id)` | — | ⛔ | |
-| `cancelPendingCreate(id)` | — | ⛔ | |
-| `listPendingCreates()` | — | ⛔ | |
-| `revokeGroupPermission(...)` | — | ⛔ | |
-| `(other group-permission methods)` | — | ⛔ | several |
-| `getOwner(id)` | — | ⛔ | |
-| `transferOwnership(...)` | — | ⛔ | |
-
-> **~13 methods marked ⛔ here** — flag-and-flip if any are oversights.
+| `isOpen(id)` | `isOpen(documentId:)` | ✅ | local-only, delegates to `DocumentManager`. Closed in #790. |
+| `requestAccess(id)` | `requestAccess(documentId:, params:)` | ✅ | Closed in #790. |
+| `cancelAccessRequest(id)` | — | ⛔ | JS uses `removePermission` for cancellation flows — there's no dedicated `cancelAccessRequest` server route. Tracked as a name-shape mismatch, not a missing endpoint. |
+| `listAccessRequests(id)` | `listAccessRequests(documentId:)` | ✅ | Closed in #790. |
+| `approveAccessRequest(id, requestId)` | `approveAccessRequest(documentId:, requestId:, params:)` | ✅ | Closed in #790. |
+| `rejectAccessRequest(id, requestId)` | `denyAccessRequest(documentId:, requestId:, params:)` | 🔀 | JS calls it `denyAccessRequest`. Swift matches the JS method name (the parity doc had `reject`; the actual JS surface is `deny`). Closed in #790. |
+| `getPendingCreate(id)` | `isPendingCreate(documentId:)` | 🔀 | Swift exposes `isPendingCreate(id) -> Bool`; the JS `getPendingCreate` returns the entry. v1.1: surface the full entry. |
+| `cancelPendingCreate(id)` | `cancelPendingCreate(documentId:)` | ✅ | Closed in #790. |
+| `listPendingCreates()` | `listPendingCreates() -> [String]` | 🔀 | Swift returns ID strings only; JS returns richer entries. v1.1: expose `{documentId, title?, createdAt}` rows. |
+| `revokeGroupPermission(...)` | `revokeGroupPermission(documentId:, groupType:, groupId:)` | ✅ | Closed in #790. |
+| `getOwner(id)` | `getOwner(documentId:)` | ✅ | Closed in #790 — convenience wrapper over `get(documentId:)`. |
+| `transferOwnership(...)` | `transferOwnership(documentId:, newOwnerId:)` | ✅ | Already present pre-#790. |
+| `hasLocalCopy(id)` | `hasLocalCopy(documentId:)` | ✅ | Closed in #790. |
+| `getDocumentPermission(id)` | `getDocumentPermission(documentId:)` | ✅ | Closed in #790. |
+| `getLocalMetadata(id)` | `getLocalMetadata(documentId:)` | ✅ | Closed in #790. |
 
 ## DatabasesAPI
 
@@ -108,19 +108,17 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | `update(id, params)` | `update(databaseId:, params:)` | ✅ | |
 | `delete(id)` | `delete(databaseId:)` | ✅ | |
 | `query(...)` | `query(...)` | ✅ | |
-| `executeBatch(...)` | — | ⛔ | |
-| `importCsv(...)` | — | ⛔ | |
-| `subscribe(id, ...)` | — | ⛔ | server-side subscriptions |
-| `getCelContext(...)` | — | ⛔ | CEL-based access control reads |
-| `setCelContext(...)` | — | ⛔ | |
-| `listManagers(id)` | — | ⛔ | |
-| `addManager(...)` | — | ⛔ | |
-| `removeManager(...)` | — | ⛔ | |
-| `listGroupPermissions(id)` | — | ⛔ | |
-| `addGroupPermission(...)` | — | ⛔ | |
-| `removeGroupPermission(...)` | — | ⛔ | |
-
-> **~10 methods marked ⛔ here** — flag-and-flip if any are oversights.
+| `executeBatch(...)` | `executeBatch(databaseId:, operationName:, batch:)` | ✅ | Closed in #790. |
+| `importCsv(...)` | `importRows(databaseId:, operationName:, rows:, batchSize:)` | 🔀 | Swift takes pre-parsed rows + batches via `executeBatch`. JS handles raw CSV parsing + schema-aware coercion + progress callbacks too — that richer surface is a v1.1 follow-up. |
+| `subscribe(id, ...)` | — | ⛔ | WebSocket-based subscriptions. Deferred (see Notes below). |
+| `getCelContext(...)` | `getCelContext(databaseId:)` | ✅ | Closed in #790. |
+| `setCelContext(...)` | `updateCelContext(databaseId:, celContext:)` | ✅ | Closed in #790. Named to match the JS `updateCelContext` (the parity doc had `setCelContext`; JS surface is `updateCelContext`). |
+| `listManagers(id)` | `listManagers(databaseId:)` | ✅ | Closed in #790. Convenience wrapper over `listPermissions` that filters to `manager` rows. |
+| `addManager(...)` | `addManager(databaseId:, userId:)` | ✅ | Closed in #790. |
+| `removeManager(...)` | `removeManager(databaseId:, userId:)` | ✅ | Closed in #790. |
+| `listGroupPermissions(id)` | `listGroupPermissions(databaseId:, includeSystem:)` | ✅ | Closed in #790. |
+| `addGroupPermission(...)` | `grantGroupPermission(databaseId:, params:)` | ✅ | Closed in #790. Named to match JS (`grantGroupPermission`). |
+| `removeGroupPermission(...)` | `revokeGroupPermission(databaseId:, groupType:, groupId:)` | ✅ | Closed in #790. |
 
 ## CollectionsAPI
 
@@ -141,21 +139,18 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 |---|---|---|---|
 | `get()` | `get()` | ✅ | |
 | `update(params)` | `update(params:)` | ✅ | |
-| `uploadAvatar(data, contentType)` | `uploadAvatar(data:, contentType:)` | ⚠️ | `contentType` param is dead/unused |
+| `uploadAvatar(data, contentType)` | `uploadAvatar(data:, contentType:)` | ✅ | `contentType` now wired through the raw-HTTP closure as `Content-Type`. Closed in #790. |
 | `pendingDocumentInvitations()` | `pendingDocumentInvitations()` | ✅ | |
-| `bookmarks.list()` | — | ⛔ | bookmarks sub-API entirely missing (4 methods) |
-| `bookmarks.add(...)` | — | ⛔ | |
-| `bookmarks.remove(...)` | — | ⛔ | |
-| `bookmarks.update(...)` | — | ⛔ | |
-| `getProfile()` | — | ⛔ | |
+| `bookmarks.*` | — | ✅ resolved by JS-side removal | The JS client *had* `me.bookmarks.*` when the parity doc was seeded; **PR #702 removed it as a breaking change.** Swift never implemented it, so the gap auto-closed when JS dropped the API. If bookmarks come back later, this row gets a new ⛔ entry. |
+| `getProfile()` | — | ✅ resolved by JS-side removal | Same as bookmarks — not in current JS source. May have been removed alongside (or never landed there to begin with). |
 
 ## UsersAPI
 
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
 | `get(userId)` | `get(userId:)` | ✅ | |
-| `getProfiles(userIds)` | — | ⛔ | batch lookup |
-| `lookup(email)` | — | ⛔ | |
+| `getProfiles(userIds)` | `getProfiles(userIds:)` | ✅ | Closed in #790. Server caps at 100 ids per call. |
+| `lookup(email)` | `lookup(email:)` | ✅ | Closed in #790. |
 
 ## GroupsAPI
 
@@ -194,7 +189,7 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
-| `get()` | `get()` | ⚠️ | **Calls `GET /me` instead of `GET /session`** — wrong endpoint (SessionAPI.swift:14) |
+| `get()` | `get()` | ✅ | Endpoint fixed in commit 7feda61b. |
 
 ## GeminiAPI / LlmAPI
 
@@ -211,15 +206,15 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 |---|---|---|---|
 | `get(id)` | `get(id:)` | ✅ | |
 | `list()` | `list()` | ✅ | |
-| `execute(id, params)` | `execute(promptId:, ...)` | ⚠️ | Swift uses positional args where JS uses options object |
+| `execute(id, params)` | `execute(promptId:, ...)` | ⚠️ | Swift uses positional args where JS uses options object. Cosmetic; functionally equivalent. v1.1 signature polish. |
 
 ## IntegrationsAPI
 
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
-| `call(spec)` | `call(...)` | ⚠️ | **Major contract gap.** Missing: structured `IntegrationCallRequest` (method/path/query/headers/body), response unwrapping into `{status, headers, body, traceId, durationMs, errorCode}`, structured error throwing on non-OK responses. The current Swift surface is much thinner than the JS one. |
-| `list()` | — | ⛔ | |
-| `get(id)` | — | ⛔ | |
+| `call(spec)` | `call(request:)` | ✅ | Structured `IntegrationCallRequest` (method/path/query/headers/body), `IntegrationCallResponse` unwrapping, typed error throwing on non-OK responses. Closed in commit 7feda61b. |
+| `list()` | — | ⛔ | Not implemented. |
+| `get(id)` | — | ⛔ | Not implemented. |
 
 ## WorkflowsAPI
 
@@ -227,11 +222,11 @@ The biggest API on both sides. Swift adds features that don't exist in JS (`runA
 
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
-| `start(workflowId, params)` | `start(workflowId:, params:)` | ⚠️ | Swift `StartWorkflowOptions` missing `forceRerun` |
-| `getStatus(runId)` | `getStatus(runId:)` | ⚠️ | Swift doesn't normalize CF/DB status codes the way JS does |
-| `terminate(runId, opts?)` | `terminate(runId:)` | ⚠️ | Swift drops `contextDocId` |
-| `listRuns(opts)` | `listRuns(filters:)` | ⚠️ | Swift `ListWorkflowRunsOptions` missing `forward`, `contextDocId` |
-| `listStepRuns(runId)` | — | ⛔ | |
+| `start(workflowId, params)` | `start(workflowKey:, input:, options:)` | ✅ | `StartWorkflowOptions.forceRerun` added in #790. |
+| `getStatus(runId)` | `getStatus(workflowKey:, runKey:, contextDocId:)` | ⚠️ | Swift doesn't normalize CF/DB status codes the way JS does. Returns the raw envelope. v1.1 polish. |
+| `terminate(runId, opts?)` | `terminate(workflowKey:, runKey:, contextDocId:)` | ✅ | `contextDocId` added in #790. |
+| `listRuns(opts)` | `listRuns(options:)` | ✅ | `ListWorkflowRunsOptions.forward` + `.contextDocId` added in #790. |
+| `listStepRuns(runId)` | `listStepRuns(runId:)` | ✅ | Closed in #790. |
 | `(definition CRUD)` | `(definition CRUD)` | ✅ | |
 | — | `runAndApply(...)` | Swift-only | apply-after-run fan-out |
 | — | `awaitRun(runId, ...)` | Swift-only | typed waiter |
@@ -241,63 +236,58 @@ The biggest API on both sides. Swift adds features that don't exist in JS (`runA
 
 ---
 
-## Other JS sub-APIs (entirely absent on Swift)
+## New sub-APIs added in #790
 
-### InvitationsAPI (app-level invitations)
+All five fully implemented:
 
-This is the *app-level* invitation flow (invite someone to join the whole app, with optional deferred grants for documents/groups they get when they accept). Distinct from per-document invitations, which are present.
+### InvitationsAPI (app-level invitations) — ✅ all closed
 
-| JS method | Status | Notes |
+App-level invitation flow + deferred-grant browsing for the #466 grant flow. Distinct from the per-document invitation methods on `client.documents.*`.
+
+| JS method | Swift | Status |
 |---|---|---|
-| `quota()` | ⛔ | invitation usage limits |
-| `create(params)` | ⛔ | with `DeferredDocumentGrant` / `DeferredGroupGrant` payloads |
-| `list(opts)` | ⛔ | |
-| `get(id)` | ⛔ | |
-| `delete(id)` | ⛔ | |
-| `accept(token)` | ⛔ | redeem invite token at signup |
-| `listDeferredGrants(opts)` | ⛔ | |
+| `quota()` | `quota()` | ✅ |
+| `create(params)` | `create(params:)` | ✅ |
+| `list(opts)` | `list(limit:, cursor:)` | ✅ |
+| `get(id)` | `get(invitationId:)` | ✅ |
+| `delete(id)` | `delete(invitationId:)` | ✅ |
+| `accept(token)` | `accept(inviteToken:)` | ✅ |
+| `listDeferredGrants(opts)` | `listDeferredGrants(type:, email:, limit:)` | ✅ |
+| `revokeDeferredGrant(id, type)` | `revokeDeferredGrant(deferredId:, type:)` | ✅ |
 
-### BlobBucketsAPI
+### BlobBucketsAPI — ✅ all closed
 
-App-level blob namespaces (not the same as per-document blobs, which exist via `client.document(id).blobs()`).
+App-level blob namespaces (not the same as per-document blobs on `client.document(id).blobs()`).
 
-| JS method | Status |
-|---|---|
-| `createBucket(...)` | ⛔ |
-| `listBuckets()` | ⛔ |
-| `getBucket(id)` | ⛔ |
-| `deleteBucket(id)` | ⛔ |
-| `upload(...)` | ⛔ |
-| `list(...)` | ⛔ |
-| `getMetadata(...)` | ⛔ |
-| `download(...)` | ⛔ |
-| `delete(...)` | ⛔ |
-| `signedUrl(...)` | ⛔ |
+| JS method | Swift | Status |
+|---|---|---|
+| `createBucket(...)` | `createBucket(params:)` | ✅ |
+| `listBuckets()` | `listBuckets()` | ✅ |
+| `getBucket(id)` | `getBucket(bucketIdOrKey:)` | ✅ |
+| `deleteBucket(id)` | `deleteBucket(bucketIdOrKey:)` | ✅ |
+| `upload(...)` | `upload(bucketIdOrKey:, data:, filename:, contentType:, tags:)` | ✅ — via raw-HTTP closure |
+| `list(...)` | `list(bucketIdOrKey:, cursor:, limit:)` | ✅ |
+| `getMetadata(...)` | `getMetadata(bucketIdOrKey:, blobId:)` | ✅ |
+| `download(...)` | `download(bucketIdOrKey:, blobId:)` | ✅ — returns `Data` via raw-HTTP closure |
+| `delete(...)` | `delete(bucketIdOrKey:, blobId:)` | ✅ |
+| `signedUrl(...)` | `getSignedUrl(bucketIdOrKey:, blobId:, expiresInSeconds:)` | ✅ |
 
-### CronTriggersAPI
+### CronTriggersAPI — ✅ all closed
 
-| JS method | Status |
-|---|---|
-| `list()` | ⛔ |
-| `get(id)` | ⛔ |
-| `create(...)` | ⛔ |
-| `update(...)` | ⛔ |
-| `delete(id)` | ⛔ |
-| `pause(id)` | ⛔ |
-| `resume(id)` | ⛔ |
-| `test(...)` | ⛔ |
+| JS method | Swift | Status |
+|---|---|---|
+| `list()` | `list()` | ✅ |
+| `get(id)` | `get(triggerId:)` | ✅ |
+| `create(...)` | `create(params:)` | ✅ |
+| `update(...)` | `update(triggerId:, params:)` | ✅ |
+| `delete(id)` | `delete(triggerId:)` | ✅ |
+| `pause(id)` | `pause(triggerId:)` | ✅ |
+| `resume(id)` | `resume(triggerId:)` | ✅ |
+| `test(...)` | `test(triggerId:)` | ✅ |
 
-### CollectionTypeConfigsAPI / DatabaseTypeConfigsAPI
+### CollectionTypeConfigsAPI / DatabaseTypeConfigsAPI — ✅ all closed
 
-| JS method | Status |
-|---|---|
-| `list()` | ⛔ |
-| `get(type)` | ⛔ |
-| `create(...)` | ⛔ |
-| `update(...)` | ⛔ |
-| `delete(type)` | ⛔ |
-
-(Both APIs are 5 methods each, identical shape, both fully ⛔.)
+Both 5-method CRUD APIs, fully implemented. See `CollectionTypeConfigsAPI.swift` / `DatabaseTypeConfigsAPI.swift`.
 
 ---
 

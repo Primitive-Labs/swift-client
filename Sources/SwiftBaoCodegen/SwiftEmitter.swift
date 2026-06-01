@@ -2,10 +2,12 @@ import Foundation
 
 struct EmitOptions {
     /// Access level applied to the generated struct, its members, and
-    /// init signatures. Default is `internal` — the same default Swift
-    /// uses, and what the demo app's hand-written models effectively
-    /// declare (no explicit modifier).
-    var accessLevel: String = "internal"
+    /// init signatures. Default is `public` so that app code can write
+    /// `public extension TodoItem { ... }` (the shape the agent guide
+    /// shows) without hitting the "public modifier cannot be used in
+    /// extensions that declare members on an internal type" diagnostic.
+    /// Override to `"internal"` for embedded-in-module use.
+    var accessLevel: String = "public"
 
     /// The module that exports `PrimitiveModel`, `PrimitiveSchema`,
     /// `PrimitiveValue`, etc. Almost always `JsBaoClient`.
@@ -51,19 +53,14 @@ struct SwiftEmitter {
 
     // MARK: - Struct
 
-    /// Emit-time field order. `id` (if present) goes first so the
-    /// generated `init` puts the primary key as the first parameter —
-    /// matches the shape callers naturally expect. TOMLKit hands us
-    /// keys alphabetically, so we don't have access to the actual
-    /// source-order; alphabetical-with-`id`-pinned is the best we can do
-    /// without a custom TOML reader.
+    /// Emit-time field order. `TomlParser` already recovers TOML
+    /// declaration order from the source, so the emitter just preserves
+    /// it — a schema declared as `id, text, completed, createdAt` yields
+    /// an init in that exact parameter order. (Previously this pinned
+    /// `id` to the front because TOMLKit's iteration is alphabetical;
+    /// the source-order recovery makes that hack unnecessary.)
     private func displayFieldOrder(_ schema: ParsedSchema) -> [String] {
-        var out = schema.fieldOrder
-        if let idx = out.firstIndex(of: "id") {
-            out.remove(at: idx)
-            out.insert("id", at: 0)
-        }
-        return out
+        return schema.fieldOrder
     }
 
     private func structDecl(schema: ParsedSchema) -> String {
@@ -342,7 +339,13 @@ struct SwiftEmitter {
             // so a direct `as? Bool` cast always fails and the row's
             // bool either drops silently (optional) or aborts the
             // whole row (required). Fall back through Int → Bool.
-            return "(row[\(key)] as? Bool) ?? (row[\(key)] as? Int).map { $0 != 0 }"
+            //
+            // Use a non-trailing closure on `.map` because the read
+            // expression sits inside a `guard let X = ..., let Y = ...
+            // else { return nil }` chain — a trailing closure there
+            // triggers the "trailing closure in this context is
+            // confusable with the body of the statement" warning.
+            return "(row[\(key)] as? Bool) ?? (row[\(key)] as? Int).map({ $0 != 0 })"
         }
         return "row[\(key)] as? \(swiftRowCastType(f))"
     }
@@ -380,10 +383,14 @@ struct SwiftEmitter {
             }
         }
 
+        // `values` is mutated only when there are optional fields to
+        // conditionally append — emit `let` otherwise to avoid the
+        // "variable 'values' was never mutated" warning in app builds.
+        let storageKeyword = optionalEntries.isEmpty ? "let" : "var"
         if requiredEntries.isEmpty {
-            out += "        var values: [String: PrimitiveValue] = [:]\n"
+            out += "        \(storageKeyword) values: [String: PrimitiveValue] = [:]\n"
         } else {
-            out += "        var values: [String: PrimitiveValue] = [\n"
+            out += "        \(storageKeyword) values: [String: PrimitiveValue] = [\n"
             for (fname, f) in requiredEntries {
                 out += "            \(quoted(fname)): \(primitiveValueLiteral(f, propRef: propName(fname))),\n"
             }

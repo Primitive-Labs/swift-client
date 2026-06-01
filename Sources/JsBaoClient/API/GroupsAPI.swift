@@ -108,4 +108,44 @@ public final class GroupsAPI: @unchecked Sendable {
         let result = try await makeRequest("GET", "/groups/\(groupType)/\(groupId)/documents", nil)
         return result as? [[String: Any]] ?? []
     }
+
+    /// Lists databases the group has access to. Mirrors js-bao's
+    /// `groups.listDatabases(groupType, groupId)`.
+    public func listDatabases(
+        groupType: String, groupId: String
+    ) async throws -> [[String: Any]] {
+        let escapedType = groupType.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? groupType
+        let escapedId = groupId.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? groupId
+        let result = try await makeRequest(
+            "GET", "/groups/\(escapedType)/\(escapedId)/databases", nil
+        )
+        return result as? [[String: Any]] ?? []
+    }
+
+    /// Lists pending invitations attached to a group. Mirrors js-bao's
+    /// `groups.listPendingInvitations(groupType, groupId)`.
+    public func listPendingInvitations(
+        groupType: String, groupId: String
+    ) async throws -> [[String: Any]] {
+        let escapedType = groupType.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? groupType
+        let escapedId = groupId.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? groupId
+        let result = try await makeRequest(
+            "GET",
+            "/groups/\(escapedType)/\(escapedId)/pending-invitations",
+            nil
+        )
+        if let dict = result as? [String: Any],
+           let items = dict["items"] as? [[String: Any]] {
+            return items
+        }
+        return result as? [[String: Any]] ?? []
+    }
 }

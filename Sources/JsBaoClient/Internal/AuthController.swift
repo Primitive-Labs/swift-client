@@ -21,6 +21,13 @@ public final class AuthController: @unchecked Sendable {
     private var authReady = false
     private var authReadyContinuations: [CheckedContinuation<Void, Never>] = []
 
+    /// Set true on `logout()`; blocks NON-interactive token applications
+    /// (a `bootstrap`/`http_refresh`/`refresh`/`startup` that resolves
+    /// after the user logged out) from silently re-authenticating or
+    /// re-persisting the JWT. Cleared by the next interactive login
+    /// (`oauth`/`magic_link`/`otp`/`passkey`). Guarded by `lock`.
+    private var blockNonInteractiveAuth = false
+
     // Refresh backoff
     private var refreshBackoffMs: Int = 2000
     private let refreshBackoffBase: Int = 2000
@@ -112,9 +119,30 @@ public final class AuthController: @unchecked Sendable {
         applyToken(token, previous: previous, cause: cause)
     }
 
+    /// Causes that represent an explicit, user-initiated sign-in (as
+    /// opposed to a background token refresh or persisted-session restore).
+    private static func isInteractiveLogin(_ cause: String?) -> Bool {
+        switch cause {
+        case "oauth", "magic_link", "otp", "passkey": return true
+        default: return false
+        }
+    }
+
     /// Apply a new token, updating internal state and emitting events
     func applyToken(_ token: String?, previous: String?, cause: String?) {
         lock.lock()
+        // Logout race guard: a refresh/restore that resolves AFTER the
+        // user logged out must not silently sign them back in (or
+        // re-persist the JWT). Drop non-interactive token applications
+        // until an explicit interactive login clears the flag.
+        if token != nil, blockNonInteractiveAuth, !Self.isInteractiveLogin(cause) {
+            lock.unlock()
+            logger.debug("Ignoring token application (cause:", cause ?? "unknown", ") — logged out, awaiting explicit login")
+            return
+        }
+        if token != nil, Self.isInteractiveLogin(cause) {
+            blockNonInteractiveAuth = false
+        }
         let oldUserId = currentUserId
         currentToken = token
 
@@ -442,6 +470,12 @@ public final class AuthController: @unchecked Sendable {
     // MARK: - Logout
 
     public func logout(wipeLocal: Bool = false) async throws {
+        // Block any in-flight refresh/restore from re-authenticating after
+        // this logout (see `blockNonInteractiveAuth`). Set before clearing
+        // the token so a refresh resolving mid-logout is caught.
+        lock.lock()
+        blockNonInteractiveAuth = true
+        lock.unlock()
         let previous = getToken()
         applyToken(nil, previous: previous, cause: "logout")
 

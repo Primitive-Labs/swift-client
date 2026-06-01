@@ -3,7 +3,6 @@ import TOMLKit
 
 enum CodegenError: Error, CustomStringConvertible {
     case parse(String)
-    case missingModelsTable
     case missingFieldType(model: String, field: String)
     case unknownFieldType(model: String, field: String, typeName: String)
     case malformedUniqueConstraint(model: String, index: Int, reason: String)
@@ -20,8 +19,6 @@ enum CodegenError: Error, CustomStringConvertible {
         switch self {
         case let .parse(m):
             return "TOML parse error: \(m)"
-        case .missingModelsTable:
-            return "TOML is missing required top-level [models] table"
         case let .missingFieldType(model, field):
             return "Model `\(model)` field `\(field)` is missing required `type`"
         case let .unknownFieldType(model, field, typeName):
@@ -63,8 +60,16 @@ enum TomlParser {
             throw CodegenError.parse(String(describing: error))
         }
 
+        // A fresh-template schema.toml ships with no models yet (the
+        // user adds the first `[models.<name>]` block as their next
+        // step). The SPM build plugin already tolerates this — it
+        // scans for `[models.X]` headers and emits zero commands if
+        // none exist. The standalone tool needs to match: returning
+        // an empty schema list lets a wrapper script (run.sh,
+        // run-ios.sh) call codegen unconditionally without failing
+        // before the schema has any models.
         guard let modelsTable = table["models"]?.table else {
-            throw CodegenError.missingModelsTable
+            return []
         }
 
         // First pass: collect field/constraint/codegen info per model.
@@ -72,9 +77,24 @@ enum TomlParser {
         var modelOrder: [String] = []
         for key in modelsTable.keys {
             guard let model = modelsTable[key]?.table else { continue }
-            schemasByName[key] = try buildSchema(
+            var schema = try buildSchema(
                 name: key, table: model, swiftNameSuffix: swiftNameSuffix
             )
+            // TOMLKit hands keys back alphabetically, which is fine for
+            // every internal use (lookups go through a dictionary) but
+            // misleading for the emitted Swift init — a user-declared
+            // schema order of `id, text, completed, createdAt` should
+            // map to that *same* init parameter order, not the alphabetical
+            // `id, completed, createdAt, text`. A positional init written
+            // against the declared order would otherwise silently swap
+            // arguments of compatible types. Recover declaration order by
+            // scanning the raw TOML source for the field-table headers.
+            schema.fieldOrder = reorderBySource(
+                fields: schema.fieldOrder,
+                model: key,
+                source: tomlString
+            )
+            schemasByName[key] = schema
             modelOrder.append(key)
         }
 
@@ -168,6 +188,64 @@ enum TomlParser {
             return s
         }
         return Naming.pascalCase(modelName) + suffix
+    }
+
+    // MARK: - Source-order recovery
+
+    /// Reorder `fields` to match the order they appear in `source` for
+    /// the given `model`. Field names not found in the source scan
+    /// (inline-table form, dotted-key form, anything the regex misses)
+    /// keep the parser's original ordering and are appended at the
+    /// end — so the worst case degrades to today's alphabetical
+    /// behavior, never to a missing field.
+    private static func reorderBySource(
+        fields: [String],
+        model: String,
+        source: String
+    ) -> [String] {
+        let known = Set(fields)
+        let sourceOrder = scanFieldHeaders(model: model, source: source)
+            .filter { known.contains($0) }
+        if sourceOrder.isEmpty { return fields }
+        var seen = Set(sourceOrder)
+        var out = sourceOrder
+        for f in fields where !seen.contains(f) {
+            out.append(f)
+            seen.insert(f)
+        }
+        return out
+    }
+
+    /// Match `[models.<model>.fields.<field>]` headers in the raw TOML
+    /// in source order. Accepts bare or quoted keys for both segments
+    /// (TOML requires quoting non-ASCII keys; bare keys are
+    /// `[A-Za-z0-9_-]+`).
+    private static func scanFieldHeaders(model: String, source: String) -> [String] {
+        let bareModel = NSRegularExpression.escapedPattern(for: model)
+        let modelAlt = "(?:\(bareModel)|\"\(bareModel)\")"
+        // Field name in the captured group: bare token OR quoted (any
+        // chars except `"`). Strip the quotes after the match.
+        let pattern =
+            #"\[\s*models\s*\.\s*"# + modelAlt +
+            #"\s*\.\s*fields\s*\.\s*([A-Za-z0-9_\-]+|"[^"]*")\s*\]"#
+        guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
+        let ns = source as NSString
+        let matches = re.matches(in: source, range: NSRange(location: 0, length: ns.length))
+        var seen = Set<String>()
+        var out: [String] = []
+        for m in matches where m.numberOfRanges > 1 {
+            let r = m.range(at: 1)
+            if r.location == NSNotFound { continue }
+            var name = ns.substring(with: r)
+            if name.hasPrefix("\""), name.hasSuffix("\""), name.count >= 2 {
+                name = String(name.dropFirst().dropLast())
+            }
+            if !seen.contains(name) {
+                seen.insert(name)
+                out.append(name)
+            }
+        }
+        return out
     }
 
     // MARK: - Fields

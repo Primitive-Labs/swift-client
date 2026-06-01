@@ -144,4 +144,20 @@ final class EventTests: XCTestCase {
 
         sub.cancel()
     }
+
+    /// #854: `EventSubscription.init(cancel:)` must be public so app
+    /// code (e.g. a `BaoDataLoader.custom` trigger wrapping
+    /// `DynamicModel.subscribe()`) can construct one directly. Verifies
+    /// the cancel closure runs exactly once across explicit
+    /// `cancel()` + a redundant follow-up call.
+    func testEventSubscriptionInitIsPublicAndCallsOnce() {
+        var cancelCount = 0
+        let sub = EventSubscription { cancelCount += 1 }
+        XCTAssertEqual(cancelCount, 0)
+        sub.cancel()
+        XCTAssertEqual(cancelCount, 1)
+        // Idempotent: a second cancel() is a no-op.
+        sub.cancel()
+        XCTAssertEqual(cancelCount, 1, "cancel() must be idempotent")
+    }
 }

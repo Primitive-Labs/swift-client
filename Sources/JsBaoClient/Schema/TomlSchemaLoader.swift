@@ -65,7 +65,16 @@ public enum TomlSchemaLoader {
 
     /// Parse a TOML string and return one `PrimitiveSchema` per
     /// `[models.<name>]` table.
-    public static func load(tomlString: String) throws -> [PrimitiveSchema] {
+    ///
+    /// - Parameter strict: when `true` (default, matches js-bao's
+    ///   `loadSchemaFromTomlString({strict: true})`), reject any
+    ///   unknown key under a model/field/relationship/unique-constraint
+    ///   table. When `false`, accept everything silently — kept for
+    ///   loading legacy/third-party TOML that hasn't been audited yet.
+    public static func load(
+        tomlString: String,
+        strict: Bool = true
+    ) throws -> [PrimitiveSchema] {
         let table: TOMLTable
         do {
             table = try TOMLTable(string: tomlString)
@@ -84,7 +93,9 @@ public enum TomlSchemaLoader {
         var modelOrder: [String] = []
         for key in modelsTable.keys {
             guard let model = modelsTable[key]?.table else { continue }
-            schemasByName[key] = try buildSchemaSkeleton(name: key, table: model)
+            schemasByName[key] = try buildSchemaSkeleton(
+                name: key, table: model, strict: strict
+            )
             modelOrder.append(key)
         }
 
@@ -97,7 +108,8 @@ public enum TomlSchemaLoader {
                 schema.relationships = try buildRelationships(
                     modelName: key,
                     relsTable: relsTable,
-                    knownModels: Set(schemasByName.keys)
+                    knownModels: Set(schemasByName.keys),
+                    strict: strict
                 )
                 schemasByName[key] = schema
             }
@@ -107,7 +119,10 @@ public enum TomlSchemaLoader {
     }
 
     /// Read a TOML schema file from disk.
-    public static func load(from url: URL) throws -> [PrimitiveSchema] {
+    public static func load(
+        from url: URL,
+        strict: Bool = true
+    ) throws -> [PrimitiveSchema] {
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -123,18 +138,28 @@ public enum TomlSchemaLoader {
                 )
             )
         }
-        return try load(tomlString: text)
+        return try load(tomlString: text, strict: strict)
     }
 
     // MARK: - Skeleton (fields + compound constraints only)
 
     private static func buildSchemaSkeleton(
         name: String,
-        table: TOMLTable
+        table: TOMLTable,
+        strict: Bool
     ) throws -> PrimitiveSchema {
-        let fields = try buildFields(modelName: name, table: table)
+        if strict {
+            try checkUnknownKeys(
+                in: table,
+                allowed: knownModelKeys,
+                context: "Model `\(name)`"
+            )
+        }
+        let fields = try buildFields(modelName: name, table: table, strict: strict)
         let constraints = try buildUniqueConstraints(
-            modelName: name, table: table, fieldNames: Set(fields.keys)
+            modelName: name, table: table,
+            fieldNames: Set(fields.keys),
+            strict: strict
         )
         return PrimitiveSchema(
             name: name,
@@ -148,14 +173,16 @@ public enum TomlSchemaLoader {
 
     private static func buildFields(
         modelName: String,
-        table: TOMLTable
+        table: TOMLTable,
+        strict: Bool
     ) throws -> [String: FieldDescriptor] {
         guard let fieldsTable = table["fields"]?.table else { return [:] }
         var out: [String: FieldDescriptor] = [:]
         for fieldName in fieldsTable.keys {
             guard let field = fieldsTable[fieldName]?.table else { continue }
             out[fieldName] = try buildField(
-                modelName: modelName, fieldName: fieldName, table: field
+                modelName: modelName, fieldName: fieldName,
+                table: field, strict: strict
             )
         }
         return out
@@ -164,7 +191,8 @@ public enum TomlSchemaLoader {
     private static func buildField(
         modelName: String,
         fieldName: String,
-        table: TOMLTable
+        table: TOMLTable,
+        strict: Bool
     ) throws -> FieldDescriptor {
         guard let typeLiteral = table["type"]?.string else {
             throw TomlSchemaLoaderError.missingFieldType(
@@ -176,6 +204,13 @@ public enum TomlSchemaLoader {
         else {
             throw TomlSchemaLoaderError.unknownFieldType(
                 model: modelName, field: fieldName, typeName: typeLiteral
+            )
+        }
+        if strict {
+            try checkUnknownKeys(
+                in: table,
+                allowed: knownFieldKeys,
+                context: "Model `\(modelName)` field `\(fieldName)`"
             )
         }
 
@@ -208,7 +243,8 @@ public enum TomlSchemaLoader {
     private static func buildUniqueConstraints(
         modelName: String,
         table: TOMLTable,
-        fieldNames: Set<String>
+        fieldNames: Set<String>,
+        strict: Bool
     ) throws -> [String: ConstraintDescriptor] {
         // `[[models.X.unique_constraints]]` lands under `unique_constraints`
         // as a TOMLArray of TOMLTables.
@@ -216,6 +252,13 @@ public enum TomlSchemaLoader {
         var out: [String: ConstraintDescriptor] = [:]
         for idx in 0..<arr.count {
             guard let entry = arr[idx].table else { continue }
+            if strict {
+                try checkUnknownKeys(
+                    in: entry,
+                    allowed: knownUniqueConstraintKeys,
+                    context: "Model `\(modelName)` unique_constraints[\(idx)]"
+                )
+            }
             guard let name = entry["name"]?.string else {
                 throw TomlSchemaLoaderError.malformedUniqueConstraint(
                     model: modelName, index: idx, reason: "missing `name`"
@@ -251,7 +294,8 @@ public enum TomlSchemaLoader {
     private static func buildRelationships(
         modelName: String,
         relsTable: TOMLTable,
-        knownModels: Set<String>
+        knownModels: Set<String>,
+        strict: Bool
     ) throws -> [String: RelationshipDescriptor] {
         var out: [String: RelationshipDescriptor] = [:]
         for relName in relsTable.keys {
@@ -260,7 +304,8 @@ public enum TomlSchemaLoader {
                 modelName: modelName,
                 relName: relName,
                 table: rel,
-                knownModels: knownModels
+                knownModels: knownModels,
+                strict: strict
             )
         }
         return out
@@ -270,7 +315,8 @@ public enum TomlSchemaLoader {
         modelName: String,
         relName: String,
         table: TOMLTable,
-        knownModels: Set<String>
+        knownModels: Set<String>,
+        strict: Bool
     ) throws -> RelationshipDescriptor {
         guard let typeLiteral = table["type"]?.string else {
             throw TomlSchemaLoaderError.missingRelationshipType(
@@ -292,6 +338,13 @@ public enum TomlSchemaLoader {
                 model: modelName, relationship: relName, target: targetModel
             )
         }
+        if strict {
+            try checkUnknownKeys(
+                in: table,
+                allowed: knownRelationshipKeys,
+                context: "Model `\(modelName)` relationship `\(relName)`"
+            )
+        }
 
         // Start with the base properties. Everything is stored as
         // plain `[String: String]` on `RelationshipDescriptor` so
@@ -303,14 +356,24 @@ public enum TomlSchemaLoader {
 
         switch typeLiteral {
         case "refersTo":
-            if let s = table["related_id_field"]?.string {
-                props["relatedIdField"] = s
+            // js-bao tomlLoader.ts:153 — `related_id_field` is required.
+            guard let s = table["related_id_field"]?.string else {
+                throw TomlSchemaLoaderError.missingRelationshipField(
+                    model: modelName, relationship: relName,
+                    relType: typeLiteral, field: "related_id_field"
+                )
             }
+            props["relatedIdField"] = s
 
         case "hasMany":
-            if let s = table["related_id_field"]?.string {
-                props["relatedIdField"] = s
+            // js-bao tomlLoader.ts:163 — required for hasMany too.
+            guard let s = table["related_id_field"]?.string else {
+                throw TomlSchemaLoaderError.missingRelationshipField(
+                    model: modelName, relationship: relName,
+                    relType: typeLiteral, field: "related_id_field"
+                )
             }
+            props["relatedIdField"] = s
             if let s = table["order_by_field"]?.string {
                 props["orderByField"] = s
             }
@@ -330,12 +393,21 @@ public enum TomlSchemaLoader {
                 )
             }
             props["joinModel"] = joinModel
-            if let s = table["join_model_local_field"]?.string {
-                props["joinModelLocalField"] = s
+            // js-bao tomlLoader.ts — both join-model link fields required.
+            guard let local = table["join_model_local_field"]?.string else {
+                throw TomlSchemaLoaderError.missingRelationshipField(
+                    model: modelName, relationship: relName,
+                    relType: typeLiteral, field: "join_model_local_field"
+                )
             }
-            if let s = table["join_model_related_field"]?.string {
-                props["joinModelRelatedField"] = s
+            props["joinModelLocalField"] = local
+            guard let related = table["join_model_related_field"]?.string else {
+                throw TomlSchemaLoaderError.missingRelationshipField(
+                    model: modelName, relationship: relName,
+                    relType: typeLiteral, field: "join_model_related_field"
+                )
             }
+            props["joinModelRelatedField"] = related
             if let s = table["join_model_order_by_field"]?.string {
                 props["joinModelOrderByField"] = s
             }
@@ -350,6 +422,45 @@ public enum TomlSchemaLoader {
 
         return RelationshipDescriptor(properties: props)
     }
+
+    // MARK: - Strict-mode helpers
+
+    /// Throw if any key in `table` is not in `allowed`. Mirrors js-bao
+    /// `tomlLoader.ts` `checkUnknownKeys`.
+    private static func checkUnknownKeys(
+        in table: TOMLTable,
+        allowed: Set<String>,
+        context: String
+    ) throws {
+        for key in table.keys where !allowed.contains(key) {
+            throw TomlSchemaLoaderError.unknownKey(
+                context: context, key: key,
+                allowed: allowed.sorted()
+            )
+        }
+    }
+
+    private static let knownModelKeys: Set<String> = [
+        "fields", "relationships", "unique_constraints", "class_name",
+    ]
+
+    private static let knownFieldKeys: Set<String> = [
+        "type", "indexed", "unique", "required",
+        "auto_assign", "auto_stamp",
+        "max_length", "max_count", "default",
+    ]
+
+    private static let knownRelationshipKeys: Set<String> = [
+        "type", "model",
+        "related_id_field",
+        "join_model", "join_model_local_field", "join_model_related_field",
+        "order_by_field", "order_direction",
+        "join_model_order_by_field", "join_model_order_direction",
+    ]
+
+    private static let knownUniqueConstraintKeys: Set<String> = [
+        "name", "fields",
+    ]
 
     // MARK: - Allowed values
 
@@ -381,6 +492,11 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
     case unknownRelatedModel(model: String, relationship: String, target: String)
     case missingJoinModel(model: String, relationship: String)
     case unknownJoinModel(model: String, relationship: String, joinModel: String)
+    case missingRelationshipField(
+        model: String, relationship: String,
+        relType: String, field: String
+    )
+    case unknownKey(context: String, key: String, allowed: [String])
 
     public var description: String {
         switch self {
@@ -410,6 +526,10 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
             return "Model `\(model)` hasManyThrough relationship `\(relationship)` is missing required `join_model`"
         case let .unknownJoinModel(model, relationship, joinModel):
             return "Model `\(model)` hasManyThrough relationship `\(relationship)` references undefined join_model `\(joinModel)`"
+        case let .missingRelationshipField(model, relationship, relType, field):
+            return "Model `\(model)` \(relType) relationship `\(relationship)` is missing required `\(field)`"
+        case let .unknownKey(context, key, allowed):
+            return "\(context): unknown key `\(key)`. Allowed: \(allowed.joined(separator: ", "))"
         }
     }
 }

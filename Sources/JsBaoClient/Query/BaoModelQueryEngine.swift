@@ -30,6 +30,15 @@ public class BaoModelQueryEngine {
     /// classes this guards against.
     private var registeredJunctions: [String: (model: String, field: String)] = [:]
 
+    /// Per-model set of scalar string-typed field names, captured at
+    /// `ensureTable` time. Used by `QueryTranslator` to gate substring
+    /// operators ($startsWith / $endsWith / $containsText): if the
+    /// target field isn't a string or stringset, the translator emits
+    /// `0` instead of letting SQLite coerce a numeric/boolean column
+    /// to text and silently match digits. Matches js-bao's
+    /// `DocumentQueryTranslator.ts:309` field-type gate (which throws).
+    private var stringFieldsByModel: [String: Set<String>] = [:]
+
     public init() {
         var db: OpaquePointer?
         // Use in-memory SQLite for query indexing (separate from persistence)
@@ -77,6 +86,14 @@ public class BaoModelQueryEngine {
     ) {
         lock.lock()
         defer { lock.unlock() }
+
+        // Capture scalar string fields for substring-op type gating
+        // (see `stringFieldsByModel` doc comment). Done up-front so
+        // every subsequent query/queryPaged/count/aggregate call can
+        // consult the same record without re-walking the field list.
+        stringFieldsByModel[modelName] = Set(
+            fields.compactMap { $0.type == .string ? $0.name : nil }
+        )
 
         let tableName = sanitizedTableName(modelName)
         var columns: [String]
@@ -614,6 +631,7 @@ public class BaoModelQueryEngine {
             do {
                 let (sql, params) = try buildSelectSQL(
                     tableName: tableName,
+                    modelName: modelName,
                     filter: filter,
                     options: options,
                     scopedToDocId: scopedToDocId,
@@ -670,6 +688,7 @@ public class BaoModelQueryEngine {
             defer { lock.unlock() }
             let (sql, params) = try buildSelectSQL(
                 tableName: tableName,
+                modelName: modelName,
                 filter: filter,
                 options: queryOptionsWithOverLimit,
                 scopedToDocId: scopedToDocId,
@@ -750,6 +769,7 @@ public class BaoModelQueryEngine {
 
     private func buildSelectSQL(
         tableName: String,
+        modelName: String,
         filter: DocumentFilter?,
         options: QueryOptions?,
         scopedToDocId: String? = nil,
@@ -791,6 +811,7 @@ public class BaoModelQueryEngine {
         if let filter, !filter.isEmpty {
             let (where_, whereParams) = QueryTranslator.translate(
                 filter, stringsetFields: stringsetFields,
+                stringFields: stringFieldsByModel[modelName],
                 tableName: tableName
             )
             whereParts.append("(\(where_))")
@@ -867,6 +888,7 @@ public class BaoModelQueryEngine {
         if let filter, !filter.isEmpty {
             let (where_, whereParams) = QueryTranslator.translate(
                 filter, stringsetFields: stringsetFields,
+                stringFields: stringFieldsByModel[modelName],
                 tableName: tableName
             )
             whereParts.append("(\(where_))")
@@ -896,7 +918,8 @@ public class BaoModelQueryEngine {
         let tableName = sanitizedTableName(modelName)
         var (sql, params) = QueryTranslator.buildAggregation(
             tableName: tableName, options: options,
-            stringsetFields: stringsetFields
+            stringsetFields: stringsetFields,
+            stringFields: stringFieldsByModel[modelName]
         )
         // `buildAggregation` already threads `tableName` through
         // `translate` internally.

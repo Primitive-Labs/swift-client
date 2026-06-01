@@ -140,7 +140,21 @@ final class DisconnectReconnectTests: XCTestCase {
     // Skipped: Reading Y.Doc after disconnect triggers a native crash in YSwift/yrs.
     // The underlying issue is that transactSync on a doc whose provider was torn down
     // causes a use-after-free in the Rust FFI layer (signal 5 / SIGTRAP).
-    func SKIP_testDocumentsRemainOpenAfterDisconnect() async throws {
+    //
+    // The previous incarnation of this test used a `SKIP_test*` name prefix so
+    // XCTest never discovered it — meaning when the YSwift FFI fix lands,
+    // nobody would notice that the regression coverage was still off. Renamed
+    // to the real `test*` name and gated with `XCTSkip` so the suite reports
+    // a documented skip the operator can grep for.
+    func testDocumentsRemainOpenAfterDisconnect() async throws {
+        throw XCTSkip(
+            "Disabled until YSwift FFI use-after-free on post-disconnect " +
+            "transactSync is fixed. Re-enable when the Rust FFI layer no " +
+            "longer signal-traps on a torn-down provider read."
+        )
+        // The body below is intentionally unreachable but preserved so the
+        // assertions don't bit-rot — when the FFI fix lands, delete the
+        // XCTSkip and the test runs as-is.
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Remain Open Test")
 
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)

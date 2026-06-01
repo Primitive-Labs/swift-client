@@ -9,23 +9,25 @@ JS counterpart: [`packages/js-bao/src/query/`](../../../packages/js-bao/src/quer
 | Operator | js-bao | Swift | Status | Notes |
 |---|---|---|---|---|
 | `$eq` | ✅ | ✅ | ✅ | exact match |
-| `$ne` | ✅ | ⚠️ | ⚠️ | **Swift includes NULL rows** (`(col != ? OR col IS NULL)`); js-bao excludes them. Different result sets. |
+| `$ne` | ✅ | ✅ | ✅ | NULL-row divergence closed in [#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789) — Swift now emits `col != ?`. |
 | `$gt` | ✅ | ✅ | ✅ | |
 | `$gte` | ✅ | ✅ | ✅ | |
 | `$lt` | ✅ | ✅ | ✅ | |
 | `$lte` | ✅ | ✅ | ✅ | |
 | `$in` | ✅ | ✅ | ✅ | |
-| `$nin` | ✅ | ⚠️ | ⚠️ | same NULL-handling divergence as `$ne` |
+| `$nin` | ✅ | ✅ | ✅ | NULL-row divergence closed in [#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789). |
 | `$exists` | ✅ | ✅ | ✅ | |
 | `$contains` (stringset) | ✅ | ✅ | ✅ | |
-| `$startsWith` | ✅ throws on non-string | ⚠️ silently `1=1` | ⚠️ | non-string fallback differs |
-| `$endsWith` | ✅ throws on non-string | ⚠️ silently `1=1` | ⚠️ | same |
-| `$containsText` | ✅ throws on non-string, trims, caps at 1024 | ⚠️ silently `1=1`, no trim, no cap | ⚠️ | same |
+| `$startsWith` | ✅ throws on non-string | 🔀 emits `0` on non-string field/value (no throw) | 🔀 | Engine tracks scalar string fields per model (`stringFieldsByModel`) and the translator emits `0` (matches nothing) when the field isn't string/stringset or the value isn't a string. js-bao throws; Swift's `dynamic.query` surface is non-throwing, so behavior is "no match" rather than "error". Result sets agree. ([#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789)) |
+| `$endsWith` | ✅ throws on non-string | 🔀 emits `0` on non-string field/value (no throw) | 🔀 | same as `$startsWith`. |
+| `$containsText` | ✅ throws on non-string, trims, caps at 1024 | 🔀 emits `0` on non-string; trims; caps at 1024 (silent cap, not throw) | 🔀 | Same gating + js-bao's trim and 1024-char cap now applied via `prepareSubstringQuery`. Strict-throws on oversize is a v1.1 follow-up tied to making `dynamic.query` throws-aware. |
 | `$and` | ✅ | ✅ | ✅ | |
 | `$or` | ✅ | ✅ | ✅ | |
 | `$not` | ✅ | ✅ | ✅ | |
 
-**Action:** the four ⚠️ rows are localized fixes in [`QueryTranslator.swift`](../../Sources/JsBaoClient/Query/QueryTranslator.swift). See [wire-format.md](wire-format.md) for why these are wire-format issues and not just translator bugs.
+**Follow-up**: the three 🔀 rows have *agreeing result sets* with js-bao but differ in *error semantics* (Swift: no throw, no match; js-bao: throws). Lifting the substring ops to throwing requires making `dynamic.query` / `aggregate` / `count` throws-aware. Tracked as a v1.1 polish.
+
+Regression coverage: `Tests/JsBaoClientTests/Schema/WireFormatGapFixesTests.swift` pins each operator's behavior.
 
 ## Sort
 
@@ -91,13 +93,13 @@ Neither blocks v1.
 
 ## Known divergences in summary
 
-If you only remember three things from this doc:
+After [#789](https://github.com/Primitive-Labs/js-bao-wss/pull/789):
 
-1. **`$ne` / `$nin` NULL handling differs** — same query gives different results.
-2. **Substring operators silently match-all on non-strings in Swift** — js-bao throws.
-3. **Cursor format is byte-compatible across languages** — that one's a bright spot.
-
-Everything else is parity.
+1. ~~**`$ne` / `$nin` NULL handling differs**~~ — closed. Same query gives same result sets across both clients.
+2. ~~**Substring operators silently match-all on non-strings in Swift**~~ — closed (Swift now emits `0`/no-match). Error semantics still differ (Swift: no throw; js-bao: throws); result sets agree.
+3. **Cursor format is byte-compatible across languages** — bright spot.
+4. **Mixed projection** — Swift `precondition` traps the process; js-bao throws. Still open ([wire-format.md](wire-format.md)).
+5. **Malformed cursor handling** — three different behaviors across Swift entry points (`query` / `queryPaged` / inconsistent). Still open.
 
 ## Notes for maintainers
 

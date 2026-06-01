@@ -147,6 +147,108 @@ final class JsBaoClientTests: XCTestCase {
         }
     }
 
+    /// #850: structured server error bodies must surface as parsed
+    /// `serverCode` and `serverMessage` on the thrown `HttpError`, so
+    /// apps can switch on the code and display the human message
+    /// instead of "HTTP 403".
+    func testHttpErrorSurfacesStructuredServerBody() async throws {
+        // The 403 path: a plain member trying to invite a brand-new
+        // email triggers MEMBER_INVITATIONS_DISABLED with a structured
+        // body. Set up: app + non-admin member + a doc they own.
+        let member = try await ctx.createTestUser(
+            appId: testApp.appId,
+            role: "member",
+            email: "errcode-member-\(UUID().uuidString.prefix(8))@test.local".lowercased()
+        )
+        let docId = try await ctx.createDocument(
+            appId: testApp.appId,
+            jwt: member.jwt,
+            title: "ErrorCode Test Doc"
+        )
+        let memberClient = createTestClient(appId: testApp.appId, token: member.jwt)
+        defer { Task { await memberClient.destroy() } }
+
+        let newEmail = "errcode-target-\(UUID().uuidString.prefix(8))@test.local".lowercased()
+        do {
+            _ = try await memberClient.documents.updatePermissions(
+                documentId: docId,
+                params: ["email": newEmail, "permission": "read-write"]
+            )
+            XCTFail("Should have rejected a non-admin invite to a new email")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.status, 403)
+            XCTAssertEqual(error.serverCode, "MEMBER_INVITATIONS_DISABLED",
+                           "serverCode must come from the body's `code` field")
+            XCTAssertNotNil(error.serverMessage,
+                            "serverMessage must come from the body's `error` field")
+            XCTAssertTrue(
+                (error.serverMessage ?? "").contains("invite") ||
+                (error.serverMessage ?? "").contains("admin"),
+                "serverMessage should be the human-readable string, got: \(error.serverMessage ?? "nil")"
+            )
+            // errorDescription must prefer serverMessage over the
+            // generic "HTTP 403" — that's the user-facing payoff.
+            XCTAssertEqual(error.errorDescription, error.serverMessage)
+        }
+    }
+
+    // MARK: - createDocument (#852)
+
+    /// #852: createDocument is now local-first by default. Online,
+    /// `localOnly: false` must return a usable YDocument immediately
+    /// — not block on `POST /documents` and return `(id, nil)` — and
+    /// the server commit must land in the background, clearing
+    /// `pendingCreate` once acknowledged.
+    func testCreateDocumentIsLocalFirstWhenOnline() async throws {
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+        try await client.connect()
+        try await waitForConnection(client: client)
+
+        let (docId, doc) = try await client.createDocument(
+            options: CreateDocumentOptions(title: "Local-first online", tags: ["lf-test"])
+        )
+
+        XCTAssertFalse(docId.isEmpty)
+        XCTAssertNotNil(doc, "Online createDocument must return a usable YDocument (was nil pre-#852)")
+        XCTAssertTrue(client.isPendingCreate(docId),
+                      "Doc must be marked pendingCreate while the background commit runs")
+        XCTAssertFalse(client.isLocalOnly(docId),
+                       "Non-localOnly create must not be flagged local-only")
+
+        // Caller can write into `doc` *before* the server commit lands.
+        if let doc {
+            let map: YMap<String> = doc.getOrCreateMap(named: "data")
+            doc.transactSync { txn in
+                map.updateValue("written-pre-commit", forKey: "k", transaction: txn)
+            }
+        }
+
+        // Wait for the background commit to finish.
+        try await eventually(timeout: 8, description: "pendingCreate clears") {
+            !client.isPendingCreate(docId)
+        }
+    }
+
+    /// `localOnly: true` still produces a usable doc but never tries
+    /// to commit, and tags ride through the local metadata path.
+    func testCreateDocumentLocalOnlyKeepsTagsAndNeverCommits() async throws {
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+
+        let (docId, doc) = try await client.createDocument(
+            options: CreateDocumentOptions(
+                title: "Local-only with tags",
+                tags: ["t1", "t2"],
+                localOnly: true
+            )
+        )
+        XCTAssertNotNil(doc)
+        XCTAssertTrue(client.isLocalOnly(docId))
+        XCTAssertFalse(client.isPendingCreate(docId),
+                       "localOnly docs must not be pending — they never sync")
+    }
+
     // MARK: - Document Listing
 
     func testListDocuments() async throws {

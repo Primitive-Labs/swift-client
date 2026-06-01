@@ -229,11 +229,21 @@ final class TomlParserTests: XCTestCase {
         }
     }
 
-    func testRejectsMissingModelsTable() {
-        XCTAssertThrowsError(try TomlParser.parse(tomlString: "", swiftNameSuffix: "Record")) { err in
-            guard case CodegenError.missingModelsTable = err else {
-                return XCTFail("wrong error: \(err)")
-            }
-        }
+    /// A fresh-template schema.toml ships with no `[models]` block yet
+    /// — the user adds their first model as part of onboarding. The SPM
+    /// plugin already handles this by emitting zero build commands; the
+    /// standalone tool needs to match so a wrapper script (run.sh /
+    /// run-ios.sh) can call codegen unconditionally on every invocation.
+    func testEmptySchemaReturnsNoSchemas() throws {
+        let schemas = try TomlParser.parse(tomlString: "", swiftNameSuffix: "Record")
+        XCTAssertTrue(schemas.isEmpty)
+    }
+
+    func testCommentOnlySchemaReturnsNoSchemas() throws {
+        let toml = """
+        # placeholder — no models defined yet
+        """
+        let schemas = try TomlParser.parse(tomlString: toml, swiftNameSuffix: "Record")
+        XCTAssertTrue(schemas.isEmpty)
     }
 }

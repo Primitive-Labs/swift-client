@@ -36,8 +36,19 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                         candidatePath = databasePath
                     } else {
                         let dir = Self.defaultDirectory(namespace: namespace)
-                        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                         candidatePath = (dir as NSString).appendingPathComponent("jsbao_storage.sqlite")
+                    }
+                    // Always ensure the parent directory exists — when
+                    // `JsBaoClient.setupStorage` pre-resolves a stable
+                    // per-appId path (#853 fix), the
+                    // `databasePath`-supplied branch skipped the
+                    // mkdir and `sqlite3_open_v2` failed with
+                    // "unable to open database file" on first run.
+                    let parentDir = (candidatePath as NSString).deletingLastPathComponent
+                    if !parentDir.isEmpty {
+                        try FileManager.default.createDirectory(
+                            atPath: parentDir, withIntermediateDirectories: true
+                        )
                     }
 
                     // Idempotent: if already initialized to this exact path, no-op.
@@ -393,6 +404,19 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.path
         #endif
         return (base as NSString).appendingPathComponent("JsBaoClient/\(namespace)")
+    }
+
+    /// Stable default SQLite file path for a given `appId`, used by
+    /// `JsBaoClient.setupStorage()` when no explicit storage directory
+    /// is supplied (issue #853). Keyed on `appId` only — NOT the full
+    /// `initialize(namespace:)` string — so auth-scoped and
+    /// user-scoped initialize calls resolve to the same file and the
+    /// shared provider doesn't trip the re-bind guard. Logical
+    /// per-namespace isolation continues to happen via the `store`
+    /// column inside `kv_store`.
+    public static func defaultDatabasePath(appId: String) -> String {
+        let dir = defaultDirectory(namespace: appId)
+        return (dir as NSString).appendingPathComponent("jsbao_storage.sqlite")
     }
 
     private static func iso8601Now() -> String {

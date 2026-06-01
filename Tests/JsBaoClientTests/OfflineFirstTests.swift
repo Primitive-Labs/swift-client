@@ -104,6 +104,81 @@ final class OfflineFirstTests: XCTestCase {
         XCTAssertTrue(client.isLocalOnly(docId))
     }
 
+    /// Local YDoc edits should land in SQLite without waiting for a
+    /// server sync to complete. Reopening a fresh client against the
+    /// same `.sqlite()` directory must surface the prior session's
+    /// writes — that's the durability guarantee js-bao's `y-indexeddb`
+    /// integration provides on the JS side, and the missing piece in
+    /// swift-client pre-this-patch (writes were only flushed on
+    /// `handleSyncComplete` or explicit close, so anything written
+    /// between sync rounds — or on a doc whose sync never completes —
+    /// vanished on app restart).
+    func testWritesPersistAcrossClientRestartWithoutSync() async throws {
+        let dbPath = tempDir + "persist-across-restart.sqlite"
+
+        // ── First client lifetime: write data, never let sync complete.
+        var capturedDocId: String = ""
+        do {
+            let client = createTestClient(
+                appId: testApp.appId,
+                token: testApp.ownerJWT,
+                offline: true,
+                storageConfig: .sqlite(directory: dbPath),
+                autoNetwork: false
+            )
+            // Stay offline for the entirety of this lifetime so the
+            // observed durability is purely local-first — no
+            // `handleSyncComplete` can fire to save the test.
+            await client.goOffline()
+
+            let (docId, maybeDoc) = try await client.createDocument(options: CreateDocumentOptions(
+                title: "Persist Across Restart",
+                localOnly: true
+            ))
+            capturedDocId = docId
+            guard let ydoc = maybeDoc else {
+                XCTFail("createDocument returned nil YDocument")
+                return
+            }
+            let map: YMap<String> = ydoc.getOrCreateMap(named: "content")
+            ydoc.transactSync { txn in
+                map.updateValue("hello", forKey: "greeting", transaction: txn)
+                map.updateValue("world", forKey: "place", transaction: txn)
+            }
+
+            // Wait well past the 250ms debounce so the persist task
+            // has a chance to flush.
+            try await delay(0.6)
+
+            await client.destroy()
+        }
+
+        // ── Fresh client, same SQLite directory: writes survived?
+        let client2 = createTestClient(
+            appId: testApp.appId,
+            token: testApp.ownerJWT,
+            offline: true,
+            storageConfig: .sqlite(directory: dbPath),
+            autoNetwork: false
+        )
+        defer { Task { await client2.destroy() } }
+        await client2.goOffline()
+
+        // Open the same doc against the new client. With local-first
+        // persistence working, `openDocument` rehydrates from SQLite.
+        let restored = try await client2.openDocument(
+            capturedDocId,
+            options: OpenDocumentOptions(
+                waitForLoad: .local,
+                enableNetworkSync: false
+            )
+        )
+
+        let restoredMap: YMap<String> = restored.getOrCreateMap(named: "content")
+        XCTAssertEqual(restoredMap["greeting"], "hello", "greeting was lost across restart — SQLite persistence isn't firing on local updates")
+        XCTAssertEqual(restoredMap["place"], "world", "place was lost across restart — SQLite persistence isn't firing on local updates")
+    }
+
     func testEvictAllLocalData() async throws {
         let client = createTestClient(
             appId: testApp.appId,

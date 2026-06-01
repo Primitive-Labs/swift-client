@@ -191,7 +191,7 @@ final class InvitationTests: XCTestCase {
     /// Ported from JS: invite to non-existent email
     /// Should still create a pending invitation even if the email is not a registered user.
     func testInviteNonExistentEmail() async throws {
-        let nonExistentEmail = "nonexistent-\(UUID().uuidString.prefix(8))@test.local"
+        let nonExistentEmail = "nonexistent-\(UUID().uuidString.prefix(8))@test.local".lowercased()
 
         let result = try await ownerClient.documents.sendInvitation(
             documentId: documentId,
@@ -398,5 +398,71 @@ final class InvitationTests: XCTestCase {
         if let permission = docInfo["permission"] as? String {
             XCTAssertEqual(permission, "read-write")
         }
+    }
+
+    // MARK: - Migration path (issue #619/#628): pending-invitations + email-removal
+
+    /// Inviting a not-yet-existing email via `updatePermissions` should
+    /// create a `DeferredDocumentPermission` that `listPendingInvitations`
+    /// surfaces. Uses the app-owner JWT because deferred grants to
+    /// brand-new emails are admin-gated (MEMBER_INVITATIONS_DISABLED
+    /// fires for plain "member" users).
+    func testListPendingInvitationsForDeferredEmail() async throws {
+        let appOwner = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await appOwner.destroy() } }
+        let ownerDocId = try await ctx.createDocument(
+            appId: testApp.appId,
+            jwt: testApp.ownerJWT,
+            title: "Migration: pending invitations"
+        )
+
+        let pendingEmail = "pending-\(UUID().uuidString.prefix(8))@test.local".lowercased()
+        _ = try await appOwner.documents.updatePermissions(
+            documentId: ownerDocId,
+            params: ["email": pendingEmail, "permission": "read-write"]
+        )
+
+        let pending = try await appOwner.documents.listPendingInvitations(
+            documentId: ownerDocId
+        )
+        XCTAssertTrue(
+            pending.contains { ($0["email"] as? String) == pendingEmail },
+            "Pending invitation for \(pendingEmail) should surface"
+        )
+    }
+
+    /// `removePermission(documentId:, email:)` cancels the deferred
+    /// grant so the email no longer appears in `listPendingInvitations`.
+    func testRemovePermissionByEmailDropsDeferredGrant() async throws {
+        let appOwner = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await appOwner.destroy() } }
+        let ownerDocId = try await ctx.createDocument(
+            appId: testApp.appId,
+            jwt: testApp.ownerJWT,
+            title: "Migration: cancel by email"
+        )
+
+        let pendingEmail = "to-cancel-\(UUID().uuidString.prefix(8))@test.local".lowercased()
+        _ = try await appOwner.documents.updatePermissions(
+            documentId: ownerDocId,
+            params: ["email": pendingEmail, "permission": "read-write"]
+        )
+        let before = try await appOwner.documents.listPendingInvitations(
+            documentId: ownerDocId
+        )
+        XCTAssertTrue(before.contains { ($0["email"] as? String) == pendingEmail })
+
+        _ = try await appOwner.documents.removePermission(
+            documentId: ownerDocId,
+            email: pendingEmail
+        )
+
+        let after = try await appOwner.documents.listPendingInvitations(
+            documentId: ownerDocId
+        )
+        XCTAssertFalse(
+            after.contains { ($0["email"] as? String) == pendingEmail },
+            "Cancelled email should be gone from pending list"
+        )
     }
 }

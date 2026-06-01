@@ -19,9 +19,21 @@ public struct QueryTranslator {
     /// - Parameter stringsetFields: names of fields whose column stores a
     ///   comma-joined stringset. The `$contains` operator dispatches
     ///   differently for these.
+    /// - Parameter stringFields: when non-nil, scalar substring operators
+    ///   (`$startsWith`, `$endsWith`, `$containsText`) require their
+    ///   target field to be in this set (or in `stringsetFields`).
+    ///   Filters that violate the rule emit `0` (match nothing) instead
+    ///   of silently running LIKE against a non-string column (which
+    ///   SQLite would coerce, producing surprising matches like
+    ///   `priority $startsWith "1"` matching `priority = 10`). Matches
+    ///   js-bao's `DocumentQueryTranslator.ts:309` field-type gate
+    ///   (which throws there; we emit `0` because the Swift surface
+    ///   is non-throwing). Nil keeps the legacy value-driven path for
+    ///   callers that don't supply schema info.
     public static func translate(
         _ filter: DocumentFilter,
         stringsetFields: Set<String> = [],
+        stringFields: Set<String>? = nil,
         tableName: String? = nil
     ) -> (String, [Any]) {
         var conditions: [String] = []
@@ -29,14 +41,14 @@ public struct QueryTranslator {
 
         for (key, value) in filter {
             if key == "$and", let arr = value as? [DocumentFilter] {
-                let sub = arr.map { translate($0, stringsetFields: stringsetFields, tableName: tableName) }
+                let sub = arr.map { translate($0, stringsetFields: stringsetFields, stringFields: stringFields, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " AND ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
             } else if key == "$or", let arr = value as? [DocumentFilter] {
-                let sub = arr.map { translate($0, stringsetFields: stringsetFields, tableName: tableName) }
+                let sub = arr.map { translate($0, stringsetFields: stringsetFields, stringFields: stringFields, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " OR ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
@@ -48,6 +60,7 @@ public struct QueryTranslator {
                     let (cond, p) = translateOperator(
                         field: key, op: op, value: opVal,
                         stringsetFields: stringsetFields,
+                        stringFields: stringFields,
                         tableName: tableName
                     )
                     conditions.append(cond)
@@ -75,9 +88,23 @@ public struct QueryTranslator {
         op: String,
         value: Any,
         stringsetFields: Set<String> = [],
+        stringFields: Set<String>? = nil,
         tableName: String? = nil
     ) -> (String, [Any]) {
         let col = quoted(field)
+
+        // Substring-op field-type gate (matches js-bao
+        // DocumentQueryTranslator.ts:309). If the caller supplied
+        // `stringFields` and this is a substring op, the target field
+        // must be a string or stringset. Otherwise we emit `0` rather
+        // than letting SQLite coerce a numeric/boolean column to text
+        // and silently match digits.
+        if let stringFields,
+           op == "$startsWith" || op == "$endsWith" || op == "$containsText",
+           !stringFields.contains(field),
+           !stringsetFields.contains(field) {
+            return ("0", [])
+        }
 
         switch op {
         case "$eq":
@@ -86,7 +113,13 @@ public struct QueryTranslator {
 
         case "$ne":
             if value is NSNull { return ("\(col) IS NOT NULL", []) }
-            return ("(\(col) != ? OR \(col) IS NULL)", [sqlValue(value)])
+            // Exclude NULL rows so the result set matches js-bao
+            // (browser.ts `$ne` emits `col != ?`, which SQLite evaluates
+            // as UNKNOWN for NULL → row excluded). The earlier OR-NULL
+            // wing made `field $ne X` behave like "anything except X,
+            // including missing", which silently disagreed with the JS
+            // client on a very common query shape.
+            return ("\(col) != ?", [sqlValue(value)])
 
         case "$gt":
             return ("\(col) > ?", [sqlValue(value)])
@@ -107,7 +140,9 @@ public struct QueryTranslator {
         case "$nin":
             if let arr = value as? [Any], !arr.isEmpty {
                 let placeholders = arr.map { _ in "?" }.joined(separator: ",")
-                return ("(\(col) NOT IN (\(placeholders)) OR \(col) IS NULL)", arr.map { sqlValue($0) })
+                // Same NULL-handling alignment as `$ne` above — exclude
+                // missing values so result sets match js-bao.
+                return ("\(col) NOT IN (\(placeholders))", arr.map { sqlValue($0) })
             }
             return ("1", []) // empty $nin matches everything
 
@@ -122,9 +157,15 @@ public struct QueryTranslator {
                                               tableName: tableName)
             }
             if let text = value as? String {
-                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(text))%"])
+                let prepared = prepareSubstringQuery(text)
+                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(prepared))%"])
             }
-            return ("1=1", [])
+            // Non-string value on a substring operator: js-bao throws.
+            // Translator can't throw with this API, so emit a clause
+            // that matches nothing — the practical analogue ("invalid
+            // input → no rows"). Strictly better than the prior `1=1`,
+            // which silently returned every row.
+            return ("0", [])
 
         case "$startsWith":
             if stringsetFields.contains(field) {
@@ -133,9 +174,10 @@ public struct QueryTranslator {
                                               tableName: tableName)
             }
             if let text = value as? String {
-                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["\(escapeLike(text))%"])
+                let prepared = prepareSubstringQuery(text)
+                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["\(escapeLike(prepared))%"])
             }
-            return ("1=1", [])
+            return ("0", [])
 
         case "$endsWith":
             if stringsetFields.contains(field) {
@@ -144,9 +186,10 @@ public struct QueryTranslator {
                                               tableName: tableName)
             }
             if let text = value as? String {
-                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(text))"])
+                let prepared = prepareSubstringQuery(text)
+                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(prepared))"])
             }
-            return ("1=1", [])
+            return ("0", [])
 
         case "$exists":
             let exists = (value as? Bool) ?? true
@@ -227,7 +270,8 @@ public struct QueryTranslator {
     public static func buildAggregation(
         tableName: String,
         options: AggregateOptions,
-        stringsetFields: Set<String> = []
+        stringsetFields: Set<String> = [],
+        stringFields: Set<String>? = nil
     ) -> (String, [Any]) {
         var selectClauses: [String] = []
         var params: [Any] = []
@@ -271,6 +315,7 @@ public struct QueryTranslator {
         if let filter = options.filter, !filter.isEmpty {
             let (where_, whereParams) = translate(
                 filter, stringsetFields: stringsetFields,
+                stringFields: stringFields,
                 tableName: tableName
             )
             sql += " WHERE \(where_)"
@@ -327,8 +372,16 @@ public struct QueryTranslator {
             assertionFailure("QueryTranslator: substring op on stringset needs tableName context")
             return ("0", [])
         }
-        guard let text = value as? String, !text.isEmpty else {
-            return ("1=1", [])
+        guard let raw = value as? String else {
+            // Non-string value on a substring op: js-bao throws; we
+            // can't throw from here, so emit a never-matches clause.
+            return ("0", [])
+        }
+        let text = prepareSubstringQuery(raw)
+        guard !text.isEmpty else {
+            // Empty (or whitespace-only) input after trim: matches
+            // nothing rather than the prior `1=1` everything-matches.
+            return ("0", [])
         }
         let junction = "\(tableName)__\(field)"
         let sql = """
@@ -340,6 +393,24 @@ public struct QueryTranslator {
         )
         """
         return (sql, [pattern.likeValue(text)])
+    }
+
+    /// Trim whitespace + cap at 1024 chars to match js-bao's contract
+    /// for `$containsText` / `$startsWith` / `$endsWith` inputs
+    /// (browser.ts caps to 1024 and rejects whitespace-only). Strictly
+    /// better than the previous "pass the raw caller string straight to
+    /// SQLite as a LIKE pattern" — that path silently differed from JS
+    /// for `"  widget  "` (Swift didn't match, JS did) and for over-1024
+    /// inputs (Swift ran an oversize LIKE pattern, JS threw).
+    ///
+    /// We can't throw from this code path with the current non-throws
+    /// translator API, so we cap silently. Strict-throws would be a
+    /// follow-up tied to making `dynamic.query(...)` throws-aware.
+    private static func prepareSubstringQuery(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 1024 { return trimmed }
+        let cap = trimmed.index(trimmed.startIndex, offsetBy: 1024)
+        return String(trimmed[..<cap])
     }
 
     /// `escapeLike` is a static helper on the type; the nested

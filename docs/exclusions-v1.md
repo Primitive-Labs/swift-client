@@ -17,27 +17,25 @@ Items group into four buckets:
 
 ## 1. Out of scope for v1, planned for later
 
-### App-level invitations + deferred grants (`InvitationsAPI`)
+### ✅ Closed in #790 (was here in v1)
 
-JS has a top-level `client.invitations.*` for **app-level** invitations: invite someone to join the whole app, optionally with deferred document/group grants that activate when they accept.
+The bulk of the original v1 exclusions landed via the API-parity pass:
 
-| JS method | Notes |
-|---|---|
-| `quota()`, `create(...)`, `list(...)`, `get(...)`, `delete(...)`, `accept(token)` | App-level invitation lifecycle |
-| `listDeferredGrants(...)` | Browse pending grants |
-| (deferred-grant accept flow) | |
+- **App-level invitations** (`InvitationsAPI`, 8 methods incl. deferred-grant browse/revoke)
+- **Blob buckets** (`BlobBucketsAPI`, 10 methods incl. raw upload/download)
+- **Cron triggers** (`CronTriggersAPI`, 8 methods)
+- **Type configs** (`CollectionTypeConfigsAPI` + `DatabaseTypeConfigsAPI`, 10 methods)
+- **DocumentsAPI access-requests** + **pending-creates** + **getOwner** + **revokeGroupPermission** + **local-state methods** (`isOpen`, `isPendingCreate`, `hasLocalCopy`, `getDocumentPermission`, `getLocalMetadata`) (~13 methods)
+- **DatabasesAPI operational** (CEL context, managers, group permissions, executeBatch, importRows) (~10 methods)
+- **UsersAPI**: `getProfiles` + `lookup`
+- **WorkflowsAPI**: `listStepRuns` + `forceRerun` + `forward` + `contextDocId` + `terminate(contextDocId:)`
+- **MeAPI**: `uploadAvatar` now respects `contentType`
 
-**Per-document invitations are present** on the Swift side — they live on `client.documents.*` (acceptInvitation, declineInvitation, listInvitations, inviteUser, etc.) and `client.me.pendingDocumentInvitations()`. Storylens and other sample apps use the per-document flow extensively.
+See [parity/api-methods.md](parity/api-methods.md) for the per-method table.
 
-The app-level flow is the planned v1.1 addition.
+### Still open
 
-### Blob buckets (`BlobBucketsAPI`)
-
-Per-document blobs are fully present (`client.document(id).blobs().upload(...)`, `.read(blobId:)`). Used extensively by storylens-ios for cover images and page images.
-
-App-level blob *buckets* (separate namespace, signed URLs, configurable TTL tiers, access policies) are not exposed.
-
-### `listLocalDocuments` and offline-metadata browsing
+#### `listLocalDocuments` and offline-metadata browsing
 
 These let JS clients browse what's been persisted locally without going to the server:
 
@@ -46,12 +44,11 @@ These let JS clients browse what's been persisted locally without going to the s
 | `listLocalDocuments()` | enumerate offline metadata |
 | `evictLocalDocument(id)` | clear a specific doc from local cache |
 | `setRetentionPolicy(...)` | configure cache eviction |
-| `getLocalMetadata(id)` | inspect cached metadata |
 | `markMetadataDeleted(id)` | tombstone for offline-deleted docs |
 
-Swift has the underlying offline store but no public surface for browsing it. Could be added in v1.1.
+Swift has the underlying offline store but no public top-level surface for browsing it. (`getLocalMetadata` did land on `client.documents.*` in #790.) Could be added in v1.1.
 
-### `waitFor*` family
+#### `waitFor*` family
 
 | JS method | Purpose |
 |---|---|
@@ -63,71 +60,15 @@ Swift has the underlying offline store but no public surface for browsing it. Co
 
 Swift has `waitForAuthReady()` but its return type is `Void` whereas JS returns `{userId, mode}`. The other `waitFor*` are entirely absent. These are mainly UX affordances — "did my write land before I navigate away?" — and some are easier in Swift via async/await directly. Worth filling in for v1.1.
 
-### Cron triggers (`CronTriggersAPI`)
+#### `MeAPI.bookmarks` sub-API + `MeAPI.getProfile()`
 
-Cron-scheduled workflow triggers. Not present on Swift.
+**Auto-closed by a JS-side removal.** When the parity doc was seeded, `client.me.bookmarks.*` existed on the JS client and was a real Swift gap. **PR #702 removed bookmarks from the JS client as a breaking change** (and `getProfile()` is also no longer in the JS source). Swift never implemented either, so the gap closed without any Swift work — but the reasoning matters for future audits: if bookmarks ever return to the JS surface, this row becomes a real Swift gap again, not a doc bug.
 
-| JS method |
-|---|
-| `list()`, `get(id)`, `create(...)`, `update(...)`, `delete(id)`, `pause(id)`, `resume(id)`, `test(...)` |
+#### `DatabasesAPI.subscribe`
 
-Workflows themselves are present (`client.workflows.*`); the cron-triggering layer on top isn't.
+WebSocket-based per-database subscription. Significantly more involved than the HTTP wrappers closed in #790. Tracked separately for a v1.1 follow-up.
 
-### Type configs (`CollectionTypeConfigsAPI`, `DatabaseTypeConfigsAPI`)
-
-Configure which TOML model types are valid for app-defined collections / databases.
-
-| JS method |
-|---|
-| `list()`, `get(type)`, `create(...)`, `update(...)`, `delete(type)` |
-
-Both APIs are 5 methods each, fully ⛔ on Swift.
-
-### `MeAPI.bookmarks` sub-API
-
-| JS method |
-|---|
-| `list()`, `add(...)`, `remove(...)`, `update(...)` |
-
-Personal bookmarks for the current user. Not in v1.
-
-### Document open-state checks, access requests, pending creates
-
-On `client.documents.*`:
-
-| JS method |
-|---|
-| `isOpen(id)` |
-| `requestAccess(id)` / `cancelAccessRequest(id)` |
-| `listAccessRequests(id)` / `approveAccessRequest(...)` / `rejectAccessRequest(...)` |
-| `getPendingCreate(id)` / `cancelPendingCreate(id)` / `listPendingCreates()` |
-| `getOwner(id)` / `transferOwnership(...)` |
-| Group permission revoke + several related methods |
-
-About 13 methods grouped here. Some (open-state, getOwner) are quick wins; others (access requests as a feature) are larger surface.
-
-### Database operational methods
-
-On `client.databases.*`:
-
-| JS method |
-|---|
-| `executeBatch(...)`, `importCsv(...)`, `subscribe(id, ...)` |
-| CEL context: `getCelContext(...)`, `setCelContext(...)` |
-| Managers: `listManagers(id)`, `addManager(...)`, `removeManager(...)` |
-| Group permissions: `listGroupPermissions(id)`, `addGroupPermission(...)`, `removeGroupPermission(...)` |
-
-About 10 methods.
-
-### `WorkflowsAPI.listStepRuns`
-
-Inspecting per-step runs of a workflow. Useful for debugging UI.
-
-### `UsersAPI.getProfiles` (batch) + `lookup` (by email)
-
-Batch-fetch user profiles, look up a user by email.
-
-### `TypedModel<T>` minimal v1 surface
+#### `TypedModel<T>` minimal v1 surface
 
 `TypedModel<T>` only has `create`, `find`, `findAll`, `delete`. The richer js-bao `BaseModel` surface (`update`, `query`, `queryOne`, `findByUnique`, etc.) requires dropping to `model.dynamic.*`. v1.1 polish: lift the common methods up to `TypedModel<T>`.
 
@@ -176,10 +117,14 @@ The 14 Swift sub-APIs use 3 different styles: thin dict facade, typed-options + 
 Capabilities not currently planned but reasonable to add. If you find yourself wanting any of these, file an issue:
 
 - `client.openDocumentByAlias(alias)` — open by URL alias
-- `client.getDocumentPermission(...)` — inspect current user's permission on a doc
 - `setNetworkMode` / `syncMetadata` options objects (currently bare-bones)
-- `WorkflowsAPI` options: `forceRerun`, `contextDocId`, `forward`
-- TypedModel `updatedAtMs` field on `StorageRecord`
+- ~~`WorkflowsAPI` options: `forceRerun`, `contextDocId`, `forward`~~ — closed in #790
+- ~~`StorageRecord.updatedAtMs` field~~ — closed in #789
+- ~~`client.getDocumentPermission(...)`~~ — closed in #790 (lives on `client.documents.*`)
+- `DatabasesAPI.subscribe` (WebSocket-based)
+- `importCsv` raw-CSV variant with schema-aware coercion (current Swift takes pre-parsed rows)
+- `addTag` / `removeTag` returning `[String]` instead of raw dict
+- `client.deleteDocument(forceCloseIfOpen:)` parameter
 
 ---
 

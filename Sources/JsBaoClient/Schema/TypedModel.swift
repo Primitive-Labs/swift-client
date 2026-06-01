@@ -131,6 +131,37 @@ public final class TypedModel<T: PrimitiveModel> {
         }
     }
 
+    /// First row matching `filter`, or `nil` when none. Mirrors
+    /// js-bao's `Model.queryOne(filter)`. Returns the first match by
+    /// the default sort (id ASC) when multiple rows match.
+    public func queryOne(_ filter: DocumentFilter? = nil) -> T? {
+        return query(filter, options: QueryOptions(limit: 1)).first
+    }
+
+    /// Find a record by a resolved unique constraint name. Mirrors
+    /// js-bao's `Model.findByUnique(constraintName, value)`. Returns
+    /// nil when no record matches the unique-index lookup. Throws if
+    /// the constraint isn't registered on the model.
+    public func findByUnique(
+        constraint name: String,
+        value: PrimitiveValue
+    ) throws -> T? {
+        guard let record = try dynamic.findByUnique(constraint: name, value: value),
+              let id = record["id"] as? String else { return nil }
+        return find(id: id)
+    }
+
+    /// Compound-unique lookup. Values must be supplied in the same
+    /// order as the constraint's declared `fields`.
+    public func findByUnique(
+        constraint name: String,
+        values: [PrimitiveValue]
+    ) throws -> T? {
+        guard let record = try dynamic.findByUnique(constraint: name, values: values),
+              let id = record["id"] as? String else { return nil }
+        return find(id: id)
+    }
+
     /// Fire-and-forget create — same as `create(_:)` but doesn't
     /// throw. Use this when the model has no unique constraints (so
     /// the only thing `create` could throw is a schema-drift
