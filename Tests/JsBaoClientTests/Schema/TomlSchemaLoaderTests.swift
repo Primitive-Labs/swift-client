@@ -306,6 +306,49 @@ final class TomlSchemaLoaderTests: XCTestCase {
         ]))
     }
 
+    // MARK: - auto_stamp (#1056)
+
+    func testLoadsAutoStamp() throws {
+        let toml = """
+        [models.Note]
+        [models.Note.fields.id]
+        type = "id"
+        [models.Note.fields.createdAt]
+        type = "number"
+        auto_stamp = "create"
+        [models.Note.fields.updatedAt]
+        type = "number"
+        auto_stamp = "both"
+        [models.Note.fields.body]
+        type = "string"
+        """
+        let note = try TomlSchemaLoader.load(tomlString: toml)[0]
+        XCTAssertEqual(note.fields["createdAt"]?.autoStamp, .create)
+        XCTAssertEqual(note.fields["updatedAt"]?.autoStamp, .both)
+        XCTAssertNil(note.fields["body"]?.autoStamp)
+    }
+
+    func testInvalidAutoStampIsRejected() {
+        let toml = """
+        [models.Note]
+        [models.Note.fields.id]
+        type = "id"
+        [models.Note.fields.ts]
+        type = "number"
+        auto_stamp = "whenever"
+        """
+        XCTAssertThrowsError(try TomlSchemaLoader.load(tomlString: toml)) { err in
+            guard case TomlSchemaLoaderError.invalidAutoStamp(
+                let model, let field, let value
+            ) = err else {
+                return XCTFail("Expected invalidAutoStamp, got \(err)")
+            }
+            XCTAssertEqual(model, "Note")
+            XCTAssertEqual(field, "ts")
+            XCTAssertEqual(value, "whenever")
+        }
+    }
+
     // MARK: - Validation errors
 
     func testUnknownFieldTypeIsRejected() {

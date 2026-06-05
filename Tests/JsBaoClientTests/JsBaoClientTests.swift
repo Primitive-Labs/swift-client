@@ -172,7 +172,7 @@ final class JsBaoClientTests: XCTestCase {
         do {
             _ = try await memberClient.documents.updatePermissions(
                 documentId: docId,
-                params: ["email": newEmail, "permission": "read-write"]
+                params: UpdatePermissionsData(email: newEmail, permission: "read-write")
             )
             XCTFail("Should have rejected a non-admin invite to a new email")
         } catch let error as HttpError {
@@ -258,7 +258,7 @@ final class JsBaoClientTests: XCTestCase {
         // Create a document
         let _ = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "List Test")
 
-        let result = try await client.documents.list()
+        let result = try await client.me.ownedDocuments()
         XCTAssertNotNil(result)
     }
 

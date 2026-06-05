@@ -64,7 +64,7 @@ final class CodegenEdgeCaseTests: XCTestCase {
         let model = TypedModel<TaskRecord>(doc: doc)
         let id = "date-\(UUID().uuidString)"
         _ = try model.create(TaskRecord(
-            id: id, createdAt: raw, title: "x"
+            id: id, title: "x", createdAt: raw
         ))
         let read = try XCTUnwrap(model.find(id: id), file: file, line: line)
         XCTAssertEqual(read.createdAt, raw, "date string should round-trip unchanged", file: file, line: line)
@@ -149,7 +149,7 @@ final class CodegenEdgeCaseTests: XCTestCase {
         let model = TypedModel<TaskRecord>(doc: doc)
         let id = "num-\(UUID().uuidString)"
         _ = try model.create(TaskRecord(
-            id: id, priority: n, title: "x"
+            id: id, title: "x", priority: n
         ))
         let read = try XCTUnwrap(model.find(id: id), file: file, line: line)
         XCTAssertEqual(read.priority, n, "number should round-trip unchanged: \(n)", file: file, line: line)
@@ -233,7 +233,7 @@ final class CodegenEdgeCaseTests: XCTestCase {
         let model = freshCrashTestModel()
         let members: Set<String> = ["a", "b", "c", "d", "e"]
         _ = try model.create(CrashTestRecord(
-            id: "ss-cap", requiredTags: ["t"], tags: members
+            id: "ss-cap", tags: members, requiredTags: ["t"]
         ))
         let read = try XCTUnwrap(model.find(id: "ss-cap"))
         XCTAssertEqual(read.tags, members,

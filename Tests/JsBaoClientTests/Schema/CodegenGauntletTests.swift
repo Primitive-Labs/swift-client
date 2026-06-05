@@ -97,8 +97,8 @@ final class CodegenGauntletTests: XCTestCase {
         // reason). Both lookups must compile and round-trip the value.
         let r = CrashTestRecord(
             id: "x",
-            default: "via init",     // labels don't need backticks
             requiredTags: ["t"],
+            default: "via init",     // labels don't need backticks
             where: "kitchen"
         )
         XCTAssertEqual(r.`default`, "via init")
@@ -111,8 +111,8 @@ final class CodegenGauntletTests: XCTestCase {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "s1",
-            requiredTags: ["alpha", "beta"],
-            tags: ["x", "y", "z"]
+            tags: ["x", "y", "z"],
+            requiredTags: ["alpha", "beta"]
         ))
         let read = try XCTUnwrap(model.find(id: "s1"))
         XCTAssertEqual(read.requiredTags, ["alpha", "beta"])
@@ -123,8 +123,8 @@ final class CodegenGauntletTests: XCTestCase {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "empty",
-            requiredTags: [],
-            tags: []
+            tags: [],
+            requiredTags: []
         ))
         let read = try XCTUnwrap(model.find(id: "empty"))
         // Empty stringsets read back as either an empty Set or nil
@@ -148,9 +148,9 @@ final class CodegenGauntletTests: XCTestCase {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "row1",
-            boundedName: "row-test",
-            email: "row@e.com",
             requiredTags: ["alpha", "beta"],
+            email: "row@e.com",
+            boundedName: "row-test",
             score: 7
         ))
         let rows = model.dynamic.query(["id": "row1"])
@@ -171,12 +171,14 @@ final class CodegenGauntletTests: XCTestCase {
         // every bool. The emitter falls back through `as? Int`.
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
-            id: "boolT", active: true,
-            requiredTags: ["t"]
+            id: "boolT",
+            requiredTags: ["t"],
+            active: true
         ))
         try model.create(CrashTestRecord(
-            id: "boolF", active: false,
-            requiredTags: ["t"]
+            id: "boolF",
+            requiredTags: ["t"],
+            active: false
         ))
         let rows = model.dynamic.query(nil, options: QueryOptions(sort: ["id": 1]))
         let typed = rows.compactMap(CrashTestRecord.init(row:))
@@ -193,8 +195,8 @@ final class CodegenGauntletTests: XCTestCase {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "kw1",
-            default: "explicit",
             requiredTags: ["t"],
+            default: "explicit",
             where: "kitchen"
         ))
         let read = try XCTUnwrap(model.find(id: "kw1"))
@@ -235,8 +237,8 @@ final class CodegenGauntletTests: XCTestCase {
         XCTAssertThrowsError(
             try model.create(CrashTestRecord(
                 id: "over",
-                requiredTags: ["t"],
-                tags: ["a", "b", "c", "d", "e", "f"]   // 6 > max 5
+                tags: ["a", "b", "c", "d", "e", "f"],   // 6 > max 5
+                requiredTags: ["t"]
             ))
         ) { error in
             guard let e = error as? FieldValidationError else {
@@ -251,14 +253,14 @@ final class CodegenGauntletTests: XCTestCase {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "u1",
-            email: "dup@example.com",
-            requiredTags: ["t"]
+            requiredTags: ["t"],
+            email: "dup@example.com"
         ))
         XCTAssertThrowsError(
             try model.create(CrashTestRecord(
                 id: "u2",
-                email: "dup@example.com",
-                requiredTags: ["t"]
+                requiredTags: ["t"],
+                email: "dup@example.com"
             ))
         ) { error in
             XCTAssertTrue(error is UniqueConstraintViolationError,
@@ -270,17 +272,17 @@ final class CodegenGauntletTests: XCTestCase {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "c1",
-            boundedName: "shared",
-            email: "u1@example.com",       // distinct emails — proves the
             requiredTags: ["t"],            // single-field unique on email
-            score: 42                       // is not what's firing.
+            email: "u1@example.com",       // distinct emails — proves the
+            boundedName: "shared",          // is not what's firing.
+            score: 42
         ))
         XCTAssertThrowsError(
             try model.create(CrashTestRecord(
                 id: "c2",
-                boundedName: "shared",
-                email: "u2@example.com",
                 requiredTags: ["t"],
+                email: "u2@example.com",
+                boundedName: "shared",
                 score: 42
             ))
         ) { error in
@@ -294,10 +296,10 @@ final class CodegenGauntletTests: XCTestCase {
     func testFilterGteOnIndexedScore() throws {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
-            id: "high", email: "h@e.com", requiredTags: ["t"], score: 90
+            id: "high", requiredTags: ["t"], email: "h@e.com", score: 90
         ))
         try model.create(CrashTestRecord(
-            id: "low",  email: "l@e.com", requiredTags: ["t"], score: 10
+            id: "low",  requiredTags: ["t"], email: "l@e.com", score: 10
         ))
         let rows = model.dynamic.query(["score": ["$gte": 50]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
@@ -309,21 +311,21 @@ final class CodegenGauntletTests: XCTestCase {
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "a",
-            boundedName: "Alpha widget",
+            requiredTags: ["t"],
             email: "a@e.com",
-            requiredTags: ["t"]
+            boundedName: "Alpha widget"
         ))
         try model.create(CrashTestRecord(
             id: "b",
-            boundedName: "Beta gadget",
+            requiredTags: ["t"],
             email: "b@e.com",
-            requiredTags: ["t"]
+            boundedName: "Beta gadget"
         ))
         try model.create(CrashTestRecord(
             id: "c",
-            boundedName: "Gamma thing",
-            email: "c@e.com",
             requiredTags: ["t"],
+            email: "c@e.com",
+            boundedName: "Gamma thing",
             score: 999
         ))
         let rows = model.dynamic.query([
@@ -343,8 +345,8 @@ final class CodegenGauntletTests: XCTestCase {
         for (i, score) in [50.0, 10.0, 50.0].enumerated() {
             try model.create(CrashTestRecord(
                 id: "s\(i)",
-                email: "s\(i)@e.com",
                 requiredTags: ["t"],
+                email: "s\(i)@e.com",
                 score: score
             ))
         }
@@ -361,17 +363,17 @@ final class CodegenGauntletTests: XCTestCase {
         for i in 0..<3 {
             try model.create(CrashTestRecord(
                 id: "t\(i)",
-                active: true,
+                requiredTags: ["t"],
                 email: "t\(i)@e.com",
-                requiredTags: ["t"]
+                active: true
             ))
         }
         for i in 0..<2 {
             try model.create(CrashTestRecord(
                 id: "f\(i)",
-                active: false,
+                requiredTags: ["t"],
                 email: "f\(i)@e.com",
-                requiredTags: ["t"]
+                active: false
             ))
         }
 
@@ -407,8 +409,8 @@ final class CodegenGauntletTests: XCTestCase {
         for i in 0..<8 {
             try model.create(CrashTestRecord(
                 id: "p\(i)",
-                email: "p\(i)@e.com",
                 requiredTags: ["t"],
+                email: "p\(i)@e.com",
                 score: Double(i)
             ))
         }
@@ -440,8 +442,8 @@ final class CodegenGauntletTests: XCTestCase {
         let model = TypedModel<RelTestRecord>(doc: doc)
         try model.create(RelTestRecord(
             id: "r1",
-            profileId: "p-1",
-            taskId: "t-1"
+            taskId: "t-1",
+            profileId: "p-1"
         ))
         let read = try XCTUnwrap(model.find(id: "r1"))
         XCTAssertEqual(read.profileId, "p-1")
@@ -649,14 +651,14 @@ final class CodegenGauntletTests: XCTestCase {
         // the two reserved-keyword fields end-to-end.
         let original = CrashTestRecord(
             id: "c1",
-            active: true,
+            tags: ["x", "y"],
+            requiredTags: ["alpha", "beta"],
+            email: "c@e.com",
             boundedName: "name",
             default: "fallback-set",   // reserved-keyword field
-            email: "c@e.com",
-            requiredTags: ["alpha", "beta"],
+            where: "kitchen",          // reserved-keyword field
             score: 9.5,
-            tags: ["x", "y"],
-            where: "kitchen"           // reserved-keyword field
+            active: true
         )
         let json = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(CrashTestRecord.self, from: json)
@@ -673,7 +675,7 @@ final class CodegenGauntletTests: XCTestCase {
     // helper shapes from the fixture's `Helpers.swift`.
 
     func testHelper_computedDisplayTitle() {
-        let withName = CrashTestRecord(id: "x", boundedName: "shiny", requiredTags: [])
+        let withName = CrashTestRecord(id: "x", requiredTags: [], boundedName: "shiny")
         XCTAssertEqual(displayTitle(withName), "SHINY")
         let noName = CrashTestRecord(id: "fallback-id", requiredTags: [])
         XCTAssertEqual(displayTitle(noName), "(fallback-id)")
@@ -734,10 +736,10 @@ final class CodegenGauntletTests: XCTestCase {
 
         try model.create(TaskRecord(
             id: "u1",
-            createdAt: "2026-04-27T00:00:00Z",
+            title: "Original",
             priority: 5,
             tags: ["urgent", "backend"],
-            title: "Original"
+            createdAt: "2026-04-27T00:00:00Z"
         ))
 
         try model.dynamic.update(

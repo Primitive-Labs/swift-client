@@ -38,6 +38,19 @@ final class PrimitiveSchemaTests: XCTestCase {
         XCTAssertEqual(f.maxLength, 64)
         XCTAssertEqual(f.maxCount, 10)
         XCTAssertEqual(f.default, .scalar(.number(0)))
+        // auto_stamp defaults to nil when omitted (backward-compatible slot).
+        XCTAssertNil(f.autoStamp)
+    }
+
+    func testFieldDescriptorAutoStampSlot() throws {
+        // #1056: FieldDescriptor carries the auto_stamp policy so the runtime
+        // write path can stamp on save. Pin the slot + its Equatable identity.
+        let create = FieldDescriptor(type: .number, autoStamp: .create)
+        let update = FieldDescriptor(type: .number, autoStamp: .update)
+        XCTAssertEqual(create.autoStamp, .create)
+        XCTAssertEqual(update.autoStamp, .update)
+        XCTAssertNotEqual(create, update)
+        XCTAssertEqual(create, FieldDescriptor(type: .number, autoStamp: .create))
     }
 
     // MARK: - DefaultValue

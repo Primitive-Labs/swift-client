@@ -1,63 +1,7 @@
 import Foundation
 
-// MARK: - Request / Response types
-
-/// Structured request for `IntegrationsAPI.call(_:)`. Mirrors the JS
-/// client's `IntegrationCallRequest` so a Swift app and a JS app can
-/// proxy the same upstream call against the same integration.
-public struct IntegrationCallRequest: Sendable {
-    public let integrationKey: String
-    public let method: String
-    public let path: String
-    public let query: [String: String]?
-    public let headers: [String: String]?
-    public let body: Any?
-
-    public init(
-        integrationKey: String,
-        method: String = "GET",
-        path: String = "",
-        query: [String: String]? = nil,
-        headers: [String: String]? = nil,
-        body: Any? = nil
-    ) {
-        self.integrationKey = integrationKey
-        self.method = method
-        self.path = path
-        self.query = query
-        self.headers = headers
-        self.body = body
-    }
-}
-
-/// Structured response from a successful `IntegrationsAPI.call(_:)`.
-/// Mirrors the JS `IntegrationCallResponse<T>` shape. The `body` is
-/// `Any?` (rather than generic) for Swift ergonomics — callers cast
-/// at the call site.
-public struct IntegrationCallResponse: Sendable {
-    public let status: Int
-    public let headers: [String: String]
-    public let body: Any?
-    public let traceId: String?
-    public let durationMs: Double?
-    public let errorCode: String?
-
-    public init(
-        status: Int,
-        headers: [String: String],
-        body: Any?,
-        traceId: String? = nil,
-        durationMs: Double? = nil,
-        errorCode: String? = nil
-    ) {
-        self.status = status
-        self.headers = headers
-        self.body = body
-        self.traceId = traceId
-        self.durationMs = durationMs
-        self.errorCode = errorCode
-    }
-}
+// The typed `IntegrationCallRequest` / `IntegrationCallResponse` models
+// live in `Types/IntegrationsTypes.swift`.
 
 // MARK: - IntegrationsAPI
 
@@ -102,16 +46,19 @@ public final class IntegrationsAPI: @unchecked Sendable {
             ?? request.integrationKey
         let path = "/integrations/\(escapedKey)/proxy"
 
-        // Wire payload mirrors the JS shape exactly. We omit nil-valued
-        // fields so the wire bytes match what JS sends when the caller
-        // doesn't specify query/headers/body.
-        var payload: [String: Any] = [
-            "method": request.method,
-            "path": request.path,
-        ]
-        if let query = request.query { payload["query"] = query }
+        // Wire payload mirrors the JS shape exactly. JS builds
+        // `{ method, path, query, headers, body }` straight off the
+        // request and lets `JSON.stringify` drop the `undefined` fields —
+        // it applies NO `method`/`path` defaults (#958). We do the same:
+        // include each field only when the caller supplied it. The typed
+        // `JSONValue` request body/query encode losslessly via
+        // `JSONCoding.jsonObject`.
+        var payload: [String: Any] = [:]
+        if let method = request.method { payload["method"] = method }
+        if let path = request.path { payload["path"] = path }
+        if let query = request.query { payload["query"] = try JSONCoding.jsonObject(from: query) }
         if let headers = request.headers { payload["headers"] = headers }
-        if let body = request.body { payload["body"] = body }
+        if let body = request.body { payload["body"] = try JSONCoding.jsonObject(from: body) }
 
         let raw: HttpClientResponse
         do {
@@ -128,7 +75,7 @@ public final class IntegrationsAPI: @unchecked Sendable {
                 message: isAuthError
                     ? "Authentication required to call integration"
                     : "Integration request failed",
-                details: ["cause": message]
+                details: ["cause": .string(message)]
             )
         }
 
@@ -163,10 +110,19 @@ public final class IntegrationsAPI: @unchecked Sendable {
             (data["headers"] as? [String: Any]) ?? [:]
         )
 
+        // Decode the opaque upstream body into a typed `JSONValue`. A
+        // missing key yields `nil`; `null` decodes to `.null`.
+        let body: JSONValue?
+        if let rawBody = data["body"] {
+            body = try? JSONCoding.decode(JSONValue.self, from: rawBody)
+        } else {
+            body = nil
+        }
+
         return IntegrationCallResponse(
             status: upstreamStatus,
             headers: headers,
-            body: data["body"],
+            body: body,
             traceId: data["traceId"] as? String,
             durationMs: (data["durationMs"] as? Double)
                 ?? (data["durationMs"] as? Int).map(Double.init),
@@ -236,51 +192,9 @@ public final class IntegrationsAPI: @unchecked Sendable {
             code = .integrationProxyFailed
         }
 
-        var details: [String: String] = ["status": "\(response.status)"]
-        if let traceId = traceId { details["traceId"] = traceId }
-        if let upstreamCode = upstreamCode { details["upstreamCode"] = upstreamCode }
+        var details: [String: JSONValue] = ["status": .number(Double(response.status))]
+        if let traceId = traceId { details["traceId"] = .string(traceId) }
+        if let upstreamCode = upstreamCode { details["upstreamCode"] = .string(upstreamCode) }
         return JsBaoError(code: code, message: message, details: details)
-    }
-
-    // MARK: - Catalog (list / get)
-    //
-    // The JS client's `list()` / `get()` go through the standard JSON
-    // path, not the raw-response one used by `call`. We piggy-back on
-    // the raw closure (the only one we have) and decode the body
-    // ourselves, mapping non-2xx to a `JsBaoError`.
-
-    /// List integrations configured for the current app.
-    public func list() async throws -> [[String: Any]] {
-        let response = try await makeRawRequest("GET", "/integrations", nil)
-        guard let json = decodeJsonBody(response: response) else { return [] }
-        if let dict = json as? [String: Any],
-           let items = dict["integrations"] as? [[String: Any]] {
-            return items
-        }
-        return json as? [[String: Any]] ?? []
-    }
-
-    /// Get a single integration by id or key.
-    public func get(integrationIdOrKey: String) async throws -> [String: Any] {
-        let escaped = integrationIdOrKey.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? integrationIdOrKey
-        let response = try await makeRawRequest("GET", "/integrations/\(escaped)", nil)
-        if let json = decodeJsonBody(response: response) as? [String: Any] {
-            return json
-        }
-        return [:]
-    }
-
-    private func decodeJsonBody(response: HttpClientResponse) -> Any? {
-        if (200..<300).contains(response.status) {
-            if let data = response.data { return data }
-            if let text = response.text,
-               let raw = text.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: raw) {
-                return json
-            }
-        }
-        return nil
     }
 }

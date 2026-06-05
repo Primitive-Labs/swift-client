@@ -539,6 +539,15 @@ public final class DocumentManager: @unchecked Sendable {
         return openDocs[documentId]
     }
 
+    /// Snapshot of every currently-open `(documentId, YDocument)`. Used by
+    /// `JsBaoClient.registerModels` to connect already-open documents to a
+    /// model's shared cross-document store the moment it's registered.
+    public func openDocumentsSnapshot() -> [(documentId: String, doc: YDocument)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return openDocs.map { (documentId: $0.key, doc: $0.value) }
+    }
+
     public func isSynced(_ documentId: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -647,7 +656,8 @@ public final class DocumentManager: @unchecked Sendable {
         documentId: String,
         title: String?,
         localOnly: Bool,
-        tags: [String]? = nil
+        tags: [String]? = nil,
+        docMetadata: JSONValue? = nil
     ) async throws -> YDocument {
         let doc = YDocument()
 
@@ -657,6 +667,10 @@ public final class DocumentManager: @unchecked Sendable {
         metadata.pendingCreate = !localOnly
         metadata.localOnly = localOnly
         metadata.createdAt = ISO8601DateFormatter().string(from: Date())
+        // Stash the create-time opaque metadata blob so the background
+        // `commitOfflineCreate` can replay it into the server POST body
+        // rather than dropping it. Mirrors js-bao (#673).
+        metadata.docMetadata = docMetadata
 
         lock.lock()
         openDocs[documentId] = doc
@@ -693,6 +707,12 @@ public final class DocumentManager: @unchecked Sendable {
             if let title = metadata?.title { body["title"] = title }
             if let tags = metadata?.tags, !tags.isEmpty {
                 body["tags"] = tags
+            }
+            // Replay the create-time metadata blob the local-first create
+            // stashed, so `documents.create({ metadata })` reaches the
+            // server on commit instead of being dropped (#673).
+            if let docMetadata = metadata?.docMetadata {
+                body["metadata"] = docMetadata.toAny()
             }
 
             guard let createRemote = createRemoteDocument else {
@@ -1067,6 +1087,38 @@ public final class DocumentManager: @unchecked Sendable {
             txn.transactionStateVector()
         }
         return Data(stateVector).base64EncodedString()
+    }
+
+    /// Base64-encoded raw Yjs state vector for an open document, or `nil`
+    /// when the doc isn't open locally. Sent to the server in a
+    /// `stateVectorCheck` round-trip so it can report `includesWrites` /
+    /// `inSync`. Mirrors js-bao's `toBase64(Y.encodeStateVector(ydoc))`.
+    public func encodeStateVectorBase64(_ documentId: String) -> String? {
+        lock.lock()
+        guard let doc = openDocs[documentId] else {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+
+        let stateVector: [UInt8] = doc.transactSync { txn in
+            txn.transactionStateVector()
+        }
+        return Data(stateVector).base64EncodedString()
+    }
+
+    /// `true` when the document holds local state the server may not have
+    /// yet — a pending offline create, or an open doc whose writes haven't
+    /// drained (`isSynced == false`). Drives the `evict` / `evictAll`
+    /// guard, mirroring js-bao's `hasUnsyncedLocalChangesByDoc` check.
+    public func hasUnsyncedLocalChanges(_ documentId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if pendingCreates.contains(documentId) { return true }
+        if openDocs[documentId] != nil, !(docSyncStates[documentId] ?? false) {
+            return true
+        }
+        return false
     }
 
     // MARK: - Persistence

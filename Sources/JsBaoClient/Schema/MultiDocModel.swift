@@ -25,7 +25,11 @@ import YSwift
 /// table immediately, so subsequent cross-doc queries don't return
 /// stale state. The underlying `YDocument` is not touched — re-
 /// connecting it will seed its rows back into the table.
-public final class MultiDocModel: IncludeTarget {
+/// Internal plumbing — the shared cross-document store behind the codegen'd
+/// `Model.*` facade. App code never references this type; it reaches the
+/// store through `JsBaoClient.queryShared`/`saveShared`/etc. (and the
+/// generated facade methods that call them).
+final class MultiDocModel: IncludeTarget {
     public let schema: PrimitiveSchema
 
     /// Satisfies `IncludeTarget` — derived from the schema so

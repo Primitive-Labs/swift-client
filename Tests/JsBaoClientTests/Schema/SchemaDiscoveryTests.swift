@@ -73,6 +73,28 @@ final class SchemaDiscoveryTests: XCTestCase {
         XCTAssertFalse(email?.autoAssign ?? true)
     }
 
+    /// auto_stamp round-trips through `_meta` as a string — mirrors js-bao
+    /// `metaSync.ts` (#1056). An unknown literal decodes to nil.
+    func testDiscoverAutoStamp() throws {
+        let doc = YDocument()
+        SchemaSync.clearCache()
+        SchemaSync.syncModelMeta(doc: doc, schema: PrimitiveSchema(
+            name: "articles",
+            fields: [
+                "createdAt": FieldDescriptor(type: .number, autoStamp: .create),
+                "updatedAt": FieldDescriptor(type: .number, autoStamp: .both),
+                "plain":     FieldDescriptor(type: .number),
+            ]
+        ))
+
+        let fields = SchemaDiscovery.discoverSchema(doc: doc, modelNames: candidateNames)
+            .models["articles"]?.fields
+        XCTAssertEqual(fields?["createdAt"]?.autoStamp, .create)
+        XCTAssertEqual(fields?["updatedAt"]?.autoStamp, .both)
+        XCTAssertNil(fields?["plain"]?.autoStamp,
+                     "a field with no auto_stamp must decode to nil")
+    }
+
     func testDiscoverMaxLengthAndMaxCount() throws {
         let doc = YDocument()
         SchemaSync.clearCache()

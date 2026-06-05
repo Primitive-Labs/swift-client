@@ -395,13 +395,18 @@ public final class AuthController: @unchecked Sendable {
         return success
     }
 
-    public func magicLinkVerify(token: String) async throws -> [String: Any] {
+    public func magicLinkVerify(token: String, inviteToken: String? = nil) async throws -> [String: Any] {
         guard let makeRequest = makeRequest else {
             throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
         }
 
+        // #466: thread the (trimmed) invite token through verify so deferred
+        // grants resolve to the signing-in user. Mirrors JS magicLinkVerify.
+        let trimmedInviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedInviteToken = (trimmedInviteToken?.isEmpty == false) ? trimmedInviteToken : nil
+
         let endpoint: String
-        let body: [String: Any]
+        var body: [String: Any]
 
         if let proxy = refreshProxy, proxy.enabled {
             endpoint = "\(proxy.baseUrl)/auth/magic-link/verify"
@@ -409,6 +414,9 @@ public final class AuthController: @unchecked Sendable {
         } else {
             endpoint = "/auth/magic-link/verify"
             body = ["token": token]
+        }
+        if let resolvedInviteToken = resolvedInviteToken {
+            body["inviteToken"] = resolvedInviteToken
         }
 
         let response = try await makeRequest("POST", endpoint, body)
@@ -469,7 +477,11 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - Logout
 
-    public func logout(wipeLocal: Bool = false) async throws {
+    /// Sign out the current user. Mirrors JS `authController.logout(options)`:
+    /// honors `clearOfflineIdentity` (default `true`), `revokeOffline`,
+    /// `wipeLocal`, and the Swift-specific `waitForDisconnect`. (`redirectTo`
+    /// is web-only `window.location` and is intentionally not modeled here.)
+    public func logout(options: LogoutOptions = LogoutOptions()) async throws {
         // Block any in-flight refresh/restore from re-authenticating after
         // this logout (see `blockNonInteractiveAuth`). Set before clearing
         // the token so a refresh resolving mid-logout is caught.
@@ -479,10 +491,39 @@ public final class AuthController: @unchecked Sendable {
         let previous = getToken()
         applyToken(nil, previous: previous, cause: "logout")
 
-        if wipeLocal {
+        // Default-true in JS: drop the in-memory offline identity unless the
+        // caller explicitly opts out.
+        if options.clearOfflineIdentity {
+            lock.lock()
+            offlineIdentity = nil
+            lock.unlock()
+        }
+
+        if options.revokeOffline {
+            // revokeOfflineGrant clears the stored grant (and the in-memory
+            // identity) and, when wipeLocal is set, evicts local data.
+            try? await revokeOfflineGrant(options: RevokeOfflineGrantOptions(wipeLocal: options.wipeLocal))
+        } else if options.wipeLocal {
             try? await clearPersistedJwt()
         }
+
+        if options.waitForDisconnect {
+            await onLogoutDisconnect?()
+        }
     }
+
+    /// Backward-compatible overload retained for the `JsBaoClient` wiring
+    /// (`logout(wipeLocal:)`). Forwards to the options-based `logout`.
+    public func logout(wipeLocal: Bool) async throws {
+        try await logout(options: LogoutOptions(wipeLocal: wipeLocal))
+    }
+
+    /// Optional hook invoked when `logout(waitForDisconnect: true)` is
+    /// requested, awaited so callers can block until the socket is torn down.
+    /// Wired by `JsBaoClient` (which owns the WebSocket lifecycle); `nil` when
+    /// the controller is used standalone. Mirrors the JS `onLogoutCleanup`
+    /// dependency the web client injects.
+    var onLogoutDisconnect: (@Sendable () async -> Void)?
 
     // MARK: - Network Mode
 
@@ -636,6 +677,21 @@ public final class AuthController: @unchecked Sendable {
             throw JsBaoError(code: .unavailable, message: "Invalid offline grant response")
         }
 
+        // Grant-method selection (mirrors JS authController.enableOfflineAccess):
+        // the default grant is the non-biometric "signed" method. Biometric is
+        // strictly opt-in via `preferBiometric` — when set, the grant is stored
+        // behind a Keychain biometric ACL and labeled "largeBlob" to match the
+        // JS unlock-method taxonomy ("largeBlob" | "pin" | "signed"). PIN
+        // fallback (`allowPinFallback` + `pinProvider`) labels the grant "pin".
+        let method: String
+        if options.preferBiometric {
+            method = "largeBlob"
+        } else if options.allowPinFallback {
+            method = "pin"
+        } else {
+            method = "signed"
+        }
+
         // Build grant record
         let userId = getUserId() ?? ""
         let grant = OfflineGrant(
@@ -646,12 +702,13 @@ public final class AuthController: @unchecked Sendable {
             email: dict["email"] as? String,
             name: dict["name"] as? String,
             expiresAt: dict["expiresAt"] as? String,
-            method: options.requireBiometric ? "biometric" : "signed"
+            method: method
         )
 
-        // Store in Keychain
+        // Store in Keychain. Biometric protection is gated on the opt-in
+        // `preferBiometric` flag (JS default is the non-biometric grant).
         let grantData = try JSONEncoder().encode(grant)
-        try keychainHelper.save(key: "grant", data: grantData, requireBiometric: options.requireBiometric)
+        try keychainHelper.save(key: "grant", data: grantData, requireBiometric: options.preferBiometric)
 
         // Also store in OfflineStore for metadata access
         try await offlineStore.putGrant(appId: appId, userId: userId, key: "grant", record: grant)

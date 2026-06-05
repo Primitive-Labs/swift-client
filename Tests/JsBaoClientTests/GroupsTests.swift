@@ -23,13 +23,14 @@ final class GroupsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let groupId = "test-group-\(UUID().uuidString.prefix(8))"
-        let result = try await client.groups.create(params: [
-            "groupType": "team",
-            "groupId": groupId,
-            "name": "Swift Test Group"
-        ])
+        let result = try await client.groups.create(params: CreateGroupParams(
+            groupType: "team",
+            groupId: groupId,
+            name: "Swift Test Group"
+        ))
 
-        XCTAssertFalse(result.isEmpty, "Expected non-empty response from group create")
+        XCTAssertEqual(result.groupId, groupId, "Created group should echo back its id")
+        XCTAssertEqual(result.name, "Swift Test Group")
     }
 
     // MARK: - Add/Remove Member
@@ -40,11 +41,11 @@ final class GroupsTests: XCTestCase {
 
         // Create a group
         let groupId = "member-group-\(UUID().uuidString.prefix(8))"
-        let _ = try await client.groups.create(params: [
-            "groupType": "team",
-            "groupId": groupId,
-            "name": "Member Test Group"
-        ])
+        let _ = try await client.groups.create(params: CreateGroupParams(
+            groupType: "team",
+            groupId: groupId,
+            name: "Member Test Group"
+        ))
 
         // Create a second user to add
         let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member")
@@ -53,18 +54,14 @@ final class GroupsTests: XCTestCase {
         let addResult = try await client.groups.addMember(
             groupType: "team",
             groupId: groupId,
-            params: ["userId": user2.userId]
+            params: .userId(user2.userId)
         )
-        XCTAssertFalse(addResult.isEmpty, "Expected non-empty response from addMember")
+        XCTAssertFalse(addResult.status.isEmpty, "Expected a status from addMember")
 
         // List members to verify
         let membersResult = try await client.groups.listMembers(groupType: "team", groupId: groupId)
-        let members = membersResult["items"] as? [[String: Any]]
-            ?? membersResult["members"] as? [[String: Any]]
-            ?? []
-
-        let hasMember = members.contains { member in
-            (member["userId"] as? String) == user2.userId
+        let hasMember = membersResult.items.contains { member in
+            member.userId == user2.userId
         }
         XCTAssertTrue(hasMember, "Added user should appear in member list")
 
@@ -74,6 +71,6 @@ final class GroupsTests: XCTestCase {
             groupId: groupId,
             userId: user2.userId
         )
-        XCTAssertFalse(removeResult.isEmpty, "Expected non-empty response from removeMember")
+        XCTAssertTrue(removeResult.success, "Expected success from removeMember")
     }
 }

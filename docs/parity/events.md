@@ -20,7 +20,11 @@ There are real parity gaps here. None are P0, but the gaps quietly break cross-l
 | Workflow cancelled | `.workflowCancelled` | `"workflowCancelled"` | `{ runId }` | ✅ |
 | Workflow apply | `.workflowApply` | `"workflowApply"` | `{ runId, ... }` | ✅ |
 | Network mode | `.networkMode` | `"networkMode"` | `{ mode }` | ✅ |
+| Cache updated | `.cacheUpdated` | `"cacheUpdated"` | `{ key, updatedAt, source, value }` | ✅ |
+| Cache update failed | `.cacheUpdateFailed` | `"cacheUpdateFailed"` | `{ key, error }` | ✅ |
 | Document opened | (no Swift case) | — | — | see below |
+
+> **`cacheUpdated` / `cacheUpdateFailed`** are emitted by `KvCache` on the network-refresh path on both clients (Swift: `Internal/KvCache.swift`, fired after a successful `set` / on a fetch error; JS: `src/client/kv-cache.ts`). The Swift `KvCache` takes an injected `emit` closure (wired through `CacheFacade` from `JsBaoClient`). Note: the JS client additionally re-emits these as `meUpdated` / `meUpdateFailed` when `key == "me"` — that `me`-reaction is **not yet wired on Swift** (see issue #1042).
 
 ## ⚠️ DocumentLoadedEvent.source — doc comment lies
 
@@ -67,6 +71,10 @@ These are JS-side `events.emit(...)` calls with no Swift case in `Types/Events.s
 
 - Swift: [`Sources/JsBaoClient/Types/Events.swift`](../../Sources/JsBaoClient/Types/Events.swift), [`Sources/JsBaoClient/Types/EventEmitter.swift`](../../Sources/JsBaoClient/Types/EventEmitter.swift)
 - JS: search `src/client/internal/` for `eventEmitter.emit(`
+
+## Payload-parity fixes (events)
+
+`documentMetadataChanged.source` is now `"local" | "server"` (was `"local" | "remote"`) and non-optional — JS's `"idb"` is dropped (no SQLite analog); the `blobs:upload-{progress,completed,failed}` payloads now carry the full upload-queue record (`queueId`/`filename`/`contentType`/`status`/`attempts`/`retainLocal`/`nextAttemptAt`/`updatedAt`/`lastError`, `lastError` optional) populated from `BlobManager`'s `UploadTask`; and `syncPerf` gained `timings`/`clientTimings` maps for decode parity (Swift has no `syncPerf` frame handler or per-phase instrumentation yet, so they stay empty). `awareness` deltas remain out — the live presence subsystem isn't in Swift v1, so there's no snapshot to diff.
 
 ## Notes for maintainers
 

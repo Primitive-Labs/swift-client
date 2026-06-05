@@ -31,13 +31,12 @@ final class DocMetadataWSTests: XCTestCase {
         try await waitForSync(client: client, documentId: docId)
 
         // Update document metadata via HTTP
-        _ = try await client.documents.update(documentId: docId, data: ["title": "Updated Title"])
+        _ = try await client.documents.update(documentId: docId, data: UpdateDocumentData(title: "Updated Title"))
 
         // Verify the document reflects the updated title
         try await eventually(timeout: 5, description: "document title updated") {
             let doc = try await client.documents.get(documentId: docId)
-            let title = doc["title"] as? String
-            return title == "Updated Title"
+            return doc.title == "Updated Title"
         }
     }
 
@@ -61,7 +60,7 @@ final class DocMetadataWSTests: XCTestCase {
         try await delay(1)
 
         // Update HTTP metadata
-        _ = try await client.documents.update(documentId: docId, data: ["title": "New Title"])
+        _ = try await client.documents.update(documentId: docId, data: UpdateDocumentData(title: "New Title"))
         try await delay(1)
 
         // Yjs data should still be there

@@ -25,6 +25,14 @@ struct ParsedField {
     var maxLength: Int?
     var maxCount: Int?
     var defaultLiteral: ParsedDefault?
+    /// Allowed-value set for a `string` field (`enum = ["a","b","c"]`).
+    /// Mirrors js-bao's `FieldOptions.enum` (#843): advisory / codegen-only,
+    /// only valid on a `string` field, non-empty, all strings. `nil` when
+    /// the TOML omits `enum`. Preserves source order.
+    var enumValues: [String]?
+    /// Auto-timestamp policy (`auto_stamp = "create" | "update" | "both"`).
+    /// Mirrors js-bao's `FieldOptions.autoStamp`. `nil` when omitted.
+    var autoStamp: ParsedAutoStamp?
 }
 
 enum ParsedFieldType: String {
@@ -34,6 +42,14 @@ enum ParsedFieldType: String {
     case date
     case id
     case stringset
+}
+
+/// When an `auto_stamp` field is auto-populated with a timestamp. Raw
+/// values match the TOML literals js-bao accepts (`create`/`update`/`both`).
+enum ParsedAutoStamp: String {
+    case create
+    case update
+    case both
 }
 
 enum ParsedDefault {

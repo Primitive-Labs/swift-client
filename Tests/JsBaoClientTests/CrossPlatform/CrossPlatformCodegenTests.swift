@@ -45,10 +45,10 @@ final class CrossPlatformCodegenTests: XCTestCase {
         // Set<String>), string (required, non-optional String).
         _ = try model.create(TaskRecord(
             id: "cgx-1",
-            createdAt: "2026-04-27T08:30:00Z",
+            title: "Land cross-platform parity",
             priority: 7,
             tags: ["urgent", "ship-blocker"],
-            title: "Land cross-platform parity"
+            createdAt: "2026-04-27T08:30:00Z"
         ))
 
         let update = CrossPlatformHarness.updateBytes(of: doc)

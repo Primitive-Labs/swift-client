@@ -57,6 +57,14 @@ Same code string, same conditions raise it. No translation layer needed at the a
 - Swift: [`Sources/JsBaoClient/Types/Errors.swift`](../../Sources/JsBaoClient/Types/Errors.swift) (91 lines)
 - JS: [`src/client/errors.ts`](../../../src/client/errors.ts)
 
+## Swift-only codes
+
+None — the code set matches JS exactly. (The former Swift-only `UNSYNCED_CHANGES` was removed; `DocumentsAPI.evict` now throws `JsBaoError(.invalidArgument, "Cannot evict …: has unsynced local changes (use force to override)")`, mirroring JS's plain `Error` from `documentManager.evictLocalDocument`.)
+
+## `details`
+
+`JsBaoError.details` is `[String: JSONValue]?`, mirroring JS's `details?: any` — nested objects, numbers, and bools round-trip while keeping `Sendable` real.
+
 ## Notes for maintainers
 
 If you add a new error code:

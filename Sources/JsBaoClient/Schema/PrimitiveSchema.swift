@@ -52,6 +52,23 @@ public enum DefaultValue: Equatable, Hashable, Sendable {
     }
 }
 
+/// When an `auto_stamp` field is auto-populated with a timestamp on write.
+/// Mirrors js-bao's `FieldOptions.autoStamp` (`"create" | "update" | "both"`).
+///
+///   - `.create`: stamped only on insert, and only when the field has no
+///     caller-supplied value (matches js-bao's `applyAutoStamps` create
+///     branch + `BaseModel.save`'s explicit-wins rule).
+///   - `.update`: stamped on every write (insert and update) unless the
+///     caller supplied an explicit non-nil value on this save.
+///   - `.both`: same firing as `.update` — stamps on every write. (js-bao
+///     treats `both` like `update` for firing; the distinction is only
+///     advisory metadata.)
+public enum AutoStamp: String, Equatable, Hashable, Sendable {
+    case create
+    case update
+    case both
+}
+
 /// Field metadata — one per field in a `_meta_{modelName}` YMap.
 ///
 /// Mirrors js-bao's `DiscoveredField` / `FieldOptions` shape. Bool flags
@@ -65,6 +82,11 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
     public var maxLength: Int?
     public var maxCount: Int?
     public var `default`: DefaultValue?
+    /// Auto-timestamp policy (`auto_stamp = "create" | "update" | "both"`).
+    /// `nil` when the field declares no `auto_stamp`. Read by the shared
+    /// write path (`DynamicModel.save`) to stamp `Date.now()`-style epoch
+    /// milliseconds on insert / update, mirroring js-bao's `BaseModel.save`.
+    public var autoStamp: AutoStamp?
 
     public init(
         type: PrimitiveFieldType,
@@ -74,7 +96,8 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         autoAssign: Bool = false,
         maxLength: Int? = nil,
         maxCount: Int? = nil,
-        default: DefaultValue? = nil
+        default: DefaultValue? = nil,
+        autoStamp: AutoStamp? = nil
     ) {
         self.type = type
         self.indexed = indexed
@@ -84,6 +107,7 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         self.maxLength = maxLength
         self.maxCount = maxCount
         self.default = `default`
+        self.autoStamp = autoStamp
     }
 }
 

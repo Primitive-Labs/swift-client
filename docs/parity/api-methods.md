@@ -70,7 +70,9 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
 | `get(id)` | `get(id:)` | ✅ | |
-| `list()` | `list()` | ✅ | |
+| `list(opts)` | `list(options:)` / `listPage(options:)` | ✅ | Swift `ListDocumentsOptions` mirrors JS `DocumentListOptions` (`tag`/`forward`/`waitForLoad`/`refreshFromServer`/`localOnly`/`returnPage`); `listPage` is the `returnPage: true` overload. Deprecated on both. |
+| `open(id, opts)` | `open(_:options:)` | ✅ | Both return `{ doc, metadata }` (`OpenDocumentResult`). |
+| `openAlias(params, opts)` | `openAlias(_:options:)` | ✅ | Both return `{ doc, metadata }`. |
 | `update(id, params)` | `update(documentId:, params:)` | ✅ | |
 | `delete(id, opts)` | `delete(documentId:)` | ⚠️ | Swift drops `forceCloseIfOpen` |
 | `addTag(id, tag)` | `addTag(documentId:, tag:)` | ⚠️ | Swift returns raw dict instead of `[String]` |
@@ -92,7 +94,7 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | `cancelPendingCreate(id)` | `cancelPendingCreate(documentId:)` | ✅ | Closed in #790. |
 | `listPendingCreates()` | `listPendingCreates() -> [String]` | 🔀 | Swift returns ID strings only; JS returns richer entries. v1.1: expose `{documentId, title?, createdAt}` rows. |
 | `revokeGroupPermission(...)` | `revokeGroupPermission(documentId:, groupType:, groupId:)` | ✅ | Closed in #790. |
-| `getOwner(id)` | `getOwner(documentId:)` | ✅ | Closed in #790 — convenience wrapper over `get(documentId:)`. |
+| _(none — read `createdBy` off `get(id)`)_ | _(removed)_ | ✅ | The Swift-only `getOwner` convenience was removed; JS has no such method and reads `createdBy` off `documents.get(id)` directly. |
 | `transferOwnership(...)` | `transferOwnership(documentId:, newOwnerId:)` | ✅ | Already present pre-#790. |
 | `hasLocalCopy(id)` | `hasLocalCopy(documentId:)` | ✅ | Closed in #790. |
 | `getDocumentPermission(id)` | `getDocumentPermission(documentId:)` | ✅ | Closed in #790. |
@@ -110,7 +112,7 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 | `query(...)` | `query(...)` | ✅ | |
 | `executeBatch(...)` | `executeBatch(databaseId:, operationName:, batch:)` | ✅ | Closed in #790. |
 | `importCsv(...)` | `importRows(databaseId:, operationName:, rows:, batchSize:)` | 🔀 | Swift takes pre-parsed rows + batches via `executeBatch`. JS handles raw CSV parsing + schema-aware coercion + progress callbacks too — that richer surface is a v1.1 follow-up. |
-| `subscribe(id, ...)` | — | ⛔ | WebSocket-based subscriptions. Deferred (see Notes below). |
+| `subscribe(id, ...)` | `subscribe(databaseId:, subscriptionKey:, options:)` | ✅ | WebSocket-based subscriptions. `throws JsBaoError(.invalidArgument)` on an empty `databaseId`/`subscriptionKey`, matching JS's `_subscribeDatabase` guards. |
 | `getCelContext(...)` | `getCelContext(databaseId:)` | ✅ | Closed in #790. |
 | `setCelContext(...)` | `updateCelContext(databaseId:, celContext:)` | ✅ | Closed in #790. Named to match the JS `updateCelContext` (the parity doc had `setCelContext`; JS surface is `updateCelContext`). |
 | `listManagers(id)` | `listManagers(databaseId:)` | ✅ | Closed in #790. Convenience wrapper over `listPermissions` that filters to `manager` rows. |
@@ -139,7 +141,9 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 |---|---|---|---|
 | `get()` | `get()` | ✅ | |
 | `update(params)` | `update(params:)` | ✅ | |
-| `uploadAvatar(data, contentType)` | `uploadAvatar(data:, contentType:)` | ✅ | `contentType` now wired through the raw-HTTP closure as `Content-Type`. Closed in #790. |
+| `uploadAvatar(data, contentType)` | `uploadAvatar(data:, contentType:)` | ✅ | `contentType` is now the typed `AvatarContentType` enum (`image/png\|jpeg\|gif\|webp`), mirroring JS's MIME union — invalid types are a compile error. Wired through the raw-HTTP closure as `Content-Type`. Closed in #790. |
+| `ownedDocuments(options)` | `ownedDocuments(cursor:limit:tag:options:)` + `ownedDocumentsPage(...)` | ✅ | `MeOwnedDocumentsOptions` (in `MeTypes.swift`) carries `includeRoot`/`refreshFromServer`/`localOnly`/`serverTimeoutMs`/`waitForLoad`/`forward`/`returnPage`. `includeRoot`/`forward` thread into the query string; `localOnly`/`refreshFromServer:false` short-circuit to the local cache. JS's `returnPage:true` overload is surfaced as the separate `ownedDocumentsPage` entry point (Swift can't express the union return). |
+| `sharedDocuments(options)` | `sharedDocuments(cursor:limit:tag:)` | ✅ | JS `SharedDocumentsOptions` is only `cursor`/`limit`/`tag` — no widening gap. |
 | `pendingDocumentInvitations()` | `pendingDocumentInvitations()` | ✅ | |
 | `bookmarks.*` | — | ✅ resolved by JS-side removal | The JS client *had* `me.bookmarks.*` when the parity doc was seeded; **PR #702 removed it as a breaking change.** Swift never implemented it, so the gap auto-closed when JS dropped the API. If bookmarks come back later, this row gets a new ⛔ entry. |
 | `getProfile()` | — | ✅ resolved by JS-side removal | Same as bookmarks — not in current JS source. May have been removed alongside (or never landed there to begin with). |
@@ -202,35 +206,32 @@ The JS client exposes 17 sub-APIs. Swift exposes 14. The ones not present as Swi
 
 ## PromptsAPI
 
+JS `prompts` is `execute`-only. The Swift surface matches.
+
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
-| `get(id)` | `get(id:)` | ✅ | |
-| `list()` | `list()` | ✅ | |
-| `execute(id, params)` | `execute(promptId:, ...)` | ⚠️ | Swift uses positional args where JS uses options object. Cosmetic; functionally equivalent. v1.1 signature polish. |
+| `execute(promptKey, options)` | `execute(promptKey:, options:)` | ✅ | Single options-struct call mirroring JS. (The Swift-only positional `execute(promptKey:variables:modelOverride:configId:)` overload was removed for strict parity.) |
 
 ## IntegrationsAPI
+
+JS `integrations` is `call`-only. The Swift surface matches.
 
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
 | `call(spec)` | `call(request:)` | ✅ | Structured `IntegrationCallRequest` (method/path/query/headers/body), `IntegrationCallResponse` unwrapping, typed error throwing on non-OK responses. Closed in commit 7feda61b. |
-| `list()` | — | ⛔ | Not implemented. |
-| `get(id)` | — | ⛔ | Not implemented. |
 
 ## WorkflowsAPI
 
-The biggest API on both sides. Swift adds features that don't exist in JS (`runAndApply`, `awaitRun`, `recheckPendingRuns`).
+The biggest API on both sides. The public surface now matches JS — the Swift-only `runAndApply` / `awaitRun` user-facing helpers were removed; the apply-waiter machinery that backed them stays as internal plumbing for the reconnect-recovery path.
 
 | JS method | Swift method | Status | Notes |
 |---|---|---|---|
-| `start(workflowId, params)` | `start(workflowKey:, input:, options:)` | ✅ | `StartWorkflowOptions.forceRerun` added in #790. |
-| `getStatus(runId)` | `getStatus(workflowKey:, runKey:, contextDocId:)` | ⚠️ | Swift doesn't normalize CF/DB status codes the way JS does. Returns the raw envelope. v1.1 polish. |
-| `terminate(runId, opts?)` | `terminate(workflowKey:, runKey:, contextDocId:)` | ✅ | `contextDocId` added in #790. |
+| `start({workflowKey, input, ...})` | `start(_:)` / `start(workflowKey:, input:, options:)` | ✅ | Options-struct overload (`StartWorkflowOptions` now carries `workflowKey` + `input`) mirrors the JS single-object call. Positional form kept. `StartWorkflowOptions.forceRerun` added in #790. |
+| `getStatus(runId)` | `getStatus(workflowKey:, runKey:, contextDocId:)` | ✅ | Returns the raw decoded envelope (`status`, `output`, `error`, `run`). The Swift-only `normalizedStatus` field was removed for strict parity. |
+| `terminate({workflowKey, runKey, contextDocId})` | `terminate(_:)` / `terminate(workflowKey:, runKey:, contextDocId:)` | ✅ | `TerminateWorkflowOptions` overload mirrors the JS options-object call; `contextDocId` rides in the options object. Positional form kept. |
 | `listRuns(opts)` | `listRuns(options:)` | ✅ | `ListWorkflowRunsOptions.forward` + `.contextDocId` added in #790. |
 | `listStepRuns(runId)` | `listStepRuns(runId:)` | ✅ | Closed in #790. |
 | `(definition CRUD)` | `(definition CRUD)` | ✅ | |
-| — | `runAndApply(...)` | Swift-only | apply-after-run fan-out |
-| — | `awaitRun(runId, ...)` | Swift-only | typed waiter |
-| — | `recheckPendingRuns()` | Swift-only | reconnect recovery |
 
 > **WorkflowsAPI deep dive:** the file is 858 lines but ~300 are docstrings; the rest is genuine state-machine plumbing. Followup recommendation: extract a `WorkflowApplyOrchestrator` so `WorkflowsAPI` itself is just the wire facade. Not blocking for this PR.
 
@@ -306,6 +307,6 @@ These are noted in the per-group reviews and worth tracking even though they're 
 
 3. **Validation** is inconsistent — some methods validate args before HTTP, some let the server tell them.
 
-4. **`MeAPI.uploadAvatar`** has a `contentType` parameter that's accepted but never used.
+4. ~~**`MeAPI.uploadAvatar`** has a `contentType` parameter that's accepted but never used.~~ Resolved: `contentType` is wired through and is now the typed `AvatarContentType` enum.
 
 These belong in a "v1.1 polish pass" issue.

@@ -10,14 +10,14 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         name: "crashTest",
         fields: [
             "id":           FieldDescriptor(type: .id),
-            "active":       FieldDescriptor(type: .boolean, default: .scalar(.boolean(true))),
+            "tags":         FieldDescriptor(type: .stringset, maxCount: 5),
+            "requiredTags": FieldDescriptor(type: .stringset, required: true),
+            "email":        FieldDescriptor(type: .string, unique: true),
             "boundedName":  FieldDescriptor(type: .string, maxLength: 20),
             "default":      FieldDescriptor(type: .string, default: .scalar(.string("fallback"))),
-            "email":        FieldDescriptor(type: .string, unique: true),
-            "requiredTags": FieldDescriptor(type: .stringset, required: true),
-            "score":        FieldDescriptor(type: .number, indexed: true, default: .scalar(.number(100))),
-            "tags":         FieldDescriptor(type: .stringset, maxCount: 5),
             "where":        FieldDescriptor(type: .string),
+            "score":        FieldDescriptor(type: .number, indexed: true, default: .scalar(.number(100))),
+            "active":       FieldDescriptor(type: .boolean, default: .scalar(.boolean(true))),
         ],
         constraints: [
             "name_score_combo": ConstraintDescriptor(name: "name_score_combo", fields: ["boundedName", "score"]),
@@ -25,49 +25,49 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
     )
 
     internal var id: String
-    internal var active: Bool?
+    internal var tags: Set<String>?
+    internal var requiredTags: Set<String>
+    internal var email: String?
     internal var boundedName: String?
     internal var `default`: String?
-    internal var email: String?
-    internal var requiredTags: Set<String>
-    internal var score: Double?
-    internal var tags: Set<String>?
     internal var `where`: String?
+    internal var score: Double?
+    internal var active: Bool?
 
     internal init(
         id: String,
-        active: Bool? = nil,
+        tags: Set<String>? = nil,
+        requiredTags: Set<String>,
+        email: String? = nil,
         boundedName: String? = nil,
         `default`: String? = nil,
-        email: String? = nil,
-        requiredTags: Set<String>,
+        `where`: String? = nil,
         score: Double? = nil,
-        tags: Set<String>? = nil,
-        `where`: String? = nil
+        active: Bool? = nil
     ) {
         self.id = id
-        self.active = active
+        self.tags = tags
+        self.requiredTags = requiredTags
+        self.email = email
         self.boundedName = boundedName
         self.`default` = `default`
-        self.email = email
-        self.requiredTags = requiredTags
-        self.score = score
-        self.tags = tags
         self.`where` = `where`
+        self.score = score
+        self.active = active
     }
 
     internal init?(record: PrimitiveRecord) {
         guard let requiredTags = record["requiredTags"]?.asStringSet
         else { return nil }
         self.id = record.id
-        self.active = record["active"]?.asBoolean
+        self.tags = record["tags"]?.asStringSet
+        self.requiredTags = requiredTags
+        self.email = record["email"]?.asString
         self.boundedName = record["boundedName"]?.asString
         self.`default` = record["default"]?.asString
-        self.email = record["email"]?.asString
-        self.requiredTags = requiredTags
-        self.score = record["score"]?.asNumber
-        self.tags = record["tags"]?.asStringSet
         self.`where` = record["where"]?.asString
+        self.score = record["score"]?.asNumber
+        self.active = record["active"]?.asBoolean
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
@@ -76,27 +76,137 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
               let requiredTags = (row["requiredTags"] as? [String]).map(Set.init)
         else { return nil }
         self.id = id
-        self.active = (row["active"] as? Bool) ?? (row["active"] as? Int).map { $0 != 0 }
+        self.tags = (row["tags"] as? [String]).map(Set.init)
+        self.requiredTags = requiredTags
+        self.email = row["email"] as? String
         self.boundedName = row["boundedName"] as? String
         self.`default` = row["default"] as? String
-        self.email = row["email"] as? String
-        self.requiredTags = requiredTags
-        self.score = row["score"] as? Double
-        self.tags = (row["tags"] as? [String]).map(Set.init)
         self.`where` = row["where"] as? String
+        self.score = row["score"] as? Double
+        self.active = (row["active"] as? Bool) ?? (row["active"] as? Int).map({ $0 != 0 })
     }
 
     internal func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [
             "requiredTags": .stringset(requiredTags),
         ]
-        if let active { values["active"] = .boolean(active) }
+        if let tags { values["tags"] = .stringset(tags) }
+        if let email { values["email"] = .string(email) }
         if let boundedName { values["boundedName"] = .string(boundedName) }
         if let `default` { values["default"] = .string(`default`) }
-        if let email { values["email"] = .string(email) }
-        if let score { values["score"] = .number(score) }
-        if let tags { values["tags"] = .stringset(tags) }
         if let `where` { values["where"] = .string(`where`) }
+        if let score { values["score"] = .number(score) }
+        if let active { values["active"] = .boolean(active) }
         return values
+    }
+}
+
+/// The app-facing API for `CrashTestRecord` — one model, like the JS client.
+/// Reads span every open document by default (scope to specific docs with
+/// `options: QueryOptions(documents: [docId])`); `save(in:)` / `delete(in:)`
+/// target one document and throw if it isn't open. Backed by the configured
+/// default `JsBaoClient` (see `JsBaoClient.configureDefault`).
+internal extension CrashTestRecord {
+    // MARK: Reads (cross-document by default)
+
+    /// Query across all open documents. Rows that fail to decode (schema
+    /// drift) are skipped. Scope to one/some docs via `options.documents`.
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [CrashTestRecord] {
+        JsBaoClient.requireDefault()
+            .queryShared(primitiveSchema, filter: filter, options: options)
+            .compactMap { CrashTestRecord(row: $0) }
+    }
+
+    /// Paginated query across all open documents. Returns the page's
+    /// rows plus `nextCursor`/`prevCursor`/`hasMore` — round-trip
+    /// `nextCursor` via `options.cursor` to page. Mirrors JS
+    /// `BaseModel.query()`'s `{ data, nextCursor, hasMore }` shape.
+    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<CrashTestRecord> {
+        let page = try JsBaoClient.requireDefault()
+            .queryPagedShared(primitiveSchema, filter: filter, options: options)
+        return PagedQueryResult(
+            data: page.data.compactMap { CrashTestRecord(row: $0) },
+            nextCursor: page.nextCursor,
+            prevCursor: page.prevCursor,
+            hasMore: page.hasMore
+        )
+    }
+
+    /// Count across all open documents.
+    static func count(_ filter: DocumentFilter? = nil) -> Int {
+        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    }
+
+    /// Every record across all open documents.
+    static func findAll() -> [CrashTestRecord] {
+        query(nil, options: nil)
+    }
+
+    /// First record with `id` across all open documents, or `nil`.
+    static func find(_ id: String) -> CrashTestRecord? {
+        JsBaoClient.requireDefault().findShared(primitiveSchema, id: id).flatMap { CrashTestRecord(row: $0) }
+    }
+
+    /// First record matching a unique `constraint` and `value`,
+    /// across all open documents, or `nil`. First-match-wins in
+    /// document connect order (uniqueness is per-document, so the
+    /// same value may exist in more than one open doc). Mirrors the
+    /// JS client's `Model.findByUnique(constraintName, value)`.
+    static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> CrashTestRecord? {
+        try JsBaoClient.requireDefault()
+            .findByUniqueShared(primitiveSchema, constraint: constraint, value: value)
+            .flatMap { CrashTestRecord(row: $0) }
+    }
+
+    /// The first record matching `filter` across all open documents,
+    /// or `nil`. Equivalent to `query(filter, options).first` — mirrors
+    /// the JS client's `Model.queryOne(filter, options)`.
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> CrashTestRecord? {
+        JsBaoClient.requireDefault()
+            .queryOneShared(primitiveSchema, filter: filter, options: options)
+            .flatMap { CrashTestRecord(row: $0) }
+    }
+
+    /// Fire `callback` after any add/update/delete in any open document's
+    /// copy of this model (local or remote). Returns an unsubscribe closure.
+    @discardableResult
+    static func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+        JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)
+    }
+
+    /// Aggregate (group / count / sum / avg / …) across all open documents.
+    static func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
+        JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
+    }
+
+    // MARK: Writes (target one document; throw if it isn't open)
+
+    /// Persist this record to document `documentId` — inserts it if it
+    /// doesn't exist yet, updates it in place if it does. One call for
+    /// both, matching the JS client's `save()`. Throws if the doc isn't
+    /// open. Returns `self` so you can `let saved = try note.save(in:)`.
+    @discardableResult
+    func save(in documentId: String) throws -> CrashTestRecord {
+        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
+        return self
+    }
+
+    /// Insert-or-update this record in `documentId`, matched by the
+    /// single-field unique constraint on `upsertOn` rather than `id` —
+    /// if a record already holds this row's `upsertOn` value, that
+    /// record is merged into (and keeps its id); otherwise a new
+    /// record is inserted. Mirrors the JS client's
+    /// `save({ upsertOn: field })`. Throws if the doc isn't open, if
+    /// `upsertOn` has no single-field unique constraint, or if the
+    /// `upsertOn` value is absent/empty. Returns `self`.
+    @discardableResult
+    func save(in documentId: String, upsertOn: String) throws -> CrashTestRecord {
+        try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)
+        return self
+    }
+
+    /// Delete this record from document `documentId`. Throws if the doc isn't open.
+    func delete(in documentId: String) throws {
+        try JsBaoClient.requireDefault().deleteShared(Self.primitiveSchema, id: id, in: documentId)
     }
 }

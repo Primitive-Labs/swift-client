@@ -916,43 +916,16 @@ public class BaoModelQueryEngine {
         defer { lock.unlock() }
 
         let tableName = sanitizedTableName(modelName)
-        var (sql, params) = QueryTranslator.buildAggregation(
+        // `buildAggregation` weaves `scopedToDocId` into the WHERE itself
+        // (and qualifies it with the table name) so the doc-scope bind
+        // param lands after any membership-JOIN params — a plain string
+        // splice can't do that safely once JOINs add placeholders.
+        let (sql, params) = QueryTranslator.buildAggregation(
             tableName: tableName, options: options,
             stringsetFields: stringsetFields,
-            stringFields: stringFieldsByModel[modelName]
+            stringFields: stringFieldsByModel[modelName],
+            scopedToDocId: scopedToDocId
         )
-        // `buildAggregation` already threads `tableName` through
-        // `translate` internally.
-        if let docId = scopedToDocId {
-            // Inject the docId predicate into the existing WHERE
-            // (or add one). buildAggregation produces SQL like
-            // `SELECT ... FROM "x" [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ...]`.
-            // The first ` WHERE ` is always the outer one (any nested
-            // WHERE inside e.g. stringset EXISTS subqueries appears
-            // later in the string); splice into just that occurrence
-            // so we don't touch the subquery. If there's no outer
-            // WHERE, insert one before the first of GROUP BY /
-            // ORDER BY / LIMIT.
-            if let whereRange = sql.range(of: " WHERE ") {
-                sql.replaceSubrange(
-                    whereRange,
-                    with: " WHERE \"_meta_doc_id\" = ? AND "
-                )
-            } else {
-                let tailStart = [" GROUP BY ", " ORDER BY ", " LIMIT "]
-                    .compactMap { sql.range(of: $0)?.lowerBound }
-                    .min()
-                if let tailStart {
-                    let head = sql[..<tailStart]
-                    let tail = sql[tailStart...]
-                    sql = String(head) + " WHERE \"_meta_doc_id\" = ?"
-                        + String(tail)
-                } else {
-                    sql += " WHERE \"_meta_doc_id\" = ?"
-                }
-            }
-            params.insert(docId, at: 0)
-        }
         return executeQuery(sql, params: params)
     }
 

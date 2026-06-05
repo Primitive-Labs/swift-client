@@ -48,12 +48,12 @@ final class SessionTests: XCTestCase {
             let result = try await client.session.get()
             // If we get here, the server returned 200 — assert the
             // discriminating field from /session's success shape.
-            XCTAssertNotNil(
-                result["sessionId"],
-                "session.get() returned 200 but with no `sessionId`. " +
+            XCTAssertFalse(
+                result.sessionId.isEmpty,
+                "session.get() returned 200 but with an empty `sessionId`. " +
                 "Either SessionAPI is calling /me (which never returns " +
                 "sessionId) or the server's /session response shape changed. " +
-                "Got keys: \(result.keys.sorted())"
+                "Got: \(result)"
             )
         } catch let error as HttpError where error.status == 404 {
             // Expected with test-JWT bootstrap: no Session row exists.

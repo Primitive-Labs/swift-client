@@ -25,7 +25,7 @@ The bulk of the original v1 exclusions landed via the API-parity pass:
 - **Blob buckets** (`BlobBucketsAPI`, 10 methods incl. raw upload/download)
 - **Cron triggers** (`CronTriggersAPI`, 8 methods)
 - **Type configs** (`CollectionTypeConfigsAPI` + `DatabaseTypeConfigsAPI`, 10 methods)
-- **DocumentsAPI access-requests** + **pending-creates** + **getOwner** + **revokeGroupPermission** + **local-state methods** (`isOpen`, `isPendingCreate`, `hasLocalCopy`, `getDocumentPermission`, `getLocalMetadata`) (~13 methods)
+- **DocumentsAPI access-requests** + **pending-creates** + **revokeGroupPermission** + **local-state methods** (`isOpen`, `isPendingCreate`, `hasLocalCopy`, `getDocumentPermission`, `getLocalMetadata`) (~12 methods) — note: the Swift-only `getOwner` convenience that landed here was later removed (JS reads `createdBy` off `get(id)` directly)
 - **DatabasesAPI operational** (CEL context, managers, group permissions, executeBatch, importRows) (~10 methods)
 - **UsersAPI**: `getProfiles` + `lookup`
 - **WorkflowsAPI**: `listStepRuns` + `forceRerun` + `forward` + `contextDocId` + `terminate(contextDocId:)`
@@ -106,9 +106,9 @@ This is deliberate: the per-document flow is by far the more common use case (st
 
 The 14 Swift sub-APIs use 3 different styles: thin dict facade, typed-options + cache-aware, orchestration + state. Worth converging in v1.1, but the current mix reflects per-feature complexity.
 
-### `client.workflows` extra methods
+### `client.workflows` apply-waiter plumbing
 
-`runAndApply`, `awaitRun`, `recheckPendingRuns` are Swift-only. They're not gaps the other direction — they're additions for a Swift-shaped UX (typed waiters around async/await).
+The per-run apply-waiter machinery (claim → getStatus → confirm, reconnect recovery via `recheckPendingRuns`) is now **internal** plumbing only — driven by the WS `workflowStatus` path and the reconnect hook in `JsBaoClient`. The previously-public Swift-only helpers (`runAndApply`, `awaitRun`, `recheckPendingRuns`, `deliverPendingApplies`, `undefine`) were removed to keep the public workflows surface at strict parity with JS. The JS-parity surface is `start` / `runSync` / `getStatus` / `terminate` / `listRuns` / `listStepRuns` / the apply-flow primitives (`claimApply` / `confirmApply` / `releaseApply` / `getPendingApplies`) / `define`.
 
 ---
 

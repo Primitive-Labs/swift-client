@@ -20,7 +20,6 @@ public final class BlobManager: @unchecked Sendable {
     private var uploadQueue: [String: UploadTask] = [:]
     private var activeUploads = 0
     private var uploadConcurrency: Int
-    private var isPaused = false
 
     // Memory cache for blobs
     private var memoryBlobs: [String: Data] = [:]
@@ -41,7 +40,8 @@ public final class BlobManager: @unchecked Sendable {
         documentId: String,
         blobId: String,
         data: Data,
-        options: BlobUploadSourceOptions = BlobUploadSourceOptions()
+        options: BlobUploadSourceOptions = BlobUploadSourceOptions(),
+        attempts: Int = 1
     ) async throws -> BlobUploadResult {
         let sha256 = options.sha256Base64 ?? hashSHA256Base64(data)
         let filename = options.filename ?? blobId
@@ -75,10 +75,21 @@ public final class BlobManager: @unchecked Sendable {
             bytesTransferred: data.count
         )
 
+        // Mirror JS `emitUploadComplete`: carry the full queue record. The
+        // immediate path isn't queued, so `queueId == blobId` (the JS
+        // invariant) and `attempts` reflects the attempt count passed in by
+        // the caller (1 for a first immediate try; the retry count when the
+        // queue worker re-invokes after a failure).
         emitter?.emit(.blobsUploadCompleted, BlobUploadCompletedEvent(
             documentId: documentId,
             blobId: blobId,
-            numBytes: data.count
+            queueId: blobId,
+            filename: filename,
+            contentType: contentType,
+            numBytes: data.count,
+            attempts: attempts,
+            retainLocal: options.retainLocal,
+            updatedAt: Date().timeIntervalSince1970
         ))
 
         return result
@@ -93,9 +104,11 @@ public final class BlobManager: @unchecked Sendable {
         let blobId = ULID.generate()
         let sha256 = options.sha256Base64 ?? hashSHA256Base64(source)
 
-        // Store in memory cache
+        // Store in memory cache under the disposition-qualified key (defaulting
+        // to inline) so a subsequent `read` — which looks up the inline variant
+        // by default — finds the just-uploaded bytes.
         lock.lock()
-        memoryBlobs["\(documentId)::\(blobId)"] = source
+        memoryBlobs[Self.cacheKey(documentId, blobId, options.disposition ?? .inline)] = source
         lock.unlock()
 
         // Try immediate upload
@@ -108,9 +121,16 @@ public final class BlobManager: @unchecked Sendable {
                     filename: options.filename,
                     contentType: options.contentType,
                     sha256Base64: sha256,
-                    disposition: options.disposition
+                    disposition: options.disposition,
+                    retainLocal: options.retainLocal
                 )
             )
+            // retainLocal defaults to `true` (matching JS). When the caller
+            // opts out, drop the bytes from the local cache after a successful
+            // upload so a later `read` re-fetches from the server.
+            if options.retainLocal == false {
+                evict(documentId: documentId, blobId: blobId)
+            }
             return result
         } catch {
             // Queue for retry
@@ -128,11 +148,23 @@ public final class BlobManager: @unchecked Sendable {
             uploadQueue[blobId] = task
             lock.unlock()
 
+            // Mirror JS `emitUploadFailed`: carry the full queue record. The
+            // task was just queued (attempt 1), so it will be retried — hence
+            // `willRetry: true`. `lastError` is optional in the payload (JS
+            // parity) but always present here.
             emitter?.emit(.blobsUploadFailed, BlobUploadFailedEvent(
                 documentId: documentId,
                 blobId: blobId,
-                error: error.localizedDescription,
-                willRetry: true
+                queueId: task.queueId,
+                filename: task.filename,
+                contentType: task.contentType,
+                numBytes: task.data.count,
+                attempts: task.attempts,
+                retainLocal: task.retainLocal,
+                lastError: task.lastError,
+                willRetry: true,
+                nextAttemptAt: task.nextAttemptAt,
+                updatedAt: task.updatedAt
             ))
 
             scheduleQueueProcessing()
@@ -142,20 +174,58 @@ public final class BlobManager: @unchecked Sendable {
 
     // MARK: - Download
 
-    /// Build download URL for a blob
-    public func downloadUrl(documentId: String, blobId: String, disposition: BlobDisposition? = nil) -> String {
+    /// Build download URL for a blob.
+    ///
+    /// Mirrors JS `getDownloadUrl` / `BlobDownloadUrlParams`: an optional
+    /// `disposition` plus an optional `attachmentFilename` that overrides the
+    /// download filename. The filename is emitted as an RFC 5987 ext-value
+    /// (`UTF-8''<pct-encoded>`), matching the JS client's `encodeRFC5987Value`.
+    public func downloadUrl(
+        documentId: String,
+        blobId: String,
+        disposition: BlobDisposition? = nil,
+        attachmentFilename: String? = nil
+    ) -> String {
         guard let apiUrl = getApiUrl?(), let appId = getAppId?() else { return "" }
         var url = "\(apiUrl)/app/\(appId)/api/documents/\(documentId)/blobs/\(blobId)/download"
+        var query: [String] = []
         if let disposition = disposition {
-            url += "?disposition=\(disposition.rawValue)"
+            query.append("disposition=\(disposition.rawValue)")
+        }
+        if let attachmentFilename = attachmentFilename, !attachmentFilename.isEmpty {
+            let encoded = "UTF-8''\(Self.encodeRFC5987Value(attachmentFilename))"
+            query.append("attachmentFilename=\(encoded)")
+        }
+        if !query.isEmpty {
+            url += "?" + query.joined(separator: "&")
         }
         return url
     }
 
+    /// Percent-encode a string as an RFC 5987 ext-value payload. Everything
+    /// outside the unreserved set is percent-encoded so the result is always
+    /// safe to decode server-side. Mirrors the JS client's `encodeRFC5987Value`.
+    static func encodeRFC5987Value(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
     /// Read a blob's content
-    public func read(documentId: String, blobId: String, force: Bool = false) async throws -> Data {
-        // Check memory cache first
-        let cacheKey = "\(documentId)::\(blobId)"
+    ///
+    /// - Parameter disposition: serve the download `inline` (the default when
+    ///   omitted) or as an `attachment`. Mirrors JS `BlobReadOptions.disposition`:
+    ///   the disposition is folded into the cache key so an `inline` and an
+    ///   `attachment` read of the same blob don't collide, and is forwarded to
+    ///   the download URL.
+    public func read(documentId: String, blobId: String, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> Data {
+        // Effective disposition for both the cache key and the request — JS
+        // defaults `read` to the inline variant when none is supplied.
+        let effectiveDisposition = disposition ?? .inline
+        // Check memory cache first. The disposition is part of the key so an
+        // inline read and an attachment read of the same blob cache separately,
+        // mirroring js-bao's `::disp=` cache-key suffix in `blobManager.ts`.
+        let cacheKey = Self.cacheKey(documentId, blobId, effectiveDisposition)
         if !force {
             lock.lock()
             if let cached = memoryBlobs[cacheKey] {
@@ -166,7 +236,7 @@ public final class BlobManager: @unchecked Sendable {
         }
 
         // Download from server
-        let url = downloadUrl(documentId: documentId, blobId: blobId, disposition: .inline)
+        let url = downloadUrl(documentId: documentId, blobId: blobId, disposition: effectiveDisposition)
         guard let requestUrl = URL(string: url) else {
             throw JsBaoError(code: .invalidArgument, message: "Invalid blob URL")
         }
@@ -213,9 +283,21 @@ public final class BlobManager: @unchecked Sendable {
 
     // MARK: - Queue Management
 
-    public func pauseUpload(_ blobId: String) -> Bool {
+    /// Pause an in-progress upload by blob ID. When `documentId` is supplied,
+    /// the upload is only paused if it belongs to that document (mirrors JS
+    /// `pauseUpload(queueId, documentId?)`, which the per-document context
+    /// passes its own id to).
+    public func pauseUpload(_ blobId: String, documentId: String? = nil) -> Bool {
         lock.lock()
         guard var task = uploadQueue[blobId] else {
+            lock.unlock()
+            return false
+        }
+        if let documentId = documentId, task.documentId != documentId {
+            lock.unlock()
+            return false
+        }
+        if task.paused {
             lock.unlock()
             return false
         }
@@ -225,30 +307,72 @@ public final class BlobManager: @unchecked Sendable {
         return true
     }
 
-    public func resumeUpload(_ blobId: String) -> Bool {
+    /// Resume a paused upload by blob ID, optionally scoped to `documentId`.
+    public func resumeUpload(_ blobId: String, documentId: String? = nil) -> Bool {
         lock.lock()
         guard var task = uploadQueue[blobId] else {
             lock.unlock()
             return false
         }
+        if let documentId = documentId, task.documentId != documentId {
+            lock.unlock()
+            return false
+        }
+        guard task.paused else {
+            lock.unlock()
+            return false
+        }
         task.paused = false
+        task.nextAttemptAt = Date().timeIntervalSince1970
         uploadQueue[blobId] = task
         lock.unlock()
         scheduleQueueProcessing()
         return true
     }
 
-    public func pauseAll() {
+    /// Pause every queued upload, optionally scoped to a single document.
+    public func pauseAll(documentId: String? = nil) {
         lock.lock()
-        isPaused = true
+        for (blobId, var task) in uploadQueue {
+            if let documentId = documentId, task.documentId != documentId { continue }
+            task.paused = true
+            uploadQueue[blobId] = task
+        }
         lock.unlock()
     }
 
-    public func resumeAll() {
+    /// Resume every paused upload, optionally scoped to a single document.
+    public func resumeAll(documentId: String? = nil) {
         lock.lock()
-        isPaused = false
+        var resumed = false
+        for (blobId, var task) in uploadQueue {
+            if let documentId = documentId, task.documentId != documentId { continue }
+            if task.paused {
+                task.paused = false
+                task.nextAttemptAt = Date().timeIntervalSince1970
+                uploadQueue[blobId] = task
+                resumed = true
+            }
+        }
         lock.unlock()
-        scheduleQueueProcessing()
+        if resumed {
+            scheduleQueueProcessing()
+        }
+    }
+
+    /// Remove a queued upload (if any) for a blob and evict its cached bytes.
+    /// Mirrors the queue-cleanup half of JS `delete`: a delete issued
+    /// mid-upload cancels the in-flight transfer and emits `queue-drained`
+    /// once the queue empties.
+    func cancelQueuedUpload(documentId: String, blobId: String) {
+        lock.lock()
+        let removed = uploadQueue.removeValue(forKey: blobId) != nil
+        let queueEmpty = uploadQueue.isEmpty
+        lock.unlock()
+        evict(documentId: documentId, blobId: blobId)
+        if removed && queueEmpty {
+            emitter?.emit(.blobsQueueDrained, [:] as [String: Any])
+        }
     }
 
     public func setUploadConcurrency(_ value: Int) {
@@ -263,19 +387,31 @@ public final class BlobManager: @unchecked Sendable {
         return uploadConcurrency
     }
 
-    public func listUploads() -> [BlobUploadStatus] {
+    /// Snapshot of tracked uploads, newest-updated first. When `documentId` is
+    /// supplied only that document's uploads are returned (mirrors JS
+    /// `getUploads(documentId?)`, which the per-document context scopes).
+    public func listUploads(documentId: String? = nil) -> [BlobUploadStatus] {
         lock.lock()
         defer { lock.unlock() }
-        return uploadQueue.values.map { task in
-            BlobUploadStatus(
-                blobId: task.blobId,
-                documentId: task.documentId,
-                status: task.paused ? "paused" : "pending",
-                attempts: task.attempts,
-                numBytes: task.data.count,
-                lastError: task.lastError
-            )
-        }
+        return uploadQueue.values
+            .filter { documentId == nil || $0.documentId == documentId }
+            .map { task in
+                BlobUploadStatus(
+                    queueId: task.queueId,
+                    documentId: task.documentId,
+                    blobId: task.blobId,
+                    filename: task.filename,
+                    contentType: task.contentType,
+                    numBytes: task.data.count,
+                    status: task.paused ? "paused" : "pending",
+                    attempts: task.attempts,
+                    nextAttemptAt: task.nextAttemptAt,
+                    retainLocal: task.retainLocal,
+                    lastError: task.lastError,
+                    updatedAt: task.updatedAt
+                )
+            }
+            .sorted { $0.updatedAt > $1.updatedAt }
     }
 
     // MARK: - Cleanup
@@ -286,7 +422,34 @@ public final class BlobManager: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Evict a single blob from the local memory cache (no server call).
+    /// Mirrors JS `deleteBlobBytes`, so a deleted blob isn't served stale
+    /// from cache on a later `read`.
+    func evict(documentId: String, blobId: String) {
+        lock.lock()
+        // Drop every disposition variant cached for this blob (the key is
+        // disposition-qualified), plus any legacy un-qualified entry, so a
+        // deleted blob can't be served stale under any disposition.
+        let prefix = "\(documentId)::\(blobId)"
+        for key in memoryBlobs.keys where key == prefix || key.hasPrefix("\(prefix)::") {
+            memoryBlobs.removeValue(forKey: key)
+        }
+        lock.unlock()
+    }
+
     // MARK: - Private
+
+    /// Build the memory-cache key for a blob read/write. The disposition is
+    /// part of the key so an inline read and an attachment read of the same
+    /// blob cache separately, mirroring js-bao's `::disp=` cache-key suffix
+    /// in `blobManager.ts`.
+    private static func cacheKey(
+        _ documentId: String,
+        _ blobId: String,
+        _ disposition: BlobDisposition
+    ) -> String {
+        return "\(documentId)::\(blobId)::disp=\(disposition.rawValue)"
+    }
 
     private func scheduleQueueProcessing() {
         Task {
@@ -296,10 +459,6 @@ public final class BlobManager: @unchecked Sendable {
 
     private func processQueue() async {
         lock.lock()
-        guard !isPaused else {
-            lock.unlock()
-            return
-        }
         let tasks = uploadQueue.values.filter { !$0.paused }
             .sorted(by: { $0.nextAttemptAt < $1.nextAttemptAt })
         let available = uploadConcurrency - activeUploads
@@ -320,7 +479,8 @@ public final class BlobManager: @unchecked Sendable {
                     documentId: task.documentId,
                     blobId: task.blobId,
                     data: task.data,
-                    options: task.options
+                    options: task.options,
+                    attempts: task.attempts
                 )
 
                 lock.lock()
@@ -335,14 +495,39 @@ public final class BlobManager: @unchecked Sendable {
             } catch {
                 lock.lock()
                 activeUploads -= 1
+                var failedTask: UploadTask?
                 if var updatedTask = uploadQueue[task.blobId] {
                     updatedTask.attempts += 1
                     updatedTask.lastError = error.localizedDescription
                     let delay = computeBackoff(attempts: updatedTask.attempts)
                     updatedTask.nextAttemptAt = Date().timeIntervalSince1970 + Double(delay) / 1000.0
+                    updatedTask.updatedAt = Date().timeIntervalSince1970
                     uploadQueue[task.blobId] = updatedTask
+                    failedTask = updatedTask
                 }
                 lock.unlock()
+
+                // Mirror JS `emitUploadFailed`: emit on every failed attempt
+                // (not just the first), carrying the updated queue record so
+                // subscribers see the incremented `attempts`, the backoff
+                // `nextAttemptAt`, and the latest `lastError`. The task stays
+                // queued, so `willRetry: true`.
+                if let failedTask = failedTask {
+                    emitter?.emit(.blobsUploadFailed, BlobUploadFailedEvent(
+                        documentId: failedTask.documentId,
+                        blobId: failedTask.blobId,
+                        queueId: failedTask.queueId,
+                        filename: failedTask.filename,
+                        contentType: failedTask.contentType,
+                        numBytes: failedTask.data.count,
+                        attempts: failedTask.attempts,
+                        retainLocal: failedTask.retainLocal,
+                        lastError: failedTask.lastError,
+                        willRetry: true,
+                        nextAttemptAt: failedTask.nextAttemptAt,
+                        updatedAt: failedTask.updatedAt
+                    ))
+                }
 
                 // Schedule retry
                 let delay = computeBackoff(attempts: task.attempts + 1)
@@ -377,6 +562,13 @@ struct UploadTask {
     var lastError: String?
     var paused: Bool = false
     var nextAttemptAt: TimeInterval = 0
+    var updatedAt: TimeInterval = Date().timeIntervalSince1970
+
+    /// The queue identifier. Mirrors JS, where `queueId === blobId`.
+    var queueId: String { blobId }
+    var filename: String { options.filename ?? blobId }
+    var contentType: String { options.contentType ?? "application/octet-stream" }
+    var retainLocal: Bool? { options.retainLocal }
 }
 
 public struct BlobUploadResult: Sendable {
@@ -386,13 +578,21 @@ public struct BlobUploadResult: Sendable {
     public let bytesTransferred: Int?
 }
 
+/// Status of a tracked upload. Field-for-field mirror of the JS
+/// `BlobUploadStatus` returned by `uploads()`.
 public struct BlobUploadStatus: Sendable {
-    public let blobId: String
+    public let queueId: String
     public let documentId: String
+    public let blobId: String
+    public let filename: String
+    public let contentType: String
+    public let numBytes: Int
     public let status: String
     public let attempts: Int
-    public let numBytes: Int
+    public let nextAttemptAt: TimeInterval
+    public let retainLocal: Bool?
     public let lastError: String?
+    public let updatedAt: TimeInterval
 }
 
 public struct BlobListResult: Sendable, Codable {

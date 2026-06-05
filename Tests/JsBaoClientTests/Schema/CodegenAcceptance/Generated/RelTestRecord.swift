@@ -10,8 +10,8 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         name: "relTest",
         fields: [
             "id":        FieldDescriptor(type: .id),
-            "profileId": FieldDescriptor(type: .string),
             "taskId":    FieldDescriptor(type: .string),
+            "profileId": FieldDescriptor(type: .string),
         ],
         relationships: [
             "profile": RelationshipDescriptor(properties: ["type": "hasMany", "model": "user_profile", "relatedIdField": "ownerId", "orderByField": "displayName", "orderDirection": "asc"]),
@@ -21,23 +21,23 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
     )
 
     internal var id: String
-    internal var profileId: String?
     internal var taskId: String?
+    internal var profileId: String?
 
     internal init(
         id: String,
-        profileId: String? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        profileId: String? = nil
     ) {
         self.id = id
-        self.profileId = profileId
         self.taskId = taskId
+        self.profileId = profileId
     }
 
     internal init?(record: PrimitiveRecord) {
         self.id = record.id
-        self.profileId = record["profileId"]?.asString
         self.taskId = record["taskId"]?.asString
+        self.profileId = record["profileId"]?.asString
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
@@ -45,14 +45,161 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         guard let id = row["id"] as? String
         else { return nil }
         self.id = id
-        self.profileId = row["profileId"] as? String
         self.taskId = row["taskId"] as? String
+        self.profileId = row["profileId"] as? String
     }
 
     internal func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [:]
-        if let profileId { values["profileId"] = .string(profileId) }
         if let taskId { values["taskId"] = .string(taskId) }
+        if let profileId { values["profileId"] = .string(profileId) }
         return values
+    }
+
+    /// Follow the `profile` relationship (hasMany → `user_profile`),
+    /// applying any emitted `order_by_field` / `order_direction`.
+    internal static func profile(
+        of record: PrimitiveRecord,
+        in target: DynamicModel
+    ) throws -> [UserProfileRecord] {
+        try record.hasMany(relationship: "profile", target: target)
+            .compactMap(UserProfileRecord.init(record:))
+    }
+
+    /// Follow the `task` relationship (refersTo → `tasks`).
+    /// `record` is this row's `PrimitiveRecord`; `target` is the
+    /// related model's `DynamicModel`. Returns `nil` when the foreign
+    /// key is unset or points at a missing record.
+    internal static func task(
+        of record: PrimitiveRecord,
+        in target: DynamicModel
+    ) throws -> TaskRecord? {
+        try record.refersTo(relationship: "task", target: target)
+            .flatMap(TaskRecord.init(record:))
+    }
+
+    /// Follow the `viaJoin` relationship (hasManyThrough → `user_profile`)
+    /// via its join model. `joinModel` is the join `DynamicModel`;
+    /// `target` is the related model's `DynamicModel`.
+    internal static func viaJoin(
+        of record: PrimitiveRecord,
+        through joinModel: DynamicModel,
+        in target: DynamicModel
+    ) throws -> [UserProfileRecord] {
+        try record.hasManyThrough(
+            relationship: "viaJoin",
+            joinModel: joinModel,
+            target: target
+        ).compactMap(UserProfileRecord.init(record:))
+    }
+}
+
+/// The app-facing API for `RelTestRecord` — one model, like the JS client.
+/// Reads span every open document by default (scope to specific docs with
+/// `options: QueryOptions(documents: [docId])`); `save(in:)` / `delete(in:)`
+/// target one document and throw if it isn't open. Backed by the configured
+/// default `JsBaoClient` (see `JsBaoClient.configureDefault`).
+internal extension RelTestRecord {
+    // MARK: Reads (cross-document by default)
+
+    /// Query across all open documents. Rows that fail to decode (schema
+    /// drift) are skipped. Scope to one/some docs via `options.documents`.
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [RelTestRecord] {
+        JsBaoClient.requireDefault()
+            .queryShared(primitiveSchema, filter: filter, options: options)
+            .compactMap { RelTestRecord(row: $0) }
+    }
+
+    /// Paginated query across all open documents. Returns the page's
+    /// rows plus `nextCursor`/`prevCursor`/`hasMore` — round-trip
+    /// `nextCursor` via `options.cursor` to page. Mirrors JS
+    /// `BaseModel.query()`'s `{ data, nextCursor, hasMore }` shape.
+    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<RelTestRecord> {
+        let page = try JsBaoClient.requireDefault()
+            .queryPagedShared(primitiveSchema, filter: filter, options: options)
+        return PagedQueryResult(
+            data: page.data.compactMap { RelTestRecord(row: $0) },
+            nextCursor: page.nextCursor,
+            prevCursor: page.prevCursor,
+            hasMore: page.hasMore
+        )
+    }
+
+    /// Count across all open documents.
+    static func count(_ filter: DocumentFilter? = nil) -> Int {
+        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    }
+
+    /// Every record across all open documents.
+    static func findAll() -> [RelTestRecord] {
+        query(nil, options: nil)
+    }
+
+    /// First record with `id` across all open documents, or `nil`.
+    static func find(_ id: String) -> RelTestRecord? {
+        JsBaoClient.requireDefault().findShared(primitiveSchema, id: id).flatMap { RelTestRecord(row: $0) }
+    }
+
+    /// First record matching a unique `constraint` and `value`,
+    /// across all open documents, or `nil`. First-match-wins in
+    /// document connect order (uniqueness is per-document, so the
+    /// same value may exist in more than one open doc). Mirrors the
+    /// JS client's `Model.findByUnique(constraintName, value)`.
+    static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> RelTestRecord? {
+        try JsBaoClient.requireDefault()
+            .findByUniqueShared(primitiveSchema, constraint: constraint, value: value)
+            .flatMap { RelTestRecord(row: $0) }
+    }
+
+    /// The first record matching `filter` across all open documents,
+    /// or `nil`. Equivalent to `query(filter, options).first` — mirrors
+    /// the JS client's `Model.queryOne(filter, options)`.
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> RelTestRecord? {
+        JsBaoClient.requireDefault()
+            .queryOneShared(primitiveSchema, filter: filter, options: options)
+            .flatMap { RelTestRecord(row: $0) }
+    }
+
+    /// Fire `callback` after any add/update/delete in any open document's
+    /// copy of this model (local or remote). Returns an unsubscribe closure.
+    @discardableResult
+    static func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+        JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)
+    }
+
+    /// Aggregate (group / count / sum / avg / …) across all open documents.
+    static func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
+        JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
+    }
+
+    // MARK: Writes (target one document; throw if it isn't open)
+
+    /// Persist this record to document `documentId` — inserts it if it
+    /// doesn't exist yet, updates it in place if it does. One call for
+    /// both, matching the JS client's `save()`. Throws if the doc isn't
+    /// open. Returns `self` so you can `let saved = try note.save(in:)`.
+    @discardableResult
+    func save(in documentId: String) throws -> RelTestRecord {
+        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
+        return self
+    }
+
+    /// Insert-or-update this record in `documentId`, matched by the
+    /// single-field unique constraint on `upsertOn` rather than `id` —
+    /// if a record already holds this row's `upsertOn` value, that
+    /// record is merged into (and keeps its id); otherwise a new
+    /// record is inserted. Mirrors the JS client's
+    /// `save({ upsertOn: field })`. Throws if the doc isn't open, if
+    /// `upsertOn` has no single-field unique constraint, or if the
+    /// `upsertOn` value is absent/empty. Returns `self`.
+    @discardableResult
+    func save(in documentId: String, upsertOn: String) throws -> RelTestRecord {
+        try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)
+        return self
+    }
+
+    /// Delete this record from document `documentId`. Throws if the doc isn't open.
+    func delete(in documentId: String) throws {
+        try JsBaoClient.requireDefault().deleteShared(Self.primitiveSchema, id: id, in: documentId)
     }
 }

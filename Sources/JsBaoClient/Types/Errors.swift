@@ -21,19 +21,21 @@ public enum JsBaoErrorCode: String, Sendable {
     case integrationSecretMissing = "INTEGRATION_SECRET_MISSING"
     case integrationRequestInvalid = "INTEGRATION_REQUEST_INVALID"
     case integrationProxyFailed = "INTEGRATION_PROXY_FAILED"
+    case workflowApplyNotConfirmed = "WORKFLOW_APPLY_NOT_CONFIRMED"
 }
 
 /// Main error type for the JsBao client library
 public struct JsBaoError: Error, Sendable {
     public let code: JsBaoErrorCode
     public let message: String
-    /// Optional structured diagnostic details. Typed as `[String: String]?`
-    /// rather than `[String: Any]?` so the struct's `Sendable` conformance is
-    /// real (not just nominally declared) — the previous `Any` value was
-    /// quietly violating it.
-    public let details: [String: String]?
+    /// Optional structured diagnostic details. Typed as `[String: JSONValue]?`
+    /// to mirror JS's `details?: any` (`src/client/errors.ts`): nested objects,
+    /// numbers, and bools are all representable, and because `JSONValue` is
+    /// itself `Sendable` the struct's `Sendable` conformance stays real (a raw
+    /// `[String: Any]?` would quietly violate it).
+    public let details: [String: JSONValue]?
 
-    public init(code: JsBaoErrorCode, message: String? = nil, details: [String: String]? = nil) {
+    public init(code: JsBaoErrorCode, message: String? = nil, details: [String: JSONValue]? = nil) {
         self.code = code
         self.message = message ?? code.rawValue
         self.details = details

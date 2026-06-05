@@ -65,6 +65,14 @@ public final class AnalyticsQueue: @unchecked Sendable {
 
     // MARK: - Event Logging
 
+    /// Typed entry point used by `client.analytics.logEvent(_:)`. Bridges
+    /// to the untyped `[String: Any]` path below (which the llm/gemini
+    /// `AnalyticsContext` callers also use), so all events funnel through
+    /// the same defaulting / override / rate-limit logic.
+    public func logEvent(_ event: AnalyticsEventInput) {
+        logEvent(event.asDictionary())
+    }
+
     public func logEvent(_ event: [String: Any]) {
         guard isWithinRateLimit() else {
             logger.debug("Analytics rate limit exceeded, dropping event")
@@ -158,6 +166,12 @@ public final class AnalyticsQueue: @unchecked Sendable {
     // MARK: - Persistence
 
     public func persistBuffer() async {
+        // Enforce the persisted-bytes cap (oldest-event eviction) before
+        // reading the buffer to persist, mirroring the JS client's
+        // `enforcePersistenceCap()` which trims the buffer in place ahead
+        // of every persist (analyticsQueue.ts).
+        enforcePersistenceCap()
+
         lock.lock()
         let events = buffer
         lock.unlock()
@@ -169,6 +183,37 @@ public final class AnalyticsQueue: @unchecked Sendable {
         } catch {
             logger.warn("Failed to persist analytics queue:", error.localizedDescription)
         }
+    }
+
+    /// Trim the oldest buffered events until the serialized buffer fits
+    /// within `maxPersistedBytes` (1 MiB), matching the JS client's FIFO
+    /// `enforcePersistenceCap()`. Byte count is the UTF-8 length of the
+    /// JSON-serialized buffer — the same payload the OfflineStore persists.
+    private func enforcePersistenceCap() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var totalBytes = estimatedBufferBytes(buffer)
+        if totalBytes <= maxPersistedBytes { return }
+
+        logger.warn(
+            "Offline analytics queue exceeded capacity; truncating oldest events",
+            "totalBytes=\(totalBytes) limit=\(maxPersistedBytes)"
+        )
+
+        while !buffer.isEmpty && totalBytes > maxPersistedBytes {
+            buffer.removeFirst()
+            totalBytes = estimatedBufferBytes(buffer)
+        }
+    }
+
+    /// UTF-8 byte length of the JSON-serialized events, matching JS's
+    /// `estimatedBufferBytes` (`utf8ByteLength(JSON.stringify(events))`).
+    /// Returns 0 for an empty buffer.
+    private func estimatedBufferBytes(_ events: [[String: Any]]) -> Int {
+        if events.isEmpty { return 0 }
+        guard let data = try? JSONSerialization.data(withJSONObject: events) else { return 0 }
+        return data.count
     }
 
     public func restoreBuffer() async {

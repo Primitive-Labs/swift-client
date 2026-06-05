@@ -213,6 +213,12 @@ public final class DynamicModel {
     /// metadata. Safe to call on the same (doc, schema) pair multiple
     /// times — `SchemaSync` has a session cache.
     ///
+    /// `DynamicModel` is the **untyped / runtime-schema** model — use it when
+    /// you don't have a codegen'd type (generic tooling, the debug inspector,
+    /// schema-from-the-wire). For a known model, prefer the codegen'd type's
+    /// `Model.*` statics. Internally it's also the per-document engine that
+    /// `MultiDocModel` connects into the shared cross-document store.
+    ///
     /// - Parameters:
     ///   - doc: the YDocument hosting this model's records.
     ///   - schema: the model's runtime schema.
@@ -329,6 +335,25 @@ public final class DynamicModel {
     /// semantics as `create`. Omitted fields are left unchanged.
     public func update(id: String, values: [String: PrimitiveValue]) throws {
         try applyWrite(id: id, values: values, isUpdate: true)
+    }
+
+    /// Create-or-update by id, the way js-bao's `BaseModel.save` does:
+    /// insert the record if it doesn't exist yet, otherwise update it in
+    /// place. The insert-vs-update decision is made *inside* the write
+    /// transaction (so it can't race a concurrent local write), and drives
+    /// the same default-filling difference as `create` vs `update` — a new
+    /// id fills unspecified fields from schema defaults; an existing id
+    /// leaves omitted fields untouched.
+    @discardableResult
+    public func save(id: String, values: [String: PrimitiveValue]) throws -> PrimitiveRecord {
+        try withThrowingTx { [self] txn in
+            let root = txn.transactionGetOrInsertMap(name: self.schema.name)
+            let isUpdate = root.getMap(tx: txn, key: id) != nil
+            try self.applyWriteInternal(
+                id: id, values: values, isUpdate: isUpdate, tx: txn
+            )
+        }
+        return PrimitiveRecord(modelName: schema.name, id: id, model: self)
     }
 
     /// Add a single member to a stringset field WITHOUT replacing the
@@ -506,13 +531,10 @@ public final class DynamicModel {
             }()
 
             if let existingId = existing {
-                // Merge path. Supplied id, if any, must match.
-                if let supplied = id, supplied != existingId {
-                    resolved = .failure(UpsertError.idMismatch(
-                        supplied: supplied, existing: existingId
-                    ))
-                    return
-                }
+                // Merge path. JS `save({ upsertOn })` matches by the unique
+                // field and updates the existing record — the existing id
+                // wins and any supplied id is ignored (mirrors js-bao; a
+                // mismatching supplied id is not an error).
                 resolved = .success((id: existingId, wasCreated: false))
             } else {
                 // Insert path. Resolve the id: caller-supplied > schema
@@ -1028,10 +1050,11 @@ public final class DynamicModel {
 
     private func applyWriteInternal(
         id: String,
-        values newValues: [String: PrimitiveValue],
+        values: [String: PrimitiveValue],
         isUpdate: Bool,
         tx txn: YrsTransaction
     ) throws {
+        var newValues = values
         let root = txn.transactionGetOrInsertMap(name: self.schema.name)
 
         // Read existing record (if any) WITHOUT creating it —
@@ -1041,6 +1064,44 @@ public final class DynamicModel {
         let oldData: [String: PrimitiveValue] = existing.map {
             self.snapshotFromMap(rec: $0, tx: txn)
         } ?? [:]
+
+        // Apply schema-declared auto-timestamps BEFORE validation so a
+        // `required: true` + `auto_stamp = "create"` field doesn't trip
+        // the required check. Mirrors js-bao `BaseModel.save` (the
+        // pre-transact stamp block) + the schemaless `applyAutoStamps`:
+        //
+        //   - `create`: stamp only on insert (`!isUpdate`) AND only when
+        //     the caller didn't supply a non-nil value AND no value is
+        //     already persisted. (`isUpdate` here is the in-transaction
+        //     insert-vs-update decision `save()` already computed.)
+        //   - `update` / `both`: stamp on every write unless the caller
+        //     supplied an explicit non-nil value on this save.
+        //
+        // The stamp is `Date.now()` — epoch milliseconds as a number,
+        // matching js-bao's `Date.now()` value (a JS number). We fold it
+        // into `newValues` so the rest of the path (merge, dirty-check,
+        // unique-index reconciliation, write) treats it like any caller
+        // field. "Explicit" = the field is present in the caller's
+        // `values`. (Swift's typed `primitiveValues()` omits nil fields
+        // entirely, so an absent key is the analogue of js-bao's
+        // null/undefined — there is no in-dict null sentinel.) A
+        // persisted-from-a-previous-save value is NOT treated as explicit,
+        // so `update` keeps firing on every save.
+        let nowMillis = (Date().timeIntervalSince1970 * 1000).rounded()
+        for (fname, desc) in self.schema.fields {
+            guard let stamp = desc.autoStamp else { continue }
+            // Explicit-wins: caller set this field on this save.
+            if newValues[fname] != nil { continue }
+            switch stamp {
+            case .create:
+                if isUpdate { continue }
+                // Don't overwrite an already-persisted value.
+                if oldData[fname] != nil { continue }
+            case .update, .both:
+                break  // always fire (caller didn't set it, per check above)
+            }
+            newValues[fname] = .number(nowMillis)
+        }
 
         // Merge caller values on top of existing, and fill in
         // schema defaults for anything still missing (only
@@ -1095,6 +1156,26 @@ public final class DynamicModel {
                     )
                 }
             }
+        }
+
+        // Dirty-check short-circuit — mirrors js-bao `BaseModel.save`,
+        // which skips the write entirely when the diff finds no changes
+        // ("No changes detected for ${id}, skipping save"). Only applies
+        // to the update path: a brand-new record is always written (an
+        // insert is, by definition, a change — matching js-bao, whose
+        // diff treats every field of a new record as "added"). For an
+        // existing record we compare the fully-merged target state
+        // (`dataToSave` = old + caller + stamps) against what's already
+        // persisted (`oldData`); if they're identical, nothing changed.
+        //
+        // Composition with auto_stamp: an `update`/`both` stamp was
+        // already folded into `dataToSave` above, so it makes the record
+        // dirty and the write proceeds — exactly as js-bao, where the
+        // pre-transact stamp lands in `_localChanges` before the diff. A
+        // pure no-op update of an `auto_stamp = "create"`-only model
+        // stays clean (create doesn't fire on update) and is skipped.
+        if isUpdate, dataToSave == oldData {
+            return
         }
 
         // Validation passed — now it's safe to materialize the nested

@@ -22,77 +22,76 @@ final class CollectionsTests: XCTestCase {
     }
 
     func testCreateCollection() async throws {
-        let result = try await client.collections.create(params: [
-            "name": "test-collection",
-            "description": "A test collection",
-        ])
-        XCTAssertNotNil(result["collectionId"])
-        XCTAssertEqual(result["name"] as? String, "test-collection")
+        let result = try await client.collections.create(params: CreateCollectionParams(
+            name: "test-collection",
+            description: "A test collection"
+        ))
+        XCTAssertFalse(result.collectionId.isEmpty)
+        XCTAssertEqual(result.name, "test-collection")
     }
 
     func testListCollections() async throws {
-        let _ = try await client.collections.create(params: ["name": "list-test"])
+        let _ = try await client.collections.create(params: CreateCollectionParams(name: "list-test"))
         let result = try await client.collections.list()
-        XCTAssertNotNil(result["items"])
+        XCTAssertFalse(result.items.isEmpty)
     }
 
     func testGetCollection() async throws {
-        let created = try await client.collections.create(params: ["name": "get-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "get-test"))
+        let collectionId = created.collectionId
         let result = try await client.collections.get(collectionId: collectionId)
-        XCTAssertEqual(result["collectionId"] as? String, collectionId)
+        XCTAssertEqual(result.collectionId, collectionId)
     }
 
     func testUpdateCollection() async throws {
-        let created = try await client.collections.create(params: ["name": "update-test"])
-        let collectionId = created["collectionId"] as! String
-        let result = try await client.collections.update(collectionId: collectionId, params: ["name": "updated-name"])
-        XCTAssertEqual(result["name"] as? String, "updated-name")
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "update-test"))
+        let collectionId = created.collectionId
+        let result = try await client.collections.update(collectionId: collectionId, params: UpdateCollectionParams(name: "updated-name"))
+        XCTAssertEqual(result.name, "updated-name")
     }
 
     func testAddDocumentToCollection() async throws {
-        let created = try await client.collections.create(params: ["name": "doc-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "doc-test"))
+        let collectionId = created.collectionId
         let result = try await client.collections.addDocument(collectionId: collectionId, documentId: documentId)
-        XCTAssertNotNil(result["collectionId"])
-        XCTAssertNotNil(result["documentId"])
+        XCTAssertEqual(result.collectionId, collectionId)
+        XCTAssertEqual(result.documentId, documentId)
     }
 
     func testListDocumentsInCollection() async throws {
-        let created = try await client.collections.create(params: ["name": "list-docs-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "list-docs-test"))
+        let collectionId = created.collectionId
         let _ = try await client.collections.addDocument(collectionId: collectionId, documentId: documentId)
         let result = try await client.collections.listDocuments(collectionId: collectionId)
-        let items = result["items"] as? [[String: Any]] ?? []
-        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(result.items.count, 1)
     }
 
     func testRemoveDocumentFromCollection() async throws {
-        let created = try await client.collections.create(params: ["name": "remove-doc-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "remove-doc-test"))
+        let collectionId = created.collectionId
         let _ = try await client.collections.addDocument(collectionId: collectionId, documentId: documentId)
         let result = try await client.collections.removeDocument(collectionId: collectionId, documentId: documentId)
-        XCTAssertEqual(result["success"] as? Bool, true)
+        XCTAssertTrue(result.success)
     }
 
     func testDeleteCollection() async throws {
-        let created = try await client.collections.create(params: ["name": "delete-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "delete-test"))
+        let collectionId = created.collectionId
         let result = try await client.collections.delete(collectionId: collectionId)
-        XCTAssertEqual(result["success"] as? Bool, true)
+        XCTAssertTrue(result.success)
     }
 
     // MARK: - Missing from JS parity
 
     func testListCollectionsForDocument() async throws {
-        let created = try await client.collections.create(params: ["name": "for-doc-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "for-doc-test"))
+        let collectionId = created.collectionId
         let _ = try await client.collections.addDocument(collectionId: collectionId, documentId: documentId)
 
         let result = try await client.collections.listCollectionsForDocument(documentId: documentId)
-        let items = result["items"] as? [[String: Any]] ?? []
+        let items = result.items
         XCTAssertGreaterThanOrEqual(items.count, 1, "Should list at least one collection for the document")
-        let collIds = items.compactMap { $0["collectionId"] as? String }
+        let collIds = items.map { $0.collectionId }
         XCTAssertTrue(collIds.contains(collectionId))
 
         // Cleanup
@@ -108,21 +107,21 @@ final class CollectionsTests: XCTestCase {
             "name": "Developers",
         ])
 
-        let created = try await client.collections.create(params: ["name": "group-perm-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "group-perm-test"))
+        let collectionId = created.collectionId
 
         let grantResult = try await client.collections.grantGroupPermission(
             collectionId: collectionId,
-            params: ["groupType": "team", "groupId": "devs", "permission": "reader"]
+            params: GrantCollectionGroupPermissionParams(groupType: "team", groupId: "devs", permission: "reader")
         )
-        XCTAssertEqual(grantResult["groupType"] as? String, "team")
-        XCTAssertEqual(grantResult["groupId"] as? String, "devs")
-        XCTAssertEqual(grantResult["permission"] as? String, "reader")
+        XCTAssertEqual(grantResult.groupType, "team")
+        XCTAssertEqual(grantResult.groupId, "devs")
+        XCTAssertEqual(grantResult.permission, "reader")
 
         let access = try await client.collections.getAccess(collectionId: collectionId)
-        let groups = access["groups"] as? [[String: Any]] ?? []
+        let groups = access.groups
         XCTAssertEqual(groups.count, 1)
-        XCTAssertEqual(groups.first?["groupType"] as? String, "team")
+        XCTAssertEqual(groups.first?.groupType, "team")
 
         // Cleanup
         let _ = try await client.collections.delete(collectionId: collectionId)
@@ -136,13 +135,13 @@ final class CollectionsTests: XCTestCase {
             "name": "Revoke Developers",
         ])
 
-        let created = try await client.collections.create(params: ["name": "revoke-perm-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "revoke-perm-test"))
+        let collectionId = created.collectionId
 
         // Grant permission
         let _ = try await client.collections.grantGroupPermission(
             collectionId: collectionId,
-            params: ["groupType": "team", "groupId": "revoke-devs", "permission": "reader"]
+            params: GrantCollectionGroupPermissionParams(groupType: "team", groupId: "revoke-devs", permission: "reader")
         )
 
         // Revoke permission
@@ -151,11 +150,11 @@ final class CollectionsTests: XCTestCase {
             groupType: "team",
             groupId: "revoke-devs"
         )
-        XCTAssertEqual(revokeResult["success"] as? Bool, true)
+        XCTAssertTrue(revokeResult.success)
 
         // Verify access is empty
         let access = try await client.collections.getAccess(collectionId: collectionId)
-        let groups = access["groups"] as? [[String: Any]] ?? []
+        let groups = access.groups
         XCTAssertEqual(groups.count, 0, "Groups should be empty after revoke")
 
         // Cleanup
@@ -163,17 +162,21 @@ final class CollectionsTests: XCTestCase {
     }
 
     func testAddAndRemoveMember() async throws {
-        let created = try await client.collections.create(params: ["name": "member-test"])
-        let collectionId = created["collectionId"] as! String
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "member-test"))
+        let collectionId = created.collectionId
         let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member")
 
-        let addResult = try await client.collections.addMember(collectionId: collectionId, params: [
-            "userId": user2.userId,
-            "permission": "reader",
-        ])
-        XCTAssertNotNil(addResult)
+        let addResult = try await client.collections.addMember(
+            collectionId: collectionId,
+            params: .user(user2.userId, permission: .reader)
+        )
+        // user2 is an existing app user, so the add resolves to a direct membership.
+        guard case let .direct(direct) = addResult else {
+            return XCTFail("Expected a direct add for an existing user, got: \(addResult)")
+        }
+        XCTAssertEqual(direct.userId, user2.userId)
 
         let removeResult = try await client.collections.removeMember(collectionId: collectionId, userId: user2.userId)
-        XCTAssertEqual(removeResult["success"] as? Bool, true)
+        XCTAssertTrue(removeResult.success)
     }
 }

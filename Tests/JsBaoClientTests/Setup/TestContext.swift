@@ -187,9 +187,9 @@ final class TestContext {
 
     // MARK: - Workflow Operations
     //
-    // Thin helpers over the admin workflow CRUD used by integration tests
-    // that exercise `runAndApply` / `awaitRun`. Mirrors the JS test
-    // helpers in sample-app/src/pages/Tests.tsx.
+    // Thin helpers over the admin workflow CRUD used by the workflow
+    // integration tests (start / runSync / the apply flow). Mirrors the JS
+    // test helpers in sample-app/src/pages/Tests.tsx.
 
     /// Create a workflow draft, publish a revision, and activate it.
     /// Returns the workflowId. `requiresClientApply` defaults to true so

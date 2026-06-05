@@ -246,6 +246,12 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// ISO-8601 timestamp of the next scheduled background-commit retry.
     /// Mirrors js-bao `LocalMetadataEntry.nextCommitAttemptAt`.
     public var nextCommitAttemptAt: String?
+    /// Opaque create-time metadata blob supplied via
+    /// `documents.create({ metadata })` / `createDocument(metadata:)`.
+    /// Stashed locally so `commitOfflineCreate` can replay it into the
+    /// server POST body instead of dropping it. Mirrors js-bao's
+    /// `LocalMetadataEntry.docMetadata` (#673).
+    public var docMetadata: JSONValue?
 
     public init(
         documentId: String,
@@ -262,7 +268,8 @@ public struct LocalMetadataEntry: Codable, Sendable {
         lastOpenedAt: String? = nil,
         localBytes: Int? = nil,
         commitRetryCount: Int? = nil,
-        nextCommitAttemptAt: String? = nil
+        nextCommitAttemptAt: String? = nil,
+        docMetadata: JSONValue? = nil
     ) {
         self.documentId = documentId
         self.title = title
@@ -279,6 +286,7 @@ public struct LocalMetadataEntry: Codable, Sendable {
         self.localBytes = localBytes
         self.commitRetryCount = commitRetryCount
         self.nextCommitAttemptAt = nextCommitAttemptAt
+        self.docMetadata = docMetadata
     }
 }
 

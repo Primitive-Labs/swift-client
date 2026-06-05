@@ -14,6 +14,10 @@ enum CodegenError: Error, CustomStringConvertible {
     case missingJoinModel(model: String, relationship: String)
     case unknownJoinModel(model: String, relationship: String, joinModel: String)
     case invalidClassName(model: String, reason: String)
+    case invalidAutoStamp(model: String, field: String, value: String)
+    case enumOnNonStringField(model: String, field: String, typeName: String)
+    case malformedEnum(model: String, field: String, reason: String)
+    case unknownKey(context: String, key: String, allowed: [String])
 
     var description: String {
         switch self {
@@ -41,8 +45,36 @@ enum CodegenError: Error, CustomStringConvertible {
             return "Model `\(model)` hasManyThrough relationship `\(relationship)` references undefined join_model `\(joinModel)`"
         case let .invalidClassName(model, reason):
             return "Model `\(model)` class_name: \(reason)"
+        case let .invalidAutoStamp(model, field, value):
+            return "Model `\(model)` field `\(field)` has invalid auto_stamp value `\(value)` — must be one of: create, update, both"
+        case let .enumOnNonStringField(model, field, typeName):
+            return "Model `\(model)` field `\(field)`: `enum` is only valid on a \"string\" field, not \"\(typeName)\""
+        case let .malformedEnum(model, field, reason):
+            return "Model `\(model)` field `\(field)`: `enum` \(reason)"
+        case let .unknownKey(context, key, allowed):
+            return "\(context): unknown key `\(key)`. Allowed: \(allowed.joined(separator: ", "))"
         }
     }
+}
+
+/// Allowed-key sets for strict validation. Mirror js-bao's
+/// `tomlLoader.ts` (`KNOWN_*` sets) verbatim so a TOML the JS loader
+/// rejects in strict mode is rejected here too, and vice versa.
+private enum KnownKeys {
+    static let model: Set<String> = [
+        "fields", "relationships", "unique_constraints", "class_name",
+    ]
+    static let field: Set<String> = [
+        "type", "indexed", "unique", "required", "auto_assign",
+        "auto_stamp", "max_length", "max_count", "default", "enum",
+    ]
+    static let relationship: Set<String> = [
+        "type", "model", "related_id_field", "join_model",
+        "join_model_local_field", "join_model_related_field",
+        "order_by_field", "order_direction",
+        "join_model_order_by_field", "join_model_order_direction",
+    ]
+    static let uniqueConstraint: Set<String> = ["name", "fields"]
 }
 
 /// Parse a TOML schema into the codegen IR. Validation rules mirror
@@ -52,7 +84,18 @@ enum CodegenError: Error, CustomStringConvertible {
 /// runtime, and vice versa).
 enum TomlParser {
 
-    static func parse(tomlString: String, swiftNameSuffix: String) throws -> [ParsedSchema] {
+    /// When `strict` is true (the default, mirroring js-bao's
+    /// `loadSchemaFromTomlString` strict mode), unknown keys at the
+    /// model / field / relationship / unique-constraint level raise a
+    /// `CodegenError.unknownKey` instead of being silently dropped — so
+    /// a typo'd key (`requierd = true`) fails loud at codegen time
+    /// rather than producing a subtly-wrong model. Pass `strict: false`
+    /// (the `--no-strict` CLI flag) for the legacy lenient behavior.
+    static func parse(
+        tomlString: String,
+        swiftNameSuffix: String,
+        strict: Bool = true
+    ) throws -> [ParsedSchema] {
         let table: TOMLTable
         do {
             table = try TOMLTable(string: tomlString)
@@ -77,8 +120,16 @@ enum TomlParser {
         var modelOrder: [String] = []
         for key in modelsTable.keys {
             guard let model = modelsTable[key]?.table else { continue }
+            // Reject unknown top-level model keys before building (so a
+            // misspelled `feilds`/`relationship` surfaces with the model
+            // named, not as a silently-missing section).
+            try checkUnknownKeys(
+                model, allowed: KnownKeys.model,
+                context: "Model `\(key)`", strict: strict
+            )
             var schema = try buildSchema(
-                name: key, table: model, swiftNameSuffix: swiftNameSuffix
+                name: key, table: model,
+                swiftNameSuffix: swiftNameSuffix, strict: strict
             )
             // TOMLKit hands keys back alphabetically, which is fine for
             // every internal use (lookups go through a dictionary) but
@@ -106,7 +157,8 @@ enum TomlParser {
                 schema.relationships = try buildRelationships(
                     modelName: key,
                     relsTable: relsTable,
-                    knownModels: Set(schemasByName.keys)
+                    knownModels: Set(schemasByName.keys),
+                    strict: strict
                 )
                 schemasByName[key] = schema
             }
@@ -115,16 +167,40 @@ enum TomlParser {
         return modelOrder.compactMap { schemasByName[$0] }
     }
 
+    // MARK: - Strict unknown-key validation
+
+    /// Raise `CodegenError.unknownKey` for any key in `table` that isn't
+    /// in `allowed`, when `strict`. No-op when `strict` is false. Mirrors
+    /// js-bao `tomlLoader.checkUnknownKeys`. The `allowed` list is sorted
+    /// in the error message for a deterministic, scan-friendly hint.
+    private static func checkUnknownKeys(
+        _ table: TOMLTable,
+        allowed: Set<String>,
+        context: String,
+        strict: Bool
+    ) throws {
+        guard strict else { return }
+        for key in table.keys where !allowed.contains(key) {
+            throw CodegenError.unknownKey(
+                context: context, key: key, allowed: allowed.sorted()
+            )
+        }
+    }
+
     // MARK: - Per-model
 
     private static func buildSchema(
         name: String,
         table: TOMLTable,
-        swiftNameSuffix: String
+        swiftNameSuffix: String,
+        strict: Bool
     ) throws -> ParsedSchema {
-        let (fieldOrder, fields) = try buildFields(modelName: name, table: table)
+        let (fieldOrder, fields) = try buildFields(
+            modelName: name, table: table, strict: strict
+        )
         let constraints = try buildUniqueConstraints(
-            modelName: name, table: table, fieldNames: Set(fields.keys)
+            modelName: name, table: table, fieldNames: Set(fields.keys),
+            strict: strict
         )
         let swiftName = try resolveSwiftName(
             modelName: name, table: table, suffix: swiftNameSuffix
@@ -252,7 +328,8 @@ enum TomlParser {
 
     private static func buildFields(
         modelName: String,
-        table: TOMLTable
+        table: TOMLTable,
+        strict: Bool
     ) throws -> ([String], [String: ParsedField]) {
         guard let fieldsTable = table["fields"]?.table else { return ([], [:]) }
         var order: [String] = []
@@ -260,7 +337,8 @@ enum TomlParser {
         for fieldName in fieldsTable.keys {
             guard let field = fieldsTable[fieldName]?.table else { continue }
             out[fieldName] = try buildField(
-                modelName: modelName, fieldName: fieldName, table: field
+                modelName: modelName, fieldName: fieldName,
+                table: field, strict: strict
             )
             order.append(fieldName)
         }
@@ -270,8 +348,12 @@ enum TomlParser {
     private static func buildField(
         modelName: String,
         fieldName: String,
-        table: TOMLTable
+        table: TOMLTable,
+        strict: Bool
     ) throws -> ParsedField {
+        // js-bao validates the field type FIRST (before the unknown-key
+        // sweep) — match that order so the error a malformed field
+        // surfaces is identical across runtimes.
         guard let typeLiteral = table["type"]?.string else {
             throw CodegenError.missingFieldType(model: modelName, field: fieldName)
         }
@@ -280,6 +362,18 @@ enum TomlParser {
                 model: modelName, field: fieldName, typeName: typeLiteral
             )
         }
+        try checkUnknownKeys(
+            table, allowed: KnownKeys.field,
+            context: "Model `\(modelName)` field `\(fieldName)`",
+            strict: strict
+        )
+        let autoStamp = try decodeAutoStamp(
+            table["auto_stamp"], modelName: modelName, fieldName: fieldName
+        )
+        let enumValues = try decodeEnum(
+            table["enum"], fieldType: type,
+            modelName: modelName, fieldName: fieldName
+        )
         return ParsedField(
             type: type,
             indexed: table["indexed"]?.bool ?? false,
@@ -288,8 +382,73 @@ enum TomlParser {
             autoAssign: table["auto_assign"]?.bool ?? false,
             maxLength: table["max_length"]?.int,
             maxCount: table["max_count"]?.int,
-            defaultLiteral: decodeDefault(table["default"])
+            defaultLiteral: decodeDefault(table["default"]),
+            enumValues: enumValues,
+            autoStamp: autoStamp
         )
+    }
+
+    /// Parse `auto_stamp = "create" | "update" | "both"`. Fail-fast on any
+    /// other value — mirrors js-bao `tomlLoader.ts` (`VALID_AUTO_STAMP_VALUES`),
+    /// so a value the JS codegen rejects is rejected here too rather than
+    /// silently dropped.
+    private static func decodeAutoStamp(
+        _ value: TOMLValue?,
+        modelName: String,
+        fieldName: String
+    ) throws -> ParsedAutoStamp? {
+        guard let value else { return nil }
+        guard let s = value.string, let stamp = ParsedAutoStamp(rawValue: s) else {
+            throw CodegenError.invalidAutoStamp(
+                model: modelName,
+                field: fieldName,
+                value: value.string ?? String(describing: value)
+            )
+        }
+        return stamp
+    }
+
+    /// Parse `enum = ["a","b","c"]`. Validated unconditionally and
+    /// fail-fast — a malformed `enum` must NOT silently fall back to a bare
+    /// `String`, because the author's intent was an exhaustive value set.
+    /// Mirrors js-bao `tomlLoader.ts` `parseFieldOptions` (#843): only valid
+    /// on a `string` field, non-empty, all values strings. Source order is
+    /// preserved.
+    private static func decodeEnum(
+        _ value: TOMLValue?,
+        fieldType: ParsedFieldType,
+        modelName: String,
+        fieldName: String
+    ) throws -> [String]? {
+        guard let value else { return nil }
+        guard fieldType == .string else {
+            throw CodegenError.enumOnNonStringField(
+                model: modelName, field: fieldName, typeName: fieldType.rawValue
+            )
+        }
+        guard let arr = value.array else {
+            throw CodegenError.malformedEnum(
+                model: modelName, field: fieldName,
+                reason: "must be a non-empty array of strings"
+            )
+        }
+        guard arr.count > 0 else {
+            throw CodegenError.malformedEnum(
+                model: modelName, field: fieldName,
+                reason: "must be a non-empty array of strings"
+            )
+        }
+        var out: [String] = []
+        for i in 0..<arr.count {
+            guard let s = arr[i].string else {
+                throw CodegenError.malformedEnum(
+                    model: modelName, field: fieldName,
+                    reason: "values must all be strings"
+                )
+            }
+            out.append(s)
+        }
+        return out
     }
 
     private static func decodeDefault(_ value: TOMLValue?) -> ParsedDefault? {
@@ -306,12 +465,18 @@ enum TomlParser {
     private static func buildUniqueConstraints(
         modelName: String,
         table: TOMLTable,
-        fieldNames: Set<String>
+        fieldNames: Set<String>,
+        strict: Bool
     ) throws -> [ParsedUniqueConstraint] {
         guard let arr = table["unique_constraints"]?.array else { return [] }
         var out: [ParsedUniqueConstraint] = []
         for idx in 0..<arr.count {
             guard let entry = arr[idx].table else { continue }
+            try checkUnknownKeys(
+                entry, allowed: KnownKeys.uniqueConstraint,
+                context: "Model `\(modelName)` unique_constraints[\(idx)]",
+                strict: strict
+            )
             guard let name = entry["name"]?.string else {
                 throw CodegenError.malformedUniqueConstraint(
                     model: modelName, index: idx, reason: "missing `name`"
@@ -347,7 +512,8 @@ enum TomlParser {
     private static func buildRelationships(
         modelName: String,
         relsTable: TOMLTable,
-        knownModels: Set<String>
+        knownModels: Set<String>,
+        strict: Bool
     ) throws -> [(name: String, descriptor: ParsedRelationship)] {
         var out: [(String, ParsedRelationship)] = []
         for relName in relsTable.keys {
@@ -358,7 +524,8 @@ enum TomlParser {
                     modelName: modelName,
                     relName: relName,
                     table: rel,
-                    knownModels: knownModels
+                    knownModels: knownModels,
+                    strict: strict
                 )
             ))
         }
@@ -369,8 +536,14 @@ enum TomlParser {
         modelName: String,
         relName: String,
         table: TOMLTable,
-        knownModels: Set<String>
+        knownModels: Set<String>,
+        strict: Bool
     ) throws -> ParsedRelationship {
+        try checkUnknownKeys(
+            table, allowed: KnownKeys.relationship,
+            context: "Model `\(modelName)` relationship `\(relName)`",
+            strict: strict
+        )
         guard let typeLiteral = table["type"]?.string else {
             throw CodegenError.missingRelationshipType(model: modelName, relationship: relName)
         }

@@ -45,8 +45,54 @@ final class ApiParityRound2Tests: XCTestCase {
         _ = try await api.ownedDocuments()
         XCTAssertEqual(r.path, "/me/owned-documents")
 
+        // JS query order: includeRoot, limit, cursor, tag, forward.
         _ = try await api.ownedDocuments(cursor: "next", limit: 10)
-        XCTAssertEqual(r.path, "/me/owned-documents?cursor=next&limit=10")
+        XCTAssertEqual(r.path, "/me/owned-documents?limit=10&cursor=next")
+    }
+
+    /// The widened option set (issue #628 parity): `includeRoot` and
+    /// `forward` thread into the query string in JS order, while `localOnly`
+    /// / `refreshFromServer == false` short-circuit to the local cache (no
+    /// server call). Mirrors js-bao `_listImpl`.
+    func test_me_ownedDocuments_optionsThreadIntoQS() async throws {
+        let r = CallRecorder()
+        let api = MeAPI(makeRequest: r.make)
+
+        _ = try await api.ownedDocuments(
+            cursor: "c1",
+            limit: 5,
+            tag: "starred",
+            options: MeOwnedDocumentsOptions(includeRoot: true, forward: true)
+        )
+        XCTAssertEqual(
+            r.path,
+            "/me/owned-documents?includeRoot=true&limit=5&cursor=c1&tag=starred&forward=true"
+        )
+    }
+
+    /// `localOnly` (and `refreshFromServer: false`) must NOT hit the network.
+    func test_me_ownedDocuments_localOnlySkipsServer() async throws {
+        let r = CallRecorder()
+        r.path = nil
+        let api = MeAPI(makeRequest: r.make)
+
+        _ = try await api.ownedDocuments(options: MeOwnedDocumentsOptions(localOnly: true))
+        XCTAssertNil(r.path, "localOnly must not issue a server request")
+
+        _ = try await api.ownedDocuments(options: MeOwnedDocumentsOptions(refreshFromServer: false))
+        XCTAssertNil(r.path, "refreshFromServer: false must not issue a server request")
+    }
+
+    /// `ownedDocumentsPage` returns the `{ items, cursor }` envelope, mirroring
+    /// JS's `ownedDocuments({ returnPage: true })` overload.
+    func test_me_ownedDocumentsPage_returnsCursor() async throws {
+        let r = CallRecorder()
+        r.response = ["items": [["documentId": "d1"]], "cursor": "next-page"]
+        let api = MeAPI(makeRequest: r.make)
+
+        let page = try await api.ownedDocumentsPage(limit: 1)
+        XCTAssertEqual(page.cursor, "next-page")
+        XCTAssertEqual(page.items.map { $0.documentId }, ["d1"])
     }
 
     // MARK: - DocumentsAPI getOrCreateWithAlias
@@ -60,10 +106,17 @@ final class ApiParityRound2Tests: XCTestCase {
                 uploadConcurrency: 1
             )
         )
+        r.response = [
+            "documentId": "doc1",
+            "created": true,
+            "alias": ["aliasKey": "notes", "scope": "app", "documentId": "doc1"],
+        ]
         _ = try await api.getOrCreateWithAlias(
-            alias: ["scope": "app", "aliasKey": "notes"],
-            title: "Notes",
-            tags: ["pinned"]
+            options: GetOrCreateWithAliasOptions(
+                alias: AliasRef(scope: .app, aliasKey: "notes"),
+                title: "Notes",
+                tags: ["pinned"]
+            )
         )
         XCTAssertEqual(r.method, "POST")
         XCTAssertEqual(r.path, "/documents/get-or-create-with-alias")
@@ -75,7 +128,62 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(body?["tags"] as? [String], ["pinned"])
     }
 
-    func test_documents_getOrCreateWithAlias_rejectsBadScope() async {
+    func test_documents_getOrCreateWithAlias_serializesUserScope() async throws {
+        // The typed `DocumentAliasScope` enum makes "bad scope" values
+        // (e.g. the JS test's `"bogus"`) unrepresentable at compile time —
+        // the type system now enforces what this test used to assert at
+        // runtime. We instead pin that the `.user` scope is serialized
+        // correctly onto the wire.
+        let r = CallRecorder()
+        let api = DocumentsAPI(
+            makeRequest: r.make,
+            blobManager: BlobManager(
+                logger: createLogger(level: .error, scope: "test"),
+                uploadConcurrency: 1
+            )
+        )
+        r.response = [
+            "documentId": "doc1",
+            "created": true,
+            "alias": ["aliasKey": "x", "scope": "user", "documentId": "doc1"],
+        ]
+        _ = try await api.getOrCreateWithAlias(
+            options: GetOrCreateWithAliasOptions(
+                alias: AliasRef(scope: .user, aliasKey: "x")
+            )
+        )
+        let alias = (r.body as? [String: Any])?["alias"] as? [String: Any]
+        XCTAssertEqual(alias?["scope"] as? String, "user")
+        XCTAssertEqual(alias?["aliasKey"] as? String, "x")
+    }
+
+    func test_documents_getOrCreateWithAlias_forwardsAliasKey() async throws {
+        // The typed Swift surface forwards a non-empty `aliasKey` verbatim.
+        let r = CallRecorder()
+        let api = DocumentsAPI(
+            makeRequest: r.make,
+            blobManager: BlobManager(
+                logger: createLogger(level: .error, scope: "test"),
+                uploadConcurrency: 1
+            )
+        )
+        r.response = [
+            "documentId": "doc1",
+            "created": true,
+            "alias": ["aliasKey": "notes", "scope": "app", "documentId": "doc1"],
+        ]
+        _ = try await api.getOrCreateWithAlias(
+            options: GetOrCreateWithAliasOptions(
+                alias: AliasRef(scope: .app, aliasKey: "notes")
+            )
+        )
+        let alias = (r.body as? [String: Any])?["alias"] as? [String: Any]
+        XCTAssertEqual(alias?["aliasKey"] as? String, "notes")
+    }
+
+    func test_documents_getOrCreateWithAlias_requiresAliasKey() async {
+        // Parity with JS (`documentsApi.ts:583-584`): an empty `aliasKey`
+        // throws client-side before any request is made.
         let r = CallRecorder()
         let api = DocumentsAPI(
             makeRequest: r.make,
@@ -86,17 +194,21 @@ final class ApiParityRound2Tests: XCTestCase {
         )
         do {
             _ = try await api.getOrCreateWithAlias(
-                alias: ["scope": "bogus", "aliasKey": "x"]
+                options: GetOrCreateWithAliasOptions(
+                    alias: AliasRef(scope: .app, aliasKey: "")
+                )
             )
-            XCTFail("expected throw on bad scope")
+            XCTFail("expected an error for empty aliasKey")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .invalidArgument)
+            XCTAssertNil(r.method, "no request should be sent when aliasKey is empty")
         } catch {
             XCTFail("expected JsBaoError, got \(error)")
         }
     }
 
-    func test_documents_getOrCreateWithAlias_requiresAliasKey() async {
+    func test_documents_createWithAlias_requiresAliasKey() async {
+        // Parity with JS (`documentsApi.ts:532-533`).
         let r = CallRecorder()
         let api = DocumentsAPI(
             makeRequest: r.make,
@@ -106,12 +218,16 @@ final class ApiParityRound2Tests: XCTestCase {
             )
         )
         do {
-            _ = try await api.getOrCreateWithAlias(
-                alias: ["scope": "app", "aliasKey": ""]
+            _ = try await api.createWithAlias(
+                options: CreateWithAliasOptions(
+                    title: "Notes",
+                    alias: AliasRef(scope: .app, aliasKey: "")
+                )
             )
-            XCTFail("expected throw on empty aliasKey")
+            XCTFail("expected an error for empty aliasKey")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .invalidArgument)
+            XCTAssertNil(r.method, "no request should be sent when aliasKey is empty")
         } catch {
             XCTFail("expected JsBaoError, got \(error)")
         }
@@ -122,6 +238,7 @@ final class ApiParityRound2Tests: XCTestCase {
     func test_collections_listAll_GET() async throws {
         let r = CallRecorder()
         let api = CollectionsAPI(makeRequest: r.make)
+        r.response = ["items": [[String: Any]]()]
         _ = try await api.listAll()
         XCTAssertEqual(r.method, "GET")
         XCTAssertEqual(r.path, "/admin/collections")
@@ -133,11 +250,18 @@ final class ApiParityRound2Tests: XCTestCase {
     func test_collections_listPendingInvitations_unwrapsItems() async throws {
         let r = CallRecorder()
         let api = CollectionsAPI(makeRequest: r.make)
-        r.response = ["items": [["invitationId": "i1"], ["invitationId": "i2"]]]
+        func invitationJSON(_ id: String) -> [String: Any] {
+            [
+                "email": "\(id)@example.com", "permission": "reader",
+                "invitationId": id, "createdAt": "2024-01-01T00:00:00Z",
+                "expiresAt": "2024-01-08T00:00:00Z",
+            ]
+        }
+        r.response = ["items": [invitationJSON("i1"), invitationJSON("i2")]]
         let invitations = try await api.listPendingInvitations(collectionId: "c1")
         XCTAssertEqual(r.path, "/collections/c1/pending-invitations")
         XCTAssertEqual(invitations.count, 2)
-        XCTAssertEqual(invitations.first?["invitationId"] as? String, "i1")
+        XCTAssertEqual(invitations.first?.invitationId, "i1")
     }
 
     // MARK: - GroupsAPI new list helpers
@@ -154,7 +278,13 @@ final class ApiParityRound2Tests: XCTestCase {
     func test_groups_listPendingInvitations_unwrapsItems() async throws {
         let r = CallRecorder()
         let api = GroupsAPI(makeRequest: r.make)
-        r.response = ["items": [["invitationId": "i1"]]]
+        r.response = ["items": [[
+            "invitationId": "i1",
+            "email": "i1@example.com",
+            "role": "member",
+            "createdAt": "2024-01-01T00:00:00Z",
+            "expiresAt": "2024-01-08T00:00:00Z",
+        ]]]
         let invitations = try await api.listPendingInvitations(
             groupType: "team", groupId: "g1"
         )

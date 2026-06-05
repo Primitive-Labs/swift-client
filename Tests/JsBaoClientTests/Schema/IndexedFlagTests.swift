@@ -87,42 +87,4 @@ final class IndexedFlagTests: XCTestCase {
         )
     }
 
-    /// Regression: the legacy `BaoModel<T>` path is unchanged — it
-    /// still blanket-indexes every non-id column (existing callers
-    /// depend on this). Verifies we didn't leak the new stricter
-    /// behavior into the legacy layer.
-    func testLegacyBaoModelStillBlanketIndexes() {
-        struct LegacyTask: BaoModelRecord {
-            static let modelName = "legacy_indexed_tasks"
-            static let fields: [FieldDefinition] = [
-                FieldDefinition("id", .string),
-                FieldDefinition("title", .string),
-                FieldDefinition("priority", .number),
-            ]
-            let id: String
-            let title: String
-            let priority: Double
-            init(id: String, title: String, priority: Double) {
-                self.id = id; self.title = title; self.priority = priority
-            }
-            init(fields: [String: Any]) {
-                self.id = fields["id"] as? String ?? ""
-                self.title = fields["title"] as? String ?? ""
-                self.priority = fields["priority"] as? Double ?? 0
-            }
-            func toFields() -> [String: Any] {
-                return ["id": id, "title": title, "priority": priority]
-            }
-        }
-
-        let doc = YDocument()
-        let model = BaoModel<LegacyTask>(doc: doc)
-        _ = model.query()
-
-        let indexes = userCreatedIndexes(in: model.queryEngineInternal,
-                                          table: "legacy_indexed_tasks")
-        XCTAssertTrue(indexes.contains("idx_legacy_indexed_tasks_title"),
-                      "Legacy BaoModel must keep blanket-indexing every field")
-        XCTAssertTrue(indexes.contains("idx_legacy_indexed_tasks_priority"))
-    }
 }

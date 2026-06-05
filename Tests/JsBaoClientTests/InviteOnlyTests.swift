@@ -35,8 +35,19 @@ final class InviteOnlyTests: XCTestCase {
         try await client.connect()
         try await waitForConnection(client: client)
 
-        let result = try await client.documents.create(options: ["title": "Invite-Only Doc"])
-        XCTAssertNotNil(result["documentId"])
+        // The invite-only app owner CAN create a document. We use the
+        // local-first `createDocument`, which returns a freshly-minted
+        // documentId synchronously and throws on failure — a non-empty id is
+        // the success signal. We deliberately avoid `documents.list()`
+        // visibility, which is racy for a just-created local-first doc.
+        let (documentId, doc) = try await client.createDocument(
+            options: CreateDocumentOptions(title: "Invite-Only Doc")
+        )
+        XCTAssertFalse(
+            documentId.isEmpty,
+            "Invite-only app owner should be able to create a document"
+        )
+        XCTAssertNotNil(doc)
     }
 
     func testInviteOnlyMemberCanOpenSharedDocument() async throws {

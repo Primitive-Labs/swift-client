@@ -300,13 +300,13 @@ func cmdSeed(
         guard modelName == "tasks" else {
             emitError("typed mode only supports model='tasks'; use mode='dynamic' for other models")
         }
-        let model = TypedModel<TaskRecord>(doc: doc)
+        let model = DynamicModel(doc: doc, schema: schemaForModel("tasks"))
         for r in records {
             guard let id = r["id"] as? String else {
                 emitError("seed record missing id: \(r)")
             }
             do {
-                try model.dynamic.create(id: id, values: recordToValues(r))
+                try model.create(id: id, values: recordToValues(r))
             } catch {
                 emitError("seed create failed for id=\(id): \(error)")
             }
@@ -345,43 +345,16 @@ func cmdQuery(
         guard modelName == "tasks" else {
             emitError("typed mode only supports model='tasks'; use mode='dynamic'")
         }
-        let model = TypedModel<TaskRecord>(doc: doc)
-
-        // Two paths through the typed API:
-        //
-        //   (a) The non-paginated case (no `limit`, no `cursor`) is
-        //       what the user-facing typed query looks like — one
-        //       call returns `[TaskRecord]` already hydrated. This is
-        //       the closest Swift analog to JS's
-        //       `await TaskRecord.query(filter)` and is what we want
-        //       readers of this CLI to see when comparing the two
-        //       languages' code samples.
-        //
-        //   (b) The paginated case has to fall through to
-        //       `model.dynamic.queryPaged(...)` because
-        //       `TypedModel<T>.query` doesn't currently expose the
-        //       `nextCursor` from the paged result — it returns
-        //       `[T]`, dropping the cursor on the floor. The cursor
-        //       pagination test (`testCursorPaginationAgreesAcrossLanguages`)
-        //       relies on `nextCursor` being round-tripped, so we
-        //       drop down for that flow only. If/when `TypedModel`
-        //       grows a `queryPaged(...) -> (data: [T], nextCursor: String?)`
-        //       overload, this branch can collapse into the (a) path.
-        let isPaginated = limit != nil || cursor != nil
-        if !isPaginated {
-            // (a) user-facing typed query — JS-parity ergonomic.
-            let results: [TaskRecord] = model.query(filter, options: opts)
-            emitPage(rows: results.map(taskToJson), nextCursor: nil)
-        } else {
-            // (b) cursor/limit pagination — drop to dynamic + cast.
-            do {
-                let page = try model.dynamic.queryPaged(filter, options: opts)
-                let results = page.data.compactMap(TaskRecord.init(row:))
-                emitPage(rows: results.map(taskToJson),
-                         nextCursor: page.nextCursor)
-            } catch {
-                emitError("queryPaged failed: \(error)")
-            }
+        // Typed output (`[TaskRecord]`) hydrated from the runtime engine via
+        // the codegen'd `TaskRecord(row:)` — the same rows the dynamic mode
+        // returns, just mapped to the typed struct for the parity comparison.
+        let dyn = DynamicModel(doc: doc, schema: schemaForModel("tasks"))
+        do {
+            let page = try dyn.queryPaged(filter, options: opts)
+            let results = page.data.compactMap(TaskRecord.init(row:))
+            emitPage(rows: results.map(taskToJson), nextCursor: page.nextCursor)
+        } catch {
+            emitError("queryPaged failed: \(error)")
         }
     }
 }
@@ -409,8 +382,8 @@ func cmdFind(docB64: String, id: String, mode: String, model modelName: String) 
         guard modelName == "tasks" else {
             emitError("typed mode only supports model='tasks'; use mode='dynamic'")
         }
-        let model = TypedModel<TaskRecord>(doc: doc)
-        if let r = model.find(id: id) {
+        let dyn = DynamicModel(doc: doc, schema: schemaForModel("tasks"))
+        if let rec = dyn.find(id: id), let r = TaskRecord(record: rec) {
             emit(["record": taskToJson(r)])
         } else {
             emit(["record": NSNull()])

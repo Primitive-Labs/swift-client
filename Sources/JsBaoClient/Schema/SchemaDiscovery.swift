@@ -117,6 +117,11 @@ public enum SchemaDiscovery {
             defaultValue = decodeDefault(raw)
         }
 
+        // Auto-stamp policy round-trips through `_meta` as a string —
+        // mirrors js-bao `metaSync.ts`. Unknown values decode to `nil`.
+        let autoStamp = decodeString(fieldMap.value(tx: tx, key: "autoStamp"))
+            .flatMap(AutoStamp.init(rawValue:))
+
         return FieldDescriptor(
             type: type,
             indexed: indexed,
@@ -125,7 +130,8 @@ public enum SchemaDiscovery {
             autoAssign: autoAssign,
             maxLength: maxLength,
             maxCount: maxCount,
-            default: defaultValue
+            default: defaultValue,
+            autoStamp: autoStamp
         )
     }
 

@@ -26,13 +26,8 @@ final class UserTests: XCTestCase {
 
         let result = try await client.users.getBasic(userId: userId)
 
-        XCTAssertFalse(result.isEmpty, "Expected non-empty user info")
-
         // Should have at least userId
-        let returnedUserId = result["userId"] as? String
-            ?? result["user_id"] as? String
-            ?? (result["user"] as? [String: Any])?["userId"] as? String
-
-        XCTAssertNotNil(returnedUserId, "Expected userId in user info response: \(result.keys)")
+        XCTAssertFalse(result.userId.isEmpty, "Expected userId in user info response: \(result)")
+        XCTAssertEqual(result.userId, userId, "Returned userId should match the requested one")
     }
 }

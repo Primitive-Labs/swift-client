@@ -26,9 +26,7 @@ final class RootDocTests: XCTestCase {
         do {
             let result = try await client.documents.getRoot()
             // If it exists, it should have a documentId
-            if let docId = result["documentId"] as? String {
-                XCTAssertFalse(docId.isEmpty)
-            }
+            XCTAssertFalse(result.documentId.isEmpty)
         } catch {
             // Root doc not configured is acceptable
             let msg = String(describing: error)
@@ -55,12 +53,13 @@ final class RootDocTests: XCTestCase {
                        "getRootDocId() must mirror the JWT payload's rootDocId")
     }
 
-    @available(*, deprecated, message: "exercises deprecated documents.list intentionally")
     func testListFiltersRootByDefault() async throws {
-        // #848: documents.list() defaults to includeRoot=false. We
-        // assert the filtering contract directly — the items returned
-        // with includeRoot:false are exactly the includeRoot:true set
-        // minus any entry whose documentId equals the JWT's rootDocId.
+        // #848: the root doc is excluded from the default owned-documents
+        // listing, but getRoot() still resolves it. This calls
+        // `me.ownedDocuments()` with no `includeRoot` option (the default),
+        // so we assert the faithful surviving contract: the root doc is
+        // filtered out of the default listing, yet getRoot() resolves it
+        // directly. (`includeRoot: true` would surface it, like JS.)
         guard let root = try await client.getRootDocId() else {
             return XCTFail("Test JWT must include rootDocId for this test")
         }
@@ -70,21 +69,29 @@ final class RootDocTests: XCTestCase {
         // a server-side resolve that warms the permission row).
         _ = try? await client.documents.getRoot()
 
-        let withRoot = try await client.documents.list(includeRoot: true)
-        let withRootItems = (withRoot["items"] ?? withRoot["documents"]) as? [[String: Any]] ?? []
-        let withoutRoot = try await client.documents.list()
-        let withoutRootItems = (withoutRoot["items"] ?? withoutRoot["documents"]) as? [[String: Any]] ?? []
-
-        let expectedAfterFilter = withRootItems.filter { ($0["documentId"] as? String) != root }
-        XCTAssertEqual(
-            withoutRootItems.count,
-            expectedAfterFilter.count,
-            "includeRoot:false should drop exactly the root doc"
-        )
+        let owned = try await client.me.ownedDocuments()
         XCTAssertFalse(
-            withoutRootItems.contains { ($0["documentId"] as? String) == root },
-            "Root doc \(root) must be filtered when includeRoot is false"
+            owned.contains { $0.documentId == root },
+            "root doc must be filtered from the default owned-documents listing"
         )
+
+        // getRoot() resolves the root doc directly even though it's absent
+        // from the default listing. The root doc may not be materialized in
+        // every test app (see testGetRootDocument), so a 404 is acceptable —
+        // but when it does resolve, it must be the JWT's rootDocId.
+        do {
+            let resolvedRoot = try await client.documents.getRoot()
+            XCTAssertEqual(
+                resolvedRoot.documentId, root,
+                "getRoot() must resolve the JWT's rootDocId"
+            )
+        } catch {
+            let msg = String(describing: error)
+            XCTAssertTrue(
+                msg.contains("404") || msg.contains("not found") || msg.contains("null"),
+                "Unexpected getRoot() error: \(msg)"
+            )
+        }
     }
 
     func testIsRootDocumentMatchesJwt() async throws {

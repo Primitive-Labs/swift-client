@@ -2,7 +2,8 @@ import PackagePlugin
 import Foundation
 
 /// SwiftPM build tool plugin: scans the consuming target's source files
-/// for `*schema.toml` files and runs `swift-bao-codegen` against each.
+/// for `*schema.toml` files (and the JS-canonical `models.toml`, #944) and
+/// runs `swift-bao-codegen` against each.
 /// Output Swift files land in the plugin's per-target work directory and
 /// are appended to the target's source list automatically by SwiftPM.
 ///
@@ -16,9 +17,11 @@ import Foundation
 /// ```
 ///
 /// Selection rule: any source file whose name ends in `schema.toml` (case
-/// sensitive) is treated as input. The narrow rule keeps unrelated TOML
-/// files in the target (e.g. tool configs) from accidentally getting
-/// codegen'd. Need to use a different filename? Pass `--input` directly
+/// sensitive), or is exactly `models.toml`, is treated as input. The
+/// narrow rule keeps unrelated TOML files in the target (e.g. tool
+/// configs) from accidentally getting codegen'd, while `models.toml`
+/// matches js-bao's `js-bao-codegen-v2` input so one shared file feeds
+/// both runtimes (#944). Need to use a different filename? Pass `--input`
 /// via a custom plugin or a build-phase script — the plugin is meant for
 /// the common case.
 ///
@@ -47,9 +50,17 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         let tool = try context.tool(named: "SwiftBaoCodegen")
         let outputDir = context.pluginWorkDirectory.appending("GeneratedModels")
 
-        // Find every `schema.toml` (or `*schema.toml`) in the target.
+        // Find every `*schema.toml` in the target, plus the bare
+        // `models.toml` filename js-bao's codegen reads (#944) — so a
+        // single `models.toml` drives both the JS and Swift generators
+        // without renaming. The `hasSuffix("schema.toml")` rule still
+        // accepts `models.schema.toml`, `app.schema.toml`, etc.; the
+        // explicit `models.toml` match adds the JS-canonical name.
         let inputs = target.sourceFiles
-            .filter { $0.path.lastComponent.hasSuffix("schema.toml") }
+            .filter {
+                let name = $0.path.lastComponent
+                return name.hasSuffix("schema.toml") || name == "models.toml"
+            }
             .map { $0.path }
 
         guard !inputs.isEmpty else { return [] }
@@ -138,10 +149,16 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
 
         // Resolve filenames in the same order the codegen tool emits.
         let suffix = "Record"
-        return modelOrder.map { name in
+        var files = modelOrder.map { name -> String in
             let swiftName = classNameByModel[name] ?? (pascalCase(name) + suffix)
             return "\(swiftName).swift"
         }
+        // The tool always emits a registration barrel alongside the
+        // per-model files (`GeneratedModels.all` + `register(on:)`).
+        // Declare it as an output so SwiftPM picks it up — keep this
+        // literal in sync with `SwiftEmitter.barrelFileName`.
+        files.append("GeneratedModels.swift")
+        return files
     }
 
     /// Match `class_name = "Foo"` (single- or double-quoted, with optional

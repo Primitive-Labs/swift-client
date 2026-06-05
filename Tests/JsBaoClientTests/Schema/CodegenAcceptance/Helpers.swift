@@ -33,8 +33,8 @@ func displayTitle(_ record: CrashTestRecord) -> String {
 func placeholderCrashTestRecord(named name: String) -> CrashTestRecord {
     CrashTestRecord(
         id: "placeholder-\(name)",
-        boundedName: name,
-        requiredTags: ["placeholder"]
+        requiredTags: ["placeholder"],
+        boundedName: name
     )
 }
 

@@ -13,60 +13,67 @@ public final class CollectionTypeConfigsAPI: @unchecked Sendable {
         self.makeRequest = makeRequest
     }
 
+    /// Percent-encode a `collectionType` for use as a path segment.
+    ///
+    /// Throws `invalidArgument` instead of silently falling back to the raw,
+    /// unescaped value — the previous `?? collectionType` fallback could emit a
+    /// request path divergent from JS's `encodeURIComponent` for unusual tags
+    /// (#596). `.urlPathAllowed` is the consistent spec across all three path
+    /// builders here.
+    private static func encodePathSegment(_ collectionType: String) throws -> String {
+        guard let escaped = collectionType.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "collectionType could not be percent-encoded for the request path: \(collectionType)"
+            )
+        }
+        return escaped
+    }
+
     /// Lists all collection type configurations for the current app.
-    public func list() async throws -> [[String: Any]] {
+    public func list() async throws -> [CollectionTypeConfigInfo] {
         let result = try await makeRequest("GET", "/collection-type-configs", nil)
-        return result as? [[String: Any]] ?? []
+        return try JSONCoding.decode([CollectionTypeConfigInfo].self, from: result)
     }
 
     /// Retrieves the configuration for a specific collection type.
-    public func get(collectionType: String) async throws -> [String: Any] {
-        let escaped = collectionType.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? collectionType
+    public func get(collectionType: String) async throws -> CollectionTypeConfigInfo {
+        let escaped = try Self.encodePathSegment(collectionType)
         let result = try await makeRequest(
             "GET", "/collection-type-configs/\(escaped)", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CollectionTypeConfigInfo.self, from: result)
     }
 
     /// Creates a new collection type configuration.
-    ///
-    /// - Parameter params: Expected keys:
-    ///   - `collectionType` (String): The type identifier.
-    ///   - `ruleSetId` (String, optional): Rule set to enforce. Must have
-    ///     `resourceType: "collection"`.
-    public func create(params: [String: Any]) async throws -> [String: Any] {
-        let result = try await makeRequest("POST", "/collection-type-configs", params)
-        return result as? [String: Any] ?? [:]
+    public func create(params: CreateCollectionTypeConfigParams) async throws -> CollectionTypeConfigInfo {
+        let body = try JSONCoding.jsonObject(from: params)
+        let result = try await makeRequest("POST", "/collection-type-configs", body)
+        return try JSONCoding.decode(CollectionTypeConfigInfo.self, from: result)
     }
 
     /// Updates an existing collection type configuration's rule set.
-    ///
-    /// - Parameter params: Expected keys:
-    ///   - `ruleSetId` (String or NSNull, optional): New rule set ID, or
-    ///     NSNull to remove.
     public func update(
         collectionType: String,
-        params: [String: Any]
-    ) async throws -> [String: Any] {
-        let escaped = collectionType.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? collectionType
+        params: UpdateCollectionTypeConfigParams
+    ) async throws -> CollectionTypeConfigInfo {
+        let escaped = try Self.encodePathSegment(collectionType)
+        let body = try JSONCoding.jsonObject(from: params)
         let result = try await makeRequest(
-            "PATCH", "/collection-type-configs/\(escaped)", params
+            "PATCH", "/collection-type-configs/\(escaped)", body
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CollectionTypeConfigInfo.self, from: result)
     }
 
     /// Deletes a collection type configuration.
-    public func delete(collectionType: String) async throws -> [String: Any] {
-        let escaped = collectionType.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? collectionType
+    @discardableResult
+    public func delete(collectionType: String) async throws -> SuccessResult {
+        let escaped = try Self.encodePathSegment(collectionType)
         let result = try await makeRequest(
             "DELETE", "/collection-type-configs/\(escaped)", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(SuccessResult.self, from: result)
     }
 }

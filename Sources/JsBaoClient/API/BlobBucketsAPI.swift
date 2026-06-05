@@ -33,50 +33,40 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     // MARK: - Bucket CRUD
 
     /// Create a new blob bucket (admin/owner only).
-    ///
-    /// - Parameter params: Expected keys:
-    ///   - `bucketKey` (String, required): app-unique slug.
-    ///   - `name` (String, required): display name.
-    ///   - `ttlTier` (String, required): one of `"1d"`, `"3d"`, `"14d"`,
-    ///     `"28d"`, `"180d"`, `"365d"`, `"permanent"`.
-    ///   - `accessPolicy` (String, required): `"public-read"`,
-    ///     `"authenticated"`, or `"owner-only"`.
-    ///   - `description` (String, optional)
-    ///   - `ruleSetId` (String, optional): CEL-based access control.
-    public func createBucket(params: [String: Any]) async throws -> [String: Any] {
-        let result = try await makeRequest("POST", "/blob-buckets", params)
-        return result as? [String: Any] ?? [:]
+    public func createBucket(params: CreateBlobBucketParams) async throws -> BlobBucketInfo {
+        let body = try JSONCoding.jsonObject(from: params)
+        let result = try await makeRequest("POST", "/blob-buckets", body)
+        return try JSONCoding.decode(BlobBucketInfo.self, from: result)
     }
 
     /// List all blob buckets for the current app (admin/owner only).
     /// The server returns `{ items: [...] }`; this method unwraps to the
     /// items array to match the JS surface (which also returns the
     /// list directly).
-    public func listBuckets() async throws -> [[String: Any]] {
+    public func listBuckets() async throws -> [BlobBucketInfo] {
         let result = try await makeRequest("GET", "/blob-buckets", nil)
-        if let dict = result as? [String: Any],
-           let items = dict["items"] as? [[String: Any]] {
-            return items
+        if let dict = result as? [String: Any], let items = dict["items"] {
+            return try JSONCoding.decode([BlobBucketInfo].self, from: items)
         }
-        return result as? [[String: Any]] ?? []
+        return try JSONCoding.decode([BlobBucketInfo].self, from: result)
     }
 
     /// Get a single bucket by its `bucketId` or `bucketKey`.
-    public func getBucket(bucketIdOrKey: String) async throws -> [String: Any] {
+    public func getBucket(bucketIdOrKey: String) async throws -> BlobBucketInfo {
         let escaped = bucketIdOrKey.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? bucketIdOrKey
         let result = try await makeRequest("GET", "/blob-buckets/\(escaped)", nil)
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(BlobBucketInfo.self, from: result)
     }
 
     /// Delete a bucket and every blob inside it.
-    public func deleteBucket(bucketIdOrKey: String) async throws -> [String: Any] {
+    public func deleteBucket(bucketIdOrKey: String) async throws -> BlobDeletedResult {
         let escaped = bucketIdOrKey.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? bucketIdOrKey
         let result = try await makeRequest("DELETE", "/blob-buckets/\(escaped)", nil)
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(BlobDeletedResult.self, from: result)
     }
 
     // MARK: - Blob upload / list / metadata / download / delete
@@ -96,7 +86,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         filename: String,
         contentType: String = "application/octet-stream",
         tags: [String]? = nil
-    ) async throws -> [String: Any] {
+    ) async throws -> BucketBlobInfo {
         guard let makeRawRequest else {
             throw JsBaoError(code: .unavailable, message: "Raw HTTP client not wired for BlobBucketsAPI")
         }
@@ -124,10 +114,8 @@ public final class BlobBucketsAPI: @unchecked Sendable {
                 body: String(data: body, encoding: .utf8)
             )
         }
-        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            return [:]
-        }
-        return json
+        let json = try JSONSerialization.jsonObject(with: body)
+        return try JSONCoding.decode(BucketBlobInfo.self, from: json)
     }
 
     /// List blobs in a bucket. Cursor-paginated per R2; response shape:
@@ -136,7 +124,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         bucketIdOrKey: String,
         cursor: String? = nil,
         limit: Int? = nil
-    ) async throws -> [String: Any] {
+    ) async throws -> BucketBlobListResult {
         let escaped = bucketIdOrKey.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? bucketIdOrKey
@@ -150,14 +138,14 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         let result = try await makeRequest(
             "GET", "/blob-buckets/\(escaped)/blobs\(suffix)", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(BucketBlobListResult.self, from: result)
     }
 
     /// Fetch a blob's metadata without downloading its bytes.
     public func getMetadata(
         bucketIdOrKey: String,
         blobId: String
-    ) async throws -> [String: Any] {
+    ) async throws -> BucketBlobInfo {
         let escaped = bucketIdOrKey.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? bucketIdOrKey
@@ -167,7 +155,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         let result = try await makeRequest(
             "GET", "/blob-buckets/\(escaped)/blobs/\(escapedBlob)/metadata", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(BucketBlobInfo.self, from: result)
     }
 
     /// Download a blob's raw bytes.
@@ -199,7 +187,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     public func delete(
         bucketIdOrKey: String,
         blobId: String
-    ) async throws -> [String: Any] {
+    ) async throws -> BlobDeletedResult {
         let escaped = bucketIdOrKey.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? bucketIdOrKey
@@ -209,7 +197,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         let result = try await makeRequest(
             "DELETE", "/blob-buckets/\(escaped)/blobs/\(escapedBlob)", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(BlobDeletedResult.self, from: result)
     }
 
     /// Get a time-limited signed URL for unauthenticated download.
@@ -218,7 +206,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         bucketIdOrKey: String,
         blobId: String,
         expiresInSeconds: Int? = nil
-    ) async throws -> [String: Any] {
+    ) async throws -> BlobSignedUrlResult {
         let escaped = bucketIdOrKey.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? bucketIdOrKey
@@ -234,6 +222,6 @@ public final class BlobBucketsAPI: @unchecked Sendable {
             "/blob-buckets/\(escaped)/blobs/\(escapedBlob)/signed-url",
             params
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(BlobSignedUrlResult.self, from: result)
     }
 }

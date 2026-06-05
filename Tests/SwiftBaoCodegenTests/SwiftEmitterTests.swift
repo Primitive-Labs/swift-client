@@ -40,6 +40,87 @@ final class SwiftEmitterTests: XCTestCase {
         XCTAssertTrue(body.contains("import JsBaoClient"))
     }
 
+    func testEmitsAppFacingModelFacade() throws {
+        // The one-model `Model.*` facade (#918) is the SINGLE app-facing API
+        // for a generated model — cross-document reads + per-document
+        // instance writes (`save(in:)` / `delete(in:)`, the JS `save()`
+        // shape). It once silently vanished when an unrelated emitter
+        // refactor dropped `crossDocumentFacade` (regression on
+        // js-parity-jun-3); nothing caught it because the only facade test
+        // hand-writes its own copy of the extension. Pin every member so a
+        // future emitter change can't drop it without a red test.
+        let src = try emit("""
+        [models.note]
+        [models.note.fields.id]
+        type = "id"
+        [models.note.fields.title]
+        type = "string"
+        required = true
+        """)
+        let body = try XCTUnwrap(src["NoteRecord"])
+        XCTAssertTrue(body.contains("extension NoteRecord {"),
+                      "facade extension should be emitted")
+        // Reads (cross-document statics)
+        XCTAssertTrue(body.contains("static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [NoteRecord]"))
+        // Paginated read — exposes nextCursor/hasMore so callers can page (#946).
+        XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<NoteRecord>"))
+        XCTAssertTrue(body.contains("static func count(_ filter: DocumentFilter? = nil) -> Int"))
+        XCTAssertTrue(body.contains("static func findAll() -> [NoteRecord]"))
+        XCTAssertTrue(body.contains("static func find(_ id: String) -> NoteRecord?"))
+        XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping () -> Void) -> () -> Void"))
+        XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) -> [[String: Any]]"))
+        // Cross-document unique lookup + single-result query (JS parity:
+        // findByUnique / queryOne).
+        XCTAssertTrue(body.contains("static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> NoteRecord?"),
+                      "findByUnique facade must be emitted")
+        XCTAssertTrue(body.contains("findByUniqueShared(primitiveSchema, constraint: constraint, value: value)"),
+                      "findByUnique should delegate to findByUniqueShared")
+        XCTAssertTrue(body.contains("static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> NoteRecord?"),
+                      "queryOne facade must be emitted")
+        XCTAssertTrue(body.contains("queryOneShared(primitiveSchema, filter: filter, options: options)"),
+                      "queryOne should delegate to queryOneShared")
+        // Writes (per-document instance methods — the save() API from #923)
+        XCTAssertTrue(body.contains("func save(in documentId: String) throws -> NoteRecord"),
+                      "instance save(in:) (create-or-update) must be emitted")
+        // Upsert-by-unique-field write (JS parity: save({ upsertOn })).
+        XCTAssertTrue(body.contains("func save(in documentId: String, upsertOn: String) throws -> NoteRecord"),
+                      "instance save(in:upsertOn:) must be emitted")
+        XCTAssertTrue(body.contains("upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)"),
+                      "save(in:upsertOn:) should delegate to upsertShared, passing the record id")
+        XCTAssertTrue(body.contains("func delete(in documentId: String) throws"),
+                      "instance delete(in:) must be emitted")
+        // The deleted static create/update writes must NOT come back.
+        XCTAssertFalse(body.contains("static func create("),
+                       "static create() was replaced by instance save(in:) (#923)")
+        XCTAssertFalse(body.contains("static func update("),
+                       "static update() was replaced by instance save(in:) (#923)")
+    }
+
+    func testEmitsEnumAccessorForKeywordNamedField() throws {
+        // Regression: a string field named after a Swift keyword (e.g.
+        // `default`) with an `enum = [...]` once emitted `` `default`Enum ``
+        // — the backtick wrapped only the keyword, so the accessor name was a
+        // syntax error. The composed identifier must be escaped as a whole
+        // (`defaultEnum` isn't a keyword, so it stays clean).
+        let src = try emit("""
+        [models.widget]
+        [models.widget.fields.id]
+        type = "id"
+        [models.widget.fields.default]
+        type = "string"
+        enum = ["on", "off"]
+        """)
+        let body = try XCTUnwrap(src["WidgetRecord"])
+        // The typed accessor compiles: composed-then-escaped, no stray backtick.
+        XCTAssertTrue(body.contains("var defaultEnum: DefaultValue?"),
+                      "enum accessor for keyword field should be `defaultEnum`, not broken backticks")
+        XCTAssertFalse(body.contains("`default`Enum"),
+                       "must not emit a backtick wrapping only the keyword")
+        // The stored property reference inside the accessor still escapes the
+        // keyword correctly (`\\`default\\``).
+        XCTAssertTrue(body.contains("`default`.flatMap(DefaultValue.init(rawValue:))"))
+    }
+
     func testCustomModuleImport() throws {
         let opts = EmitOptions(accessLevel: "internal", moduleImport: "MyCore", sourcePath: "schema.toml")
         let src = try emit("[models.x]\n[models.x.fields.id]\ntype = \"id\"", opts: opts)
@@ -463,5 +544,306 @@ final class SwiftEmitterTests: XCTestCase {
         } catch {
             XCTFail("expected CodegenError.parse or empty output, got \(error)")
         }
+    }
+
+    // MARK: - Relationship accessors (#995)
+
+    /// Emit every model in `toml`, wiring up the cross-model name map
+    /// exactly like the CLI driver does so relationship accessors can name
+    /// their typed return types.
+    private func emitWithNameMap(
+        _ toml: String,
+        accessLevel: String = "public"
+    ) throws -> (files: [String: String], schemas: [ParsedSchema], emitter: SwiftEmitter) {
+        let schemas = try TomlParser.parse(tomlString: toml, swiftNameSuffix: "Record")
+        var names: [String: String] = [:]
+        for s in schemas { names[s.name] = s.swiftName }
+        let emitter = SwiftEmitter(options: EmitOptions(
+            accessLevel: accessLevel,
+            moduleImport: "JsBaoClient",
+            sourcePath: "schema.toml",
+            swiftNamesByModel: names
+        ))
+        var files: [String: String] = [:]
+        for s in schemas { files[s.swiftName] = emitter.emit(schema: s) }
+        return (files, schemas, emitter)
+    }
+
+    private static let relationshipFixture = """
+    [models.posts]
+    [models.posts.fields.id]
+    type = "id"
+    [models.posts.fields.userId]
+    type = "string"
+    [models.posts.relationships.author]
+    type = "refersTo"
+    model = "users"
+    related_id_field = "userId"
+    [models.posts.relationships.tags]
+    type = "hasManyThrough"
+    model = "tags"
+    join_model = "post_tag_links"
+    join_model_local_field = "postId"
+    join_model_related_field = "tagId"
+
+    [models.users]
+    [models.users.fields.id]
+    type = "id"
+    [models.users.relationships.posts]
+    type = "hasMany"
+    model = "posts"
+    related_id_field = "userId"
+    order_by_field = "createdAt"
+
+    [models.tags]
+    [models.tags.fields.id]
+    type = "id"
+
+    [models.post_tag_links]
+    [models.post_tag_links.fields.id]
+    type = "id"
+    """
+
+    func testRefersToAccessorReturnsTypedOptional() throws {
+        let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
+        let posts = try XCTUnwrap(files["PostsRecord"])
+        XCTAssertTrue(
+            posts.contains("static func author(") ,
+            "expected a typed accessor for the `author` refersTo relationship"
+        )
+        XCTAssertTrue(
+            posts.contains("in target: DynamicModel\n    ) throws -> UsersRecord?"),
+            "refersTo accessor should return the target's optional typed record"
+        )
+        XCTAssertTrue(
+            posts.contains(#"record.refersTo(relationship: "author", target: target)"#),
+            "accessor should delegate to the runtime PrimitiveRecord.refersTo resolver"
+        )
+    }
+
+    func testHasManyAccessorReturnsTypedArray() throws {
+        let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
+        let users = try XCTUnwrap(files["UsersRecord"])
+        XCTAssertTrue(users.contains("static func posts("))
+        XCTAssertTrue(
+            users.contains("throws -> [PostsRecord]"),
+            "hasMany accessor should return an array of the target's typed record"
+        )
+        XCTAssertTrue(
+            users.contains(#"record.hasMany(relationship: "posts", target: target)"#)
+        )
+    }
+
+    func testHasManyThroughAccessorTakesJoinModel() throws {
+        let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
+        let posts = try XCTUnwrap(files["PostsRecord"])
+        XCTAssertTrue(posts.contains("static func tags("))
+        XCTAssertTrue(
+            posts.contains("through joinModel: DynamicModel"),
+            "hasManyThrough accessor should accept the join model"
+        )
+        XCTAssertTrue(posts.contains("throws -> [TagsRecord]"))
+        XCTAssertTrue(
+            posts.contains(#"record.hasManyThrough("#)
+        )
+    }
+
+    func testNoRelationshipsEmitsNoAccessors() throws {
+        let (files, _, _) = try emitWithNameMap("""
+        [models.tags]
+        [models.tags.fields.id]
+        type = "id"
+        """)
+        let tags = try XCTUnwrap(files["TagsRecord"])
+        // Every model emits the cross-document facade statics (`query`/`find`/…),
+        // so `static func` alone is no longer a relationship-accessor marker.
+        // Relationship accessors are uniquely doc-commented "Follow the … relationship".
+        XCTAssertFalse(tags.contains("Follow the"),
+                       "a model with no relationships should emit no relationship accessors")
+    }
+
+    // MARK: - Registration barrel (#995)
+
+    func testBarrelAggregatesAllModelsInOrder() throws {
+        let (_, schemas, emitter) = try emitWithNameMap(Self.relationshipFixture)
+        let barrel = emitter.emitBarrel(schemas: schemas)
+        XCTAssertTrue(barrel.contains("// Generated by swift-bao-codegen — DO NOT EDIT."))
+        XCTAssertTrue(barrel.contains("enum GeneratedModels"))
+        XCTAssertTrue(barrel.contains("static let all: [any PrimitiveModel.Type]"))
+        XCTAssertTrue(barrel.contains("static func register(on client: JsBaoClient)"))
+        XCTAssertTrue(barrel.contains("client.registerModels(all)"))
+        // Every model's `.self` should appear.
+        for s in schemas {
+            XCTAssertTrue(barrel.contains("\(s.swiftName).self,"),
+                          "barrel missing \(s.swiftName).self")
+        }
+    }
+
+    func testBarrelEmittedForEmptySchema() throws {
+        let schemas = try TomlParser.parse(tomlString: "# no models\n", swiftNameSuffix: "Record")
+        XCTAssertTrue(schemas.isEmpty)
+        let emitter = SwiftEmitter(options: EmitOptions())
+        let barrel = emitter.emitBarrel(schemas: schemas)
+        XCTAssertTrue(barrel.contains("static let all: [any PrimitiveModel.Type] = [\n    ]"),
+                      "empty schema should still emit an (empty) barrel array")
+    }
+
+    func testBarrelFilenameConstant() {
+        XCTAssertEqual(SwiftEmitter.barrelFileName, "GeneratedModels.swift")
+    }
+
+    func testBarrelRegisterAssertsModelSetMatchesToml() throws {
+        // #mirror JS import-time assertion: register(on:) must fail loud if
+        // the generated/registered model set drifts from the TOML model set
+        // baked in at codegen time (hand-edit, class_name drift, …).
+        let (_, schemas, emitter) = try emitWithNameMap(Self.relationshipFixture)
+        let barrel = emitter.emitBarrel(schemas: schemas)
+        // The expected TOML model-name set is baked in, in declaration order.
+        XCTAssertTrue(barrel.contains("static let modelNames: [String] = ["),
+                      "barrel should bake the expected TOML model-name set")
+        for s in schemas {
+            XCTAssertTrue(barrel.contains("\"\(s.name)\","),
+                          "modelNames should include the raw TOML name \(s.name)")
+        }
+        // register(on:) cross-checks registered names against the baked set.
+        XCTAssertTrue(barrel.contains("let registered = all.map { $0.primitiveSchema.name }"))
+        XCTAssertTrue(barrel.contains("precondition("),
+                      "register(on:) must precondition the sets match")
+        XCTAssertTrue(barrel.contains("out of sync with the schema TOML"),
+                      "precondition message should explain the drift")
+        XCTAssertTrue(barrel.contains("client.registerModels(all)"))
+    }
+
+    // MARK: - auto_stamp emit (#1056)
+
+    func testAutoStampRidesInsideFieldDescriptorLiteral() throws {
+        // #1056: the auto_stamp policy must land INSIDE the per-field
+        // FieldDescriptor literal so the shared runtime write path reads it
+        // off `primitiveSchema` and actually stamps on save — not just as
+        // advisory metadata.
+        let src = try emit("""
+        [models.t]
+        [models.t.fields.id]
+        type = "id"
+        [models.t.fields.createdAt]
+        type = "number"
+        auto_stamp = "create"
+        [models.t.fields.updatedAt]
+        type = "number"
+        auto_stamp = "update"
+        [models.t.fields.touchedAt]
+        type = "number"
+        auto_stamp = "both"
+        """)
+        let body = try XCTUnwrap(src["TRecord"])
+        XCTAssertTrue(
+            body.contains("FieldDescriptor(type: .number, autoStamp: .create)"),
+            "create stamp should ride inside the FieldDescriptor literal:\n\(body)"
+        )
+        XCTAssertTrue(body.contains("FieldDescriptor(type: .number, autoStamp: .update)"))
+        XCTAssertTrue(body.contains("FieldDescriptor(type: .number, autoStamp: .both)"))
+    }
+
+    func testAutoStampAdvisoryStaticMapStillEmitted() throws {
+        // The advisory `autoStampFields` static is kept for backward
+        // compatibility (app code may read the policy keyed by name).
+        let src = try emit("""
+        [models.t]
+        [models.t.fields.id]
+        type = "id"
+        [models.t.fields.createdAt]
+        type = "number"
+        auto_stamp = "create"
+        """)
+        let body = try XCTUnwrap(src["TRecord"])
+        XCTAssertTrue(body.contains("static let autoStampFields: [String: String] = ["))
+        XCTAssertTrue(body.contains(#""createdAt": "create""#))
+    }
+
+    func testNoAutoStampEmitsNeitherSlotNorMap() throws {
+        // A schema with no auto_stamp field stays byte-stable: no
+        // `autoStamp:` arg in any FieldDescriptor, no advisory map.
+        let src = try emit("""
+        [models.t]
+        [models.t.fields.id]
+        type = "id"
+        [models.t.fields.title]
+        type = "string"
+        required = true
+        """)
+        let body = try XCTUnwrap(src["TRecord"])
+        XCTAssertFalse(body.contains("autoStamp:"),
+                       "no FieldDescriptor should carry an autoStamp arg")
+        XCTAssertFalse(body.contains("autoStampFields"),
+                       "advisory map should be omitted when nothing declares auto_stamp")
+    }
+
+    // MARK: - enum emit (#1056)
+
+    func testEnumTypeNameForKeywordNamedField() throws {
+        // #1056: an `enum` on a Swift-keyword-named field (`default`) must
+        // produce a legal nested *type* name. A type name can't be
+        // backtick-escaped, so the emitter sanitizes: `default` →
+        // `DefaultValue` (the `Value` suffix also lifts it out of
+        // keyword-space). The accessor name is `defaultEnum`; the stored
+        // property ref inside it stays backtick-escaped (`` `default` ``).
+        let src = try emit("""
+        [models.widget]
+        [models.widget.fields.id]
+        type = "id"
+        [models.widget.fields.default]
+        type = "string"
+        enum = ["on", "off"]
+        """)
+        let body = try XCTUnwrap(src["WidgetRecord"])
+        XCTAssertTrue(body.contains("enum DefaultValue: String, Codable, CaseIterable, Sendable"),
+                      "keyword field should yield a sanitized type name `DefaultValue`:\n\(body)")
+        XCTAssertTrue(body.contains("var defaultEnum: DefaultValue?"))
+        XCTAssertFalse(body.contains("`default`Value"),
+                       "must not backtick-wrap the keyword inside a type name")
+        XCTAssertFalse(body.contains("`default`Enum"),
+                       "must not backtick-wrap only the keyword in the accessor name")
+        // Cases preserve raw values verbatim.
+        XCTAssertTrue(body.contains(#"case on = "on""#))
+        XCTAssertTrue(body.contains(#"case off = "off""#))
+    }
+
+    func testEnumTypeNameDerivationSanitizes() throws {
+        // Unit-test the type-name derivation directly: a keyword field lands
+        // out of keyword-space via the `Value` suffix; a leading-digit name
+        // is `_`-prefixed; punctuation/Unicode-digit chars are stripped — all
+        // so the emitted nested `enum <Name>:` is a legal type identifier
+        // that can't be expressed by backtick-escaping. (Driving these
+        // through full `emit()` isn't possible in isolation because the same
+        // field names also need to be legal *property* identifiers, a
+        // separate emitter concern — so we pin the derivation here.)
+        XCTAssertEqual(Naming.enumTypeName(forField: "default"), "DefaultValue")
+        XCTAssertEqual(Naming.enumTypeName(forField: "user_status"), "UserStatusValue")
+        XCTAssertEqual(Naming.enumTypeName(forField: "2fa"), "_2faValue")
+        XCTAssertEqual(Naming.enumTypeName(forField: "order.status"), "OrderstatusValue")
+        XCTAssertEqual(Naming.enumTypeName(forField: "Self"), "SelfValue")
+        // Empty / all-punctuation degrades to a lone `_` base.
+        XCTAssertEqual(Naming.enumTypeName(forField: "."), "_Value")
+    }
+
+    func testEnumAndAutoStampCompose() throws {
+        // Both emit paths on one model — enum on a normal field plus an
+        // auto_stamp field — to pin that they don't interfere.
+        let src = try emit("""
+        [models.task]
+        [models.task.fields.id]
+        type = "id"
+        [models.task.fields.status]
+        type = "string"
+        enum = ["todo", "done"]
+        [models.task.fields.createdAt]
+        type = "number"
+        auto_stamp = "create"
+        """)
+        let body = try XCTUnwrap(src["TaskRecord"])
+        XCTAssertTrue(body.contains("enum StatusValue: String"))
+        XCTAssertTrue(body.contains("var statusEnum: StatusValue?"))
+        XCTAssertTrue(body.contains("FieldDescriptor(type: .number, autoStamp: .create)"))
+        XCTAssertTrue(body.contains("static let autoStampFields: [String: String]"))
     }
 }

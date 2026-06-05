@@ -124,9 +124,9 @@ final class InvitationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(invitations.count, 1)
 
         // Find the invitation for our invited user
-        let found = invitations.first { ($0["email"] as? String) == invitedUser.email }
+        let found = invitations.first { $0.email == invitedUser.email }
         XCTAssertNotNil(found, "Expected to find invitation for \(invitedUser.email)")
-        XCTAssertEqual(found?["permission"] as? String, "reader")
+        XCTAssertEqual(found?.permission, "reader")
     }
 
     /// Ported from JS: "should create a document invitation" (verify response fields)
@@ -138,20 +138,12 @@ final class InvitationTests: XCTestCase {
             permission: "read-write"
         )
 
-        // Verify response has expected fields
-        XCTAssertNotNil(result["email"] ?? result["success"],
-                        "Expected response to contain email or success field")
-
+        // Verify response has expected fields. `DocumentInvitationResponse`
+        // exposes these as non-optional, so assert their values directly.
         // The JS test checks: success, message, email, permission, invitationId, invitedBy, invitedAt, expiresAt
-        if let success = result["success"] as? Bool {
-            XCTAssertTrue(success)
-        }
-        if let email = result["email"] as? String {
-            XCTAssertEqual(email, invitedUser.email)
-        }
-        if let permission = result["permission"] as? String {
-            XCTAssertEqual(permission, "read-write")
-        }
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.email, invitedUser.email)
+        XCTAssertEqual(result.permission, "read-write")
     }
 
     /// Ported from JS: invite with different permission levels
@@ -166,9 +158,9 @@ final class InvitationTests: XCTestCase {
 
         // Verify the invitation was created with reader permission
         let invitations = try await ownerClient.documents.listInvitations(documentId: documentId)
-        let found = invitations.first { ($0["email"] as? String) == invitedUser.email }
+        let found = invitations.first { $0.email == invitedUser.email }
         XCTAssertNotNil(found)
-        XCTAssertEqual(found?["permission"] as? String, "reader")
+        XCTAssertEqual(found?.permission, "reader")
     }
 
     /// Ported from JS: invite with read-write permission
@@ -183,9 +175,9 @@ final class InvitationTests: XCTestCase {
 
         // Verify the invitation was created with read-write permission
         let invitations = try await ownerClient.documents.listInvitations(documentId: documentId)
-        let found = invitations.first { ($0["email"] as? String) == invitedUser.email }
+        let found = invitations.first { $0.email == invitedUser.email }
         XCTAssertNotNil(found)
-        XCTAssertEqual(found?["permission"] as? String, "read-write")
+        XCTAssertEqual(found?.permission, "read-write")
     }
 
     /// Ported from JS: invite to non-existent email
@@ -225,7 +217,7 @@ final class InvitationTests: XCTestCase {
         // Verify the invited user can access the document (either via accept or auto-accept)
         do {
             let doc = try await memberClient.documents.get(documentId: documentId)
-            XCTAssertNotNil(doc["documentId"], "Invited user should be able to access the document")
+            XCTAssertEqual(doc.documentId, documentId, "Invited user should be able to access the document")
         } catch {
             // If the server doesn't grant access via invitation in public mode,
             // the user may already have access as an app member
@@ -248,10 +240,10 @@ final class InvitationTests: XCTestCase {
         XCTAssertNotNil(pending)
 
         // Find the invitation for our document
-        let found = pending.first { ($0["documentId"] as? String) == documentId }
+        let found = pending.first { $0.documentId == documentId }
         if let found = found {
-            XCTAssertEqual(found["email"] as? String, invitedUser.email)
-            XCTAssertEqual(found["permission"] as? String, "reader")
+            XCTAssertEqual(found.email, invitedUser.email)
+            XCTAssertEqual(found.permission, "reader")
         }
         // Note: If auto-accept is enabled, pending list may be empty -- that's acceptable
     }
@@ -272,10 +264,8 @@ final class InvitationTests: XCTestCase {
             permission: "read-write"
         )
 
-        XCTAssertEqual(updated["permission"] as? String, "read-write")
-        if let success = updated["success"] as? Bool {
-            XCTAssertTrue(success)
-        }
+        XCTAssertEqual(updated.permission, "read-write")
+        XCTAssertTrue(updated.success)
     }
 
     /// Ported from JS: "should get a specific document invitation"
@@ -294,8 +284,8 @@ final class InvitationTests: XCTestCase {
         )
 
         XCTAssertNotNil(invitation, "Should find the invitation")
-        XCTAssertEqual(invitation?["email"] as? String, invitedUser.email)
-        XCTAssertEqual(invitation?["permission"] as? String, "read-write")
+        XCTAssertEqual(invitation?.email, invitedUser.email)
+        XCTAssertEqual(invitation?.permission, "read-write")
     }
 
     /// Ported from JS: "should delete a document invitation"
@@ -307,17 +297,14 @@ final class InvitationTests: XCTestCase {
             permission: "reader"
         )
 
-        guard let invitationId = response["invitationId"] as? String else {
-            XCTFail("Expected invitationId in response")
-            return
-        }
+        let invitationId = response.invitationId
 
         // Delete the invitation
         let result = try await ownerClient.documents.deleteInvitation(
             documentId: documentId,
             invitationId: invitationId
         )
-        XCTAssertEqual(result["success"] as? Bool, true)
+        XCTAssertTrue(result.success)
 
         // Verify invitation is gone
         let invitations = try await ownerClient.documents.listInvitations(documentId: documentId)
@@ -330,20 +317,15 @@ final class InvitationTests: XCTestCase {
             documentId: documentId,
             email: invitedUser.email,
             permission: "read-write",
-            options: [
-                "sendEmail": true,
-                "documentUrl": "https://example.com/doc/123",
-                "note": "Please review this document",
-            ]
+            options: InvitationEmailOptions(
+                sendEmail: true,
+                documentUrl: "https://example.com/doc/123",
+                note: "Please review this document"
+            )
         )
 
-        XCTAssertNotNil(result)
-        if let success = result["success"] as? Bool {
-            XCTAssertTrue(success)
-        }
-        if let email = result["email"] as? String {
-            XCTAssertEqual(email, invitedUser.email)
-        }
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.email, invitedUser.email)
     }
 
     /// Ported from JS: "should decline an invitation via client API"
@@ -355,10 +337,7 @@ final class InvitationTests: XCTestCase {
             permission: "reader"
         )
 
-        guard let invitationId = response["invitationId"] as? String else {
-            XCTFail("Expected invitationId in response")
-            return
-        }
+        let invitationId = response.invitationId
 
         try await delay(1)
 
@@ -367,11 +346,11 @@ final class InvitationTests: XCTestCase {
             documentId: documentId,
             invitationId: invitationId
         )
-        XCTAssertEqual(decline["success"] as? Bool, true)
+        XCTAssertTrue(decline.success)
 
         // Verify invitation is no longer listed
         let invitations = try await ownerClient.documents.listInvitations(documentId: documentId)
-        let emails = invitations.compactMap { $0["email"] as? String }
+        let emails = invitations.map { $0.email }
         XCTAssertFalse(emails.contains(invitedUser.email), "Declined invitation should not appear in list")
     }
 
@@ -389,15 +368,10 @@ final class InvitationTests: XCTestCase {
 
         // The invited user gets the document -- this may trigger auto-acceptance
         let docInfo = try await memberClient.documents.get(documentId: documentId)
-        XCTAssertNotNil(docInfo)
 
         // If auto-accept is enabled, should have documentId and permission
-        if let docId = docInfo["documentId"] as? String {
-            XCTAssertEqual(docId, documentId)
-        }
-        if let permission = docInfo["permission"] as? String {
-            XCTAssertEqual(permission, "read-write")
-        }
+        XCTAssertEqual(docInfo.documentId, documentId)
+        XCTAssertEqual(docInfo.permission, .readWrite)
     }
 
     // MARK: - Migration path (issue #619/#628): pending-invitations + email-removal
@@ -419,14 +393,14 @@ final class InvitationTests: XCTestCase {
         let pendingEmail = "pending-\(UUID().uuidString.prefix(8))@test.local".lowercased()
         _ = try await appOwner.documents.updatePermissions(
             documentId: ownerDocId,
-            params: ["email": pendingEmail, "permission": "read-write"]
+            params: .email(pendingEmail, permission: "read-write")
         )
 
         let pending = try await appOwner.documents.listPendingInvitations(
             documentId: ownerDocId
         )
         XCTAssertTrue(
-            pending.contains { ($0["email"] as? String) == pendingEmail },
+            pending.contains { $0.email == pendingEmail },
             "Pending invitation for \(pendingEmail) should surface"
         )
     }
@@ -445,23 +419,23 @@ final class InvitationTests: XCTestCase {
         let pendingEmail = "to-cancel-\(UUID().uuidString.prefix(8))@test.local".lowercased()
         _ = try await appOwner.documents.updatePermissions(
             documentId: ownerDocId,
-            params: ["email": pendingEmail, "permission": "read-write"]
+            params: .email(pendingEmail, permission: "read-write")
         )
         let before = try await appOwner.documents.listPendingInvitations(
             documentId: ownerDocId
         )
-        XCTAssertTrue(before.contains { ($0["email"] as? String) == pendingEmail })
+        XCTAssertTrue(before.contains { $0.email == pendingEmail })
 
         _ = try await appOwner.documents.removePermission(
             documentId: ownerDocId,
-            email: pendingEmail
+            .email(pendingEmail)
         )
 
         let after = try await appOwner.documents.listPendingInvitations(
             documentId: ownerDocId
         )
         XCTAssertFalse(
-            after.contains { ($0["email"] as? String) == pendingEmail },
+            after.contains { $0.email == pendingEmail },
             "Cancelled email should be gone from pending list"
         )
     }

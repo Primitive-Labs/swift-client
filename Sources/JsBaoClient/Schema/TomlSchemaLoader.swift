@@ -214,6 +214,19 @@ public enum TomlSchemaLoader {
             )
         }
 
+        // Parse `auto_stamp = "create" | "update" | "both"`. Fail-fast on
+        // an unrecognized literal — mirrors js-bao `tomlLoader.ts`'s
+        // `VALID_AUTO_STAMP_VALUES` guard.
+        var autoStamp: AutoStamp? = nil
+        if let rawStamp = table["auto_stamp"]?.string {
+            guard let parsed = AutoStamp(rawValue: rawStamp) else {
+                throw TomlSchemaLoaderError.invalidAutoStamp(
+                    model: modelName, field: fieldName, value: rawStamp
+                )
+            }
+            autoStamp = parsed
+        }
+
         return FieldDescriptor(
             type: type,
             indexed: table["indexed"]?.bool ?? false,
@@ -222,7 +235,8 @@ public enum TomlSchemaLoader {
             autoAssign: table["auto_assign"]?.bool ?? false,
             maxLength: table["max_length"]?.int,
             maxCount: table["max_count"]?.int,
-            default: decodeDefault(table["default"])
+            default: decodeDefault(table["default"]),
+            autoStamp: autoStamp
         )
     }
 
@@ -497,6 +511,7 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
         relType: String, field: String
     )
     case unknownKey(context: String, key: String, allowed: [String])
+    case invalidAutoStamp(model: String, field: String, value: String)
 
     public var description: String {
         switch self {
@@ -530,6 +545,8 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
             return "Model `\(model)` \(relType) relationship `\(relationship)` is missing required `\(field)`"
         case let .unknownKey(context, key, allowed):
             return "\(context): unknown key `\(key)`. Allowed: \(allowed.joined(separator: ", "))"
+        case let .invalidAutoStamp(model, field, value):
+            return "Model `\(model)` field `\(field)` has invalid auto_stamp value `\(value)` — must be one of: create, update, both"
         }
     }
 }

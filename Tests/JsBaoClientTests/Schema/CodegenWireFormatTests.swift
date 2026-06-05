@@ -74,7 +74,7 @@ final class CodegenWireFormatTests: XCTestCase {
         // without trailing `.0`. Wire bytes mirror what JS produces
         // for an Int.
         let (doc, _) = try persist(TaskRecord(
-            id: "wf-num-int", priority: 3, title: "x"
+            id: "wf-num-int", title: "x", priority: 3
         ))
         let raw = try readRawField(doc: doc, modelName: "tasks", recordId: "wf-num-int", field: "priority")
         XCTAssertEqual(raw, "3",
@@ -83,7 +83,7 @@ final class CodegenWireFormatTests: XCTestCase {
 
     func testNumberField_floatPreservesFraction() throws {
         let (doc, _) = try persist(TaskRecord(
-            id: "wf-num-float", priority: 2.5, title: "x"
+            id: "wf-num-float", title: "x", priority: 2.5
         ))
         let raw = try readRawField(doc: doc, modelName: "tasks", recordId: "wf-num-float", field: "priority")
         XCTAssertEqual(raw, "2.5",
@@ -92,7 +92,7 @@ final class CodegenWireFormatTests: XCTestCase {
 
     func testNumberField_negative() throws {
         let (doc, _) = try persist(TaskRecord(
-            id: "wf-num-neg", priority: -7.25, title: "x"
+            id: "wf-num-neg", title: "x", priority: -7.25
         ))
         let raw = try readRawField(doc: doc, modelName: "tasks", recordId: "wf-num-neg", field: "priority")
         XCTAssertEqual(raw, "-7.25",
@@ -101,14 +101,14 @@ final class CodegenWireFormatTests: XCTestCase {
 
     func testBooleanField_encodesAsBareLiteral() throws {
         let (doc, _) = try persist(CrashTestRecord(
-            id: "wf-bool-t", active: true, requiredTags: []
+            id: "wf-bool-t", requiredTags: [], active: true
         ))
         let raw = try readRawField(doc: doc, modelName: "crashTest", recordId: "wf-bool-t", field: "active")
         XCTAssertEqual(raw, "true",
                        "boolean true should encode as the bare 'true' literal (no quotes)")
 
         let (doc2, _) = try persist(CrashTestRecord(
-            id: "wf-bool-f", active: false, requiredTags: []
+            id: "wf-bool-f", requiredTags: [], active: false
         ))
         let raw2 = try readRawField(doc: doc2, modelName: "crashTest", recordId: "wf-bool-f", field: "active")
         XCTAssertEqual(raw2, "false",
@@ -121,8 +121,8 @@ final class CodegenWireFormatTests: XCTestCase {
         // via `.asDateString` on `PrimitiveValue`.
         let (doc, _) = try persist(TaskRecord(
             id: "wf-date",
-            createdAt: "2026-04-27T12:34:56Z",
-            title: "x"
+            title: "x",
+            createdAt: "2026-04-27T12:34:56Z"
         ))
         let raw = try readRawField(doc: doc, modelName: "tasks", recordId: "wf-date", field: "createdAt")
         XCTAssertEqual(raw, "\"2026-04-27T12:34:56Z\"",

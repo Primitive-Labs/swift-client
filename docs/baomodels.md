@@ -180,7 +180,8 @@ let all = try await multi.query(["completed": false])
 ## What's in / out of v1
 
 - **In:** TOML codegen, `TypedModel<T>` CRUD, `DynamicModel` full surface, three relationship types, multi-doc indexing, Mongo-style filters, sort, cursor pagination, batch `Include`, observers.
-- **Out for v1:** `update`/`queryOne`/`findByUnique` on `TypedModel<T>` (use `model.dynamic.*`), function defaults in TOML, `refersToMany` relationship type.
+- **In (codegen `Model.*` facade):** the cross-document static facade now mirrors the JS client's `findByUnique(constraint, value)`, `queryOne(filter, options)`, and upsert (`save(in:upsertOn:)`) — backed by the client's `findByUniqueShared` / `queryOneShared` / `upsertShared` shims over `MultiDocModel`/`DynamicModel`.
+- **Out for v1:** `update`/`queryOne`/`findByUnique` on `TypedModel<T>` specifically (use the codegen facade above, or `model.dynamic.*`), function defaults in TOML, `refersToMany` relationship type.
 
 See [`exclusions-v1.md`](exclusions-v1.md).
 

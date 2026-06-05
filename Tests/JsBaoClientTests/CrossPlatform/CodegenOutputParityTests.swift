@@ -118,8 +118,16 @@ final class CodegenOutputParityTests: XCTestCase {
         let swiftFiles = try listFiles(in: swiftOutDir, ext: ".swift")
         let tsFiles    = try listFiles(in: tsOutDir,    ext: ".generated.ts")
 
+        // The Swift codegen also emits a `GeneratedModels.swift`
+        // registration barrel (the analogue of the TS `index.ts`, which
+        // the `.generated.ts` filter above already excludes). Drop it
+        // before the one-file-per-model comparison.
+        let swiftModelFiles = swiftFiles
+            .map { $0.lastPathComponent }
+            .filter { $0 != "GeneratedModels.swift" }
+
         XCTAssertEqual(
-            Set(swiftFiles.map { $0.lastPathComponent }),
+            Set(swiftModelFiles),
             Set(Self.expectedModels.map { "\($0.className).swift" }),
             "Swift codegen should produce one <ClassName>.swift per model"
         )

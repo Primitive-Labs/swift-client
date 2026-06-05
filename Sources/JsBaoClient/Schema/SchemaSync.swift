@@ -158,6 +158,12 @@ public enum SchemaSync {
         if desc.required   { setScalar(fieldMeta, key: "required",   value: true, tx: tx) }
         if desc.autoAssign { setScalar(fieldMeta, key: "autoAssign", value: true, tx: tx) }
 
+        // Auto-stamp policy — mirrors js-bao `metaSync.ts`
+        // (`if (fieldOpts.autoStamp) setIfChanged(fieldMeta, "autoStamp", ...)`).
+        if let autoStamp = desc.autoStamp {
+            setScalar(fieldMeta, key: "autoStamp", value: autoStamp.rawValue, tx: tx)
+        }
+
         if let maxLength = desc.maxLength {
             setScalar(fieldMeta, key: "maxLength", value: Double(maxLength), tx: tx)
         }

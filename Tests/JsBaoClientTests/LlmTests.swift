@@ -23,9 +23,8 @@ final class LlmTests: XCTestCase {
     func testModelsReturnsModelsOrClearError() async throws {
         do {
             let res = try await client.llm.models()
-            let models = res["models"] as? [Any] ?? []
-            XCTAssertGreaterThan(models.count, 0)
-            XCTAssertNotNil(res["defaultModel"])
+            XCTAssertGreaterThan(res.models.count, 0)
+            XCTAssertFalse(res.defaultModel.isEmpty, "Expected a non-empty default model")
         } catch {
             // If upstream key is not configured, we get an error
             let msg = String(describing: error)
@@ -38,7 +37,7 @@ final class LlmTests: XCTestCase {
 
     func testChatValidatesInput() async throws {
         do {
-            _ = try await client.llm.chat(options: ["messages": []])
+            _ = try await client.llm.chat(options: LlmChatOptions(messages: []))
             XCTFail("Should have thrown for empty messages")
         } catch {
             let msg = String(describing: error)
@@ -52,17 +51,16 @@ final class LlmTests: XCTestCase {
     /// Ported from JS: "llm.chat() returns assistant message when upstream key present (or clear error otherwise)"
     func testChatReturnsAssistantMessageOrClearError() async throws {
         do {
-            let result = try await client.llm.chat(options: [
-                "messages": [
-                    ["role": "system", "content": "Reply concisely."],
-                    ["role": "user", "content": "Write a haiku about primitive food."],
+            let result = try await client.llm.chat(options: LlmChatOptions(
+                messages: [
+                    ChatMessage(role: "system", text: "Reply concisely."),
+                    ChatMessage(role: "user", text: "Write a haiku about primitive food."),
                 ],
-                "temperature": 0.3,
-            ])
+                temperature: 0.3
+            ))
 
-            XCTAssertEqual(result["role"] as? String, "assistant")
-            let content = result["content"]
-            XCTAssertNotNil(content, "Expected content in response")
+            XCTAssertEqual(result.role, "assistant")
+            XCTAssertNotNil(result.content, "Expected content in response")
         } catch {
             // If upstream key is not configured or upstream returns an error
             let msg = String(describing: error)
@@ -77,10 +75,10 @@ final class LlmTests: XCTestCase {
 
     func testChatReturnsErrorForInvalidModel() async throws {
         do {
-            _ = try await client.llm.chat(options: [
-                "model": "not/a-real-model",
-                "messages": [["role": "user", "content": "Hello"]],
-            ])
+            _ = try await client.llm.chat(options: LlmChatOptions(
+                model: "not/a-real-model",
+                messages: [ChatMessage(role: "user", text: "Hello")]
+            ))
             XCTFail("Should have thrown for invalid model")
         } catch {
             // Either missing API key or invalid model error

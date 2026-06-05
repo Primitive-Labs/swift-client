@@ -34,27 +34,27 @@ final class BlobTests: XCTestCase {
         let blobId = uploadResult.blobId
         XCTAssertFalse(blobId.isEmpty)
 
-        // List
-        let items = try await blobContext.list()
-        XCTAssertGreaterThanOrEqual(items.count, 1)
-        XCTAssertTrue(items.contains { ($0["blobId"] as? String) == blobId })
+        // List — typed page (`items` + optional `cursor`)
+        let page = try await blobContext.list()
+        XCTAssertGreaterThanOrEqual(page.items.count, 1)
+        XCTAssertTrue(page.items.contains { $0.blobId == blobId })
 
-        // Get
+        // Get — typed `BlobInfo`
         let meta = try await blobContext.get(blobId: blobId)
-        XCTAssertEqual(meta["blobId"] as? String, blobId)
-        XCTAssertEqual(meta["filename"] as? String, "test.txt")
+        XCTAssertEqual(meta.blobId, blobId)
+        XCTAssertEqual(meta.filename, "test.txt")
 
         // Download URL
         let url = blobContext.downloadUrl(blobId: blobId, disposition: .attachment)
         XCTAssertTrue(url.contains("/blobs/\(blobId)/download"))
 
-        // Delete
+        // Delete — typed `{ deleted }`
         let deleteResult = try await blobContext.delete(blobId: blobId)
-        XCTAssertEqual(deleteResult["deleted"] as? Bool, true)
+        XCTAssertTrue(deleteResult.deleted)
 
         // Verify deleted
-        let itemsAfter = try await blobContext.list()
-        XCTAssertFalse(itemsAfter.contains { ($0["blobId"] as? String) == blobId })
+        let pageAfter = try await blobContext.list()
+        XCTAssertFalse(pageAfter.items.contains { $0.blobId == blobId })
     }
 
     func testUploadAndReadBlobData() async throws {
@@ -94,13 +94,41 @@ final class BlobTests: XCTestCase {
 
         // Blobs should be gone (or at least the document is inaccessible)
         do {
-            let items = try await blobContext.list()
+            let page = try await blobContext.list()
             // If we can still list, blobs should be empty
-            XCTAssertTrue(items.isEmpty || !items.contains { ($0["blobId"] as? String) == uploadResult.blobId })
+            XCTAssertTrue(page.items.isEmpty || !page.items.contains { $0.blobId == uploadResult.blobId })
         } catch {
             // Expected: document not found
             let msg = String(describing: error)
             XCTAssertTrue(msg.contains("404") || msg.contains("not found"))
         }
+    }
+
+    /// `downloadUrl` honors `disposition` and the RFC 5987 `attachmentFilename`
+    /// override — parity with JS `BlobDownloadUrlParams`. Synchronous, no server.
+    func testDownloadUrlAttachmentFilename() {
+        let blobContext = client.documents.blobs(documentId: documentId)
+        let url = blobContext.downloadUrl(
+            blobId: "blob123",
+            disposition: .attachment,
+            attachmentFilename: "my report.pdf"
+        )
+        XCTAssertTrue(url.contains("disposition=attachment"))
+        // RFC 5987 ext-value: UTF-8''<pct-encoded>, space encoded as %20.
+        XCTAssertTrue(url.contains("attachmentFilename=UTF-8''my%20report.pdf"))
+    }
+
+    /// The upload-queue facade is exposed on the per-document context and is
+    /// scoped to this document. With no queued uploads, `uploads()` is empty and
+    /// pause/resume are no-ops returning `false`. Synchronous, no server.
+    func testUploadQueueFacadeScoping() {
+        let blobContext = client.documents.blobs(documentId: documentId)
+        XCTAssertTrue(blobContext.uploads().isEmpty)
+        XCTAssertFalse(blobContext.pauseUpload(blobId: "missing"))
+        XCTAssertFalse(blobContext.resumeUpload(blobId: "missing"))
+        // pauseAll/resumeAll are safe to call with an empty queue.
+        blobContext.pauseAll()
+        blobContext.resumeAll()
+        XCTAssertTrue(blobContext.uploads().isEmpty)
     }
 }

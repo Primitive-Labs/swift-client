@@ -45,10 +45,10 @@ final class CodegenAcceptanceTests: XCTestCase {
 
         let original = TaskRecord(
             id: "t1",
-            createdAt: "2026-04-27T00:00:00Z",
+            title: "Ship it",
             priority: 3,
             tags: ["urgent", "backend"],
-            title: "Ship it"
+            createdAt: "2026-04-27T00:00:00Z"
         )
         _ = try model.create(original)
 

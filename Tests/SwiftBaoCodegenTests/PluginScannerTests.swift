@@ -185,17 +185,23 @@ final class PluginScannerTests: XCTestCase {
         file: StaticString = #file,
         line: UInt = #line
     ) throws {
+        // `expectedFiles` lists the per-model outputs. The tool (and the
+        // plugin's predictor) also always emit the registration barrel,
+        // so fold it into the expected set here.
+        let barrel = "GeneratedModels.swift"
         let expected = Set(expectedFiles)
+        let expectedWithBarrel = expected.union([barrel])
 
-        // 1. Mirrored scanner.
+        // 1. Mirrored scanner (predicts model files + barrel).
         let scannerOut = Set(MirroredPluginScanner.predict(toml: toml))
         XCTAssertEqual(
-            scannerOut, expected,
+            scannerOut, expectedWithBarrel,
             "mirrored plugin scanner produced wrong file set",
             file: file, line: line
         )
 
-        // 2. Real codegen parser.
+        // 2. Real codegen parser yields the per-model file set only —
+        //    the barrel is added by the CLI driver, not the parser.
         let schemas = try TomlParser.parse(tomlString: toml, swiftNameSuffix: "Record")
         let parserOut = Set(schemas.map { "\($0.swiftName).swift" })
         XCTAssertEqual(
@@ -204,10 +210,12 @@ final class PluginScannerTests: XCTestCase {
             file: file, line: line
         )
 
-        // 3. Belt-and-suspenders: the two MUST agree on the set.
+        // 3. Belt-and-suspenders: scanner == parser model files + barrel.
+        //    This is the drift the plugin would surface as 'missing
+        //    output' at user build time.
         XCTAssertEqual(
-            scannerOut, parserOut,
-            "mirrored plugin scanner and real parser disagree — this is the drift the plugin would surface as 'missing output' at user build time",
+            scannerOut, parserOut.union([barrel]),
+            "mirrored plugin scanner and real parser disagree",
             file: file, line: line
         )
     }
@@ -265,10 +273,14 @@ private enum MirroredPluginScanner {
         }
 
         let suffix = "Record"
-        return modelOrder.map { name in
+        var files = modelOrder.map { name -> String in
             let swiftName = classNameByModel[name] ?? (pascalCase(name) + suffix)
             return "\(swiftName).swift"
         }
+        // The tool always emits the registration barrel alongside the
+        // per-model files — mirror that here.
+        files.append("GeneratedModels.swift")
+        return files
     }
 
     private static func parseClassNameOverride(_ line: String) -> String? {

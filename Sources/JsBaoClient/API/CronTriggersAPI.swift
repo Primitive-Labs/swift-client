@@ -5,6 +5,14 @@ import Foundation
 /// Mirrors the JS `CronTriggersAPI` — schedule workflow runs on a
 /// standard 5-field cron expression. Triggers are stored as app-scoped
 /// rows; each one binds a Durable Object that owns the next-fire alarm.
+///
+/// All methods are typed against `api/cronTriggersApi.d.ts`: typed inputs
+/// (`CreateCronTriggerParams` / `UpdateCronTriggerParams`) encode to the
+/// request body via `JSONCoding.jsonObject`, and responses decode into
+/// `CronTriggerInfo` / `CronTriggerListResult` / `CronTriggerDeleteResult` /
+/// `CronTriggerTestResult` via `JSONCoding.decode` — which **throws** on a
+/// shape mismatch rather than silently coercing a malformed body to an empty
+/// `[:]` as the previous `[String: Any]` surface did (#954, #991).
 public final class CronTriggersAPI: @unchecked Sendable {
     private let makeRequest: (String, String, Any?) async throws -> Any
 
@@ -13,90 +21,75 @@ public final class CronTriggersAPI: @unchecked Sendable {
     }
 
     /// List all cron triggers for the current app. Archived triggers
-    /// are excluded. Response shape: `{ "items": [...] }`.
-    public func list() async throws -> [String: Any] {
+    /// are excluded. Response envelope: `{ "items": [...] }`.
+    public func list() async throws -> CronTriggerListResult {
         let result = try await makeRequest("GET", "/cron-triggers", nil)
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CronTriggerListResult.self, from: result)
     }
 
     /// Get a cron trigger by id, including runtime state from the
     /// associated Durable Object (`scheduledAlarm` / `scheduledAlarmAt`
-    /// fields populate `result["runtime"]`).
-    public func get(triggerId: String) async throws -> [String: Any] {
+    /// populate `result.runtime`).
+    public func get(triggerId: String) async throws -> CronTriggerInfo {
         let result = try await makeRequest(
             "GET", "/cron-triggers/\(triggerId)", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CronTriggerInfo.self, from: result)
     }
 
     /// Create a new cron trigger. The Durable Object is bound and the
     /// first alarm is scheduled as part of this call.
-    ///
-    /// - Parameter params: Expected keys:
-    ///   - `triggerKey` (String, required): per-app identifier.
-    ///   - `displayName` (String, required)
-    ///   - `cron` (String, required): 5-field cron expression.
-    ///   - `workflowKey` (String, required): workflow to invoke on fire.
-    ///   - `timezone` (String, optional): IANA name; defaults to `"UTC"`.
-    ///   - `description` (String, optional)
-    ///   - `overlapPolicy` (String, optional): `"skip"` (default) or
-    ///     `"allow"` for what to do if a prior run is still active.
-    ///   - `rootInput` (Any, optional): root workflow input.
-    ///   - `inputMapping` (Any, optional): supports `{{now}}` template.
-    public func create(params: [String: Any]) async throws -> [String: Any] {
-        let result = try await makeRequest("POST", "/cron-triggers", params)
-        return result as? [String: Any] ?? [:]
+    public func create(params: CreateCronTriggerParams) async throws -> CronTriggerInfo {
+        let body = try JSONCoding.jsonObject(from: params)
+        let result = try await makeRequest("POST", "/cron-triggers", body)
+        return try JSONCoding.decode(CronTriggerInfo.self, from: result)
     }
 
     /// Update one or more fields. Schedule-relevant changes (`cron`,
     /// `timezone`, `state`) propagate to the Durable Object.
-    ///
-    /// - Parameter params: Any subset of `displayName`, `description`,
-    ///   `cron`, `timezone`, `workflowKey`, `overlapPolicy`, `rootInput`,
-    ///   `inputMapping`, `state` (`"active" | "paused" | "archived"`).
     public func update(
         triggerId: String,
-        params: [String: Any]
-    ) async throws -> [String: Any] {
+        params: UpdateCronTriggerParams
+    ) async throws -> CronTriggerInfo {
+        let body = try JSONCoding.jsonObject(from: params)
         let result = try await makeRequest(
-            "PUT", "/cron-triggers/\(triggerId)", params
+            "PUT", "/cron-triggers/\(triggerId)", body
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CronTriggerInfo.self, from: result)
     }
 
     /// Soft-delete (archive) a cron trigger and cancel its pending alarm.
-    public func delete(triggerId: String) async throws -> [String: Any] {
+    public func delete(triggerId: String) async throws -> CronTriggerDeleteResult {
         let result = try await makeRequest(
             "DELETE", "/cron-triggers/\(triggerId)", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CronTriggerDeleteResult.self, from: result)
     }
 
     /// Pause a trigger. The scheduled alarm is cancelled and no further
     /// runs are started until the trigger is resumed.
-    public func pause(triggerId: String) async throws -> [String: Any] {
+    public func pause(triggerId: String) async throws -> CronTriggerInfo {
         let result = try await makeRequest(
             "POST", "/cron-triggers/\(triggerId)/pause", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CronTriggerInfo.self, from: result)
     }
 
-    /// Resume a paused or error_paused trigger. Clears `lastError` and
+    /// Resume a paused or `error_paused` trigger. Clears `lastError` and
     /// reschedules the next fire.
-    public func resume(triggerId: String) async throws -> [String: Any] {
+    public func resume(triggerId: String) async throws -> CronTriggerInfo {
         let result = try await makeRequest(
             "POST", "/cron-triggers/\(triggerId)/resume", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CronTriggerInfo.self, from: result)
     }
 
     /// Fire the associated workflow immediately without affecting the
-    /// schedule. Response shape:
-    /// `{ "started": Bool, "runId"?: String, "instanceId"?: String, "error"?: String }`.
-    public func test(triggerId: String) async throws -> [String: Any] {
+    /// schedule. Response: `{ started, runId?, instanceId?, error? }`.
+    public func test(triggerId: String) async throws -> CronTriggerTestResult {
         let result = try await makeRequest(
             "POST", "/cron-triggers/\(triggerId)/test", nil
         )
-        return result as? [String: Any] ?? [:]
+        return try JSONCoding.decode(CronTriggerTestResult.self, from: result)
     }
 }

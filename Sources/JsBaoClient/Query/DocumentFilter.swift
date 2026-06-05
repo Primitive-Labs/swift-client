@@ -109,10 +109,22 @@ public struct AggregateSort: Sendable {
     }
 }
 
+/// A group-by clause: a plain field, or a StringSet-membership check
+/// (`{ field, contains }`). Mirrors js-bao's `GroupByField`
+/// (`string | StringSetMembership`). A bare string literal is a field,
+/// so existing `groupBy: ["category"]` call sites keep working; a
+/// stringset *field* name groups by member value (facet), and
+/// `.stringSetMembership` groups by whether the set contains a value.
+public enum AggregateGroupBy: Sendable, Equatable, ExpressibleByStringLiteral {
+    case field(String)
+    case stringSetMembership(field: String, contains: String)
+    public init(stringLiteral value: String) { self = .field(value) }
+}
+
 /// Options for aggregate operations.
 public struct AggregateOptions {
     /// Fields to group by
-    public var groupBy: [String]
+    public var groupBy: [AggregateGroupBy]
     /// Aggregation operations to perform
     public var operations: [AggregateOperation]
     /// Optional filter to apply before aggregating
@@ -124,7 +136,7 @@ public struct AggregateOptions {
     public var limit: Int?
 
     public init(
-        groupBy: [String] = [],
+        groupBy: [AggregateGroupBy] = [],
         operations: [AggregateOperation],
         filter: DocumentFilter? = nil,
         sort: AggregateSort? = nil,

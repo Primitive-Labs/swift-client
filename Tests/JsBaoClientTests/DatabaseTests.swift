@@ -16,12 +16,12 @@ final class DatabaseTests: XCTestCase {
         client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
 
         // Create a database
-        let db = try await client.databases.create(params: [
-            "title": "Metadata Test DB",
-            "databaseType": "test-type",
-        ])
-        databaseId = db["databaseId"] as? String
-        XCTAssertNotNil(databaseId, "Failed to create database")
+        let db = try await client.databases.create(params: CreateDatabaseParams(
+            title: "Metadata Test DB",
+            databaseType: "test-type"
+        ))
+        databaseId = db.databaseId
+        XCTAssertFalse(databaseId.isEmpty, "Failed to create database")
     }
 
     override func tearDown() async throws {
@@ -38,10 +38,10 @@ final class DatabaseTests: XCTestCase {
             "active": true,
         ])
 
-        let metadata = result["metadata"] as? [String: Any]
-        XCTAssertEqual(metadata?["color"] as? String, "blue")
-        XCTAssertEqual(metadata?["count"] as? Int, 42)
-        XCTAssertEqual(metadata?["active"] as? Bool, true)
+        let metadata = result.metadata
+        XCTAssertEqual(metadata?["color"]?.stringValue, "blue")
+        XCTAssertEqual(metadata?["count"]?.numberValue, 42)
+        XCTAssertEqual(metadata?["active"]?.boolValue, true)
     }
 
     func testMergeWithExistingMetadata() async throws {
@@ -54,10 +54,10 @@ final class DatabaseTests: XCTestCase {
             "label": "hello",
         ])
 
-        let metadata = result["metadata"] as? [String: Any]
-        XCTAssertEqual(metadata?["color"] as? String, "blue")
-        XCTAssertEqual(metadata?["count"] as? Int, 42)
-        XCTAssertEqual(metadata?["label"] as? String, "hello")
+        let metadata = result.metadata
+        XCTAssertEqual(metadata?["color"]?.stringValue, "blue")
+        XCTAssertEqual(metadata?["count"]?.numberValue, 42)
+        XCTAssertEqual(metadata?["label"]?.stringValue, "hello")
     }
 
     func testRemoveKeysSetToNull() async throws {
@@ -67,12 +67,12 @@ final class DatabaseTests: XCTestCase {
         ])
 
         let result = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
-            "color": NSNull(),
+            "color": .null,
         ])
 
-        let metadata = result["metadata"] as? [String: Any]
+        let metadata = result.metadata
         XCTAssertNil(metadata?["color"])
-        XCTAssertEqual(metadata?["count"] as? Int, 42)
+        XCTAssertEqual(metadata?["count"]?.numberValue, 42)
     }
 
     func testReflectMetadataInGet() async throws {
@@ -82,23 +82,23 @@ final class DatabaseTests: XCTestCase {
         ])
 
         let db = try await client.databases.get(databaseId: databaseId)
-        let metadata = db["metadata"] as? [String: Any]
-        XCTAssertEqual(metadata?["color"] as? String, "red")
-        XCTAssertEqual(metadata?["count"] as? Int, 7)
+        let metadata = db.metadata
+        XCTAssertEqual(metadata?["color"]?.stringValue, "red")
+        XCTAssertEqual(metadata?["count"]?.numberValue, 7)
     }
 
     // MARK: - CRUD
 
     func testCreateAndGetDatabase() async throws {
-        let db = try await client.databases.create(params: [
-            "title": "CRUD Test DB",
-            "databaseType": "crud-type",
-        ])
-        let dbId = db["databaseId"] as? String
-        XCTAssertNotNil(dbId)
+        let db = try await client.databases.create(params: CreateDatabaseParams(
+            title: "CRUD Test DB",
+            databaseType: "crud-type"
+        ))
+        let dbId = db.databaseId
+        XCTAssertFalse(dbId.isEmpty)
 
-        let fetched = try await client.databases.get(databaseId: dbId!)
-        XCTAssertEqual(fetched["title"] as? String, "CRUD Test DB")
+        let fetched = try await client.databases.get(databaseId: dbId)
+        XCTAssertEqual(fetched.title, "CRUD Test DB")
     }
 
     func testListDatabases() async throws {
@@ -107,21 +107,21 @@ final class DatabaseTests: XCTestCase {
     }
 
     func testUpdateDatabase() async throws {
-        let result = try await client.databases.update(databaseId: databaseId, params: [
-            "title": "Updated Title",
-        ])
-        XCTAssertEqual(result["title"] as? String, "Updated Title")
+        let result = try await client.databases.update(databaseId: databaseId, params: UpdateDatabaseParams(
+            title: "Updated Title"
+        ))
+        XCTAssertEqual(result.title, "Updated Title")
     }
 
     func testDeleteDatabase() async throws {
-        let db = try await client.databases.create(params: [
-            "title": "Delete Me",
-            "databaseType": "delete-type",
-        ])
-        let dbId = db["databaseId"] as! String
+        let db = try await client.databases.create(params: CreateDatabaseParams(
+            title: "Delete Me",
+            databaseType: "delete-type"
+        ))
+        let dbId = db.databaseId
 
         let result = try await client.databases.delete(databaseId: dbId)
-        XCTAssertNotNil(result)
+        XCTAssertTrue(result.success)
     }
 
     // MARK: - Permissions
@@ -129,17 +129,17 @@ final class DatabaseTests: XCTestCase {
     func testGrantAndRevokePermission() async throws {
         let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member")
 
-        let grantResult = try await client.databases.grantPermission(databaseId: databaseId, params: [
-            "userId": user2.userId,
-            "permission": "manager",
-        ])
-        XCTAssertNotNil(grantResult)
+        let grantResult = try await client.databases.grantPermission(databaseId: databaseId, params: GrantPermissionParams(
+            userId: user2.userId,
+            permission: "manager"
+        ))
+        XCTAssertEqual(grantResult.userId, user2.userId)
 
         let permissions = try await client.databases.listPermissions(databaseId: databaseId)
-        let user2Perm = permissions.first { ($0["userId"] as? String) == user2.userId }
+        let user2Perm = permissions.first { $0.userId == user2.userId }
         XCTAssertNotNil(user2Perm)
 
         let revokeResult = try await client.databases.revokePermission(databaseId: databaseId, userId: user2.userId)
-        XCTAssertNotNil(revokeResult)
+        XCTAssertTrue(revokeResult.success)
     }
 }
