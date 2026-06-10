@@ -1275,6 +1275,12 @@ public final class JsBaoClient: @unchecked Sendable {
                     let resumed = ResumedFlag()
                     let resumedLock = NSLock()
 
+                    func isResumed() -> Bool {
+                        resumedLock.lock()
+                        defer { resumedLock.unlock() }
+                        return resumed.value
+                    }
+
                     func resumeOnce() {
                         resumedLock.lock()
                         let alreadyResumed = resumed.value
@@ -1292,6 +1298,29 @@ public final class JsBaoClient: @unchecked Sendable {
                             resumeOnce()
                         }
                     }
+
+                    // Retry tick — mirrors js-bao's `waitForAvailability`
+                    // (350ms `setInterval` → re-`sendSyncStep1`). A freshly
+                    // `documents.create`'d doc is `pendingCreate` (committed to
+                    // the server in the background), so the initial `syncStep1`
+                    // above reaches the server before the doc exists there — no
+                    // `syncComplete` comes back. Re-send `syncStep1` every 350ms
+                    // until the background commit lands and the server can
+                    // answer (or the timeout below fires). Without this, a
+                    // `.network` open of a just-created doc always burned the
+                    // full `availabilityWaitMs` (~30s) regardless of how fast
+                    // the commit actually completed.
+                    Task { [weak self] in
+                        while !isResumed() {
+                            try? await Task.sleep(nanoseconds: 350 * 1_000_000)
+                            if isResumed() { break }
+                            guard let self else { break }
+                            if self.isOnline() {
+                                await self.startNetworkSync(documentId: syncDocId)
+                            }
+                        }
+                    }
+
                     // Bound the wait by `availabilityWaitMs` (JS parity):
                     // resolve with whatever local state exists once the
                     // network-availability budget is exhausted. A value of

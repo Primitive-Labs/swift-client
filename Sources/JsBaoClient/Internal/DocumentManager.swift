@@ -672,9 +672,26 @@ public final class DocumentManager: @unchecked Sendable {
         // rather than dropping it. Mirrors js-bao (#673).
         metadata.docMetadata = docMetadata
 
+        // A freshly-created doc is immediately "open" (added to `openDocs`
+        // below), so a subsequent `openDocument` hits the fast-path and never
+        // runs `_openDocumentImpl` — which is where the per-doc sync protocol
+        // and awareness entry are normally built. Set up both here so a
+        // created-then-opened doc behaves like one opened via the full path:
+        //   • Sync protocol: without it `buildSyncStep1Message` returns nil,
+        //     `startNetworkSync` sends nothing, and a `.network` open of the
+        //     new doc stalls until the 30s `availabilityWaitMs` timeout
+        //     (#852 local-first-create regression).
+        //   • Awareness entry: without it `setLocalAwarenessState` / remote
+        //     awareness applies silently no-op (presence/cursors).
+        // (`docPersistence` is intentionally not built here — it late-binds on
+        // the first save, mirroring `_openDocumentImpl`'s deferred path.)
+        let syncProtocol = YProtocol(document: doc)
+
         lock.lock()
         openDocs[documentId] = doc
         docSyncStates[documentId] = false
+        syncProtocols[documentId] = syncProtocol
+        docAwareness[documentId] = AwarenessEntry()
         metadataIndex[documentId] = metadata
         if localOnly {
             localOnlyDocs.insert(documentId)
