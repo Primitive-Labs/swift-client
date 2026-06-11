@@ -1277,6 +1277,16 @@ public final class JsBaoClient: @unchecked Sendable {
         ))
     }
 
+    /// In-flight online-auth handoff, for coalescing. Concurrent
+    /// `.online` entries (two quick `setNetworkMode(.online)` calls, or
+    /// `setNetworkMode(.online)` racing `goOnline()`) await the same
+    /// task instead of running two handoffs — the refresh is already
+    /// single-flight in `AuthController` and `connect()` tolerates
+    /// concurrent entry, but a doubled *failed* handoff would emit
+    /// `.authOnlineRequired` twice. JS can't race here (its handoff
+    /// runs inline in `setNetworkMode`).
+    private var pendingOnlineHandoff: Task<Void, Never>?
+
     /// The `setNetworkMode("online")` auth handoff (#1059 / #1113),
     /// mirroring JS: with no token, attempt a refresh before connecting;
     /// on failure emit `.authOnlineRequired`, revert to offline
@@ -1284,6 +1294,25 @@ public final class JsBaoClient: @unchecked Sendable {
     /// and disconnect — never connect without a token. With a usable
     /// token, just connect.
     internal func runOnlineAuthHandoff() async {
+        lock.lock()
+        if let inFlight = pendingOnlineHandoff {
+            lock.unlock()
+            await inFlight.value
+            return
+        }
+        let task = Task<Void, Never> { [weak self] in
+            await self?.runOnlineAuthHandoffImpl()
+        }
+        pendingOnlineHandoff = task
+        lock.unlock()
+
+        await task.value
+        lock.lock()
+        pendingOnlineHandoff = nil
+        lock.unlock()
+    }
+
+    private func runOnlineAuthHandoffImpl() async {
         // The mode may have been flipped away (e.g. an immediate
         // `setNetworkMode(.offline)`) before this fire-and-forget task
         // ran — JS runs the handoff inline so it can't race like this.
@@ -1380,8 +1409,6 @@ public final class JsBaoClient: @unchecked Sendable {
         // later via `startNetworkSync(documentId:)`. Mirrors JS `open`'s
         // `deferNetworkSync` short-circuit.
         if options.enableNetworkSync && !options.deferNetworkSync && isOnline() {
-            await startNetworkSync(documentId: documentId)
-
             // Decide whether to block on the sync handshake before returning
             // (JS parity — JsBaoClient.ts `canResolveEarly`/`needsNetworkWait`):
             //   .network                                   → always wait
@@ -1393,7 +1420,14 @@ public final class JsBaoClient: @unchecked Sendable {
             // open on a second device, fresh install) returned an EMPTY
             // YDocument immediately and callers raced the `.sync` event —
             // surfacing as "Story not found" flashes in StoryLens.
+            //
+            // Read `ydocHasData` BEFORE kicking off sync, matching the JS
+            // evaluation order (`canResolveEarly` decides `hasLocal` first):
+            // `startNetworkSync` is an await suspension, and a fast server
+            // `syncComplete` landing in that window would flip the answer
+            // to "has data" and skip the wait.
             let effectiveHasLocal = documentManager.ydocHasData(documentId)
+            await startNetworkSync(documentId: documentId)
             let needsNetworkWait =
                 options.waitForLoad == .network
                 || (options.waitForLoad == .localIfAvailableElseNetwork && !effectiveHasLocal)
@@ -1598,28 +1632,36 @@ public final class JsBaoClient: @unchecked Sendable {
 
         let result: (T, [UInt8]) = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                // Use raw YrsDoc to bypass syncQueue entirely
-                let rawDoc = doc.document
+                // Use raw YrsDoc to bypass syncQueue entirely. Raw access
+                // still must hold the doc's FFI lock — an observer
+                // registration (model connect, doc open) on another thread
+                // while one of these transactions is live panics in yrs and
+                // aborts the process (#1126).
+                let payload: (T, [UInt8]) = doc.withExclusiveAccess {
+                    let rawDoc = doc.document
 
-                // 1. Get state vector before write
-                let svTxn = rawDoc.transact(origin: nil)
-                let svBefore = svTxn.transactionStateVector()
-                svTxn.free()
+                    // 1. Get state vector before write
+                    let svTxn = rawDoc.transact(origin: nil)
+                    let svBefore = svTxn.transactionStateVector()
+                    svTxn.free()
 
-                // 2. Apply changes
-                let writeTxn = rawDoc.transact(origin: nil)
-                let result = changes(writeTxn)
-                writeTxn.free()
+                    // 2. Apply changes
+                    let writeTxn = rawDoc.transact(origin: nil)
+                    let result = changes(writeTxn)
+                    writeTxn.free()
 
-                // 3. Compute diff
-                let diffTxn = rawDoc.transact(origin: nil)
-                var update: [UInt8] = []
-                do {
-                    update = try diffTxn.transactionEncodeStateAsUpdateFromSv(stateVector: svBefore)
-                } catch {}
-                diffTxn.free()
+                    // 3. Compute diff
+                    let diffTxn = rawDoc.transact(origin: nil)
+                    var update: [UInt8] = []
+                    do {
+                        update = try diffTxn.transactionEncodeStateAsUpdateFromSv(stateVector: svBefore)
+                    } catch {}
+                    diffTxn.free()
 
-                continuation.resume(returning: (result, update))
+                    return (result, update)
+                }
+
+                continuation.resume(returning: payload)
             }
         }
 

@@ -269,6 +269,38 @@ final class SubscribeTests: XCTestCase {
         unsub()
     }
 
+    // MARK: - Cross-doc nesting (doc-scoped activeTx)
+
+    /// A write to a model bound to doc B nested inside a `transact` on
+    /// doc A must open B's **own** yrs transaction — the thread-local
+    /// active transaction is doc-scoped (#1116 review follow-up).
+    /// Reusing A's doc-bound `YrsTransaction` for B's branches would
+    /// misapply the mutations. Both writes must land, and B's
+    /// subscriber fires when B's own (inner) transaction commits.
+    func testCrossDocWriteInsideTransactUsesOwnTransaction() throws {
+        SchemaSync.clearCache()
+        let modelA = DynamicModel(doc: YDocument(), schema: schema)
+        SchemaSync.clearCache()
+        let modelB = DynamicModel(doc: YDocument(), schema: schema)
+
+        var bFired = 0
+        let unsubB = modelB.subscribe { bFired += 1 }
+
+        try modelA.transact {
+            _ = try modelA.create(id: "a1", values: ["label": .string("a")])
+            _ = try modelB.create(id: "b1", values: ["label": .string("b")])
+        }
+        modelA.awaitObserverDrain()
+        modelB.awaitObserverDrain()
+
+        XCTAssertNotNil(modelA.find(id: "a1"), "doc A write must land")
+        XCTAssertNotNil(modelB.find(id: "b1"),
+                        "doc B write nested in doc A's transact must land in doc B")
+        XCTAssertGreaterThanOrEqual(bFired, 1,
+                                    "doc B subscriber fires on its own commit")
+        unsubB()
+    }
+
     // MARK: - Helpers
 
     /// Swift's root-map / per-record observers dispatch async work

@@ -1045,11 +1045,13 @@ public final class DocumentManager: @unchecked Sendable {
                     delta.removed.append(clientId)
                 }
             } else if let state = rawState as? [String: Any] {
-                let isNew = entry.remoteStates[clientId] == nil
+                let previous = entry.remoteStates[clientId]
                 entry.remoteStates[clientId] = state
-                if isNew {
+                if previous == nil {
                     delta.added.append(clientId)
-                } else {
+                } else if !(previous! as NSDictionary).isEqual(to: state) {
+                    // A re-sent identical state is a no-op, matching the
+                    // JS awareness layer — don't report it in `updated`.
                     delta.updated.append(clientId)
                 }
             }
@@ -1319,10 +1321,16 @@ public final class DocumentManager: @unchecked Sendable {
         lock.unlock()
 
         // Get full document state as an update.
-        // Use raw YrsDoc to avoid blocking the cooperative thread pool on syncQueue.
-        let txn = doc.document.transact(origin: nil)
-        defer { txn.free() }
-        let state: [UInt8] = txn.transactionEncodeStateAsUpdate()
+        // Use raw YrsDoc to avoid blocking the cooperative thread pool on
+        // syncQueue — but bracket it with the doc's FFI lock so it can't
+        // overlap an observer registration or another transaction (#1126).
+        // The transaction is freed before the awaits below; only the
+        // encoded bytes escape the locked scope.
+        let state: [UInt8] = doc.withExclusiveAccess {
+            let txn = doc.document.transact(origin: nil)
+            defer { txn.free() }
+            return txn.transactionEncodeStateAsUpdate()
+        }
 
         // Resolve persistence lazily. `openDocument` wires `docPersistence`
         // up-front, but only if `offlineStore.getStorageProvider()` was

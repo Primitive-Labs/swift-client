@@ -127,7 +127,7 @@ public final class DynamicModel {
     /// right after `transactSync` returns. Outside a transaction it
     /// fires immediately.
     internal func notifyListenersAfterWrite() {
-        if Self.activeTx != nil {
+        if activeTx != nil {
             let dict = Thread.current.threadDictionary
             var pending = dict[Self.pendingNotifyKey] as? [DynamicModel] ?? []
             if !pending.contains(where: { $0 === self }) {
@@ -139,17 +139,26 @@ public final class DynamicModel {
         }
     }
 
-    /// Fire (and clear) every notification queued on this thread while
-    /// a write transaction was open. Called by the transaction wrappers
-    /// after their `transactSync` closes — i.e. after the yrs commit —
-    /// so subscriber callbacks observe fully-committed state and are
-    /// free to open new transactions (query, write, etc.).
-    fileprivate static func flushPendingNotifications() {
+    /// Fire (and clear) the notifications queued on this thread for
+    /// models bound to `docKey`'s doc. Called by the transaction
+    /// wrappers after their `transactSync` closes — i.e. after the yrs
+    /// commit — so subscriber callbacks observe fully-committed state
+    /// and are free to open new transactions (query, write, etc.).
+    /// Doc-scoped to match `activeTxByDoc`: a nested transaction on doc
+    /// B closing must not flush notifications queued under doc A's
+    /// still-open transaction.
+    fileprivate static func flushPendingNotifications(for docKey: ObjectIdentifier) {
         let dict = Thread.current.threadDictionary
         guard let pending = dict[pendingNotifyKey] as? [DynamicModel],
               !pending.isEmpty else { return }
-        dict.removeObject(forKey: pendingNotifyKey)
-        for model in pending { model.notifyListeners() }
+        let mine = pending.filter { $0.docIdentity == docKey }
+        let rest = pending.filter { $0.docIdentity != docKey }
+        if rest.isEmpty {
+            dict.removeObject(forKey: pendingNotifyKey)
+        } else {
+            dict[pendingNotifyKey] = rest
+        }
+        for model in mine { model.notifyListeners() }
     }
     /// Serial queue that drains observer-driven SQLite work. Observers
     /// fire from inside yrs's commit hook (RwLock held), so they can't
@@ -193,8 +202,34 @@ public final class DynamicModel {
     /// transaction wrapper after `transactSync` returns (#1116).
     fileprivate static let pendingNotifyKey = "JsBaoClient.DynamicModel.pendingNotify"
 
-    fileprivate static var activeTx: YrsTransaction? {
-        Thread.current.threadDictionary[activeTxKey] as? YrsTransaction
+    /// Open yrs transactions on this thread, keyed by the YDocument's
+    /// identity. **Doc-scoped, not global**: a YrsTransaction is bound to
+    /// one yrs doc, so a write to a model on doc B nested inside a
+    /// `transact` on doc A must open B's own transaction — reusing A's
+    /// would apply B's mutations through a transaction object belonging
+    /// to a different doc. Same-doc nesting (any model sharing the same
+    /// `YDocument` instance) still reuses the open transaction, which is
+    /// what dodges the yrs reentrant-RwLock deadlock.
+    fileprivate static var activeTxByDoc: [ObjectIdentifier: YrsTransaction] {
+        get {
+            Thread.current.threadDictionary[activeTxKey]
+                as? [ObjectIdentifier: YrsTransaction] ?? [:]
+        }
+        set {
+            if newValue.isEmpty {
+                Thread.current.threadDictionary.removeObject(forKey: activeTxKey)
+            } else {
+                Thread.current.threadDictionary[activeTxKey] = newValue
+            }
+        }
+    }
+
+    fileprivate var docIdentity: ObjectIdentifier { ObjectIdentifier(doc) }
+
+    /// The open transaction for **this model's doc** on the current
+    /// thread, if any.
+    fileprivate var activeTx: YrsTransaction? {
+        Self.activeTxByDoc[docIdentity]
     }
 
     /// Open a single yrs transaction spanning every write/read done
@@ -210,25 +245,23 @@ public final class DynamicModel {
     ///   all-or-nothing must track and undo manually.
     @discardableResult
     public func transact<T>(_ body: () throws -> T) throws -> T {
-        // Nested transact: reuse the outer tx, no new commit.
-        if Self.activeTx != nil {
+        // Nested transact on the same doc: reuse the outer tx, no new
+        // commit. A transact on a *different* doc opens its own.
+        if activeTx != nil {
             return try body()
         }
+        let docKey = docIdentity
         var result: Result<T, Error>!
         // `body` is non-escaping but `transactSync`'s closure wants
         // @escaping. Use withoutActuallyEscaping — the closure truly
         // doesn't escape past this call.
         withoutActuallyEscaping(body) { body in
             doc.transactSync { txn in
-                let dict = Thread.current.threadDictionary
-                let prev = dict[Self.activeTxKey]
-                dict[Self.activeTxKey] = txn
+                Self.activeTxByDoc[docKey] = txn
                 defer {
-                    if let prev = prev {
-                        dict[Self.activeTxKey] = prev
-                    } else {
-                        dict.removeObject(forKey: Self.activeTxKey)
-                    }
+                    var map = Self.activeTxByDoc
+                    map.removeValue(forKey: docKey)
+                    Self.activeTxByDoc = map
                 }
                 do { result = .success(try body()) }
                 catch { result = .failure(error) }
@@ -237,7 +270,7 @@ public final class DynamicModel {
         // Commit is done — deliver listener notifications queued
         // during the batch (even on a throw: yrs doesn't roll back,
         // so writes made before the throw ARE committed).
-        Self.flushPendingNotifications()
+        Self.flushPendingNotifications(for: docKey)
         return try result.get()
     }
 
@@ -246,19 +279,23 @@ public final class DynamicModel {
     /// publishes it via the thread-local so nested helpers (and the
     /// post-commit notification queue) see it.
     fileprivate func withTx<T>(_ body: (YrsTransaction) -> T) -> T {
-        if let existing = Self.activeTx {
+        if let existing = activeTx {
             return body(existing)
         }
+        let docKey = docIdentity
         var result: T!
         withoutActuallyEscaping(body) { body in
             doc.transactSync { txn in
-                let dict = Thread.current.threadDictionary
-                dict[Self.activeTxKey] = txn
-                defer { dict.removeObject(forKey: Self.activeTxKey) }
+                Self.activeTxByDoc[docKey] = txn
+                defer {
+                    var map = Self.activeTxByDoc
+                    map.removeValue(forKey: docKey)
+                    Self.activeTxByDoc = map
+                }
                 result = body(txn)
             }
         }
-        Self.flushPendingNotifications()
+        Self.flushPendingNotifications(for: docKey)
         return result
     }
 
@@ -267,20 +304,24 @@ public final class DynamicModel {
     fileprivate func withThrowingTx<T>(
         _ body: (YrsTransaction) throws -> T
     ) throws -> T {
-        if let existing = Self.activeTx {
+        if let existing = activeTx {
             return try body(existing)
         }
+        let docKey = docIdentity
         var result: Result<T, Error>!
         withoutActuallyEscaping(body) { body in
             doc.transactSync { txn in
-                let dict = Thread.current.threadDictionary
-                dict[Self.activeTxKey] = txn
-                defer { dict.removeObject(forKey: Self.activeTxKey) }
+                Self.activeTxByDoc[docKey] = txn
+                defer {
+                    var map = Self.activeTxByDoc
+                    map.removeValue(forKey: docKey)
+                    Self.activeTxByDoc = map
+                }
                 do { result = .success(try body(txn)) }
                 catch { result = .failure(error) }
             }
         }
-        Self.flushPendingNotifications()
+        Self.flushPendingNotifications(for: docKey)
         return try result.get()
     }
 
