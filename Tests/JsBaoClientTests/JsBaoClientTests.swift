@@ -205,7 +205,7 @@ final class JsBaoClientTests: XCTestCase {
         try await client.connect()
         try await waitForConnection(client: client)
 
-        let (docId, doc) = try await client.createDocument(
+        let (docId, doc) = try await client.createDocumentForTest(
             options: CreateDocumentOptions(title: "Local-first online", tags: ["lf-test"])
         )
 
@@ -236,7 +236,7 @@ final class JsBaoClientTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let (docId, doc) = try await client.createDocument(
+        let (docId, doc) = try await client.createDocumentForTest(
             options: CreateDocumentOptions(
                 title: "Local-only with tags",
                 tags: ["t1", "t2"],
@@ -247,6 +247,36 @@ final class JsBaoClientTests: XCTestCase {
         XCTAssertTrue(client.isLocalOnly(docId))
         XCTAssertFalse(client.isPendingCreate(docId),
                        "localOnly docs must not be pending — they never sync")
+    }
+
+    /// #1108: createDocument must return `{ metadata }` exactly like js-bao
+    /// (`createDocument(options): Promise<{ metadata }>`). The metadata
+    /// carries the generated documentId plus the create-time fields the
+    /// local-first path writes; the open YDocument is fetched separately
+    /// via `getDoc`, matching JS.
+    func testCreateDocumentReturnsMetadataLikeJS() async throws {
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+
+        let result = try await client.createDocument(
+            options: CreateDocumentOptions(
+                title: "Metadata shape",
+                tags: ["m1"],
+                localOnly: true
+            )
+        )
+
+        let metadata = try XCTUnwrap(result.metadata, "createDocument must return the created metadata")
+        let docId = try XCTUnwrap(metadata["documentId"]?.stringValue)
+        XCTAssertFalse(docId.isEmpty)
+        XCTAssertEqual(metadata["title"]?.stringValue, "Metadata shape")
+        XCTAssertEqual(metadata["localOnly"], .bool(true))
+        XCTAssertEqual(metadata["pendingCreate"], .bool(false))
+        XCTAssertNotNil(metadata["createdAt"]?.stringValue, "createdAt must be stamped at create time")
+
+        // The doc itself is not in the return value (JS parity) but is
+        // already open and reachable via getDoc.
+        XCTAssertNotNil(client.getDoc(docId), "Created doc must be open and fetchable via getDoc")
     }
 
     // MARK: - Document Listing

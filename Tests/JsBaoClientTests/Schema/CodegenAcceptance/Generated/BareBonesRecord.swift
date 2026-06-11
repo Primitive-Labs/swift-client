@@ -74,14 +74,35 @@ internal extension BareBonesRecord {
         JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
     }
 
-    /// Every record across all open documents.
-    static func findAll() -> [BareBonesRecord] {
-        query(nil, options: nil)
+    /// Every record across all open documents. `async` to match the JS
+    /// client's `Model.findAll()` call shape (#992). Throws
+    /// `PrimitiveDecodeError` if any stored row no longer decodes as
+    /// `BareBonesRecord` — JS `findAll` never drops rows, so schema drift
+    /// surfaces loudly instead of silently shrinking the result.
+    static func findAll() async throws -> [BareBonesRecord] {
+        try JsBaoClient.requireDefault()
+            .queryShared(primitiveSchema, filter: nil, options: nil)
+            .map { row in
+                guard let decoded = BareBonesRecord(row: row) else {
+                    throw PrimitiveDecodeError(modelName: modelName, row: row)
+                }
+                return decoded
+            }
     }
 
-    /// First record with `id` across all open documents, or `nil`.
-    static func find(_ id: String) -> BareBonesRecord? {
-        JsBaoClient.requireDefault().findShared(primitiveSchema, id: id).flatMap { BareBonesRecord(row: $0) }
+    /// First record with `id` across all open documents; `nil` only when
+    /// no open document has it. `async` to match the JS client's
+    /// `Model.find(id)` call shape (#992). Throws `PrimitiveDecodeError`
+    /// when the row exists but no longer decodes as `BareBonesRecord` —
+    /// distinct from the `nil` not-found case.
+    static func find(_ id: String) async throws -> BareBonesRecord? {
+        guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {
+            return nil
+        }
+        guard let decoded = BareBonesRecord(row: row) else {
+            throw PrimitiveDecodeError(modelName: modelName, row: row)
+        }
+        return decoded
     }
 
     /// First record matching a unique `constraint` and `value`,
@@ -135,11 +156,39 @@ internal extension BareBonesRecord {
     /// record is inserted. Mirrors the JS client's
     /// `save({ upsertOn: field })`. Throws if the doc isn't open, if
     /// `upsertOn` has no single-field unique constraint, or if the
-    /// `upsertOn` value is absent/empty. Returns `self`.
+    /// `upsertOn` value is absent/empty.
+    ///
+    /// Returns the RESOLVED record: on the merge path its `id` is the
+    /// EXISTING record's id (JS reassigns `this.id = existingId`) and
+    /// its fields reflect the merged state, NOT necessarily `self`.
     @discardableResult
     func save(in documentId: String, upsertOn: String) throws -> BareBonesRecord {
-        try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)
-        return self
+        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)
+        if let resolved = BareBonesRecord(record: result.record) { return resolved }
+        var copy = self
+        copy.id = result.record.id
+        return copy
+    }
+
+    /// Insert-or-update this record in `documentId`, matched by the
+    /// NAMED unique constraint (single-field or compound). Mirrors the
+    /// JS client's `Model.upsertByUnique(constraintName, lookupValue,
+    /// data, options)` — the lookup values come straight from this
+    /// record's fields (every constraint field must be set), and `mode`
+    /// maps JS's flags: `.mustExist` ⇔ `objectMustExist`,
+    /// `.mustNotExist` ⇔ `objectMustNotExist`, `.either` ⇔ default.
+    /// Throws if the doc isn't open, the constraint isn't declared on
+    /// this model, or a constraint field is unset on this record.
+    ///
+    /// Returns the RESOLVED record: on the merge path its `id` is the
+    /// EXISTING record's id and its fields reflect the merged state.
+    @discardableResult
+    func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> BareBonesRecord {
+        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId)
+        if let resolved = BareBonesRecord(record: result.record) { return resolved }
+        var copy = self
+        copy.id = result.record.id
+        return copy
     }
 
     /// Delete this record from document `documentId`. Throws if the doc isn't open.

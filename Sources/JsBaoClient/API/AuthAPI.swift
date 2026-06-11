@@ -26,6 +26,9 @@ public final class AuthAPI: @unchecked Sendable {
     private let _magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> Any)?
     private let _otpRequest: (_ email: String) async throws -> Bool
     private let _otpVerify: (_ email: String, _ code: String) async throws -> Any
+    // Carries the optional #466 invite token through verify. When unwired,
+    // `otpVerify` falls back to the email+code-only path.
+    private let _otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> Any)?
 
     // App auth config (`GET /oauth-config`)
     private let _getAuthConfig: () async throws -> Any
@@ -56,6 +59,7 @@ public final class AuthAPI: @unchecked Sendable {
         magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> Any)? = nil,
         otpRequest: @escaping (_ email: String) async throws -> Bool,
         otpVerify: @escaping (_ email: String, _ code: String) async throws -> Any,
+        otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> Any)? = nil,
         getAuthConfig: @escaping () async throws -> Any,
         getAppConfig: (() async throws -> Any)? = nil,
         logout: @escaping (_ wipeLocal: Bool) async throws -> Void,
@@ -75,6 +79,7 @@ public final class AuthAPI: @unchecked Sendable {
         self._magicLinkVerifyWithInvite = magicLinkVerifyWithInvite
         self._otpRequest = otpRequest
         self._otpVerify = otpVerify
+        self._otpVerifyWithInvite = otpVerifyWithInvite
         self._getAuthConfig = getAuthConfig
         self._getAppConfig = getAppConfig
         self._logout = logout
@@ -166,15 +171,26 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Verify an OTP code, completing sign-in. On success the SDK has already
     /// applied the returned access token. Mirrors JS
-    /// `auth.otpVerify({ email, code })`.
+    /// `auth.otpVerify(email, code, { inviteToken })`.
+    ///
+    /// `inviteToken` (#466): when present, accepts the named invitation
+    /// server-side during verify and resolves deferred grants to the
+    /// signing-in user — even when the signup email differs from the invited
+    /// email. Threaded through only when the invite-aware closure is wired;
+    /// otherwise the email+code-only path is used.
     public func otpVerify(_ params: OtpVerifyParams) async throws -> OtpVerifyResult {
-        let raw = try await _otpVerify(params.email, params.code)
+        let raw: Any
+        if let verifyWithInvite = _otpVerifyWithInvite {
+            raw = try await verifyWithInvite(params.email, params.code, params.inviteToken)
+        } else {
+            raw = try await _otpVerify(params.email, params.code)
+        }
         return try JSONCoding.decode(OtpVerifyResult.self, from: raw)
     }
 
     /// Convenience overload taking the fields directly.
-    public func otpVerify(email: String, code: String) async throws -> OtpVerifyResult {
-        try await otpVerify(OtpVerifyParams(email: email, code: code))
+    public func otpVerify(email: String, code: String, inviteToken: String? = nil) async throws -> OtpVerifyResult {
+        try await otpVerify(OtpVerifyParams(email: email, code: code, inviteToken: inviteToken))
     }
 
     // MARK: - Auth config

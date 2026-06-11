@@ -7,6 +7,18 @@ public struct AwarenessEntry: @unchecked Sendable {
     public var remoteStates: [String: [String: Any]] = [:]
 }
 
+/// Delta of awareness changes produced by applying a remote awareness frame.
+/// Mirrors the JS `applyRemoteAwarenessStates` return value
+/// (`src/client/internal/documentManager.ts`): arrays of client IDs that
+/// were added, updated, or removed.
+public struct AwarenessDelta: Sendable {
+    public var added: [String] = []
+    public var updated: [String] = []
+    public var removed: [String] = []
+
+    public var isEmpty: Bool { added.isEmpty && updated.isEmpty && removed.isEmpty }
+}
+
 /// Manages document lifecycle, Yjs sync protocol, metadata, and pending creates.
 public final class DocumentManager: @unchecked Sendable {
     private let lock = NSLock()
@@ -40,6 +52,10 @@ public final class DocumentManager: @unchecked Sendable {
 
     // Awareness state per document
     private var docAwareness: [String: AwarenessEntry] = [:]
+
+    // Docs that asked the server for sync-perf timings (JS
+    // `syncPerfRequestedByDoc`). Consulted when building syncStep1.
+    private var syncPerfRequestedDocs: Set<String> = []
 
     // Sync protocol state
     private var syncProtocols: [String: YProtocol] = [:]
@@ -324,6 +340,7 @@ public final class DocumentManager: @unchecked Sendable {
         updateSubscriptions.removeValue(forKey: documentId)?.cancel()
         docAwareness.removeValue(forKey: documentId)
         docPersistence.removeValue(forKey: documentId)
+        syncPerfRequestedDocs.remove(documentId)
         lock.unlock()
 
         if options.evictLocal {
@@ -350,17 +367,41 @@ public final class DocumentManager: @unchecked Sendable {
         let step1 = syncProto.handleConnectionStarted()
         let base64 = Data(step1.buffer).base64EncodedString()
 
-        let message: [String: Any] = [
+        var message: [String: Any] = [
             "type": "syncStep1",
             "documentId": documentId,
             "stateVector": base64,
         ]
+        // Mirror JS `sendSyncStep1`: when the doc requested sync-perf
+        // telemetry, ask the server to send a `syncPerf` frame.
+        if isSyncPerfRequested(documentId) {
+            message["requestPerf"] = true
+        }
 
         guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
             return nil
         }
         return jsonString
+    }
+
+    /// Mark a document as wanting server sync-perf timings on its next
+    /// sync round-trips. Mirrors JS `setSyncPerfRequested`.
+    public func setSyncPerfRequested(_ documentId: String, _ value: Bool) {
+        lock.lock()
+        if value {
+            syncPerfRequestedDocs.insert(documentId)
+        } else {
+            syncPerfRequestedDocs.remove(documentId)
+        }
+        lock.unlock()
+    }
+
+    /// Mirrors JS `isSyncPerfRequested`.
+    public func isSyncPerfRequested(_ documentId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return syncPerfRequestedDocs.contains(documentId)
     }
 
     /// Build a syncStep2 response message given the server's state vector.
@@ -554,6 +595,24 @@ public final class DocumentManager: @unchecked Sendable {
         return docSyncStates[documentId] ?? false
     }
 
+    /// Whether any CRDT updates have been applied to the open ydoc.
+    /// Mirrors JS `documentManager.ydocHasData`: the state vector of an
+    /// empty doc encodes as a single byte (varint 0 — "AA==" in base64),
+    /// so anything longer means real updates exist. More reliable than
+    /// checking shared-type sizes, which can read 0 before the shared
+    /// types are materialized after an applyUpdate.
+    public func ydocHasData(_ documentId: String) -> Bool {
+        lock.lock()
+        let doc = openDocs[documentId]
+        lock.unlock()
+        guard let doc else { return false }
+        var stateVectorLength = 0
+        doc.transactSync { txn in
+            stateVectorLength = txn.transactionStateVector().count
+        }
+        return stateVectorLength > 1
+    }
+
     public func isOpen(_ documentId: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -605,6 +664,16 @@ public final class DocumentManager: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Encode a `LocalMetadataEntry` to a `[String: Any]` for event
+    /// payloads (the typed `DocumentMetadataChangedEvent.metadata` field).
+    private func metadataDictionary(_ entry: LocalMetadataEntry) -> [String: Any]? {
+        guard let data = try? JSONEncoder().encode(entry),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return obj
+    }
+
     public func handleServerDocuments(_ documents: [[String: Any]]) async {
         for docData in documents {
             guard let documentId = docData["documentId"] as? String else { continue }
@@ -629,9 +698,19 @@ public final class DocumentManager: @unchecked Sendable {
 
             // Persist
             try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: entry)
-        }
 
-        emitter?.emit(.documentMetadataChanged, [:] as [String: Any])
+            // Per-doc typed event, mirroring JS `handleServerDocuments`
+            // (`src/client/internal/documentManager.ts`): action "updated",
+            // source "server". (#996 — was a single untyped `[:]` emit that
+            // typed subscribers never received.)
+            emitter?.emit(.documentMetadataChanged, DocumentMetadataChangedEvent(
+                documentId: documentId,
+                action: "updated",
+                metadata: metadataDictionary(entry),
+                changedFields: nil,
+                source: "server"
+            ))
+        }
     }
 
     // MARK: - Pending Creates
@@ -703,7 +782,16 @@ public final class DocumentManager: @unchecked Sendable {
         // Persist metadata
         try await offlineStore?.putMetadata(appId: appId, userId: userId, record: metadata)
 
-        emitter?.emit(.documentMetadataChanged, ["action": "created", "documentId": documentId] as [String: Any])
+        // Typed event (#996 — was an untyped dict that typed subscribers
+        // never received). A local create originates on-device: source
+        // "local", matching JS's local-first create path.
+        emitter?.emit(.documentMetadataChanged, DocumentMetadataChangedEvent(
+            documentId: documentId,
+            action: "created",
+            metadata: metadataDictionary(metadata),
+            changedFields: nil,
+            source: "local"
+        ))
 
         return doc
     }
@@ -904,11 +992,24 @@ public final class DocumentManager: @unchecked Sendable {
 
     // MARK: - Awareness State
 
-    /// Set the local awareness state for a document.
-    public func setLocalAwarenessState(_ documentId: String, state: [String: Any]) {
+    /// Set the local awareness state for a document. Returns the previous
+    /// local state plus whether the doc had an awareness entry at all
+    /// (mirrors JS `setLocalAwarenessState`'s `{ previousState, exists }`
+    /// so the caller can emit an `added` vs `updated` delta).
+    @discardableResult
+    public func setLocalAwarenessState(
+        _ documentId: String,
+        state: [String: Any]
+    ) -> (previousState: [String: Any]?, exists: Bool) {
         lock.lock()
-        docAwareness[documentId]?.localState = state
-        lock.unlock()
+        defer { lock.unlock() }
+        guard var entry = docAwareness[documentId] else {
+            return (nil, false)
+        }
+        let previous = entry.localState
+        entry.localState = state
+        docAwareness[documentId] = entry
+        return (previous, true)
     }
 
     /// Get the full awareness snapshot for a document (local + remote states).
@@ -918,25 +1019,56 @@ public final class DocumentManager: @unchecked Sendable {
         return docAwareness[documentId]
     }
 
-    /// Apply incoming remote awareness states for a document.
-    public func applyRemoteAwareness(_ documentId: String, states: [[String: Any]]) {
+    /// Apply an incoming remote awareness frame for a document and return
+    /// the delta. Mirrors JS `applyRemoteAwarenessStates`.
+    ///
+    /// The wire format (both directions — see `sendExistingStates` in
+    /// `src/doc-worker/awareness.ts` and `sendAwarenessState` in
+    /// `src/client/JsBaoClient.ts`) is an array of `[clientId, state]`
+    /// tuples; `state == null` means "this client's awareness was removed".
+    public func applyRemoteAwarenessStates(
+        _ documentId: String,
+        states: [[Any]]
+    ) -> AwarenessDelta {
         lock.lock()
+        defer { lock.unlock() }
         guard var entry = docAwareness[documentId] else {
-            lock.unlock()
-            return
+            return AwarenessDelta()
         }
-        for state in states {
-            if let clientId = state["clientId"] as? String {
+
+        var delta = AwarenessDelta()
+        for tuple in states {
+            guard tuple.count >= 2, let clientId = tuple[0] as? String else { continue }
+            let rawState = tuple[1]
+            if rawState is NSNull {
+                if entry.remoteStates.removeValue(forKey: clientId) != nil {
+                    delta.removed.append(clientId)
+                }
+            } else if let state = rawState as? [String: Any] {
+                let isNew = entry.remoteStates[clientId] == nil
                 entry.remoteStates[clientId] = state
+                if isNew {
+                    delta.added.append(clientId)
+                } else {
+                    delta.updated.append(clientId)
+                }
             }
         }
         docAwareness[documentId] = entry
-        lock.unlock()
+        return delta
     }
 
-    /// Remove awareness states for specific clients. Returns the IDs that were actually removed.
+    /// Remove awareness states for specific clients. Returns the IDs that
+    /// were actually removed. When `removeLocal` is true the doc's local
+    /// awareness state is also cleared (mirrors JS `removeAwarenessClients`'s
+    /// `removeLocal` flag, used when the caller passes its own
+    /// connectionId).
     @discardableResult
-    public func removeAwarenessClients(_ documentId: String, clientIds: [String]) -> [String] {
+    public func removeAwarenessClients(
+        _ documentId: String,
+        clientIds: [String],
+        removeLocal: Bool = false
+    ) -> [String] {
         lock.lock()
         guard var entry = docAwareness[documentId] else {
             lock.unlock()
@@ -947,6 +1079,9 @@ public final class DocumentManager: @unchecked Sendable {
             if entry.remoteStates.removeValue(forKey: clientId) != nil {
                 removed.append(clientId)
             }
+        }
+        if removeLocal {
+            entry.localState = nil
         }
         docAwareness[documentId] = entry
         lock.unlock()

@@ -73,7 +73,7 @@ final class PersistenceTests: XCTestCase {
         // initialize the same provider with the user namespace.
         // Without the #853 fix this throws "SQLiteStorageProvider
         // already initialized".
-        let (docId, _) = try await client.createDocument(
+        let (docId, _) = try await client.createDocumentForTest(
             options: CreateDocumentOptions(localOnly: true)
         )
         XCTAssertFalse(docId.isEmpty,

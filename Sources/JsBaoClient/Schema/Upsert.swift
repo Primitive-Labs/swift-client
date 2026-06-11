@@ -20,10 +20,15 @@ public enum UpsertError: Error, Equatable, Sendable {
     /// No single-field unique constraint is registered on the `on:`
     /// field. Compound uniques are not a valid upsert target (per
     /// js-bao's `constraint.fields.length === 1` requirement).
+    ///
+    /// Note there is deliberately no "id mismatch" error: on the merge
+    /// path the existing record's id always wins and any supplied id is
+    /// ignored. JS only throws its upsertOn-conflict error when the id
+    /// was *explicitly* passed to the model constructor — Swift structs
+    /// can't distinguish an explicit id from a freshly generated one,
+    /// so the supplied id is treated like JS's auto-generated id (used
+    /// on insert, discarded on merge).
     case noSingleFieldUniqueConstraint(field: String)
-    /// The caller supplied an id that doesn't match the id of the
-    /// existing record matched by the upsertOn value.
-    case idMismatch(supplied: String, existing: String)
 }
 
 /// Mode for `DynamicModel.upsertByUnique`. Matches js-bao's option

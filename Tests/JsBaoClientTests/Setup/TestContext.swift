@@ -191,15 +191,23 @@ final class TestContext {
     // integration tests (start / runSync / the apply flow). Mirrors the JS
     // test helpers in sample-app/src/pages/Tests.tsx.
 
-    /// Create a workflow draft, publish a revision, and activate it.
+    /// Create a workflow (the create writes the active configuration from
+    /// `steps` under the workflow-config model) and activate it.
     /// Returns the workflowId. `requiresClientApply` defaults to true so
     /// the run parks in `apply_pending` until a client claims and applies.
+    /// `syncCallable` opts the workflow into `runSync` (mirrors the JS
+    /// `createSyncWorkflow` helper in
+    /// tests/client/js-bao-client-workflow-runSync.test.ts — which, like
+    /// this helper, does NOT call the legacy `/publish` endpoint: the
+    /// server now answers 409 WORKFLOW_CONFIG_MODEL for workflows that
+    /// already have an active configuration).
     @discardableResult
     func setupWorkflow(
         appId: String,
         workflowKey: String,
         steps: [[String: Any]],
-        requiresClientApply: Bool = true
+        requiresClientApply: Bool = true,
+        syncCallable: Bool = false
     ) async throws -> String {
         let createRes = try await adminPost(
             "/admin/api/apps/\(appId)/workflows",
@@ -208,17 +216,13 @@ final class TestContext {
                 "name": workflowKey,
                 "description": "Swift test workflow",
                 "steps": steps,
+                "syncCallable": syncCallable,
             ]
         )
         guard let workflow = createRes["workflow"] as? [String: Any],
               let workflowId = workflow["workflowId"] as? String else {
             throw TestSetupError("Failed to create workflow: \(createRes)")
         }
-
-        _ = try await adminPost(
-            "/admin/api/apps/\(appId)/workflows/\(workflowId)/publish",
-            body: [:]
-        )
 
         _ = try await adminRequest(
             method: "PATCH",
@@ -230,6 +234,19 @@ final class TestContext {
         )
 
         return workflowId
+    }
+
+    // MARK: - App settings
+
+    /// PATCH-style update of app-level settings via the admin API
+    /// (`PUT /admin/api/apps/{appId}` — e.g. `otpEnabled`,
+    /// `magicLinkEnabled`). Mirrors the JS tests' `adminHttpClient().put`.
+    func updateAppSettings(appId: String, settings: [String: Any]) async throws {
+        _ = try await adminRequest(
+            method: "PUT",
+            path: "/admin/api/apps/\(appId)",
+            body: settings
+        )
     }
 
     // MARK: - Cleanup

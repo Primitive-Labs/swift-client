@@ -40,7 +40,12 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
     private var lastCloseInitiator: String?
     private var reconnectWorkItem: DispatchWorkItem?
 
-    public let connectionId: String = UUID().uuidString
+    /// Stable per-client connection id, minted once at construction. Must be
+    /// a ULID, not a UUID: the JS client mints a ULID, and the server's auth
+    /// middleware validates the `X-JB-Connection-Id` header against a ULID
+    /// regex (`permission-middleware.ts`) — a UUID is silently dropped, which
+    /// breaks the #737 `isOrigin` round-trip on `db.change` frames.
+    public let connectionId: String = ULID.generate()
 
     // Connect continuation (the in-flight connect() call's own continuation)
     private var connectContinuation: CheckedContinuation<Void, Error>?

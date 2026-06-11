@@ -49,7 +49,7 @@ final class OpenFreshDocTests: XCTestCase {
 
         // Fresh doc — local-first create; commits to the server in the
         // background, so the doc is still `pendingCreate` when we open it below.
-        let (documentId, _) = try await client.createDocument(
+        let (documentId, _) = try await client.createDocumentForTest(
             options: CreateDocumentOptions(title: "fresh-open")
         )
         XCTAssertFalse(documentId.isEmpty)

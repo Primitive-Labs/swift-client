@@ -11,7 +11,7 @@ The Swift client has **81 integration test files** (~13,200 lines) that run agai
 
 There are no mocks per the project's "live APIs only" policy in CLAUDE.md — tests exercise real HTTP, WebSocket, Yjs sync, and SQLite paths against a real dev server.
 
-For test coverage parity vs the JS client, see [`parity/test-coverage.md`](parity/test-coverage.md).
+For test coverage parity vs the JS client, see the docstrings in `Tests/JsBaoClientTests/CrossPlatform/`.
 
 ## Two flavors of tests
 
@@ -115,10 +115,10 @@ Reads server URL and admin JWT from environment variables. Defaults to `http://l
 
 ## Schema test directory (38 files)
 
-Lives at `Tests/JsBaoClientTests/Schema/`. Each file exercises one piece of the typed-model layer (`PrimitiveSchema`, `TypedModel`, `DynamicModel`, `IncludeResolver`, `TomlSchemaLoader`, etc.) against `js-bao` parity. Each test docstring points at its js-bao reference. See [`parity/schema-and-models.md`](parity/schema-and-models.md) and [`parity/test-coverage.md`](parity/test-coverage.md) for the full mapping.
+Lives at `Tests/JsBaoClientTests/Schema/`. Each file exercises one piece of the typed-model layer (`PrimitiveSchema`, `TypedModel`, `DynamicModel`, `IncludeResolver`, `TomlSchemaLoader`, etc.) against `js-bao` parity. Each test docstring points at its js-bao reference. Each test docstring points at its js-bao reference.
 
 ## Cross-platform parity tests
 
-Lives at `Tests/JsBaoClientTests/CrossPlatform/`. Spawns Node subprocesses to verify Swift↔JS wire-format equivalence. Required by [`parity/wire-format.md`](parity/wire-format.md).
+Lives at `Tests/JsBaoClientTests/CrossPlatform/`. Spawns Node subprocesses to verify Swift↔JS wire-format equivalence. 
 
 The harness JS scripts `require("js-bao")` from the repo's `node_modules` — make sure `pnpm install` ran at the project root first, otherwise these tests fail with a `HarnessError` instead of an `XCTSkip`.

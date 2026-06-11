@@ -236,9 +236,8 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         return out
     }
 
-    /// Encode a `Double` the way JSON.stringify in JS does: integer values
-    /// have no trailing `.0`, everything else uses the shortest roundtrip
-    /// decimal. Swift's `"\(n)"` prints `42.0` for `42`; strip that.
+    /// Encode a `Double` the way JSON.stringify in JS does — byte-for-
+    /// byte identical to `Number.prototype.toString(10)` (#1117).
     ///
     /// Returns `nil` for **non-finite** values (NaN, ±Infinity). Those
     /// don't have a valid JSON representation, and the yrs FFI parses
@@ -249,9 +248,87 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     /// before reaching the encoder.
     static func encodeNumber(_ n: Double) -> String? {
         guard n.isFinite else { return nil }
-        if n == n.rounded(), abs(n) < 1e16 {
-            return String(Int64(n))
+        return jsNumberString(n)
+    }
+
+    /// ECMA-262 `Number::toString(x, 10)` for a finite Double.
+    ///
+    /// Swift's own `String(Double)` is also shortest-round-trip, but it
+    /// formats differently from JS at the edges: `1e20` prints as
+    /// "1e+20" where JS prints "100000000000000000000" (full digits up
+    /// to 1e21), `1e-7` prints as "1e-07" (zero-padded exponent) where
+    /// JS prints "1e-7", `1e-6` prints as "1e-06" where JS prints
+    /// "0.000001", and integral values carry a trailing ".0". Since
+    /// these strings go onto the wire (yrs scalar values, unique-index
+    /// keys), they must match js-bao byte-for-byte.
+    ///
+    /// Approach: take Swift's shortest-round-trip digits, normalize to
+    /// (digits s, decimal exponent n) with value = s × 10^(n − k),
+    /// k = digit count, then apply the spec's four layout rules:
+    ///   - k ≤ n ≤ 21         → digits + (n − k) zeros
+    ///   - 0 < n ≤ 21, n < k  → digits with point after n digits
+    ///   - −6 < n ≤ 0         → "0." + (−n zeros) + digits
+    ///   - otherwise          → d[.ddd]e±(n−1), exponent unpadded
+    static func jsNumberString(_ x: Double) -> String {
+        if x == 0 { return "0" } // JS: String(0) and String(-0) are "0"
+        if x < 0 { return "-" + jsNumberString(-x) }
+
+        // --- Extract shortest-round-trip digits + decimal exponent ---
+        let repr = String(x) // e.g. "123.456", "1e+20", "1.5e-07"
+        var digits: String
+        var n: Int // decimal exponent: value = 0.digits × 10^n
+
+        if let eIdx = repr.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+            let mantissa = repr[..<eIdx]
+            let expPart = repr[repr.index(after: eIdx)...]
+            let exp = Int(expPart) ?? 0
+            // Mantissa is "d" or "d.ddd" (never zero-leading here
+            // because x > 0 and Swift normalizes to one integer digit).
+            let intFrac = mantissa.split(separator: ".", maxSplits: 1)
+            let intDigits = String(intFrac[0])
+            let fracDigits = intFrac.count > 1 ? String(intFrac[1]) : ""
+            digits = intDigits + fracDigits
+            n = exp + intDigits.count
+        } else {
+            let intFrac = repr.split(separator: ".", maxSplits: 1)
+            var intDigits = String(intFrac[0])
+            let fracDigits = intFrac.count > 1 ? String(intFrac[1]) : ""
+            // Strip leading zeros ("0.001" → int "" frac "001").
+            while intDigits.first == "0" { intDigits.removeFirst() }
+            if intDigits.isEmpty {
+                // Pure fraction: locate the first significant digit.
+                var leadingZeros = 0
+                for ch in fracDigits {
+                    if ch == "0" { leadingZeros += 1 } else { break }
+                }
+                digits = String(fracDigits.dropFirst(leadingZeros))
+                n = -leadingZeros
+            } else {
+                digits = intDigits + fracDigits
+                n = intDigits.count
+            }
         }
-        return String(n)
+        // Strip trailing zeros — the spec's s has no trailing zeros.
+        while digits.hasSuffix("0") { digits.removeLast() }
+        let k = digits.count
+
+        // --- Lay out per Number::toString ---
+        if k <= n && n <= 21 {
+            return String(digits) + String(repeating: "0", count: n - k)
+        }
+        if 0 < n && n <= 21 {
+            let idx = digits.index(digits.startIndex, offsetBy: n)
+            return "\(digits[..<idx]).\(digits[idx...])"
+        }
+        if -6 < n && n <= 0 {
+            return "0." + String(repeating: "0", count: -n) + String(digits)
+        }
+        // Exponential. JS prints the exponent without zero padding.
+        let expVal = n - 1
+        let expStr = expVal >= 0 ? "+\(expVal)" : "\(expVal)"
+        if k == 1 {
+            return String(digits) + "e" + expStr
+        }
+        return "\(digits.prefix(1)).\(digits.dropFirst())e\(expStr)"
     }
 }

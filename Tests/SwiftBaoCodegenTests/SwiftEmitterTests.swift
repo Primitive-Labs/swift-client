@@ -65,8 +65,14 @@ final class SwiftEmitterTests: XCTestCase {
         // Paginated read — exposes nextCursor/hasMore so callers can page (#946).
         XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<NoteRecord>"))
         XCTAssertTrue(body.contains("static func count(_ filter: DocumentFilter? = nil) -> Int"))
-        XCTAssertTrue(body.contains("static func findAll() -> [NoteRecord]"))
-        XCTAssertTrue(body.contains("static func find(_ id: String) -> NoteRecord?"))
+        // find/findAll are async + decode-loud (#992): async matches the JS
+        // call shape; a row that exists but fails typed decode throws
+        // PrimitiveDecodeError instead of vanishing (find) or being silently
+        // dropped from the result (findAll).
+        XCTAssertTrue(body.contains("static func findAll() async throws -> [NoteRecord]"))
+        XCTAssertTrue(body.contains("static func find(_ id: String) async throws -> NoteRecord?"))
+        XCTAssertTrue(body.contains("throw PrimitiveDecodeError(modelName: modelName, row: row)"),
+                      "decode misses in find/findAll must throw, not return nil / drop rows")
         XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping () -> Void) -> () -> Void"))
         XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) -> [[String: Any]]"))
         // Cross-document unique lookup + single-result query (JS parity:
@@ -87,6 +93,19 @@ final class SwiftEmitterTests: XCTestCase {
                       "instance save(in:upsertOn:) must be emitted")
         XCTAssertTrue(body.contains("upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)"),
                       "save(in:upsertOn:) should delegate to upsertShared, passing the record id")
+        // The upsert paths must return the RESOLVED record, not `self` —
+        // on the merge path the existing record's id wins (JS reassigns
+        // `this.id = existingId`), so the facade re-decodes the result.
+        XCTAssertTrue(body.contains("if let resolved = NoteRecord(record: result.record) { return resolved }"),
+                      "upsert facades should re-decode the resolved record so merge keeps the existing id")
+        XCTAssertFalse(body.contains("on: upsertOn, in: documentId)\n        return self"),
+                      "save(in:upsertOn:) must not return stale `self` (its id is wrong on the merge path)")
+        // Upsert-by-named-constraint write (JS parity: Model.upsertByUnique,
+        // covers compound constraints — #1053).
+        XCTAssertTrue(body.contains("func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> NoteRecord"),
+                      "instance upsertByUnique(_:mode:in:) must be emitted")
+        XCTAssertTrue(body.contains("upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId)"),
+                      "upsertByUnique should delegate to upsertByUniqueShared, passing the record id")
         XCTAssertTrue(body.contains("func delete(in documentId: String) throws"),
                       "instance delete(in:) must be emitted")
         // The deleted static create/update writes must NOT come back.

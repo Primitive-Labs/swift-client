@@ -53,21 +53,14 @@ public final class WorkflowsAPI: @unchecked Sendable {
         case resolvedOrInFlight
     }
 
-    /// Optional emitter for `workflowStarted` events. Wired by
-    /// `JsBaoClient.setupSubApis`; `nil` when WorkflowsAPI is
-    /// constructed directly (tests / standalone usage).
-    private weak var events: EventEmitter?
-
     public init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         getConnectionId: @escaping () -> String = { "" },
-        logger: Logger? = nil,
-        events: EventEmitter? = nil
+        logger: Logger? = nil
     ) {
         self.makeRequest = makeRequest
         self.getConnectionId = getConnectionId
         self.logger = logger
-        self.events = events
     }
 
     // MARK: - Workflow Execution
@@ -98,27 +91,11 @@ public final class WorkflowsAPI: @unchecked Sendable {
         if options?.forceRerun == true { body["forceRerun"] = true }
 
         let result = try await makeRequest("POST", "/workflows/\(encodedKey)/start", body)
-        let decoded = try JSONCoding.decode(StartWorkflowResult.self, from: result)
-        // Fire `workflowStarted` so cross-platform subscribers can
-        // observe successful starts without polling. Same shape as
-        // the JS event.
-        if !decoded.runId.isEmpty {
-            // The HTTP start response (`StartWorkflowResult`) carries
-            // `runKey`/`instanceId`; `contextDocId`/`meta` come from the
-            // caller's options. `workflowId` is not in the start envelope,
-            // so it stays nil on this path (it is populated on the
-            // server-pushed `workflowStarted` WS frame — see
-            // `handleWebSocketMessage` in `JsBaoClient.swift`).
-            events?.emit(.workflowStarted, WorkflowStartedEvent(
-                workflowKey: workflowKey,
-                runId: decoded.runId,
-                runKey: decoded.runKey.isEmpty ? nil : decoded.runKey,
-                instanceId: decoded.instanceId,
-                contextDocId: options?.contextDocId,
-                meta: options?.meta
-            ))
-        }
-        return decoded
+        // No local `workflowStarted` emit here (#1112): JS emits the event
+        // exclusively from the server-pushed `workflowStarted` WS frame
+        // (handled in `JsBaoClient.handleWebSocketMessage`), so emitting
+        // from the HTTP start path too produced a double emit per start.
+        return try JSONCoding.decode(StartWorkflowResult.self, from: result)
     }
 
     /// Options-struct overload of `start`, mirroring js-bao's single

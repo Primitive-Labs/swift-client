@@ -40,7 +40,7 @@ final class InviteOnlyTests: XCTestCase {
         // documentId synchronously and throws on failure — a non-empty id is
         // the success signal. We deliberately avoid `documents.list()`
         // visibility, which is racy for a just-created local-first doc.
-        let (documentId, doc) = try await client.createDocument(
+        let (documentId, doc) = try await client.createDocumentForTest(
             options: CreateDocumentOptions(title: "Invite-Only Doc")
         )
         XCTAssertFalse(

@@ -131,26 +131,32 @@ final class UpsertTests: XCTestCase {
 
     // MARK: - ID conflict
 
-    /// Supplied id that doesn't match the existing record's id →
-    /// throws UpsertError.idMismatch.
-    func testUpsertWithNonMatchingSuppliedIdThrows() throws {
+    /// Supplied id that doesn't match the existing record's id → the
+    /// existing record's id wins and the supplied id is ignored, no
+    /// error and no second record. Mirrors JS `save({ upsertOn })` with
+    /// an auto-generated id (`this.id = existingId` reassignment); the
+    /// Swift facade always passes the struct's freshly minted id, so it
+    /// must be treated as non-authoritative on the merge path.
+    func testUpsertWithNonMatchingSuppliedIdMergesIntoExisting() throws {
         let model = freshModel()
         _ = try model.create(id: "u1", values: [
             "email": .string("alice@example.com"),
+            "name":  .string("Alice"),
         ])
 
-        XCTAssertThrowsError(
-            try model.upsert(
-                ["email": .string("alice@example.com")],
-                on: "email",
-                id: "u_different"
-            )
-        ) { error in
-            guard let e = error as? UpsertError else {
-                return XCTFail("Expected UpsertError, got \(error)")
-            }
-            XCTAssertEqual(e, .idMismatch(supplied: "u_different", existing: "u1"))
-        }
+        let result = try model.upsert(
+            ["email": .string("alice@example.com"), "name": .string("Alice V2")],
+            on: "email",
+            id: "u_different"
+        )
+
+        XCTAssertFalse(result.wasCreated)
+        XCTAssertEqual(result.record.id, "u1",
+                       "merge must keep the existing record's id")
+        XCTAssertEqual(model.findAll().count, 1,
+                       "the supplied id must not create a second record")
+        XCTAssertNil(model.find(id: "u_different"))
+        XCTAssertEqual(model.find(id: "u1")?["name"], .string("Alice V2"))
     }
 
     // MARK: - Validation errors

@@ -448,12 +448,20 @@ public final class AuthController: @unchecked Sendable {
         return success
     }
 
-    public func otpVerify(email: String, code: String) async throws -> [String: Any] {
+    public func otpVerify(email: String, code: String, inviteToken: String? = nil) async throws -> [String: Any] {
         guard let makeRequest = makeRequest else {
             throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
         }
 
-        let body: [String: Any] = ["email": email, "code": code]
+        // #466: thread the (trimmed) invite token through verify so deferred
+        // grants resolve to the signing-in user. Mirrors JS otpVerify.
+        let trimmedInviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedInviteToken = (trimmedInviteToken?.isEmpty == false) ? trimmedInviteToken : nil
+
+        var body: [String: Any] = ["email": email, "code": code]
+        if let resolvedInviteToken = resolvedInviteToken {
+            body["inviteToken"] = resolvedInviteToken
+        }
 
         let endpoint: String
         if let proxy = refreshProxy, proxy.enabled {
@@ -482,6 +490,12 @@ public final class AuthController: @unchecked Sendable {
     /// `wipeLocal`, and the Swift-specific `waitForDisconnect`. (`redirectTo`
     /// is web-only `window.location` and is intentionally not modeled here.)
     public func logout(options: LogoutOptions = LogoutOptions()) async throws {
+        // JS parity (#1059): JS emits `auth:logout` (payload `{}`) as the very
+        // first statement of `JsBaoClient.logout()`, before any teardown.
+        // Every Swift logout path funnels through this method, so emitting
+        // here covers `client.logout(...)` and `client.auth.logout(...)`.
+        emitter?.emit(.authLogout, AuthLogoutEvent())
+
         // Block any in-flight refresh/restore from re-authenticating after
         // this logout (see `blockNonInteractiveAuth`). Set before clearing
         // the token so a refresh resolving mid-logout is caught.
@@ -510,6 +524,11 @@ public final class AuthController: @unchecked Sendable {
         if options.waitForDisconnect {
             await onLogoutDisconnect?()
         }
+
+        // JS parity (#1059): JS emits `auth:logout:complete` (payload `{}`)
+        // after the best-effort server logout, networking shutdown, and
+        // `auth.logout(...)` teardown have all finished.
+        emitter?.emit(.authLogoutComplete, AuthLogoutCompleteEvent())
     }
 
     /// Backward-compatible overload retained for the `JsBaoClient` wiring

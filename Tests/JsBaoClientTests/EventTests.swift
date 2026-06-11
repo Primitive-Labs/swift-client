@@ -101,6 +101,43 @@ final class EventTests: XCTestCase {
         sub.cancel()
     }
 
+    /// `syncPerf` payload parity (#996): opening a doc with
+    /// `requestSyncPerf: true` makes syncStep1 carry `requestPerf: true`,
+    /// and the server replies with a `syncPerf` frame whose `timings` map
+    /// (totalMs, reconstructMs, docHashMs, ...) is delivered verbatim —
+    /// the same `{ documentId, timings, clientTimings? }` shape as JS.
+    func testEmitSyncPerfWithServerTimingsWhenRequested() async throws {
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+
+        try await client.connect()
+        try await waitForConnection(client: client)
+
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "SyncPerf Test Doc")
+
+        var perfEvents: [SyncPerfEvent] = []
+        let sub = client.events.on(.syncPerf) { (e: SyncPerfEvent) in
+            perfEvents.append(e)
+        }
+        defer { sub.cancel() }
+
+        _ = try await client.openDocument(
+            docId,
+            options: OpenDocumentOptions(waitForLoad: .network, requestSyncPerf: true)
+        )
+        try await waitForSync(client: client, documentId: docId)
+
+        try await eventually(timeout: 5, description: "syncPerf event with server timings") {
+            perfEvents.contains { $0.documentId == docId && !$0.timings.isEmpty }
+        }
+
+        let event = perfEvents.first { $0.documentId == docId && !$0.timings.isEmpty }
+        XCTAssertNotNil(event)
+        // `totalMs` is present on every server syncPerf payload variant
+        // (both the already-in-sync and full-sync paths in yjs-room-v2).
+        XCTAssertNotNil(event?.timings["totalMs"], "Expected server-provided totalMs in timings")
+    }
+
     func testEmitStatusEvents() async throws {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }

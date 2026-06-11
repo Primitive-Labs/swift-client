@@ -21,8 +21,10 @@ public final class DynamicModel {
     internal let doc: YDocument
 
     /// Identifier for this doc within a shared SQLite store. Defaults
-    /// to `""` for single-doc usage. When multiple `DynamicModel`s
-    /// share the same `BaoModelQueryEngine`, every row is tagged with
+    /// to `BaoModelQueryEngine.legacyDefaultDocId`
+    /// ("__legacy_default__" — js-bao's `DEFAULT_LEGACY_DOC_ID`) for
+    /// single-doc usage. When multiple `DynamicModel`s share the same
+    /// `BaoModelQueryEngine`, every row is tagged with
     /// `_meta_doc_id = self.docId` so per-doc queries scope correctly
     /// and `MultiDocModel` can run cross-doc aggregations.
     public let docId: String
@@ -77,9 +79,13 @@ public final class DynamicModel {
     /// js-bao browser's `Model.subscribe` (browser.js:3628).
     ///
     /// The callback runs on whichever thread committed the change:
-    /// local writes fire synchronously inside the write path; remote
-    /// changes fire from the observer-drain queue. Keep callbacks
-    /// fast and non-blocking.
+    /// local writes fire synchronously on the writing thread AFTER the
+    /// write transaction commits (matching js-bao, which notifies
+    /// post-commit — see #1116); remote changes fire from the
+    /// observer-drain queue. A batch (`transact`) notifies once per
+    /// model, not once per write. Callbacks may safely re-enter the
+    /// model (query, write) since no transaction is open when they
+    /// run. Keep callbacks fast and non-blocking.
     @discardableResult
     public func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
         let id = UUID()
@@ -103,6 +109,48 @@ public final class DynamicModel {
         listenerLock.unlock()
         for cb in snapshot { cb() }
     }
+
+    /// Notify listeners of a local write, deferring until the
+    /// enclosing write transaction commits. js-bao notifies after the
+    /// Y.Doc transaction closes; firing synchronously *inside* the
+    /// open yrs transaction (the previous behavior, #1116) meant a
+    /// subscriber observed half-committed batch state — and could
+    /// deadlock if its callback touched anything that needs a new
+    /// transaction (`query()` draining an observer task that calls
+    /// `transactSync`, for example).
+    ///
+    /// Inside a transaction (the thread-local `activeTx` is set by
+    /// `transact` / `withTx` / `withThrowingTx`), the model is queued
+    /// on the thread's pending list — deduplicated, so a batch of N
+    /// writes notifies once, matching js-bao's once-per-commit
+    /// semantics. The outermost transaction wrapper flushes the queue
+    /// right after `transactSync` returns. Outside a transaction it
+    /// fires immediately.
+    internal func notifyListenersAfterWrite() {
+        if Self.activeTx != nil {
+            let dict = Thread.current.threadDictionary
+            var pending = dict[Self.pendingNotifyKey] as? [DynamicModel] ?? []
+            if !pending.contains(where: { $0 === self }) {
+                pending.append(self)
+            }
+            dict[Self.pendingNotifyKey] = pending
+        } else {
+            notifyListeners()
+        }
+    }
+
+    /// Fire (and clear) every notification queued on this thread while
+    /// a write transaction was open. Called by the transaction wrappers
+    /// after their `transactSync` closes — i.e. after the yrs commit —
+    /// so subscriber callbacks observe fully-committed state and are
+    /// free to open new transactions (query, write, etc.).
+    fileprivate static func flushPendingNotifications() {
+        let dict = Thread.current.threadDictionary
+        guard let pending = dict[pendingNotifyKey] as? [DynamicModel],
+              !pending.isEmpty else { return }
+        dict.removeObject(forKey: pendingNotifyKey)
+        for model in pending { model.notifyListeners() }
+    }
     /// Serial queue that drains observer-driven SQLite work. Observers
     /// fire from inside yrs's commit hook (RwLock held), so they can't
     /// open a new `transactSync` directly — they dispatch here.
@@ -112,6 +160,12 @@ public final class DynamicModel {
     internal let observerDrainQueue = DispatchQueue(
         label: "JsBaoClient.DynamicModel.observerDrain"
     )
+
+    /// Per-instance queue marker so `awaitObserverDrain` can detect a
+    /// re-entrant call from this model's own drain queue (a listener
+    /// callback that runs `query()`, say) and skip the self-deadlocking
+    /// `sync`. Set on `observerDrainQueue` in `init`.
+    private let drainQueueKey = DispatchSpecificKey<Bool>()
 
     /// Serial queue used to run uniqueness reconciliation *off* the
     /// yrs update-observer callback. yrs's `observe_update_v1` fires
@@ -133,6 +187,11 @@ public final class DynamicModel {
     // every method signature.
 
     fileprivate static let activeTxKey = "JsBaoClient.DynamicModel.activeTx"
+
+    /// Thread-local list of models with listener notifications queued
+    /// while a write transaction is open. Flushed by the outermost
+    /// transaction wrapper after `transactSync` returns (#1116).
+    fileprivate static let pendingNotifyKey = "JsBaoClient.DynamicModel.pendingNotify"
 
     fileprivate static var activeTx: YrsTransaction? {
         Thread.current.threadDictionary[activeTxKey] as? YrsTransaction
@@ -175,19 +234,31 @@ public final class DynamicModel {
                 catch { result = .failure(error) }
             }
         }
+        // Commit is done — deliver listener notifications queued
+        // during the batch (even on a throw: yrs doesn't roll back,
+        // so writes made before the throw ARE committed).
+        Self.flushPendingNotifications()
         return try result.get()
     }
 
     /// Non-throwing variant used by reads / deletes. Reuses the active
-    /// transaction when one is in scope.
+    /// transaction when one is in scope; otherwise opens one and
+    /// publishes it via the thread-local so nested helpers (and the
+    /// post-commit notification queue) see it.
     fileprivate func withTx<T>(_ body: (YrsTransaction) -> T) -> T {
         if let existing = Self.activeTx {
             return body(existing)
         }
         var result: T!
         withoutActuallyEscaping(body) { body in
-            doc.transactSync { txn in result = body(txn) }
+            doc.transactSync { txn in
+                let dict = Thread.current.threadDictionary
+                dict[Self.activeTxKey] = txn
+                defer { dict.removeObject(forKey: Self.activeTxKey) }
+                result = body(txn)
+            }
         }
+        Self.flushPendingNotifications()
         return result
     }
 
@@ -202,10 +273,14 @@ public final class DynamicModel {
         var result: Result<T, Error>!
         withoutActuallyEscaping(body) { body in
             doc.transactSync { txn in
+                let dict = Thread.current.threadDictionary
+                dict[Self.activeTxKey] = txn
+                defer { dict.removeObject(forKey: Self.activeTxKey) }
                 do { result = .success(try body(txn)) }
                 catch { result = .failure(error) }
             }
         }
+        Self.flushPendingNotifications()
         return try result.get()
     }
 
@@ -224,7 +299,8 @@ public final class DynamicModel {
     ///   - schema: the model's runtime schema.
     ///   - docId: identifier for this doc inside the SQLite mirror.
     ///     Required when sharing an engine with other docs — see
-    ///     `MultiDocModel`. Defaults to `""` for single-doc usage.
+    ///     `MultiDocModel`. Defaults to js-bao's legacy doc id
+    ///     (`__legacy_default__`) for single-doc usage.
     ///   - sharedEngine: if non-nil, this DynamicModel writes its
     ///     rows into the supplied engine (tagged with `docId`).
     ///     When nil, a fresh engine is created. Multi-doc setups
@@ -232,12 +308,13 @@ public final class DynamicModel {
     public init(
         doc: YDocument,
         schema: PrimitiveSchema,
-        docId: String = "",
+        docId: String = BaoModelQueryEngine.legacyDefaultDocId,
         sharedEngine: BaoModelQueryEngine? = nil
     ) {
         self.doc = doc
         self.schema = schema
         self.docId = docId
+        observerDrainQueue.setSpecific(key: drainQueueKey, value: true)
 
         // Resolve the engine first so the table exists by the time
         // init's seeding loop tries to upsert rows into it.
@@ -533,8 +610,10 @@ public final class DynamicModel {
             if let existingId = existing {
                 // Merge path. JS `save({ upsertOn })` matches by the unique
                 // field and updates the existing record — the existing id
-                // wins and any supplied id is ignored (mirrors js-bao; a
-                // mismatching supplied id is not an error).
+                // wins and any supplied id is ignored. (JS only throws its
+                // upsertOn-conflict error for ids *explicitly* passed to the
+                // constructor; Swift can't distinguish explicit from fresh
+                // ids, so the supplied id is treated like JS's auto id.)
                 resolved = .success((id: existingId, wasCreated: false))
             } else {
                 // Insert path. Resolve the id: caller-supplied > schema
@@ -1016,7 +1095,8 @@ public final class DynamicModel {
             modelName: schema.name, id: id, scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
         )
-        notifyListeners()
+        // Deferred when inside an outer `transact` batch (#1116).
+        notifyListenersAfterWrite()
     }
 
     // MARK: - Write + uniqueness enforcement
@@ -1269,7 +1349,10 @@ public final class DynamicModel {
             self.installRecordObserverUnlocked(id: id, rootMap: root, tx: txn)
         }
         self.upsertSqliteRow(id: id, rootMap: root, tx: txn)
-        self.notifyListeners()
+        // applyWriteInternal always runs inside the write transaction —
+        // the notification is queued and delivered by the transaction
+        // wrapper after the yrs commit (#1116).
+        self.notifyListenersAfterWrite()
     }
 
     /// Snapshot a record's fields WITHOUT opening a new transaction.
@@ -1410,23 +1493,39 @@ public final class DynamicModel {
         if case let .stringset(items) = value {
             // Per-member layout: each member is a key in the nested
             // Y.Map with value `true`. Mirrors js-bao's wire format
-            // (browser.ts `setStringSet`). Previously Swift wrote the
-            // JSON-encoded member name as the value — both clients
-            // could read either shape, but byte-equality assertions
-            // failed and downstream tooling that inspects the raw
-            // Y.Doc saw different content.
+            // (browser.ts `setStringSet`).
             //
-            // We still replace the nested Y.Map wholesale here — this
-            // is the full-set-replace write path (`create`/`update`
-            // with a stringset value). Per-member add/remove without
-            // overwriting the whole map goes through
-            // `addStringsetMember(_:)` / `removeStringsetMember(_:)`,
-            // which keeps the CRDT-union semantics intact under
-            // concurrent offline writes.
-            _ = try? rec.remove(tx: tx, key: fieldName)
-            let nested = rec.insertMap(tx: tx, key: fieldName)
-            for item in items {
-                nested.insert(tx: tx, key: item, value: "true")
+            // Full-set assignment is a DIFF against the locally-known
+            // members, not a wholesale map replacement — mirrors
+            // js-bao's `applyStringSetChangeToYMap` (BaseModel.ts),
+            // which only `target.set(member, true)`s additions and
+            // `target.delete(member)`s removals on the *existing*
+            // nested Y.Map. Keeping the same Y.Map instance alive is
+            // what preserves CRDT union semantics: a concurrent
+            // offline add from another client targets this map, so it
+            // survives a full-set assignment that doesn't know about
+            // it. Replacing the map (the previous behavior) orphaned
+            // those concurrent inserts and they were lost on merge
+            // (#1114).
+            if let nested = rec.getMap(tx: tx, key: fieldName) {
+                let collector = KeyCollector()
+                nested.keys(tx: tx, delegate: collector)
+                let existing = Set(collector.keys)
+                for member in items.subtracting(existing) {
+                    nested.insert(tx: tx, key: member, value: "true")
+                }
+                for member in existing.subtracting(items) {
+                    _ = try? nested.remove(tx: tx, key: member)
+                }
+            } else {
+                // No nested map yet (fresh field, or a legacy scalar
+                // value that getMap can't see) — clear any scalar and
+                // materialize the map with the full member set.
+                _ = try? rec.remove(tx: tx, key: fieldName)
+                let nested = rec.insertMap(tx: tx, key: fieldName)
+                for item in items {
+                    nested.insert(tx: tx, key: item, value: "true")
+                }
             }
             return
         }
@@ -1525,12 +1624,15 @@ public final class DynamicModel {
     /// this before reading so remote-driven async upserts finish
     /// before the SELECT runs. Idempotent; cheap when queue is idle.
     ///
-    /// MUST NOT be called from inside an observer callback (which
-    /// runs on `observerDrainQueue`) — that would self-deadlock.
-    /// Subscribe handlers in particular should not re-enter `query()`
-    /// synchronously.
+    /// Re-entrancy-safe: when called from this model's own drain
+    /// queue (a subscriber callback delivered there that re-enters
+    /// `query()`, for example), the `sync` would self-deadlock — and
+    /// it's also unnecessary, because the mirror already reflects
+    /// every change applied before the current task. We detect that
+    /// case via the queue-specific marker and return immediately
+    /// (#1116).
     internal func awaitObserverDrain() {
-        dispatchPrecondition(condition: .notOnQueue(observerDrainQueue))
+        if DispatchQueue.getSpecific(key: drainQueueKey) == true { return }
         observerDrainQueue.sync {}
     }
 
@@ -1584,7 +1686,13 @@ private final class RootMapObserver: YrsMapObservationDelegate {
                     scopedToDocId: model.docId,
                     stringsetFields: model.stringsetFieldNames
                 )
-                model.notifyListeners()
+                // Notify from the drain queue, not from inside yrs's
+                // commit hook (where this observer fires with the doc
+                // lock held) — a listener that re-enters the model
+                // would deadlock against the in-flight commit (#1116).
+                model.observerDrainQueue.async { [weak model] in
+                    model?.notifyListeners()
+                }
             default:
                 // Scalar events on the root map are not a normal
                 // layout for this schema — ignore.

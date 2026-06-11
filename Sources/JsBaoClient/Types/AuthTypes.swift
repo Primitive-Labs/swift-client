@@ -59,14 +59,20 @@ public struct OtpRequestResult: Decodable, Sendable, Equatable {
 }
 
 /// Parameters for `auth.otpVerify(...)`. Mirrors JS
-/// `otpVerify({ email, code })`.
+/// `otpVerify(email, code, { inviteToken })`.
 public struct OtpVerifyParams: Sendable {
     public var email: String
     public var code: String
+    /// Optional invitation token (#466): when present, the server accepts
+    /// the named invitation during verify and resolves deferred grants to
+    /// the signing-in user — even when the signup email differs from the
+    /// invited email. Mirrors JS `otpVerify(email, code, { inviteToken })`.
+    public var inviteToken: String?
 
-    public init(email: String, code: String) {
+    public init(email: String, code: String, inviteToken: String? = nil) {
         self.email = email
         self.code = code
+        self.inviteToken = inviteToken
     }
 }
 

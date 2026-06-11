@@ -89,6 +89,13 @@ public enum JsBaoEvent: String, Sendable {
     // file that owns the underlying signal; see corresponding payload
     // structs below for the data shape.
     case authLogout = "auth:logout"
+    /// Fires when logout teardown finishes. Mirrors JS `auth:logout:complete`
+    /// (`src/client/JsBaoClient.ts` `logout()`): JS emits `auth:logout`
+    /// immediately on entry, then `auth:logout:complete` after the
+    /// best-effort server logout, networking shutdown, and auth-state
+    /// teardown have all run. Payload is `{}` on JS;
+    /// `AuthLogoutCompleteEvent` is the (empty) Swift analog.
+    case authLogoutComplete = "auth:logout:complete"
     case authOnlineRequired = "auth:onlineAuthRequired"
     case connectionClose = "connection-close"
     case connectionError = "connection-error"
@@ -174,14 +181,27 @@ public struct SyncEvent: Sendable {
     public let synced: Bool
 }
 
+/// Payload for `.awareness`. Mirrors the JS client's `AwarenessEvent`
+/// (`src/client/JsBaoClient.ts`) field-for-field: a **delta** of client
+/// IDs whose presence state changed — `added` (new clients), `updated`
+/// (existing clients with new state), `removed` (clients whose state was
+/// cleared). To read the actual states, call
+/// `client.getAwarenessStates(documentId:)` with the delivered IDs —
+/// same pattern as JS.
+///
+/// (#996: this replaced the previous Swift-only full-snapshot `states`
+/// payload, which JS never delivered.)
 public struct AwarenessEvent: Sendable {
     public let documentId: String
-    public let states: [[String: Any]]
+    public let added: [String]
+    public let updated: [String]
+    public let removed: [String]
 
-    // Sendable conformance note: states contains Any but is only used on main actor
-    nonisolated public init(documentId: String, states: [[String: Any]]) {
+    public init(documentId: String, added: [String], updated: [String], removed: [String]) {
         self.documentId = documentId
-        self.states = states
+        self.added = added
+        self.updated = updated
+        self.removed = removed
     }
 }
 
@@ -189,9 +209,18 @@ public struct RemoteUpdateEvent: Sendable {
     public let documentId: String
 }
 
+/// Payload for `.permission`. JS delivers `permission` as a plain string
+/// (`"owner" | "read-write" | "reader" | "admin"`); Swift keeps a typed
+/// enum whose `rawValue`s are exactly those wire strings (#996 decision:
+/// typed accessor with matching observable value). Read
+/// `event.permission.rawValue` for the JS-identical string — also exposed
+/// directly as `permissionRaw`.
 public struct PermissionEvent: Sendable {
     public let documentId: String
     public let permission: DocumentPermission
+
+    /// The JS wire string for `permission` (e.g. `"read-write"`).
+    public var permissionRaw: String { permission.rawValue }
 }
 
 /// Typed payload for `.documentMetadataChanged`. Mirrors the JS
@@ -205,14 +234,16 @@ public struct DocumentMetadataChangedEvent: @unchecked Sendable {
     public let action: String
     public let metadata: [String: Any]?
     public let changedFields: [String]?
-    /// Where the change originated. Matches js-bao's
+    /// Where the change originated. Always present (#996). Matches js-bao's
     /// `documentMetadataChanged.source` vocabulary field-for-field:
     /// - `"local"`  — write originated on this device
     /// - `"server"` — the server pushed it over the WebSocket
-    ///
-    /// JS additionally emits `"idb"` for IndexedDB-replayed changes; that
-    /// has no Swift/SQLite analog and is intentionally dropped (the Swift
-    /// offline store doesn't re-emit metadata changes on hydration).
+    /// - `"idb"`    — replayed from local persistence. JS uses this value
+    ///   for IndexedDB-originated changes; Swift maps its SQLite
+    ///   offline-store hydration to the **same wire value** so
+    ///   cross-platform subscribers see one vocabulary. (Neither client
+    ///   currently emits a hydration-sourced change — the value is
+    ///   declared in both type surfaces and reserved for that path.)
     public let source: String
 
     public init(
@@ -297,6 +328,80 @@ public struct BlobUploadProgressEvent: Sendable {
 /// Payload for `blobs:upload-completed`. Mirrors the JS client's
 /// `BlobUploadCompletedEvent` field-for-field.
 public struct BlobUploadCompletedEvent: Sendable {
+    public let documentId: String
+    public let blobId: String
+    public let queueId: String
+    public let filename: String
+    public let contentType: String
+    public let numBytes: Int
+    public let attempts: Int
+    public let retainLocal: Bool?
+    public let updatedAt: TimeInterval
+
+    public init(
+        documentId: String,
+        blobId: String,
+        queueId: String,
+        filename: String,
+        contentType: String,
+        numBytes: Int,
+        attempts: Int,
+        retainLocal: Bool? = nil,
+        updatedAt: TimeInterval
+    ) {
+        self.documentId = documentId
+        self.blobId = blobId
+        self.queueId = queueId
+        self.filename = filename
+        self.contentType = contentType
+        self.numBytes = numBytes
+        self.attempts = attempts
+        self.retainLocal = retainLocal
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Payload for `blobs:upload-paused`. Mirrors the JS client's
+/// `emitUploadPaused` payload (`src/client/internal/blobManager.ts`)
+/// field-for-field: the full queue record at pause time.
+public struct BlobUploadPausedEvent: Sendable {
+    public let documentId: String
+    public let blobId: String
+    public let queueId: String
+    public let filename: String
+    public let contentType: String
+    public let numBytes: Int
+    public let attempts: Int
+    public let retainLocal: Bool?
+    public let updatedAt: TimeInterval
+
+    public init(
+        documentId: String,
+        blobId: String,
+        queueId: String,
+        filename: String,
+        contentType: String,
+        numBytes: Int,
+        attempts: Int,
+        retainLocal: Bool? = nil,
+        updatedAt: TimeInterval
+    ) {
+        self.documentId = documentId
+        self.blobId = blobId
+        self.queueId = queueId
+        self.filename = filename
+        self.contentType = contentType
+        self.numBytes = numBytes
+        self.attempts = attempts
+        self.retainLocal = retainLocal
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Payload for `blobs:upload-resumed`. Mirrors the JS client's
+/// `emitUploadResumed` payload field-for-field (same record shape as
+/// `BlobUploadPausedEvent`).
+public struct BlobUploadResumedEvent: Sendable {
     public let documentId: String
     public let blobId: String
     public let queueId: String
@@ -471,6 +576,12 @@ public struct AuthLogoutEvent: Sendable {
     public init(reason: String? = nil) { self.reason = reason }
 }
 
+/// Payload for `.authLogoutComplete`. JS emits `{}`; the struct is empty
+/// to match (mirrors the `AuthLogoutEvent` / JS `auth:logout` pairing).
+public struct AuthLogoutCompleteEvent: Sendable {
+    public init() {}
+}
+
 public struct AuthOnlineRequiredEvent: Sendable {
     public let reason: String?
     public init(reason: String? = nil) { self.reason = reason }
@@ -547,53 +658,48 @@ public struct SchemaDiscoveredEvent: Sendable {
 /// Payload for `.syncPerf`. Mirrors the JS client's `syncPerf` event
 /// (`src/client/JsBaoClient.ts`): `{ documentId, timings, clientTimings? }`.
 ///
-/// In JS, `timings` is the server-provided per-phase timing map carried on
-/// the `syncPerf` WS frame, and `clientTimings` is derived from
-/// `docManager.getSyncTimings(documentId)` (e.g. `clientTotalMs`). The Swift
-/// client does **not** yet handle a `syncPerf` WS frame and does not
-/// instrument per-phase sync timings (no `getSyncTimings` analog), so these
-/// maps are present for cross-platform decode parity but are populated only
-/// if/when a Swift emit site is wired. `phase`/`elapsedMs` are a Swift-only
-/// convenience pair retained for existing callers.
+/// `timings` is the server-provided per-phase timing map carried on the
+/// `syncPerf` WS frame (`totalMs`, `reconstructMs`, `docHashMs`, … — see
+/// `src/yjs-room-v2.ts`). The server only sends the frame when the client
+/// set `requestPerf: true` on its `syncStep1` — request it via
+/// `OpenDocumentOptions(requestSyncPerf: true)`, same as JS
+/// `openDocument(..., { requestSyncPerf: true })`.
+///
+/// `clientTimings` is the client-side derived map (JS `clientTimings?`,
+/// e.g. `clientTotalMs`/`clientRoundTripMs`). The Swift client does not
+/// yet instrument per-phase sync timings (no `getSyncTimings` analog), so
+/// it is `nil` today; the field exists for cross-platform payload parity.
+///
+/// (#996: the previous Swift-only `phase`/`elapsedMs` pair was removed —
+/// JS never carried those fields.)
 public struct SyncPerfEvent: @unchecked Sendable {
     public let documentId: String
-    /// Server-provided per-phase timing map (mirrors JS `timings`). Empty
-    /// when no server frame supplied it.
+    /// Server-provided per-phase timing map (mirrors JS `timings`).
     public let timings: [String: Any]
-    /// Client-side derived timings (mirrors JS `clientTimings?`). `nil` when
-    /// the Swift client hasn't computed any (the common case today, since
-    /// Swift lacks the `getSyncTimings` instrumentation).
+    /// Client-side derived timings (mirrors JS `clientTimings?`). `nil`
+    /// until Swift grows sync-timing instrumentation.
     public let clientTimings: [String: Any]?
-    /// Swift-only: a coarse single-phase label. Not present in JS.
-    public let phase: String
-    /// Swift-only: elapsed ms for `phase`. Not present in JS.
-    public let elapsedMs: Double
 
     public init(
         documentId: String,
         timings: [String: Any] = [:],
-        clientTimings: [String: Any]? = nil,
-        phase: String,
-        elapsedMs: Double
+        clientTimings: [String: Any]? = nil
     ) {
         self.documentId = documentId
         self.timings = timings
         self.clientTimings = clientTimings
-        self.phase = phase
-        self.elapsedMs = elapsedMs
     }
 }
 
 /// Fired when a workflow run is started. Mirrors the JS client's
 /// `WorkflowStartedEvent` (`src/client/JsBaoClient.ts`) field-for-field.
 ///
-/// On the server-pushed path (a `workflowStarted` WS frame, the JS
-/// source of truth) every field is populated from the frame. On the
-/// local `workflows.start(...)` HTTP-response path, only the fields the
-/// `StartWorkflowResult` envelope and the caller's options carry are
-/// set — `meta`/`contextDocId` come from the start options when present.
+/// Emitted exclusively from the server-pushed `workflowStarted` WS frame
+/// (the JS source of truth); every field is populated from the frame.
+/// The local `workflows.start(...)` HTTP path does NOT emit — it did
+/// pre-#1112, which double-emitted every start observed over WS.
 /// All fields beyond `workflowKey`/`runId` are optional so decoding /
-/// construction stays lenient when a source can't supply them.
+/// construction stays lenient when the frame omits them.
 public struct WorkflowStartedEvent: @unchecked Sendable {
     public let workflowKey: String
     public let runId: String

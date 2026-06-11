@@ -31,7 +31,7 @@ final class OfflineTests: XCTestCase {
         )
         defer { Task { await client.destroy() } }
 
-        let (docId, ydoc) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docId, ydoc) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Local Only",
             localOnly: true
         ))
@@ -57,7 +57,7 @@ final class OfflineTests: XCTestCase {
         await client.goOffline()
 
         // Create a document while offline
-        let (docId, ydoc) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docId, ydoc) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Offline Created"
         ))
 
@@ -128,7 +128,7 @@ final class OfflineTests: XCTestCase {
         await client.goOffline()
 
         // Create a document while offline (non-local-only => pending)
-        let (docId, ydoc) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docId, ydoc) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Offline Then Online"
         ))
 
@@ -170,7 +170,7 @@ final class OfflineTests: XCTestCase {
         // Create multiple documents while offline
         var docIds: [String] = []
         for i in 0..<3 {
-            let (docId, _) = try await client.createDocument(options: CreateDocumentOptions(
+            let (docId, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(
                 title: "Offline Doc \(i)"
             ))
             XCTAssertFalse(docId.isEmpty)
@@ -270,7 +270,7 @@ final class OfflineTests: XCTestCase {
             storageConfig: .sqlite(directory: dbPath)
         )
 
-        let (docId, ydoc1) = try await client1.createDocument(options: CreateDocumentOptions(
+        let (docId, ydoc1) = try await client1.createDocumentForTest(options: CreateDocumentOptions(
             title: "Local Persist",
             localOnly: true
         ))
@@ -324,7 +324,7 @@ final class OfflineTests: XCTestCase {
         await client.goOffline()
 
         // Create pending doc A
-        let (docIdA, _) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docIdA, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Pending Cancel"
         ))
         XCTAssertTrue(client.isPendingCreate(docIdA), "Doc A should be pending")
@@ -334,7 +334,7 @@ final class OfflineTests: XCTestCase {
         XCTAssertFalse(client.isPendingCreate(docIdA), "Doc A should no longer be pending after cancel")
 
         // Create pending doc B
-        let (docIdB, _) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docIdB, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Pending Commit"
         ))
         XCTAssertTrue(client.isPendingCreate(docIdB), "Doc B should be pending")

@@ -58,17 +58,9 @@ public final class DocumentsAPI: @unchecked Sendable {
         }
 
         // Delegate to the authoritative local-first create, exactly as
-        // js-bao's `DocumentsAPI.create` forwards to `client.createDocument`.
-        let (documentId, _) = try await client.createDocument(options: options)
-
-        // Return the freshly-written local metadata as the `{ metadata }`
-        // result, matching js-bao's return shape.
-        let entry = documentManager?.getLocalMetadata(documentId)
-        let metadataValue = try entry.map { entry -> JSONValue in
-            let any = try JSONCoding.jsonObject(from: entry)
-            return try JSONCoding.decode(JSONValue.self, from: any)
-        }
-        return CreateDocumentResult(metadata: metadataValue)
+        // js-bao's `DocumentsAPI.create` forwards to `client.createDocument`
+        // — which itself returns the `{ metadata }` result since #1108.
+        return try await client.createDocument(options: options)
     }
 
     /// List documents accessible to the current user.
@@ -151,7 +143,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         // the requested tag should be returned (mirrors js-bao's `filterRoot`).
         if !includeRoot, options?.tag == nil {
             var rootDocId: String? = nil
-            if let client { rootDocId = try? await client.getRootDocId() }
+            if let client { rootDocId = client.getRootDocId() }
             items = Self.filterOutRoot(items, rootDocId: rootDocId)
         }
         return DocumentListPage(items: items, cursor: cursor)
@@ -640,6 +632,20 @@ public final class DocumentsAPI: @unchecked Sendable {
         }
     }
 
+    /// Get the pending-create entry for a single document, or `nil` when
+    /// the document has no uncommitted local create. Same entry shape as
+    /// `listPendingCreates()` (`{ documentId, title?, createdAt }`),
+    /// sourced from local metadata — no network (#1111).
+    public func getPendingCreate(documentId: String) async -> PendingCreateInfo? {
+        guard let mgr = documentManager, mgr.isPendingCreate(documentId) else { return nil }
+        let meta = mgr.getLocalMetadata(documentId)
+        return PendingCreateInfo(
+            documentId: documentId,
+            title: meta?.title,
+            createdAt: meta?.createdAt ?? ""
+        )
+    }
+
     /// Cancel a pending local document create. With `options.evictLocal`,
     /// the document's local data is also evicted after cancellation.
     /// Mirrors js-bao's `documents.cancelPendingCreate(documentId, { evictLocal })`.
@@ -846,7 +852,7 @@ public final class DocumentsAPI: @unchecked Sendable {
                 message: "DocumentsAPI.openRoot requires a wired JsBaoClient"
             )
         }
-        guard let docId = try await client.getRootDocId() else {
+        guard let docId = client.getRootDocId() else {
             throw JsBaoError(
                 code: .notFound,
                 message: "App has no root document"

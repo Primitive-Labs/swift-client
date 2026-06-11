@@ -56,17 +56,23 @@ public extension PrimitiveRecord {
             )
         }
 
-        let matches = target.findAll().filter {
-            $0[fkField]?.asString == self.id
-        }
-
-        guard let orderBy = rel.properties["orderByField"] else { return matches }
-
+        // Route through the SQLite-backed query engine (indexed FK
+        // lookup) instead of `findAll().filter` — the O(N) full scan
+        // this used to do (#1115). Same filter the batch Include path
+        // builds (`fkField IN parents`), specialized to one parent.
+        // js-bao's generated hasMany accessor does the same:
+        // `query({ [relatedIdField]: this.id }, { sort: ... })`
+        // (relationshipManager.ts `generateHasManyMethod`).
+        let orderBy = rel.properties["orderByField"]
         let descending = rel.properties["orderDirection"] == "DESC"
-        return matches.sorted { a, b in
-            let av = a[orderBy]?.asString ?? ""
-            let bv = b[orderBy]?.asString ?? ""
-            return descending ? av > bv : av < bv
+        let options = orderBy.map {
+            QueryOptions(sort: [$0: descending ? -1 : 1])
+        }
+        let rows = target.query([fkField: self.id], options: options)
+        return rows.compactMap { row in
+            (row["id"] as? String).map {
+                PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
+            }
         }
     }
 
@@ -114,12 +120,15 @@ public extension PrimitiveRecord {
             )
         }
 
-        // Find join rows pointing at this record.
-        let joinRows = joinModel.findAll().filter {
-            $0[localField]?.asString == self.id
-        }
+        // Find join rows pointing at this record — indexed query
+        // instead of the old `findAll().filter` full scan (#1115).
+        // Matches js-bao's generated hasManyThrough accessor, which
+        // queries the join model on `joinModelLocalField` and then
+        // resolves the collected target ids
+        // (relationshipManager.ts `generateHasManyThroughMethod`).
+        let joinRows = joinModel.query([localField: self.id], options: nil)
         // Collect target ids and resolve to records.
-        let targetIds = joinRows.compactMap { $0[relatedField]?.asString }
+        let targetIds = joinRows.compactMap { $0[relatedField] as? String }
         return targetIds.compactMap { target.find(id: $0) }
     }
 

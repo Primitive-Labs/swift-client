@@ -45,7 +45,7 @@ final class OfflineFirstTests: XCTestCase {
         await client.goOffline()
 
         // Create a document while offline
-        let (docId, ydoc) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docId, ydoc) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Offline First Doc"
         ))
 
@@ -78,7 +78,7 @@ final class OfflineFirstTests: XCTestCase {
         )
         defer { Task { await client.destroy() } }
 
-        let (docId, ydoc) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docId, ydoc) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Local Only Forever",
             localOnly: true
         ))
@@ -131,7 +131,7 @@ final class OfflineFirstTests: XCTestCase {
             // `handleSyncComplete` can fire to save the test.
             await client.goOffline()
 
-            let (docId, maybeDoc) = try await client.createDocument(options: CreateDocumentOptions(
+            let (docId, maybeDoc) = try await client.createDocumentForTest(options: CreateDocumentOptions(
                 title: "Persist Across Restart",
                 localOnly: true
             ))
@@ -188,7 +188,7 @@ final class OfflineFirstTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         // Create some local data
-        let (docId, _) = try await client.createDocument(options: CreateDocumentOptions(
+        let (docId, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(
             title: "Evict Test",
             localOnly: true
         ))
@@ -199,5 +199,49 @@ final class OfflineFirstTests: XCTestCase {
 
         // After eviction, document references should be cleared
         XCTAssertEqual(client.listOpenDocuments().count, 0)
+    }
+
+    /// #1111: `documents.getPendingCreate(documentId:)` returns the
+    /// pending-create entry — the same `{ documentId, title?, createdAt }`
+    /// shape `listPendingCreates()` lists — or nil when the document has
+    /// no uncommitted local create.
+    func testGetPendingCreateReturnsEntry() async throws {
+        let client = createTestClient(
+            appId: testApp.appId,
+            token: testApp.ownerJWT,
+            offline: true,
+            storageConfig: .memory,
+            autoNetwork: false
+        )
+        defer { Task { await client.destroy() } }
+
+        await client.goOffline()
+
+        let (docId, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(
+            title: "Pending entry"
+        ))
+        XCTAssertTrue(client.isPendingCreate(docId), "offline create must be pending")
+
+        let entry = await client.documents.getPendingCreate(documentId: docId)
+        XCTAssertEqual(entry?.documentId, docId)
+        XCTAssertEqual(entry?.title, "Pending entry")
+        XCTAssertFalse(entry?.createdAt.isEmpty ?? true, "entry must carry createdAt")
+
+        // Exactly the entry listPendingCreates returns for the same doc.
+        let listed = await client.documents.listPendingCreates()
+        XCTAssertTrue(listed.contains(where: { $0 == entry }),
+                      "getPendingCreate must return the listPendingCreates entry")
+
+        // Unknown doc -> nil.
+        let missing = await client.documents.getPendingCreate(documentId: "no-such-doc")
+        XCTAssertNil(missing)
+
+        // localOnly docs never commit, so they are not pending creates.
+        let (localId, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(
+            title: "Local only",
+            localOnly: true
+        ))
+        let localEntry = await client.documents.getPendingCreate(documentId: localId)
+        XCTAssertNil(localEntry, "localOnly docs must not surface as pending creates")
     }
 }

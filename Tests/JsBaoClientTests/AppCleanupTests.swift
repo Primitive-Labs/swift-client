@@ -28,9 +28,15 @@ final class AppCleanupTests: XCTestCase {
         // a best-effort wait. Re-enable (delete this XCTSkip) once the JS-side
         // create-then-open sync issue is fixed. The body below is preserved so
         // it runs as-is when that lands.
+        //
+        // Re-verified 2026-06-10 (#1058): un-skipped and run twice against the
+        // live dev server — fails both times with the documented
+        // `Timeout waiting for sync on <docId>` (~42s each), so the JS-side
+        // bug is still unfixed and the skip stays.
         throw XCTSkip(
             "Blocked on the JS-side create-then-open sync bug " +
             "(tests/client/app-cleanup.test.ts \"TODO: Fix sync issues\"). " +
+            "Re-verified still failing 2026-06-10 under #1058. " +
             "Swift mirrors the JS client; re-enable when the sync gap is fixed."
         )
 
@@ -42,7 +48,7 @@ final class AppCleanupTests: XCTestCase {
         let client = createTestClient(appId: appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let (documentId, _) = try await client.createDocument(
+        let (documentId, _) = try await client.createDocumentForTest(
             options: CreateDocumentOptions(title: "Cleanup Test Document")
         )
         XCTAssertFalse(documentId.isEmpty, "Document should be created")
@@ -89,7 +95,7 @@ final class AppCleanupTests: XCTestCase {
 
         // Create some data
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
-        _ = try await client.createDocument(options: CreateDocumentOptions(title: "Idempotent Test"))
+        _ = try await client.createDocumentForTest(options: CreateDocumentOptions(title: "Idempotent Test"))
         await client.destroy()
 
         // Cleanup multiple times should not error

@@ -53,7 +53,10 @@ public final class JsBaoClient: @unchecked Sendable {
     let documentManager: DocumentManager
     private let blobManager: BlobManager
     private let offlineStore: OfflineStore
-    private let analyticsQueue: AnalyticsQueue
+    /// Internal (not `private`) so `@testable` integration tests can observe
+    /// logged events via `AnalyticsQueue.onEventLogged` — the Swift analog of
+    /// the JS tests poking `client.analyticsQueue` (#963 coverage).
+    let analyticsQueue: AnalyticsQueue
     private let kvCache: KvCache
 
     private let lock = NSLock()
@@ -134,12 +137,25 @@ public final class JsBaoClient: @unchecked Sendable {
             persistConfig: options.auth
         )
 
+        // WebSocket manager — created BEFORE the HTTP client so the HTTP
+        // layer can forward the live connection id as `X-JB-Connection-Id`.
+        // (`HttpClientConfig` is immutable; the previous `{ nil }` placeholder
+        // could never be "set after wsManager init", so Swift HTTP writes were
+        // silently unattributed — JS forwards the id on every request, which
+        // is what makes `db.change` frames round-trip with `isOrigin: true`
+        // for the writer's own connection, #737.)
+        let wsManager = WebSocketManager(
+            logger: logger,
+            maxReconnectDelayMs: Int(options.maxReconnectDelay * 1000)
+        )
+        self.wsManager = wsManager
+
         // HTTP client
         self.httpClient = HttpClient(config: HttpClientConfig(
             apiUrl: options.apiUrl,
             appId: options.appId,
             getToken: { [weak authController] in authController?.getToken() },
-            getConnectionId: { nil }, // Will be set after wsManager init
+            getConnectionId: { [weak wsManager] in wsManager?.connectionId },
             onTokenRefresh: { [weak authController] token in
                 authController?.updateToken(token, cause: "http_refresh")
             },
@@ -148,12 +164,6 @@ public final class JsBaoClient: @unchecked Sendable {
             logger: logger,
             refreshProxy: options.auth.refreshProxy
         ))
-
-        // WebSocket manager
-        self.wsManager = WebSocketManager(
-            logger: logger,
-            maxReconnectDelayMs: Int(options.maxReconnectDelay * 1000)
-        )
 
         // Document manager
         self.documentManager = DocumentManager(logger: logger)
@@ -344,7 +354,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Sync read of `rootDocId` from the parsed JWT payload, matching
     /// js-bao's `payload.user.rootDocId || payload.rootDocId` lookup.
     /// `nil` if no token is loaded or neither field is set. Internal
-    /// helper used by `getRootDocId(refresh:)` and `isRootDocument`.
+    /// helper used by `getRootDocId()` and `isRootDocument`.
     private func rootDocIdFromJwt() -> String? {
         guard let payload = authController.getJwtPayload() else { return nil }
         if let user = payload["user"] as? [String: Any],
@@ -608,11 +618,43 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Insert-or-update a record in document `docId`, matched by the
     /// single-field unique constraint on `field` — mirrors js-bao's
     /// `save({ upsertOn: field })`. Throws if the doc isn't open.
+    ///
+    /// Returns the `UpsertResult` so callers can read the RESOLVED
+    /// record: on the merge path the existing record's id wins (JS
+    /// reassigns `this.id = existingId`), so `result.record.id` may
+    /// differ from the `id` passed in.
+    @discardableResult
     public func upsertShared(
         _ schema: PrimitiveSchema, id: String,
         values: [String: PrimitiveValue], on field: String, in docId: String
-    ) throws {
-        _ = try requireMember(schema, in: docId).upsert(values, on: field, id: id)
+    ) throws -> UpsertResult {
+        try requireMember(schema, in: docId).upsert(values, on: field, id: id)
+    }
+
+    /// Insert-or-update a record in document `docId`, matched by the
+    /// NAMED unique constraint (single-field or compound) — mirrors
+    /// js-bao's `BaseModel.upsertByUnique(constraintName, lookupValue,
+    /// data, options)`. The lookup values come straight out of `values`
+    /// (every constraint field must be present there), so JS's separate
+    /// `uniqueLookupValue` argument — and its mismatch error — has no
+    /// Swift counterpart. `mode` maps JS's option flags:
+    /// `.mustExist` ⇔ `objectMustExist`, `.mustNotExist` ⇔
+    /// `objectMustNotExist`, `.either` ⇔ default. Throws if the doc
+    /// isn't open, the constraint isn't declared, or a constraint field
+    /// is missing from `values`.
+    ///
+    /// Scope note: js-bao's `upsertByUnique` searches every connected
+    /// document for an existing match; here both the lookup and the
+    /// write are scoped to `docId`, consistent with `save(in:)` /
+    /// `upsertShared` and the per-document uniqueness model.
+    @discardableResult
+    public func upsertByUniqueShared(
+        _ schema: PrimitiveSchema, id: String,
+        values: [String: PrimitiveValue], constraint: String,
+        mode: UpsertMode = .either, in docId: String
+    ) throws -> UpsertResult {
+        try requireMember(schema, in: docId)
+            .upsertByUnique(constraint: constraint, data: values, mode: mode, id: id)
     }
 
     /// Delete a record from document `docId`. Throws if the doc isn't open.
@@ -1117,8 +1159,18 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Verify a one-time password code.
-    public func otpVerify(email: String, code: String) async throws -> [String: Any] {
-        try await authController.otpVerify(email: email, code: code)
+    ///
+    /// `inviteToken` mirrors JS `otpVerify(email, code, { inviteToken })`
+    /// (#466 / #1110): when present, the named invitation is accepted
+    /// server-side during verify and deferred grants resolve to the
+    /// signing-in user, even when the signup email differs from the
+    /// invited email.
+    public func otpVerify(
+        email: String,
+        code: String,
+        inviteToken: String? = nil
+    ) async throws -> [String: Any] {
+        try await authController.otpVerify(email: email, code: code, inviteToken: inviteToken)
     }
 
     // MARK: - Token Management
@@ -1162,10 +1214,16 @@ public final class JsBaoClient: @unchecked Sendable {
         )
     }
 
-    /// Switch to online mode
+    /// Switch to online mode.
+    ///
+    /// Awaited form of the `setNetworkMode(.online)` auth handoff —
+    /// exactly like JS, where `goOnline()` is just
+    /// `setNetworkMode("online")`. Use this when the caller wants to
+    /// observe the full handoff (refresh attempt → connect, or
+    /// `.authOnlineRequired` + offline revert) before continuing.
     public func goOnline() async {
-        setNetworkMode(.online)
-        try? await connect()
+        applyNetworkMode(.online, options: SetNetworkModeOptions())
+        await runOnlineAuthHandoff()
     }
 
     /// Switch to offline mode
@@ -1178,7 +1236,33 @@ public final class JsBaoClient: @unchecked Sendable {
     /// emitted `networkMode` event so subscribers can distinguish
     /// user-initiated from system-initiated mode changes. Matches
     /// js-bao's `setNetworkMode(mode, opts)` shape.
+    ///
+    /// Setting `.online` kicks the same auth handoff JS's
+    /// `setNetworkMode("online")` runs (#1059 / #1113): the mode flips
+    /// to `.online` first (emitting `networkMode`, same as JS), then —
+    /// asynchronously, since this method is synchronous — if there is
+    /// no valid token a refresh is attempted before connecting. When
+    /// re-authentication fails, `.authOnlineRequired` fires (JS
+    /// `auth:onlineAuthRequired`, payload `{}`) and the mode reverts to
+    /// `.offline` (emitting a second `networkMode`), never connecting
+    /// without a token. `goOnline()` runs the identical handoff,
+    /// awaited.
     public func setNetworkMode(
+        _ mode: NetworkMode,
+        options: SetNetworkModeOptions = SetNetworkModeOptions()
+    ) {
+        applyNetworkMode(mode, options: options)
+        if mode == .online {
+            Task { [weak self] in
+                await self?.runOnlineAuthHandoff()
+            }
+        }
+    }
+
+    /// Flip the stored mode and emit `networkMode` — the synchronous
+    /// core shared by `setNetworkMode` and `goOnline` (which must not
+    /// double-kick the online auth handoff).
+    private func applyNetworkMode(
         _ mode: NetworkMode,
         options: SetNetworkModeOptions = SetNetworkModeOptions()
     ) {
@@ -1191,6 +1275,34 @@ public final class JsBaoClient: @unchecked Sendable {
             isOnline: mode != .offline,
             reason: options.reason ?? "user_set"
         ))
+    }
+
+    /// The `setNetworkMode("online")` auth handoff (#1059 / #1113),
+    /// mirroring JS: with no token, attempt a refresh before connecting;
+    /// on failure emit `.authOnlineRequired`, revert to offline
+    /// (`networkMode` fires again with reason "onlineAuthRequired"),
+    /// and disconnect — never connect without a token. With a usable
+    /// token, just connect.
+    internal func runOnlineAuthHandoff() async {
+        // The mode may have been flipped away (e.g. an immediate
+        // `setNetworkMode(.offline)`) before this fire-and-forget task
+        // ran — JS runs the handoff inline so it can't race like this.
+        guard getNetworkMode() == .online else { return }
+        if authController.getToken() == nil {
+            let outcome = await authController.refreshAccessToken(
+                cause: "networkMode:online"
+            )
+            if outcome != .success {
+                events.emit(.authOnlineRequired, AuthOnlineRequiredEvent())
+                applyNetworkMode(
+                    .offline,
+                    options: SetNetworkModeOptions(reason: "onlineAuthRequired")
+                )
+                await disconnect()
+                return
+            }
+        }
+        try? await connect()
     }
 
     // MARK: - Offline Access
@@ -1256,6 +1368,13 @@ public final class JsBaoClient: @unchecked Sendable {
         // funnels through here).
         connectToSharedModels(documentId: documentId, doc: doc)
 
+        // Mirror JS `openDocument`'s `requestSyncPerf` option: flag the doc
+        // so subsequent syncStep1 messages carry `requestPerf: true` and
+        // the server replies with `syncPerf` telemetry frames (#996).
+        if options.requestSyncPerf {
+            documentManager.setSyncPerfRequested(documentId, true)
+        }
+
         // Start network sync if requested. `deferNetworkSync` opens the
         // document locally without kicking off sync — the caller drives it
         // later via `startNetworkSync(documentId:)`. Mirrors JS `open`'s
@@ -1263,10 +1382,22 @@ public final class JsBaoClient: @unchecked Sendable {
         if options.enableNetworkSync && !options.deferNetworkSync && isOnline() {
             await startNetworkSync(documentId: documentId)
 
-            // If waitForLoad is .network, actually wait for the sync to
-            // complete before returning. Without this, callers get an empty
-            // YDocument and have to race against the .sync event.
-            if options.waitForLoad == .network && !documentManager.isSynced(documentId) {
+            // Decide whether to block on the sync handshake before returning
+            // (JS parity — JsBaoClient.ts `canResolveEarly`/`needsNetworkWait`):
+            //   .network                                   → always wait
+            //   .localIfAvailableElseNetwork + ydoc HAS data → resolve now, sync in background
+            //   .localIfAvailableElseNetwork + ydoc EMPTY    → wait for network
+            //   .local                                       → never wait
+            // The else-network half was previously unimplemented: only
+            // `.network` ever waited, so a doc with no local copy (first
+            // open on a second device, fresh install) returned an EMPTY
+            // YDocument immediately and callers raced the `.sync` event —
+            // surfacing as "Story not found" flashes in StoryLens.
+            let effectiveHasLocal = documentManager.ydocHasData(documentId)
+            let needsNetworkWait =
+                options.waitForLoad == .network
+                || (options.waitForLoad == .localIfAvailableElseNetwork && !effectiveHasLocal)
+            if needsNetworkWait && !documentManager.isSynced(documentId) {
                 let syncDocId = documentId
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                     // Class-boxed so the sync handler and timeout Task share
@@ -1357,18 +1488,21 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Create a new document
     /// Create a document. Local-first by default — mirrors js-bao's
-    /// `DocumentManager.createDocument` flow (#852). The returned
-    /// `YDocument` is immediately writable; when `options.localOnly`
-    /// is false (the default), a server commit is scheduled in the
-    /// background and the `pendingCreate` metadata flag is cleared on
-    /// success. On failure the `pendingCreateFailed` event fires and
-    /// the metadata's `commitError` carries the reason.
+    /// `DocumentManager.createDocument` flow (#852). The created
+    /// `YDocument` is immediately writable (fetch it via
+    /// `getDoc(documentId)`); when `options.localOnly` is false (the
+    /// default), a server commit is scheduled in the background and the
+    /// `pendingCreate` metadata flag is cleared on success. On failure
+    /// the `pendingCreateFailed` event fires and the metadata's
+    /// `commitError` carries the reason.
     ///
-    /// Before #852, this method blocked on `POST /documents` when
-    /// online and returned `(id, nil)` — apps had to pass
-    /// `localOnly: true` and call `commitOfflineCreate` manually to
-    /// get a usable doc.
-    public func createDocument(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> (documentId: String, doc: YDocument?) {
+    /// Returns `{ metadata }` — the freshly-written local metadata for
+    /// the new document — matching js-bao's
+    /// `createDocument(options): Promise<{ metadata }>` exactly (#1108).
+    /// The document id rides inside `metadata.documentId`. Before #1108
+    /// this returned a Swift-only `(documentId, doc)` tuple.
+    @discardableResult
+    public func createDocument(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> CreateDocumentResult {
         // The server's `POST /documents` route validates documentId
         // against `^[0-9A-HJKMNP-TV-Z]{26}$` (Crockford ULID). Pre-#852
         // this method generated a UUID, which the server quietly
@@ -1402,7 +1536,15 @@ public final class JsBaoClient: @unchecked Sendable {
             documentManager.scheduleCommitRetry(documentId: documentId)
         }
 
-        return (documentId, doc)
+        // Return the freshly-written local metadata as `{ metadata }`,
+        // matching js-bao's return shape (#1108). The open doc stays
+        // reachable via `getDoc(documentId)`, exactly like JS.
+        let entry = documentManager.getLocalMetadata(documentId)
+        let metadataValue = try entry.map { entry -> JSONValue in
+            let any = try JSONCoding.jsonObject(from: entry)
+            return try JSONCoding.decode(JSONValue.self, from: any)
+        }
+        return CreateDocumentResult(metadata: metadataValue)
     }
 
     /// Get a Y.Doc for an open document
@@ -1509,14 +1651,15 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Get root document ID from the parsed JWT payload. Matches
-    /// js-bao's `authController.getRootDocId()` (reads
-    /// `payload.user.rootDocId || payload.rootDocId`), with the offline
-    /// identity as a final fallback. No HTTP call — the value is
-    /// available immediately after sign-in in any auth flow
-    /// (OTP / OAuth / magic link / offline grant). `refresh` is kept
-    /// for source compatibility and is a no-op now that there's
-    /// nothing to refetch.
-    public func getRootDocId(refresh: Bool = false) async throws -> String? {
+    /// js-bao's `getRootDocId(): string | null` — a pure synchronous
+    /// cached read of `payload.user.rootDocId || payload.rootDocId`,
+    /// with the offline identity as a final fallback (exactly the JS
+    /// `authController.getRootDocId()` lookup). No HTTP call — the
+    /// value is available immediately after sign-in in any auth flow
+    /// (OTP / OAuth / magic link / offline grant). The pre-#1109
+    /// `async throws` + `refresh:` surface is gone: there is nothing
+    /// to refetch.
+    public func getRootDocId() -> String? {
         if let root = rootDocIdFromJwt() { return root }
         return authController.getOfflineIdentity()?.rootDocId
     }
@@ -1604,26 +1747,54 @@ public final class JsBaoClient: @unchecked Sendable {
     // MARK: - Awareness
 
     /// Set awareness state for a document (e.g. cursor position, selection, user info).
+    ///
+    /// Broadcasts the state to the server keyed by this client's
+    /// `connectionId` (the wire key remote peers store the local state
+    /// under — JS `sendAwarenessState` does the same) and emits a local
+    /// `.awareness` delta event (`added` on the first set, `updated`
+    /// after), mirroring JS `setLocalAwarenessState` (#996).
     public func setAwareness(_ documentId: String, state: [String: Any]) {
-        documentManager.setLocalAwarenessState(documentId, state: state)
+        let result = documentManager.setLocalAwarenessState(documentId, state: state)
+        guard result.exists else { return }
 
+        // Wire format is `[clientId, state]` tuples, keyed by connectionId.
+        // (Previously Swift sent a bare `[state]`, which JS peers could not
+        // destructure — #996.)
+        let localKey = connectionId
         let message: [String: Any] = [
             "type": "awareness",
             "documentId": documentId,
-            "states": [state],
+            "states": [[localKey, state]],
         ]
 
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
-              let jsonString = String(data: jsonData, encoding: .utf8) else { return }
-
-        Task {
-            try? await wsManager.send(jsonString)
+        if let jsonData = try? JSONSerialization.data(withJSONObject: message),
+           let jsonString = String(data: jsonData, encoding: .utf8) {
+            Task {
+                try? await wsManager.send(jsonString)
+            }
         }
+
+        events.emit(.awareness, AwarenessEvent(
+            documentId: documentId,
+            added: result.previousState == nil ? [localKey] : [],
+            updated: result.previousState != nil ? [localKey] : [],
+            removed: []
+        ))
     }
 
     /// Remove awareness states for specific clients.
+    ///
+    /// Broadcasts `[clientId, null]` removal tuples to the server and emits
+    /// a local `.awareness` delta event with the requested IDs in
+    /// `removed`, mirroring JS `removeAwarenessStates` (#996).
     public func removeAwareness(documentId: String, clientIds: [String]) {
-        documentManager.removeAwarenessClients(documentId, clientIds: clientIds)
+        // Clearing our own wire key also clears the local state (JS parity).
+        let removeLocal = clientIds.contains(connectionId)
+        documentManager.removeAwarenessClients(
+            documentId,
+            clientIds: clientIds,
+            removeLocal: removeLocal
+        )
 
         // Send removal as [clientId, null] tuples
         let states: [[Any]] = clientIds.map { [$0, NSNull()] }
@@ -1633,12 +1804,21 @@ public final class JsBaoClient: @unchecked Sendable {
             "states": states,
         ]
 
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
-              let jsonString = String(data: jsonData, encoding: .utf8) else { return }
-
-        Task {
-            try? await wsManager.send(jsonString)
+        if let jsonData = try? JSONSerialization.data(withJSONObject: message),
+           let jsonString = String(data: jsonData, encoding: .utf8) {
+            Task {
+                try? await wsManager.send(jsonString)
+            }
         }
+
+        // JS emits the full requested list in `removed` (not just the IDs
+        // that were actually present) — mirror that.
+        events.emit(.awareness, AwarenessEvent(
+            documentId: documentId,
+            added: [],
+            updated: [],
+            removed: clientIds
+        ))
     }
 
     /// Get all awareness states for a document (local + remote).
@@ -2351,6 +2531,10 @@ public final class JsBaoClient: @unchecked Sendable {
                 guard let self = self else { throw JsBaoError(code: .unavailable) }
                 return try await self.authController.otpVerify(email: email, code: code)
             },
+            otpVerifyWithInvite: { [weak self] email, code, inviteToken in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.otpVerify(email: email, code: code, inviteToken: inviteToken)
+            },
             getAuthConfig: { try await request("GET", "/oauth-config", nil) },
             getAppConfig: { try await request("GET", "/oauth-config", nil) },
             logout: { [weak self] wipeLocal in
@@ -2419,8 +2603,7 @@ public final class JsBaoClient: @unchecked Sendable {
         workflows = WorkflowsAPI(
             makeRequest: request,
             getConnectionId: { [weak self] in self?.wsManager.connectionId ?? "" },
-            logger: logger,
-            events: events
+            logger: logger
         )
         invitations = InvitationsAPI(makeRequest: request)
         // BlobBuckets reuses the same raw HTTP closure defined above
@@ -2584,10 +2767,37 @@ public final class JsBaoClient: @unchecked Sendable {
             events.emit(.remoteUpdate, RemoteUpdateEvent(documentId: roomId))
 
         case "awareness":
+            // Wire format: `states` is an array of `[clientId, state]`
+            // tuples (see `src/doc-worker/awareness.ts` and the JS client's
+            // `sendAwarenessState`); `state == null` means removal. Apply
+            // the frame and emit a JS-shaped **delta** event
+            // (added/updated/removed client IDs) — #996.
             guard let roomId = roomId,
-                  let states = json["states"] as? [[String: Any]] else { return }
-            documentManager.applyRemoteAwareness(roomId, states: states)
-            events.emit(.awareness, AwarenessEvent(documentId: roomId, states: states))
+                  let states = json["states"] as? [[Any]] else { return }
+            let delta = documentManager.applyRemoteAwarenessStates(roomId, states: states)
+            if !delta.isEmpty {
+                events.emit(.awareness, AwarenessEvent(
+                    documentId: roomId,
+                    added: delta.added,
+                    updated: delta.updated,
+                    removed: delta.removed
+                ))
+            }
+
+        case "syncPerf":
+            // Server sync-timing telemetry, sent only when our syncStep1
+            // carried `requestPerf: true` (see
+            // `OpenDocumentOptions.requestSyncPerf`). Same payload shape as
+            // JS: `{ documentId, timings, clientTimings? }`. Swift has no
+            // per-phase client instrumentation yet, so `clientTimings` is
+            // nil (JS derives it from `getSyncTimings`).
+            guard let roomId = roomId else { return }
+            let timings = json["timings"] as? [String: Any] ?? [:]
+            events.emit(.syncPerf, SyncPerfEvent(
+                documentId: roomId,
+                timings: timings,
+                clientTimings: nil
+            ))
 
         case "serverDocuments":
             if let docs = json["documents"] as? [[String: Any]] {

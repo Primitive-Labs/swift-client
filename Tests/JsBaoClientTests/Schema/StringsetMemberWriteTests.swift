@@ -134,6 +134,112 @@ final class StringsetMemberWriteTests: XCTestCase {
         }
     }
 
+    // MARK: - Full-set assignment is a diff, not a map replace (#1114)
+
+    /// Merge updates from `src` into `dst` — simulates a remote
+    /// client's updates arriving over the wire.
+    private func merge(from src: YDocument, into dst: YDocument) {
+        let bytes = src.transactSync { txn in
+            Data(txn.transactionEncodeStateAsUpdate())
+        }
+        dst.transactSync { txn in
+            _ = try? txn.transactionApplyUpdate(update: Array(bytes))
+        }
+    }
+
+    /// Assigning a full set removes locally-known members that the new
+    /// set omits and inserts the new ones — same observable result as
+    /// the old replace path for purely local edits.
+    func test_fullSetAssignment_diffsAgainstLocalMembers() throws {
+        let model = makeModel()
+        _ = try model.create(id: "r1", values: [
+            "tags": .stringset(["alpha", "beta", "gamma"]),
+        ])
+        try model.update(id: "r1", values: [
+            "tags": .stringset(["beta", "delta"]),
+        ])
+        XCTAssertEqual(
+            readStringset(model: model, id: "r1", field: "tags"),
+            ["beta", "delta"]
+        )
+    }
+
+    /// The CRDT guarantee js-bao gets from per-member sync: a
+    /// concurrent add of a member this client has never seen SURVIVES
+    /// a full-set assignment, because the diff never touches the
+    /// unknown key and the nested Y.Map instance is preserved. The
+    /// old replace-the-map path orphaned the remote insert and lost it.
+    func test_fullSetAssignment_preservesConcurrentRemoteAdd() throws {
+        SchemaSync.clearCache()
+        let docA = YDocument()
+        let modelA = DynamicModel(doc: docA, schema: schema)
+        _ = try modelA.create(id: "r1", values: [
+            "tags": .stringset(["beta"]),
+        ])
+
+        // Replica B receives A's state, then adds "alpha" while
+        // disconnected from A.
+        SchemaSync.clearCache()
+        let docB = YDocument()
+        merge(from: docA, into: docB)
+        let modelB = DynamicModel(doc: docB, schema: schema)
+        try modelB.addStringsetMember(
+            id: "r1", fieldName: "tags", member: "alpha"
+        )
+
+        // A — not knowing about "alpha" — assigns the full set
+        // {beta, gamma} through the save/update path.
+        try modelA.update(id: "r1", values: [
+            "tags": .stringset(["beta", "gamma"]),
+        ])
+
+        // Reconnect: B's offline add merges into A. Union wins.
+        merge(from: docB, into: docA)
+        XCTAssertEqual(
+            readStringset(model: modelA, id: "r1", field: "tags"),
+            ["alpha", "beta", "gamma"],
+            "concurrent unknown member must survive a full-set assignment"
+        )
+    }
+
+    /// Both directions: two clients each add a different member while
+    /// disconnected — one via per-member add, one via full-set
+    /// assignment — and the reconnected docs converge on the union.
+    func test_twoClientOfflineEdits_unionAfterReconnect() throws {
+        SchemaSync.clearCache()
+        let docA = YDocument()
+        let modelA = DynamicModel(doc: docA, schema: schema)
+        _ = try modelA.create(id: "r1", values: [
+            "tags": .stringset(["base"]),
+        ])
+
+        SchemaSync.clearCache()
+        let docB = YDocument()
+        merge(from: docA, into: docB)
+        let modelB = DynamicModel(doc: docB, schema: schema)
+
+        // Offline edits on both sides.
+        try modelA.update(id: "r1", values: [
+            "tags": .stringset(["base", "from-a"]),
+        ])
+        try modelB.update(id: "r1", values: [
+            "tags": .stringset(["base", "from-b"]),
+        ])
+
+        // Reconnect both ways.
+        merge(from: docB, into: docA)
+        merge(from: docA, into: docB)
+
+        XCTAssertEqual(
+            readStringset(model: modelA, id: "r1", field: "tags"),
+            ["base", "from-a", "from-b"]
+        )
+        XCTAssertEqual(
+            readStringset(model: modelB, id: "r1", field: "tags"),
+            ["base", "from-a", "from-b"]
+        )
+    }
+
     func test_addStringsetMember_respectsMaxCount() throws {
         SchemaSync.clearCache()
         let bounded = PrimitiveSchema(

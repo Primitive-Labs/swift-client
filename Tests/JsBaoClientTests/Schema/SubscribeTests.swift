@@ -103,6 +103,98 @@ final class SubscribeTests: XCTestCase {
         unsubB()
     }
 
+    // MARK: - Post-commit notification (#1116)
+
+    /// js-bao notifies subscribers AFTER the write transaction
+    /// commits. A subscriber whose callback re-enters the model with
+    /// `query()` must observe the fully-committed batch state — and
+    /// must not deadlock against the still-open yrs transaction.
+    /// Previously the listener fired synchronously inside
+    /// `applyWriteInternal`, so a batched `transact` notified
+    /// mid-batch with partial state.
+    func testSubscriberQuerySeesCommittedBatchState() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+
+        var observedCounts: [Int] = []
+        let unsub = model.subscribe {
+            // Re-entering the model from the callback: requires the
+            // write transaction to be closed.
+            observedCounts.append(model.query().count)
+        }
+
+        try model.transact {
+            _ = try model.create(id: "r1", values: ["label": .string("one")])
+            _ = try model.create(id: "r2", values: ["label": .string("two")])
+        }
+
+        awaitListenerDrain(model: model)
+        XCTAssertGreaterThanOrEqual(observedCounts.count, 1,
+                                    "Batch must notify at least once")
+        XCTAssertEqual(
+            observedCounts, observedCounts.map { _ in 2 },
+            "Every notification observes the committed batch (2 records), never partial state"
+        )
+        unsub()
+    }
+
+    /// A batch (`transact`) coalesces the model's direct write
+    /// notifications into one post-commit fire (observer-driven async
+    /// notifications may add more later, but none before commit).
+    func testBatchNotifiesOnceSynchronously() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+
+        let firingThread = Thread.current
+        var syncFires = 0
+        let unsub = model.subscribe {
+            // Count only the synchronous post-commit delivery on the
+            // writing thread; async observer-drain fires arrive on a
+            // different thread.
+            if Thread.current === firingThread { syncFires += 1 }
+        }
+
+        try model.transact {
+            _ = try model.create(id: "b1", values: ["label": .string("x")])
+            _ = try model.create(id: "b2", values: ["label": .string("y")])
+            _ = try model.create(id: "b3", values: ["label": .string("z")])
+            XCTAssertEqual(syncFires, 0,
+                           "No notification may fire inside the open transaction")
+        }
+        XCTAssertEqual(syncFires, 1,
+                       "Direct write notifications coalesce to one per batch")
+        awaitListenerDrain(model: model)
+        unsub()
+    }
+
+    /// Deletes inside a batch defer their notification to commit too.
+    func testDeleteInsideBatchNotifiesAfterCommit() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+        _ = try model.create(id: "r1", values: ["label": .string("one")])
+        // Let the create's async observer notification land before
+        // subscribing, so the callback only sees the delete.
+        awaitListenerDrain(model: model)
+
+        var observedCounts: [Int] = []
+        let unsub = model.subscribe {
+            observedCounts.append(model.query().count)
+        }
+
+        try model.transact {
+            model.delete(id: "r1")
+        }
+
+        awaitListenerDrain(model: model)
+        XCTAssertGreaterThanOrEqual(observedCounts.count, 1)
+        XCTAssertEqual(observedCounts, observedCounts.map { _ in 0 },
+                       "Callback observes the committed delete")
+        unsub()
+    }
+
     // MARK: - MultiDocModel.subscribe
 
     /// Subscribing BEFORE any docs are connected. When the first
