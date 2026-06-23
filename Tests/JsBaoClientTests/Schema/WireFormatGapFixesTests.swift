@@ -12,10 +12,8 @@ import YSwift
 /// `QueryTranslator`, `TomlSchemaLoader`, or `StorageProvider` silently
 /// re-introduces one of the gaps, the matching test goes red.
 ///
-/// References:
-///   - `swift-client/docs/parity/query-engine.md`     (gaps A–G)
-///   - `swift-client/docs/parity/schema-and-models.md` (gaps H–J)
-///   - `swift-client/docs/parity/wire-format.md`       (gaps K–L)
+/// Gaps A–L were originally catalogued in the (since-retired) parity
+/// docs; the PR #789 description carries the same list.
 final class WireFormatGapFixesTests: XCTestCase {
 
     // MARK: - Fixtures
@@ -352,5 +350,26 @@ final class WireFormatGapFixesTests: XCTestCase {
             updatedAtMs: 1714060800000
         )
         XCTAssertEqual(rec.updatedAtMs, 1714060800000)
+    }
+
+    // MARK: - M. `_meta_doc_id` legacy default matches js-bao (#1117)
+
+    /// Single-doc DynamicModels (no explicit docId) tag their SQLite
+    /// mirror rows with js-bao's `DEFAULT_LEGACY_DOC_ID`
+    /// ("__legacy_default__"), not the empty string Swift used before.
+    func test_M_meta_doc_id_defaults_to_legacy_default() throws {
+        SchemaSync.clearCache()
+        let model = DynamicModel(doc: YDocument(), schema: taskSchema)
+        _ = try model.create(id: "m0", values: ["title": .string("legacy")])
+
+        XCTAssertEqual(model.docId, "__legacy_default__")
+        let rows = model.inspectionQueryEngine.rawQuery(
+            "SELECT \"_meta_doc_id\" FROM \"\(model.inspectionTableName)\" WHERE id = 'm0'"
+        )
+        XCTAssertEqual(
+            rows.first?["_meta_doc_id"] as? String,
+            "__legacy_default__",
+            "mirror rows must carry js-bao's DEFAULT_LEGACY_DOC_ID"
+        )
     }
 }

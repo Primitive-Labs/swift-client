@@ -44,9 +44,14 @@ final class InvitationWSTests: XCTestCase {
         // thread) and the assertion below.
         let lock = NSLock()
         var invitationReceived = false
-        let sub = inviteeClient.events.onAny(.invitation) { _ in
+        var receivedEvent: InvitationEvent?
+        // Subscribe via the typed path (#1146). Pre-#1146 `.invitation`
+        // delivered the raw `[String: Any]`, so a `(e: InvitationEvent)`
+        // handler would silently never fire; now it's a fully-typed struct.
+        let sub = inviteeClient.events.on(.invitation) { (e: InvitationEvent) in
             lock.lock()
             invitationReceived = true
+            receivedEvent = e
             lock.unlock()
         }
 
@@ -63,6 +68,7 @@ final class InvitationWSTests: XCTestCase {
 
         lock.lock()
         let received = invitationReceived
+        let event = receivedEvent
         lock.unlock()
 
         // Previous version of this test cancelled the subscription and
@@ -78,6 +84,17 @@ final class InvitationWSTests: XCTestCase {
             "is still wired to forward invitation events to the " +
             "invitee's session — same place WorkflowStatusEvent is " +
             "delivered."
+        )
+
+        // #1146: the event must be delivered as a typed `InvitationEvent`
+        // with the document/permission fields populated, not a raw dict.
+        XCTAssertNotNil(event, "Expected the typed InvitationEvent payload")
+        XCTAssertEqual(event?.action, "created")
+        XCTAssertEqual(event?.documentId, docId)
+        XCTAssertEqual(event?.permission, "read-write")
+        XCTAssertFalse(
+            event?.invitationId.isEmpty ?? true,
+            "Expected a non-empty invitationId on the typed event"
         )
     }
 }

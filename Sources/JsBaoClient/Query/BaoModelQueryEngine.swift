@@ -10,6 +10,14 @@ import SQLite3
 /// This replaces the JS client's IndexedDB/sql.js approach with native SQLite.
 public class BaoModelQueryEngine {
 
+    /// The `_meta_doc_id` value used when no explicit document id is
+    /// supplied (single-doc / legacy mode). Matches js-bao's
+    /// `BaseModel.DEFAULT_LEGACY_DOC_ID` ("__legacy_default__") so the
+    /// in-memory SQLite mirror's rows are tagged identically on both
+    /// clients (#1117). Mirror-only state — rebuilt per session, never
+    /// persisted or sent over the wire.
+    public static let legacyDefaultDocId = "__legacy_default__"
+
     private var db: OpaquePointer?
     private let lock = NSLock()
 
@@ -171,6 +179,15 @@ public class BaoModelQueryEngine {
         // Collision check — if another (model, field) pair already
         // claimed this name, fail-fast. Same table for two different
         // stringset fields would silently interleave their members.
+        //
+        // Deliberately remains a `preconditionFailure` (unlike the
+        // mixed-projection validation, converted to a thrown
+        // JsBaoError in #1118): this fires during `ensureTable` —
+        // i.e. from `DynamicModel.init`, which cannot throw — and it
+        // flags a schema-definition bug (two fields composing the
+        // same junction name), not bad per-query input. There is no
+        // js-bao runtime equivalent to mirror: js-bao's single-
+        // underscore names just silently collide (js-bao#14).
         if let existing = registeredJunctions[junctionName],
            existing.model != modelName || existing.field != fieldName {
             preconditionFailure("""
@@ -420,13 +437,21 @@ public class BaoModelQueryEngine {
         tableName: String,
         projection: [String: Int]?,
         stringsetFields: Set<String>
-    ) -> String {
+    ) throws -> String {
         guard let projection, !projection.isEmpty else { return "*" }
-        // Validate: no mixed include + exclude (matches js-bao
-        // which also rejects mixed projections).
+        // Validate: no mixed include + exclude. js-bao THROWS here
+        // (DocumentQueryTranslator.ts: InvalidOperatorError "Cannot mix
+        // inclusion and exclusion in projection"); a precondition crash
+        // on caller-supplied query input is wrong (#1118). Throwing
+        // entry points (queryPaged) surface the error; the non-throwing
+        // `query()` wrapper catches it, logs, and returns [].
         let values = Set(projection.values)
-        precondition(values.count <= 1 || !(values.contains(0) && values.contains(1)),
-                     "Projection cannot mix include (1) and exclude (0) values")
+        if values.contains(0) && values.contains(1) {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "Cannot mix inclusion and exclusion in projection"
+            )
+        }
 
         // Column names actually present on the table. Caller already
         // holds `lock` (the deadlock we had earlier was from a second
@@ -639,11 +664,13 @@ public class BaoModelQueryEngine {
                 )
                 return executeQuery(sql, params: params)
             } catch {
-                // Non-throwing public API — typically only the cursor
-                // decoder throws here, and a malformed cursor is a
-                // caller bug. Log and return no rows rather than
-                // crashing the host app via `try!`. Callers that need
-                // error visibility should use `queryPaged`.
+                // Non-throwing public API — the cursor decoder and the
+                // projection validator (mixed include/exclude, #1118)
+                // throw here, and both indicate a caller bug. Log and
+                // return no rows rather than crashing the host app.
+                // Callers that need error visibility should use
+                // `queryPaged`, which propagates the JsBaoError.
+                // (A fully throws-aware `query` is tracked as #1119.)
                 NSLog("[BaoModelQueryEngine] query failed for '\(modelName)': \(error)")
                 return []
             }
@@ -781,7 +808,7 @@ public class BaoModelQueryEngine {
         // post-query by `populateStringsets`). The existing columns
         // path below looks at table schema to fold in id and
         // _meta_doc_id even when the caller doesn't list them.
-        let selectList = buildSelectColumnList(
+        let selectList = try buildSelectColumnList(
             tableName: tableName,
             projection: options?.projection,
             stringsetFields: stringsetFields

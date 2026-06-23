@@ -4,8 +4,9 @@ import Foundation
 //
 // Typed models for the NON-NATIVE auth surface exposed by `client.auth`
 // (issue #964): magic-link, OTP, auth-config, logout, and the offline-grant
-// suite. Native passkeys (#929) and OAuth/Google sign-in (#928) are DEFERRED
-// and intentionally NOT modeled here.
+// suite. Native passkeys (#929) are DEFERRED and intentionally NOT modeled
+// here. Native Google sign-in (#928) lives in GoogleSignIn.swift
+// (`JsBaoClient.signInWithGoogle`), not under `client.auth`.
 //
 // Shapes mirror the JS client (`src/client/internal/authController.ts`):
 // timestamps stay as ISO-8601 `String`s exactly as JS exposes them, and only
@@ -59,14 +60,20 @@ public struct OtpRequestResult: Decodable, Sendable, Equatable {
 }
 
 /// Parameters for `auth.otpVerify(...)`. Mirrors JS
-/// `otpVerify({ email, code })`.
+/// `otpVerify(email, code, { inviteToken })`.
 public struct OtpVerifyParams: Sendable {
     public var email: String
     public var code: String
+    /// Optional invitation token (#466): when present, the server accepts
+    /// the named invitation during verify and resolves deferred grants to
+    /// the signing-in user — even when the signup email differs from the
+    /// invited email. Mirrors JS `otpVerify(email, code, { inviteToken })`.
+    public var inviteToken: String?
 
-    public init(email: String, code: String) {
+    public init(email: String, code: String, inviteToken: String? = nil) {
         self.email = email
         self.code = code
+        self.inviteToken = inviteToken
     }
 }
 
@@ -82,9 +89,11 @@ public struct OtpVerifyResult: Decodable, Sendable, Equatable {
 
 /// The app's auth configuration, returned by `auth.getAuthConfig()`. Mirrors
 /// the object JS `AuthController.getAuthConfig()` resolves to (the
-/// `GET /oauth-config` envelope). The passkey/OAuth fields are surfaced for
-/// completeness (so a UI can decide what to show) even though the native
-/// flows themselves are deferred (#928 / #929).
+/// `GET /oauth-config` envelope). The OAuth fields pair with native Google
+/// sign-in (#928); the Apple fields pair with `signInWithApple` (#409
+/// port). The passkey fields are surfaced for completeness (so a UI can
+/// decide what to show) — the native passkey flows (#929) live on a
+/// separate branch and are intentionally NOT part of this one.
 public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     public let appId: String
     public let name: String
@@ -101,6 +110,11 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     /// because the shape is configuration data the SDK never introspects.
     public let passkeyRpConfig: JSONValue?
     public let hasPasskey: Bool
+    /// Sign in with Apple (#409): enabled flag + the fully-configured
+    /// gate (`appleAudiences` present AND not explicitly disabled).
+    /// `false` against servers that predate the Apple port.
+    public let appleSignInEnabled: Bool
+    public let hasApple: Bool
     public let magicLinkEnabled: Bool
     public let otpEnabled: Bool
 
@@ -119,6 +133,8 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
         passkeyRpName = try c.decodeIfPresent(String.self, forKey: .passkeyRpName)
         passkeyRpConfig = try c.decodeIfPresent(JSONValue.self, forKey: .passkeyRpConfig)
         hasPasskey = try c.decodeIfPresent(Bool.self, forKey: .hasPasskey) ?? false
+        appleSignInEnabled = try c.decodeIfPresent(Bool.self, forKey: .appleSignInEnabled) ?? false
+        hasApple = try c.decodeIfPresent(Bool.self, forKey: .hasApple) ?? false
         magicLinkEnabled = try c.decodeIfPresent(Bool.self, forKey: .magicLinkEnabled) ?? false
         otpEnabled = try c.decodeIfPresent(Bool.self, forKey: .otpEnabled) ?? false
     }
@@ -126,7 +142,8 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case appId, name, mode, waitlistEnabled, googleOAuthEnabled, googleClientId
         case hasOAuth, redirectUris, passkeyEnabled, passkeyRpId, passkeyRpName
-        case passkeyRpConfig, hasPasskey, magicLinkEnabled, otpEnabled
+        case passkeyRpConfig, hasPasskey, appleSignInEnabled, hasApple
+        case magicLinkEnabled, otpEnabled
     }
 }
 
@@ -180,6 +197,26 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case appId, name, mode, waitlistEnabled, hasOAuth, hasPasskey, magicLinkEnabled
+    }
+}
+
+// MARK: OAuth flow options
+
+/// Waitlist enrollment carried through the OAuth state bag. Mirrors the JS
+/// `startOAuthFlow(continueUrl, { waitlist })` shape
+/// (`{ source?: string | null; note?: string | null }`). When present, the
+/// OAuth callback enrolls the user in the app's waitlist. Both fields are
+/// trimmed and clamped to 255 characters before being embedded in the state,
+/// matching the JS client (src/client/internal/authController.ts).
+public struct OAuthWaitlist: Sendable {
+    /// Optional acquisition source (e.g. a campaign tag).
+    public var source: String?
+    /// Optional free-form note recorded with the waitlist entry.
+    public var note: String?
+
+    public init(source: String? = nil, note: String? = nil) {
+        self.source = source
+        self.note = note
     }
 }
 

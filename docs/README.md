@@ -8,7 +8,7 @@ This directory is the navigation guide for everything in `swift-client/`. Start 
 
 ### "I'm trying to figure out if a JS client feature exists on Swift"
 
-Go to [`parity/`](parity/). It's the canonical reference. The big chart is [`parity/api-methods.md`](parity/api-methods.md). For "why is X not here?", see [`exclusions-v1.md`](exclusions-v1.md).
+Known divergences from the JS client are tracked as GitHub issues (label `swift-client-parity`). The standing policy lives in the Parity policy section below.
 
 ### "I'm writing Swift code that uses JsBaoClient"
 
@@ -20,7 +20,7 @@ Go to [`parity/`](parity/). It's the canonical reference. The big chart is [`par
 
 - [`testing.md`](testing.md) — running tests against a live server
 - [`yswift-fork.md`](yswift-fork.md) — why we fork yswift, what we patched
-- [`parity/`](parity/) — what to maintain alignment with on the JS side
+- Parity policy (below) — what to maintain alignment with on the JS side
 
 ## Documentation map
 
@@ -31,17 +31,7 @@ docs/
 ├── architecture.md                   ← module map, concurrency model
 ├── baomodels.md                      ← typed model authoring
 ├── testing.md                        ← running the suite
-├── yswift-fork.md                    ← CRDT layer fork rationale
-├── exclusions-v1.md                  ← what's deliberately out of v1
-└── parity/                           ← canonical reference for JS-client parity
-    ├── README.md                     ← legend + index
-    ├── api-methods.md                ← per-sub-API method tables
-    ├── schema-and-models.md          ← field types, validation, relationships
-    ├── query-engine.md               ← operators, sort, cursor
-    ├── wire-format.md                ← byte-level invariants, divergences
-    ├── events.md                     ← event-name table
-    ├── errors.md                     ← error-code taxonomy
-    └── test-coverage.md              ← Swift tests ↔ JS tests
+└── yswift-fork.md                    ← CRDT layer fork rationale
 ```
 
 ## Quick start
@@ -90,4 +80,22 @@ client.events.on(.sync) { (event: SyncEvent) in
 
 ## Status
 
-This client is at **v1**. It implements 14 of the 17 JS sub-APIs and most of the typed-model layer. See [`parity/api-methods.md`](parity/api-methods.md) for the full mapping and [`exclusions-v1.md`](exclusions-v1.md) for what's deliberately out of v1.
+This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method sets; remaining behavioral divergences are tracked as GitHub issues (label `swift-client-parity`).
+
+## Breaking changes in the current parity batch
+
+- `.invitation` event handlers now receive `InvitationEvent`, not the raw
+  `[String: Any]` WebSocket dictionary. Existing subscribers written as
+  `client.events.on(.invitation) { (payload: [String: Any]) in ... }` will no
+  longer match the typed payload. Migrate to
+  `client.events.on(.invitation) { (event: InvitationEvent) in ... }`, or use
+  `onAny(.invitation)` during a temporary migration window.
+
+## Parity policy
+
+The JS client (`src/client/`) and js-bao (`packages/js-bao/`) are the **source of truth**. The Swift client matches their names, shapes, and semantics:
+
+1. **Don't add Swift-only public surface.** If a capability needs a new API, it lands on JS first (or simultaneously), then Swift mirrors it. If JS removes an API, the Swift gap auto-closes — don't implement it.
+2. Anything touching **field encoding/decoding** (`DynamicModel`, `PrimitiveValue`), **TOML validation** (`TomlSchemaLoader`), or **operator translation** (`QueryTranslator`) must be checked against `packages/js-bao/src/` and pinned with a cross-platform test in `Tests/JsBaoClientTests/CrossPlatform/`. Ask: "does the JS side write the same bytes here?" A Swift write that JS can't decode is a P0.
+3. New events, error codes, and TOML attributes land on **both sides in the same change**, with the shape decided together.
+4. Known divergences are tracked as GitHub issues labeled `swift-client-parity` — file one when you find a new divergence, close it when the behavior converges. There is no parity doc to keep in sync; the issues and the cross-platform tests are the record.

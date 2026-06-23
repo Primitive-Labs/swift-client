@@ -131,26 +131,81 @@ final class UpsertTests: XCTestCase {
 
     // MARK: - ID conflict
 
-    /// Supplied id that doesn't match the existing record's id →
-    /// throws UpsertError.idMismatch.
-    func testUpsertWithNonMatchingSuppliedIdThrows() throws {
+    /// Supplied id that doesn't match the existing record's id → the
+    /// existing record's id wins and the supplied id is ignored, no
+    /// error and no second record. Mirrors JS `save({ upsertOn })` with
+    /// an auto-generated id (`this.id = existingId` reassignment); the
+    /// Swift facade always passes the struct's freshly minted id, so it
+    /// must be treated as non-authoritative on the merge path.
+    func testUpsertWithNonMatchingSuppliedIdMergesIntoExisting() throws {
         let model = freshModel()
         _ = try model.create(id: "u1", values: [
             "email": .string("alice@example.com"),
+            "name":  .string("Alice"),
+        ])
+
+        let result = try model.upsert(
+            ["email": .string("alice@example.com"), "name": .string("Alice V2")],
+            on: "email",
+            id: "u_different"
+        )
+
+        XCTAssertFalse(result.wasCreated)
+        XCTAssertEqual(result.record.id, "u1",
+                       "merge must keep the existing record's id")
+        XCTAssertEqual(model.findAll().count, 1,
+                       "the supplied id must not create a second record")
+        XCTAssertNil(model.find(id: "u_different"))
+        XCTAssertEqual(model.find(id: "u1")?["name"], .string("Alice V2"))
+    }
+
+    /// #1122: an EXPLICIT (caller-pinned) id that doesn't match the
+    /// matched record's id is a hard conflict — mirrors js-bao's
+    /// `_constructorProvidedId && this.id !== existingId` guard, which
+    /// throws `"[Model] upsertOn conflict: caller id … does not match
+    /// existing record …"`. With `explicitId: false` (auto-id) the same
+    /// call silently merges (see test above); the only difference is
+    /// provenance.
+    func testUpsertWithExplicitNonMatchingIdThrowsConflict() throws {
+        let model = freshModel()
+        _ = try model.create(id: "u1", values: [
+            "email": .string("alice@example.com"),
+            "name":  .string("Alice"),
         ])
 
         XCTAssertThrowsError(
             try model.upsert(
-                ["email": .string("alice@example.com")],
+                ["email": .string("alice@example.com"), "name": .string("Alice V2")],
                 on: "email",
-                id: "u_different"
+                id: "u_different",
+                explicitId: true
             )
         ) { error in
-            guard let e = error as? UpsertError else {
-                return XCTFail("Expected UpsertError, got \(error)")
-            }
-            XCTAssertEqual(e, .idMismatch(supplied: "u_different", existing: "u1"))
+            XCTAssertEqual(
+                error as? UpsertError,
+                .explicitIdConflict(supplied: "u_different", existing: "u1")
+            )
         }
+        // Conflict must not mutate or insert.
+        XCTAssertEqual(model.findAll().count, 1)
+        XCTAssertEqual(model.find(id: "u1")?["name"], .string("Alice"))
+        XCTAssertNil(model.find(id: "u_different"))
+    }
+
+    /// An explicit id that DOES match the existing record merges cleanly
+    /// (no conflict — js-bao only throws on a mismatch).
+    func testUpsertWithExplicitMatchingIdMerges() throws {
+        let model = freshModel()
+        _ = try model.create(id: "u1", values: [
+            "email": .string("alice@example.com"), "name": .string("Alice"),
+        ])
+        let result = try model.upsert(
+            ["email": .string("alice@example.com"), "name": .string("Alice V2")],
+            on: "email", id: "u1", explicitId: true
+        )
+        XCTAssertFalse(result.wasCreated)
+        XCTAssertEqual(result.record.id, "u1")
+        XCTAssertEqual(result.record["name"], .string("Alice V2"))
     }
 
     // MARK: - Validation errors

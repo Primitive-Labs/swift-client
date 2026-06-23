@@ -93,7 +93,58 @@ tasks.delete(id: "t-1")
 
 `TypedModel<T>.query(...)` returns `[T]` already hydrated — no manual `compactMap(T.init(row:))` needed.
 
-For **paginated queries** (cursor + nextCursor), drop to `tasks.dynamic.queryPaged(...)`. `TypedModel<T>.query(...)` returns `[T]` but currently drops the cursor — see [`parity/query-engine.md`](parity/query-engine.md). v1.1 will lift this into the typed surface.
+For **paginated queries** (cursor + nextCursor), drop to `tasks.dynamic.queryPaged(...)`. `TypedModel<T>.query(...)` returns `[T]` but currently drops the cursor — see the `swift-client-parity` issues. v1.1 will lift this into the typed surface.
+
+## Upsert by natural key (#1053)
+
+The codegen facade mirrors the JS client's atomic upsert-by-unique-constraint
+writes. No query-then-save emulation needed — the existing-record lookup and
+the write happen inside one Yjs transaction, so there is no read-then-write
+window:
+
+```swift
+// JS: new User({ email, name }).save({ upsertOn: "email" })
+// — single-field unique constraint on the field itself
+let saved = try UserRecord(id: newULID(), email: "a@x.com", name: "Alice")
+    .save(in: docId, upsertOn: "email")
+
+// JS: User.upsertByUnique("name_score_combo", [name, score], data, options)
+// — NAMED constraint, single-field or compound; lookup values come from
+//   the record's own fields
+let saved2 = try PlayerRecord(id: newULID(), name: "Ada", score: 100, rank: 1)
+    .upsertByUnique("name_score_combo", in: docId)
+
+// Mode maps JS option flags:
+//   .mustExist    ⇔ { objectMustExist: true }    (throws UpsertByUniqueError.recordNotFound)
+//   .mustNotExist ⇔ { objectMustNotExist: true } (throws UniqueConstraintViolationError)
+//   .either       ⇔ default insert-or-merge
+_ = try PlayerRecord(id: newULID(), name: "Ada", score: 100, rank: 2)
+    .upsertByUnique("name_score_combo", mode: .mustExist, in: docId)
+```
+
+Semantics (matching JS `save({ upsertOn })`):
+
+- **No match** → insert under the record's own `id`.
+- **Match** → merge the record's set fields into the existing record; the
+  **existing id wins**. Both methods return the RESOLVED record — read the
+  final `id`/fields off the return value, not off the struct you saved
+  (JS does the equivalent by reassigning `this.id = existingId`).
+- Merge writes only the fields the struct has set (`nil` optionals are left
+  untouched on the existing record); schema defaults apply only on insert.
+- `save(in:upsertOn:)` requires a **single-field** unique constraint on the
+  field (compound constraints must go through `upsertByUnique`), and throws
+  if the value is absent/empty — same errors as JS.
+
+Forced divergence: JS throws an "upsertOn conflict" error when an id that was
+*explicitly* passed to the constructor doesn't match the existing record.
+Swift structs can't distinguish an explicit id from a freshly minted one, so
+the supplied id is always treated like JS's auto-generated id — used on
+insert, silently discarded on merge. Likewise `upsertByUnique` takes no
+separate `uniqueLookupValue` argument: the lookup key is built from the
+record's own constraint fields, so JS's lookup-vs-data mismatch error has no
+Swift counterpart. And where JS `upsertByUnique` searches every connected
+document for a match, the Swift facade scopes both lookup and write to the
+single `in:` document, consistent with `save(in:)`.
 
 ## When to use `DynamicModel`
 
@@ -164,7 +215,7 @@ let postsWithAuthors = users.findAll().map {
 }
 ```
 
-Status: `refersTo`, `hasMany`, `hasManyThrough` all parity with js-bao. The lazy `record.posts()` path uses `findAll().filter` (O(N), no pagination); the batch `Include` path uses the query engine. See [`parity/schema-and-models.md`](parity/schema-and-models.md).
+Status: `refersTo`, `hasMany`, `hasManyThrough` all parity with js-bao. The lazy `record.posts()` path uses `findAll().filter` (O(N), no pagination); the batch `Include` path uses the query engine.
 
 ## Multi-doc indexing
 
@@ -180,10 +231,9 @@ let all = try await multi.query(["completed": false])
 ## What's in / out of v1
 
 - **In:** TOML codegen, `TypedModel<T>` CRUD, `DynamicModel` full surface, three relationship types, multi-doc indexing, Mongo-style filters, sort, cursor pagination, batch `Include`, observers.
-- **In (codegen `Model.*` facade):** the cross-document static facade now mirrors the JS client's `findByUnique(constraint, value)`, `queryOne(filter, options)`, and upsert (`save(in:upsertOn:)`) — backed by the client's `findByUniqueShared` / `queryOneShared` / `upsertShared` shims over `MultiDocModel`/`DynamicModel`.
+- **In (codegen `Model.*` facade):** the cross-document static facade now mirrors the JS client's `findByUnique(constraint, value)`, `queryOne(filter, options)`, and atomic upserts (`save(in:upsertOn:)` and `upsertByUnique(_:mode:in:)` — see "Upsert by natural key" above) — backed by the client's `findByUniqueShared` / `queryOneShared` / `upsertShared` / `upsertByUniqueShared` shims over `MultiDocModel`/`DynamicModel`.
 - **Out for v1:** `update`/`queryOne`/`findByUnique` on `TypedModel<T>` specifically (use the codegen facade above, or `model.dynamic.*`), function defaults in TOML, `refersToMany` relationship type.
 
-See [`exclusions-v1.md`](exclusions-v1.md).
 
 ## When to drop below the model layer
 
@@ -204,8 +254,5 @@ doc.transactSync { txn in
 
 ## Further reading
 
-- [`parity/schema-and-models.md`](parity/schema-and-models.md) — js-bao parity per concept
-- [`parity/query-engine.md`](parity/query-engine.md) — operator/sort/cursor parity
-- [`parity/wire-format.md`](parity/wire-format.md) — wire-format invariants
 - [`yswift-fork.md`](yswift-fork.md) — why the YSwift fork exists
 - `Sources/JsBaoClient/Schema/` — the source

@@ -153,6 +153,102 @@ final class RelationshipsRuntimeTests: XCTestCase {
         XCTAssertEqual(ordered.map(\.id), ["pB", "pC", "pA"])
     }
 
+    // MARK: - Lazy vs batch equivalence (#1115)
+
+    /// The lazy `hasMany` accessor routes through the query engine —
+    /// its results (membership AND order) must match what the batch
+    /// `Include(type: .hasMany, ...)` path attaches under `_related`.
+    /// Default order (no orderByField) is the engine's `id ASC`.
+    func testHasManyLazyMatchesBatchInclude_defaultOrder() throws {
+        _ = try users.create(id: "u1", values: ["name": .string("Alice")])
+        // Create out of id order so insertion order != id order.
+        _ = try posts.create(id: "p3", values: ["userId": .string("u1"), "title": .string("c")])
+        _ = try posts.create(id: "p1", values: ["userId": .string("u1"), "title": .string("a")])
+        _ = try posts.create(id: "p2", values: ["userId": .string("u1"), "title": .string("b")])
+        _ = try posts.create(id: "p9", values: ["userId": .string("uX"), "title": .string("other")])
+
+        let lazy = try users.find(id: "u1")!
+            .hasMany(relationship: "posts", target: posts)
+
+        let batchRows = try users.query(
+            ["id": "u1"],
+            options: nil,
+            include: [Include(
+                type: .hasMany, target: posts!, foreignKey: "userId"
+            )]
+        )
+        let related = (batchRows.first?["_related"] as? [String: Any])?["posts_rel"]
+            as? [[String: Any]] ?? []
+
+        XCTAssertEqual(
+            lazy.map(\.id),
+            related.compactMap { $0["id"] as? String },
+            "lazy hasMany must return the same records in the same order as the batch include path"
+        )
+        XCTAssertEqual(lazy.map(\.id), ["p1", "p2", "p3"])
+    }
+
+    /// Sorted variant: orderByField/orderDirection on the lazy side
+    /// must equal `sort:` on the batch include side.
+    func testHasManyLazyMatchesBatchInclude_sorted() throws {
+        _ = try users.create(id: "u1", values: ["name": .string("Alice")])
+        _ = try posts.create(id: "pA", values: [
+            "userId": .string("u1"), "title": .string("A"),
+            "createdAt": .string("2026-01-01T00:00:00Z"),
+        ])
+        _ = try posts.create(id: "pB", values: [
+            "userId": .string("u1"), "title": .string("B"),
+            "createdAt": .string("2026-03-01T00:00:00Z"),
+        ])
+        _ = try posts.create(id: "pC", values: [
+            "userId": .string("u1"), "title": .string("C"),
+            "createdAt": .string("2026-02-01T00:00:00Z"),
+        ])
+
+        let lazy = try users.find(id: "u1")!
+            .hasMany(relationship: "postsByCreatedDesc", target: posts)
+
+        let batchRows = try users.query(
+            ["id": "u1"],
+            options: nil,
+            include: [Include(
+                type: .hasMany, target: posts!, foreignKey: "userId",
+                sort: ["createdAt": -1]
+            )]
+        )
+        let related = (batchRows.first?["_related"] as? [String: Any])?["posts_rel"]
+            as? [[String: Any]] ?? []
+
+        XCTAssertEqual(
+            lazy.map(\.id),
+            related.compactMap { $0["id"] as? String }
+        )
+        XCTAssertEqual(lazy.map(\.id), ["pB", "pC", "pA"])
+    }
+
+    /// hasManyThrough join rows resolve in join-id order (the query
+    /// engine's deterministic `id ASC` default — same default js-bao's
+    /// generated accessor uses for `joinModelOrderByField`).
+    func testHasManyThroughOrderIsJoinIdAscending() throws {
+        _ = try posts.create(id: "p1", values: ["title": .string("Post")])
+        _ = try tags.create(id: "t1", values: ["name": .string("red")])
+        _ = try tags.create(id: "t2", values: ["name": .string("blue")])
+        // Insert join rows out of id order.
+        _ = try postTagLinks.create(id: "l2", values: [
+            "postId": .string("p1"), "tagId": .string("t1"),
+        ])
+        _ = try postTagLinks.create(id: "l1", values: [
+            "postId": .string("p1"), "tagId": .string("t2"),
+        ])
+
+        let post = posts.find(id: "p1")!
+        let result = try post.hasManyThrough(
+            relationship: "tags", joinModel: postTagLinks, target: tags
+        )
+        XCTAssertEqual(result.map(\.id), ["t2", "t1"],
+                       "targets resolve in join-row id order (l1 -> t2, l2 -> t1)")
+    }
+
     // MARK: - hasManyThrough
 
     func testHasManyThroughResolvesViaJoinModel() throws {

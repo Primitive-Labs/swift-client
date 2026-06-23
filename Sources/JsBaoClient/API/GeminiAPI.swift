@@ -36,6 +36,7 @@ public final class GeminiAPI: @unchecked Sendable {
     ///   to the server default when omitted.
     /// - Returns: A typed `GeminiGenerateResult` with `message`, optional
     ///   `candidates`, `usage`, and the `raw` provider response.
+    @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow gemini.generate step instead.")
     public func generate(options: GeminiGenerateOptions) async throws -> GeminiGenerateResult {
         let body = try JSONCoding.jsonObject(from: options)
         let startedAt = Date()
@@ -53,6 +54,7 @@ public final class GeminiAPI: @unchecked Sendable {
 
     /// Lists available Gemini models and returns the default model name.
     /// - Returns: A typed `GeminiModelsResult` with `models` and `defaultModel`.
+    @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow gemini.generate step instead.")
     public func models() async throws -> GeminiModelsResult {
         let result = try await makeRequest("GET", "/gemini/models", nil)
         return try JSONCoding.decode(GeminiModelsResult.self, from: result)
@@ -65,6 +67,7 @@ public final class GeminiAPI: @unchecked Sendable {
     ///   `structuredOutput` are accepted for parity but do not affect counts.
     /// - Returns: A typed `GeminiCountTokensResult` with `totalTokens` and
     ///   optional `promptTokens`, `candidates`, and `raw`.
+    @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow gemini.generate step instead.")
     public func countTokens(options: GeminiPromptOptions) async throws -> GeminiCountTokensResult {
         let body = try JSONCoding.jsonObject(from: options)
         let startedAt = Date()
@@ -87,6 +90,7 @@ public final class GeminiAPI: @unchecked Sendable {
     ///   `model` is required; `body` must be a JSON object. `query` values are
     ///   stringified and appended to the request URL.
     /// - Returns: The raw response from the Gemini API as a `JSONValue`.
+    @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow gemini.generate step instead.")
     public func generateRaw(options: GeminiGenerateRawOptions) async throws -> JSONValue {
         let model = options.model
         guard !model.trimmingCharacters(in: .whitespaces).isEmpty else {

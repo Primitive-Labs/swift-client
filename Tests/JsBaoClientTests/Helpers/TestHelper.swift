@@ -11,7 +11,8 @@ func createTestClient(
     offline: Bool = false,
     storageConfig: StorageConfig = .memory,
     autoNetwork: Bool = false,
-    logLevel: LogLevel = .warn
+    logLevel: LogLevel = .warn,
+    analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig()
 ) -> JsBaoClient {
     JsBaoClient(options: JsBaoClientOptions(
         apiUrl: TestConfig.httpUrl,
@@ -23,7 +24,8 @@ func createTestClient(
         wsHeaders: ["X-Global-Admin-App-Id": globalAdminAppId],
         logLevel: logLevel,
         storageConfig: storageConfig,
-        autoNetwork: autoNetwork
+        autoNetwork: autoNetwork,
+        analyticsAutoEvents: analyticsAutoEvents
     ))
 }
 
@@ -114,4 +116,25 @@ func collectEvents(
 /// Sleep for given seconds.
 func delay(_ seconds: TimeInterval) async throws {
     try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+}
+
+// MARK: - createDocument test convenience (#1108)
+
+extension JsBaoClient {
+    /// Test convenience over the JS-parity `createDocument` (which returns
+    /// `{ metadata }` only, like js-bao — #1108): extracts the documentId
+    /// from the returned metadata and pairs it with the already-open local
+    /// `YDocument` so existing tuple-style test call sites keep working.
+    func createDocumentForTest(
+        options: CreateDocumentOptions = CreateDocumentOptions()
+    ) async throws -> (documentId: String, doc: YDocument?) {
+        let result = try await createDocument(options: options)
+        guard let id = result.metadata?["documentId"]?.stringValue, !id.isEmpty else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "createDocument returned no documentId in metadata"
+            )
+        }
+        return (id, getDoc(id))
+    }
 }

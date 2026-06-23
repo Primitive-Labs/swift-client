@@ -45,8 +45,8 @@ Each layer is independently usable in tests. The [architecture doc](architecture
 | `TypedModel<T: PrimitiveModel>` | Generic wrapper. CRUD and query helpers for a typed struct. | When you have a codegen-emitted struct and want type-safe access. |
 | `DynamicModel` | Schemaless view of records in a doc. Same storage, weaker typing. | When the schema isn't known at compile time, or you need a method `TypedModel<T>` doesn't expose yet. |
 | `PrimitiveRecord` | Stringly-typed record dictionary. What `DynamicModel` returns. | Inside `init?(record:)` (codegen-emitted), or when working with `DynamicModel`. |
-| `EventEmitter` / `JsBaoEvent` | Typed event bus. `.sync`, `.connectionState`, etc. | Subscribing to lifecycle events. See [`parity/events.md`](parity/events.md). |
-| `JsBaoError` / `JsBaoErrorCode` | Error taxonomy. 19 error codes that match JS exactly. See [`parity/errors.md`](parity/errors.md). | Catching and reasoning about failures. |
+| `EventEmitter` / `JsBaoEvent` | Typed event bus. `.sync`, `.connectionState`, etc. | Subscribing to lifecycle events. |
+| `JsBaoError` / `JsBaoErrorCode` | Error taxonomy. 19 error codes that match JS exactly. | Catching and reasoning about failures. |
 
 ## How a request flows
 
@@ -88,5 +88,5 @@ A `model.query(filter)` call goes:
 
 - **Authoring typed records:** [`baomodels.md`](baomodels.md)
 - **Internal architecture:** [`architecture.md`](architecture.md)
-- **What does the JS client do that this doesn't?:** [`exclusions-v1.md`](exclusions-v1.md) and [`parity/`](parity/)
-- **Cross-platform wire format:** [`parity/wire-format.md`](parity/wire-format.md)
+- **What does the JS client do that this doesn't?:** open GitHub issues labeled `swift-client-parity`
+- **Cross-platform wire format:** `Tests/JsBaoClientTests/CrossPlatform/` (the tests are the spec)

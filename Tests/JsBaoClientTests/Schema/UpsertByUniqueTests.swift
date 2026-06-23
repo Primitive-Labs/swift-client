@@ -230,4 +230,62 @@ final class UpsertByUniqueTests: XCTestCase {
         XCTAssertTrue(result.wasCreated)
         XCTAssertEqual(result.record.id, "u_custom")
     }
+
+    // MARK: - Explicit uniqueLookupValue (#1122)
+
+    /// An explicit `uniqueLookupValue` that agrees with `data` keys the
+    /// lookup exactly like the implicit path. Mirrors js-bao's separate
+    /// `uniqueLookupValue` argument.
+    func testExplicitLookupValueMatchesData() throws {
+        let doc = YDocument()
+        SchemaSync.clearCache()
+        let model = DynamicModel(doc: doc, schema: singleSchema)
+        _ = try model.create(id: "u1", values: [
+            "email": .string("a@b.c"), "name": .string("Alice"),
+        ])
+        let result = try model.upsertByUnique(
+            constraint: "users_ubu_email_unique",
+            data: ["email": .string("a@b.c"), "name": .string("Alice V2")],
+            uniqueLookupValue: [.string("a@b.c")]
+        )
+        XCTAssertFalse(result.wasCreated)
+        XCTAssertEqual(result.record.id, "u1")
+        XCTAssertEqual(result.record["name"], .string("Alice V2"))
+    }
+
+    /// A `uniqueLookupValue` that disagrees with `data` throws — mirrors
+    /// js-bao's "Mismatch between dataToUpsert.'<field>' … and
+    /// uniqueLookupValue" guard.
+    func testExplicitLookupValueMismatchThrows() throws {
+        let doc = YDocument()
+        SchemaSync.clearCache()
+        let model = DynamicModel(doc: doc, schema: singleSchema)
+        XCTAssertThrowsError(try model.upsertByUnique(
+            constraint: "users_ubu_email_unique",
+            data: ["email": .string("a@b.c")],
+            uniqueLookupValue: [.string("different@b.c")]
+        )) { error in
+            XCTAssertEqual(
+                error as? UpsertByUniqueError,
+                .lookupValueMismatch(constraint: "users_ubu_email_unique", field: "email")
+            )
+        }
+    }
+
+    /// A `uniqueLookupValue` of the wrong arity throws.
+    func testExplicitLookupValueArityMismatchThrows() throws {
+        let doc = YDocument()
+        SchemaSync.clearCache()
+        let model = DynamicModel(doc: doc, schema: compoundSchema)
+        XCTAssertThrowsError(try model.upsertByUnique(
+            constraint: "uq_tenant_sku",
+            data: ["tenantId": .string("t1"), "sku": .string("A")],
+            uniqueLookupValue: [.string("t1")]  // 1 value, constraint has 2 fields
+        )) { error in
+            XCTAssertEqual(
+                error as? UpsertByUniqueError,
+                .lookupValueArityMismatch(constraint: "uq_tenant_sku", expected: 2, got: 1)
+            )
+        }
+    }
 }

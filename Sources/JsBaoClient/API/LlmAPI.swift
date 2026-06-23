@@ -28,6 +28,7 @@ public final class LlmAPI: @unchecked Sendable {
     ///   `tools`/`tool_choice`/`plugins`, sampling controls, and `reasoning`.
     /// - Returns: The assistant message with `role`, `content`, optional
     ///   `annotations`, and the provider `raw` response.
+    @available(*, deprecated, message: "The direct LLM client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow llm.chat step instead.")
     public func chat(options: LlmChatOptions) async throws -> LlmChatResponse {
         let body = try JSONCoding.jsonObject(from: options)
         let startedAt = Date()
@@ -93,6 +94,7 @@ public final class LlmAPI: @unchecked Sendable {
 
     /// Lists available LLM models and returns the default model name.
     /// - Returns: The `models` array and the `defaultModel` name.
+    @available(*, deprecated, message: "The direct LLM client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow llm.chat step instead.")
     public func models() async throws -> LlmModelsResponse {
         let result = try await makeRequest("GET", "/llm/models", nil)
         return try JSONCoding.decode(LlmModelsResponse.self, from: result)

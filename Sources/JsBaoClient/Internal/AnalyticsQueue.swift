@@ -33,7 +33,7 @@ public final class AnalyticsQueue: @unchecked Sendable {
     private let maxBatchBytes: Int = 25 * 1024
     private let rateLimit: Int = 300
     private let burstCap: Int = 60
-    private let maxPersistedBytes: Int = 1_000_000
+    private let maxPersistedBytes: Int = 1024 * 1024
     private let contextBlobLimit: Int = 1024
 
     // Dependencies
@@ -42,6 +42,13 @@ public final class AnalyticsQueue: @unchecked Sendable {
     var getUserId: (() -> String?)?
     var offlineStore: OfflineStore?
     var appId: String = ""
+
+    /// Test-observability hook: invoked with the fully-prepared event right
+    /// before it is buffered. Internal (visible only via `@testable import`)
+    /// — the live-integration analytics tests use it to observe auto-events
+    /// (#963) the same way the JS tests observe `client.analyticsQueue`.
+    /// Never set in production code.
+    var onEventLogged: (([String: Any]) -> Void)?
 
     public init(logger: Logger) {
         self.logger = logger.forScope(scope: "analytics")
@@ -101,6 +108,8 @@ public final class AnalyticsQueue: @unchecked Sendable {
         lock.lock()
         buffer.append(preparedEvent)
         lock.unlock()
+
+        onEventLogged?(preparedEvent)
 
         scheduleFlush()
     }

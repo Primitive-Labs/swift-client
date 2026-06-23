@@ -21,9 +21,21 @@ public enum UpsertError: Error, Equatable, Sendable {
     /// field. Compound uniques are not a valid upsert target (per
     /// js-bao's `constraint.fields.length === 1` requirement).
     case noSingleFieldUniqueConstraint(field: String)
-    /// The caller supplied an id that doesn't match the id of the
-    /// existing record matched by the upsertOn value.
-    case idMismatch(supplied: String, existing: String)
+    /// The caller supplied an EXPLICIT id (via the model's designated
+    /// `init(id:…)` initializer, not the auto-id convenience init), the
+    /// `on:` field matched an existing record, and that record's id is
+    /// different from the supplied one. Mirrors js-bao's
+    /// `"[Model] upsertOn conflict: caller id '<supplied>' does not match
+    /// existing record '<existing>'"` thrown from `BaseModel.save` when
+    /// `_constructorProvidedId && this.id !== existingId`.
+    ///
+    /// JS only raises this when the id was *explicitly* passed to the
+    /// model constructor; a freshly auto-generated id is silently
+    /// discarded on merge. The Swift codegen tracks the same provenance:
+    /// the auto-id convenience initializer marks the id non-explicit, so
+    /// only a caller who pinned a specific id and then collided trips
+    /// this error.
+    case explicitIdConflict(supplied: String, existing: String)
 }
 
 /// Mode for `DynamicModel.upsertByUnique`. Matches js-bao's option
@@ -49,4 +61,13 @@ public enum UpsertByUniqueError: Error, Equatable, Sendable {
     case missingConstraintField(field: String)
     /// Mode `.mustExist` selected but no existing record matches.
     case recordNotFound(constraint: String)
+    /// An explicit `uniqueLookupValue` was supplied but its arity didn't
+    /// match the constraint's field count. Mirrors js-bao building the
+    /// lookup key from `keyValuesForLookup` per constraint field.
+    case lookupValueArityMismatch(constraint: String, expected: Int, got: Int)
+    /// An explicit `uniqueLookupValue` disagrees with the value carried
+    /// for the same field in `data`. Mirrors js-bao's
+    /// `"upsertByUnique: Mismatch between dataToUpsert.'<field>' … and
+    /// uniqueLookupValue for constraint '<name>'"` guard.
+    case lookupValueMismatch(constraint: String, field: String)
 }

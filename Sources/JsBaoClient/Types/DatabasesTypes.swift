@@ -323,17 +323,29 @@ public struct CsvImportProgress: Sendable, Equatable {
 /// Options for `importCsv`. Mirrors JS `CsvImportOptions`.
 ///
 /// Provide either `csv` (raw text, parsed with a quoted-field-aware parser)
-/// or `data` (pre-parsed string rows). `modelName` is required — the Swift
-/// surface resolves the model by name (the JS `model:` BaseModel-class path,
-/// with its schema-driven field filtering and index sync, is not ported; see
-/// `syncIndexes`). Callbacks are Swift closures rather than JS functions.
+/// or `data` (pre-parsed string rows). Identify the target model with either
+/// `model` (a codegen'd `PrimitiveModel` type — mirrors the JS `model:`
+/// BaseModel-class path: resolves the name, filters CSV columns to the
+/// model's schema, builds a type-coercion map from the schema, and syncs the
+/// model's indexes after import → `CsvImportResult.indexesCreated`) or
+/// `modelName` (a plain string — no schema-driven filtering or index sync).
+/// Exactly one is required. Callbacks are Swift closures rather than JS
+/// functions.
 public struct CsvImportOptions: Sendable {
     /// Raw CSV string to parse. Provide either `csv` or `data`.
     public var csv: String?
     /// Pre-parsed rows (each a `header -> value` dictionary). Provide either
     /// `csv` or `data`.
     public var data: [[String: String]]?
-    /// Model name the rows are written to (required).
+    /// A codegen'd model type used to resolve the model name, filter CSV
+    /// columns to the model's schema fields, coerce number/boolean fields
+    /// from the schema, and sync the model's indexes after import. Mirrors
+    /// the JS `model:` BaseModel-class path. Provide either `model` or
+    /// `modelName`.
+    public var model: (any PrimitiveModel.Type)?
+    /// Model name the rows are written to. Provide either `model` or
+    /// `modelName`. When set (and `model` is `nil`), no schema-driven column
+    /// filtering or index sync runs.
     public var modelName: String?
     /// Map CSV column headers to field names (e.g. `["Product Name": "name"]`).
     public var columnMap: [String: String]?
@@ -354,9 +366,11 @@ public struct CsvImportOptions: Sendable {
     public var onProgress: (@Sendable (CsvImportProgress) -> Void)?
     /// Called when a batch fails. Return `false` to abort remaining batches.
     public var onBatchError: (@Sendable (Error, Int) -> Bool)?
-    /// Sync indexes from the model schema after import. Kept for parity with
-    /// JS; in Swift it has no effect (no BaseModel-class introspection), so
-    /// `CsvImportResult.indexesCreated` is always `0`.
+    /// Sync indexes from the model schema after import (defaults to `true`).
+    /// Only applies when `model` is set (a `PrimitiveModel` type); ignored
+    /// when only `modelName` is given, in which case
+    /// `CsvImportResult.indexesCreated` stays `0`. Mirrors JS
+    /// `CsvImportOptions.syncIndexes`.
     public var syncIndexes: Bool?
     /// Name of the registered save operation (default `"save"`). Must accept
     /// params `{ modelName, id, data }`.
@@ -365,6 +379,7 @@ public struct CsvImportOptions: Sendable {
     public init(
         csv: String? = nil,
         data: [[String: String]]? = nil,
+        model: (any PrimitiveModel.Type)? = nil,
         modelName: String? = nil,
         columnMap: [String: String]? = nil,
         transform: (@Sendable ([String: JSONValue], Int) -> [String: JSONValue]?)? = nil,
@@ -380,6 +395,7 @@ public struct CsvImportOptions: Sendable {
     ) {
         self.csv = csv
         self.data = data
+        self.model = model
         self.modelName = modelName
         self.columnMap = columnMap
         self.transform = transform
@@ -412,8 +428,10 @@ public struct CsvImportResult: Sendable, Equatable {
     public let imported: Int
     public let failed: Int
     public let errors: [CsvImportError]
-    /// Number of indexes created after import. Always `0` on the Swift
-    /// surface (no model-class index sync); see `CsvImportOptions.syncIndexes`.
+    /// Number of indexes/constraints newly registered after import. Non-zero
+    /// only when `CsvImportOptions.model` is set and `syncIndexes` is not
+    /// `false`; stays `0` for the `modelName`-only path. See
+    /// `CsvImportOptions.syncIndexes`.
     public let indexesCreated: Int
     public let durationMs: Int
 

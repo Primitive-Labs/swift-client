@@ -25,7 +25,7 @@ public final class AuthController: @unchecked Sendable {
     /// (a `bootstrap`/`http_refresh`/`refresh`/`startup` that resolves
     /// after the user logged out) from silently re-authenticating or
     /// re-persisting the JWT. Cleared by the next interactive login
-    /// (`oauth`/`magic_link`/`otp`/`passkey`). Guarded by `lock`.
+    /// (`oauth`/`apple`/`magic_link`/`otp`/`passkey`). Guarded by `lock`.
     private var blockNonInteractiveAuth = false
 
     // Refresh backoff
@@ -44,6 +44,12 @@ public final class AuthController: @unchecked Sendable {
     // Offline access grant
     private let keychainHelper: KeychainHelper
     private var offlineIdentity: OfflineIdentity?
+
+    // PKCE: code_verifier from the most recent startOAuthFlow call, held
+    // until handleOAuthCallback consumes it. Native (iOS) Google OAuth
+    // clients have no client_secret and prove possession of the auth code
+    // via PKCE (RFC 7636) instead. Guarded by `lock`.
+    private var pendingCodeVerifier: String?
 
     // Request function (set externally to break circular dependency)
     var makeRequest: ((String, String, Any?) async throws -> Any)?
@@ -123,7 +129,7 @@ public final class AuthController: @unchecked Sendable {
     /// opposed to a background token refresh or persisted-session restore).
     private static func isInteractiveLogin(_ cause: String?) -> Bool {
         switch cause {
-        case "oauth", "magic_link", "otp", "passkey": return true
+        case "oauth", "apple", "magic_link", "otp", "passkey": return true
         default: return false
         }
     }
@@ -325,51 +331,100 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - OAuth
 
-    public func startOAuthFlow(redirectUri: String, continueUrl: String? = nil) async throws -> URL {
-        let state: [String: Any] = [
-            "nonce": UUID().uuidString,
-            "redirectUri": redirectUri,
-            "continueUrl": continueUrl as Any,
-        ]
-        let stateData = try JSONSerialization.data(withJSONObject: state)
-        let stateBase64 = stateData.base64EncodedString()
-
+    /// Start the OAuth flow. Mirrors JS `authController.startOAuthFlow`
+    /// (src/client/internal/authController.ts): fetch the app's auth config
+    /// (`GET /oauth-config`), require a `googleClientId`, and build the Google
+    /// authorize URL client-side with the base64-JSON state bag
+    /// `{nonce, redirectUri, continueUrl?}`. Where the JS client redirects the
+    /// browser, this returns the URL for the caller to open (e.g. via
+    /// `ASWebAuthenticationSession` — see `JsBaoClient.signInWithGoogle`).
+    public func startOAuthFlow(
+        redirectUri: String,
+        continueUrl: String? = nil,
+        waitlist: OAuthWaitlist? = nil,
+        inviteToken: String? = nil
+    ) async throws -> URL {
         guard let makeRequest = makeRequest else {
             throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
         }
 
-        let response = try await makeRequest("POST", "/oauth-config", nil)
-        guard let dict = response as? [String: Any],
-              let authUrl = dict["authorizationUrl"] as? String else {
+        let response = try await makeRequest("GET", "/oauth-config", nil)
+        guard let dict = response as? [String: Any] else {
             throw JsBaoError(code: .unavailable, message: "Invalid OAuth config response")
         }
-
-        guard var components = URLComponents(string: authUrl) else {
-            throw JsBaoError(code: .unavailable, message: "Invalid OAuth URL")
+        guard let googleClientId = dict["googleClientId"] as? String,
+              !googleClientId.isEmpty else {
+            throw JsBaoError(code: .unavailable, message: "OAuth not configured")
         }
 
-        var queryItems = components.queryItems ?? []
-        queryItems.append(URLQueryItem(name: "state", value: stateBase64))
-        queryItems.append(URLQueryItem(name: "redirect_uri", value: redirectUri))
-        components.queryItems = queryItems
+        // PKCE (RFC 7636): generate a fresh verifier+challenge pair for this
+        // flow. The challenge (base64url SHA-256 of the verifier) goes to
+        // Google on the authorize URL; the verifier is held on `self` until
+        // `handleOAuthCallback` sends it to our server with the code
+        // exchange. Together they prove the client exchanging the code is
+        // the one that started the flow — replacing the client_secret that
+        // confidential (web) OAuth clients use. Native iOS clients have no
+        // secret, so PKCE is what makes the native flow work. Servers that
+        // don't support PKCE yet simply ignore the extra parameters.
+        let verifier = Self.generatePkceVerifier()
+        let challenge = Self.pkceChallenge(forVerifier: verifier)
+        lock.lock()
+        pendingCodeVerifier = verifier
+        lock.unlock()
 
-        guard let url = components.url else {
-            throw JsBaoError(code: .unavailable, message: "Could not build OAuth URL")
-        }
-        return url
+        let state = try Self.encodeOAuthState(
+            redirectUri: redirectUri,
+            continueUrl: continueUrl,
+            waitlist: waitlist,
+            inviteToken: inviteToken
+        )
+        return try Self.buildGoogleAuthorizationUrl(
+            googleClientId: googleClientId,
+            redirectUri: redirectUri,
+            state: state,
+            codeChallenge: challenge
+        )
     }
 
-    public func handleOAuthCallback(code: String, state: String) async throws {
+    /// Exchange the authorization code for a session token. Mirrors JS
+    /// `exchangeOAuthCode` (src/client/internal/authController.ts):
+    /// `GET /oauth/callback?code=&state=` returns `{token, isNewUser}` plus
+    /// the `rt-{appId}` HttpOnly refresh cookie (handled transparently by
+    /// `URLSession`'s shared cookie storage). Applies the token with cause
+    /// `"oauth"`, which emits `.authSuccess` / `.authState` like every other
+    /// interactive sign-in path. Returns the raw server response so callers
+    /// can read `isNewUser`.
+    @discardableResult
+    public func handleOAuthCallback(code: String, state: String) async throws -> [String: Any] {
         guard let makeRequest = makeRequest else {
             throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
         }
 
-        let body: [String: Any] = [
-            "code": code,
-            "state": state,
-        ]
+        // PKCE: consume the verifier from the most recent startOAuthFlow.
+        // Cleared whether the exchange succeeds or fails so a stale verifier
+        // can't leak into a later attempt. Callers that never went through
+        // startOAuthFlow (e.g. resuming a web-started flow) have no verifier
+        // and the legacy GET path is used — same wire shape as before.
+        lock.lock()
+        let codeVerifier = pendingCodeVerifier
+        pendingCodeVerifier = nil
+        lock.unlock()
 
-        let response = try await makeRequest("POST", "/auth/oauth/callback", body)
+        // The server only reads the verifier from the native JSON endpoint
+        // (`POST /auth/oauth/callback`, body `{code, state, codeVerifier}` —
+        // OAuthController.callbackJson); the web `GET /oauth/callback` never
+        // looks at a code_verifier param. So: verifier → POST, none → GET.
+        let response: Any
+        if let codeVerifier {
+            response = try await makeRequest(
+                "POST",
+                "/auth/oauth/callback",
+                ["code": code, "state": state, "codeVerifier": codeVerifier]
+            )
+        } else {
+            let path = try Self.oauthCallbackPath(code: code, state: state)
+            response = try await makeRequest("GET", path, nil)
+        }
         guard let dict = response as? [String: Any],
               let token = dict["token"] as? String else {
             throw JsBaoError(code: .unavailable, message: "Invalid OAuth callback response")
@@ -377,6 +432,191 @@ public final class AuthController: @unchecked Sendable {
 
         let previous = getToken()
         applyToken(token, previous: previous, cause: "oauth")
+        return dict
+    }
+
+    // MARK: - Sign in with Apple
+
+    /// Exchange a native Sign in with Apple credential for a session token.
+    /// `POST /auth/apple/callback` with the JSON body
+    /// `{identityToken, nonce, user, email?, firstName?, lastName?}` —
+    /// the contract of the server's `AppleAuthController` (#409):
+    ///  * `identityToken` — Apple's JWT (`credential.identityToken`, UTF-8).
+    ///  * `nonce` — the **raw** nonce; the client put its SHA-256 (lowercase
+    ///    hex) on `ASAuthorizationAppleIDRequest.nonce`, and the server
+    ///    re-hashes this raw value to check the token's `nonce` claim.
+    ///  * `user` — Apple's stable user identifier (`credential.user`).
+    ///  * `email` / `firstName` / `lastName` — first-authorization hints
+    ///    (Apple only provides them once per user+app).
+    /// The response is `{token, isNewUser}` plus the `rt-{appId}` HttpOnly
+    /// refresh cookie (handled by `URLSession`'s cookie storage). Applies
+    /// the token with cause `"apple"`, emitting `.authSuccess` /
+    /// `.authState` like the other interactive sign-in paths. Returns the
+    /// raw server response so callers can read `isNewUser`.
+    @discardableResult
+    public func handleAppleCallback(
+        identityToken: String,
+        rawNonce: String,
+        user: String,
+        email: String? = nil,
+        firstName: String? = nil,
+        lastName: String? = nil
+    ) async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+
+        let body = AppleSignInHelpers.callbackBody(
+            identityToken: identityToken,
+            rawNonce: rawNonce,
+            user: user,
+            email: email,
+            firstName: firstName,
+            lastName: lastName
+        )
+        let response = try await makeRequest("POST", "/auth/apple/callback", body)
+        guard let dict = response as? [String: Any],
+              let token = dict["token"] as? String else {
+            throw JsBaoError(code: .unavailable, message: "Invalid Apple sign-in response")
+        }
+
+        let previous = getToken()
+        applyToken(token, previous: previous, cause: "apple")
+        return dict
+    }
+
+    // MARK: - OAuth URL helpers (pure, unit-testable)
+
+    /// Encode the OAuth state bag the server round-trips through Google.
+    /// Mirrors the JS shape: `btoa(JSON.stringify({redirectUri, nonce,
+    /// continueUrl?}))` — `continueUrl` omitted when absent.
+    static func encodeOAuthState(
+        redirectUri: String,
+        continueUrl: String? = nil,
+        waitlist: OAuthWaitlist? = nil,
+        inviteToken: String? = nil,
+        nonce: String = UUID().uuidString
+    ) throws -> String {
+        var state: [String: Any] = [
+            "nonce": nonce,
+            "redirectUri": redirectUri,
+        ]
+        if let continueUrl, !continueUrl.isEmpty {
+            state["continueUrl"] = continueUrl
+        }
+        // #466 parity: enroll the user in the waitlist via the OAuth state bag.
+        // JS trims both fields and clamps each to 255 chars, and only attaches
+        // the `waitlist` key when at least one field survives trimming.
+        if let waitlist {
+            var entry: [String: Any] = [:]
+            if let source = waitlist.source?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !source.isEmpty {
+                entry["source"] = String(source.prefix(255))
+            }
+            if let note = waitlist.note?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !note.isEmpty {
+                entry["note"] = String(note.prefix(255))
+            }
+            if !entry.isEmpty {
+                state["waitlist"] = entry
+            }
+        }
+        // #466 parity: thread the (trimmed) invite token through the state bag.
+        // The callback handler reads `stateData.inviteToken` and accepts the
+        // named invitation server-side, resolving deferred grants to the new
+        // user even when the OAuth email differs from the invited email.
+        if let inviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !inviteToken.isEmpty {
+            state["inviteToken"] = inviteToken
+        }
+        let data = try JSONSerialization.data(withJSONObject: state)
+        return data.base64EncodedString()
+    }
+
+    /// Build the Google authorize URL exactly like the JS client:
+    /// `https://accounts.google.com/o/oauth2/v2/auth` with
+    /// `client_id`, `redirect_uri`, `response_type=code`,
+    /// `scope="openid email profile"`, and `state` — plus, when
+    /// `codeChallenge` is given, the PKCE pair `code_challenge` /
+    /// `code_challenge_method=S256` (RFC 7636 §4.3).
+    ///
+    /// Query values are strictly percent-encoded (RFC 3986 unreserved set)
+    /// rather than via `URLComponents.queryItems`, which leaves `+` literal —
+    /// Google would decode a literal `+` in the base64 state as a space and
+    /// corrupt it.
+    static func buildGoogleAuthorizationUrl(
+        googleClientId: String,
+        redirectUri: String,
+        state: String,
+        codeChallenge: String? = nil
+    ) throws -> URL {
+        var params: [(String, String)] = [
+            ("client_id", googleClientId),
+            ("redirect_uri", redirectUri),
+            ("response_type", "code"),
+            ("scope", "openid email profile"),
+            ("state", state),
+        ]
+        if let codeChallenge, !codeChallenge.isEmpty {
+            params.append(("code_challenge", codeChallenge))
+            params.append(("code_challenge_method", "S256"))
+        }
+        let query = try params.map { name, value in
+            "\(name)=\(try Self.strictPercentEncode(value))"
+        }.joined(separator: "&")
+
+        guard var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth") else {
+            throw JsBaoError(code: .unavailable, message: "Could not build OAuth URL")
+        }
+        components.percentEncodedQuery = query
+        guard let url = components.url else {
+            throw JsBaoError(code: .unavailable, message: "Could not build OAuth URL")
+        }
+        return url
+    }
+
+    /// Request path for the legacy (non-PKCE) code exchange:
+    /// `/oauth/callback?code=&state=` with both values strictly
+    /// percent-encoded (the base64 state contains `+` / `/` / `=`, all
+    /// reserved in queries). PKCE flows don't use this path — the verifier
+    /// goes in the JSON body of `POST /auth/oauth/callback` instead, which
+    /// is the only place the server reads it.
+    static func oauthCallbackPath(
+        code: String,
+        state: String
+    ) throws -> String {
+        let encodedCode = try strictPercentEncode(code)
+        let encodedState = try strictPercentEncode(state)
+        return "/oauth/callback?code=\(encodedCode)&state=\(encodedState)"
+    }
+
+    // MARK: - PKCE helpers (pure, unit-testable)
+
+    /// Generate a high-entropy PKCE `code_verifier` per RFC 7636 §4.1:
+    /// 32 random bytes, base64url-encoded without padding — 43 characters,
+    /// all from the spec's unreserved set, comfortably inside the required
+    /// 43–128 range.
+    static func generatePkceVerifier() -> String {
+        let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+        return Base64Url.encode(Data(bytes))
+    }
+
+    /// Derive the S256 PKCE `code_challenge` for a verifier (RFC 7636 §4.2):
+    /// `base64url(sha256(ascii(verifier)))`, no padding.
+    static func pkceChallenge(forVerifier verifier: String) -> String {
+        Base64Url.encode(hashSHA256(Data(verifier.utf8)))
+    }
+
+    /// Percent-encode everything outside the RFC 3986 unreserved set
+    /// (alphanumerics plus `-._~`), matching JS `encodeURIComponent` for
+    /// the characters that matter in OAuth payloads (`+`, `/`, `=`, `:`).
+    static func strictPercentEncode(_ value: String) throws -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        guard let encoded = value.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            throw JsBaoError(code: .invalidArgument, message: "Could not percent-encode OAuth parameter")
+        }
+        return encoded
     }
 
     // MARK: - Magic Link
@@ -448,12 +688,20 @@ public final class AuthController: @unchecked Sendable {
         return success
     }
 
-    public func otpVerify(email: String, code: String) async throws -> [String: Any] {
+    public func otpVerify(email: String, code: String, inviteToken: String? = nil) async throws -> [String: Any] {
         guard let makeRequest = makeRequest else {
             throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
         }
 
-        let body: [String: Any] = ["email": email, "code": code]
+        // #466: thread the (trimmed) invite token through verify so deferred
+        // grants resolve to the signing-in user. Mirrors JS otpVerify.
+        let trimmedInviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedInviteToken = (trimmedInviteToken?.isEmpty == false) ? trimmedInviteToken : nil
+
+        var body: [String: Any] = ["email": email, "code": code]
+        if let resolvedInviteToken = resolvedInviteToken {
+            body["inviteToken"] = resolvedInviteToken
+        }
 
         let endpoint: String
         if let proxy = refreshProxy, proxy.enabled {
@@ -482,6 +730,12 @@ public final class AuthController: @unchecked Sendable {
     /// `wipeLocal`, and the Swift-specific `waitForDisconnect`. (`redirectTo`
     /// is web-only `window.location` and is intentionally not modeled here.)
     public func logout(options: LogoutOptions = LogoutOptions()) async throws {
+        // JS parity (#1059): JS emits `auth:logout` (payload `{}`) as the very
+        // first statement of `JsBaoClient.logout()`, before any teardown.
+        // Every Swift logout path funnels through this method, so emitting
+        // here covers `client.logout(...)` and `client.auth.logout(...)`.
+        emitter?.emit(.authLogout, AuthLogoutEvent())
+
         // Block any in-flight refresh/restore from re-authenticating after
         // this logout (see `blockNonInteractiveAuth`). Set before clearing
         // the token so a refresh resolving mid-logout is caught.
@@ -510,6 +764,11 @@ public final class AuthController: @unchecked Sendable {
         if options.waitForDisconnect {
             await onLogoutDisconnect?()
         }
+
+        // JS parity (#1059): JS emits `auth:logout:complete` (payload `{}`)
+        // after the best-effort server logout, networking shutdown, and
+        // `auth.logout(...)` teardown have all finished.
+        emitter?.emit(.authLogoutComplete, AuthLogoutCompleteEvent())
     }
 
     /// Backward-compatible overload retained for the `JsBaoClient` wiring

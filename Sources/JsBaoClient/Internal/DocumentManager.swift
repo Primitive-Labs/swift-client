@@ -7,6 +7,18 @@ public struct AwarenessEntry: @unchecked Sendable {
     public var remoteStates: [String: [String: Any]] = [:]
 }
 
+/// Delta of awareness changes produced by applying a remote awareness frame.
+/// Mirrors the JS `applyRemoteAwarenessStates` return value
+/// (`src/client/internal/documentManager.ts`): arrays of client IDs that
+/// were added, updated, or removed.
+public struct AwarenessDelta: Sendable {
+    public var added: [String] = []
+    public var updated: [String] = []
+    public var removed: [String] = []
+
+    public var isEmpty: Bool { added.isEmpty && updated.isEmpty && removed.isEmpty }
+}
+
 /// Manages document lifecycle, Yjs sync protocol, metadata, and pending creates.
 public final class DocumentManager: @unchecked Sendable {
     private let lock = NSLock()
@@ -40,6 +52,18 @@ public final class DocumentManager: @unchecked Sendable {
 
     // Awareness state per document
     private var docAwareness: [String: AwarenessEntry] = [:]
+
+    // Docs that asked the server for sync-perf timings (JS
+    // `syncPerfRequestedByDoc`). Consulted when building syncStep1.
+    private var syncPerfRequestedDocs: Set<String> = []
+
+    // Per-doc client-side sync timing capture (JS `clientSyncTimings`).
+    // Keys mirror the JS field names emitted on `syncPerf.clientTimings`
+    // (`clientRoundTripMs`, `clientUpdateBytes`, `clientApplyMs`,
+    // `clientTotalMs`) plus the internal `syncStep1SentAt` anchor, which
+    // is stripped before the map is emitted. Values are `Double`
+    // (milliseconds, except `clientUpdateBytes` which is a byte count).
+    private var clientSyncTimings: [String: [String: Double]] = [:]
 
     // Sync protocol state
     private var syncProtocols: [String: YProtocol] = [:]
@@ -324,6 +348,8 @@ public final class DocumentManager: @unchecked Sendable {
         updateSubscriptions.removeValue(forKey: documentId)?.cancel()
         docAwareness.removeValue(forKey: documentId)
         docPersistence.removeValue(forKey: documentId)
+        syncPerfRequestedDocs.remove(documentId)
+        clientSyncTimings.removeValue(forKey: documentId)
         lock.unlock()
 
         if options.evictLocal {
@@ -350,17 +376,112 @@ public final class DocumentManager: @unchecked Sendable {
         let step1 = syncProto.handleConnectionStarted()
         let base64 = Data(step1.buffer).base64EncodedString()
 
-        let message: [String: Any] = [
+        var message: [String: Any] = [
             "type": "syncStep1",
             "documentId": documentId,
             "stateVector": base64,
         ]
+        // Mirror JS `sendSyncStep1`: when the doc requested sync-perf
+        // telemetry, ask the server to send a `syncPerf` frame.
+        if isSyncPerfRequested(documentId) {
+            message["requestPerf"] = true
+        }
 
         guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
             return nil
         }
+
+        // Mirror JS `sendSyncStep1`, which clears prior timings and stamps
+        // `syncStep1SentAt` immediately before the frame goes on the wire.
+        // This is the per-phase anchor that `clientTimings` durations are
+        // measured against. We stamp here (rather than in the caller)
+        // because every syncStep1 send — initial open and the 350ms
+        // re-send loop — funnels through this builder.
+        markSyncStep1Sent(documentId)
+
         return jsonString
+    }
+
+    /// Mark a document as wanting server sync-perf timings on its next
+    /// sync round-trips. Mirrors JS `setSyncPerfRequested`.
+    public func setSyncPerfRequested(_ documentId: String, _ value: Bool) {
+        lock.lock()
+        if value {
+            syncPerfRequestedDocs.insert(documentId)
+        } else {
+            syncPerfRequestedDocs.remove(documentId)
+        }
+        lock.unlock()
+    }
+
+    /// Mirrors JS `isSyncPerfRequested`.
+    public func isSyncPerfRequested(_ documentId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return syncPerfRequestedDocs.contains(documentId)
+    }
+
+    // MARK: - Client sync-perf instrumentation
+
+    /// Current time in milliseconds since the epoch — the Swift analogue
+    /// of JS `Date.now()`. Used to anchor and measure sync phases so the
+    /// emitted `clientTimings` durations match the JS units (ms).
+    private static func nowMs() -> Double {
+        Date().timeIntervalSince1970 * 1000.0
+    }
+
+    /// Record a single client-side timing value for a document. Mirrors
+    /// JS `DocumentManager.setSyncTiming`.
+    public func setSyncTiming(_ documentId: String, _ key: String, _ value: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        var timings = clientSyncTimings[documentId] ?? [:]
+        timings[key] = value
+        clientSyncTimings[documentId] = timings
+    }
+
+    /// Read the raw client-side timing map for a document (including the
+    /// internal `syncStep1SentAt` anchor). Mirrors JS
+    /// `DocumentManager.getSyncTimings`.
+    public func getSyncTimings(_ documentId: String) -> [String: Double]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return clientSyncTimings[documentId]
+    }
+
+    /// Drop all client-side timings for a document. Mirrors JS
+    /// `DocumentManager.clearSyncTimings`.
+    public func clearSyncTimings(_ documentId: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        clientSyncTimings.removeValue(forKey: documentId)
+    }
+
+    /// Reset and anchor a fresh sync-timing window for a document.
+    /// Mirrors JS `sendSyncStep1`, which clears prior timings and stamps
+    /// `syncStep1SentAt` immediately before sending the syncStep1 frame.
+    public func markSyncStep1Sent(_ documentId: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        clientSyncTimings[documentId] = ["syncStep1SentAt": Self.nowMs()]
+    }
+
+    /// Capture the per-phase timings that JS records inside `handleUpdate`
+    /// (which handles both `syncStep2` and incremental `update` frames):
+    /// the round-trip from syncStep1, the applied byte count, and the
+    /// apply duration. `applyMs` is measured around the YDoc apply by the
+    /// caller. Mirrors the `clientRoundTripMs` / `clientUpdateBytes` /
+    /// `clientApplyMs` writes in JS `handleUpdate`.
+    private func recordUpdatePhaseTimings(documentId: String, updateBytes: Int, applyMs: Double) {
+        lock.lock()
+        let sentAt = clientSyncTimings[documentId]?["syncStep1SentAt"]
+        lock.unlock()
+        if let sentAt = sentAt {
+            setSyncTiming(documentId, "clientRoundTripMs", Self.nowMs() - sentAt)
+        }
+        setSyncTiming(documentId, "clientUpdateBytes", Double(updateBytes))
+        setSyncTiming(documentId, "clientApplyMs", applyMs)
     }
 
     /// Build a syncStep2 response message given the server's state vector.
@@ -421,6 +542,7 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         let updateBytes = [UInt8](updateData)
+        let applyStartMs = Self.nowMs()
         doc.transactSync { [self] txn in
             do {
                 try txn.transactionApplyUpdate(update: updateBytes)
@@ -429,6 +551,7 @@ public final class DocumentManager: @unchecked Sendable {
                 self.logger.warn("Failed to apply syncStep2 for doc:", documentId, error.localizedDescription)
             }
         }
+        let applyMs = Self.nowMs() - applyStartMs
 
         lock.lock()
         applyingRemoteUpdate[documentId] = false
@@ -438,6 +561,11 @@ public final class DocumentManager: @unchecked Sendable {
         lock.lock()
         docServerBytes[documentId] = (docServerBytes[documentId] ?? 0) + bytes
         lock.unlock()
+
+        // Mirror JS `handleUpdate` (which handles both syncStep2 and
+        // incremental update frames): capture round-trip, byte count, and
+        // apply duration for `syncPerf.clientTimings`.
+        recordUpdatePhaseTimings(documentId: documentId, updateBytes: bytes, applyMs: applyMs)
     }
 
     /// Handle an incremental update from server
@@ -459,6 +587,7 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         let updateBytes = [UInt8](updateData)
+        let applyStartMs = Self.nowMs()
         doc.transactSync { [self] txn in
             do {
                 try txn.transactionApplyUpdate(update: updateBytes)
@@ -467,10 +596,15 @@ public final class DocumentManager: @unchecked Sendable {
                 self.logger.warn("Failed to apply update for doc:", documentId, error.localizedDescription)
             }
         }
+        let applyMs = Self.nowMs() - applyStartMs
 
         lock.lock()
         applyingRemoteUpdate[documentId] = false
         lock.unlock()
+
+        // Mirror JS `handleUpdate`: capture round-trip, byte count, and
+        // apply duration for `syncPerf.clientTimings`.
+        recordUpdatePhaseTimings(documentId: documentId, updateBytes: updateData.count, applyMs: applyMs)
     }
 
     /// Handle syncComplete message
@@ -479,7 +613,14 @@ public final class DocumentManager: @unchecked Sendable {
         docSyncStates[documentId] = true
         let startTime = docOpenStartTime[documentId]
         let bytes = docServerBytes[documentId]
+        let syncStep1SentAt = clientSyncTimings[documentId]?["syncStep1SentAt"]
         lock.unlock()
+
+        // Mirror JS `syncComplete` handler: total time from syncStep1 send
+        // to sync completion, for `syncPerf.clientTimings.clientTotalMs`.
+        if let syncStep1SentAt = syncStep1SentAt {
+            setSyncTiming(documentId, "clientTotalMs", Self.nowMs() - syncStep1SentAt)
+        }
 
         let elapsed = startTime.map { (CFAbsoluteTimeGetCurrent() - $0) * 1000 } ?? 0
 
@@ -554,6 +695,24 @@ public final class DocumentManager: @unchecked Sendable {
         return docSyncStates[documentId] ?? false
     }
 
+    /// Whether any CRDT updates have been applied to the open ydoc.
+    /// Mirrors JS `documentManager.ydocHasData`: the state vector of an
+    /// empty doc encodes as a single byte (varint 0 — "AA==" in base64),
+    /// so anything longer means real updates exist. More reliable than
+    /// checking shared-type sizes, which can read 0 before the shared
+    /// types are materialized after an applyUpdate.
+    public func ydocHasData(_ documentId: String) -> Bool {
+        lock.lock()
+        let doc = openDocs[documentId]
+        lock.unlock()
+        guard let doc else { return false }
+        var stateVectorLength = 0
+        doc.transactSync { txn in
+            stateVectorLength = txn.transactionStateVector().count
+        }
+        return stateVectorLength > 1
+    }
+
     public func isOpen(_ documentId: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -605,6 +764,16 @@ public final class DocumentManager: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Encode a `LocalMetadataEntry` to a `[String: Any]` for event
+    /// payloads (the typed `DocumentMetadataChangedEvent.metadata` field).
+    private func metadataDictionary(_ entry: LocalMetadataEntry) -> [String: Any]? {
+        guard let data = try? JSONEncoder().encode(entry),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return obj
+    }
+
     public func handleServerDocuments(_ documents: [[String: Any]]) async {
         for docData in documents {
             guard let documentId = docData["documentId"] as? String else { continue }
@@ -629,9 +798,19 @@ public final class DocumentManager: @unchecked Sendable {
 
             // Persist
             try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: entry)
-        }
 
-        emitter?.emit(.documentMetadataChanged, [:] as [String: Any])
+            // Per-doc typed event, mirroring JS `handleServerDocuments`
+            // (`src/client/internal/documentManager.ts`): action "updated",
+            // source "server". (#996 — was a single untyped `[:]` emit that
+            // typed subscribers never received.)
+            emitter?.emit(.documentMetadataChanged, DocumentMetadataChangedEvent(
+                documentId: documentId,
+                action: "updated",
+                metadata: metadataDictionary(entry),
+                changedFields: nil,
+                source: "server"
+            ))
+        }
     }
 
     // MARK: - Pending Creates
@@ -703,7 +882,16 @@ public final class DocumentManager: @unchecked Sendable {
         // Persist metadata
         try await offlineStore?.putMetadata(appId: appId, userId: userId, record: metadata)
 
-        emitter?.emit(.documentMetadataChanged, ["action": "created", "documentId": documentId] as [String: Any])
+        // Typed event (#996 — was an untyped dict that typed subscribers
+        // never received). A local create originates on-device: source
+        // "local", matching JS's local-first create path.
+        emitter?.emit(.documentMetadataChanged, DocumentMetadataChangedEvent(
+            documentId: documentId,
+            action: "created",
+            metadata: metadataDictionary(metadata),
+            changedFields: nil,
+            source: "local"
+        ))
 
         return doc
     }
@@ -904,11 +1092,24 @@ public final class DocumentManager: @unchecked Sendable {
 
     // MARK: - Awareness State
 
-    /// Set the local awareness state for a document.
-    public func setLocalAwarenessState(_ documentId: String, state: [String: Any]) {
+    /// Set the local awareness state for a document. Returns the previous
+    /// local state plus whether the doc had an awareness entry at all
+    /// (mirrors JS `setLocalAwarenessState`'s `{ previousState, exists }`
+    /// so the caller can emit an `added` vs `updated` delta).
+    @discardableResult
+    public func setLocalAwarenessState(
+        _ documentId: String,
+        state: [String: Any]
+    ) -> (previousState: [String: Any]?, exists: Bool) {
         lock.lock()
-        docAwareness[documentId]?.localState = state
-        lock.unlock()
+        defer { lock.unlock() }
+        guard var entry = docAwareness[documentId] else {
+            return (nil, false)
+        }
+        let previous = entry.localState
+        entry.localState = state
+        docAwareness[documentId] = entry
+        return (previous, true)
     }
 
     /// Get the full awareness snapshot for a document (local + remote states).
@@ -918,25 +1119,58 @@ public final class DocumentManager: @unchecked Sendable {
         return docAwareness[documentId]
     }
 
-    /// Apply incoming remote awareness states for a document.
-    public func applyRemoteAwareness(_ documentId: String, states: [[String: Any]]) {
+    /// Apply an incoming remote awareness frame for a document and return
+    /// the delta. Mirrors JS `applyRemoteAwarenessStates`.
+    ///
+    /// The wire format (both directions — see `sendExistingStates` in
+    /// `src/doc-worker/awareness.ts` and `sendAwarenessState` in
+    /// `src/client/JsBaoClient.ts`) is an array of `[clientId, state]`
+    /// tuples; `state == null` means "this client's awareness was removed".
+    public func applyRemoteAwarenessStates(
+        _ documentId: String,
+        states: [[Any]]
+    ) -> AwarenessDelta {
         lock.lock()
+        defer { lock.unlock() }
         guard var entry = docAwareness[documentId] else {
-            lock.unlock()
-            return
+            return AwarenessDelta()
         }
-        for state in states {
-            if let clientId = state["clientId"] as? String {
+
+        var delta = AwarenessDelta()
+        for tuple in states {
+            guard tuple.count >= 2, let clientId = tuple[0] as? String else { continue }
+            let rawState = tuple[1]
+            if rawState is NSNull {
+                if entry.remoteStates.removeValue(forKey: clientId) != nil {
+                    delta.removed.append(clientId)
+                }
+            } else if let state = rawState as? [String: Any] {
+                let previous = entry.remoteStates[clientId]
                 entry.remoteStates[clientId] = state
+                if previous == nil {
+                    delta.added.append(clientId)
+                } else if !(previous! as NSDictionary).isEqual(to: state) {
+                    // A re-sent identical state is a no-op, matching the
+                    // JS awareness layer — don't report it in `updated`.
+                    delta.updated.append(clientId)
+                }
             }
         }
         docAwareness[documentId] = entry
-        lock.unlock()
+        return delta
     }
 
-    /// Remove awareness states for specific clients. Returns the IDs that were actually removed.
+    /// Remove awareness states for specific clients. Returns the IDs that
+    /// were actually removed. When `removeLocal` is true the doc's local
+    /// awareness state is also cleared (mirrors JS `removeAwarenessClients`'s
+    /// `removeLocal` flag, used when the caller passes its own
+    /// connectionId).
     @discardableResult
-    public func removeAwarenessClients(_ documentId: String, clientIds: [String]) -> [String] {
+    public func removeAwarenessClients(
+        _ documentId: String,
+        clientIds: [String],
+        removeLocal: Bool = false
+    ) -> [String] {
         lock.lock()
         guard var entry = docAwareness[documentId] else {
             lock.unlock()
@@ -947,6 +1181,9 @@ public final class DocumentManager: @unchecked Sendable {
             if entry.remoteStates.removeValue(forKey: clientId) != nil {
                 removed.append(clientId)
             }
+        }
+        if removeLocal {
+            entry.localState = nil
         }
         docAwareness[documentId] = entry
         lock.unlock()
@@ -1184,10 +1421,16 @@ public final class DocumentManager: @unchecked Sendable {
         lock.unlock()
 
         // Get full document state as an update.
-        // Use raw YrsDoc to avoid blocking the cooperative thread pool on syncQueue.
-        let txn = doc.document.transact(origin: nil)
-        defer { txn.free() }
-        let state: [UInt8] = txn.transactionEncodeStateAsUpdate()
+        // Use raw YrsDoc to avoid blocking the cooperative thread pool on
+        // syncQueue — but bracket it with the doc's FFI lock so it can't
+        // overlap an observer registration or another transaction (#1126).
+        // The transaction is freed before the awaits below; only the
+        // encoded bytes escape the locked scope.
+        let state: [UInt8] = doc.withExclusiveAccess {
+            let txn = doc.document.transact(origin: nil)
+            defer { txn.free() }
+            return txn.transactionEncodeStateAsUpdate()
+        }
 
         // Resolve persistence lazily. `openDocument` wires `docPersistence`
         // up-front, but only if `offlineStore.getStorageProvider()` was

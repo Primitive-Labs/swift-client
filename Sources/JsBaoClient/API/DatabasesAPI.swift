@@ -514,21 +514,36 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// batched writes, and progress / error callbacks. Mirrors js-bao's
     /// `databases.importCsv` (#962a).
     ///
-    /// Pipeline (matches JS): resolve `modelName` → parse `csv` (quoted-field
-    /// aware) or copy `data` → apply `columnMap` → coerce values per `types` →
-    /// assign `id` (`idColumn` → `idGenerator` → ULID) → run `transform`
-    /// (skip on `nil`) → write in batches of `batchSize` (default 5000) via the
-    /// named save operation as `{ modelName, id, data }`.
+    /// Pipeline (matches JS): resolve `model`/`modelName` → parse `csv`
+    /// (quoted-field aware) or copy `data` → apply `columnMap` → (model only)
+    /// filter columns to the schema's fields → coerce values per the schema +
+    /// `types` → assign `id` (`idColumn` → `idGenerator` → ULID) → run
+    /// `transform` (skip on `nil`) → write in batches of `batchSize`
+    /// (default 5000) via the named save operation as `{ modelName, id, data }`
+    /// → (model only, unless `syncIndexes == false`) sync the model's indexes
+    /// and report the count as `indexesCreated`.
     ///
-    /// - Note: the JS `model:` BaseModel-class path (schema-driven field
-    ///   filtering + post-import `syncIndexes`) is not ported; `modelName` is
-    ///   required and `indexesCreated` is always `0`.
+    /// - Note: schema-driven column filtering, schema type coercion, and
+    ///   post-import index sync only run when `options.model` is set (a
+    ///   `PrimitiveModel` type, mirroring the JS BaseModel-class path). The
+    ///   `modelName`-only path skips all three and leaves `indexesCreated` at
+    ///   `0`.
     public func importCsv(databaseId: String, options: CsvImportOptions) async throws -> CsvImportResult {
         let start = Date()
         func elapsedMs() -> Int { Int(Date().timeIntervalSince(start) * 1000) }
 
-        // 1. Resolve model name.
-        guard let modelName = options.modelName, !modelName.isEmpty else {
+        // 1. Resolve model name + (when a model class is given) its schema.
+        //    Mirrors JS: `model` resolves the name AND drives field filtering
+        //    + index sync; a bare `modelName` does neither.
+        let modelName: String
+        let schema: PrimitiveSchema?
+        if let model = options.model {
+            modelName = model.modelName
+            schema = model.primitiveSchema
+        } else if let name = options.modelName, !name.isEmpty {
+            modelName = name
+            schema = nil
+        } else {
             throw DatabaseImportError.modelNameRequired
         }
 
@@ -557,11 +572,21 @@ public final class DatabasesAPI: @unchecked Sendable {
             }
         }
 
-        // 4 & 6. Coerce values, assign IDs, apply transform.
-        //   (Step 4/5 in JS — schema-based field filtering and the schema type
-        //   map — require a BaseModel class, which the Swift surface doesn't
-        //   take; only the explicit `types` overrides are applied here.)
-        let typeMap = options.types ?? [:]
+        // 4. If a model class was given, filter columns to its schema fields
+        //    (mirrors JS: drop any header not in the model's field set). The
+        //    `id` column survives because the schema always carries `id`.
+        if let schema {
+            let allowed = Set(schema.fields.keys)
+            rows = rows.map { row in row.filter { allowed.contains($0.key) } }
+        }
+
+        // 5 & 6. Build the type-coercion map (schema number/boolean fields,
+        //   then explicit `types` overrides — `types` wins, matching JS), then
+        //   coerce values, assign IDs, and apply the per-row transform.
+        var typeMap = Self.coercionMap(from: schema)
+        if let explicit = options.types {
+            for (field, type) in explicit { typeMap[field] = type }
+        }
         var processedRows: [[String: JSONValue]] = []
         processedRows.reserveCapacity(rows.count)
 
@@ -578,7 +603,7 @@ public final class DatabasesAPI: @unchecked Sendable {
 
             // Assign ID: idColumn → idGenerator → existing id → ULID.
             if let idColumn = options.idColumn,
-               let raw = rawRow[idColumn], !raw.isEmpty {
+               let raw = rawRow[idColumn] {
                 row["id"] = .string(raw)
             } else if let idGenerator = options.idGenerator {
                 row["id"] = .string(idGenerator(row, i))
@@ -644,13 +669,73 @@ public final class DatabasesAPI: @unchecked Sendable {
             }
         }
 
-        // 9. Index sync is JS BaseModel-class only; always 0 here.
+        // 9. Sync indexes from the model schema (model-class path only, unless
+        //    explicitly disabled). Mirrors JS:
+        //    `syncIndexes !== false && model && typeof model !== "string"`.
+        var indexesCreated = 0
+        if let schema, options.syncIndexes != false {
+            let syncState = Self.modelSyncState(from: schema)
+            indexesCreated = try await connect(databaseId: databaseId)
+                .syncIndexes(models: [syncState])
+        }
+
         return CsvImportResult(
             imported: imported,
             failed: failed,
             errors: errors,
-            indexesCreated: 0,
+            indexesCreated: indexesCreated,
             durationMs: elapsedMs()
+        )
+    }
+
+    // MARK: - Model-class import helpers
+
+    /// Build the CSV type-coercion map from a model schema: number-like
+    /// fields → `.number`, boolean fields → `.boolean`. Mirrors JS
+    /// `importCsv` step 5 (`number`/`float`/`integer` → number, `boolean` →
+    /// boolean). Returns an empty map when no schema is given.
+    static func coercionMap(from schema: PrimitiveSchema?) -> [String: CsvCoercionType] {
+        guard let schema else { return [:] }
+        var map: [String: CsvCoercionType] = [:]
+        for (fieldName, desc) in schema.fields {
+            switch desc.type {
+            case .number:
+                map[fieldName] = .number
+            case .boolean:
+                map[fieldName] = .boolean
+            default:
+                break
+            }
+        }
+        return map
+    }
+
+    /// Extract the desired index state for the `/indexes/sync` batch from a
+    /// model schema. Mirrors js-bao's `extractModelSyncState`: skip `id`,
+    /// include every field flagged `indexed` or `unique` (single-field uniques
+    /// carry `unique: true`), and pass the compound unique constraints.
+    static func modelSyncState(from schema: PrimitiveSchema) -> DoDbModelSyncState {
+        var indexes: [DoDbModelSyncState.Index] = []
+        for (fieldName, desc) in schema.fields.sorted(by: { $0.key < $1.key }) {
+            if fieldName == "id" { continue }
+            guard desc.indexed || desc.unique else { continue }
+            indexes.append(.init(
+                fieldName: fieldName,
+                fieldType: desc.type.rawValue,
+                unique: desc.unique
+            ))
+        }
+        // Only compound (multi-field) constraints go on the wire as named
+        // constraints; single-field uniques ride the `unique` index flag
+        // above. Matches js-bao's `schema.options.uniqueConstraints`.
+        let uniqueConstraints = schema.constraints.values
+            .filter { $0.fields.count > 1 }
+            .sorted(by: { $0.name < $1.name })
+            .map { DoDbModelSyncState.UniqueConstraint(name: $0.name, fields: $0.fields) }
+        return DoDbModelSyncState(
+            modelName: schema.name,
+            indexes: indexes,
+            uniqueConstraints: uniqueConstraints
         )
     }
 

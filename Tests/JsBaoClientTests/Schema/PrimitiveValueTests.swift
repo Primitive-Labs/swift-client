@@ -97,6 +97,38 @@ final class PrimitiveValueTests: XCTestCase {
         XCTAssertEqual(PrimitiveValue.number(0.0).encodedForYrs(), "0")
     }
 
+    /// Number → string must be byte-identical to JS
+    /// `JSON.stringify` / `Number.prototype.toString` (#1117).
+    /// Expected strings below are literal Node.js outputs.
+    func testEncodeNumberMatchesJsToString() throws {
+        func enc(_ d: Double) -> String? {
+            PrimitiveValue.number(d).encodedForYrs()
+        }
+        // Large magnitudes: full digits up to 1e21, then scientific.
+        XCTAssertEqual(enc(1e20), "100000000000000000000")
+        XCTAssertEqual(enc(-1e20), "-100000000000000000000")
+        XCTAssertEqual(enc(1e21), "1e+21")
+        XCTAssertEqual(enc(-1e21), "-1e+21")
+        XCTAssertEqual(enc(1e16), "10000000000000000")
+        XCTAssertEqual(enc(1e15), "1000000000000000")
+        // Large non-round integers (Swift prints "1.2345678901234568e+18").
+        XCTAssertEqual(enc(1234567890123456789.0), "1234567890123456800")
+        // Fractions.
+        XCTAssertEqual(enc(0.1), "0.1")
+        XCTAssertEqual(enc(0.5), "0.5")
+        XCTAssertEqual(enc(123.456), "123.456")
+        // Small magnitudes: decimal form down to 1e-6, then scientific
+        // with an UNPADDED exponent (JS "1e-7", not Swift's "1e-07").
+        XCTAssertEqual(enc(0.000001), "0.000001")
+        XCTAssertEqual(enc(1e-7), "1e-7")
+        XCTAssertEqual(enc(1.5e-7), "1.5e-7")
+        // Extremes.
+        XCTAssertEqual(enc(5e-324), "5e-324")
+        XCTAssertEqual(enc(1.7976931348623157e308), "1.7976931348623157e+308")
+        // Zeros: JS String(-0) === "0".
+        XCTAssertEqual(enc(-0.0), "0")
+    }
+
     func testEncodeBoolean() throws {
         XCTAssertEqual(PrimitiveValue.boolean(true).encodedForYrs(), "true")
         XCTAssertEqual(PrimitiveValue.boolean(false).encodedForYrs(), "false")

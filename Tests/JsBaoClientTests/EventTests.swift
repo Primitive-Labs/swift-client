@@ -101,6 +101,101 @@ final class EventTests: XCTestCase {
         sub.cancel()
     }
 
+    /// `syncPerf` payload parity (#996): opening a doc with
+    /// `requestSyncPerf: true` makes syncStep1 carry `requestPerf: true`,
+    /// and the server replies with a `syncPerf` frame whose `timings` map
+    /// (totalMs, reconstructMs, docHashMs, ...) is delivered verbatim —
+    /// the same `{ documentId, timings, clientTimings? }` shape as JS.
+    func testEmitSyncPerfWithServerTimingsWhenRequested() async throws {
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+
+        try await client.connect()
+        try await waitForConnection(client: client)
+
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "SyncPerf Test Doc")
+
+        var perfEvents: [SyncPerfEvent] = []
+        let sub = client.events.on(.syncPerf) { (e: SyncPerfEvent) in
+            perfEvents.append(e)
+        }
+        defer { sub.cancel() }
+
+        _ = try await client.openDocument(
+            docId,
+            options: OpenDocumentOptions(waitForLoad: .network, requestSyncPerf: true)
+        )
+        try await waitForSync(client: client, documentId: docId)
+
+        try await eventually(timeout: 5, description: "syncPerf event with server timings") {
+            perfEvents.contains { $0.documentId == docId && !$0.timings.isEmpty }
+        }
+
+        let event = perfEvents.first { $0.documentId == docId && !$0.timings.isEmpty }
+        XCTAssertNotNil(event)
+        // `totalMs` is present on every server syncPerf payload variant
+        // (both the already-in-sync and full-sync paths in yjs-room-v2).
+        XCTAssertNotNil(event?.timings["totalMs"], "Expected server-provided totalMs in timings")
+    }
+
+    /// `syncPerf.clientTimings` parity (#1121): JS derives `clientTimings`
+    /// from per-phase `getSyncTimings` instrumentation; Swift now mirrors
+    /// that. With `requestSyncPerf: true`, the emitted event must carry a
+    /// non-nil `clientTimings` map keyed with the JS field names
+    /// (`clientTotalMs` is always present; the per-update phases
+    /// `clientRoundTripMs` / `clientUpdateBytes` / `clientApplyMs` appear
+    /// only when the server sends data). The internal `syncStep1SentAt`
+    /// anchor must be stripped, exactly as JS does.
+    func testSyncPerfClientTimingsPopulated() async throws {
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+
+        try await client.connect()
+        try await waitForConnection(client: client)
+
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "SyncPerf ClientTimings Doc")
+
+        var perfEvents: [SyncPerfEvent] = []
+        let sub = client.events.on(.syncPerf) { (e: SyncPerfEvent) in
+            perfEvents.append(e)
+        }
+        defer { sub.cancel() }
+
+        _ = try await client.openDocument(
+            docId,
+            options: OpenDocumentOptions(waitForLoad: .network, requestSyncPerf: true)
+        )
+        try await waitForSync(client: client, documentId: docId)
+
+        try await eventually(timeout: 5, description: "syncPerf event with client timings") {
+            perfEvents.contains { $0.documentId == docId && $0.clientTimings != nil }
+        }
+
+        let event = perfEvents.first { $0.documentId == docId && $0.clientTimings != nil }
+        XCTAssertNotNil(event, "Expected a syncPerf event with non-nil clientTimings")
+        let clientTimings = try XCTUnwrap(event?.clientTimings)
+
+        // Internal anchor must never leak into the emitted map (JS strips
+        // `syncStep1SentAt` before assigning `data.clientTimings`).
+        XCTAssertNil(clientTimings["syncStep1SentAt"], "syncStep1SentAt must be stripped before emit")
+
+        // `clientTotalMs` is the one field set on every sync path
+        // (syncComplete, or computed in the syncPerf handler when it
+        // arrives first).
+        XCTAssertNotNil(clientTimings["clientTotalMs"], "Expected clientTotalMs in clientTimings")
+
+        // Every key must be one of the JS field names — no stray keys.
+        let allowedKeys: Set<String> = [
+            "clientRoundTripMs",
+            "clientUpdateBytes",
+            "clientApplyMs",
+            "clientTotalMs",
+        ]
+        for key in clientTimings.keys {
+            XCTAssertTrue(allowedKeys.contains(key), "Unexpected clientTimings key: \(key)")
+        }
+    }
+
     func testEmitStatusEvents() async throws {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
@@ -159,5 +254,71 @@ final class EventTests: XCTestCase {
         // Idempotent: a second cancel() is a no-op.
         sub.cancel()
         XCTAssertEqual(cancelCount, 1, "cancel() must be idempotent")
+    }
+
+    /// #1120: `.documentSyncStateChanged` (state "synced") is the supported,
+    /// non-deprecated replacement for the deprecated Swift-only `.remoteUpdate`
+    /// event. It must fire on the *reader* client when a *writer* client lands
+    /// a remote update on the same document, so reload-on-remote-write loaders
+    /// can migrate off `.remoteUpdate`. Mirrors the `.remoteUpdate` emit site:
+    /// both fire from the same `"update"` WS frame.
+    func testEmitDocumentSyncStateChangedOnRemoteUpdate() async throws {
+        let reader = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await reader.destroy() } }
+        let writer = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await writer.destroy() } }
+
+        try await reader.connect()
+        try await waitForConnection(client: reader)
+        try await writer.connect()
+        try await waitForConnection(client: writer)
+
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "SyncState Test Doc")
+
+        // Reader opens and subscribes to the replacement event.
+        _ = try await reader.openDocument(docId, options: OpenDocumentOptions(waitForLoad: .network))
+        try await waitForSync(client: reader, documentId: docId)
+
+        let syncedStates = ThreadSafeBox<[String]>([])
+        let sub = reader.events.on(.documentSyncStateChanged) { (e: DocumentSyncStateChangedEvent) in
+            if e.documentId == docId {
+                syncedStates.mutate { $0.append(e.state) }
+            }
+        }
+        defer { sub.cancel() }
+
+        // Writer opens the same doc and makes a change → the server fans an
+        // `update` frame to the reader, which should emit a "synced" change.
+        let writerDoc = try await writer.openDocument(docId, options: OpenDocumentOptions(waitForLoad: .network))
+        try await waitForSync(client: writer, documentId: docId)
+
+        let writerMap: YMap<String> = writerDoc.getOrCreateMap(named: "data")
+        writer.transactAndSync(docId) { txn in
+            writerMap.updateValue("from-writer", forKey: "key", transaction: txn)
+        }
+
+        try await eventually(timeout: 5, description: ".documentSyncStateChanged (synced) on remote update") {
+            syncedStates.value.contains("synced")
+        }
+        XCTAssertTrue(
+            syncedStates.value.contains("synced"),
+            "Expected a documentSyncStateChanged event with state == \"synced\" after a remote write"
+        )
+    }
+}
+
+/// Minimal thread-safe box for collecting event payloads from concurrent
+/// event-emitter callbacks in tests.
+final class ThreadSafeBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: T
+    init(_ value: T) { self._value = value }
+    var value: T {
+        lock.lock(); defer { lock.unlock() }
+        return _value
+    }
+    func mutate(_ body: (inout T) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        body(&_value)
     }
 }

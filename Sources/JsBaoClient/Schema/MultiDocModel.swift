@@ -174,7 +174,7 @@ final class MultiDocModel: IncludeTarget {
         // Drain every member's observer queue so an incoming remote
         // update is visible before we read.
         let snapshot = snapshotMembersInOrder()
-        for (docId, model) in snapshot {
+        for (_, model) in snapshot {
             model.awaitObserverDrain()
         }
         // Prefer one SQL query over iterating Y.Maps — `id` is not
@@ -226,6 +226,116 @@ final class MultiDocModel: IncludeTarget {
             return Located(docId: docId, row: row)
         }
         return nil
+    }
+
+    /// Cross-doc "find by constraint OR create" — mirrors js-bao's
+    /// `BaseModel.upsertByUnique`, which searches EVERY connected
+    /// document for an existing match before deciding insert vs. merge.
+    ///
+    /// Search: iterate connected docs in connect order; the first doc
+    /// whose `_uniqueIdx_*` map holds the constraint key wins (uniqueness
+    /// is per-doc, so the same key may exist in more than one open doc —
+    /// first-match-wins matches js-bao's `for (docId of connectedDocuments)`
+    /// loop with `break`).
+    ///
+    /// Merge: writes the matched record id through `targetDocId`, mirroring
+    /// js-bao's `existingRecord.save({ targetDocument })` path when a target
+    /// document is supplied. If the match was found in another open doc, this
+    /// preserves JS's explicit-target behavior: the target doc receives the
+    /// resolved id, while the original doc is not deleted or moved.
+    ///
+    /// Insert: writes into `targetDocId`; throws if that doc isn't open.
+    ///
+    /// - Parameters:
+    ///   - uniqueLookupValue: optional explicit lookup value(s) (one per
+    ///     constraint field). Mirrors js-bao's separate
+    ///     `uniqueLookupValue` argument; validated against `data`.
+    @discardableResult
+    public func upsertByUnique(
+        constraint name: String,
+        data: [String: PrimitiveValue],
+        mode: UpsertMode = .either,
+        id: String? = nil,
+        explicitId: Bool = false,
+        targetDocId: String,
+        uniqueLookupValue: [PrimitiveValue]? = nil
+    ) throws -> UpsertResult {
+        let members = snapshotMembersInOrder()
+        for (_, model) in members { model.awaitObserverDrain() }
+
+        // Resolve + validate the lookup key once. Any connected member
+        // can do this (they share the schema); fall back to the target
+        // doc's member when nothing is connected yet.
+        guard let keyResolver = members.first?.model
+                ?? member(docId: targetDocId) else {
+            throw JsBaoError(
+                code: .notFound,
+                message: "No document is connected for `\(schema.name)`."
+            )
+        }
+        let (constraint, key) = try keyResolver.resolveUpsertConstraintKey(
+            constraint: name, data: data, uniqueLookupValue: uniqueLookupValue
+        )
+
+        // Cross-doc search: first connected doc that holds the key wins.
+        var matchRecordId: String?
+        for (_, model) in members {
+            if let rid = model.existingRecordId(constraintName: name, key: key) {
+                matchRecordId = rid
+                break
+            }
+        }
+
+        switch mode {
+        case .mustExist where matchRecordId == nil:
+            throw UpsertByUniqueError.recordNotFound(constraint: name)
+        case .mustNotExist where matchRecordId != nil:
+            throw UniqueConstraintViolationError(
+                modelName: schema.name,
+                constraintName: name,
+                fields: constraint.fields,
+                attemptedRecordId: id ?? "(auto)",
+                existingRecordId: matchRecordId!
+            )
+        default:
+            break
+        }
+
+        if let matchRecordId {
+            // Explicit-id conflict: caller pinned a specific id that
+            // disagrees with the matched record. Mirrors js-bao's
+            // `_constructorProvidedId && this.id !== existingId` guard
+            // (here surfaced via `upsertByUnique`'s explicit-id path).
+            if explicitId, let supplied = id, supplied != matchRecordId {
+                throw UpsertError.explicitIdConflict(
+                    supplied: supplied, existing: matchRecordId
+                )
+            }
+            guard let target = member(docId: targetDocId) else {
+                throw JsBaoError(
+                    code: .notFound,
+                    message: "Document `\(targetDocId)` is not open. Open it " +
+                             "(client.openDocument) before writing `\(schema.name)` records."
+                )
+            }
+            _ = try target.save(id: matchRecordId, values: data)
+            return UpsertResult(
+                record: PrimitiveRecord(
+                    modelName: schema.name, id: matchRecordId, model: target
+                ),
+                wasCreated: false
+            )
+        }
+
+        // Insert into the target doc.
+        guard let target = member(docId: targetDocId) else {
+            throw JsBaoError(
+                code: .notFound,
+                message: "Document `\(targetDocId)` is not open. Open it " +
+                         "(client.openDocument) before writing `\(schema.name)` records."
+            )
+        }
+        return try target.insertNew(id: id, data: data)
     }
 
     /// Cross-doc query. Filter, sort, limit, offset, and cursor all

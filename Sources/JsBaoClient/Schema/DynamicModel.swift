@@ -21,8 +21,10 @@ public final class DynamicModel {
     internal let doc: YDocument
 
     /// Identifier for this doc within a shared SQLite store. Defaults
-    /// to `""` for single-doc usage. When multiple `DynamicModel`s
-    /// share the same `BaoModelQueryEngine`, every row is tagged with
+    /// to `BaoModelQueryEngine.legacyDefaultDocId`
+    /// ("__legacy_default__" — js-bao's `DEFAULT_LEGACY_DOC_ID`) for
+    /// single-doc usage. When multiple `DynamicModel`s share the same
+    /// `BaoModelQueryEngine`, every row is tagged with
     /// `_meta_doc_id = self.docId` so per-doc queries scope correctly
     /// and `MultiDocModel` can run cross-doc aggregations.
     public let docId: String
@@ -77,9 +79,13 @@ public final class DynamicModel {
     /// js-bao browser's `Model.subscribe` (browser.js:3628).
     ///
     /// The callback runs on whichever thread committed the change:
-    /// local writes fire synchronously inside the write path; remote
-    /// changes fire from the observer-drain queue. Keep callbacks
-    /// fast and non-blocking.
+    /// local writes fire synchronously on the writing thread AFTER the
+    /// write transaction commits (matching js-bao, which notifies
+    /// post-commit — see #1116); remote changes fire from the
+    /// observer-drain queue. A batch (`transact`) notifies once per
+    /// model, not once per write. Callbacks may safely re-enter the
+    /// model (query, write) since no transaction is open when they
+    /// run. Keep callbacks fast and non-blocking.
     @discardableResult
     public func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
         let id = UUID()
@@ -103,6 +109,57 @@ public final class DynamicModel {
         listenerLock.unlock()
         for cb in snapshot { cb() }
     }
+
+    /// Notify listeners of a local write, deferring until the
+    /// enclosing write transaction commits. js-bao notifies after the
+    /// Y.Doc transaction closes; firing synchronously *inside* the
+    /// open yrs transaction (the previous behavior, #1116) meant a
+    /// subscriber observed half-committed batch state — and could
+    /// deadlock if its callback touched anything that needs a new
+    /// transaction (`query()` draining an observer task that calls
+    /// `transactSync`, for example).
+    ///
+    /// Inside a transaction (the thread-local `activeTx` is set by
+    /// `transact` / `withTx` / `withThrowingTx`), the model is queued
+    /// on the thread's pending list — deduplicated, so a batch of N
+    /// writes notifies once, matching js-bao's once-per-commit
+    /// semantics. The outermost transaction wrapper flushes the queue
+    /// right after `transactSync` returns. Outside a transaction it
+    /// fires immediately.
+    internal func notifyListenersAfterWrite() {
+        if activeTx != nil {
+            let dict = Thread.current.threadDictionary
+            var pending = dict[Self.pendingNotifyKey] as? [DynamicModel] ?? []
+            if !pending.contains(where: { $0 === self }) {
+                pending.append(self)
+            }
+            dict[Self.pendingNotifyKey] = pending
+        } else {
+            notifyListeners()
+        }
+    }
+
+    /// Fire (and clear) the notifications queued on this thread for
+    /// models bound to `docKey`'s doc. Called by the transaction
+    /// wrappers after their `transactSync` closes — i.e. after the yrs
+    /// commit — so subscriber callbacks observe fully-committed state
+    /// and are free to open new transactions (query, write, etc.).
+    /// Doc-scoped to match `activeTxByDoc`: a nested transaction on doc
+    /// B closing must not flush notifications queued under doc A's
+    /// still-open transaction.
+    fileprivate static func flushPendingNotifications(for docKey: ObjectIdentifier) {
+        let dict = Thread.current.threadDictionary
+        guard let pending = dict[pendingNotifyKey] as? [DynamicModel],
+              !pending.isEmpty else { return }
+        let mine = pending.filter { $0.docIdentity == docKey }
+        let rest = pending.filter { $0.docIdentity != docKey }
+        if rest.isEmpty {
+            dict.removeObject(forKey: pendingNotifyKey)
+        } else {
+            dict[pendingNotifyKey] = rest
+        }
+        for model in mine { model.notifyListeners() }
+    }
     /// Serial queue that drains observer-driven SQLite work. Observers
     /// fire from inside yrs's commit hook (RwLock held), so they can't
     /// open a new `transactSync` directly — they dispatch here.
@@ -112,6 +169,12 @@ public final class DynamicModel {
     internal let observerDrainQueue = DispatchQueue(
         label: "JsBaoClient.DynamicModel.observerDrain"
     )
+
+    /// Per-instance queue marker so `awaitObserverDrain` can detect a
+    /// re-entrant call from this model's own drain queue (a listener
+    /// callback that runs `query()`, say) and skip the self-deadlocking
+    /// `sync`. Set on `observerDrainQueue` in `init`.
+    private let drainQueueKey = DispatchSpecificKey<Bool>()
 
     /// Serial queue used to run uniqueness reconciliation *off* the
     /// yrs update-observer callback. yrs's `observe_update_v1` fires
@@ -134,8 +197,39 @@ public final class DynamicModel {
 
     fileprivate static let activeTxKey = "JsBaoClient.DynamicModel.activeTx"
 
-    fileprivate static var activeTx: YrsTransaction? {
-        Thread.current.threadDictionary[activeTxKey] as? YrsTransaction
+    /// Thread-local list of models with listener notifications queued
+    /// while a write transaction is open. Flushed by the outermost
+    /// transaction wrapper after `transactSync` returns (#1116).
+    fileprivate static let pendingNotifyKey = "JsBaoClient.DynamicModel.pendingNotify"
+
+    /// Open yrs transactions on this thread, keyed by the YDocument's
+    /// identity. **Doc-scoped, not global**: a YrsTransaction is bound to
+    /// one yrs doc, so a write to a model on doc B nested inside a
+    /// `transact` on doc A must open B's own transaction — reusing A's
+    /// would apply B's mutations through a transaction object belonging
+    /// to a different doc. Same-doc nesting (any model sharing the same
+    /// `YDocument` instance) still reuses the open transaction, which is
+    /// what dodges the yrs reentrant-RwLock deadlock.
+    fileprivate static var activeTxByDoc: [ObjectIdentifier: YrsTransaction] {
+        get {
+            Thread.current.threadDictionary[activeTxKey]
+                as? [ObjectIdentifier: YrsTransaction] ?? [:]
+        }
+        set {
+            if newValue.isEmpty {
+                Thread.current.threadDictionary.removeObject(forKey: activeTxKey)
+            } else {
+                Thread.current.threadDictionary[activeTxKey] = newValue
+            }
+        }
+    }
+
+    fileprivate var docIdentity: ObjectIdentifier { ObjectIdentifier(doc) }
+
+    /// The open transaction for **this model's doc** on the current
+    /// thread, if any.
+    fileprivate var activeTx: YrsTransaction? {
+        Self.activeTxByDoc[docIdentity]
     }
 
     /// Open a single yrs transaction spanning every write/read done
@@ -151,43 +245,57 @@ public final class DynamicModel {
     ///   all-or-nothing must track and undo manually.
     @discardableResult
     public func transact<T>(_ body: () throws -> T) throws -> T {
-        // Nested transact: reuse the outer tx, no new commit.
-        if Self.activeTx != nil {
+        // Nested transact on the same doc: reuse the outer tx, no new
+        // commit. A transact on a *different* doc opens its own.
+        if activeTx != nil {
             return try body()
         }
+        let docKey = docIdentity
         var result: Result<T, Error>!
         // `body` is non-escaping but `transactSync`'s closure wants
         // @escaping. Use withoutActuallyEscaping — the closure truly
         // doesn't escape past this call.
         withoutActuallyEscaping(body) { body in
             doc.transactSync { txn in
-                let dict = Thread.current.threadDictionary
-                let prev = dict[Self.activeTxKey]
-                dict[Self.activeTxKey] = txn
+                Self.activeTxByDoc[docKey] = txn
                 defer {
-                    if let prev = prev {
-                        dict[Self.activeTxKey] = prev
-                    } else {
-                        dict.removeObject(forKey: Self.activeTxKey)
-                    }
+                    var map = Self.activeTxByDoc
+                    map.removeValue(forKey: docKey)
+                    Self.activeTxByDoc = map
                 }
                 do { result = .success(try body()) }
                 catch { result = .failure(error) }
             }
         }
+        // Commit is done — deliver listener notifications queued
+        // during the batch (even on a throw: yrs doesn't roll back,
+        // so writes made before the throw ARE committed).
+        Self.flushPendingNotifications(for: docKey)
         return try result.get()
     }
 
     /// Non-throwing variant used by reads / deletes. Reuses the active
-    /// transaction when one is in scope.
+    /// transaction when one is in scope; otherwise opens one and
+    /// publishes it via the thread-local so nested helpers (and the
+    /// post-commit notification queue) see it.
     fileprivate func withTx<T>(_ body: (YrsTransaction) -> T) -> T {
-        if let existing = Self.activeTx {
+        if let existing = activeTx {
             return body(existing)
         }
+        let docKey = docIdentity
         var result: T!
         withoutActuallyEscaping(body) { body in
-            doc.transactSync { txn in result = body(txn) }
+            doc.transactSync { txn in
+                Self.activeTxByDoc[docKey] = txn
+                defer {
+                    var map = Self.activeTxByDoc
+                    map.removeValue(forKey: docKey)
+                    Self.activeTxByDoc = map
+                }
+                result = body(txn)
+            }
         }
+        Self.flushPendingNotifications(for: docKey)
         return result
     }
 
@@ -196,16 +304,24 @@ public final class DynamicModel {
     fileprivate func withThrowingTx<T>(
         _ body: (YrsTransaction) throws -> T
     ) throws -> T {
-        if let existing = Self.activeTx {
+        if let existing = activeTx {
             return try body(existing)
         }
+        let docKey = docIdentity
         var result: Result<T, Error>!
         withoutActuallyEscaping(body) { body in
             doc.transactSync { txn in
+                Self.activeTxByDoc[docKey] = txn
+                defer {
+                    var map = Self.activeTxByDoc
+                    map.removeValue(forKey: docKey)
+                    Self.activeTxByDoc = map
+                }
                 do { result = .success(try body(txn)) }
                 catch { result = .failure(error) }
             }
         }
+        Self.flushPendingNotifications(for: docKey)
         return try result.get()
     }
 
@@ -224,7 +340,8 @@ public final class DynamicModel {
     ///   - schema: the model's runtime schema.
     ///   - docId: identifier for this doc inside the SQLite mirror.
     ///     Required when sharing an engine with other docs — see
-    ///     `MultiDocModel`. Defaults to `""` for single-doc usage.
+    ///     `MultiDocModel`. Defaults to js-bao's legacy doc id
+    ///     (`__legacy_default__`) for single-doc usage.
     ///   - sharedEngine: if non-nil, this DynamicModel writes its
     ///     rows into the supplied engine (tagged with `docId`).
     ///     When nil, a fresh engine is created. Multi-doc setups
@@ -232,12 +349,13 @@ public final class DynamicModel {
     public init(
         doc: YDocument,
         schema: PrimitiveSchema,
-        docId: String = "",
+        docId: String = BaoModelQueryEngine.legacyDefaultDocId,
         sharedEngine: BaoModelQueryEngine? = nil
     ) {
         self.doc = doc
         self.schema = schema
         self.docId = docId
+        observerDrainQueue.setSpecific(key: drainQueueKey, value: true)
 
         // Resolve the engine first so the table exists by the time
         // init's seeding loop tries to upsert rows into it.
@@ -291,11 +409,19 @@ public final class DynamicModel {
 
     deinit {
         docUpdateSubscription?.cancel()
-        // `Yniffi.YSubscription` is the raw FFI handle — it auto-
-        // cancels on Drop when the reference count hits zero, so
-        // clearing our refs is enough.
-        rootSubscription = nil
-        recordSubscriptions.removeAll()
+        // `Yniffi.YSubscription` is the raw FFI handle — it auto-cancels on
+        // Drop, which calls into yrs to unobserve. That unobserve MUST be
+        // serialized against transactions on the same doc: multiple
+        // DynamicModels bind one shared YDocument, so this deinit (running on
+        // an arbitrary thread) can otherwise race another model's
+        // transaction — the observer-deregistration-vs-transaction crash
+        // class behind #1126. Drop the raw handles under the per-doc FFI lock
+        // (recursive, so this is safe even if deinit fires inside a held
+        // transaction on the same thread).
+        doc.withExclusiveAccess {
+            rootSubscription = nil
+            recordSubscriptions.removeAll()
+        }
     }
 
     public var modelName: String { schema.name }
@@ -484,11 +610,20 @@ public final class DynamicModel {
     /// Only caller-provided fields are written on the merge path —
     /// fields not mentioned are left untouched. Schema defaults apply
     /// only on the insert path.
+    /// - Parameter explicitId: `true` when `id` was pinned by the caller
+    ///   (the codegen's designated `init(id:…)`), `false` when it was
+    ///   auto-generated (the auto-id convenience init). On the merge
+    ///   path an explicit id that differs from the matched record's id
+    ///   throws `UpsertError.explicitIdConflict` — mirroring js-bao's
+    ///   `_constructorProvidedId && this.id !== existingId` guard. A
+    ///   non-explicit id is silently discarded on merge (JS auto-id
+    ///   parity), which is the default.
     @discardableResult
     public func upsert(
         _ values: [String: PrimitiveValue],
         on field: String,
-        id: String? = nil
+        id: String? = nil,
+        explicitId: Bool = false
     ) throws -> UpsertResult {
         // --- Validate the upsert-on input up-front (no tx yet) -------
         guard let fieldValue = values[field] else {
@@ -533,9 +668,20 @@ public final class DynamicModel {
             if let existingId = existing {
                 // Merge path. JS `save({ upsertOn })` matches by the unique
                 // field and updates the existing record — the existing id
-                // wins and any supplied id is ignored (mirrors js-bao; a
-                // mismatching supplied id is not an error).
-                resolved = .success((id: existingId, wasCreated: false))
+                // wins. JS throws its upsertOn-conflict error ONLY when the
+                // caller pinned an explicit id that differs from the match
+                // (`_constructorProvidedId && this.id !== existingId`); an
+                // auto-generated id is silently discarded. We mirror that
+                // exactly via the `explicitId` provenance flag.
+                if explicitId, let supplied = id, supplied != existingId {
+                    resolved = .failure(
+                        UpsertError.explicitIdConflict(
+                            supplied: supplied, existing: existingId
+                        )
+                    )
+                } else {
+                    resolved = .success((id: existingId, wasCreated: false))
+                }
             } else {
                 // Insert path. Resolve the id: caller-supplied > schema
                 // default generator > fallback ULID.
@@ -715,23 +861,22 @@ public final class DynamicModel {
         }
     }
 
-    /// Explicit "find by constraint OR create" primitive. Mirrors
-    /// js-bao's `BaseModel.upsertByUnique`.
+    /// Resolve and validate the constraint + lookup key for an
+    /// `upsertByUnique` call. Shared by the single-doc path below and by
+    /// `MultiDocModel.upsertByUnique`'s cross-doc search so both build
+    /// the identical key. Mirrors js-bao's lookup-key construction,
+    /// including the optional `uniqueLookupValue` cross-check.
     ///
-    /// - Parameters:
-    ///   - name: resolved unique constraint name (single-field or compound).
-    ///   - data: the full or partial record. MUST include every field
-    ///     named by the constraint — those values form the lookup key.
-    ///   - mode: `.either` insert-or-update; `.mustExist` only update;
-    ///     `.mustNotExist` only insert.
-    ///   - id: optional caller-supplied id used when inserting.
-    @discardableResult
-    public func upsertByUnique(
+    /// - Parameter uniqueLookupValue: when non-nil, the explicit lookup
+    ///   values (one per constraint field). They must match the values
+    ///   carried in `data` for those fields — js-bao throws on mismatch.
+    ///   When nil, the lookup values come straight from `data` (the
+    ///   single-arg Swift convention).
+    func resolveUpsertConstraintKey(
         constraint name: String,
         data: [String: PrimitiveValue],
-        mode: UpsertMode = .either,
-        id: String? = nil
-    ) throws -> UpsertResult {
+        uniqueLookupValue: [PrimitiveValue]? = nil
+    ) throws -> (constraint: ConstraintDescriptor, key: String) {
         guard let constraint = schema.resolvedUniqueConstraints
             .first(where: { $0.name == name })
         else {
@@ -739,12 +884,44 @@ public final class DynamicModel {
         }
 
         // Every constraint field must be present in `data` — we need
-        // all of them to build the lookup key.
+        // all of them (the merged write carries them too).
         for f in constraint.fields where data[f] == nil {
             throw UpsertByUniqueError.missingConstraintField(field: f)
         }
 
-        // Build the key once up front.
+        // When the caller hands us an explicit lookup value, validate
+        // its arity + that it agrees with `data` field-by-field, then
+        // key off it. Otherwise key off `data` directly.
+        let keyValues: [PrimitiveValue]
+        if let lookup = uniqueLookupValue {
+            guard lookup.count == constraint.fields.count else {
+                throw UpsertByUniqueError.lookupValueArityMismatch(
+                    constraint: name,
+                    expected: constraint.fields.count,
+                    got: lookup.count
+                )
+            }
+            for (idx, field) in constraint.fields.enumerated() {
+                if data[field] != lookup[idx] {
+                    throw UpsertByUniqueError.lookupValueMismatch(
+                        constraint: name, field: field
+                    )
+                }
+            }
+            keyValues = lookup
+            guard let key = UniqueIndex.buildKey(
+                fields: constraint.fields,
+                values: Dictionary(
+                    uniqueKeysWithValues: zip(constraint.fields, keyValues)
+                )
+            ) else {
+                throw UpsertByUniqueError.missingConstraintField(
+                    field: constraint.fields.first ?? ""
+                )
+            }
+            return (constraint, key)
+        }
+
         guard let key = UniqueIndex.buildKey(
             fields: constraint.fields, values: data
         ) else {
@@ -754,8 +931,12 @@ public final class DynamicModel {
                 field: constraint.fields.first ?? ""
             )
         }
+        return (constraint, key)
+    }
 
-        // Resolve existing record inside a transaction to avoid TOCTOU.
+    /// Look up the existing record id for a precomputed constraint key
+    /// inside this doc, or `nil`. Used by the cross-doc search.
+    func existingRecordId(constraintName name: String, key: String) -> String? {
         var existingId: String?
         withTx { [self] txn in
             let indexMap = txn.transactionGetOrInsertMap(
@@ -769,36 +950,30 @@ public final class DynamicModel {
                 existingId = decoded
             }
         }
+        return existingId
+    }
 
-        switch mode {
-        case .mustExist where existingId == nil:
-            throw UpsertByUniqueError.recordNotFound(constraint: name)
-        case .mustNotExist where existingId != nil:
-            throw UniqueConstraintViolationError(
-                modelName: schema.name,
-                constraintName: name,
-                fields: constraint.fields,
-                attemptedRecordId: id ?? "(auto)",
-                existingRecordId: existingId!
-            )
-        default:
-            break
-        }
+    /// Merge `data` into the existing record `existingId` in this doc.
+    /// Shared by the single- and cross-doc merge paths.
+    func mergeExisting(
+        existingId: String, data: [String: PrimitiveValue]
+    ) throws -> UpsertResult {
+        var values = data
+        values.removeValue(forKey: "id")
+        try applyWrite(id: existingId, values: values, isUpdate: true)
+        return UpsertResult(
+            record: PrimitiveRecord(
+                modelName: schema.name, id: existingId, model: self
+            ),
+            wasCreated: false
+        )
+    }
 
-        if let existingId {
-            var values = data
-            values.removeValue(forKey: "id")
-            try applyWrite(id: existingId, values: values, isUpdate: true)
-            return UpsertResult(
-                record: PrimitiveRecord(
-                    modelName: schema.name, id: existingId, model: self
-                ),
-                wasCreated: false
-            )
-        }
-
-        // Insert path. Resolve id: caller-supplied > data.id > default >
-        // fresh ULID.
+    /// Insert a new record in this doc, resolving the id the same way
+    /// the single-doc path does.
+    func insertNew(
+        id: String?, data: [String: PrimitiveValue]
+    ) throws -> UpsertResult {
         let newId: String
         if let supplied = id {
             newId = supplied
@@ -821,6 +996,57 @@ public final class DynamicModel {
             ),
             wasCreated: true
         )
+    }
+
+    /// Explicit "find by constraint OR create" primitive. Mirrors
+    /// js-bao's `BaseModel.upsertByUnique`.
+    ///
+    /// - Parameters:
+    ///   - name: resolved unique constraint name (single-field or compound).
+    ///   - data: the full or partial record. MUST include every field
+    ///     named by the constraint — those values form the lookup key.
+    ///   - mode: `.either` insert-or-update; `.mustExist` only update;
+    ///     `.mustNotExist` only insert.
+    ///   - id: optional caller-supplied id used when inserting.
+    ///   - uniqueLookupValue: optional explicit lookup value(s), one per
+    ///     constraint field. Mirrors js-bao's separate `uniqueLookupValue`
+    ///     argument; when nil the key is built from `data`.
+    ///
+    /// Single-doc scope: searches only this doc. Cross-doc search (every
+    /// connected document, per js-bao) is `MultiDocModel.upsertByUnique`.
+    @discardableResult
+    public func upsertByUnique(
+        constraint name: String,
+        data: [String: PrimitiveValue],
+        mode: UpsertMode = .either,
+        id: String? = nil,
+        uniqueLookupValue: [PrimitiveValue]? = nil
+    ) throws -> UpsertResult {
+        let (constraint, key) = try resolveUpsertConstraintKey(
+            constraint: name, data: data, uniqueLookupValue: uniqueLookupValue
+        )
+
+        let existingId = existingRecordId(constraintName: name, key: key)
+
+        switch mode {
+        case .mustExist where existingId == nil:
+            throw UpsertByUniqueError.recordNotFound(constraint: name)
+        case .mustNotExist where existingId != nil:
+            throw UniqueConstraintViolationError(
+                modelName: schema.name,
+                constraintName: name,
+                fields: constraint.fields,
+                attemptedRecordId: id ?? "(auto)",
+                existingRecordId: existingId!
+            )
+        default:
+            break
+        }
+
+        if let existingId {
+            return try mergeExisting(existingId: existingId, data: data)
+        }
+        return try insertNew(id: id, data: data)
     }
 
     // MARK: - Post-merge uniqueness reconciliation
@@ -1016,7 +1242,8 @@ public final class DynamicModel {
             modelName: schema.name, id: id, scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
         )
-        notifyListeners()
+        // Deferred when inside an outer `transact` batch (#1116).
+        notifyListenersAfterWrite()
     }
 
     // MARK: - Write + uniqueness enforcement
@@ -1269,7 +1496,10 @@ public final class DynamicModel {
             self.installRecordObserverUnlocked(id: id, rootMap: root, tx: txn)
         }
         self.upsertSqliteRow(id: id, rootMap: root, tx: txn)
-        self.notifyListeners()
+        // applyWriteInternal always runs inside the write transaction —
+        // the notification is queued and delivered by the transaction
+        // wrapper after the yrs commit (#1116).
+        self.notifyListenersAfterWrite()
     }
 
     /// Snapshot a record's fields WITHOUT opening a new transaction.
@@ -1410,23 +1640,39 @@ public final class DynamicModel {
         if case let .stringset(items) = value {
             // Per-member layout: each member is a key in the nested
             // Y.Map with value `true`. Mirrors js-bao's wire format
-            // (browser.ts `setStringSet`). Previously Swift wrote the
-            // JSON-encoded member name as the value — both clients
-            // could read either shape, but byte-equality assertions
-            // failed and downstream tooling that inspects the raw
-            // Y.Doc saw different content.
+            // (browser.ts `setStringSet`).
             //
-            // We still replace the nested Y.Map wholesale here — this
-            // is the full-set-replace write path (`create`/`update`
-            // with a stringset value). Per-member add/remove without
-            // overwriting the whole map goes through
-            // `addStringsetMember(_:)` / `removeStringsetMember(_:)`,
-            // which keeps the CRDT-union semantics intact under
-            // concurrent offline writes.
-            _ = try? rec.remove(tx: tx, key: fieldName)
-            let nested = rec.insertMap(tx: tx, key: fieldName)
-            for item in items {
-                nested.insert(tx: tx, key: item, value: "true")
+            // Full-set assignment is a DIFF against the locally-known
+            // members, not a wholesale map replacement — mirrors
+            // js-bao's `applyStringSetChangeToYMap` (BaseModel.ts),
+            // which only `target.set(member, true)`s additions and
+            // `target.delete(member)`s removals on the *existing*
+            // nested Y.Map. Keeping the same Y.Map instance alive is
+            // what preserves CRDT union semantics: a concurrent
+            // offline add from another client targets this map, so it
+            // survives a full-set assignment that doesn't know about
+            // it. Replacing the map (the previous behavior) orphaned
+            // those concurrent inserts and they were lost on merge
+            // (#1114).
+            if let nested = rec.getMap(tx: tx, key: fieldName) {
+                let collector = KeyCollector()
+                nested.keys(tx: tx, delegate: collector)
+                let existing = Set(collector.keys)
+                for member in items.subtracting(existing) {
+                    nested.insert(tx: tx, key: member, value: "true")
+                }
+                for member in existing.subtracting(items) {
+                    _ = try? nested.remove(tx: tx, key: member)
+                }
+            } else {
+                // No nested map yet (fresh field, or a legacy scalar
+                // value that getMap can't see) — clear any scalar and
+                // materialize the map with the full member set.
+                _ = try? rec.remove(tx: tx, key: fieldName)
+                let nested = rec.insertMap(tx: tx, key: fieldName)
+                for item in items {
+                    nested.insert(tx: tx, key: item, value: "true")
+                }
             }
             return
         }
@@ -1476,11 +1722,19 @@ public final class DynamicModel {
     }
 
     internal func cancelRecordObserverUnlocked(id: String) {
-        observerLock.lock()
-        // Removing from the dictionary drops the last strong ref,
-        // triggering Rust Drop → cancels the subscription.
-        recordSubscriptions.removeValue(forKey: id)
-        observerLock.unlock()
+        // Removing from the dictionary drops the last strong ref, triggering
+        // Rust Drop → yrs unobserve. Like deinit, that unobserve must be
+        // serialized against transactions on the shared doc (#1126 class).
+        // Some callers already hold the FFI lock (observer callbacks fire
+        // during commit); others don't (e.g. the local-delete path after its
+        // `withTx` closes). The lock is recursive, so taking it here is safe
+        // either way. Ordering is always FFI lock → observerLock, matching
+        // the install path (transaction held, then observerLock).
+        doc.withExclusiveAccess {
+            observerLock.lock()
+            recordSubscriptions.removeValue(forKey: id)
+            observerLock.unlock()
+        }
     }
 
     /// Build the SQLite row for a record and upsert it. Uses a held
@@ -1525,12 +1779,15 @@ public final class DynamicModel {
     /// this before reading so remote-driven async upserts finish
     /// before the SELECT runs. Idempotent; cheap when queue is idle.
     ///
-    /// MUST NOT be called from inside an observer callback (which
-    /// runs on `observerDrainQueue`) — that would self-deadlock.
-    /// Subscribe handlers in particular should not re-enter `query()`
-    /// synchronously.
+    /// Re-entrancy-safe: when called from this model's own drain
+    /// queue (a subscriber callback delivered there that re-enters
+    /// `query()`, for example), the `sync` would self-deadlock — and
+    /// it's also unnecessary, because the mirror already reflects
+    /// every change applied before the current task. We detect that
+    /// case via the queue-specific marker and return immediately
+    /// (#1116).
     internal func awaitObserverDrain() {
-        dispatchPrecondition(condition: .notOnQueue(observerDrainQueue))
+        if DispatchQueue.getSpecific(key: drainQueueKey) == true { return }
         observerDrainQueue.sync {}
     }
 
@@ -1584,7 +1841,13 @@ private final class RootMapObserver: YrsMapObservationDelegate {
                     scopedToDocId: model.docId,
                     stringsetFields: model.stringsetFieldNames
                 )
-                model.notifyListeners()
+                // Notify from the drain queue, not from inside yrs's
+                // commit hook (where this observer fires with the doc
+                // lock held) — a listener that re-enters the model
+                // would deadlock against the in-flight commit (#1116).
+                model.observerDrainQueue.async { [weak model] in
+                    model?.notifyListeners()
+                }
             default:
                 // Scalar events on the root map are not a normal
                 // layout for this schema — ignore.

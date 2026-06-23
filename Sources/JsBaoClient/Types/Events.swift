@@ -46,6 +46,15 @@ public enum StartNetworkMode: String, Sendable {
 public enum JsBaoEvent: String, Sendable {
     case status
     case networkMode
+
+    /// Generic "auth" event. **Swift-only and never emitted** — js-bao has
+    /// no `"auth"` event, and nothing in this client emits it. It was dead
+    /// surface. Subscribe to the specific typed auth events that JS actually
+    /// emits instead: `.authSuccess` (`auth-success`), `.authFailed`
+    /// (`auth-failed`), `.authState` (`auth:state`), `.authLogout`
+    /// (`auth:logout`), `.authLogoutComplete` (`auth:logout:complete`).
+    /// Scheduled for removal once the deprecation window closes (#1120).
+    @available(*, deprecated, message: "Swift-only and never emitted; JS has no `auth` event. Subscribe to a specific event instead: .authSuccess / .authFailed / .authState / .authLogout / .authLogoutComplete (#1120).")
     case auth
     case authSuccess = "auth-success"
     case authFailed = "auth-failed"
@@ -62,6 +71,14 @@ public enum JsBaoEvent: String, Sendable {
     case blobsUploadProgress = "blobs:upload-progress"
     case blobsUploadCompleted = "blobs:upload-completed"
     case blobsUploadFailed = "blobs:upload-failed"
+    /// **Swift-only and never emitted** — js-bao does not emit a distinct
+    /// "queued" upload event. A blob that is enqueued surfaces through the
+    /// regular `.blobsUploadProgress` (`blobs:upload-progress`) event with
+    /// `status == "queued"`, exactly as on JS. Migrate any
+    /// `.blobsUploadQueued` subscriber to `.blobsUploadProgress` and branch
+    /// on `event.status`. Scheduled for removal once the deprecation window
+    /// closes (#1120).
+    @available(*, deprecated, message: "Swift-only and never emitted; JS has no queued event. Subscribe to .blobsUploadProgress and check `event.status == \"queued\"` (#1120).")
     case blobsUploadQueued = "blobs:upload-queued"
     case blobsUploadPaused = "blobs:upload-paused"
     case blobsUploadResumed = "blobs:upload-resumed"
@@ -74,13 +91,31 @@ public enum JsBaoEvent: String, Sendable {
     case pendingCreateFailed
     case authRefreshDeferred = "auth-refresh-deferred"
 
-    // ── Swift-only ────────────────────────────────────────────────
+    // ── Swift-only (deprecated, #1120) ────────────────────────────
     /// Fires after a remote Yjs update lands in a local doc. **Swift-
     /// only**: js-bao uses the string `"remoteUpdate"` as a `Y.Doc`
     /// origin tag (passed to `Y.Doc.transact(fn, "remoteUpdate")`),
     /// not as an emitted event. Cross-language code that subscribes
-    /// to `"remoteUpdate"` on the JS side will never fire — use the
-    /// origin tag pattern there instead.
+    /// to `"remoteUpdate"` on the JS side will never fire.
+    ///
+    /// **Deprecated (#1120).** This is a Swift-only client event with no JS
+    /// counterpart, so it's being retired for cross-platform parity. It is
+    /// still emitted today (deprecation window) so existing subscribers keep
+    /// working, but new code should migrate:
+    ///   - **For a non-deprecated client event**: subscribe to
+    ///     `.documentSyncStateChanged` and react when `state == "synced"` —
+    ///     it now fires on every remote-update landing (see
+    ///     `DocumentSyncStateChangedEvent`). This is the supported in-client
+    ///     replacement.
+    ///   - **For true JS parity**: observe the `Y.Doc` directly (the JS
+    ///     pattern), e.g. a YSwift map/array/text observer, so your code
+    ///     reacts to the actual CRDT change rather than a client-emitted
+    ///     ping.
+    ///
+    /// Scheduled for removal once the deprecation window closes. It is
+    /// load-bearing for downstream reload-on-remote-write loaders, so it will
+    /// not be hard-removed until consumers have migrated.
+    @available(*, deprecated, message: "Swift-only; JS has no `remoteUpdate` event (it's a Y.Doc origin tag there). Still emitted during the deprecation window. Migrate to .documentSyncStateChanged (state == \"synced\") for an in-client event, or observe the Y.Doc directly for JS parity (#1120).")
     case remoteUpdate
 
     // ── JS events not previously surfaced on Swift ────────────────
@@ -89,6 +124,13 @@ public enum JsBaoEvent: String, Sendable {
     // file that owns the underlying signal; see corresponding payload
     // structs below for the data shape.
     case authLogout = "auth:logout"
+    /// Fires when logout teardown finishes. Mirrors JS `auth:logout:complete`
+    /// (`src/client/JsBaoClient.ts` `logout()`): JS emits `auth:logout`
+    /// immediately on entry, then `auth:logout:complete` after the
+    /// best-effort server logout, networking shutdown, and auth-state
+    /// teardown have all run. Payload is `{}` on JS;
+    /// `AuthLogoutCompleteEvent` is the (empty) Swift analog.
+    case authLogoutComplete = "auth:logout:complete"
     case authOnlineRequired = "auth:onlineAuthRequired"
     case connectionClose = "connection-close"
     case connectionError = "connection-error"
@@ -174,24 +216,52 @@ public struct SyncEvent: Sendable {
     public let synced: Bool
 }
 
+/// Payload for `.awareness`. Mirrors the JS client's `AwarenessEvent`
+/// (`src/client/JsBaoClient.ts`) field-for-field: a **delta** of client
+/// IDs whose presence state changed — `added` (new clients), `updated`
+/// (existing clients with new state), `removed` (clients whose state was
+/// cleared). To read the actual states, call
+/// `client.getAwarenessStates(documentId:)` with the delivered IDs —
+/// same pattern as JS.
+///
+/// (#996: this replaced the previous Swift-only full-snapshot `states`
+/// payload, which JS never delivered.)
 public struct AwarenessEvent: Sendable {
     public let documentId: String
-    public let states: [[String: Any]]
+    public let added: [String]
+    public let updated: [String]
+    public let removed: [String]
 
-    // Sendable conformance note: states contains Any but is only used on main actor
-    nonisolated public init(documentId: String, states: [[String: Any]]) {
+    public init(documentId: String, added: [String], updated: [String], removed: [String]) {
         self.documentId = documentId
-        self.states = states
+        self.added = added
+        self.updated = updated
+        self.removed = removed
     }
 }
 
+/// Payload for the deprecated `.remoteUpdate` event (#1120). See
+/// `JsBaoEvent.remoteUpdate` for the migration path
+/// (`.documentSyncStateChanged` with `state == "synced"`, or a direct
+/// `Y.Doc` observer). Not annotated `@available(deprecated)` itself so the
+/// internal emit site and the still-supported subscribers don't trip a
+/// warning during the deprecation window.
 public struct RemoteUpdateEvent: Sendable {
     public let documentId: String
 }
 
+/// Payload for `.permission`. JS delivers `permission` as a plain string
+/// (`"owner" | "read-write" | "reader" | "admin"`); Swift keeps a typed
+/// enum whose `rawValue`s are exactly those wire strings (#996 decision:
+/// typed accessor with matching observable value). Read
+/// `event.permission.rawValue` for the JS-identical string — also exposed
+/// directly as `permissionRaw`.
 public struct PermissionEvent: Sendable {
     public let documentId: String
     public let permission: DocumentPermission
+
+    /// The JS wire string for `permission` (e.g. `"read-write"`).
+    public var permissionRaw: String { permission.rawValue }
 }
 
 /// Typed payload for `.documentMetadataChanged`. Mirrors the JS
@@ -205,14 +275,16 @@ public struct DocumentMetadataChangedEvent: @unchecked Sendable {
     public let action: String
     public let metadata: [String: Any]?
     public let changedFields: [String]?
-    /// Where the change originated. Matches js-bao's
+    /// Where the change originated. Always present (#996). Matches js-bao's
     /// `documentMetadataChanged.source` vocabulary field-for-field:
     /// - `"local"`  — write originated on this device
     /// - `"server"` — the server pushed it over the WebSocket
-    ///
-    /// JS additionally emits `"idb"` for IndexedDB-replayed changes; that
-    /// has no Swift/SQLite analog and is intentionally dropped (the Swift
-    /// offline store doesn't re-emit metadata changes on hydration).
+    /// - `"idb"`    — replayed from local persistence. JS uses this value
+    ///   for IndexedDB-originated changes; Swift maps its SQLite
+    ///   offline-store hydration to the **same wire value** so
+    ///   cross-platform subscribers see one vocabulary. (Neither client
+    ///   currently emits a hydration-sourced change — the value is
+    ///   declared in both type surfaces and reserved for that path.)
     public let source: String
 
     public init(
@@ -297,6 +369,80 @@ public struct BlobUploadProgressEvent: Sendable {
 /// Payload for `blobs:upload-completed`. Mirrors the JS client's
 /// `BlobUploadCompletedEvent` field-for-field.
 public struct BlobUploadCompletedEvent: Sendable {
+    public let documentId: String
+    public let blobId: String
+    public let queueId: String
+    public let filename: String
+    public let contentType: String
+    public let numBytes: Int
+    public let attempts: Int
+    public let retainLocal: Bool?
+    public let updatedAt: TimeInterval
+
+    public init(
+        documentId: String,
+        blobId: String,
+        queueId: String,
+        filename: String,
+        contentType: String,
+        numBytes: Int,
+        attempts: Int,
+        retainLocal: Bool? = nil,
+        updatedAt: TimeInterval
+    ) {
+        self.documentId = documentId
+        self.blobId = blobId
+        self.queueId = queueId
+        self.filename = filename
+        self.contentType = contentType
+        self.numBytes = numBytes
+        self.attempts = attempts
+        self.retainLocal = retainLocal
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Payload for `blobs:upload-paused`. Mirrors the JS client's
+/// `emitUploadPaused` payload (`src/client/internal/blobManager.ts`)
+/// field-for-field: the full queue record at pause time.
+public struct BlobUploadPausedEvent: Sendable {
+    public let documentId: String
+    public let blobId: String
+    public let queueId: String
+    public let filename: String
+    public let contentType: String
+    public let numBytes: Int
+    public let attempts: Int
+    public let retainLocal: Bool?
+    public let updatedAt: TimeInterval
+
+    public init(
+        documentId: String,
+        blobId: String,
+        queueId: String,
+        filename: String,
+        contentType: String,
+        numBytes: Int,
+        attempts: Int,
+        retainLocal: Bool? = nil,
+        updatedAt: TimeInterval
+    ) {
+        self.documentId = documentId
+        self.blobId = blobId
+        self.queueId = queueId
+        self.filename = filename
+        self.contentType = contentType
+        self.numBytes = numBytes
+        self.attempts = attempts
+        self.retainLocal = retainLocal
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Payload for `blobs:upload-resumed`. Mirrors the JS client's
+/// `emitUploadResumed` payload field-for-field (same record shape as
+/// `BlobUploadPausedEvent`).
+public struct BlobUploadResumedEvent: Sendable {
     public let documentId: String
     public let blobId: String
     public let queueId: String
@@ -425,6 +571,97 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
     }
 }
 
+/// Real-time notification that a document invitation has changed state.
+///
+/// Payload for `.invitation` (`client.events.on(.invitation) { (e: InvitationEvent) in … }`).
+/// Mirrors the JS client's `InvitationEvent` (`src/client/JsBaoClient.ts`)
+/// field-for-field, including optionality.
+///
+/// **Important:** events are targeted — most actions are delivered to only
+/// one side of the invitation (inviter _or_ invitee, not both). Consumers
+/// should `switch` on `action` and handle every value, with a `default`
+/// branch for forward-compatibility (new action values may be added without
+/// a breaking change). See {@link InvitationEvent.action} on the JS side for
+/// the full targeting matrix:
+///
+/// - `"created"`   — invitee only. A new invitation was sent to them.
+/// - `"updated"`   — invitee only. An existing pending invitation changed.
+/// - `"cancelled"` — invitee only. The inviter/admin cancelled it.
+/// - `"declined"`  — both invitee and inviter. The invitee declined.
+/// - `"accepted"`  — inviter only. The invitee accepted; `acceptedBy`
+///                   carries the accepting user's `userId`.
+public struct InvitationEvent: Sendable, Equatable {
+    /// Nested document summary carried on the event. Mirrors the JS
+    /// `InvitationEvent.document` object field-for-field; every field is
+    /// optional, matching JS.
+    public struct Document: Sendable, Equatable {
+        public let documentId: String?
+        public let title: String?
+        public let tags: [String]?
+        public let createdAt: String?
+        public let lastModified: String?
+        public let createdBy: String?
+
+        public init(
+            documentId: String? = nil,
+            title: String? = nil,
+            tags: [String]? = nil,
+            createdAt: String? = nil,
+            lastModified: String? = nil,
+            createdBy: String? = nil
+        ) {
+            self.documentId = documentId
+            self.title = title
+            self.tags = tags
+            self.createdAt = createdAt
+            self.lastModified = lastModified
+            self.createdBy = createdBy
+        }
+    }
+
+    /// The lifecycle transition that just occurred. JS types this as a
+    /// closed union (`"created" | "updated" | "cancelled" | "declined" |
+    /// "accepted"`) but documents that new values may appear; Swift keeps
+    /// it as the raw `String` so an unknown server value is delivered
+    /// rather than dropped. Compare against the literals above.
+    public let action: String
+    public let invitationId: String
+    public let documentId: String
+    public let permission: String
+    public let title: String?
+    public let invitedBy: String?
+    public let invitedAt: String?
+    public let expiresAt: String?
+    /// UserId of the invitee who accepted. Populated only when
+    /// `action == "accepted"` (matches JS).
+    public let acceptedBy: String?
+    public let document: Document?
+
+    public init(
+        action: String,
+        invitationId: String,
+        documentId: String,
+        permission: String,
+        title: String? = nil,
+        invitedBy: String? = nil,
+        invitedAt: String? = nil,
+        expiresAt: String? = nil,
+        acceptedBy: String? = nil,
+        document: Document? = nil
+    ) {
+        self.action = action
+        self.invitationId = invitationId
+        self.documentId = documentId
+        self.permission = permission
+        self.title = title
+        self.invitedBy = invitedBy
+        self.invitedAt = invitedAt
+        self.expiresAt = expiresAt
+        self.acceptedBy = acceptedBy
+        self.document = document
+    }
+}
+
 /// Context delivered to the user's `onApply` handler registered via
 /// `client.workflows.define(...)`. Mirrors the JS client's apply context.
 public struct WorkflowApplyContext: @unchecked Sendable {
@@ -469,6 +706,12 @@ public typealias WorkflowApplyHandler = @Sendable (WorkflowApplyContext) async t
 public struct AuthLogoutEvent: Sendable {
     public let reason: String?
     public init(reason: String? = nil) { self.reason = reason }
+}
+
+/// Payload for `.authLogoutComplete`. JS emits `{}`; the struct is empty
+/// to match (mirrors the `AuthLogoutEvent` / JS `auth:logout` pairing).
+public struct AuthLogoutCompleteEvent: Sendable {
+    public init() {}
 }
 
 public struct AuthOnlineRequiredEvent: Sendable {
@@ -547,53 +790,48 @@ public struct SchemaDiscoveredEvent: Sendable {
 /// Payload for `.syncPerf`. Mirrors the JS client's `syncPerf` event
 /// (`src/client/JsBaoClient.ts`): `{ documentId, timings, clientTimings? }`.
 ///
-/// In JS, `timings` is the server-provided per-phase timing map carried on
-/// the `syncPerf` WS frame, and `clientTimings` is derived from
-/// `docManager.getSyncTimings(documentId)` (e.g. `clientTotalMs`). The Swift
-/// client does **not** yet handle a `syncPerf` WS frame and does not
-/// instrument per-phase sync timings (no `getSyncTimings` analog), so these
-/// maps are present for cross-platform decode parity but are populated only
-/// if/when a Swift emit site is wired. `phase`/`elapsedMs` are a Swift-only
-/// convenience pair retained for existing callers.
+/// `timings` is the server-provided per-phase timing map carried on the
+/// `syncPerf` WS frame (`totalMs`, `reconstructMs`, `docHashMs`, … — see
+/// `src/yjs-room-v2.ts`). The server only sends the frame when the client
+/// set `requestPerf: true` on its `syncStep1` — request it via
+/// `OpenDocumentOptions(requestSyncPerf: true)`, same as JS
+/// `openDocument(..., { requestSyncPerf: true })`.
+///
+/// `clientTimings` is the client-side derived map (JS `clientTimings?`,
+/// e.g. `clientTotalMs`/`clientRoundTripMs`). The Swift client does not
+/// yet instrument per-phase sync timings (no `getSyncTimings` analog), so
+/// it is `nil` today; the field exists for cross-platform payload parity.
+///
+/// (#996: the previous Swift-only `phase`/`elapsedMs` pair was removed —
+/// JS never carried those fields.)
 public struct SyncPerfEvent: @unchecked Sendable {
     public let documentId: String
-    /// Server-provided per-phase timing map (mirrors JS `timings`). Empty
-    /// when no server frame supplied it.
+    /// Server-provided per-phase timing map (mirrors JS `timings`).
     public let timings: [String: Any]
-    /// Client-side derived timings (mirrors JS `clientTimings?`). `nil` when
-    /// the Swift client hasn't computed any (the common case today, since
-    /// Swift lacks the `getSyncTimings` instrumentation).
+    /// Client-side derived timings (mirrors JS `clientTimings?`). `nil`
+    /// until Swift grows sync-timing instrumentation.
     public let clientTimings: [String: Any]?
-    /// Swift-only: a coarse single-phase label. Not present in JS.
-    public let phase: String
-    /// Swift-only: elapsed ms for `phase`. Not present in JS.
-    public let elapsedMs: Double
 
     public init(
         documentId: String,
         timings: [String: Any] = [:],
-        clientTimings: [String: Any]? = nil,
-        phase: String,
-        elapsedMs: Double
+        clientTimings: [String: Any]? = nil
     ) {
         self.documentId = documentId
         self.timings = timings
         self.clientTimings = clientTimings
-        self.phase = phase
-        self.elapsedMs = elapsedMs
     }
 }
 
 /// Fired when a workflow run is started. Mirrors the JS client's
 /// `WorkflowStartedEvent` (`src/client/JsBaoClient.ts`) field-for-field.
 ///
-/// On the server-pushed path (a `workflowStarted` WS frame, the JS
-/// source of truth) every field is populated from the frame. On the
-/// local `workflows.start(...)` HTTP-response path, only the fields the
-/// `StartWorkflowResult` envelope and the caller's options carry are
-/// set — `meta`/`contextDocId` come from the start options when present.
+/// Emitted exclusively from the server-pushed `workflowStarted` WS frame
+/// (the JS source of truth); every field is populated from the frame.
+/// The local `workflows.start(...)` HTTP path does NOT emit — it did
+/// pre-#1112, which double-emitted every start observed over WS.
 /// All fields beyond `workflowKey`/`runId` are optional so decoding /
-/// construction stays lenient when a source can't supply them.
+/// construction stays lenient when the frame omits them.
 public struct WorkflowStartedEvent: @unchecked Sendable {
     public let workflowKey: String
     public let runId: String
@@ -622,6 +860,13 @@ public struct WorkflowStartedEvent: @unchecked Sendable {
     }
 }
 
+/// Payload for `.documentSyncStateChanged`. `state` is one of
+/// `"syncing" | "synced" | "stale" | "error"`.
+///
+/// This is the supported in-client replacement for the deprecated
+/// `.remoteUpdate` event (#1120): a `"synced"` change is emitted each time a
+/// remote Yjs update lands for an open document, so reload-on-remote-write
+/// loaders can subscribe here instead of `.remoteUpdate`.
 public struct DocumentSyncStateChangedEvent: Sendable {
     public let documentId: String
     public let state: String // "syncing" | "synced" | "stale" | "error"

@@ -245,19 +245,26 @@ public struct OpenDocumentOptions: Sendable {
     /// sync — sync begins only on an explicit `startNetworkSync(documentId:)`
     /// call. Mirrors JS `open`/`openDocument`'s `deferNetworkSync`.
     public var deferNetworkSync: Bool
+    /// When `true`, syncStep1 messages for this document carry
+    /// `requestPerf: true`, asking the server for a `syncPerf` telemetry
+    /// frame after each sync round-trip (delivered via the `.syncPerf`
+    /// event). Mirrors JS `openDocument`'s `requestSyncPerf` option (#996).
+    public var requestSyncPerf: Bool
 
     public init(
         waitForLoad: WaitForLoadMode = .localIfAvailableElseNetwork,
         enableNetworkSync: Bool = true,
         retainLocal: Bool = true,
         availabilityWaitMs: Int = 30_000,
-        deferNetworkSync: Bool = false
+        deferNetworkSync: Bool = false,
+        requestSyncPerf: Bool = false
     ) {
         self.waitForLoad = waitForLoad
         self.enableNetworkSync = enableNetworkSync
         self.retainLocal = retainLocal
         self.availabilityWaitMs = max(0, availabilityWaitMs)
         self.deferNetworkSync = deferNetworkSync
+        self.requestSyncPerf = requestSyncPerf
     }
 }
 

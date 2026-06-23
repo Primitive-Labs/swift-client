@@ -195,4 +195,55 @@ final class ProjectionTests: XCTestCase {
         XCTAssertNil(row["body"])
         XCTAssertEqual(row["score"] as? Double, 10)
     }
+
+    // MARK: - Mixed include/exclude projections (#1118)
+
+    /// js-bao throws InvalidOperatorError("Cannot mix inclusion and
+    /// exclusion in projection"); Swift previously crashed the process
+    /// via `precondition`. The throwing entry point (`queryPaged`)
+    /// must surface a `JsBaoError(.invalidArgument)`.
+    func testMixedProjectionThrowsOnQueryPaged() throws {
+        let model = try seeded()
+        XCTAssertThrowsError(
+            try model.queryPaged(
+                nil,
+                options: QueryOptions(projection: ["title": 1, "body": 0])
+            )
+        ) { error in
+            guard let jbe = error as? JsBaoError else {
+                XCTFail("expected JsBaoError, got \(error)")
+                return
+            }
+            XCTAssertEqual(jbe.code, .invalidArgument)
+            XCTAssertTrue(
+                jbe.message.contains("mix inclusion and exclusion"),
+                "message should explain the mixed projection: \(jbe.message)"
+            )
+        }
+    }
+
+    /// The non-throwing `query()` wrapper must NOT crash on a mixed
+    /// projection: it routes through the throwing core, logs, and
+    /// returns no rows. (Throws-aware `query` is tracked as #1119.)
+    func testMixedProjectionOnQueryReturnsEmptyInsteadOfCrashing() throws {
+        let model = try seeded()
+        let rows = model.query(
+            nil,
+            options: QueryOptions(projection: ["title": 1, "body": 0])
+        )
+        XCTAssertEqual(rows.count, 0,
+                       "mixed projection is invalid input; query() returns []")
+    }
+
+    /// Pure include / pure exclude projections still work after the
+    /// validation change.
+    func testPureProjectionsStillWorkAfterValidationChange() throws {
+        let model = try seeded()
+        XCTAssertEqual(
+            model.query(nil, options: QueryOptions(projection: ["title": 1])).count, 2
+        )
+        XCTAssertEqual(
+            model.query(nil, options: QueryOptions(projection: ["body": 0])).count, 2
+        )
+    }
 }

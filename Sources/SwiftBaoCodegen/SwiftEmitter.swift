@@ -95,13 +95,34 @@ struct SwiftEmitter {
         out += "    static func count(_ filter: DocumentFilter? = nil) -> Int {\n"
         out += "        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)\n"
         out += "    }\n\n"
-        out += "    /// Every record across all open documents.\n"
-        out += "    static func findAll() -> [\(typeName)] {\n"
-        out += "        query(nil, options: nil)\n"
+        out += "    /// Every record across all open documents. `async` to match the JS\n"
+        out += "    /// client's `Model.findAll()` call shape (#992). Throws\n"
+        out += "    /// `PrimitiveDecodeError` if any stored row no longer decodes as\n"
+        out += "    /// `\(typeName)` — JS `findAll` never drops rows, so schema drift\n"
+        out += "    /// surfaces loudly instead of silently shrinking the result.\n"
+        out += "    static func findAll() async throws -> [\(typeName)] {\n"
+        out += "        try JsBaoClient.requireDefault()\n"
+        out += "            .queryShared(primitiveSchema, filter: nil, options: nil)\n"
+        out += "            .map { row in\n"
+        out += "                guard let decoded = \(typeName)(row: row) else {\n"
+        out += "                    throw PrimitiveDecodeError(modelName: modelName, row: row)\n"
+        out += "                }\n"
+        out += "                return decoded\n"
+        out += "            }\n"
         out += "    }\n\n"
-        out += "    /// First record with `id` across all open documents, or `nil`.\n"
-        out += "    static func find(_ id: String) -> \(typeName)? {\n"
-        out += "        JsBaoClient.requireDefault().findShared(primitiveSchema, id: id).flatMap { \(typeName)(row: $0) }\n"
+        out += "    /// First record with `id` across all open documents; `nil` only when\n"
+        out += "    /// no open document has it. `async` to match the JS client's\n"
+        out += "    /// `Model.find(id)` call shape (#992). Throws `PrimitiveDecodeError`\n"
+        out += "    /// when the row exists but no longer decodes as `\(typeName)` —\n"
+        out += "    /// distinct from the `nil` not-found case.\n"
+        out += "    static func find(_ id: String) async throws -> \(typeName)? {\n"
+        out += "        guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {\n"
+        out += "            return nil\n"
+        out += "        }\n"
+        out += "        guard let decoded = \(typeName)(row: row) else {\n"
+        out += "            throw PrimitiveDecodeError(modelName: modelName, row: row)\n"
+        out += "        }\n"
+        out += "        return decoded\n"
         out += "    }\n\n"
         out += "    /// First record matching a unique `constraint` and `value`,\n"
         out += "    /// across all open documents, or `nil`. First-match-wins in\n"
@@ -148,11 +169,59 @@ struct SwiftEmitter {
         out += "    /// record is inserted. Mirrors the JS client's\n"
         out += "    /// `save({ upsertOn: field })`. Throws if the doc isn't open, if\n"
         out += "    /// `upsertOn` has no single-field unique constraint, or if the\n"
-        out += "    /// `upsertOn` value is absent/empty. Returns `self`.\n"
+        out += "    /// `upsertOn` value is absent/empty.\n"
+        out += "    ///\n"
+        out += "    /// Returns the RESOLVED record: on the merge path its `id` is the\n"
+        out += "    /// EXISTING record's id (JS reassigns `this.id = existingId`) and\n"
+        out += "    /// its fields reflect the merged state, NOT necessarily `self`.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String, upsertOn: String) throws -> \(typeName) {\n"
-        out += "        try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)\n"
-        out += "        return self\n"
+        out += "        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)\n"
+        out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
+        out += "        var copy = self\n"
+        out += "        copy.id = result.record.id\n"
+        out += "        return copy\n"
+        out += "    }\n\n"
+        out += "    /// Insert-or-update this record, matched by the NAMED unique\n"
+        out += "    /// constraint (single-field or compound). Mirrors the JS client's\n"
+        out += "    /// `Model.upsertByUnique(constraintName, lookupValue, data,\n"
+        out += "    /// options)` — the lookup values come straight from this record's\n"
+        out += "    /// fields (every constraint field must be set), and `mode` maps\n"
+        out += "    /// JS's flags: `.mustExist` ⇔ `objectMustExist`, `.mustNotExist`\n"
+        out += "    /// ⇔ `objectMustNotExist`, `.either` ⇔ default.\n"
+        out += "    ///\n"
+        out += "    /// Search scope matches js-bao: the existing-record lookup spans\n"
+        out += "    /// EVERY open document. A match in any open doc is then saved\n"
+        out += "    /// through the explicit `documentId` target, matching JS\n"
+        out += "    /// `existingRecord.save({ targetDocument })`; a fresh insert also\n"
+        out += "    /// lands in `documentId`. Throws if the\n"
+        out += "    /// constraint isn't declared, a constraint field is unset, an\n"
+        out += "    /// explicit (pinned) id collides with a matched record\n"
+        out += "    /// (`UpsertError.explicitIdConflict`), or (on insert) `documentId`\n"
+        out += "    /// isn't open.\n"
+        out += "    ///\n"
+        out += "    /// Returns the RESOLVED record: on the merge path its `id` is the\n"
+        out += "    /// EXISTING record's id and its fields reflect the merged state.\n"
+        out += "    @discardableResult\n"
+        out += "    func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
+        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)\n"
+        out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
+        out += "        var copy = self\n"
+        out += "        copy.id = result.record.id\n"
+        out += "        return copy\n"
+        out += "    }\n\n"
+        out += "    /// `upsertByUnique` overload taking an EXPLICIT lookup value (one\n"
+        out += "    /// per constraint field) — mirrors js-bao's separate\n"
+        out += "    /// `uniqueLookupValue` argument. The values must agree with this\n"
+        out += "    /// record's own constraint fields (js-bao throws on mismatch). Use\n"
+        out += "    /// when you want to make the lookup key explicit at the call site.\n"
+        out += "    @discardableResult\n"
+        out += "    func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
+        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue)\n"
+        out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
+        out += "        var copy = self\n"
+        out += "        copy.id = result.record.id\n"
+        out += "        return copy\n"
         out += "    }\n\n"
         out += "    /// Delete this record from document `documentId`. Throws if the doc isn't open.\n"
         out += "    func delete(in documentId: String) throws {\n"
@@ -286,32 +355,142 @@ struct SwiftEmitter {
         out += autoStampMetadata(schema: schema)
         out += storedProperties(schema: schema)
         out += "\n"
+        out += idProvenanceProperty(schema: schema)
+        out += "\n"
         out += designatedInit(schema: schema)
+        out += "\n"
+        out += autoIdInit(schema: schema)
         out += "\n"
         out += recordInit(schema: schema)
         out += "\n"
         out += rowInit(schema: schema)
         out += "\n"
         out += primitiveValuesFn(schema: schema)
+        out += "\n"
+        out += equatableHashableCodableConformance(schema: schema)
         out += relationshipAccessors(schema: schema)
         out += "}\n"
         return out
     }
 
+    // MARK: - Explicit-id provenance (#1122)
+
+    /// Emit the non-persisted `_explicitId` provenance flag plus the
+    /// public `id`-was-pinned accessor the facade reads. Tracks whether
+    /// the caller pinned the id (designated `init(id:…)`) or let it be
+    /// auto-generated (the auto-id convenience init). Mirrors js-bao's
+    /// `_constructorProvidedId` — used by `save(in:upsertOn:)` /
+    /// `upsertByUnique` to decide whether an id colliding with a matched
+    /// record is a hard conflict (explicit) or a silent discard (auto).
+    ///
+    /// Excluded from `Codable` (via the emitted `CodingKeys`) and from
+    /// `Equatable`/`Hashable` (via the emitted `==` / `hash(into:)`), so
+    /// it never serializes and never affects value equality — it is pure
+    /// call-site provenance, not record data.
+    private func idProvenanceProperty(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        var out = ""
+        out += "    /// `true` when the caller pinned `id` via the designated\n"
+        out += "    /// initializer; `false` when it was auto-generated. Drives the\n"
+        out += "    /// explicit-id-conflict check on `save(in:upsertOn:)` /\n"
+        out += "    /// `upsertByUnique` (js-bao `_constructorProvidedId` parity).\n"
+        out += "    /// Not part of the record's persisted/equatable identity.\n"
+        out += "    \(access) private(set) var _explicitId: Bool = true\n"
+        return out
+    }
+
+    /// Emit the convenience initializer that AUTO-generates the id. A
+    /// caller using this path is treated as not pinning an id, so a
+    /// later upsert that collides on the unique value silently merges
+    /// into the existing record (js-bao auto-id parity) rather than
+    /// throwing `UpsertError.explicitIdConflict`. Mirrors js-bao's
+    /// `new Model({ …no id… })` constructor path.
+    private func autoIdInit(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        // Params: every field EXCEPT id, in display order.
+        var lines: [String] = []
+        for fname in displayFieldOrder(schema) {
+            guard let f = schema.fields[fname], fname != "id" else { continue }
+            let type = swiftStoredType(f, fieldName: fname)
+            let suffix = type.hasSuffix("?") ? " = nil" : ""
+            lines.append("        \(propName(fname)): \(type)\(suffix)")
+        }
+        var out = ""
+        out += "    /// Create a record with an auto-generated id. The id is NOT\n"
+        out += "    /// treated as caller-pinned, so an `upsert` that collides on a\n"
+        out += "    /// unique value merges into the existing record rather than\n"
+        out += "    /// throwing `UpsertError.explicitIdConflict`. Mirrors js-bao's\n"
+        out += "    /// id-less `new Model({...})` constructor.\n"
+        if lines.isEmpty {
+            // Id-only model: no parameters.
+            out += "    \(access) init() {\n"
+        } else {
+            out += "    \(access) init(\n"
+            out += lines.joined(separator: ",\n")
+            out += "\n    ) {\n"
+        }
+        out += "        self.id = PrimitiveSchemaRegistry.newId()\n"
+        for fname in displayFieldOrder(schema) where fname != "id" {
+            out += "        self.\(propName(fname)) = \(propName(fname))\n"
+        }
+        out += "        self._explicitId = false\n"
+        out += "    }\n"
+        return out
+    }
+
+    /// Emit explicit `CodingKeys` + `==` + `hash(into:)` that cover only
+    /// the real schema fields — excluding the `_explicitId` provenance
+    /// flag. This replaces the compiler's same-file synthesis (which
+    /// would otherwise pull `_explicitId` into Codable/Equatable/Hashable)
+    /// while preserving the exact same observable conformance behavior.
+    private func equatableHashableCodableConformance(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        let fields = displayFieldOrder(schema).filter { schema.fields[$0] != nil }
+        var out = ""
+        // CodingKeys: only the real fields. `_explicitId` is omitted, so
+        // it never encodes and decode leaves it at its `true` default.
+        out += "    \(access) enum CodingKeys: String, CodingKey {\n"
+        out += "        case " + fields.map { propName($0) }.joined(separator: ", ") + "\n"
+        out += "    }\n\n"
+        // Equatable: compare only real fields.
+        out += "    \(access) static func == (lhs: \(schema.swiftName), rhs: \(schema.swiftName)) -> Bool {\n"
+        let eqLines = fields.map { "        lhs.\(propName($0)) == rhs.\(propName($0))" }
+        out += eqLines.joined(separator: " &&\n") + "\n"
+        out += "    }\n\n"
+        // Hashable: hash only real fields.
+        out += "    \(access) func hash(into hasher: inout Hasher) {\n"
+        for f in fields {
+            out += "        hasher.combine(\(propName(f)))\n"
+        }
+        out += "    }\n"
+        return out
+    }
+
     // MARK: - Relationship accessors
 
-    /// Emit one static accessor per declared relationship. The generated
-    /// struct is a doc-decoupled value type, so the accessors mirror the
-    /// runtime resolvers on `PrimitiveRecord` (`refersTo` / `hasMany` /
-    /// `hasManyThrough` in `JsBaoClient.RelationshipResolution`): the
-    /// caller passes the source `PrimitiveRecord` they already have plus
-    /// the target `DynamicModel`(s), and the accessor returns *typed*
-    /// records — the same `init?(record:)` the rest of the file emits.
+    /// Emit one idiomatic INSTANCE accessor per declared relationship,
+    /// mirroring the JS client's generated instance methods (#1151):
+    /// `author.posts()` (→ `[Post]`) and `post.author()` (→ `Author?`).
+    /// Each accessor auto-resolves the related model itself — the call
+    /// site is just `try await author.posts()`, no manually-constructed
+    /// `DynamicModel` target to pass in.
     ///
-    /// Mirrors the JS codegen, which bakes typed `author()` / `posts(...)`
-    /// accessors onto the generated class (#995). Swift can't store the
-    /// doc binding on a value type, so the target model is an explicit
-    /// parameter rather than implicit `this`.
+    /// How the value-type struct reaches the related data: the emitter
+    /// already knows the target's resolved Swift type (via
+    /// `options.swiftNamesByModel`), and every generated type exposes
+    /// `static let primitiveSchema`. So the accessor resolves the target
+    /// model from `TargetRecord.primitiveSchema` and delegates to the
+    /// configured default `JsBaoClient`'s cross-document relationship
+    /// helpers (`refersToShared` / `hasManyShared` / `hasManyThroughShared`)
+    /// — the same shared store the rest of the facade reads. This matches
+    /// JS, where the target model class is baked in at codegen and the
+    /// accessor queries it (`relationshipManager.ts`). No global model
+    /// registry is needed because the target type is known statically.
+    ///
+    /// `async throws` matches the JS instance methods' promise-returning
+    /// call shape and the generated `find()` / `findAll()` facade. Today's
+    /// helper path is synchronous; like the rest of this facade, a missing
+    /// default client is a `JsBaoClient.requireDefault()` precondition.
     ///
     /// The return type names the target's resolved Swift type via
     /// `options.swiftNamesByModel`; when a target isn't in the map (an
@@ -328,41 +507,57 @@ struct SwiftEmitter {
             let method = propName(rname)
             switch rel.rawType {
             case "refersTo":
-                out += "    /// Follow the `\(rname)` relationship (refersTo → `\(targetModel)`).\n"
-                out += "    /// `record` is this row's `PrimitiveRecord`; `target` is the\n"
-                out += "    /// related model's `DynamicModel`. Returns `nil` when the foreign\n"
-                out += "    /// key is unset or points at a missing record.\n"
-                out += "    \(access) static func \(method)(\n"
-                out += "        of record: PrimitiveRecord,\n"
-                out += "        in target: DynamicModel\n"
-                out += "    ) throws -> \(targetType)? {\n"
-                out += "        try record.refersTo(relationship: \(quoted(rname)), target: target)\n"
-                out += "            .flatMap(\(targetType).init(record:))\n"
+                // The foreign key is a field on THIS model — read it off the
+                // struct's own property, exactly like JS reads `this[relatedIdField]`.
+                guard let fk = props["relatedIdField"] else { continue }
+                let fkProp = propName(fk)
+                out += "    /// Follow the `\(rname)` relationship (refersTo → `\(targetModel)`):\n"
+                out += "    /// resolve the `\(targetType)` this record's `\(fk)` points at, across\n"
+                out += "    /// all open documents. Returns `nil` when the foreign key is unset\n"
+                out += "    /// or points at a missing record. Mirrors the JS `\(method)()`\n"
+                out += "    /// instance accessor.\n"
+                out += "    \(access) func \(method)() async throws -> \(targetType)? {\n"
+                out += "        JsBaoClient.requireDefault()\n"
+                out += "            .refersToShared(target: \(targetType).primitiveSchema, foreignKey: \(fkProp))\n"
+                out += "            .flatMap { \(targetType)(row: $0) }\n"
                 out += "    }\n\n"
             case "hasMany":
-                out += "    /// Follow the `\(rname)` relationship (hasMany → `\(targetModel)`),\n"
-                out += "    /// applying any emitted `order_by_field` / `order_direction`.\n"
-                out += "    \(access) static func \(method)(\n"
-                out += "        of record: PrimitiveRecord,\n"
-                out += "        in target: DynamicModel\n"
-                out += "    ) throws -> [\(targetType)] {\n"
-                out += "        try record.hasMany(relationship: \(quoted(rname)), target: target)\n"
-                out += "            .compactMap(\(targetType).init(record:))\n"
+                guard let fk = props["relatedIdField"] else { continue }
+                let orderArgs = relationshipOrderArgs(
+                    field: props["orderByField"], direction: props["orderDirection"]
+                )
+                out += "    /// Follow the `\(rname)` relationship (hasMany → `\(targetModel)`):\n"
+                out += "    /// every `\(targetType)` whose `\(fk)` points back at this record,\n"
+                out += "    /// across all open documents, applying any emitted\n"
+                out += "    /// `order_by_field` / `order_direction`. Mirrors the JS\n"
+                out += "    /// `\(method)()` instance accessor.\n"
+                out += "    \(access) func \(method)() async throws -> [\(targetType)] {\n"
+                out += "        JsBaoClient.requireDefault()\n"
+                out += "            .hasManyShared(\n"
+                out += "                target: \(targetType).primitiveSchema,\n"
+                out += "                relatedIdField: \(quoted(fk)),\n"
+                out += "                sourceId: id\(orderArgs)\n"
+                out += "            )\n"
+                out += "            .compactMap { \(targetType)(row: $0) }\n"
                 out += "    }\n\n"
             case "hasManyThrough":
+                guard let joinModel = props["joinModel"],
+                      let localField = props["joinModelLocalField"],
+                      let relatedField = props["joinModelRelatedField"] else { continue }
+                let joinType = swiftTypeName(forModel: joinModel)
                 out += "    /// Follow the `\(rname)` relationship (hasManyThrough → `\(targetModel)`)\n"
-                out += "    /// via its join model. `joinModel` is the join `DynamicModel`;\n"
-                out += "    /// `target` is the related model's `DynamicModel`.\n"
-                out += "    \(access) static func \(method)(\n"
-                out += "        of record: PrimitiveRecord,\n"
-                out += "        through joinModel: DynamicModel,\n"
-                out += "        in target: DynamicModel\n"
-                out += "    ) throws -> [\(targetType)] {\n"
-                out += "        try record.hasManyThrough(\n"
-                out += "            relationship: \(quoted(rname)),\n"
-                out += "            joinModel: joinModel,\n"
-                out += "            target: target\n"
-                out += "        ).compactMap(\(targetType).init(record:))\n"
+                out += "    /// via the `\(joinModel)` join model, across all open documents.\n"
+                out += "    /// Mirrors the JS `\(method)()` instance accessor.\n"
+                out += "    \(access) func \(method)() async throws -> [\(targetType)] {\n"
+                out += "        JsBaoClient.requireDefault()\n"
+                out += "            .hasManyThroughShared(\n"
+                out += "                target: \(targetType).primitiveSchema,\n"
+                out += "                joinModel: \(joinType).primitiveSchema,\n"
+                out += "                sourceId: id,\n"
+                out += "                joinModelLocalField: \(quoted(localField)),\n"
+                out += "                joinModelRelatedField: \(quoted(relatedField))\n"
+                out += "            )\n"
+                out += "            .compactMap { \(targetType)(row: $0) }\n"
                 out += "    }\n\n"
             default:
                 break
@@ -372,6 +567,18 @@ struct SwiftEmitter {
         // closing brace sits flush, matching the rest of the emitter.
         if out.hasSuffix("\n\n") { out.removeLast() }
         return out
+    }
+
+    /// Render the trailing `orderByField:` / `orderDirection:` argument
+    /// fragment for a `hasMany` accessor — empty when no order is declared.
+    /// Leading comma + newline so it folds into the multi-line call.
+    private func relationshipOrderArgs(field: String?, direction: String?) -> String {
+        guard let field else { return "" }
+        var s = ",\n                orderByField: \(quoted(field))"
+        if let direction {
+            s += ",\n                orderDirection: \(quoted(direction))"
+        }
+        return s
     }
 
     /// Resolve a target model name to its Swift type for relationship

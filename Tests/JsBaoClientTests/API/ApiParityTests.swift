@@ -2,7 +2,7 @@ import XCTest
 @testable import JsBaoClient
 
 /// Wire-shape tests for the API-parity pass that filled in the
-/// ⛔ entries from `swift-client/docs/parity/api-methods.md`.
+/// gaps catalogued in the (since-retired) parity docs — see PR #790.
 ///
 /// Each test instantiates a sub-API with a stub `makeRequest` closure
 /// that records the `(method, path, body)` triple, then invokes the

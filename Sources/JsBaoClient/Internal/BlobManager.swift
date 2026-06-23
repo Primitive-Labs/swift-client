@@ -166,6 +166,9 @@ public final class BlobManager: @unchecked Sendable {
                 nextAttemptAt: task.nextAttemptAt,
                 updatedAt: task.updatedAt
             ))
+            // JS `handleUploadFailure` follows the failed event with a
+            // progress frame showing the queued-for-retry state (#996).
+            emitUploadProgress(task, status: "pending")
 
             scheduleQueueProcessing()
             throw error
@@ -302,8 +305,12 @@ public final class BlobManager: @unchecked Sendable {
             return false
         }
         task.paused = true
+        task.updatedAt = Date().timeIntervalSince1970
         uploadQueue[blobId] = task
         lock.unlock()
+        // Mirror JS `pauseUpload`: paused event + progress frame (#996).
+        emitUploadPaused(task)
+        emitUploadProgress(task, status: "paused")
         return true
     }
 
@@ -324,38 +331,56 @@ public final class BlobManager: @unchecked Sendable {
         }
         task.paused = false
         task.nextAttemptAt = Date().timeIntervalSince1970
+        task.updatedAt = Date().timeIntervalSince1970
         uploadQueue[blobId] = task
         lock.unlock()
+        // Mirror JS `resumeUpload`: resumed event + progress frame with the
+        // queued-for-retry ("pending") state (#996).
+        emitUploadResumed(task)
+        emitUploadProgress(task, status: "pending")
         scheduleQueueProcessing()
         return true
     }
 
     /// Pause every queued upload, optionally scoped to a single document.
     public func pauseAll(documentId: String? = nil) {
+        var pausedTasks: [UploadTask] = []
         lock.lock()
         for (blobId, var task) in uploadQueue {
             if let documentId = documentId, task.documentId != documentId { continue }
+            if task.paused { continue }
             task.paused = true
+            task.updatedAt = Date().timeIntervalSince1970
             uploadQueue[blobId] = task
+            pausedTasks.append(task)
         }
         lock.unlock()
+        for task in pausedTasks {
+            emitUploadPaused(task)
+            emitUploadProgress(task, status: "paused")
+        }
     }
 
     /// Resume every paused upload, optionally scoped to a single document.
     public func resumeAll(documentId: String? = nil) {
+        var resumedTasks: [UploadTask] = []
         lock.lock()
-        var resumed = false
         for (blobId, var task) in uploadQueue {
             if let documentId = documentId, task.documentId != documentId { continue }
             if task.paused {
                 task.paused = false
                 task.nextAttemptAt = Date().timeIntervalSince1970
+                task.updatedAt = Date().timeIntervalSince1970
                 uploadQueue[blobId] = task
-                resumed = true
+                resumedTasks.append(task)
             }
         }
         lock.unlock()
-        if resumed {
+        for task in resumedTasks {
+            emitUploadResumed(task)
+            emitUploadProgress(task, status: "pending")
+        }
+        if !resumedTasks.isEmpty {
             scheduleQueueProcessing()
         }
     }
@@ -474,6 +499,10 @@ public final class BlobManager: @unchecked Sendable {
             activeUploads += 1
             lock.unlock()
 
+            // Mirror JS `runUploadTask`: progress frame when the attempt
+            // actually starts (#996).
+            emitUploadProgress(task, status: "uploading")
+
             do {
                 let _ = try await uploadImmediate(
                     documentId: task.documentId,
@@ -527,6 +556,9 @@ public final class BlobManager: @unchecked Sendable {
                         nextAttemptAt: failedTask.nextAttemptAt,
                         updatedAt: failedTask.updatedAt
                     ))
+                    // JS `handleUploadFailure` parity: progress frame with
+                    // the queued-for-retry state (#996).
+                    emitUploadProgress(failedTask, status: "pending")
                 }
 
                 // Schedule retry
@@ -537,6 +569,54 @@ public final class BlobManager: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Emit `blobs:upload-progress` with the full queue record, mirroring
+    /// JS `emitUploadProgress` (`src/client/internal/blobManager.ts`).
+    /// `status` ∈ `"queued" | "uploading" | "pending" | "paused"` (#996).
+    private func emitUploadProgress(_ task: UploadTask, status: String) {
+        emitter?.emit(.blobsUploadProgress, BlobUploadProgressEvent(
+            documentId: task.documentId,
+            blobId: task.blobId,
+            queueId: task.queueId,
+            filename: task.filename,
+            contentType: task.contentType,
+            numBytes: task.data.count,
+            status: status,
+            attempts: task.attempts,
+            nextAttemptAt: task.nextAttemptAt,
+            retainLocal: task.retainLocal,
+            lastError: task.lastError,
+            updatedAt: task.updatedAt
+        ))
+    }
+
+    private func emitUploadPaused(_ task: UploadTask) {
+        emitter?.emit(.blobsUploadPaused, BlobUploadPausedEvent(
+            documentId: task.documentId,
+            blobId: task.blobId,
+            queueId: task.queueId,
+            filename: task.filename,
+            contentType: task.contentType,
+            numBytes: task.data.count,
+            attempts: task.attempts,
+            retainLocal: task.retainLocal,
+            updatedAt: task.updatedAt
+        ))
+    }
+
+    private func emitUploadResumed(_ task: UploadTask) {
+        emitter?.emit(.blobsUploadResumed, BlobUploadResumedEvent(
+            documentId: task.documentId,
+            blobId: task.blobId,
+            queueId: task.queueId,
+            filename: task.filename,
+            contentType: task.contentType,
+            numBytes: task.data.count,
+            attempts: task.attempts,
+            retainLocal: task.retainLocal,
+            updatedAt: task.updatedAt
+        ))
     }
 
     private func computeBackoff(attempts: Int) -> Int {

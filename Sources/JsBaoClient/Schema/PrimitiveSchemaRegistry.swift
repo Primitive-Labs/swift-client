@@ -41,6 +41,14 @@ public final class PrimitiveSchemaRegistry: @unchecked Sendable {
         name.hasPrefix("$") ? String(name.dropFirst()) : name
     }
 
+    /// Generate a fresh ULID string. Public so codegen'd models (in a
+    /// separate module) can auto-assign ids in their convenience
+    /// initializer — mirrors js-bao's `generateULID()` used by
+    /// `BaseModel`'s constructor when no id is supplied.
+    public static func newId() -> String {
+        generateULID()
+    }
+
     // MARK: - ULID generation
 
     /// Crockford base-32 ULID. 48-bit ms timestamp + 80 bits randomness.

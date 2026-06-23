@@ -65,8 +65,14 @@ final class SwiftEmitterTests: XCTestCase {
         // Paginated read — exposes nextCursor/hasMore so callers can page (#946).
         XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<NoteRecord>"))
         XCTAssertTrue(body.contains("static func count(_ filter: DocumentFilter? = nil) -> Int"))
-        XCTAssertTrue(body.contains("static func findAll() -> [NoteRecord]"))
-        XCTAssertTrue(body.contains("static func find(_ id: String) -> NoteRecord?"))
+        // find/findAll are async + decode-loud (#992): async matches the JS
+        // call shape; a row that exists but fails typed decode throws
+        // PrimitiveDecodeError instead of vanishing (find) or being silently
+        // dropped from the result (findAll).
+        XCTAssertTrue(body.contains("static func findAll() async throws -> [NoteRecord]"))
+        XCTAssertTrue(body.contains("static func find(_ id: String) async throws -> NoteRecord?"))
+        XCTAssertTrue(body.contains("throw PrimitiveDecodeError(modelName: modelName, row: row)"),
+                      "decode misses in find/findAll must throw, not return nil / drop rows")
         XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping () -> Void) -> () -> Void"))
         XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) -> [[String: Any]]"))
         // Cross-document unique lookup + single-result query (JS parity:
@@ -85,8 +91,36 @@ final class SwiftEmitterTests: XCTestCase {
         // Upsert-by-unique-field write (JS parity: save({ upsertOn })).
         XCTAssertTrue(body.contains("func save(in documentId: String, upsertOn: String) throws -> NoteRecord"),
                       "instance save(in:upsertOn:) must be emitted")
-        XCTAssertTrue(body.contains("upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId)"),
-                      "save(in:upsertOn:) should delegate to upsertShared, passing the record id")
+        XCTAssertTrue(body.contains("upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)"),
+                      "save(in:upsertOn:) should delegate to upsertShared, passing the record id + explicit-id provenance (#1122)")
+        // The upsert paths must return the RESOLVED record, not `self` —
+        // on the merge path the existing record's id wins (JS reassigns
+        // `this.id = existingId`), so the facade re-decodes the result.
+        XCTAssertTrue(body.contains("if let resolved = NoteRecord(record: result.record) { return resolved }"),
+                      "upsert facades should re-decode the resolved record so merge keeps the existing id")
+        XCTAssertFalse(body.contains("on: upsertOn, in: documentId)\n        return self"),
+                      "save(in:upsertOn:) must not return stale `self` (its id is wrong on the merge path)")
+        // Upsert-by-named-constraint write (JS parity: Model.upsertByUnique,
+        // covers compound constraints — #1053).
+        XCTAssertTrue(body.contains("func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> NoteRecord"),
+                      "instance upsertByUnique(_:mode:in:) must be emitted")
+        XCTAssertTrue(body.contains("upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)"),
+                      "upsertByUnique should delegate to upsertByUniqueShared, passing the record id + explicit-id provenance (#1122)")
+        // Explicit lookup-value overload (#1122 — js-bao's separate
+        // `uniqueLookupValue` argument).
+        XCTAssertTrue(body.contains("func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> NoteRecord"),
+                      "instance upsertByUnique(_:lookupValue:mode:in:) overload must be emitted")
+        XCTAssertTrue(body.contains("uniqueLookupValue: lookupValue"),
+                      "lookup-value overload should forward uniqueLookupValue")
+        // Explicit-id provenance (#1122): the auto-id convenience init
+        // marks the id non-explicit so a colliding auto-id silently
+        // merges; the designated init leaves the default `true`.
+        XCTAssertTrue(body.contains("var _explicitId: Bool = true"),
+                      "explicit-id provenance flag must be emitted")
+        XCTAssertTrue(body.contains("self.id = PrimitiveSchemaRegistry.newId()"),
+                      "auto-id convenience init must be emitted")
+        XCTAssertTrue(body.contains("self._explicitId = false"),
+                      "auto-id init must mark the id non-explicit")
         XCTAssertTrue(body.contains("func delete(in documentId: String) throws"),
                       "instance delete(in:) must be emitted")
         // The deleted static create/update writes must NOT come back.
@@ -604,47 +638,63 @@ final class SwiftEmitterTests: XCTestCase {
     type = "id"
     """
 
+    // Relationship accessors are idiomatic INSTANCE methods that
+    // auto-resolve the target model (#1151) — `try await post.author()`,
+    // `try await user.posts()` — mirroring the JS client's generated
+    // instance methods. They delegate to the default client's
+    // cross-document relationship helpers.
+
     func testRefersToAccessorReturnsTypedOptional() throws {
         let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
         let posts = try XCTUnwrap(files["PostsRecord"])
         XCTAssertTrue(
-            posts.contains("static func author(") ,
-            "expected a typed accessor for the `author` refersTo relationship"
+            posts.contains("func author() async throws -> UsersRecord?"),
+            "expected an instance accessor returning the target's optional typed record"
         )
         XCTAssertTrue(
-            posts.contains("in target: DynamicModel\n    ) throws -> UsersRecord?"),
-            "refersTo accessor should return the target's optional typed record"
+            posts.contains(#".refersToShared(target: UsersRecord.primitiveSchema, foreignKey: userId)"#),
+            "refersTo accessor should resolve via the default client, reading its own FK field"
         )
-        XCTAssertTrue(
-            posts.contains(#"record.refersTo(relationship: "author", target: target)"#),
-            "accessor should delegate to the runtime PrimitiveRecord.refersTo resolver"
+        XCTAssertFalse(
+            posts.contains("static func author("),
+            "the refersTo accessor should be an instance method, not a static"
         )
     }
 
     func testHasManyAccessorReturnsTypedArray() throws {
         let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
         let users = try XCTUnwrap(files["UsersRecord"])
-        XCTAssertTrue(users.contains("static func posts("))
         XCTAssertTrue(
-            users.contains("throws -> [PostsRecord]"),
-            "hasMany accessor should return an array of the target's typed record"
+            users.contains("func posts() async throws -> [PostsRecord]"),
+            "hasMany accessor should be an instance method returning an array of the target's typed record"
         )
         XCTAssertTrue(
-            users.contains(#"record.hasMany(relationship: "posts", target: target)"#)
+            users.contains(#".hasManyShared("#)
+            && users.contains(#"target: PostsRecord.primitiveSchema"#)
+            && users.contains(#"relatedIdField: "userId""#)
+            && users.contains("sourceId: id"),
+            "hasMany accessor should resolve the target via the default client by FK = self.id"
+        )
+        XCTAssertTrue(
+            users.contains(#"orderByField: "createdAt""#),
+            "hasMany accessor should forward the declared order_by_field"
         )
     }
 
     func testHasManyThroughAccessorTakesJoinModel() throws {
         let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
         let posts = try XCTUnwrap(files["PostsRecord"])
-        XCTAssertTrue(posts.contains("static func tags("))
         XCTAssertTrue(
-            posts.contains("through joinModel: DynamicModel"),
-            "hasManyThrough accessor should accept the join model"
+            posts.contains("func tags() async throws -> [TagsRecord]"),
+            "hasManyThrough accessor should be an instance method returning the target array"
         )
-        XCTAssertTrue(posts.contains("throws -> [TagsRecord]"))
         XCTAssertTrue(
-            posts.contains(#"record.hasManyThrough("#)
+            posts.contains(#".hasManyThroughShared("#)
+            && posts.contains(#"target: TagsRecord.primitiveSchema"#)
+            && posts.contains(#"joinModel: PostTagLinksRecord.primitiveSchema"#)
+            && posts.contains(#"joinModelLocalField: "postId""#)
+            && posts.contains(#"joinModelRelatedField: "tagId""#),
+            "hasManyThrough accessor should auto-resolve both target and join model"
         )
     }
 

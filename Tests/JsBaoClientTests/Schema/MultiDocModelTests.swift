@@ -314,4 +314,74 @@ final class MultiDocModelTests: XCTestCase {
             value: .string("shared@x.com")
         ))
     }
+
+    // MARK: - upsertByUnique: cross-doc search (#1122)
+
+    /// js-bao's `upsertByUnique` searches EVERY connected doc for an
+    /// existing match before inserting. Here the match lives in docB but
+    /// the target doc is docA — the upsert must still find the match, then
+    /// save the resolved record id through the supplied target document
+    /// (`existingRecord.save({ targetDocument })` parity).
+    func testUpsertByUniqueSearchesAcrossDocsAndWritesToTargetDoc() throws {
+        let multi = try seededPair()  // carol@b.com lives in docB
+        let result = try multi.upsertByUnique(
+            constraint: "md_users_email_unique",
+            data: ["email": .string("carol@b.com"), "name": .string("Carol V2")],
+            targetDocId: "docA"  // target differs from the match's doc
+        )
+        XCTAssertFalse(result.wasCreated, "cross-doc match must resolve an existing record id")
+        XCTAssertEqual(result.record.id, "b1", "must resolve to docB's existing id")
+        XCTAssertEqual(result.record["name"], .string("Carol V2"))
+        XCTAssertEqual(multi.find(id: "b1")?.docId, "docA",
+                       "targetDocument parity writes the resolved id into docA")
+        XCTAssertEqual(multi.find(id: "b1")?.row["name"] as? String, "Carol V2")
+    }
+
+    /// No match in any connected doc → insert into the target doc.
+    func testUpsertByUniqueInsertsIntoTargetWhenNoMatchAnywhere() throws {
+        let multi = try seededPair()
+        let result = try multi.upsertByUnique(
+            constraint: "md_users_email_unique",
+            data: ["email": .string("dave@new.com"), "name": .string("Dave")],
+            id: "d1",
+            targetDocId: "docA"
+        )
+        XCTAssertTrue(result.wasCreated)
+        XCTAssertEqual(result.record.id, "d1")
+        let inserted = multi.findAll().first { ($0["id"] as? String) == "d1" }
+        XCTAssertEqual(inserted?["_meta_doc_id"] as? String, "docA",
+                       "fresh insert lands in the target doc")
+    }
+
+    /// `.mustExist` with a match in ANOTHER doc still updates (proves the
+    /// existence check spans docs, not just the target).
+    func testUpsertByUniqueMustExistFindsMatchInOtherDoc() throws {
+        let multi = try seededPair()  // carol@b.com in docB
+        let result = try multi.upsertByUnique(
+            constraint: "md_users_email_unique",
+            data: ["email": .string("carol@b.com"), "rank": .number(99)],
+            mode: .mustExist,
+            targetDocId: "docA"
+        )
+        XCTAssertFalse(result.wasCreated)
+        XCTAssertEqual(result.record.id, "b1")
+        XCTAssertEqual(result.record["rank"], .number(99))
+    }
+
+    /// An explicit (caller-pinned) id colliding with a cross-doc match is
+    /// a hard conflict (#1122 — js-bao `_constructorProvidedId` parity).
+    func testUpsertByUniqueExplicitIdConflictAcrossDocs() throws {
+        let multi = try seededPair()
+        XCTAssertThrowsError(try multi.upsertByUnique(
+            constraint: "md_users_email_unique",
+            data: ["email": .string("carol@b.com"), "name": .string("X")],
+            id: "different",
+            explicitId: true,
+            targetDocId: "docA"
+        )) { error in
+            XCTAssertEqual(error as? UpsertError,
+                           .explicitIdConflict(supplied: "different", existing: "b1"))
+        }
+        XCTAssertEqual(multi.findAll().count, 3, "conflict must not insert")
+    }
 }
