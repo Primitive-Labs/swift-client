@@ -82,7 +82,7 @@ enum AppleSignInHelpers {
     /// goes to the server; its SHA-256 hex goes to Apple (see `sha256Hex`).
     static func generateRawNonce() -> String {
         let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
-        return Base64Url.encode(Data(bytes))
+        return PasskeyWire.base64UrlEncode(Data(bytes))
     }
 
     /// Lowercase-hex SHA-256 of a string — the value to set on

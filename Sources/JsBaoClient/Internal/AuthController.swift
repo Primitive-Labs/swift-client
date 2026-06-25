@@ -598,13 +598,13 @@ public final class AuthController: @unchecked Sendable {
     /// 43–128 range.
     static func generatePkceVerifier() -> String {
         let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
-        return Base64Url.encode(Data(bytes))
+        return PasskeyWire.base64UrlEncode(Data(bytes))
     }
 
     /// Derive the S256 PKCE `code_challenge` for a verifier (RFC 7636 §4.2):
     /// `base64url(sha256(ascii(verifier)))`, no padding.
     static func pkceChallenge(forVerifier verifier: String) -> String {
-        Base64Url.encode(hashSHA256(Data(verifier.utf8)))
+        PasskeyWire.base64UrlEncode(hashSHA256(Data(verifier.utf8)))
     }
 
     /// Percent-encode everything outside the RFC 3986 unreserved set
@@ -720,6 +720,131 @@ public final class AuthController: @unchecked Sendable {
             applyToken(accessToken, previous: previous, cause: "otp")
         }
 
+        return dict
+    }
+
+    // MARK: - Passkeys (#929)
+    //
+    // Wire-level passkey endpoints, mirroring JS `authController.passkey*`.
+    // The native AuthenticationServices orchestration lives in
+    // `AuthAPI+NativePasskeys.swift`; these methods only speak HTTP.
+
+    /// `POST /passkey/auth/start` (no auth). Returns the raw response dict:
+    /// WebAuthn request options spread at the top level plus `challengeToken`.
+    public func passkeyAuthStart() async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        let response = try await makeRequest("POST", "/passkey/auth/start", [String: Any]())
+        guard let dict = response as? [String: Any],
+              dict["challengeToken"] is String else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey auth start response")
+        }
+        return dict
+    }
+
+    /// `POST /passkey/auth/finish` (no auth). On success applies the
+    /// returned access token (cause `"passkey"`) — the session lands exactly
+    /// like the magic-link / OTP paths — and returns the response dict
+    /// (`{ token, expiresAt, user, isNewUser }`).
+    public func passkeyAuthFinish(credential: [String: Any], challengeToken: String) async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        let body: [String: Any] = [
+            "credential": credential,
+            "challengeToken": challengeToken,
+        ]
+        let response = try await makeRequest("POST", "/passkey/auth/finish", body)
+        guard let dict = response as? [String: Any] else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey auth finish response")
+        }
+        if let accessToken = dict["token"] as? String {
+            let previous = getToken()
+            applyToken(accessToken, previous: previous, cause: "passkey")
+        }
+        return dict
+    }
+
+    /// `POST /passkey/register/start` (requires auth). Returns the raw
+    /// response dict: WebAuthn creation options plus `challengeToken`.
+    public func passkeyRegisterStart() async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        let response = try await makeRequest("POST", "/passkey/register/start", [String: Any]())
+        guard let dict = response as? [String: Any],
+              dict["challengeToken"] is String else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey register start response")
+        }
+        return dict
+    }
+
+    /// `POST /passkey/register/finish` (requires auth). Returns
+    /// `{ success, credentialBackedUp?, invitation? }`. `inviteToken` (#466)
+    /// folds invitation acceptance into the registration call.
+    public func passkeyRegisterFinish(
+        credential: [String: Any],
+        challengeToken: String,
+        deviceName: String? = nil,
+        inviteToken: String? = nil
+    ) async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        var body: [String: Any] = [
+            "credential": credential,
+            "challengeToken": challengeToken,
+        ]
+        if let deviceName = deviceName, !deviceName.isEmpty {
+            body["deviceName"] = deviceName
+        }
+        let trimmedInviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedInviteToken = trimmedInviteToken, !trimmedInviteToken.isEmpty {
+            body["inviteToken"] = trimmedInviteToken
+        }
+        let response = try await makeRequest("POST", "/passkey/register/finish", body)
+        guard let dict = response as? [String: Any] else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey register finish response")
+        }
+        return dict
+    }
+
+    /// `GET /passkey/list` (requires auth). Returns `{ passkeys: [...] }`.
+    public func passkeyList() async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        let response = try await makeRequest("GET", "/passkey/list", nil)
+        guard let dict = response as? [String: Any] else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey list response")
+        }
+        return dict
+    }
+
+    /// `DELETE /passkey/{passkeyId}` (requires auth). Returns `{ success }`.
+    public func passkeyDelete(passkeyId: String) async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        let response = try await makeRequest("DELETE", "/passkey/\(passkeyId)", nil)
+        guard let dict = response as? [String: Any] else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey delete response")
+        }
+        return dict
+    }
+
+    /// `PATCH /passkey/{passkeyId}` (requires auth). Renames a passkey;
+    /// returns `{ passkey: {...} }`.
+    public func passkeyUpdate(passkeyId: String, deviceName: String) async throws -> [String: Any] {
+        guard let makeRequest = makeRequest else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        let body: [String: Any] = ["deviceName": deviceName]
+        let response = try await makeRequest("PATCH", "/passkey/\(passkeyId)", body)
+        guard let dict = response as? [String: Any] else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey update response")
+        }
         return dict
     }
 

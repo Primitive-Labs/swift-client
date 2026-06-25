@@ -161,6 +161,13 @@ final class TestContext {
         return TestUser(userId: userId, email: userEmail, name: userName, role: role, jwt: jwt)
     }
 
+    /// Update app settings via `PUT /app/{appId}/api/settings` (owner JWT).
+    /// Used by the passkey tests to flip `passkeyEnabled` / RP config the
+    /// same way the JS suite does (tests/api/http/app-passkeys.test.ts).
+    func updateAppSettings(appId: String, updates: [String: Any], jwt: String) async throws {
+        _ = try await appRequest(method: "PUT", appId: appId, path: "/settings", body: updates, jwt: jwt)
+    }
+
     // MARK: - Document Operations
 
     func createDocument(appId: String, jwt: String, title: String? = nil) async throws -> String {

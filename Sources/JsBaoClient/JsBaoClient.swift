@@ -36,6 +36,10 @@ public final class JsBaoClient: @unchecked Sendable {
     public private(set) var collectionTypeConfigs: CollectionTypeConfigsAPI!
     public private(set) var databaseTypeConfigs: DatabaseTypeConfigsAPI!
     public private(set) var analytics: AnalyticsAPI!
+    /// Deep-link / universal-link routing (#931). Set
+    /// `links.appBaseURL` to your app's public web base URL to enable
+    /// the `shareURL(...)` builders.
+    public private(set) var links: LinksAPI!
 
     /// Cache facade for general-purpose caching
     public private(set) var cache: CacheFacade!
@@ -2710,6 +2714,7 @@ public final class JsBaoClient: @unchecked Sendable {
             client: self
         )
         collections = CollectionsAPI(makeRequest: request)
+        links = LinksAPI(aliases: documents.aliases)
         // Realtime DB subscriptions (`databases.subscribe`). The registry
         // routes inbound `db.change` frames and is re-subscribed on reconnect.
         let dbSubscriptionRegistry = DatabaseSubscriptionRegistry(logger: logger)
@@ -2819,6 +2824,43 @@ public final class JsBaoClient: @unchecked Sendable {
             },
             hasOfflineGrantStored: { [weak self] in
                 self?.authController.isOfflineGrantAvailable() ?? false
+            },
+            passkeyAuthStart: { [weak self] in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyAuthStart()
+            },
+            passkeyAuthFinish: { [weak self] credential, challengeToken in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyAuthFinish(
+                    credential: credential, challengeToken: challengeToken
+                )
+            },
+            passkeyRegisterStart: { [weak self] in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyRegisterStart()
+            },
+            passkeyRegisterFinish: { [weak self] credential, challengeToken, deviceName, inviteToken in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyRegisterFinish(
+                    credential: credential,
+                    challengeToken: challengeToken,
+                    deviceName: deviceName,
+                    inviteToken: inviteToken
+                )
+            },
+            passkeyList: { [weak self] in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyList()
+            },
+            passkeyDelete: { [weak self] passkeyId in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyDelete(passkeyId: passkeyId)
+            },
+            passkeyUpdate: { [weak self] passkeyId, deviceName in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyUpdate(
+                    passkeyId: passkeyId, deviceName: deviceName
+                )
             }
         )
         // logout(waitForDisconnect:) tears down networking via this hook.

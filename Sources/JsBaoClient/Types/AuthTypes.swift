@@ -2,11 +2,11 @@ import Foundation
 
 // MARK: - Auth: typed request & response models
 //
-// Typed models for the NON-NATIVE auth surface exposed by `client.auth`
-// (issue #964): magic-link, OTP, auth-config, logout, and the offline-grant
-// suite. Native passkeys (#929) are DEFERRED and intentionally NOT modeled
-// here. Native Google sign-in (#928) lives in GoogleSignIn.swift
-// (`JsBaoClient.signInWithGoogle`), not under `client.auth`.
+// Typed models for the auth surface exposed by `client.auth` (issue #964):
+// magic-link, OTP, auth-config, logout, and the offline-grant suite.
+// Passkey models (#929) live in `PasskeyTypes.swift`. Native Google sign-in
+// (#928) lives in GoogleSignIn.swift (`JsBaoClient.signInWithGoogle`), not
+// under `client.auth`.
 //
 // Shapes mirror the JS client (`src/client/internal/authController.ts`):
 // timestamps stay as ISO-8601 `String`s exactly as JS exposes them, and only
@@ -89,11 +89,10 @@ public struct OtpVerifyResult: Decodable, Sendable, Equatable {
 
 /// The app's auth configuration, returned by `auth.getAuthConfig()`. Mirrors
 /// the object JS `AuthController.getAuthConfig()` resolves to (the
-/// `GET /oauth-config` envelope). The OAuth fields pair with native Google
-/// sign-in (#928); the Apple fields pair with `signInWithApple` (#409
-/// port). The passkey fields are surfaced for completeness (so a UI can
-/// decide what to show) — the native passkey flows (#929) live on a
-/// separate branch and are intentionally NOT part of this one.
+/// `GET /oauth-config` envelope). The passkey fields pair with the native
+/// passkey flows (#929 — see `AuthAPI+NativePasskeys.swift`); the OAuth
+/// fields pair with native Google sign-in (#928); the Apple fields pair
+/// with `signInWithApple` (#409 port).
 public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     public let appId: String
     public let name: String

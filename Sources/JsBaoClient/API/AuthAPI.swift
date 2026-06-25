@@ -3,9 +3,10 @@ import Foundation
 // MARK: - AuthAPI
 //
 // Typed `client.auth` namespace for the auth surface (issue #964):
-// magic-link, OTP, auth-config, logout, identity accessors, and the
-// offline-grant suite. Native passkeys (#929) live on a separate branch
-// and are intentionally NOT part of this one. Native Google sign-in (#928)
+// magic-link, OTP, auth-config, logout, identity accessors, the
+// offline-grant suite, and passkeys (#929 — wire-level methods below; the
+// native AuthenticationServices flows `registerPasskey` / `signInWithPasskey`
+// live in `AuthAPI+NativePasskeys.swift`). Native Google sign-in (#928)
 // lives on the client itself (`JsBaoClient.signInWithGoogle`,
 // GoogleSignIn.swift), matching the JS client where sign-in entry points
 // hang off the top-level client.
@@ -53,6 +54,18 @@ public final class AuthAPI: @unchecked Sendable {
     private let _revokeOfflineGrant: (_ options: RevokeOfflineGrantOptions) async throws -> Void
     private let _hasOfflineGrantStored: () -> Bool
 
+    // Passkeys (#929). Wire-level closures returning the raw response dicts;
+    // `internal` (not `private`) so the AuthenticationServices-gated native
+    // flows in `AuthAPI+NativePasskeys.swift` (a separate file) can reach
+    // them. All optional for source compatibility — unwired instances throw.
+    let _passkeyAuthStart: (() async throws -> [String: Any])?
+    let _passkeyAuthFinish: ((_ credential: [String: Any], _ challengeToken: String) async throws -> [String: Any])?
+    let _passkeyRegisterStart: (() async throws -> [String: Any])?
+    let _passkeyRegisterFinish: ((_ credential: [String: Any], _ challengeToken: String, _ deviceName: String?, _ inviteToken: String?) async throws -> [String: Any])?
+    let _passkeyList: (() async throws -> [String: Any])?
+    let _passkeyDelete: ((_ passkeyId: String) async throws -> [String: Any])?
+    let _passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> [String: Any])?
+
     public init(
         getUserId: @escaping () -> String?,
         getToken: @escaping () -> String?,
@@ -72,7 +85,14 @@ public final class AuthAPI: @unchecked Sendable {
         getOfflineGrantStatus: @escaping () -> OfflineGrantStatus,
         renewOfflineGrant: @escaping (_ options: EnableOfflineAccessOptions) async throws -> Bool,
         revokeOfflineGrant: @escaping (_ options: RevokeOfflineGrantOptions) async throws -> Void,
-        hasOfflineGrantStored: @escaping () -> Bool
+        hasOfflineGrantStored: @escaping () -> Bool,
+        passkeyAuthStart: (() async throws -> [String: Any])? = nil,
+        passkeyAuthFinish: ((_ credential: [String: Any], _ challengeToken: String) async throws -> [String: Any])? = nil,
+        passkeyRegisterStart: (() async throws -> [String: Any])? = nil,
+        passkeyRegisterFinish: ((_ credential: [String: Any], _ challengeToken: String, _ deviceName: String?, _ inviteToken: String?) async throws -> [String: Any])? = nil,
+        passkeyList: (() async throws -> [String: Any])? = nil,
+        passkeyDelete: ((_ passkeyId: String) async throws -> [String: Any])? = nil,
+        passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> [String: Any])? = nil
     ) {
         self._getUserId = getUserId
         self._getToken = getToken
@@ -93,6 +113,13 @@ public final class AuthAPI: @unchecked Sendable {
         self._renewOfflineGrant = renewOfflineGrant
         self._revokeOfflineGrant = revokeOfflineGrant
         self._hasOfflineGrantStored = hasOfflineGrantStored
+        self._passkeyAuthStart = passkeyAuthStart
+        self._passkeyAuthFinish = passkeyAuthFinish
+        self._passkeyRegisterStart = passkeyRegisterStart
+        self._passkeyRegisterFinish = passkeyRegisterFinish
+        self._passkeyList = passkeyList
+        self._passkeyDelete = passkeyDelete
+        self._passkeyUpdate = passkeyUpdate
     }
 
     // MARK: - Identity / token accessors
@@ -284,5 +311,152 @@ public final class AuthAPI: @unchecked Sendable {
     /// `isOfflineGrantAvailable()` (Keychain presence check).
     public func hasOfflineGrantStored() -> Bool {
         _hasOfflineGrantStored()
+    }
+
+    // MARK: - Passkeys (#929) — wire-level methods
+    //
+    // These mirror the JS client one-to-one (`passkeyAuthStart`,
+    // `passkeyAuthFinish`, `passkeyRegisterStart`, `passkeyRegisterFinish`,
+    // `passkeyList`, `passkeyDelete`, `passkeyUpdate`). Most apps should use
+    // the native conveniences `signInWithPasskey(...)` /
+    // `registerPasskey(...)` (see `AuthAPI+NativePasskeys.swift`), which
+    // drive the system passkey sheet and call these under the hood.
+
+    /// Start the passkey sign-in flow. Mirrors JS `passkeyAuthStart()`:
+    /// returns the WebAuthn request options (challenge is base64url) plus a
+    /// short-lived `challengeToken` to pass back to `passkeyAuthFinish`.
+    public func passkeyAuthStart() async throws -> PasskeyAuthStartResult {
+        let (options, challengeToken) = try await passkeyAuthStartRaw()
+        return PasskeyAuthStartResult(
+            options: try JSONCoding.decode(JSONValue.self, from: options),
+            challengeToken: challengeToken
+        )
+    }
+
+    /// Complete passkey sign-in with an authenticator's
+    /// `AuthenticationResponseJSON` (all binary fields base64url). Mirrors JS
+    /// `passkeyAuthFinish(credential, challengeToken)`. On success the SDK
+    /// has already applied the returned access token (cause `"passkey"`).
+    public func passkeyAuthFinish(
+        credential: [String: Any],
+        challengeToken: String
+    ) async throws -> PasskeySignInResult {
+        let raw = try await passkeyAuthFinishRaw(credential: credential, challengeToken: challengeToken)
+        return try JSONCoding.decode(PasskeySignInResult.self, from: raw)
+    }
+
+    /// Start registering a passkey for the **current (authenticated) user**.
+    /// Mirrors JS `passkeyRegisterStart()`: returns the WebAuthn creation
+    /// options (challenge and `user.id` are base64url) plus a short-lived
+    /// `challengeToken` to pass back to `passkeyRegisterFinish`.
+    public func passkeyRegisterStart() async throws -> PasskeyRegisterStartResult {
+        let (options, challengeToken) = try await passkeyRegisterStartRaw()
+        return PasskeyRegisterStartResult(
+            options: try JSONCoding.decode(JSONValue.self, from: options),
+            challengeToken: challengeToken
+        )
+    }
+
+    /// Complete passkey registration with an authenticator's
+    /// `RegistrationResponseJSON`. Mirrors JS
+    /// `passkeyRegisterFinish({ credential, challengeToken, deviceName,
+    /// inviteToken })`.
+    public func passkeyRegisterFinish(
+        credential: [String: Any],
+        challengeToken: String,
+        deviceName: String? = nil,
+        inviteToken: String? = nil
+    ) async throws -> PasskeyRegistrationResult {
+        let raw = try await passkeyRegisterFinishRaw(
+            credential: credential,
+            challengeToken: challengeToken,
+            deviceName: deviceName,
+            inviteToken: inviteToken
+        )
+        return try JSONCoding.decode(PasskeyRegistrationResult.self, from: raw)
+    }
+
+    /// List the current user's registered passkeys. Mirrors JS
+    /// `passkeyList()`.
+    public func passkeyList() async throws -> PasskeyListResult {
+        guard let passkeyList = _passkeyList else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        let raw = try await passkeyList()
+        return try JSONCoding.decode(PasskeyListResult.self, from: raw)
+    }
+
+    /// Delete a registered passkey by id. Mirrors JS
+    /// `passkeyDelete(passkeyId)`.
+    @discardableResult
+    public func passkeyDelete(passkeyId: String) async throws -> PasskeyDeleteResult {
+        guard let passkeyDelete = _passkeyDelete else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        let raw = try await passkeyDelete(passkeyId)
+        return try JSONCoding.decode(PasskeyDeleteResult.self, from: raw)
+    }
+
+    /// Rename a registered passkey. Mirrors JS
+    /// `passkeyUpdate(passkeyId, { deviceName })`.
+    @discardableResult
+    public func passkeyUpdate(passkeyId: String, deviceName: String) async throws -> PasskeyUpdateResult {
+        guard let passkeyUpdate = _passkeyUpdate else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        let raw = try await passkeyUpdate(passkeyId, deviceName)
+        return try JSONCoding.decode(PasskeyUpdateResult.self, from: raw)
+    }
+
+    // MARK: Passkeys — raw plumbing shared with the native flows
+
+    /// Like `passkeyAuthStart()` but returns the options as the raw
+    /// `[String: Any]` dict the native flow parses with `PasskeyWire`.
+    func passkeyAuthStartRaw() async throws -> (options: [String: Any], challengeToken: String) {
+        guard let passkeyAuthStart = _passkeyAuthStart else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        var dict = try await passkeyAuthStart()
+        guard let challengeToken = dict["challengeToken"] as? String else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey auth start response")
+        }
+        dict.removeValue(forKey: "challengeToken")
+        return (dict, challengeToken)
+    }
+
+    func passkeyAuthFinishRaw(
+        credential: [String: Any],
+        challengeToken: String
+    ) async throws -> [String: Any] {
+        guard let passkeyAuthFinish = _passkeyAuthFinish else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        return try await passkeyAuthFinish(credential, challengeToken)
+    }
+
+    /// Like `passkeyRegisterStart()` but returns the options as the raw
+    /// `[String: Any]` dict the native flow parses with `PasskeyWire`.
+    func passkeyRegisterStartRaw() async throws -> (options: [String: Any], challengeToken: String) {
+        guard let passkeyRegisterStart = _passkeyRegisterStart else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        var dict = try await passkeyRegisterStart()
+        guard let challengeToken = dict["challengeToken"] as? String else {
+            throw JsBaoError(code: .unavailable, message: "Invalid passkey register start response")
+        }
+        dict.removeValue(forKey: "challengeToken")
+        return (dict, challengeToken)
+    }
+
+    func passkeyRegisterFinishRaw(
+        credential: [String: Any],
+        challengeToken: String,
+        deviceName: String?,
+        inviteToken: String?
+    ) async throws -> [String: Any] {
+        guard let passkeyRegisterFinish = _passkeyRegisterFinish else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        return try await passkeyRegisterFinish(credential, challengeToken, deviceName, inviteToken)
     }
 }
