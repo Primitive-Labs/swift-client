@@ -43,7 +43,7 @@ let package = Package(
     ],
     dependencies: [
         // Local fork of yswift with observe_update_v1 support
-        .package(url: "https://github.com/Primitive-Labs/yswift-fork.git", branch: "main"),
+        .package(url: "https://github.com/Primitive-Labs/yswift-fork.git", branch: "alpha"),
         .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
     ],
     targets: [
