@@ -276,16 +276,22 @@ final class ApiParityTests: XCTestCase {
         let api = BlobBucketsAPI(makeRequest: r.make)
         r.response = [
             "bucketId": "b1", "appId": "app1", "bucketKey": "k",
-            "name": "n", "ttlTier": "permanent", "accessPolicy": "authenticated",
+            "name": "n", "ttlTier": "permanent", "preset": "personal-uploads",
+            "accessPolicy": "personal-uploads",
             "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
             "modifiedAt": "2024-01-01T00:00:00Z",
         ]
-        _ = try await api.createBucket(params: CreateBlobBucketParams(
+        let bucket = try await api.createBucket(params: CreateBlobBucketParams(
             bucketKey: "k", name: "n",
-            ttlTier: .permanent, accessPolicy: .authenticated
+            ttlTier: .permanent, preset: .personalUploads
         ))
         XCTAssertEqual(r.method, "POST")
         XCTAssertEqual(r.path, "/blob-buckets")
+        XCTAssertEqual(bucket.preset, .personalUploads)
+        XCTAssertEqual(bucket.accessPolicy, "personal-uploads")
+        let body = r.body as? [String: Any]
+        XCTAssertEqual(body?["preset"] as? String, "personal-uploads")
+        XCTAssertNil(body?["accessPolicy"])
     }
 
     func test_blobBuckets_listBuckets_unwrapsItems() async throws {
@@ -294,7 +300,8 @@ final class ApiParityTests: XCTestCase {
         func bucketJSON(_ id: String) -> [String: Any] {
             [
                 "bucketId": id, "appId": "app1", "bucketKey": "k-\(id)",
-                "name": "n", "ttlTier": "permanent", "accessPolicy": "authenticated",
+                "name": "n", "ttlTier": "permanent", "preset": "authenticated",
+                "accessPolicy": "authenticated",
                 "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
                 "modifiedAt": "2024-01-01T00:00:00Z",
             ]
@@ -303,6 +310,35 @@ final class ApiParityTests: XCTestCase {
         let buckets = try await api.listBuckets()
         XCTAssertEqual(buckets.count, 2)
         XCTAssertEqual(buckets.first?.bucketId, "b1")
+    }
+
+    func test_blobBuckets_updateBucket_PATCH() async throws {
+        let r = CallRecorder()
+        let api = BlobBucketsAPI(makeRequest: r.make)
+        r.response = [
+            "bucketId": "b1", "appId": "app1", "bucketKey": "k",
+            "name": "Renamed", "description": NSNull(), "ttlTier": "permanent",
+            "preset": "admin-only", "accessPolicy": "admin-only",
+            "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
+            "modifiedAt": "2024-01-02T00:00:00Z",
+        ]
+        let bucket = try await api.updateBucket(
+            bucketIdOrKey: "k",
+            params: UpdateBlobBucketParams(
+                preset: .adminOnly,
+                ruleSetId: .clear,
+                name: "Renamed",
+                description: .clear
+            )
+        )
+        XCTAssertEqual(r.method, "PATCH")
+        XCTAssertEqual(r.path, "/blob-buckets/k")
+        XCTAssertEqual(bucket.preset, .adminOnly)
+        let body = r.body as? [String: Any]
+        XCTAssertEqual(body?["preset"] as? String, "admin-only")
+        XCTAssertEqual(body?["name"] as? String, "Renamed")
+        XCTAssertTrue(body?["ruleSetId"] is NSNull)
+        XCTAssertTrue(body?["description"] is NSNull)
     }
 
     func test_blobBuckets_list_buildsQS() async throws {
@@ -329,6 +365,56 @@ final class ApiParityTests: XCTestCase {
         _ = try await api.delete(bucketIdOrKey: "k", blobId: "b1")
         XCTAssertEqual(r.method, "DELETE")
         XCTAssertEqual(r.path, "/blob-buckets/k/blobs/b1")
+    }
+
+    // Batch delete overload (#1494 / parity with #1455). POSTs to
+    // `.../blobs/delete` with `{ blobIds }`, decodes `{ deleted, blobIds,
+    // bucketId }`.
+    func test_blobBuckets_deleteBatch_POST() async throws {
+        let r = CallRecorder()
+        let api = BlobBucketsAPI(makeRequest: r.make)
+        r.response = [
+            "deleted": 3,
+            "blobIds": ["b1", "b2", "b3"],
+            "bucketId": "k",
+        ]
+        let result = try await api.delete(
+            bucketIdOrKey: "k", blobIds: ["b1", "b2", "b3"]
+        )
+        XCTAssertEqual(r.method, "POST")
+        XCTAssertEqual(r.path, "/blob-buckets/k/blobs/delete")
+        // Body carries the ids under `blobIds`, in order.
+        let body = r.body as? [String: Any]
+        XCTAssertEqual(body?["blobIds"] as? [String], ["b1", "b2", "b3"])
+        // Response decodes into the batch result shape.
+        XCTAssertEqual(result.deleted, 3)
+        XCTAssertEqual(result.blobIds, ["b1", "b2", "b3"])
+        XCTAssertEqual(result.bucketId, "k")
+    }
+
+    // The bucket segment is percent-encoded (a space must not leak into the
+    // path), matching how the single-blob and other bucket paths escape it.
+    func test_blobBuckets_deleteBatch_encodesBucket() async throws {
+        let r = CallRecorder()
+        let api = BlobBucketsAPI(makeRequest: r.make)
+        r.response = ["deleted": 1, "blobIds": ["b1"], "bucketId": "a b"]
+        _ = try await api.delete(bucketIdOrKey: "a b", blobIds: ["b1"])
+        XCTAssertEqual(r.path, "/blob-buckets/a%20b/blobs/delete")
+    }
+
+    // Empty array is still a well-formed request (the server treats it as a
+    // 200 no-op returning `{ deleted: 0, blobIds: [] }`).
+    func test_blobBuckets_deleteBatch_emptyArray() async throws {
+        let r = CallRecorder()
+        let api = BlobBucketsAPI(makeRequest: r.make)
+        r.response = ["deleted": 0, "blobIds": [String](), "bucketId": "k"]
+        let result = try await api.delete(bucketIdOrKey: "k", blobIds: [])
+        XCTAssertEqual(r.method, "POST")
+        XCTAssertEqual(r.path, "/blob-buckets/k/blobs/delete")
+        let body = r.body as? [String: Any]
+        XCTAssertEqual(body?["blobIds"] as? [String], [])
+        XCTAssertEqual(result.deleted, 0)
+        XCTAssertEqual(result.blobIds, [])
     }
 
     func test_blobBuckets_signedUrl_POSTwithExpires() async throws {

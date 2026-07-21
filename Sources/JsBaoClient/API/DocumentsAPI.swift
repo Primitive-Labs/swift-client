@@ -443,6 +443,60 @@ public final class DocumentsAPI: @unchecked Sendable {
         return try JSONCoding.decode(PermissionUpdateResult.self, from: result)
     }
 
+    // MARK: - Link Access ("anyone with the link")
+
+    /// Turn on "anyone with the link" access for a document. Any signed-in app
+    /// user who has the document id then resolves to at least `level` without
+    /// an explicit grant. Requires document owner, app owner, or read-write
+    /// editor. Mirrors js-bao's `documents.setLinkAccess(id, level)`.
+    ///
+    /// - Parameters:
+    ///   - documentId: The document to share via link.
+    ///   - level: The shared level — `.reader` or `.readWrite`.
+    @discardableResult
+    public func setLinkAccess(
+        documentId: String,
+        level: DocumentLinkAccessLevel
+    ) async throws -> LinkAccessResult {
+        // Root-document guard — mirrors js-bao (documentsApi.ts:1863-1865).
+        if client?.isRootDocument(documentId) == true {
+            throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be shared")
+        }
+        let body: [String: Any] = ["level": level.rawValue]
+        let result = try await makeRequest("PUT", "/documents/\(documentId)/link-access", body)
+        return try JSONCoding.decode(LinkAccessResult.self, from: result)
+    }
+
+    /// Read the current "anyone with the link" state for a document.
+    /// Authorized for any caller who can read the document OR manage its
+    /// sharing (document owner, app owner, or read-write editor), so an app
+    /// owner can inspect the state without a content grant — which the
+    /// content-gated `get(documentId:)` would refuse. Returns
+    /// `linkAccess == nil` when link access is off.
+    ///
+    /// Mirrors js-bao's `documents.getLinkAccess(id)`. No client-side
+    /// root-document guard: the server answers root documents with a 403,
+    /// matching js-bao, which does not pre-check either.
+    public func getLinkAccess(documentId: String) async throws -> LinkAccessResult {
+        let result = try await makeRequest("GET", "/documents/\(documentId)/link-access", nil)
+        return try JSONCoding.decode(LinkAccessResult.self, from: result)
+    }
+
+    /// Turn off "anyone with the link" access for a document. Existing explicit
+    /// grants are unaffected; link-only viewers lose access. Mirrors js-bao's
+    /// `documents.clearLinkAccess(id)`.
+    ///
+    /// - Parameter documentId: The document to stop sharing via link.
+    @discardableResult
+    public func clearLinkAccess(documentId: String) async throws -> LinkAccessResult {
+        // Root-document guard — mirrors js-bao (documentsApi.ts:1880-1882).
+        if client?.isRootDocument(documentId) == true {
+            throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be shared")
+        }
+        let result = try await makeRequest("DELETE", "/documents/\(documentId)/link-access", nil)
+        return try JSONCoding.decode(LinkAccessResult.self, from: result)
+    }
+
     // MARK: - Root Document
 
     /// Get the root document for the app.
@@ -1069,9 +1123,26 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
     }
 
     /// List all aliases for a document.
+    ///
+    /// Decodes each entry independently and drops entries that fail —
+    /// a server deployed before #1168's server-side filter can still
+    /// return retained legacy `scope: "app"` rows, and one such row must
+    /// not fail the whole response (the remaining user aliases are valid).
     public func listForDocument(documentId: String) async throws -> [DocumentAliasInfo] {
         let result = try await makeRequest("GET", "/documents/\(documentId)/aliases", nil)
-        return try JSONCoding.decode([DocumentAliasInfo].self, from: result)
+        let entries = try JSONCoding.decode(
+            [FailableEntry<DocumentAliasInfo>].self, from: result
+        )
+        return entries.compactMap(\.value)
+    }
+
+    /// Wrapper that swallows a single element's decode failure instead of
+    /// failing the surrounding array.
+    private struct FailableEntry<T: Decodable>: Decodable {
+        let value: T?
+        init(from decoder: Decoder) throws {
+            value = try? T(from: decoder)
+        }
     }
 
     private func isNotFoundError(_ error: Error) -> Bool {

@@ -44,14 +44,14 @@ final class QueryDocumentsFilterTests: XCTestCase {
 
     func testDocumentsSingleScopeReturnsOnlyThatDoc() throws {
         let multi = try seededTrio()
-        let rows = multi.query(nil, options: QueryOptions(documents: ["docA"]))
+        let rows = try multi.query(nil, options: QueryOptions(documents: ["docA"]))
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["a1"])
     }
 
     func testDocumentsMultipleScopeUnionsMatches() throws {
         let multi = try seededTrio()
-        let rows = multi.query(nil, options: QueryOptions(documents: ["docA", "docC"]))
+        let rows = try multi.query(nil, options: QueryOptions(documents: ["docA", "docC"]))
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["a1", "c1"])
     }
@@ -60,13 +60,13 @@ final class QueryDocumentsFilterTests: XCTestCase {
     /// nothing (`WHERE 1 = 0`) rather than everything.
     func testDocumentsEmptyListMatchesNothing() throws {
         let multi = try seededTrio()
-        let rows = multi.query(nil, options: QueryOptions(documents: []))
+        let rows = try multi.query(nil, options: QueryOptions(documents: []))
         XCTAssertTrue(rows.isEmpty)
     }
 
     func testDocumentsNilActsLikeNoScope() throws {
         let multi = try seededTrio()
-        let rows = multi.query(nil, options: QueryOptions(documents: nil))
+        let rows = try multi.query(nil, options: QueryOptions(documents: nil))
         XCTAssertEqual(rows.count, 3)
     }
 
@@ -74,7 +74,7 @@ final class QueryDocumentsFilterTests: XCTestCase {
     /// the filter and the documents scope.
     func testDocumentsCombinesWithFilter() throws {
         let multi = try seededTrio()
-        let rows = multi.query(
+        let rows = try multi.query(
             ["rank": ["$gte": 2]],
             options: QueryOptions(documents: ["docB"])
         )
@@ -87,7 +87,7 @@ final class QueryDocumentsFilterTests: XCTestCase {
     /// Count honors the documents scope.
     func testCountRespectsDocumentsScope() throws {
         let multi = try seededTrio()
-        let c = multi.count(options: QueryOptions(documents: ["docA", "docB"]))
+        let c = try multi.count(options: QueryOptions(documents: ["docA", "docB"]))
         XCTAssertEqual(c, 2)
     }
 

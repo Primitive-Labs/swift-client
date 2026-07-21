@@ -157,6 +157,30 @@ final class GoogleSignInUnitTests: XCTestCase {
         XCTAssertEqual(bare, "/oauth/callback?code=abc&state=c3RhdGU%3D")
     }
 
+    func testHandleOAuthCallbackEmitsGoogleAuthCause() async throws {
+        let emitter = EventEmitter()
+        let controller = AuthController(
+            appId: "test-app",
+            apiUrl: "http://localhost:8787",
+            logger: Logger(level: .error),
+            offlineStore: OfflineStore(),
+            emitter: emitter,
+            refreshProxy: nil,
+            persistConfig: AuthConfig()
+        )
+        controller.makeRequest = { _, _, _ in
+            ["token": "token-google", "isNewUser": false]
+        }
+
+        let events = try await collectEvents(from: emitter, event: .authSuccess) {
+            _ = try await controller.handleOAuthCallback(code: "code", state: "state")
+        }
+
+        let success = try XCTUnwrap(events.first as? AuthSuccessEvent)
+        XCTAssertEqual(success.token, "token-google")
+        XCTAssertEqual(success.cause, "google")
+    }
+
     func testStrictPercentEncodeLeavesUnreservedCharacters() throws {
         let encoded = try AuthController.strictPercentEncode("AZaz09-._~")
         XCTAssertEqual(encoded, "AZaz09-._~")

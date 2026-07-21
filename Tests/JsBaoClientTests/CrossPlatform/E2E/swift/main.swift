@@ -472,7 +472,11 @@ func cmdResolveRelationship(
     docB64: String,
     modelName: String,
     id: String,
-    relationship: String
+    relationship: String,
+    limit: Int? = nil,
+    afterCursor: String? = nil,
+    beforeCursor: String? = nil,
+    direction: String? = nil
 ) {
     let doc = decodeDoc(docB64)
     SchemaSync.clearCache()
@@ -497,7 +501,39 @@ func cmdResolveRelationship(
         return
     }
 
+    let cursorDirection: CursorDirection = (direction == "backward") ? .backward : .forward
+
     do {
+        // Paginated hasManyThrough (#1230): when `limit` is present, use
+        // the paginated overload and echo back the join-leg cursors so the
+        // cross-language parity test can walk pages on either side.
+        if relType == "hasManyThrough", let limit {
+            guard let joinModelName = rel.properties["joinModel"] else {
+                emitError("hasManyThrough '\(relationship)' missing 'joinModel'")
+            }
+            let joinModel = DynamicModel(doc: doc, schema: schemaForModel(joinModelName))
+            let page = try sourceRec.hasManyThrough(
+                relationship: relationship,
+                joinModel: joinModel,
+                target: targetModel,
+                limit: limit,
+                afterCursor: afterCursor,
+                beforeCursor: beforeCursor,
+                direction: cursorDirection
+            )
+            var out: [String: Any] = [
+                "results": page.data.map { primitiveRecordToJson($0, schema: targetSchema) },
+                "hasMore": page.hasMore,
+            ]
+            // Cursors are the engine's OPAQUE base64 tokens now (#1607) —
+            // echoed verbatim so the parity test can decode + compare their
+            // structure and feed them back into either client.
+            if let next = page.nextCursor { out["nextCursor"] = next }
+            if let prev = page.prevCursor { out["prevCursor"] = prev }
+            emit(out)
+            return
+        }
+
         let resolved: [PrimitiveRecord]
         switch relType {
         case "refersTo":
@@ -594,7 +630,11 @@ while let cmd = readCommand() {
         }
         cmdResolveRelationship(
             docB64: docB64, modelName: modelName,
-            id: id, relationship: relationship
+            id: id, relationship: relationship,
+            limit: cmd["limit"] as? Int,
+            afterCursor: cmd["afterCursor"] as? String,
+            beforeCursor: cmd["beforeCursor"] as? String,
+            direction: cmd["direction"] as? String
         )
 
     default:

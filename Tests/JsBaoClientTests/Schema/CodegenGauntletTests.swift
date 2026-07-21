@@ -153,7 +153,7 @@ final class CodegenGauntletTests: XCTestCase {
             boundedName: "row-test",
             score: 7
         ))
-        let rows = model.dynamic.query(["id": "row1"])
+        let rows = try model.dynamic.query(["id": "row1"])
         let typed = rows.compactMap(CrashTestRecord.init(row:))
         XCTAssertEqual(typed.count, 1,
                        "compactMap dropped the row — init?(row:) returned nil")
@@ -180,7 +180,7 @@ final class CodegenGauntletTests: XCTestCase {
             requiredTags: ["t"],
             active: false
         ))
-        let rows = model.dynamic.query(nil, options: QueryOptions(sort: ["id": 1]))
+        let rows = try model.dynamic.query(nil, options: QueryOptions(sort: ["id": 1]))
         let typed = rows.compactMap(CrashTestRecord.init(row:))
         XCTAssertEqual(typed.count, 2,
                        "init?(row:) dropped a boolean row")
@@ -301,7 +301,7 @@ final class CodegenGauntletTests: XCTestCase {
         try model.create(CrashTestRecord(
             id: "low",  requiredTags: ["t"], email: "l@e.com", score: 10
         ))
-        let rows = model.dynamic.query(["score": ["$gte": 50]])
+        let rows = try model.dynamic.query(["score": ["$gte": 50]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertTrue(ids.contains("high"))
         XCTAssertFalse(ids.contains("low"))
@@ -328,7 +328,7 @@ final class CodegenGauntletTests: XCTestCase {
             boundedName: "Gamma thing",
             score: 999
         ))
-        let rows = model.dynamic.query([
+        let rows = try model.dynamic.query([
             "$or": [
                 ["boundedName": ["$containsText": "widget"]],
                 ["score": ["$gte": 500]],
@@ -350,7 +350,7 @@ final class CodegenGauntletTests: XCTestCase {
                 score: score
             ))
         }
-        let sorted = model.dynamic.query(nil, options: QueryOptions(
+        let sorted = try model.dynamic.query(nil, options: QueryOptions(
             sortOrder: [("score", -1), ("id", 1)],
             limit: 1000
         ))
@@ -377,7 +377,7 @@ final class CodegenGauntletTests: XCTestCase {
             ))
         }
 
-        let groups = model.dynamic.aggregate(AggregateOptions(
+        let groups = try model.dynamic.aggregate(AggregateOptions(
             groupBy: ["active"],
             operations: [AggregateOperation(type: .count, outputField: "n")]
         ))

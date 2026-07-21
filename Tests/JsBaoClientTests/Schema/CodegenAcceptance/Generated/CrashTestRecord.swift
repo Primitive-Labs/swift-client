@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
+internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
     internal static let modelName = "crashTest"
     internal static let primitiveSchema = PrimitiveSchema(
         name: "crashTest",
@@ -34,6 +34,8 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
     internal var score: Double?
     internal var active: Bool?
 
+    internal var related: RelatedRecords = .empty
+
     /// `true` when the caller pinned `id` via the designated
     /// initializer; `false` when it was auto-generated. Drives the
     /// explicit-id-conflict check on `save(in:upsertOn:)` /
@@ -61,6 +63,7 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.`where` = `where`
         self.score = score
         self.active = active
+        self.related = .empty
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -87,6 +90,7 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.`where` = `where`
         self.score = score
         self.active = active
+        self.related = .empty
         self._explicitId = false
     }
 
@@ -102,6 +106,7 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.`where` = record["where"]?.asString
         self.score = record["score"]?.asNumber
         self.active = record["active"]?.asBoolean
+        self.related = .empty
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
@@ -118,6 +123,7 @@ internal struct CrashTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.`where` = row["where"] as? String
         self.score = row["score"] as? Double
         self.active = (row["active"] as? Bool) ?? (row["active"] as? Int).map({ $0 != 0 })
+        self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
     }
 
     internal func primitiveValues() -> [String: PrimitiveValue] {
@@ -173,9 +179,18 @@ internal extension CrashTestRecord {
 
     /// Query across all open documents. Rows that fail to decode (schema
     /// drift) are skipped. Scope to one/some docs via `options.documents`.
-    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [CrashTestRecord] {
-        JsBaoClient.requireDefault()
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [CrashTestRecord] {
+        try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: filter, options: options)
+            .compactMap { CrashTestRecord(row: $0) }
+    }
+
+    /// Query across all open documents and batch-prefetch related
+    /// records into each row's `related` bag. Mirrors JS
+    /// `BaseModel.query(filter, { include })`.
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [CrashTestRecord] {
+        try JsBaoClient.requireDefault()
+            .queryShared(primitiveSchema, filter: filter, options: options, include: include)
             .compactMap { CrashTestRecord(row: $0) }
     }
 
@@ -194,17 +209,30 @@ internal extension CrashTestRecord {
         )
     }
 
-    /// Count across all open documents.
-    static func count(_ filter: DocumentFilter? = nil) -> Int {
-        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    /// Paginated query with query-time relationship includes.
+    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<CrashTestRecord> {
+        let page = try JsBaoClient.requireDefault()
+            .queryPagedShared(primitiveSchema, filter: filter, options: options, include: include)
+        return PagedQueryResult(
+            data: page.data.compactMap { CrashTestRecord(row: $0) },
+            nextCursor: page.nextCursor,
+            prevCursor: page.prevCursor,
+            hasMore: page.hasMore
+        )
     }
 
-    /// Every record across all open documents. `async` to match the JS
-    /// client's `Model.findAll()` call shape (#992). Throws
-    /// `PrimitiveDecodeError` if any stored row no longer decodes as
-    /// `CrashTestRecord` — JS `findAll` never drops rows, so schema drift
-    /// surfaces loudly instead of silently shrinking the result.
-    static func findAll() async throws -> [CrashTestRecord] {
+    /// Count across all open documents.
+    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    }
+
+    /// Every record across all open documents. Synchronous like the
+    /// rest of the facade reads (#1156) — the shared store never
+    /// suspends. Throws `PrimitiveDecodeError` if any stored row no
+    /// longer decodes as `CrashTestRecord` — JS `findAll` never drops rows,
+    /// so schema drift surfaces loudly instead of silently shrinking
+    /// the result.
+    static func findAll() throws -> [CrashTestRecord] {
         try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: nil, options: nil)
             .map { row in
@@ -216,11 +244,11 @@ internal extension CrashTestRecord {
     }
 
     /// First record with `id` across all open documents; `nil` only when
-    /// no open document has it. `async` to match the JS client's
-    /// `Model.find(id)` call shape (#992). Throws `PrimitiveDecodeError`
-    /// when the row exists but no longer decodes as `CrashTestRecord` —
-    /// distinct from the `nil` not-found case.
-    static func find(_ id: String) async throws -> CrashTestRecord? {
+    /// no open document has it. Synchronous like the rest of the facade
+    /// reads (#1156) — the shared store never suspends. Throws
+    /// `PrimitiveDecodeError` when the row exists but no longer decodes
+    /// as `CrashTestRecord` — distinct from the `nil` not-found case.
+    static func find(_ id: String) throws -> CrashTestRecord? {
         guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {
             return nil
         }
@@ -244,9 +272,19 @@ internal extension CrashTestRecord {
     /// The first record matching `filter` across all open documents,
     /// or `nil`. Equivalent to `query(filter, options).first` — mirrors
     /// the JS client's `Model.queryOne(filter, options)`.
-    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> CrashTestRecord? {
-        JsBaoClient.requireDefault()
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> CrashTestRecord? {
+        try JsBaoClient.requireDefault()
             .queryOneShared(primitiveSchema, filter: filter, options: options)
+            .flatMap { CrashTestRecord(row: $0) }
+    }
+
+    /// The first record matching `filter` with query-time relationship
+    /// includes attached under `related`, or `nil`. Equivalent to
+    /// `query(filter, options, include:).first` — mirrors the JS client's
+    /// `Model.queryOne(filter, { include })`.
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> CrashTestRecord? {
+        try JsBaoClient.requireDefault()
+            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)
             .flatMap { CrashTestRecord(row: $0) }
     }
 
@@ -258,8 +296,8 @@ internal extension CrashTestRecord {
     }
 
     /// Aggregate (group / count / sum / avg / …) across all open documents.
-    static func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
-        JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
+    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+        try JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
     }
 
     // MARK: Writes (target one document; throw if it isn't open)

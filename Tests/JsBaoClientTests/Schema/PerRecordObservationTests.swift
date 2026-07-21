@@ -45,11 +45,11 @@ final class PerRecordObservationTests: XCTestCase {
         }
         // Make sure any queued observer work from the seeds has
         // drained before we snapshot the row-write counter.
-        _ = model.query(nil)
+        _ = try model.query(nil)
         let before = model.queryEngineInternal.rowWriteCount
 
         try model.update(id: "r42", values: ["score": .number(999)])
-        _ = model.query(nil)  // drain
+        _ = try model.query(nil)  // drain
 
         let delta = model.queryEngineInternal.rowWriteCount - before
         // One row write from the direct sync path; the root-map
@@ -68,11 +68,11 @@ final class PerRecordObservationTests: XCTestCase {
         _ = try model.create(id: "r1", values: [
             "name": .string("before"), "score": .number(1),
         ])
-        let first = model.query(["id": "r1"])
+        let first = try model.query(["id": "r1"])
         XCTAssertEqual(first.first?["name"] as? String, "before")
 
         try model.update(id: "r1", values: ["name": .string("after")])
-        let second = model.query(["id": "r1"])
+        let second = try model.query(["id": "r1"])
         XCTAssertEqual(second.first?["name"] as? String, "after",
                        "query immediately after update must see new state")
     }
@@ -81,9 +81,9 @@ final class PerRecordObservationTests: XCTestCase {
         SchemaSync.clearCache()
         let model = DynamicModel(doc: YDocument(), schema: schema)
         _ = try model.create(id: "r1", values: ["name": .string("x")])
-        XCTAssertEqual(model.query(nil).count, 1)
+        XCTAssertEqual(try model.query(nil).count, 1)
         model.delete(id: "r1")
-        XCTAssertEqual(model.query(nil).count, 0)
+        XCTAssertEqual(try model.query(nil).count, 0)
     }
 
     // MARK: - Remote catch-up
@@ -113,7 +113,7 @@ final class PerRecordObservationTests: XCTestCase {
         }
 
         // query() drains pending observer work before reading.
-        let rows = modelA.query(["id": "remote_r"])
+        let rows = try modelA.query(["id": "remote_r"])
         XCTAssertEqual(rows.first?["name"] as? String, "from-b")
         XCTAssertEqual(rows.first?["score"] as? Double, 7)
     }
@@ -137,7 +137,7 @@ final class PerRecordObservationTests: XCTestCase {
         docB.transactSync { txn in
             _ = try? txn.transactionApplyUpdate(update: Array(fullUpdate))
         }
-        XCTAssertEqual(modelB.query(nil).count, 1)
+        XCTAssertEqual(try modelB.query(nil).count, 1)
 
         // A deletes; B receives the delete.
         modelA.delete(id: "shared")
@@ -147,7 +147,7 @@ final class PerRecordObservationTests: XCTestCase {
         docB.transactSync { txn in
             _ = try? txn.transactionApplyUpdate(update: Array(deleteUpdate))
         }
-        XCTAssertEqual(modelB.query(nil).count, 0,
+        XCTAssertEqual(try modelB.query(nil).count, 0,
                        "Remote delete must propagate into SQLite")
     }
 
@@ -167,7 +167,7 @@ final class PerRecordObservationTests: XCTestCase {
         // confirms the row reflects the new state.
         record["score"] = .number(42)
 
-        let row = model.query(["id": "r1"]).first
+        let row = try model.query(["id": "r1"]).first
         XCTAssertEqual(row?["score"] as? Double, 42)
     }
 
@@ -181,7 +181,7 @@ final class PerRecordObservationTests: XCTestCase {
         let doc = YDocument()
         var model: DynamicModel? = DynamicModel(doc: doc, schema: schema)
         _ = try model!.create(id: "r1", values: ["name": .string("alive")])
-        XCTAssertEqual(model!.query(nil).count, 1)
+        XCTAssertEqual(try model!.query(nil).count, 1)
 
         // Drop the model. Its observers should unsubscribe as the
         // subscriptions deallocate (Rust Drop fires on Arc=0).
@@ -201,7 +201,7 @@ final class PerRecordObservationTests: XCTestCase {
         // (from before) and r2 (from after deinit) via the initial
         // findAll pass.
         let fresh = DynamicModel(doc: doc, schema: schema)
-        let rows = fresh.query(nil)
+        let rows = try fresh.query(nil)
         XCTAssertEqual(Set(rows.compactMap { $0["id"] as? String }),
                        ["r1", "r2"])
     }
@@ -218,6 +218,6 @@ final class PerRecordObservationTests: XCTestCase {
         // Drop the first model; bring up a new one on the same doc.
         // Init's initial seed should repopulate the mirror.
         let second = DynamicModel(doc: doc, schema: schema)
-        XCTAssertEqual(second.query(nil).count, 2)
+        XCTAssertEqual(try second.query(nil).count, 2)
     }
 }

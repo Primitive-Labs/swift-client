@@ -1210,7 +1210,6 @@ public final class DocumentManager: @unchecked Sendable {
 
     public func evictAllLocalData() async {
         lock.lock()
-        let docIds = Array(metadataIndex.keys)
         metadataIndex.removeAll()
         docPersistence.removeAll()
         openDocs.removeAll()
@@ -1224,9 +1223,16 @@ public final class DocumentManager: @unchecked Sendable {
         persistDebounceTasks.removeAll()
         lock.unlock()
 
-        for docId in docIds {
-            try? await offlineStore?.deleteMetadata(appId: appId, userId: userId, documentId: docId)
-        }
+        // Purge BOTH on-disk stores at the store level — the metadata store
+        // (`meta`) AND the Yjs CRDT store (`yjs_docs`). A per-document delete
+        // driven by `metadataIndex` (the previous approach) evicted nothing
+        // when nothing was loaded — the index is empty in the
+        // `persistJwtInStorage == false` path — and never touched `yjs_docs`
+        // at all, so a reused document ID reopened later could still hydrate a
+        // prior account's CRDT content (issue #1780). The store-level clear
+        // truncates both tables regardless of what is in memory. Fast no-op on
+        // empty tables.
+        try? await offlineStore?.clearAllDocumentData(appId: appId, userId: userId)
     }
 
     // MARK: - Retention Policy
@@ -1508,6 +1514,21 @@ public final class DocumentManager: @unchecked Sendable {
         try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
     }
 
+    /// Reset in-memory, user-scoped state and re-point at `newUserId` WITHOUT
+    /// deleting the previous user's persisted metadata (unlike
+    /// `evictAllLocalData`, which purges disk). Used when the signed-in user
+    /// changes before any document is opened — e.g. the test bootstrap where
+    /// OTP signs in a different account than the restored session (#1780). The
+    /// caller reloads the new user's metadata via `loadLocalMetadata()` after.
+    public func resetInMemoryUserState(userId newUserId: String) async {
+        lock.lock()
+        metadataIndex.removeAll()
+        pendingCreates.removeAll()
+        localOnlyDocs.removeAll()
+        userId = newUserId
+        lock.unlock()
+    }
+
     /// Load all local metadata from storage
     public func loadLocalMetadata() async {
         guard let offlineStore = offlineStore else { return }
@@ -1551,7 +1572,11 @@ public final class DocumentManager: @unchecked Sendable {
 public final class YjsSQLitePersistence: @unchecked Sendable {
     private let storageProvider: StorageProvider
     private let documentId: String
-    private static let store = "yjs_docs"
+    /// The on-disk store (table partition) holding Yjs CRDT document
+    /// content, keyed by `documentId` alone (app-wide). Exposed at module
+    /// scope so a store-level purge (`OfflineStore.clearAllDocumentData`)
+    /// can truncate it alongside the `meta` store.
+    static let store = "yjs_docs"
 
     public init(storageProvider: StorageProvider, documentId: String) {
         self.storageProvider = storageProvider

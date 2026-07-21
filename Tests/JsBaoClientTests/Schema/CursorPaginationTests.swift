@@ -162,9 +162,12 @@ final class CursorPaginationTests: XCTestCase {
                     cursor: c, direction: .backward
                 )
             )
-            // Backward page rows are returned id-DESC; reverse before
-            // prepending so the final list stays ASC.
-            collected = page.data.compactMap { $0["id"] as? String }.reversed() + collected
+            // Backward pages now return rows in DECLARED (id-ASC) order
+            // (#1607 D8 — the engine reverses the trimmed page before
+            // returning). Prepend the page as-is so the accumulated list
+            // stays ASC. (Before the fix, backward pages came back id-DESC
+            // and this test reversed each page to compensate.)
+            collected = page.data.compactMap { $0["id"] as? String } + collected
             cursorBack = page.nextCursor
         }
 

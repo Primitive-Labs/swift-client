@@ -296,7 +296,7 @@ final class TomlSchemaLoaderTests: XCTestCase {
             "email": .string("alice@x.com"),
             "name":  .string("Alice"),
         ])
-        let rows = model.query(["email": "alice@x.com"])
+        let rows = try model.query(["email": "alice@x.com"])
         XCTAssertEqual(rows.first?["name"] as? String, "Alice")
 
         // Field-level `unique = true` should enforce via `_uniqueIdx_*`.

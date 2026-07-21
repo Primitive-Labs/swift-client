@@ -27,44 +27,76 @@ public struct QueryTranslator {
     ///   SQLite would coerce, producing surprising matches like
     ///   `priority $startsWith "1"` matching `priority = 10`). Matches
     ///   js-bao's `DocumentQueryTranslator.ts:309` field-type gate
-    ///   (which throws there; we emit `0` because the Swift surface
-    ///   is non-throwing). Nil keeps the legacy value-driven path for
-    ///   callers that don't supply schema info.
+    ///   (which throws — and now so do we: a substring op on a
+    ///   non-string/-stringset field throws `JsBaoError(.invalidArgument)`).
+    ///   Nil keeps the legacy value-driven path for callers that don't
+    ///   supply schema info.
+    /// - Parameter fieldTypes: per-field type name (`"number"`, `"string"`,
+    ///   `"stringset"`, …) used only to fill the `fieldType` detail on a
+    ///   thrown substring error, mirroring js-bao's `InvalidOperatorError`.
+    ///
+    /// Throws `JsBaoError(.invalidArgument)` when a `$startsWith` /
+    /// `$endsWith` / `$containsText` operator targets a non-string/-stringset
+    /// field, is given a non-string value, exceeds 1024 characters, or when
+    /// more than one substring operator is used on the same field — matching
+    /// js-bao's `DocumentQueryTranslator` throw points.
     public static func translate(
         _ filter: DocumentFilter,
         stringsetFields: Set<String> = [],
         stringFields: Set<String>? = nil,
+        fieldTypes: [String: String]? = nil,
         tableName: String? = nil
-    ) -> (String, [Any]) {
+    ) throws -> (String, [Any]) {
         var conditions: [String] = []
         var params: [Any] = []
 
         for (key, value) in filter {
             if key == "$and", let arr = value as? [DocumentFilter] {
-                let sub = arr.map { translate($0, stringsetFields: stringsetFields, stringFields: stringFields, tableName: tableName) }
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " AND ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
             } else if key == "$or", let arr = value as? [DocumentFilter] {
-                let sub = arr.map { translate($0, stringsetFields: stringsetFields, stringFields: stringFields, tableName: tableName) }
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " OR ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
             } else if let ops = value as? [String: Any] {
-                // Operator expression: { "field": { "$gt": 5 } }
+                // Operator expression: { "field": { "$gt": 5 } }.
+                //
+                // Validate "at most one substring op per field" BEFORE the
+                // per-op loop. Swift processes each field operator
+                // independently, so the loop alone can't enforce js-bao's
+                // `DocumentQueryTranslator.ts:296-303` rule — hoist it here.
+                let present = substringOpNames.filter { ops.keys.contains($0) }
+                if present.count > 1 {
+                    let type = fieldTypeName(
+                        key, fieldTypes: fieldTypes, stringsetFields: stringsetFields
+                    )
+                    throw substringError(
+                        "Only one of $startsWith, $endsWith, $containsText may be used per field",
+                        field: key, op: present[1], fieldType: type
+                    )
+                }
                 for (op, opVal) in ops {
-                    let (cond, p) = translateOperator(
+                    // A substring op on a whitespace-only value contributes
+                    // NO condition (js-bao `buildLikePattern` returns null) —
+                    // `translateOperator` returns nil for that case, so we
+                    // skip it rather than appending a false `0` clause.
+                    if let (cond, p) = try translateOperator(
                         field: key, op: op, value: opVal,
                         stringsetFields: stringsetFields,
                         stringFields: stringFields,
+                        fieldTypes: fieldTypes,
                         tableName: tableName
-                    )
-                    conditions.append(cond)
-                    params.append(contentsOf: p)
+                    ) {
+                        conditions.append(cond)
+                        params.append(contentsOf: p)
+                    }
                 }
             } else {
                 // Simple equality: { "field": value }
@@ -83,27 +115,63 @@ public struct QueryTranslator {
         return (conditions.joined(separator: " AND "), params)
     }
 
+    /// Translate one `{ field: { op: value } }` operator into a SQL
+    /// condition. Returns `nil` when the operator contributes no condition
+    /// (a substring op on a whitespace-only value — js-bao's
+    /// `buildLikePattern` null no-op). Throws `JsBaoError(.invalidArgument)`
+    /// on the substring-op error cases js-bao throws on.
     private static func translateOperator(
         field: String,
         op: String,
         value: Any,
         stringsetFields: Set<String> = [],
         stringFields: Set<String>? = nil,
+        fieldTypes: [String: String]? = nil,
         tableName: String? = nil
-    ) -> (String, [Any]) {
+    ) throws -> (String, [Any])? {
         let col = quoted(field)
 
-        // Substring-op field-type gate (matches js-bao
-        // DocumentQueryTranslator.ts:309). If the caller supplied
-        // `stringFields` and this is a substring op, the target field
-        // must be a string or stringset. Otherwise we emit `0` rather
-        // than letting SQLite coerce a numeric/boolean column to text
-        // and silently match digits.
-        if let stringFields,
-           op == "$startsWith" || op == "$endsWith" || op == "$containsText",
-           !stringFields.contains(field),
-           !stringsetFields.contains(field) {
-            return ("0", [])
+        // Substring operators ($startsWith / $endsWith / $containsText)
+        // share one validate-then-build path so the scalar and stringset
+        // sides apply the same field-type gate, value-type check, trimming,
+        // empty no-op, escaping, and oversize throw — matching js-bao's
+        // `DocumentQueryTranslator.ts:308-341`.
+        if let mode = SubstringPattern(operatorName: op) {
+            let type = fieldTypeName(
+                field, fieldTypes: fieldTypes, stringsetFields: stringsetFields
+            )
+            // Field-type gate (js-bao DocumentQueryTranslator.ts:308-315).
+            // When the caller supplied `stringFields`, a substring op's
+            // target must be a string or stringset field; otherwise throw
+            // rather than let SQLite coerce a numeric/boolean column to text.
+            if let stringFields,
+               !stringFields.contains(field),
+               !stringsetFields.contains(field) {
+                throw substringError(
+                    "\(op) operator is only supported for string and stringset fields, field \(field) is type \(type)",
+                    field: field, op: op, fieldType: type
+                )
+            }
+            // Value-type check (js-bao DocumentQueryTranslator.ts:316-323).
+            guard let raw = value as? String else {
+                throw substringError(
+                    "\(op) operator requires a string value for field \(field)",
+                    field: field, op: op, fieldType: type
+                )
+            }
+            // Build the LIKE pattern (trims, throws on oversize). A nil
+            // pattern means whitespace-only input → no condition at all.
+            guard let pattern = try buildSubstringPattern(
+                raw, mode: mode, field: field, op: op, fieldType: type
+            ) else {
+                return nil
+            }
+            if stringsetFields.contains(field) {
+                return stringsetSubstringSQL(
+                    field: field, pattern: pattern, tableName: tableName
+                )
+            }
+            return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", [pattern])
         }
 
         switch op {
@@ -145,51 +213,6 @@ public struct QueryTranslator {
                 return ("\(col) NOT IN (\(placeholders))", arr.map { sqlValue($0) })
             }
             return ("1", []) // empty $nin matches everything
-
-        case "$containsText":
-            // On a stringset field the substring ops match ANY member
-            // via EXISTS against the junction — mirrors js-bao
-            // browser.js:703-769. On a scalar string column they
-            // continue to match the column value directly.
-            if stringsetFields.contains(field) {
-                return stringsetSubstringSQL(field: field, value: value,
-                                              pattern: .contains,
-                                              tableName: tableName)
-            }
-            if let text = value as? String {
-                let prepared = prepareSubstringQuery(text)
-                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(prepared))%"])
-            }
-            // Non-string value on a substring operator: js-bao throws.
-            // Translator can't throw with this API, so emit a clause
-            // that matches nothing — the practical analogue ("invalid
-            // input → no rows"). Strictly better than the prior `1=1`,
-            // which silently returned every row.
-            return ("0", [])
-
-        case "$startsWith":
-            if stringsetFields.contains(field) {
-                return stringsetSubstringSQL(field: field, value: value,
-                                              pattern: .startsWith,
-                                              tableName: tableName)
-            }
-            if let text = value as? String {
-                let prepared = prepareSubstringQuery(text)
-                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["\(escapeLike(prepared))%"])
-            }
-            return ("0", [])
-
-        case "$endsWith":
-            if stringsetFields.contains(field) {
-                return stringsetSubstringSQL(field: field, value: value,
-                                              pattern: .endsWith,
-                                              tableName: tableName)
-            }
-            if let text = value as? String {
-                let prepared = prepareSubstringQuery(text)
-                return ("\(col) LIKE ? ESCAPE '\\' COLLATE NOCASE", ["%\(escapeLike(prepared))"])
-            }
-            return ("0", [])
 
         case "$exists":
             let exists = (value as? Bool) ?? true
@@ -285,8 +308,9 @@ public struct QueryTranslator {
         options: AggregateOptions,
         stringsetFields: Set<String> = [],
         stringFields: Set<String>? = nil,
+        fieldTypes: [String: String]? = nil,
         scopedToDocId: String? = nil
-    ) -> (String, [Any]) {
+    ) throws -> (String, [Any]) {
         var regularFields: [String] = []
         var facetFields: [String] = []
         var memberships: [(field: String, contains: String)] = []
@@ -314,10 +338,11 @@ public struct QueryTranslator {
         // mixed drops the facet and proceeds as regular aggregation.
         if regularFields.isEmpty && memberships.isEmpty && !facetFields.isEmpty {
             if facetFields.count == 1 {
-                return buildFacetAggregation(
+                return try buildFacetAggregation(
                     tableName: tableName, facetField: facetFields[0],
                     options: options, stringsetFields: stringsetFields,
-                    stringFields: stringFields, scopedToDocId: scopedToDocId
+                    stringFields: stringFields, fieldTypes: fieldTypes,
+                    scopedToDocId: scopedToDocId
                 )
             }
             // 2+ pure facet fields: unsupported shape (js-bao 400s here). Return
@@ -335,11 +360,11 @@ public struct QueryTranslator {
         // mixed case the facet fields are intentionally dropped (matches
         // js-bao's regular branch); regular + membership grouping (or a global
         // rollup when both are empty) proceeds normally.
-        return buildRegularAggregation(
+        return try buildRegularAggregation(
             tableName: tableName, regularFields: regularFields,
             memberships: memberships, options: options,
             stringsetFields: stringsetFields, stringFields: stringFields,
-            scopedToDocId: scopedToDocId
+            fieldTypes: fieldTypes, scopedToDocId: scopedToDocId
         )
     }
 
@@ -358,8 +383,9 @@ public struct QueryTranslator {
         options: AggregateOptions,
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
+        fieldTypes: [String: String]?,
         scopedToDocId: String?
-    ) -> (String, [Any]) {
+    ) throws -> (String, [Any]) {
         let t = quoted(tableName)
         var params: [Any] = []
         var selectClauses: [String] = []
@@ -407,9 +433,10 @@ public struct QueryTranslator {
         if scopedToDocId != nil { whereParts.append("\(t).\"_meta_doc_id\" = ?") }
         var filterParts: (String, [Any])? = nil
         if let filter = options.filter, !filter.isEmpty {
-            filterParts = translate(
+            filterParts = try translate(
                 filter, stringsetFields: stringsetFields,
-                stringFields: stringFields, tableName: tableName
+                stringFields: stringFields, fieldTypes: fieldTypes,
+                tableName: tableName
             )
         }
         if let docId = scopedToDocId { params.append(docId) }
@@ -434,8 +461,9 @@ public struct QueryTranslator {
         options: AggregateOptions,
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
+        fieldTypes: [String: String]?,
         scopedToDocId: String?
-    ) -> (String, [Any]) {
+    ) throws -> (String, [Any]) {
         let t = quoted(tableName)
         let junction = quoted("\(tableName)__\(facetField)")
         var params: [Any] = []
@@ -451,9 +479,10 @@ public struct QueryTranslator {
         if scopedToDocId != nil { whereParts.append("\(t).\"_meta_doc_id\" = ?") }
         var filterParts: (String, [Any])? = nil
         if let filter = options.filter, !filter.isEmpty {
-            filterParts = translate(
+            filterParts = try translate(
                 filter, stringsetFields: stringsetFields,
-                stringFields: stringFields, tableName: tableName
+                stringFields: stringFields, fieldTypes: fieldTypes,
+                tableName: tableName
             )
         }
         if let docId = scopedToDocId { params.append(docId) }
@@ -525,9 +554,27 @@ public struct QueryTranslator {
 
     // MARK: - Helpers
 
-    /// How a substring op wraps the search text as a `LIKE` pattern.
+    /// The three substring-operator names, in the fixed order js-bao
+    /// reports them (`DocumentQueryTranslator.ts:291`). Used both to
+    /// detect a substring op and to pick the deterministic
+    /// "second op" for the more-than-one-per-field error.
+    private static let substringOpNames = ["$startsWith", "$endsWith", "$containsText"]
+
+    /// How a substring op wraps the (already-escaped) search text as a
+    /// `LIKE` pattern.
     private enum SubstringPattern {
         case startsWith, endsWith, contains
+
+        /// Map an operator name to its pattern shape, or `nil` if the
+        /// operator isn't a substring op.
+        init?(operatorName op: String) {
+            switch op {
+            case "$startsWith":   self = .startsWith
+            case "$endsWith":     self = .endsWith
+            case "$containsText": self = .contains
+            default:              return nil
+            }
+        }
 
         func likeValue(_ text: String) -> String {
             let e = escapeLikeStatic(text)
@@ -539,29 +586,46 @@ public struct QueryTranslator {
         }
     }
 
+    /// Single shared LIKE-pattern builder for both scalar and stringset
+    /// substring ops. Mirrors js-bao's `buildLikePattern`
+    /// (`utils/patterns.ts:8-23`): trims, returns `nil` (no-op, no
+    /// condition) for whitespace-only input, **throws**
+    /// `JsBaoError(.invalidArgument)` when the trimmed value exceeds 1024
+    /// characters, and otherwise returns the escaped, wrapped pattern.
+    /// Strictly over 1024 throws; exactly 1024 does not.
+    private static func buildSubstringPattern(
+        _ raw: String,
+        mode: SubstringPattern,
+        field: String,
+        op: String,
+        fieldType: String
+    ) throws -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil } // js-bao buildLikePattern → null
+        if trimmed.count > 1024 {
+            throw substringError(
+                "substring value exceeds 1024 characters",
+                field: field, op: op, fieldType: fieldType
+            )
+        }
+        return mode.likeValue(trimmed)
+    }
+
     /// EXISTS subquery against the stringset junction table: matches
-    /// when ANY member's `value` column satisfies the LIKE pattern.
-    /// Correlates on both `parent_id` and `_meta_doc_id` so a shared-
-    /// engine multi-doc query can't match a different doc's rows.
+    /// when ANY member's `value` column satisfies the prepared LIKE
+    /// pattern. Correlates on both `parent_id` and `_meta_doc_id` so a
+    /// shared-engine multi-doc query can't match a different doc's rows.
+    /// The `pattern` is already trimmed/escaped/wrapped by
+    /// `buildSubstringPattern`.
     private static func stringsetSubstringSQL(
         field: String,
-        value: Any,
-        pattern: SubstringPattern,
+        pattern: String,
         tableName: String?
     ) -> (String, [Any]) {
         guard let tableName else {
+            // Engine always supplies the table name; a missing one is an
+            // internal wiring bug, not bad query input.
             assertionFailure("QueryTranslator: substring op on stringset needs tableName context")
-            return ("0", [])
-        }
-        guard let raw = value as? String else {
-            // Non-string value on a substring op: js-bao throws; we
-            // can't throw from here, so emit a never-matches clause.
-            return ("0", [])
-        }
-        let text = prepareSubstringQuery(raw)
-        guard !text.isEmpty else {
-            // Empty (or whitespace-only) input after trim: matches
-            // nothing rather than the prior `1=1` everything-matches.
             return ("0", [])
         }
         let junction = "\(tableName)__\(field)"
@@ -573,25 +637,40 @@ public struct QueryTranslator {
               AND \(quoted(junction))."value" LIKE ? ESCAPE '\\' COLLATE NOCASE
         )
         """
-        return (sql, [pattern.likeValue(text)])
+        return (sql, [pattern])
     }
 
-    /// Trim whitespace + cap at 1024 chars to match js-bao's contract
-    /// for `$containsText` / `$startsWith` / `$endsWith` inputs
-    /// (browser.ts caps to 1024 and rejects whitespace-only). Strictly
-    /// better than the previous "pass the raw caller string straight to
-    /// SQLite as a LIKE pattern" — that path silently differed from JS
-    /// for `"  widget  "` (Swift didn't match, JS did) and for over-1024
-    /// inputs (Swift ran an oversize LIKE pattern, JS threw).
-    ///
-    /// We can't throw from this code path with the current non-throws
-    /// translator API, so we cap silently. Strict-throws would be a
-    /// follow-up tied to making `dynamic.query(...)` throws-aware.
-    private static func prepareSubstringQuery(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.count <= 1024 { return trimmed }
-        let cap = trimmed.index(trimmed.startIndex, offsetBy: 1024)
-        return String(trimmed[..<cap])
+    /// Build the structured `JsBaoError(.invalidArgument)` a substring-op
+    /// validation failure throws. Carries `field` / `operator` /
+    /// `fieldType` in `details`, mirroring js-bao's `InvalidOperatorError`
+    /// structured fields and reusing the `.invalidArgument` code the
+    /// projection precedent (#1118) chose for query-input errors.
+    private static func substringError(
+        _ message: String, field: String, op: String, fieldType: String
+    ) -> JsBaoError {
+        JsBaoError(
+            code: .invalidArgument,
+            message: message,
+            details: [
+                "field": .string(field),
+                "operator": .string(op),
+                "fieldType": .string(fieldType),
+            ]
+        )
+    }
+
+    /// Best-effort type name for a field, for the `fieldType` error
+    /// detail. Stringset fields are tracked separately; everything else
+    /// comes from the caller-supplied `fieldTypes` map (derived from the
+    /// engine's column types). Falls back to `"unknown"` when no schema
+    /// info was threaded through.
+    private static func fieldTypeName(
+        _ field: String,
+        fieldTypes: [String: String]?,
+        stringsetFields: Set<String>
+    ) -> String {
+        if stringsetFields.contains(field) { return "stringset" }
+        return fieldTypes?[field] ?? "unknown"
     }
 
     /// `escapeLike` is a static helper on the type; the nested

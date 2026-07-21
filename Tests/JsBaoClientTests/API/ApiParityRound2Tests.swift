@@ -109,11 +109,11 @@ final class ApiParityRound2Tests: XCTestCase {
         r.response = [
             "documentId": "doc1",
             "created": true,
-            "alias": ["aliasKey": "notes", "scope": "app", "documentId": "doc1"],
+            "alias": ["aliasKey": "notes", "scope": "user", "documentId": "doc1"],
         ]
         _ = try await api.getOrCreateWithAlias(
             options: GetOrCreateWithAliasOptions(
-                alias: AliasRef(scope: .app, aliasKey: "notes"),
+                alias: AliasRef(scope: .user, aliasKey: "notes"),
                 title: "Notes",
                 tags: ["pinned"]
             )
@@ -122,7 +122,7 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(r.path, "/documents/get-or-create-with-alias")
         let body = r.body as? [String: Any]
         let alias = body?["alias"] as? [String: Any]
-        XCTAssertEqual(alias?["scope"] as? String, "app")
+        XCTAssertEqual(alias?["scope"] as? String, "user")
         XCTAssertEqual(alias?["aliasKey"] as? String, "notes")
         XCTAssertEqual(body?["title"] as? String, "Notes")
         XCTAssertEqual(body?["tags"] as? [String], ["pinned"])
@@ -170,11 +170,11 @@ final class ApiParityRound2Tests: XCTestCase {
         r.response = [
             "documentId": "doc1",
             "created": true,
-            "alias": ["aliasKey": "notes", "scope": "app", "documentId": "doc1"],
+            "alias": ["aliasKey": "notes", "scope": "user", "documentId": "doc1"],
         ]
         _ = try await api.getOrCreateWithAlias(
             options: GetOrCreateWithAliasOptions(
-                alias: AliasRef(scope: .app, aliasKey: "notes")
+                alias: AliasRef(scope: .user, aliasKey: "notes")
             )
         )
         let alias = (r.body as? [String: Any])?["alias"] as? [String: Any]
@@ -195,7 +195,7 @@ final class ApiParityRound2Tests: XCTestCase {
         do {
             _ = try await api.getOrCreateWithAlias(
                 options: GetOrCreateWithAliasOptions(
-                    alias: AliasRef(scope: .app, aliasKey: "")
+                    alias: AliasRef(scope: .user, aliasKey: "")
                 )
             )
             XCTFail("expected an error for empty aliasKey")
@@ -221,7 +221,7 @@ final class ApiParityRound2Tests: XCTestCase {
             _ = try await api.createWithAlias(
                 options: CreateWithAliasOptions(
                     title: "Notes",
-                    alias: AliasRef(scope: .app, aliasKey: "")
+                    alias: AliasRef(scope: .user, aliasKey: "")
                 )
             )
             XCTFail("expected an error for empty aliasKey")
@@ -282,6 +282,7 @@ final class ApiParityRound2Tests: XCTestCase {
             "invitationId": "i1",
             "email": "i1@example.com",
             "role": "member",
+            "deferredId": "01JQ0GRANT0000000000000001",
             "createdAt": "2024-01-01T00:00:00Z",
             "expiresAt": "2024-01-08T00:00:00Z",
         ]]]

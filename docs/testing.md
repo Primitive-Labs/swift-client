@@ -40,16 +40,24 @@ The backend integration tests require the setup below.
    node debug-server.js
    ```
 
-2. **Environment file** — copy the example and fill in your JWT:
+2. **Environment file** (optional) — copy the example:
    ```bash
    cd swift-client
    cp .env.tests.example .env.tests
    ```
-   Edit `.env.tests` and set `TEST_SUPERADMIN_JWT` to a local super-admin token. To mint one:
+   You normally **don't** need a hand-minted JWT: the suite mints its own
+   short-lived super-admin token at setup time, signed with `TEST_JWT_SECRET`
+   (default `test-jwt-secret-only-for-agents`, matching the dev server's
+   `JWT_SECRET` in the repo root `.dev.vars`). The server accepts it because
+   `AdminAuthService.validateToken` builds a virtual super-admin from a JWT
+   carrying both `adminId` and `email` when no `AdminUser` record exists.
+
+   To override with your own token instead, set `TEST_SUPERADMIN_JWT`. Mint one with:
    ```bash
-   node -e "const jwt = require('jsonwebtoken'); console.log(jwt.sign({adminId:'YOUR_ADMIN_ID',email:'you@example.com',name:'Your Name',role:'super-admin',isSuperAdmin:true,appCreationLimit:50,type:'admin',enableTestFeatures:true},'test-jwt-secret-only-for-tests',{expiresIn:'24h'}))"
+   node -e "const jwt = require('jsonwebtoken'); console.log(jwt.sign({adminId:'YOUR_ADMIN_ID',email:'you@example.com',name:'Your Name',role:'super-admin',isSuperAdmin:true,appCreationLimit:50,type:'admin',enableTestFeatures:true},'test-jwt-secret-only-for-agents',{expiresIn:'24h'}))"
    ```
-   The JWT secret (`test-jwt-secret-only-for-tests`) and your `adminId` come from `wrangler.toml` and DynamoDB respectively.
+   The JWT secret (`test-jwt-secret-only-for-agents`) comes from the dev
+   server's `JWT_SECRET`; keep `TEST_JWT_SECRET` in sync with it.
 
 ## Running Tests
 

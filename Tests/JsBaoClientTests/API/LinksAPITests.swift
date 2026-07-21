@@ -13,31 +13,10 @@ import XCTest
 ///   server `src/app-api/controllers/magic-link-controller.ts:507-515`
 final class LinksAPITests: XCTestCase {
 
-    /// Records the request the API would have sent and plays back a
-    /// canned response (same pattern as `ApiParityTests.CallRecorder`).
-    final class CallRecorder: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        var response: Any = [String: Any]()
-        var error: Error?
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            if let error { throw error }
-            return response
-        }
-    }
-
     private func makeLinks(
-        recorder: CallRecorder = CallRecorder(),
         base: String? = "https://notes.example.com"
     ) -> LinksAPI {
-        LinksAPI(
-            aliases: DocumentAliasesAPI(makeRequest: recorder.make),
-            appBaseURL: base.flatMap { URL(string: $0) }
-        )
+        LinksAPI(appBaseURL: base.flatMap { URL(string: $0) })
     }
 
     private let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -60,22 +39,18 @@ final class LinksAPITests: XCTestCase {
         XCTAssertEqual(links.parse(url: pathForm), .document(id: ulid))
     }
 
-    func test_parse_documentShareLink_nonUlid_isAlias() {
+    func test_parse_documentShareLink_nonUlid_isUnknown() {
+        // Alias share links were removed with app-scoped aliases (#1168):
+        // a user-scoped alias key carries no owner user id, so a recipient
+        // cannot resolve it. Non-ULID document segments are `.unknown`.
         let links = makeLinks()
-        let url = URL(string: "https://notes.example.com/document/spring-planning")!
-        XCTAssertEqual(
-            links.parse(url: url),
-            .documentAlias(AliasRef(scope: .app, aliasKey: "spring-planning"))
-        )
-    }
-
-    func test_parse_documentShareLink_percentEncodedAlias() {
-        let links = makeLinks()
-        let url = URL(string: "https://notes.example.com/document/spring%20planning")!
-        XCTAssertEqual(
-            links.parse(url: url),
-            .documentAlias(AliasRef(scope: .app, aliasKey: "spring planning"))
-        )
+        for raw in [
+            "https://notes.example.com/document/spring-planning",
+            "https://notes.example.com/document/spring%20planning",
+        ] {
+            let url = URL(string: raw)!
+            XCTAssertEqual(links.parse(url: url), .unknown(url), raw)
+        }
     }
 
     func test_parse_documentPathWithPrefix() {
@@ -204,32 +179,6 @@ final class LinksAPITests: XCTestCase {
         XCTAssertEqual(links.parse(url: url!), .document(id: ulid))
     }
 
-    func test_shareURL_roundTrip_alias() {
-        let links = makeLinks()
-        let url = links.shareURL(forDocument: ulid, alias: "spring-planning")
-        XCTAssertEqual(
-            url?.absoluteString,
-            "https://notes.example.com/document/spring-planning"
-        )
-        XCTAssertEqual(
-            links.parse(url: url!),
-            .documentAlias(AliasRef(scope: .app, aliasKey: "spring-planning"))
-        )
-    }
-
-    func test_shareURL_aliasEncodesSinglePathSegment() {
-        let links = makeLinks()
-        let url = links.shareURL(forDocument: ulid, alias: "folder/spring planning?#1")
-        XCTAssertEqual(
-            url?.absoluteString,
-            "https://notes.example.com/document/folder%2Fspring%20planning%3F%231"
-        )
-        XCTAssertEqual(
-            links.parse(url: url!),
-            .documentAlias(AliasRef(scope: .app, aliasKey: "folder/spring planning?#1"))
-        )
-    }
-
     func test_shareURL_trailingSlashBase() {
         // Server normalizes app.baseUrl by stripping trailing slashes
         // (settings-controller.ts:348-353); the builder tolerates them too.
@@ -259,43 +208,19 @@ final class LinksAPITests: XCTestCase {
 
     // MARK: - resolve(url:) plumbing
 
-    func test_resolve_aliasLink_callsAliasEndpoint() async throws {
-        let recorder = CallRecorder()
-        recorder.response = [
-            "aliasKey": "spring-planning",
-            "scope": "app",
-            "documentId": ulid,
-        ]
-        let links = makeLinks(recorder: recorder)
-        let url = URL(string: "https://notes.example.com/document/spring-planning")!
-        let target = try await links.resolve(url: url)
-        XCTAssertEqual(target, .document(id: ulid))
-        XCTAssertEqual(recorder.method, "GET")
-        XCTAssertEqual(recorder.path, "/document-aliases/app/spring-planning")
-    }
-
-    func test_resolve_documentLink_isPure() async throws {
-        let recorder = CallRecorder()
-        let links = makeLinks(recorder: recorder)
+    func test_resolve_documentLink_matchesParse() async throws {
+        let links = makeLinks()
         let url = URL(string: "https://notes.example.com/document/\(ulid)")!
         let target = try await links.resolve(url: url)
         XCTAssertEqual(target, .document(id: ulid))
-        XCTAssertNil(recorder.method, "no request expected for a concrete-id link")
     }
 
-    func test_resolve_unknownAlias_throwsAliasNotFound() async {
-        let recorder = CallRecorder()
-        recorder.error = JsBaoError(code: .notFound, message: "HTTP 404")
-        let links = makeLinks(recorder: recorder)
+    func test_resolve_nonUlidDocumentLink_isUnknown() async throws {
+        // Alias share links are gone (#1168) — no network hop, no throw.
+        let links = makeLinks()
         let url = URL(string: "https://notes.example.com/document/no-such-alias")!
-        do {
-            _ = try await links.resolve(url: url)
-            XCTFail("expected aliasNotFound")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .aliasNotFound)
-        } catch {
-            XCTFail("expected JsBaoError, got \(error)")
-        }
+        let target = try await links.resolve(url: url)
+        XCTAssertEqual(target, .unknown(url))
     }
 
     #if canImport(ObjectiveC)

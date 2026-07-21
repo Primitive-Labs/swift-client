@@ -138,3 +138,21 @@ extension JsBaoClient {
         return (id, getDoc(id))
     }
 }
+
+// MARK: - Async assertion helpers
+
+/// Async-throwing assertion helper: `XCTAssertThrowsError` does not accept an
+/// async autoclosure, so await the expression and fail if it returns.
+func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    _ message: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail(message, file: file, line: line)
+    } catch {
+        // expected
+    }
+}

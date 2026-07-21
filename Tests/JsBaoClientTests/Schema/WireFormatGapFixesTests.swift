@@ -80,7 +80,7 @@ final class WireFormatGapFixesTests: XCTestCase {
 
     func test_A_ne_excludes_null_rows() throws {
         let model = try seededAssignees()
-        let rows = model.query(["assignee": ["$ne": "alice"]])
+        let rows = try model.query(["assignee": ["$ne": "alice"]])
         let assignees = rows.compactMap { $0["assignee"] as? String }
         XCTAssertEqual(
             assignees, ["bob"],
@@ -95,7 +95,7 @@ final class WireFormatGapFixesTests: XCTestCase {
 
     func test_B_nin_excludes_null_rows() throws {
         let model = try seededAssignees()
-        let rows = model.query(["assignee": ["$nin": ["alice"]]])
+        let rows = try model.query(["assignee": ["$nin": ["alice"]]])
         let assignees = rows.compactMap { $0["assignee"] as? String }
         XCTAssertEqual(
             assignees, ["bob"],
@@ -105,36 +105,40 @@ final class WireFormatGapFixesTests: XCTestCase {
         XCTAssertEqual(rows.count, 1)
     }
 
-    // MARK: - C/D/E. Substring ops on a non-string field
+    // MARK: - C/D/E. Substring ops on a non-string field now THROW (#1119)
 
-    func test_C_startsWith_on_number_returns_no_rows() throws {
+    func test_C_startsWith_on_number_throws() throws {
         let model = try seededPriorities()
-        let rows = model.query(["priority": ["$startsWith": "1"]])
-        XCTAssertEqual(
-            rows.count, 0,
-            "$startsWith on a non-string field used to emit `1=1` " +
-            "(silently match every row). Now emits `0` — the " +
-            "non-throwing analogue of js-bao's `throws on bad input`."
-        )
+        XCTAssertThrowsError(
+            try model.query(["priority": ["$startsWith": "1"]])
+        ) { error in
+            guard let jbe = error as? JsBaoError else {
+                XCTFail("expected JsBaoError, got \(error)"); return
+            }
+            XCTAssertEqual(jbe.code, .invalidArgument)
+            XCTAssertEqual(jbe.details?["fieldType"], .string("number"))
+        }
     }
 
-    func test_D_endsWith_on_number_returns_no_rows() throws {
+    func test_D_endsWith_on_number_throws() throws {
         let model = try seededPriorities()
-        let rows = model.query(["priority": ["$endsWith": "5"]])
-        XCTAssertEqual(rows.count, 0)
+        XCTAssertThrowsError(try model.query(["priority": ["$endsWith": "5"]])) { error in
+            XCTAssertEqual((error as? JsBaoError)?.code, .invalidArgument)
+        }
     }
 
-    func test_E_containsText_on_number_returns_no_rows() throws {
+    func test_E_containsText_on_number_throws() throws {
         let model = try seededPriorities()
-        let rows = model.query(["priority": ["$containsText": "1"]])
-        XCTAssertEqual(rows.count, 0)
+        XCTAssertThrowsError(try model.query(["priority": ["$containsText": "1"]])) { error in
+            XCTAssertEqual((error as? JsBaoError)?.code, .invalidArgument)
+        }
     }
 
     // MARK: - F. `$containsText` trims whitespace before matching
 
     func test_F_containsText_trims_whitespace() throws {
         let model = try seededTitles()
-        let rows = model.query([
+        let rows = try model.query([
             "title": ["$containsText": "  widget  "],
         ])
         let titles = rows.compactMap { $0["title"] as? String }
@@ -146,21 +150,26 @@ final class WireFormatGapFixesTests: XCTestCase {
         )
     }
 
-    // MARK: - G. `$containsText` caps input at 1024 chars
+    // MARK: - G. `$containsText` over 1024 chars now THROWS (#1119)
 
-    func test_G_containsText_caps_at_1024_chars() throws {
+    func test_G_containsText_over_1024_chars_throws() throws {
         let model = try seededTitles()
-        // 2006-char input. After the 1024 cap, the LIKE pattern is
-        // `widget` + 1018 Z's. No seeded title has Z's, so 0 rows.
-        // Without the cap, SQLite ran an oversize LIKE; this test
-        // doesn't directly observe the cap, but it pins the contract
-        // so a future change that drops it can be probed with a
-        // pattern that *would* spuriously match uncapped.
+        // 2006-char input (> 1024). js-bao throws "substring value exceeds
+        // 1024 characters"; the Swift client now does too, instead of the
+        // old silent cap-at-1024.
         let longProbe = "widget" + String(repeating: "Z", count: 2000)
-        let rows = model.query([
-            "title": ["$containsText": longProbe],
-        ])
-        XCTAssertEqual(rows.count, 0)
+        XCTAssertThrowsError(
+            try model.query(["title": ["$containsText": longProbe]])
+        ) { error in
+            guard let jbe = error as? JsBaoError else {
+                XCTFail("expected JsBaoError, got \(error)"); return
+            }
+            XCTAssertEqual(jbe.code, .invalidArgument)
+            XCTAssertTrue(
+                jbe.message.contains("1024"),
+                "message should mention the 1024 limit: \(jbe.message)"
+            )
+        }
     }
 
     // MARK: - H. TOML loader rejects unknown field keys (strict mode)

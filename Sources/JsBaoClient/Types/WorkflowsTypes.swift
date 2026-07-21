@@ -29,7 +29,26 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
     public let contextDocId: String?
     public let status: String
     public let createdAt: String?
+    /// ISO-8601 timestamp stamped when the run started. Mirrors JS
+    /// `WorkflowRun.startedAt`. Decoded when present.
+    public let startedAt: String?
+    /// #1367 — ISO-8601 timestamp of the true execution start, stamped once
+    /// Cloudflare actually schedules the instance. `nil`/absent while the run is
+    /// still queued (`startedAt` remains the request time). Mirrors JS
+    /// `WorkflowRun.executionStartedAt`. Decoded when present.
+    public let executionStartedAt: String?
+    /// #1367 — derived queue delay in ms (`executionStartedAt − startedAt`), i.e.
+    /// how long the run sat queued before executing. `nil` while still queued.
+    /// Mirrors JS `WorkflowRun.queueDelayMs`. Decoded when present.
+    public let queueDelayMs: Int?
+    /// #1367 — wall-clock ms the `env.WORKFLOW_APP.create()` call itself took.
+    /// `nil` for runs started via a path that does not record it. Mirrors JS
+    /// `WorkflowRun.createCallDurationMs`. Decoded when present.
+    public let createCallDurationMs: Int?
     public let endedAt: String?
+    /// Error message when `status == "failed"`, `null` otherwise. Mirrors JS
+    /// `WorkflowRun.errorMessage`. Decoded when present.
+    public let errorMessage: String?
     /// User-defined metadata attached to the run (max 1 KB). Opaque blob.
     public let meta: JSONValue?
     /// User who started the run, when the server records it. Not present in
@@ -39,7 +58,9 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case runId, runKey, instanceId, workflowId, workflowKey
-        case revisionId, contextDocId, status, createdAt, endedAt, meta
+        case revisionId, contextDocId, status, createdAt, startedAt
+        case executionStartedAt, queueDelayMs, createCallDurationMs, endedAt
+        case errorMessage, meta
         case startedByUserId
     }
 
@@ -54,7 +75,12 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
         contextDocId = try c.decodeIfPresent(String.self, forKey: .contextDocId)
         status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+        startedAt = try c.decodeIfPresent(String.self, forKey: .startedAt)
+        executionStartedAt = try c.decodeIfPresent(String.self, forKey: .executionStartedAt)
+        queueDelayMs = try c.decodeIfPresent(Int.self, forKey: .queueDelayMs)
+        createCallDurationMs = try c.decodeIfPresent(Int.self, forKey: .createCallDurationMs)
         endedAt = try c.decodeIfPresent(String.self, forKey: .endedAt)
+        errorMessage = try c.decodeIfPresent(String.self, forKey: .errorMessage)
         meta = try c.decodeIfPresent(JSONValue.self, forKey: .meta)
         startedByUserId = try c.decodeIfPresent(String.self, forKey: .startedByUserId)
     }
@@ -323,4 +349,76 @@ public struct RunSyncWorkflowResult: Decodable, Sendable {
     public let run: WorkflowRunInfo?
     /// `true` if `runKey` matched an existing run (no new execution occurred).
     public let existing: Bool?
+}
+
+// MARK: - Typed workflow results (#1547, Phase 3)
+//
+// The generic `WorkflowsAPI` overloads (`runSync<Input,Output>` /
+// `getStatus<Output>`) return these typed envelopes: identical to the untyped
+// `RunSyncWorkflowResult` / `WorkflowStatusResult` above but with the opaque
+// `output` blob decoded into the generated `<Key>Output` type. They mirror the
+// JS client's `RunSyncWorkflowResult<O>` / `WorkflowStatusResult<O>` generics
+// (Swift structs cannot carry a defaulted generic parameter, so these are named
+// mirrors rather than the same symbol). Constructed by the API layer from the
+// untyped result, so no bespoke decode logic diverges from the untyped path.
+
+/// Typed result envelope from the generic `workflows.runSync`. Mirrors JS
+/// `RunSyncWorkflowResult<O>` — every field matches `RunSyncWorkflowResult`
+/// except `output`, which is decoded into `Output`.
+public struct RunSyncResult<Output: Decodable & Sendable>: Sendable {
+    public let runId: String
+    public let runKey: String
+    /// `completed` | `failed` | `terminated` | `timeout` | `apply_pending`.
+    public let status: String
+    /// Final output decoded into `Output` when `status == "completed"` (and the
+    /// server returned a non-null output); `nil` otherwise.
+    public let output: Output?
+    /// Error message when `status == "failed"`.
+    public let error: String?
+    /// Persisted run record (present on success).
+    public let run: WorkflowRunInfo?
+    /// `true` if `runKey` matched an existing run (no new execution occurred).
+    public let existing: Bool?
+
+    public init(
+        runId: String,
+        runKey: String,
+        status: String,
+        output: Output?,
+        error: String?,
+        run: WorkflowRunInfo?,
+        existing: Bool?
+    ) {
+        self.runId = runId
+        self.runKey = runKey
+        self.status = status
+        self.output = output
+        self.error = error
+        self.run = run
+        self.existing = existing
+    }
+}
+
+/// Typed result of the generic `workflows.getStatus`. Mirrors JS
+/// `WorkflowStatusResult<O>` — same fields as `WorkflowStatusResult` except
+/// `output`, which is decoded into `Output`. `status` is the Cloudflare
+/// workflow status; `run` is the persisted DB record.
+public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
+    public let status: String
+    /// Final output decoded into `Output` when present; `nil` otherwise.
+    public let output: Output?
+    public let error: String?
+    public let run: WorkflowRunInfo?
+
+    public init(
+        status: String,
+        output: Output?,
+        error: String?,
+        run: WorkflowRunInfo?
+    ) {
+        self.status = status
+        self.output = output
+        self.error = error
+        self.run = run
+    }
 }

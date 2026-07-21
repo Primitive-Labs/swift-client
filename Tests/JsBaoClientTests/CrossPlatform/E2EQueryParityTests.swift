@@ -62,6 +62,48 @@ final class E2EQueryParityTests: XCTestCase {
     // shared state is fine here without a lock.
     private static var codegenError: Error?
 
+    // MARK: - Harness preflight
+
+    /// Touch every external dependency this suite needs *before* any
+    /// assertion runs, so a missing tool registers the test as
+    /// **skipped** rather than **failed**.
+    ///
+    /// `XCTSkip` only counts as a skip when it propagates uncaught to the
+    /// top of the test (or out of `setUpWithError`). The parity tests reach
+    /// their skip conditions lazily from inside `XCTAssert*` / `XCTUnwrap`
+    /// autoclosures (e.g. `try XCTUnwrap(try findJs(...))`), which catch the
+    /// thrown `XCTSkip` and report it as a failure. Running the preflight
+    /// here moves every skip to statement level so it registers correctly.
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try skipUnlessHarnessAvailable()
+    }
+
+    /// The union of every skip condition the tests in this class can hit:
+    /// Node, the JS codegen, `E2E/js/main.ts`, `vite-node`, and the built
+    /// `E2EMiniApp` Swift binary. Re-throws any `XCTSkip` (or a real codegen
+    /// failure) at statement level. This class's dependency set is broader
+    /// than `CodegenOutputParityTests` (which needs only Node + the two
+    /// codegen binaries), so each class keeps its own preflight — a missing
+    /// `E2EMiniApp`/`vite-node` must not skip codegen parity.
+    private func skipUnlessHarnessAvailable() throws {
+        // Node — needed by both the codegen step and the JS CLI runner.
+        _ = try CrossPlatformHarness.nodePath()
+        // JS codegen — runs once per process; surface a missing codegen.mjs
+        // (XCTSkip) or a real codegen failure (NSError) at statement level.
+        _ = E2EQueryParityTests.codegenOnce
+        if let err = E2EQueryParityTests.codegenError { throw err }
+        // The JS entry point the vite-node runner executes.
+        let mainTs = E2EQueryParityTests.thisDir
+            .appendingPathComponent("E2E/js/main.ts").path
+        guard FileManager.default.fileExists(atPath: mainTs) else {
+            throw XCTSkip("E2E/js/main.ts missing at \(mainTs)")
+        }
+        // vite-node runner + the built Swift mini-app.
+        _ = try E2EQueryParityTests.viteNodeBinPath()
+        _ = try locateSwiftBinary()
+    }
+
     /// Invoke `E2E/js/codegen.mjs` synchronously. Throws if the
     /// script is missing or exits non-zero. The tail of stderr is
     /// included in any failure so a broken TOML surfaces clearly.
@@ -710,10 +752,85 @@ final class E2EQueryParityTests: XCTestCase {
         XCTAssertEqual(idsFrom(results), ["p1", "p2"])
     }
 
+    /// `hasMany` with NO `order_by_field` — `users.postsUnordered`.
+    /// Regression guard for #1160: an order-less `hasMany` must resolve
+    /// to a globally `id`-ascending list on BOTH clients, NOT in
+    /// insertion or document-grouped order. JS defaults
+    /// `orderByField = "id"` (relationshipManager.ts:51-52); Swift's
+    /// query engine appends `id ASC` in `resolveSort`
+    /// (BaoModelQueryEngine.swift:787-792), always emitted by
+    /// `buildSelectSQL` (:879). Both clients already converge on
+    /// `id ASC` — this test locks in that existing guarantee, it is not
+    /// a fix. The companion `posts` relationship above declares
+    /// `order_by_field = "createdAt"`, so it never exercises the
+    /// order-less path; this test isolates it.
+    ///
+    /// Posts are seeded OUT of `id` order (and the `id` order differs
+    /// from `createdAt` order) so the assertion is meaningful: a result
+    /// in insertion order would be `[p3, p1, p2]`, in `createdAt` order
+    /// `[p3, p2, p1]`; only an `id ASC` sort yields `[p1, p2, p3]`.
+    func testHasMany_orderless_swiftWritesPosts_jsResolvesIdAsc() throws {
+        var doc = try seedSwift(
+            [["id": "u1", "name": "Alice"], ["id": "u2", "name": "Bob"]],
+            mode: "dynamic", model: "users"
+        )
+        doc = try seedSwift(
+            [
+              ["id": "p3", "title": "third", "userId": "u1",
+               "createdAt": "2026-01-01T00:00:00Z"],
+              ["id": "p1", "title": "first", "userId": "u1",
+               "createdAt": "2026-03-01T00:00:00Z"],
+              ["id": "p2", "title": "second", "userId": "u1",
+               "createdAt": "2026-02-01T00:00:00Z"],
+              // Decoy: different user's post must be filtered out.
+              ["id": "px", "title": "other-user", "userId": "u2",
+               "createdAt": "2026-01-15T00:00:00Z"],
+            ],
+            existingDoc: doc, mode: "dynamic", model: "posts"
+        )
+        let results = try resolveRelationshipJs(
+            doc: doc, model: "users", id: "u1", relationship: "postsUnordered"
+        )
+        XCTAssertEqual(idsFrom(results), ["p1", "p2", "p3"],
+                       "order-less hasMany must resolve to u1's posts in id-ascending order, not insertion/createdAt/doc order")
+    }
+
+    /// Order-less `hasMany` reverse direction — JS writes, Swift resolves.
+    func testHasMany_orderless_jsWritesPosts_swiftResolvesIdAsc() throws {
+        var doc = try seedJs(
+            [["id": "u1", "name": "Alice"], ["id": "u2", "name": "Bob"]],
+            model: "users"
+        )
+        doc = try seedJs(
+            [
+              ["id": "p3", "title": "third", "userId": "u1",
+               "createdAt": "2026-01-01T00:00:00Z"],
+              ["id": "p1", "title": "first", "userId": "u1",
+               "createdAt": "2026-03-01T00:00:00Z"],
+              ["id": "p2", "title": "second", "userId": "u1",
+               "createdAt": "2026-02-01T00:00:00Z"],
+              ["id": "px", "title": "other-user", "userId": "u2",
+               "createdAt": "2026-01-15T00:00:00Z"],
+            ],
+            existingDoc: doc, model: "posts"
+        )
+        let results = try resolveRelationshipSwift(
+            doc: doc, model: "users", id: "u1", relationship: "postsUnordered"
+        )
+        XCTAssertEqual(idsFrom(results), ["p1", "p2", "p3"],
+                       "order-less hasMany must resolve to u1's posts in id-ascending order, not insertion/createdAt/doc order")
+    }
+
     /// `hasManyThrough` — Swift writes posts + tags + join rows;
     /// JS resolves `post.tags()` walking through `post_tag_links`.
     /// Pins both legs of the join (`joinModelLocalField`,
     /// `joinModelRelatedField`) plus the target lookup.
+    ///
+    /// Ordered assertion (#1201): join rows are seeded so both their id
+    /// order (l1→t2, l2→t1) and their `position` order differ from target
+    /// `id ASC`. The declared `join_model_order_by_field = "position"` sorts
+    /// the join leg, but the output must be target `id ASC` (`["t1", "t2"]`)
+    /// on both clients — a `Set` here would hide an order regression.
     func testHasManyThrough_swiftWrites_jsResolvesPostTags() throws {
         var doc = try seedSwift(
             [["id": "u1", "name": "Alice"]],
@@ -730,21 +847,22 @@ final class E2EQueryParityTests: XCTestCase {
             existingDoc: doc, mode: "dynamic", model: "tags"
         )
         doc = try seedSwift(
-            [["id": "l1", "postId": "p1", "tagId": "t1"],
-             ["id": "l2", "postId": "p1", "tagId": "t2"],
+            [["id": "l1", "postId": "p1", "tagId": "t2", "position": 1],
+             ["id": "l2", "postId": "p1", "tagId": "t1", "position": 2],
              // Decoy: a join row pointing at a different post.
-             ["id": "l3", "postId": "other", "tagId": "t3"]],
+             ["id": "l3", "postId": "other", "tagId": "t3", "position": 1]],
             existingDoc: doc, mode: "dynamic", model: "post_tag_links"
         )
         let results = try resolveRelationshipJs(
             doc: doc, model: "posts", id: "p1", relationship: "tags"
         )
-        let resolvedIds = Set(results.compactMap { $0["id"] as? String })
+        let resolvedIds = results.compactMap { $0["id"] as? String }
         XCTAssertEqual(resolvedIds, ["t1", "t2"],
-                       "hasManyThrough should walk join rows for p1 and resolve tag ids")
+                       "hasManyThrough resolves p1's tags in target id ASC, not join-row order")
     }
 
     /// `hasManyThrough` reverse direction — JS writes, Swift resolves.
+    /// Ordered assertion, same seed-order-differs-from-id-ASC setup (#1201).
     func testHasManyThrough_jsWrites_swiftResolvesPostTags() throws {
         var doc = try seedJs(
             [["id": "u1", "name": "Alice"]], model: "users"
@@ -760,16 +878,278 @@ final class E2EQueryParityTests: XCTestCase {
             existingDoc: doc, model: "tags"
         )
         doc = try seedJs(
-            [["id": "l1", "postId": "p1", "tagId": "t1"],
-             ["id": "l2", "postId": "p1", "tagId": "t2"],
-             ["id": "l3", "postId": "other", "tagId": "t3"]],
+            [["id": "l1", "postId": "p1", "tagId": "t2", "position": 1],
+             ["id": "l2", "postId": "p1", "tagId": "t1", "position": 2],
+             ["id": "l3", "postId": "other", "tagId": "t3", "position": 1]],
             existingDoc: doc, model: "post_tag_links"
         )
         let results = try resolveRelationshipSwift(
             doc: doc, model: "posts", id: "p1", relationship: "tags"
         )
-        let resolvedIds = Set(results.compactMap { $0["id"] as? String })
-        XCTAssertEqual(resolvedIds, ["t1", "t2"])
+        let resolvedIds = results.compactMap { $0["id"] as? String }
+        XCTAssertEqual(resolvedIds, ["t1", "t2"],
+                       "hasManyThrough resolves p1's tags in target id ASC on the Swift side too")
+    }
+
+    /// **Cross-language `hasManyThrough` pagination parity (#1230,
+    /// rerouted #1607).**
+    ///
+    /// Seeds one post with six labels + six join rows, then walks the
+    /// `labels` relationship — which declares no join order, so both
+    /// clients default to join-model `id ASC` — page by page with
+    /// `limit: 2`. Cursors are now the shared engine's OPAQUE composite
+    /// tokens, so this asserts on the DECODED `CursorData` (values +
+    /// sortFields + direction), NEVER the raw token bytes (JS and Swift
+    /// may serialize the cursor JSON's key order differently). It also
+    /// cross-feeds: a cursor minted by JS must resolve the same page under
+    /// Swift and vice-versa, forward AND backward.
+    func testHasManyThrough_paginationParity_jsAndSwiftReturnSamePages() throws {
+        var doc = try seedSwift(
+            [["id": "p1", "title": "hello", "userId": "u1",
+              "createdAt": "2026-01-01T00:00:00Z"]],
+            mode: "dynamic", model: "posts"
+        )
+        doc = try seedSwift(
+            (1...6).map { ["id": "lb\($0)", "name": "label\($0)"] },
+            existingDoc: doc, mode: "dynamic", model: "labels"
+        )
+        // Join row pl{i} → label lb{i}. Default join order is join-row `id`
+        // ASC (pl1 < pl2 < … < pl6), so the pages are
+        // [lb1,lb2] [lb3,lb4] [lb5,lb6].
+        doc = try seedSwift(
+            (1...6).map { ["id": "pl\($0)", "postId": "p1", "labelId": "lb\($0)"] },
+            existingDoc: doc, mode: "dynamic", model: "post_label_links"
+        )
+
+        let rel = "labels"
+        let expectedIds = [["lb1", "lb2"], ["lb3", "lb4"], ["lb5", "lb6"]]
+        var afterCursor: String?
+        for (i, ids) in expectedIds.enumerated() {
+            let js = try resolveRelationshipPagedJs(
+                doc: doc, model: "posts", id: "p1", relationship: rel,
+                limit: 2, afterCursor: afterCursor
+            )
+            let sw = try resolveRelationshipPagedSwift(
+                doc: doc, model: "posts", id: "p1", relationship: rel,
+                limit: 2, afterCursor: afterCursor
+            )
+            XCTAssertEqual(js.ids, ids, "JS page \(i + 1) ids")
+            XCTAssertEqual(sw.ids, ids, "Swift page \(i + 1) ids")
+            // Compare DECODED cursor structure, not the opaque token bytes.
+            assertCursorDataEqual(js.nextCursor, sw.nextCursor, "page \(i + 1) nextCursor")
+            assertCursorDataEqual(js.prevCursor, sw.prevCursor, "page \(i + 1) prevCursor")
+
+            // Cross-feed: JS's cursor resolves the same page on Swift, and
+            // Swift's on JS — proving the token is portable across clients.
+            if let jsNext = js.nextCursor, let swNext = sw.nextCursor {
+                let swFromJs = try resolveRelationshipPagedSwift(
+                    doc: doc, model: "posts", id: "p1", relationship: rel,
+                    limit: 2, afterCursor: jsNext
+                )
+                let jsFromSw = try resolveRelationshipPagedJs(
+                    doc: doc, model: "posts", id: "p1", relationship: rel,
+                    limit: 2, afterCursor: swNext
+                )
+                XCTAssertEqual(swFromJs.ids, jsFromSw.ids,
+                               "page \(i + 1): JS-minted and Swift-minted cursors resolve the same next page")
+            }
+            afterCursor = js.nextCursor
+        }
+
+        // Backward cross-feed parity: walk each client to page 3 to obtain
+        // its prevCursor, then feed that backward cursor to the OTHER client.
+        let jsP1 = try resolveRelationshipPagedJs(doc: doc, model: "posts", id: "p1", relationship: rel, limit: 2)
+        let jsP2 = try resolveRelationshipPagedJs(doc: doc, model: "posts", id: "p1", relationship: rel, limit: 2, afterCursor: jsP1.nextCursor)
+        let jsP3 = try resolveRelationshipPagedJs(doc: doc, model: "posts", id: "p1", relationship: rel, limit: 2, afterCursor: jsP2.nextCursor)
+        let swP1 = try resolveRelationshipPagedSwift(doc: doc, model: "posts", id: "p1", relationship: rel, limit: 2)
+        let swP2 = try resolveRelationshipPagedSwift(doc: doc, model: "posts", id: "p1", relationship: rel, limit: 2, afterCursor: swP1.nextCursor)
+        let swP3 = try resolveRelationshipPagedSwift(doc: doc, model: "posts", id: "p1", relationship: rel, limit: 2, afterCursor: swP2.nextCursor)
+
+        let jsPrev = try XCTUnwrap(jsP3.prevCursor, "JS page 3 must expose a prevCursor")
+        let swPrev = try XCTUnwrap(swP3.prevCursor, "Swift page 3 must expose a prevCursor")
+        // Feed JS's backward cursor to Swift and Swift's to JS.
+        let swBackFromJs = try resolveRelationshipPagedSwift(
+            doc: doc, model: "posts", id: "p1", relationship: rel,
+            limit: 2, beforeCursor: jsPrev, direction: "backward")
+        let jsBackFromSw = try resolveRelationshipPagedJs(
+            doc: doc, model: "posts", id: "p1", relationship: rel,
+            limit: 2, beforeCursor: swPrev, direction: "backward")
+        XCTAssertEqual(swBackFromJs.ids, ["lb3", "lb4"],
+                       "Swift resolves JS's backward cursor to page 2's rows")
+        XCTAssertEqual(jsBackFromSw.ids, ["lb3", "lb4"],
+                       "JS resolves Swift's backward cursor to page 2's rows")
+    }
+
+    /// **Cross-language NUMERIC-order `hasManyThrough` pagination (#1230,
+    /// rerouted #1607).** The `tags` relationship orders the join leg by
+    /// the numeric `position` field. The cursor is now the shared engine's
+    /// OPAQUE composite token, so this asserts on the DECODED `CursorData`:
+    /// both clients must carry the boundary `position` as a `.number`
+    /// (not a stringified `"2"`) inside the same `(position, id)` cursor,
+    /// and a token minted on one client must resolve the same next page on
+    /// the other. Seeds six tags/links (position 1…6 → t1…t6).
+    func testHasManyThrough_numericCursorPaginationParity() throws {
+        var doc = try seedSwift(
+            [["id": "p1", "title": "hello", "userId": "u1",
+              "createdAt": "2026-01-01T00:00:00Z"]],
+            mode: "dynamic", model: "posts"
+        )
+        doc = try seedSwift(
+            (1...6).map { ["id": "t\($0)", "name": "tag\($0)"] },
+            existingDoc: doc, mode: "dynamic", model: "tags"
+        )
+        // position i → tag t{i}; the join order field `position` is numeric.
+        // position ASC and target id ASC agree.
+        doc = try seedSwift(
+            (1...6).map { ["id": "pt\($0)", "postId": "p1", "tagId": "t\($0)", "position": $0] },
+            existingDoc: doc, mode: "dynamic", model: "post_tag_links"
+        )
+
+        let expectedIds = [["t1", "t2"], ["t3", "t4"], ["t5", "t6"]]
+        let expectedBoundaryPosition = [2.0, 4.0, nil]  // last kept row's position
+        var afterCursor: String?
+        for (i, ids) in expectedIds.enumerated() {
+            let js = try resolveRelationshipPagedJs(
+                doc: doc, model: "posts", id: "p1", relationship: "tags",
+                limit: 2, afterCursor: afterCursor)
+            let sw = try resolveRelationshipPagedSwift(
+                doc: doc, model: "posts", id: "p1", relationship: "tags",
+                limit: 2, afterCursor: afterCursor)
+            XCTAssertEqual(js.ids, ids, "JS page \(i + 1) ids")
+            XCTAssertEqual(sw.ids, ids, "Swift page \(i + 1) ids")
+
+            // Decoded cursor structure agrees, and carries a NUMERIC position.
+            assertCursorDataEqual(js.nextCursor, sw.nextCursor, "page \(i + 1) nextCursor")
+            if let expPos = expectedBoundaryPosition[i] {
+                let data = try XCTUnwrap(decodeCursorData(js.nextCursor),
+                                         "page \(i + 1) nextCursor should decode")
+                XCTAssertTrue(data.sortFields.contains("position"),
+                              "cursor sortFields should include the numeric order field")
+                XCTAssertEqual(data.values["position"], .number(expPos),
+                               "page \(i + 1) boundary position must stay a number, not a string")
+            } else {
+                XCTAssertNil(js.nextCursor, "last page has no nextCursor")
+                XCTAssertNil(sw.nextCursor, "last page has no nextCursor")
+            }
+
+            // Cross-feed the numeric-order cursor across clients.
+            if let jsNext = js.nextCursor, let swNext = sw.nextCursor {
+                let swFromJs = try resolveRelationshipPagedSwift(
+                    doc: doc, model: "posts", id: "p1", relationship: "tags",
+                    limit: 2, afterCursor: jsNext)
+                let jsFromSw = try resolveRelationshipPagedJs(
+                    doc: doc, model: "posts", id: "p1", relationship: "tags",
+                    limit: 2, afterCursor: swNext)
+                XCTAssertEqual(swFromJs.ids, jsFromSw.ids,
+                               "page \(i + 1): numeric cursors are portable across clients")
+            }
+            afterCursor = js.nextCursor
+        }
+    }
+
+    /// **Zero-valued numeric-order `hasManyThrough` pagination (#1607).**
+    /// A boundary at `position == 0` is a legitimate value on a zero-based
+    /// numeric join order. With the composite cursor it is encoded inside
+    /// the opaque token (no falsy scalar guard to drop it), so walking with
+    /// `limit: 1` must advance through every row exactly once on both
+    /// clients — never repeating the first page — and the two walks must
+    /// agree. Seeds six tags at zero-based positions (0…5 → t0…t5).
+    func testHasManyThrough_zeroValuedCursorPaginationParity() throws {
+        var doc = try seedSwift(
+            [["id": "p1", "title": "hello", "userId": "u1",
+              "createdAt": "2026-01-01T00:00:00Z"]],
+            mode: "dynamic", model: "posts"
+        )
+        doc = try seedSwift(
+            (0...5).map { ["id": "t\($0)", "name": "tag\($0)"] },
+            existingDoc: doc, mode: "dynamic", model: "tags"
+        )
+        doc = try seedSwift(
+            (0...5).map { ["id": "pt\($0)", "postId": "p1", "tagId": "t\($0)", "position": $0] },
+            existingDoc: doc, mode: "dynamic", model: "post_tag_links"
+        )
+
+        func walk(_ resolve: (String?) throws -> RelPage) rethrows -> [String] {
+            var ids: [String] = []
+            var cursor: String? = nil
+            var guardCount = 0
+            repeat {
+                let page = try resolve(cursor)
+                ids.append(contentsOf: page.ids)
+                cursor = page.nextCursor
+                guardCount += 1
+                if guardCount > 20 { break }
+            } while cursor != nil
+            return ids
+        }
+
+        let jsWalk = try walk { cursor in
+            try resolveRelationshipPagedJs(
+                doc: doc, model: "posts", id: "p1", relationship: "tags",
+                limit: 1, afterCursor: cursor)
+        }
+        let swWalk = try walk { cursor in
+            try resolveRelationshipPagedSwift(
+                doc: doc, model: "posts", id: "p1", relationship: "tags",
+                limit: 1, afterCursor: cursor)
+        }
+        XCTAssertEqual(jsWalk, ["t0", "t1", "t2", "t3", "t4", "t5"],
+                       "JS zero-cursor walk must advance through every row once, not repeat page 1")
+        XCTAssertEqual(swWalk, jsWalk,
+                       "Swift and JS must agree walking past a zero-valued cursor")
+
+        // The first page's cursor encodes position 0 (not dropped). We only
+        // assert the field is PRESENT in the cursor, not its decoded scalar
+        // type: JSON `0` bridges to an NSNumber that the cursor decoder's
+        // `anyToPrimitive` classifies as `.boolean(false)` before `.number`
+        // (a known Bool/Double ambiguity). Presence is what proves the
+        // zero-valued boundary was carried rather than dropped; the walk
+        // asserted above proves it resolves correctly.
+        let p1 = try resolveRelationshipPagedJs(
+            doc: doc, model: "posts", id: "p1", relationship: "tags",
+            limit: 1)
+        let data = try XCTUnwrap(decodeCursorData(p1.nextCursor),
+                                 "first page nextCursor should decode")
+        XCTAssertTrue(data.sortFields.contains("position"),
+                      "cursor sortFields should include the numeric order field")
+        XCTAssertNotNil(data.values["position"],
+                        "a zero-valued position must survive in the composite cursor, not be dropped")
+    }
+
+    // MARK: - Cursor decode helpers (opaque-token parity, #1607)
+
+    /// Decode an opaque cursor token into `CursorData`, or `nil` for a nil
+    /// token. Uses the SAME decoder the engine uses, so a token minted by
+    /// either client decodes here regardless of its JSON key order.
+    private func decodeCursorData(_ token: String?) -> CursorData? {
+        guard let token else { return nil }
+        return try? CursorManager.decodeCursor(token)
+    }
+
+    /// Assert two opaque cursor tokens carry the same DECODED structure
+    /// (values + sortFields + direction). Never compares the raw bytes:
+    /// JS `JSON.stringify` and Swift `JSONSerialization` may order keys
+    /// differently, so byte equality is not a valid parity signal.
+    private func assertCursorDataEqual(
+        _ a: String?, _ b: String?, _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        switch (a, b) {
+        case (nil, nil):
+            return
+        case let (x?, y?):
+            guard let da = decodeCursorData(x) else {
+                XCTFail("\(message): JS/left cursor failed to decode", file: file, line: line)
+                return
+            }
+            guard let db = decodeCursorData(y) else {
+                XCTFail("\(message): Swift/right cursor failed to decode", file: file, line: line)
+                return
+            }
+            XCTAssertEqual(da, db, "\(message): decoded CursorData differs", file: file, line: line)
+        default:
+            XCTFail("\(message): one cursor is nil, the other present", file: file, line: line)
+        }
     }
 
     // MARK: - Fixtures + helpers
@@ -1027,6 +1407,61 @@ final class E2EQueryParityTests: XCTestCase {
         ]
         let out = try runJsCli(cmd: cmd)
         return (out["results"] as? [[String: Any]]) ?? []
+    }
+
+    /// One page of a paginated `hasManyThrough` resolution (#1230):
+    /// the resolved ids plus the join-leg cursors echoed by the harness.
+    private struct RelPage: Equatable {
+        let ids: [String]
+        let nextCursor: String?
+        let prevCursor: String?
+    }
+
+    private func resolveRelationshipPaged(
+        cli: ([String: Any]) throws -> [String: Any],
+        doc: String, model: String, id: String, relationship: String,
+        limit: Int, afterCursor: String? = nil, beforeCursor: String? = nil,
+        direction: String = "forward"
+    ) throws -> RelPage {
+        var cmd: [String: Any] = [
+            "cmd": "resolveRelationship",
+            "doc": doc, "model": model, "id": id,
+            "relationship": relationship,
+            "limit": limit, "direction": direction,
+        ]
+        if let afterCursor { cmd["afterCursor"] = afterCursor }
+        if let beforeCursor { cmd["beforeCursor"] = beforeCursor }
+        let out = try cli(cmd)
+        let rows = (out["results"] as? [[String: Any]]) ?? []
+        return RelPage(
+            ids: rows.compactMap { $0["id"] as? String },
+            nextCursor: out["nextCursor"] as? String,
+            prevCursor: out["prevCursor"] as? String
+        )
+    }
+
+    private func resolveRelationshipPagedSwift(
+        doc: String, model: String, id: String, relationship: String,
+        limit: Int, afterCursor: String? = nil, beforeCursor: String? = nil,
+        direction: String = "forward"
+    ) throws -> RelPage {
+        try resolveRelationshipPaged(
+            cli: runSwiftCli, doc: doc, model: model, id: id,
+            relationship: relationship, limit: limit,
+            afterCursor: afterCursor, beforeCursor: beforeCursor, direction: direction
+        )
+    }
+
+    private func resolveRelationshipPagedJs(
+        doc: String, model: String, id: String, relationship: String,
+        limit: Int, afterCursor: String? = nil, beforeCursor: String? = nil,
+        direction: String = "forward"
+    ) throws -> RelPage {
+        try resolveRelationshipPaged(
+            cli: runJsCli, doc: doc, model: model, id: id,
+            relationship: relationship, limit: limit,
+            afterCursor: afterCursor, beforeCursor: beforeCursor, direction: direction
+        )
     }
 
     /// Wire-byte inspect on JS side.

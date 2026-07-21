@@ -223,7 +223,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Update a database's CEL context dict.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.updateMetadata`.
-    @available(*, deprecated, message: "Use databases.updateCelContext(databaseId:celContext:) instead.")
+    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). A category has separate readRule/writeRule, so a writer no longer inherits update from read access. Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API, write its values, and read them from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated updateCelContext.")
     public func updateMetadata(databaseId: String, metadata: [String: JSONValue]) async throws -> DatabaseInfo {
         let body = try JSONCoding.jsonObject(from: metadata)
         let result = try await makeRequest("PATCH", "/databases/\(databaseId)/metadata", body)
@@ -233,7 +233,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Read a database's CEL context dict.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.getMetadata`.
-    @available(*, deprecated, message: "Use databases.getCelContext(databaseId:) instead.")
+    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). A category has separate readRule/writeRule (read no longer implies update). Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read its values from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated getCelContext.")
     public func getMetadata(databaseId: String) async throws -> CelContextResult {
         let result = try await makeRequest("GET", "/databases/\(databaseId)/metadata", nil)
         return try JSONCoding.decode(CelContextResult.self, from: result)
@@ -331,6 +331,48 @@ public final class DatabasesAPI: @unchecked Sendable {
         return try JSONCoding.decode(JSONValue.self, from: result)
     }
 
+    // MARK: - Typed generic overload (#1547)
+    //
+    // The published SDK surface for the CLI-generated typed database-ops factory
+    // (`primitive databases codegen --lang swift`). The generated `<Type>Ops`
+    // struct binds each op's `<Op>Params` in and `<Op>Result` out over THIS
+    // overload; only it is library surface (the generated factory is app-target
+    // code). It delegates to the untyped `executeOperation` above — encoding the
+    // typed `Codable` params into the opaque `params` object and decoding the
+    // opaque result blob into `Output` — so no request/response behavior
+    // diverges from the untyped path.
+
+    /// Execute a registered operation with typed `Codable` params and a typed
+    /// `Output` result. `Params` is encoded into the request `params` object and
+    /// the opaque result is decoded into `Output`. Pagination + diagnostics
+    /// (`limit`/`cursor`/`direction`/`timing`) pass straight through.
+    public func executeOperation<Params: Encodable, Output: Decodable & Sendable>(
+        databaseId: String,
+        name: String,
+        params: Params,
+        limit: Int? = nil,
+        cursor: String? = nil,
+        direction: SortDirection? = nil,
+        timing: Bool? = nil
+    ) async throws -> Output {
+        // Encode the typed params into the loosely-typed `JSONValue` the untyped
+        // `ExecuteOperationOptions.params` carries.
+        let paramsValue = try JSONCoding.decode(
+            JSONValue.self,
+            from: JSONCoding.jsonObject(from: params)
+        )
+        let options = ExecuteOperationOptions(
+            params: paramsValue,
+            limit: limit,
+            cursor: cursor,
+            direction: direction,
+            timing: timing
+        )
+        let raw = try await executeOperation(databaseId: databaseId, name: name, options: options)
+        // Decode the opaque result blob into the typed `Output`.
+        return try JSONCoding.decode(Output.self, from: JSONCoding.jsonObject(from: raw))
+    }
+
     // MARK: - Bulk Import
 
     /// Import a batch of records using a named mutation operation.
@@ -365,12 +407,18 @@ public final class DatabasesAPI: @unchecked Sendable {
     ///
     /// Response payload includes the same dict under both `metadata`
     /// (legacy wire name) and `celContext` (current name).
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.getCelContext`.
+    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). The metadataAccess gate that controls this read uses one CEL expression for read AND update, so read implies update. A metadata category has separate readRule/writeRule; read its values from CEL as md.self.<category>.<key>.")
     public func getCelContext(databaseId: String) async throws -> CelContextResult {
         let result = try await makeRequest("GET", "/databases/\(databaseId)/metadata", nil)
         return try JSONCoding.decode(CelContextResult.self, from: result)
     }
 
     /// Merge new key-value pairs into a database's CEL context dict.
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.updateCelContext`.
+    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). Writing here is gated by the same single metadataAccess expression that gates reads, so anyone who can read can also update. A metadata category has separate readRule/writeRule; read its values from CEL as md.self.<category>.<key>.")
     public func updateCelContext(
         databaseId: String,
         celContext: [String: JSONValue]

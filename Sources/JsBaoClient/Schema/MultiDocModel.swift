@@ -165,7 +165,11 @@ final class MultiDocModel: IncludeTarget {
     // MARK: - Reads
 
     public func findAll() -> [[String: Any]] {
-        return query(nil, options: nil)
+        // `nil` filter never carries a substring operator, so the
+        // now-throwing `query` can't actually throw here — handle the
+        // unreachable error locally to keep `findAll` non-throwing
+        // (fixed-shape read, per the #1119 design).
+        return (try? query(nil, options: nil)) ?? []
     }
 
     /// Find a record by id. First-match-wins in connect order
@@ -179,11 +183,14 @@ final class MultiDocModel: IncludeTarget {
         }
         // Prefer one SQL query over iterating Y.Maps — `id` is not
         // unique across docs (that's the whole point), so we sort
-        // results by docId in connect order.
-        let rows = engine.query(
+        // results by docId in connect order. A bare `id` equality filter
+        // can't trigger the substring-op validator, so the now-throwing
+        // `engine.query` is unreachable-error here — handle it locally
+        // so `find` stays non-throwing.
+        let rows = (try? engine.query(
             modelName: schema.name,
             filter: ["id": id]
-        )
+        )) ?? []
         guard !rows.isEmpty else { return nil }
         let connectOrder = snapshot.enumerated().reduce(
             into: [String: Int]()
@@ -344,17 +351,17 @@ final class MultiDocModel: IncludeTarget {
     public func query(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) -> [[String: Any]] {
+    ) throws -> [[String: Any]] {
         drainAllObservers()
-        return engine.query(
+        return try engine.query(
             modelName: schema.name, filter: filter, options: options,
             stringsetFields: stringsetFieldNames
         )
     }
 
-    public func count(_ filter: DocumentFilter? = nil) -> Int {
+    public func count(_ filter: DocumentFilter? = nil) throws -> Int {
         drainAllObservers()
-        return engine.count(
+        return try engine.count(
             modelName: schema.name, filter: filter,
             stringsetFields: stringsetFieldNames
         )
@@ -367,9 +374,9 @@ final class MultiDocModel: IncludeTarget {
     public func count(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions?
-    ) -> Int {
+    ) throws -> Int {
         drainAllObservers()
-        return engine.count(
+        return try engine.count(
             modelName: schema.name, filter: filter,
             stringsetFields: stringsetFieldNames,
             documents: options?.documents
@@ -379,9 +386,9 @@ final class MultiDocModel: IncludeTarget {
     /// Cross-doc aggregation. Runs one SQL query against the shared
     /// table. Group by `_meta_doc_id` to get per-doc rollups; omit
     /// grouping for a single global rollup.
-    public func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
+    public func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
         drainAllObservers()
-        return engine.aggregate(
+        return try engine.aggregate(
             modelName: schema.name, options: options,
             stringsetFields: stringsetFieldNames
         )
@@ -489,7 +496,7 @@ final class MultiDocModel: IncludeTarget {
         include: [Include]
     ) throws -> [[String: Any]] {
         drainAllObservers()
-        var rows = engine.query(
+        var rows = try engine.query(
             modelName: schema.name, filter: filter, options: options,
             stringsetFields: stringsetFieldNames
         )

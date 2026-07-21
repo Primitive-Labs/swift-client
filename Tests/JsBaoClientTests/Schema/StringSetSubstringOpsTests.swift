@@ -50,14 +50,14 @@ final class StringSetSubstringOpsTests: XCTestCase {
 
     func testStartsWithMatchesAnyMemberPrefix() throws {
         let model = try seeded()
-        let rows = model.query(["tags": ["$startsWith": "draft-"]])
+        let rows = try model.query(["tags": ["$startsWith": "draft-"]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["p1", "p2"])
     }
 
     func testStartsWithDoesNotMatchIfNoMemberStartsWithPrefix() throws {
         let model = try seeded()
-        let rows = model.query(["tags": ["$startsWith": "archived-"]])
+        let rows = try model.query(["tags": ["$startsWith": "archived-"]])
         XCTAssertTrue(rows.isEmpty)
     }
 
@@ -65,7 +65,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
 
     func testEndsWithMatchesAnyMemberSuffix() throws {
         let model = try seeded()
-        let rows = model.query(["tags": ["$endsWith": "-A"]])
+        let rows = try model.query(["tags": ["$endsWith": "-A"]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["p3"])
     }
@@ -74,7 +74,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
 
     func testContainsTextMatchesSubstringWithinAnyMember() throws {
         let model = try seeded()
-        let rows = model.query(["tags": ["$containsText": "rove"]])
+        let rows = try model.query(["tags": ["$containsText": "rove"]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["p1", "p3"],
                        "'rove' is a substring of 'approved' — both p1 and p3 carry 'approved'")
@@ -88,7 +88,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
         // "001approved" would be a boundary-crossing match under a
         // naive CSV storage (members "draft-001" + "approved"). With
         // junction rows it cannot match.
-        let rows = model.query(["tags": ["$containsText": "001approved"]])
+        let rows = try model.query(["tags": ["$containsText": "001approved"]])
         XCTAssertTrue(rows.isEmpty)
     }
 
@@ -96,7 +96,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
 
     func testStartsWithOnEmptyStringsetNoMatch() throws {
         let model = try seeded()
-        let rows = model.query(["tags": ["$startsWith": "anything"]])
+        let rows = try model.query(["tags": ["$startsWith": "anything"]])
         let ids = rows.compactMap { $0["id"] as? String }
         XCTAssertFalse(ids.contains("p4"))
     }
@@ -107,7 +107,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
     /// column value directly — no junction lookup.
     func testSubstringOpsOnStringFieldStillMatchColumn() throws {
         let model = try seeded()
-        let rows = model.query(["name": ["$startsWith": "fir"]])
+        let rows = try model.query(["name": ["$startsWith": "fir"]])
         XCTAssertEqual(rows.compactMap { $0["id"] as? String }, ["p1"])
     }
 
@@ -128,7 +128,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
             "name": .string("B"), "tags": .stringset(["draft-B", "archived"]),
         ])
 
-        let rows = multi.query(["tags": ["$startsWith": "draft-"]])
+        let rows = try multi.query(["tags": ["$startsWith": "draft-"]])
         XCTAssertEqual(
             Set(rows.compactMap { $0["id"] as? String }),
             ["a1", "b1"]

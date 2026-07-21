@@ -34,7 +34,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
                 "name": .string("n\(i)"), "score": .number(Double(i)),
             ])
         }
-        _ = model.query(nil) // drain post-seed async observer work
+        _ = try model.query(nil) // drain post-seed async observer work
         return model
     }
 
@@ -56,7 +56,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
 
         let elapsed = try timed {
             try model.update(id: "r500", values: ["score": .number(9999)])
-            _ = model.query(["id": "r500"])  // drain
+            _ = try model.query(["id": "r500"])  // drain
         }
 
         let delta = model.queryEngineInternal.rowWriteCount - before
@@ -85,7 +85,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
                 _ = try model.create(id: "r\(i)", values: [
                     "name": .string("n\(i)"), "score": .number(Double(i)),
                 ])
-                _ = model.query(nil)
+                _ = try model.query(nil)
             }
         }
 
@@ -120,7 +120,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
                     "name": .string("n\(i)"), "score": .number(Double(i)),
                 ])
             }
-            _ = model.query(nil)  // final drain
+            _ = try model.query(nil)  // final drain
         }
 
         let delta = model.queryEngineInternal.rowWriteCount - before
@@ -145,7 +145,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
 
         let elapsed = try timed {
             for _ in 0..<n {
-                _ = model.query(["score": ["$gt": 500]])
+                _ = try model.query(["score": ["$gt": 500]])
             }
         }
 
@@ -190,7 +190,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
                     "name": .string("n\(i)"), "score": .number(Double(i)),
                 ])
             }
-            _ = m.query(nil)
+            _ = try m.query(nil)
             return m.queryEngineInternal.rowWriteCount - before
         }
 
@@ -198,7 +198,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
             let m = try freshModel(seed: 1000)
             let before = m.queryEngineInternal.rowWriteCount
             try m.update(id: "r500", values: ["score": .number(-1)])
-            _ = m.query(nil)
+            _ = try m.query(nil)
             return m.queryEngineInternal.rowWriteCount - before
         }
 
@@ -207,7 +207,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
             let before = m.queryEngineInternal.rowWriteCount
             for i in 0..<100 {
                 _ = try m.create(id: "r\(i)", values: ["score": .number(Double(i))])
-                _ = m.query(nil)
+                _ = try m.query(nil)
             }
             return m.queryEngineInternal.rowWriteCount - before
         }
@@ -216,7 +216,7 @@ final class PerformanceBenchmarkTests: XCTestCase {
             let m = try freshModel(seed: 1000)
             let before = m.queryEngineInternal.rowWriteCount
             for _ in 0..<100 {
-                _ = m.query(["score": ["$gt": 500]])
+                _ = try m.query(["score": ["$gt": 500]])
             }
             return m.queryEngineInternal.rowWriteCount - before
         }

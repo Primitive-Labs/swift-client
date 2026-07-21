@@ -25,7 +25,7 @@ public final class AuthController: @unchecked Sendable {
     /// (a `bootstrap`/`http_refresh`/`refresh`/`startup` that resolves
     /// after the user logged out) from silently re-authenticating or
     /// re-persisting the JWT. Cleared by the next interactive login
-    /// (`oauth`/`apple`/`magic_link`/`otp`/`passkey`). Guarded by `lock`.
+    /// (`google`/`oauth`/`apple`/`magic_link`/`otp`/`passkey`). Guarded by `lock`.
     private var blockNonInteractiveAuth = false
 
     // Refresh backoff
@@ -129,7 +129,7 @@ public final class AuthController: @unchecked Sendable {
     /// opposed to a background token refresh or persisted-session restore).
     private static func isInteractiveLogin(_ cause: String?) -> Bool {
         switch cause {
-        case "oauth", "apple", "magic_link", "otp", "passkey": return true
+        case "google", "oauth", "apple", "magic_link", "otp", "passkey": return true
         default: return false
         }
     }
@@ -391,7 +391,7 @@ public final class AuthController: @unchecked Sendable {
     /// `GET /oauth/callback?code=&state=` returns `{token, isNewUser}` plus
     /// the `rt-{appId}` HttpOnly refresh cookie (handled transparently by
     /// `URLSession`'s shared cookie storage). Applies the token with cause
-    /// `"oauth"`, which emits `.authSuccess` / `.authState` like every other
+    /// `"google"`, which emits `.authSuccess` / `.authState` like every other
     /// interactive sign-in path. Returns the raw server response so callers
     /// can read `isNewUser`.
     @discardableResult
@@ -431,7 +431,7 @@ public final class AuthController: @unchecked Sendable {
         }
 
         let previous = getToken()
-        applyToken(token, previous: previous, cause: "oauth")
+        applyToken(token, previous: previous, cause: "google")
         return dict
     }
 
@@ -439,7 +439,7 @@ public final class AuthController: @unchecked Sendable {
 
     /// Exchange a native Sign in with Apple credential for a session token.
     /// `POST /auth/apple/callback` with the JSON body
-    /// `{identityToken, nonce, user, email?, firstName?, lastName?}` —
+    /// `{identityToken, nonce, user, email?, firstName?, lastName?, inviteToken?}` —
     /// the contract of the server's `AppleAuthController` (#409):
     ///  * `identityToken` — Apple's JWT (`credential.identityToken`, UTF-8).
     ///  * `nonce` — the **raw** nonce; the client put its SHA-256 (lowercase
@@ -448,6 +448,9 @@ public final class AuthController: @unchecked Sendable {
     ///  * `user` — Apple's stable user identifier (`credential.user`).
     ///  * `email` / `firstName` / `lastName` — first-authorization hints
     ///    (Apple only provides them once per user+app).
+    ///  * `inviteToken` — optional invitation token (#1467); the server
+    ///    accepts the invitation and resolves its deferred grants during a
+    ///    first sign-in. Omitted from the body when nil or empty.
     /// The response is `{token, isNewUser}` plus the `rt-{appId}` HttpOnly
     /// refresh cookie (handled by `URLSession`'s cookie storage). Applies
     /// the token with cause `"apple"`, emitting `.authSuccess` /
@@ -460,7 +463,8 @@ public final class AuthController: @unchecked Sendable {
         user: String,
         email: String? = nil,
         firstName: String? = nil,
-        lastName: String? = nil
+        lastName: String? = nil,
+        inviteToken: String? = nil
     ) async throws -> [String: Any] {
         guard let makeRequest = makeRequest else {
             throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
@@ -472,7 +476,8 @@ public final class AuthController: @unchecked Sendable {
             user: user,
             email: email,
             firstName: firstName,
-            lastName: lastName
+            lastName: lastName,
+            inviteToken: inviteToken
         )
         let response = try await makeRequest("POST", "/auth/apple/callback", body)
         guard let dict = response as? [String: Any],

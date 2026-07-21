@@ -49,7 +49,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
 
     func testFacetGroupByTagValue() throws {
         let model = try seededDoc()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["tags"],
             operations: [AggregateOperation(type: .count)]
         ))
@@ -63,7 +63,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
 
     func testFacetHonorsFilterOnMainTable() throws {
         let model = try seededDoc()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["tags"],
             operations: [AggregateOperation(type: .count)],
             filter: ["score": ["$gte": 20]]
@@ -80,7 +80,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
 
     func testMembershipGroupByTrueFalse() throws {
         let model = try seededDoc()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: [.stringSetMembership(field: "tags", contains: "red")],
             operations: [AggregateOperation(type: .count)]
         ))
@@ -94,7 +94,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
 
     func testMembershipWithSumOperation() throws {
         let model = try seededDoc()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: [.stringSetMembership(field: "tags", contains: "red")],
             operations: [
                 AggregateOperation(type: .count),
@@ -126,7 +126,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
 
     func testFacetAcrossDocs() throws {
         let multi = try seededPair()
-        let rows = multi.aggregate(AggregateOptions(
+        let rows = try multi.aggregate(AggregateOptions(
             groupBy: ["tags"],
             operations: [AggregateOperation(type: .count)]
         ))
@@ -140,7 +140,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
 
     func testMembershipAcrossDocs() throws {
         let multi = try seededPair()
-        let rows = multi.aggregate(AggregateOptions(
+        let rows = try multi.aggregate(AggregateOptions(
             groupBy: [.stringSetMembership(field: "tags", contains: "blue")],
             operations: [AggregateOperation(type: .count)]
         ))
@@ -158,7 +158,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
     /// facet and runs the regular/membership branch. Must not crash.
     func testFacetMixedWithMembershipDropsFacet() throws {
         let model = try seededDoc()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["tags", .stringSetMembership(field: "tags", contains: "red")],
             operations: [AggregateOperation(type: .count)]
         ))
@@ -174,7 +174,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
     /// by the regular field. Must not crash.
     func testFacetMixedWithRegularFieldDropsFacet() throws {
         let model = try seededDoc()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["tags", "score"],
             operations: [AggregateOperation(type: .count)]
         ))
@@ -200,7 +200,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         _ = try model.create(id: "x1", values: ["tags": .stringset(["a"]), "labels": .stringset(["p"])])
         _ = try model.create(id: "x2", values: ["tags": .stringset(["a", "b"]), "labels": .stringset(["q"])])
 
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["tags", "labels"],
             operations: [AggregateOperation(type: .count)]
         ))

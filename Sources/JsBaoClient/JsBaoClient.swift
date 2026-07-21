@@ -71,6 +71,18 @@ public final class JsBaoClient: @unchecked Sendable {
     private var pendingUpdates: [String: [[UInt8]]] = [:]
     private var isDestroyed = false
 
+    // MARK: Storage-init completion signal (#1780)
+
+    /// Guards `storageReady` + `storageReadyWaiters`.
+    private let storageReadyLock = NSLock()
+    /// Latched `true` once `setupStorage()`'s init task has run to completion —
+    /// token restored (or none), the user-scoped managers bound, and local
+    /// metadata loaded — whether it succeeded or failed. Never resets.
+    private var storageReady = false
+    /// Continuations parked in `awaitStorageReady()` before the signal fired,
+    /// keyed so a cancelled waiter can remove only its own.
+    private var storageReadyWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
     // MARK: Analytics session lifecycle (#963)
 
     /// Timestamp the current analytics session started. Stamped at init;
@@ -538,6 +550,13 @@ public final class JsBaoClient: @unchecked Sendable {
         return sharedModels[modelName]
     }
 
+    /// Public include target for generated query-time include builders.
+    /// App code should normally use the generated `Model.includeRelation()`
+    /// helpers, which call this with the target model's schema.
+    public func includeTarget(for schema: PrimitiveSchema) -> any IncludeTarget {
+        sharedModel(for: schema)
+    }
+
     // MARK: Shared-store CRUD (backs the codegen'd `Model.*` facade)
     //
     // Schema + dict shaped (no generics) so the generated per-type facade
@@ -550,8 +569,20 @@ public final class JsBaoClient: @unchecked Sendable {
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) -> [[String: Any]] {
-        sharedModel(for: schema).query(filter, options: options)
+    ) throws -> [[String: Any]] {
+        try sharedModel(for: schema).query(filter, options: options)
+    }
+
+    /// Cross-document query with query-time relationship includes. Returns raw
+    /// rows with related records attached under `_related`, matching JS
+    /// `BaseModel.query(filter, { include })`.
+    public func queryShared(
+        _ schema: PrimitiveSchema,
+        filter: DocumentFilter? = nil,
+        options: QueryOptions? = nil,
+        include: [Include]
+    ) throws -> [[String: Any]] {
+        try sharedModel(for: schema).query(filter, options: options, include: include)
     }
 
     /// Cross-document paginated query → raw rows + cursors. The facade maps
@@ -567,9 +598,19 @@ public final class JsBaoClient: @unchecked Sendable {
         try sharedModel(for: schema).queryPaged(filter, options: options)
     }
 
+    /// Cross-document paginated query with query-time relationship includes.
+    public func queryPagedShared(
+        _ schema: PrimitiveSchema,
+        filter: DocumentFilter? = nil,
+        options: QueryOptions? = nil,
+        include: [Include]
+    ) throws -> PagedQueryResult<[String: Any]> {
+        try sharedModel(for: schema).queryPaged(filter, options: options, include: include)
+    }
+
     /// Cross-document count.
-    public func countShared(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil) -> Int {
-        sharedModel(for: schema).count(filter)
+    public func countShared(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil) throws -> Int {
+        try sharedModel(for: schema).count(filter)
     }
 
     /// First record with `id` across every open doc (raw row), or `nil`.
@@ -587,8 +628,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Aggregate (group / count / sum / avg / …) across every open document.
     public func aggregateShared(
         _ schema: PrimitiveSchema, options: AggregateOptions
-    ) -> [[String: Any]] {
-        sharedModel(for: schema).aggregate(options)
+    ) throws -> [[String: Any]] {
+        try sharedModel(for: schema).aggregate(options)
     }
 
     /// Create-or-update a record in document `docId` — insert if it doesn't
@@ -615,8 +656,27 @@ public final class JsBaoClient: @unchecked Sendable {
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) -> [String: Any]? {
-        sharedModel(for: schema).query(filter, options: options).first
+    ) throws -> [String: Any]? {
+        try sharedModel(for: schema).query(filter, options: options).first
+    }
+
+    /// First record matching `filter` across every open doc with query-time
+    /// relationship includes attached under `_related` (raw row), or `nil`.
+    /// Mirrors js-bao's `BaseModel.queryOne(filter, { include })`.
+    ///
+    /// Convention: this takes `.first` of the included query rather than
+    /// forwarding `limit: 1` the way js-bao's `queryOne` does. That matches the
+    /// existing no-include `queryOneShared` above, so the typed `queryOne`
+    /// overloads stay consistent with each other; the include resolver runs over
+    /// the full match set and the first row (with its `_related`) is returned. A
+    /// filter that matches nothing returns `nil` with no related decode.
+    public func queryOneShared(
+        _ schema: PrimitiveSchema,
+        filter: DocumentFilter? = nil,
+        options: QueryOptions? = nil,
+        include: [Include]
+    ) throws -> [String: Any]? {
+        try sharedModel(for: schema).query(filter, options: options, include: include).first
     }
 
     // MARK: - Cross-document relationship traversal (backs generated instance accessors)
@@ -658,27 +718,117 @@ public final class JsBaoClient: @unchecked Sendable {
         sourceId: String,
         orderByField: String? = nil,
         orderDirection: String? = nil
-    ) -> [[String: Any]] {
+    ) throws -> [[String: Any]] {
         let descending = (orderDirection?.uppercased() == "DESC")
         let options = orderByField.map { QueryOptions(sort: [$0: descending ? -1 : 1]) }
-        return queryShared(target, filter: [relatedIdField: sourceId], options: options)
+        return try queryShared(target, filter: [relatedIdField: sourceId], options: options)
     }
 
     /// Resolve a `hasManyThrough` relationship via `joinModel`: find join
-    /// rows whose `joinModelLocalField` equals `sourceId`, collect their
-    /// `joinModelRelatedField` values, and resolve those ids in `target`.
-    /// Returns raw target rows in join-row order. Mirrors JS
-    /// `generateHasManyThroughMethod`.
+    /// rows whose `joinModelLocalField` equals `sourceId` (ordered by the
+    /// declared `joinModelOrderByField` / `joinModelOrderDirection`, default
+    /// `id ASC`), collect their `joinModelRelatedField` values, and resolve
+    /// those ids in `target` with a single `id: { $in: [...] }` query. That
+    /// query's `id ASC` tiebreaker re-orders the output, so targets come back
+    /// in **target `id ASC`** — the declared join order governs which rows are
+    /// selected, not the final order. Mirrors JS `generateHasManyThroughMethod`
+    /// (sort join leg → `query({ id: { $in } })` → `id ASC` tiebreaker).
     public func hasManyThroughShared(
         target: PrimitiveSchema,
         joinModel: PrimitiveSchema,
         sourceId: String,
         joinModelLocalField: String,
-        joinModelRelatedField: String
-    ) -> [[String: Any]] {
-        let joinRows = queryShared(joinModel, filter: [joinModelLocalField: sourceId], options: nil)
+        joinModelRelatedField: String,
+        joinModelOrderByField: String? = nil,
+        joinModelOrderDirection: String? = nil
+    ) throws -> [[String: Any]] {
+        let descending = (joinModelOrderDirection?.uppercased() == "DESC")
+        let joinOptions = joinModelOrderByField.map {
+            QueryOptions(sort: [$0: descending ? -1 : 1])
+        }
+        let joinRows = try queryShared(
+            joinModel, filter: [joinModelLocalField: sourceId], options: joinOptions
+        )
         let targetIds = joinRows.compactMap { $0[joinModelRelatedField] as? String }
-        return targetIds.compactMap { findShared(target, id: $0) }
+        guard !targetIds.isEmpty else { return [] }
+        return try queryShared(target, filter: ["id": ["$in": targetIds]], options: nil)
+    }
+
+    /// Paginated `hasManyThrough` traversal — pages the JOIN leg through the
+    /// shared composite-cursor engine (`queryPagedShared`) by the declared
+    /// `joinModelOrderByField` / `joinModelOrderDirection` (defaulting to
+    /// **`id ASC`** when none is declared), then `$in`-resolves the page's
+    /// related ids against `target`. Mirrors JS `generateHasManyThroughMethod`,
+    /// which now delegates the page cut to `BaseModel.query`
+    /// (`relationshipManager.ts`).
+    ///
+    /// The cursor is the engine's **opaque** token (a `String?`), the same
+    /// composite `(field, id)` cursor `queryPaged` mints — so a cursor issued
+    /// here or by the JS client round-trips through the shared decoder. This
+    /// fixes the tie-straddle skip/duplicate defect (#1607) the old
+    /// hand-rolled raw-scalar cursor had. `limit` is required so a bare
+    /// `hasManyThroughShared(...)` call still binds to the unpaginated
+    /// overload above.
+    ///
+    /// Envelope contract: the returned `nextCursor` / `prevCursor` / `hasMore`
+    /// are COPIED verbatim from the join leg's paged result, and `data` is
+    /// REPLACED with the `$in`-resolved targets. Targets come back **target
+    /// `id ASC`** (the `$in` tiebreaker, #1201) — the join order governs which
+    /// rows are on the page, not the intra-page order. `hasMore` is the
+    /// engine's over-fetch signal: more rows remain in the CURRENT paging
+    /// direction (forward → later rows, backward → earlier rows) — it is NOT
+    /// "a prevCursor is present".
+    ///
+    /// A non-positive `limit` returns an empty page without querying.
+    public func hasManyThroughShared(
+        target: PrimitiveSchema,
+        joinModel: PrimitiveSchema,
+        sourceId: String,
+        joinModelLocalField: String,
+        joinModelRelatedField: String,
+        joinModelOrderByField: String? = nil,
+        joinModelOrderDirection: String? = nil,
+        limit: Int,
+        afterCursor: String? = nil,
+        beforeCursor: String? = nil,
+        direction: CursorDirection = .forward
+    ) throws -> PagedQueryResult<[String: Any]> {
+        guard limit > 0 else {
+            return PagedQueryResult(data: [], nextCursor: nil, prevCursor: nil, hasMore: false)
+        }
+        let orderByField = joinModelOrderByField ?? "id"
+        let descending = (joinModelOrderDirection?.uppercased() == "DESC")
+
+        // D7 / Fork B (#1607): warn on a nullable join order field.
+        RelationshipPaginationValidator.warnIfOrderFieldNullable(
+            schema: joinModel, orderByField: orderByField,
+            relationshipDescription:
+                "hasManyThrough(\(target.name) via \(joinModel.name))"
+        )
+
+        let cursor = direction == .forward ? afterCursor : beforeCursor
+        let joinOptions = QueryOptions(
+            sort: [orderByField: descending ? -1 : 1],
+            limit: limit,
+            cursor: cursor,
+            direction: direction,
+            projection: [joinModelRelatedField: 1, orderByField: 1]
+        )
+        let joinPage = try queryPagedShared(
+            joinModel, filter: [joinModelLocalField: sourceId], options: joinOptions
+        )
+        let relatedIds = joinPage.data.compactMap { $0[joinModelRelatedField] as? String }
+        guard !relatedIds.isEmpty else {
+            return PagedQueryResult(
+                data: [], nextCursor: joinPage.nextCursor,
+                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+            )
+        }
+        let rows = try queryShared(target, filter: ["id": ["$in": relatedIds]], options: nil)
+        return PagedQueryResult(
+            data: rows, nextCursor: joinPage.nextCursor,
+            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+        )
     }
 
     /// Insert-or-update a record in document `docId`, matched by the
@@ -1311,7 +1461,8 @@ public final class JsBaoClient: @unchecked Sendable {
         user: String,
         email: String? = nil,
         firstName: String? = nil,
-        lastName: String? = nil
+        lastName: String? = nil,
+        inviteToken: String? = nil
     ) async throws -> [String: Any] {
         let result = try await authController.handleAppleCallback(
             identityToken: identityToken,
@@ -1319,7 +1470,8 @@ public final class JsBaoClient: @unchecked Sendable {
             user: user,
             email: email,
             firstName: firstName,
-            lastName: lastName
+            lastName: lastName,
+            inviteToken: inviteToken
         )
         if !wsManager.isSocketOpen {
             try? await connect()
@@ -2714,7 +2866,7 @@ public final class JsBaoClient: @unchecked Sendable {
             client: self
         )
         collections = CollectionsAPI(makeRequest: request)
-        links = LinksAPI(aliases: documents.aliases)
+        links = LinksAPI()
         // Realtime DB subscriptions (`databases.subscribe`). The registry
         // routes inbound `db.change` frames and is re-subscribed on reconnect.
         let dbSubscriptionRegistry = DatabaseSubscriptionRegistry(logger: logger)
@@ -2977,18 +3129,19 @@ public final class JsBaoClient: @unchecked Sendable {
                     await authController.tryRestoreSession()
                 }
 
-                // Set userId on kvCache
-                kvCache.setUserId(authController.getUserId())
-
-                // Load local metadata
-                if let userId = authController.getUserId() {
-                    documentManager.userId = userId
-                    try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: userId)
-                    await documentManager.loadLocalMetadata()
-                }
+                // Snapshot the restored user into the user-scoped managers and
+                // load that user's local metadata.
+                await bindCurrentUserScopedStorage()
 
                 // Restore analytics queue
                 await analyticsQueue.restoreBuffer()
+
+                // Storage init is fully settled — token restored (or none) and
+                // the user-scoped state (documentManager.userId + metadata)
+                // snapshotted. Signal now, BEFORE the optional network
+                // auto-connect, so waiters unblock on local readiness without
+                // waiting on the network (#1780).
+                markStorageReady()
 
                 // Auto-connect if online
                 if options.autoNetwork && isOnline() {
@@ -2997,6 +3150,113 @@ public final class JsBaoClient: @unchecked Sendable {
             } catch {
                 logger.error("Storage setup failed:", error.localizedDescription)
             }
+            // Idempotent guarantee: fire the signal even if setup threw before
+            // reaching the marker above, so `waitForStorageReady` never stalls
+            // a caller on the error path.
+            markStorageReady()
+        }
+    }
+
+    /// Snapshot the current auth user into the user-scoped managers and load
+    /// that user's local metadata. Shared by `setupStorage()` (initial bind)
+    /// and `rebindUserScopedStorage()` (post-sign-in rebind, #1780).
+    private func bindCurrentUserScopedStorage() async {
+        kvCache.setUserId(authController.getUserId())
+        if let userId = authController.getUserId() {
+            documentManager.userId = userId
+            try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: userId)
+            await documentManager.loadLocalMetadata()
+        }
+    }
+
+    /// Re-scope the user-owned managers to the currently authenticated user,
+    /// clearing the previously-bound user's in-memory metadata first. A no-op
+    /// when the user is unchanged.
+    ///
+    /// `setupStorage()` binds document/metadata storage to whoever init
+    /// restored. A later sign-in (`otpVerify`) updates only `AuthController`,
+    /// so without this the client would keep serving the restored user's local
+    /// document state under the new identity — the returned client would
+    /// authenticate as B while retaining A's local documents (#1780). Call
+    /// after a sign-in that may land a different user than init restored, once
+    /// `waitForStorageReady()` confirms the initial bind has finished.
+    public func rebindUserScopedStorage() async {
+        let newUserId = authController.getUserId() ?? ""
+        if documentManager.userId == newUserId { return }
+        await documentManager.resetInMemoryUserState(userId: newUserId)
+        kvCache.setUserId(authController.getUserId())
+        if !newUserId.isEmpty {
+            try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
+            await documentManager.loadLocalMetadata()
+        }
+    }
+
+    /// Wait until storage initialization has fully completed — token restored
+    /// (or none), the user-scoped managers bound, and local metadata loaded —
+    /// or until `timeout` elapses. Returns `true` if init completed within the
+    /// bound, `false` on timeout.
+    ///
+    /// Unlike `waitForAuthReady`, this covers the whole `setupStorage()` task,
+    /// not just token auth-ready (`markAuthReady()` fires mid-task, before the
+    /// user-scoped bind). It is also genuinely bounded: the wait is
+    /// cancellation-aware, so a slow or stuck startup refresh cannot stall the
+    /// caller past `timeout` (#1780 codex P1/P2).
+    @discardableResult
+    public func waitForStorageReady(timeout: TimeInterval = 10) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await self.awaitStorageReady()
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Resume all parked waiters and latch the ready flag. Idempotent.
+    private func markStorageReady() {
+        storageReadyLock.lock()
+        if storageReady {
+            storageReadyLock.unlock()
+            return
+        }
+        storageReady = true
+        let waiters = Array(storageReadyWaiters.values)
+        storageReadyWaiters.removeAll()
+        storageReadyLock.unlock()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Suspend until `setupStorage()` signals completion. Cancellation-aware:
+    /// if the surrounding task is cancelled (e.g. the timeout child in
+    /// `waitForStorageReady`), the parked continuation resumes promptly rather
+    /// than stranding the caller until storage finishes.
+    private func awaitStorageReady() async {
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                storageReadyLock.lock()
+                // `Task.isCancelled` closes the race where cancellation fires
+                // before this continuation is parked: the `onCancel` handler
+                // would find nothing to resume, so resume here instead.
+                if storageReady || Task.isCancelled {
+                    storageReadyLock.unlock()
+                    continuation.resume()
+                    return
+                }
+                storageReadyWaiters[id] = continuation
+                storageReadyLock.unlock()
+            }
+        } onCancel: {
+            storageReadyLock.lock()
+            let waiter = storageReadyWaiters.removeValue(forKey: id)
+            storageReadyLock.unlock()
+            waiter?.resume()
         }
     }
 
@@ -3239,10 +3499,9 @@ public final class JsBaoClient: @unchecked Sendable {
         case "docMetadata":
             // Server-pushed metadata change. Carries `action` ∈ {created,
             // updated, deleted, evicted}, plus the new metadata blob (nil
-            // on delete/revoke). Emit the typed event for general
-            // subscribers; derive `documentDeleted` for the common
-            // "detail view needs to pop" case so subscribers don't have
-            // to filter the action string themselves.
+            // on delete/revoke). Emit the same general metadata event as
+            // JS; subscribers that care about delete/revoke filter
+            // `action == "deleted"` themselves.
             guard let docId = roomId else { return }
             let actionStr = json["action"] as? String ?? "updated"
             let metadata = json["metadata"] as? [String: Any]
@@ -3255,12 +3514,6 @@ public final class JsBaoClient: @unchecked Sendable {
                 source: "server"
             )
             events.emit(.documentMetadataChanged, event)
-            if actionStr == "deleted" {
-                events.emit(
-                    .documentDeleted,
-                    DocumentDeletedEvent(documentId: docId, source: "server-push")
-                )
-            }
 
         case "db.change":
             // Route to the matching databases.subscribe callback. Frames with

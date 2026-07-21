@@ -60,6 +60,19 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         return try JSONCoding.decode(BlobBucketInfo.self, from: result)
     }
 
+    /// Update a bucket's preset/rule set or display metadata.
+    public func updateBucket(
+        bucketIdOrKey: String,
+        params: UpdateBlobBucketParams
+    ) async throws -> BlobBucketInfo {
+        let escaped = bucketIdOrKey.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? bucketIdOrKey
+        let body = try JSONCoding.jsonObject(from: params)
+        let result = try await makeRequest("PATCH", "/blob-buckets/\(escaped)", body)
+        return try JSONCoding.decode(BlobBucketInfo.self, from: result)
+    }
+
     /// Delete a bucket and every blob inside it.
     public func deleteBucket(bucketIdOrKey: String) async throws -> BlobDeletedResult {
         let escaped = bucketIdOrKey.addingPercentEncoding(
@@ -183,7 +196,8 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         return body
     }
 
-    /// Delete a blob from a bucket.
+    /// Delete a single blob from a bucket (`DELETE .../blobs/:blobId`).
+    /// Returns `{ deleted: Bool }`. Unchanged, back-compatible.
     public func delete(
         bucketIdOrKey: String,
         blobId: String
@@ -198,6 +212,34 @@ public final class BlobBucketsAPI: @unchecked Sendable {
             "DELETE", "/blob-buckets/\(escaped)/blobs/\(escapedBlob)", nil
         )
         return try JSONCoding.decode(BlobDeletedResult.self, from: result)
+    }
+
+    /// Batch-delete blobs from a bucket (#1455). Routes to
+    /// `POST .../blobs/delete` with body `{ blobIds }` and returns
+    /// `{ deleted, blobIds, bucketId }`. Mirrors the JS array overload of
+    /// `blobBuckets.delete(bucket, blobIds)`.
+    ///
+    /// All-or-nothing access screening: if the bucket's `delete` rule denies
+    /// any id the whole batch fails (403, nothing deleted). `deleted` counts
+    /// ids processed (input length, duplicates included), not ids that existed.
+    /// The server caps a batch at 500 ids; an empty array is a 200 no-op
+    /// (`{ deleted: 0, blobIds: [] }`, no R2 operation).
+    ///
+    /// A missing id is screened against the `delete` rule with
+    /// `blobCreatedBy == null`, exactly like the single-blob path — so a
+    /// missing id and an existing-but-unauthorized id are indistinguishable
+    /// (no existence oracle).
+    public func delete(
+        bucketIdOrKey: String,
+        blobIds: [String]
+    ) async throws -> BatchBlobDeleteResult {
+        let escaped = bucketIdOrKey.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? bucketIdOrKey
+        let result = try await makeRequest(
+            "POST", "/blob-buckets/\(escaped)/blobs/delete", ["blobIds": blobIds]
+        )
+        return try JSONCoding.decode(BatchBlobDeleteResult.self, from: result)
     }
 
     /// Get a time-limited signed URL for unauthenticated download.

@@ -18,6 +18,57 @@ public enum RelationshipError: Error, Equatable, Sendable {
     case missingRequiredProperty(relationship: String, property: String)
 }
 
+/// Shared D7 / Fork B (#1607) guard for relationship pagination: warn when a
+/// pagination order field is nullable / optional on the model being paged.
+/// Kept as one helper so the cross-document shared path
+/// (`JsBaoClient.hasManyThroughShared`) and the dynamic path
+/// (`PrimitiveRecord.hasManyThrough`) apply the identical rule. Mirrors JS
+/// `warnIfOrderFieldNullable` (`relationshipManager.ts`).
+///
+/// This started (Fork B, sponsor-approved 2026-07-17) as a hard throw. It was
+/// relaxed to a warning to match JS: a hard throw broke existing valid schemas
+/// that order a `hasMany` by an indexed-but-not-`required` field (the
+/// canonical `authors.posts`-by-`createdAt` "newest first" pattern shipped in
+/// the vue demo and docs harness). The composite `(field, id)` cursor already
+/// appends the `id` tiebreaker, so a non-unique order field paginates
+/// deterministically; only a value that is *actually* NULL on a boundary row
+/// is a hazard, and that isn't detectable from the `required` flag alone
+/// (`createdAt` is not marked `required` yet is always present in practice).
+/// Full NULL-ordering semantics are deferred to #1316.
+///
+/// Only warns about a field we can positively see is not marked required:
+/// `id` / `type` are always present, and an order field absent from
+/// `schema.fields` isn't something we can assert about, so both are skipped.
+enum RelationshipPaginationValidator {
+    /// System fields that are always present and never nullable.
+    static let alwaysPresentOrderFields: Set<String> = ["id", "type"]
+
+    /// Advisory logger for the D7 warning. Fixed at `.warn` because this is a
+    /// rare, correctness-relevant advisory (only fires for a nullable order
+    /// field) that should surface regardless of the client's log level.
+    private static let logger = createLogger(level: .warn, scope: "RelationshipPagination")
+
+    static func warnIfOrderFieldNullable(
+        schema: PrimitiveSchema,
+        orderByField: String,
+        relationshipDescription: String
+    ) {
+        if alwaysPresentOrderFields.contains(orderByField) { return }
+        guard let field = schema.fields[orderByField] else { return }
+        if field.required != true {
+            logger.warn(
+                "\(relationshipDescription) orders by "
+                    + "'\(orderByField)', which is not marked required. The composite "
+                    + "(\(orderByField), id) cursor paginates deterministically, but a row "
+                    + "whose '\(orderByField)' is actually NULL has no stable cursor position "
+                    + "and may drop from the tail. Mark '\(orderByField)' as required, or order "
+                    + "by a required field such as 'id', to remove the risk. "
+                    + "(Full NULL-ordering support is tracked in #1316.)"
+            )
+        }
+    }
+}
+
 public extension PrimitiveRecord {
 
     /// Follow a `refersTo` relationship: this record holds a foreign
@@ -68,7 +119,7 @@ public extension PrimitiveRecord {
         let options = orderBy.map {
             QueryOptions(sort: [$0: descending ? -1 : 1])
         }
-        let rows = target.query([fkField: self.id], options: options)
+        let rows = try target.query([fkField: self.id], options: options)
         return rows.compactMap { row in
             (row["id"] as? String).map {
                 PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
@@ -122,14 +173,109 @@ public extension PrimitiveRecord {
 
         // Find join rows pointing at this record — indexed query
         // instead of the old `findAll().filter` full scan (#1115).
-        // Matches js-bao's generated hasManyThrough accessor, which
-        // queries the join model on `joinModelLocalField` and then
-        // resolves the collected target ids
+        // Order the join leg by the declared `joinModelOrderByField` /
+        // `joinModelOrderDirection` (default `id ASC`), like the `hasMany`
+        // sibling above — js-bao sorts the join leg before collecting ids
         // (relationshipManager.ts `generateHasManyThroughMethod`).
-        let joinRows = joinModel.query([localField: self.id], options: nil)
-        // Collect target ids and resolve to records.
+        let joinOrderBy = rel.properties["joinModelOrderByField"] ?? "id"
+        let descending = rel.properties["joinModelOrderDirection"]?.uppercased() == "DESC"
+        let joinOptions = QueryOptions(sort: [joinOrderBy: descending ? -1 : 1])
+        let joinRows = try joinModel.query([localField: self.id], options: joinOptions)
         let targetIds = joinRows.compactMap { $0[relatedField] as? String }
-        return targetIds.compactMap { target.find(id: $0) }
+        guard !targetIds.isEmpty else { return [] }
+        // Resolve the targets with one batched `id: { $in: [...] }` query.
+        // Its `id ASC` tiebreaker re-orders the output to target `id ASC`,
+        // matching JS and the generated `hasManyThroughShared` path — the
+        // declared join order selects which rows, not the final order.
+        let rows = try target.query(["id": ["$in": targetIds]], options: nil)
+        return rows.compactMap { row in
+            (row["id"] as? String).map {
+                PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
+            }
+        }
+    }
+
+    /// Paginated `hasManyThrough` — pages the join leg through the shared
+    /// composite-cursor engine (`DynamicModel.queryPaged`), then
+    /// `$in`-resolves the page's ids against `target`. The dynamic-path
+    /// counterpart to `JsBaoClient.hasManyThroughShared`'s paginated
+    /// overload; both delegate the page cut to the same engine so the
+    /// tie-straddle skip/duplicate defect (#1607) can't recur.
+    ///
+    /// Cursors are the engine's **opaque** tokens (a `String?`), not raw
+    /// join-scalar values — so a cursor minted here or by the JS client
+    /// round-trips through the same composite `(field, id)` decoder. The
+    /// wrapper copies the join leg's `nextCursor` / `prevCursor` / `hasMore`
+    /// verbatim and replaces `data` with the resolved targets. Targets come
+    /// back **target `id ASC`** (the `$in` tiebreaker, #1201) — the join
+    /// order picks page membership, not intra-page order. `hasMore` is the
+    /// engine's over-fetch signal: more rows remain in the CURRENT paging
+    /// direction (forward → later rows, backward → earlier rows).
+    ///
+    /// `limit` is required so a bare `hasManyThrough(...)` call still binds
+    /// to the unpaginated overload above.
+    func hasManyThrough(
+        relationship name: String,
+        joinModel: DynamicModel,
+        target: DynamicModel,
+        limit: Int,
+        afterCursor: String? = nil,
+        beforeCursor: String? = nil,
+        direction: CursorDirection = .forward
+    ) throws -> PagedQueryResult<PrimitiveRecord> {
+        guard limit > 0 else {
+            return PagedQueryResult(data: [], nextCursor: nil, prevCursor: nil, hasMore: false)
+        }
+        let rel = try requireRelationship(
+            name: name, expectedType: "hasManyThrough"
+        )
+        guard let localField = rel.properties["joinModelLocalField"] else {
+            throw RelationshipError.missingRequiredProperty(
+                relationship: name, property: "joinModelLocalField"
+            )
+        }
+        guard let relatedField = rel.properties["joinModelRelatedField"] else {
+            throw RelationshipError.missingRequiredProperty(
+                relationship: name, property: "joinModelRelatedField"
+            )
+        }
+
+        let orderByField = rel.properties["joinModelOrderByField"] ?? "id"
+        let descending = (rel.properties["joinModelOrderDirection"]?.uppercased() == "DESC")
+
+        // D7 / Fork B (#1607): warn on a nullable join order field.
+        RelationshipPaginationValidator.warnIfOrderFieldNullable(
+            schema: joinModel.schema, orderByField: orderByField,
+            relationshipDescription:
+                "hasManyThrough(\(target.schema.name) via \(joinModel.schema.name))"
+        )
+
+        let cursor = direction == .forward ? afterCursor : beforeCursor
+        let options = QueryOptions(
+            sort: [orderByField: descending ? -1 : 1],
+            limit: limit,
+            cursor: cursor,
+            direction: direction,
+            projection: [relatedField: 1, orderByField: 1]
+        )
+        let joinPage = try joinModel.queryPaged([localField: self.id], options: options)
+        let relatedIds = joinPage.data.compactMap { $0[relatedField] as? String }
+        guard !relatedIds.isEmpty else {
+            return PagedQueryResult(
+                data: [], nextCursor: joinPage.nextCursor,
+                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+            )
+        }
+        let rows = try target.query(["id": ["$in": relatedIds]], options: nil)
+        let records: [PrimitiveRecord] = rows.compactMap { row in
+            (row["id"] as? String).map {
+                PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
+            }
+        }
+        return PagedQueryResult(
+            data: records, nextCursor: joinPage.nextCursor,
+            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+        )
     }
 
     // MARK: - Internals

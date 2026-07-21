@@ -103,6 +103,23 @@ public final class OfflineStore: @unchecked Sendable {
         return record?.value
     }
 
+    /// Store-level purge of ALL locally persisted document data for this
+    /// app's SQLite database: both the metadata store (`meta`) and the Yjs
+    /// CRDT store (`yjs_docs`). Both are truncated directly on disk
+    /// (`clear` → `DELETE FROM …`), independent of any in-memory document
+    /// index — so rows for documents that were never loaded into memory are
+    /// removed too. The single app-wide database keys these stores by
+    /// `documentId` alone (not by `userId`), so a per-document delete driven
+    /// by the current user's in-memory index cannot enforce a fresh-client
+    /// boundary. This does, by clearing the on-disk tables outright. Fast
+    /// no-op on empty tables (`DELETE FROM` an empty table is instant).
+    public func clearAllDocumentData(appId: String, userId: String) async throws {
+        try await ensureMetadataDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return }
+        try await provider.clear(store: Self.storeMetaDocs)
+        try await provider.clear(store: YjsSQLitePersistence.store)
+    }
+
     // MARK: - Grant Operations
 
     public func putGrant(appId: String, userId: String, key: String, record: OfflineGrant) async throws {

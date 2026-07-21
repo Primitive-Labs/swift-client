@@ -72,9 +72,17 @@ struct SwiftEmitter {
         out += "    // MARK: Reads (cross-document by default)\n\n"
         out += "    /// Query across all open documents. Rows that fail to decode (schema\n"
         out += "    /// drift) are skipped. Scope to one/some docs via `options.documents`.\n"
-        out += "    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [\(typeName)] {\n"
-        out += "        JsBaoClient.requireDefault()\n"
+        out += "    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [\(typeName)] {\n"
+        out += "        try JsBaoClient.requireDefault()\n"
         out += "            .queryShared(primitiveSchema, filter: filter, options: options)\n"
+        out += "            .compactMap { \(typeName)(row: $0) }\n"
+        out += "    }\n\n"
+        out += "    /// Query across all open documents and batch-prefetch related\n"
+        out += "    /// records into each row's `related` bag. Mirrors JS\n"
+        out += "    /// `BaseModel.query(filter, { include })`.\n"
+        out += "    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [\(typeName)] {\n"
+        out += "        try JsBaoClient.requireDefault()\n"
+        out += "            .queryShared(primitiveSchema, filter: filter, options: options, include: include)\n"
         out += "            .compactMap { \(typeName)(row: $0) }\n"
         out += "    }\n\n"
         out += "    /// Paginated query across all open documents. Returns the page's\n"
@@ -91,16 +99,28 @@ struct SwiftEmitter {
         out += "            hasMore: page.hasMore\n"
         out += "        )\n"
         out += "    }\n\n"
-        out += "    /// Count across all open documents.\n"
-        out += "    static func count(_ filter: DocumentFilter? = nil) -> Int {\n"
-        out += "        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)\n"
+        out += "    /// Paginated query with query-time relationship includes.\n"
+        out += "    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<\(typeName)> {\n"
+        out += "        let page = try JsBaoClient.requireDefault()\n"
+        out += "            .queryPagedShared(primitiveSchema, filter: filter, options: options, include: include)\n"
+        out += "        return PagedQueryResult(\n"
+        out += "            data: page.data.compactMap { \(typeName)(row: $0) },\n"
+        out += "            nextCursor: page.nextCursor,\n"
+        out += "            prevCursor: page.prevCursor,\n"
+        out += "            hasMore: page.hasMore\n"
+        out += "        )\n"
         out += "    }\n\n"
-        out += "    /// Every record across all open documents. `async` to match the JS\n"
-        out += "    /// client's `Model.findAll()` call shape (#992). Throws\n"
-        out += "    /// `PrimitiveDecodeError` if any stored row no longer decodes as\n"
-        out += "    /// `\(typeName)` — JS `findAll` never drops rows, so schema drift\n"
-        out += "    /// surfaces loudly instead of silently shrinking the result.\n"
-        out += "    static func findAll() async throws -> [\(typeName)] {\n"
+        out += "    /// Count across all open documents.\n"
+        out += "    static func count(_ filter: DocumentFilter? = nil) throws -> Int {\n"
+        out += "        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)\n"
+        out += "    }\n\n"
+        out += "    /// Every record across all open documents. Synchronous like the\n"
+        out += "    /// rest of the facade reads (#1156) — the shared store never\n"
+        out += "    /// suspends. Throws `PrimitiveDecodeError` if any stored row no\n"
+        out += "    /// longer decodes as `\(typeName)` — JS `findAll` never drops rows,\n"
+        out += "    /// so schema drift surfaces loudly instead of silently shrinking\n"
+        out += "    /// the result.\n"
+        out += "    static func findAll() throws -> [\(typeName)] {\n"
         out += "        try JsBaoClient.requireDefault()\n"
         out += "            .queryShared(primitiveSchema, filter: nil, options: nil)\n"
         out += "            .map { row in\n"
@@ -111,11 +131,11 @@ struct SwiftEmitter {
         out += "            }\n"
         out += "    }\n\n"
         out += "    /// First record with `id` across all open documents; `nil` only when\n"
-        out += "    /// no open document has it. `async` to match the JS client's\n"
-        out += "    /// `Model.find(id)` call shape (#992). Throws `PrimitiveDecodeError`\n"
-        out += "    /// when the row exists but no longer decodes as `\(typeName)` —\n"
-        out += "    /// distinct from the `nil` not-found case.\n"
-        out += "    static func find(_ id: String) async throws -> \(typeName)? {\n"
+        out += "    /// no open document has it. Synchronous like the rest of the facade\n"
+        out += "    /// reads (#1156) — the shared store never suspends. Throws\n"
+        out += "    /// `PrimitiveDecodeError` when the row exists but no longer decodes\n"
+        out += "    /// as `\(typeName)` — distinct from the `nil` not-found case.\n"
+        out += "    static func find(_ id: String) throws -> \(typeName)? {\n"
         out += "        guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {\n"
         out += "            return nil\n"
         out += "        }\n"
@@ -137,9 +157,18 @@ struct SwiftEmitter {
         out += "    /// The first record matching `filter` across all open documents,\n"
         out += "    /// or `nil`. Equivalent to `query(filter, options).first` — mirrors\n"
         out += "    /// the JS client's `Model.queryOne(filter, options)`.\n"
-        out += "    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> \(typeName)? {\n"
-        out += "        JsBaoClient.requireDefault()\n"
+        out += "    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> \(typeName)? {\n"
+        out += "        try JsBaoClient.requireDefault()\n"
         out += "            .queryOneShared(primitiveSchema, filter: filter, options: options)\n"
+        out += "            .flatMap { \(typeName)(row: $0) }\n"
+        out += "    }\n\n"
+        out += "    /// The first record matching `filter` with query-time relationship\n"
+        out += "    /// includes attached under `related`, or `nil`. Equivalent to\n"
+        out += "    /// `query(filter, options, include:).first` — mirrors the JS client's\n"
+        out += "    /// `Model.queryOne(filter, { include })`.\n"
+        out += "    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> \(typeName)? {\n"
+        out += "        try JsBaoClient.requireDefault()\n"
+        out += "            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)\n"
         out += "            .flatMap { \(typeName)(row: $0) }\n"
         out += "    }\n\n"
         out += "    /// Fire `callback` after any add/update/delete in any open document's\n"
@@ -149,8 +178,8 @@ struct SwiftEmitter {
         out += "        JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)\n"
         out += "    }\n\n"
         out += "    /// Aggregate (group / count / sum / avg / …) across all open documents.\n"
-        out += "    static func aggregate(_ options: AggregateOptions) -> [[String: Any]] {\n"
-        out += "        JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)\n"
+        out += "    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {\n"
+        out += "        try JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)\n"
         out += "    }\n\n"
         out += "    // MARK: Writes (target one document; throw if it isn't open)\n\n"
         out += "    /// Persist this record to document `documentId` — inserts it if it\n"
@@ -348,12 +377,14 @@ struct SwiftEmitter {
         // fields like `default` / `where` round-trip through
         // `JSONEncoder` / `JSONDecoder` without needing a manual
         // `CodingKeys` enum.
-        var out = "\(access) struct \(typeName): PrimitiveModel, Equatable, Hashable, Codable {\n"
+        var out = "\(access) struct \(typeName): PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {\n"
         out += staticMembers(schema: schema)
         out += "\n"
         out += nestedEnums(schema: schema)
         out += autoStampMetadata(schema: schema)
         out += storedProperties(schema: schema)
+        out += "\n"
+        out += relatedRecordsProperty(schema: schema)
         out += "\n"
         out += idProvenanceProperty(schema: schema)
         out += "\n"
@@ -374,6 +405,13 @@ struct SwiftEmitter {
     }
 
     // MARK: - Explicit-id provenance (#1122)
+
+    /// Query-time include payloads attached under `_related`. This is not
+    /// persisted model data and is excluded from Codable/Equatable/Hashable.
+    private func relatedRecordsProperty(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        return "    \(access) var related: RelatedRecords = .empty\n"
+    }
 
     /// Emit the non-persisted `_explicitId` provenance flag plus the
     /// public `id`-was-pinned accessor the facade reads. Tracks whether
@@ -433,6 +471,7 @@ struct SwiftEmitter {
         for fname in displayFieldOrder(schema) where fname != "id" {
             out += "        self.\(propName(fname)) = \(propName(fname))\n"
         }
+        out += "        self.related = .empty\n"
         out += "        self._explicitId = false\n"
         out += "    }\n"
         return out
@@ -472,7 +511,7 @@ struct SwiftEmitter {
     /// mirroring the JS client's generated instance methods (#1151):
     /// `author.posts()` (→ `[Post]`) and `post.author()` (→ `Author?`).
     /// Each accessor auto-resolves the related model itself — the call
-    /// site is just `try await author.posts()`, no manually-constructed
+    /// site is just `try author.posts()`, no manually-constructed
     /// `DynamicModel` target to pass in.
     ///
     /// How the value-type struct reaches the related data: the emitter
@@ -487,10 +526,10 @@ struct SwiftEmitter {
     /// accessor queries it (`relationshipManager.ts`). No global model
     /// registry is needed because the target type is known statically.
     ///
-    /// `async throws` matches the JS instance methods' promise-returning
-    /// call shape and the generated `find()` / `findAll()` facade. Today's
-    /// helper path is synchronous; like the rest of this facade, a missing
-    /// default client is a `JsBaoClient.requireDefault()` precondition.
+    /// Synchronous `throws`, matching the generated `find()` / `findAll()`
+    /// facade and the rest of this facade (#1156) — the helper path never
+    /// suspends. Like the rest of this facade, a missing default client is a
+    /// `JsBaoClient.requireDefault()` precondition.
     ///
     /// The return type names the target's resolved Swift type via
     /// `options.swiftNamesByModel`; when a target isn't in the map (an
@@ -505,6 +544,7 @@ struct SwiftEmitter {
             guard let targetModel = props["model"] else { continue }
             let targetType = swiftTypeName(forModel: targetModel)
             let method = propName(rname)
+            let relatedAccessor = propName("related" + Naming.pascalCase(rname))
             switch rel.rawType {
             case "refersTo":
                 // The foreign key is a field on THIS model — read it off the
@@ -516,14 +556,39 @@ struct SwiftEmitter {
                 out += "    /// all open documents. Returns `nil` when the foreign key is unset\n"
                 out += "    /// or points at a missing record. Mirrors the JS `\(method)()`\n"
                 out += "    /// instance accessor.\n"
-                out += "    \(access) func \(method)() async throws -> \(targetType)? {\n"
+                out += "    \(access) func \(method)() throws -> \(targetType)? {\n"
                 out += "        JsBaoClient.requireDefault()\n"
                 out += "            .refersToShared(target: \(targetType).primitiveSchema, foreignKey: \(fkProp))\n"
                 out += "            .flatMap { \(targetType)(row: $0) }\n"
                 out += "    }\n\n"
+                out += "    /// Typed query-time include payload for `\(rname)`, when present in `related`.\n"
+                out += "    \(access) var \(relatedAccessor): \(targetType)? {\n"
+                out += "        related.one(\(quoted(rname)), as: \(targetType).self)\n"
+                out += "            ?? related.one(\(targetType).modelName, as: \(targetType).self)\n"
+                out += "    }\n\n"
+                out += "    /// Build a query-time include for `\(rname)`.\n"
+                out += "    \(access) static func include\(Naming.pascalCase(rname))(\n"
+                out += "        filter: DocumentFilter? = nil,\n"
+                out += "        projection: [String: Int]? = nil,\n"
+                out += "        resultKey: String? = \(quoted(rname)),\n"
+                out += "        include: [Include]? = nil\n"
+                out += "    ) -> Include {\n"
+                out += "        Include(\n"
+                out += "            type: .refersTo,\n"
+                out += "            target: JsBaoClient.requireDefault().includeTarget(for: \(targetType).primitiveSchema),\n"
+                out += "            sourceField: \(quoted(fk)),\n"
+                out += "            filter: filter,\n"
+                out += "            projection: projection,\n"
+                out += "            resultKey: resultKey,\n"
+                out += "            include: include\n"
+                out += "        )\n"
+                out += "    }\n\n"
             case "hasMany":
                 guard let fk = props["relatedIdField"] else { continue }
                 let orderArgs = relationshipOrderArgs(
+                    field: props["orderByField"], direction: props["orderDirection"]
+                )
+                let sortDefault = includeSortDefault(
                     field: props["orderByField"], direction: props["orderDirection"]
                 )
                 out += "    /// Follow the `\(rname)` relationship (hasMany → `\(targetModel)`):\n"
@@ -531,8 +596,8 @@ struct SwiftEmitter {
                 out += "    /// across all open documents, applying any emitted\n"
                 out += "    /// `order_by_field` / `order_direction`. Mirrors the JS\n"
                 out += "    /// `\(method)()` instance accessor.\n"
-                out += "    \(access) func \(method)() async throws -> [\(targetType)] {\n"
-                out += "        JsBaoClient.requireDefault()\n"
+                out += "    \(access) func \(method)() throws -> [\(targetType)] {\n"
+                out += "        try JsBaoClient.requireDefault()\n"
                 out += "            .hasManyShared(\n"
                 out += "                target: \(targetType).primitiveSchema,\n"
                 out += "                relatedIdField: \(quoted(fk)),\n"
@@ -540,24 +605,105 @@ struct SwiftEmitter {
                 out += "            )\n"
                 out += "            .compactMap { \(targetType)(row: $0) }\n"
                 out += "    }\n\n"
+                out += "    /// Typed query-time include payload for `\(rname)`, when present in `related`.\n"
+                out += "    \(access) var \(relatedAccessor): [\(targetType)] {\n"
+                out += "        if related.contains(\(quoted(rname))) {\n"
+                out += "            return related.many(\(quoted(rname)), as: \(targetType).self)\n"
+                out += "        }\n"
+                out += "        return related.many(\(targetType).modelName, as: \(targetType).self)\n"
+                out += "    }\n\n"
+                out += "    /// Build a query-time include for `\(rname)`.\n"
+                out += "    \(access) static func include\(Naming.pascalCase(rname))(\n"
+                out += "        filter: DocumentFilter? = nil,\n"
+                out += "        sort: [String: Int]? = \(sortDefault),\n"
+                out += "        limit: Int? = nil,\n"
+                out += "        projection: [String: Int]? = nil,\n"
+                out += "        resultKey: String? = \(quoted(rname)),\n"
+                out += "        include: [Include]? = nil\n"
+                out += "    ) -> Include {\n"
+                out += "        Include(\n"
+                out += "            type: .hasMany,\n"
+                out += "            target: JsBaoClient.requireDefault().includeTarget(for: \(targetType).primitiveSchema),\n"
+                out += "            foreignKey: \(quoted(fk)),\n"
+                out += "            localField: \"id\",\n"
+                out += "            filter: filter,\n"
+                out += "            sort: sort,\n"
+                out += "            limit: limit,\n"
+                out += "            projection: projection,\n"
+                out += "            resultKey: resultKey,\n"
+                out += "            include: include\n"
+                out += "        )\n"
+                out += "    }\n\n"
             case "hasManyThrough":
                 guard let joinModel = props["joinModel"],
                       let localField = props["joinModelLocalField"],
                       let relatedField = props["joinModelRelatedField"] else { continue }
                 let joinType = swiftTypeName(forModel: joinModel)
+                let joinOrderArgs = relationshipOrderArgs(
+                    field: props["joinModelOrderByField"],
+                    direction: props["joinModelOrderDirection"],
+                    fieldLabel: "joinModelOrderByField",
+                    directionLabel: "joinModelOrderDirection"
+                )
                 out += "    /// Follow the `\(rname)` relationship (hasManyThrough → `\(targetModel)`)\n"
-                out += "    /// via the `\(joinModel)` join model, across all open documents.\n"
-                out += "    /// Mirrors the JS `\(method)()` instance accessor.\n"
-                out += "    \(access) func \(method)() async throws -> [\(targetType)] {\n"
-                out += "        JsBaoClient.requireDefault()\n"
+                out += "    /// via the `\(joinModel)` join model, across all open documents,\n"
+                out += "    /// applying any emitted `join_model_order_by_field` /\n"
+                out += "    /// `join_model_order_direction` to the join leg. Mirrors the JS\n"
+                out += "    /// `\(method)()` instance accessor.\n"
+                out += "    \(access) func \(method)() throws -> [\(targetType)] {\n"
+                out += "        try JsBaoClient.requireDefault()\n"
                 out += "            .hasManyThroughShared(\n"
                 out += "                target: \(targetType).primitiveSchema,\n"
                 out += "                joinModel: \(joinType).primitiveSchema,\n"
                 out += "                sourceId: id,\n"
                 out += "                joinModelLocalField: \(quoted(localField)),\n"
-                out += "                joinModelRelatedField: \(quoted(relatedField))\n"
+                out += "                joinModelRelatedField: \(quoted(relatedField))\(joinOrderArgs)\n"
                 out += "            )\n"
                 out += "            .compactMap { \(targetType)(row: $0) }\n"
+                out += "    }\n\n"
+                out += "    /// Paginated `\(method)` — pages the `\(joinModel)` join leg by its\n"
+                out += "    /// declared order (default `id ASC`) through the shared\n"
+                out += "    /// composite-cursor engine, then `$in`-resolves the page against\n"
+                out += "    /// `\(targetModel)`. The cursor is the engine's opaque `String`\n"
+                out += "    /// token (a composite `(field, id)` cursor), so it round-trips\n"
+                out += "    /// through the same decoder as the JS client; `limit:` is required\n"
+                out += "    /// so the bare `\(method)()` overload above still binds. Mirrors the\n"
+                out += "    /// JS `\(method)({ limit, afterCursor, beforeCursor, direction })`\n"
+                out += "    /// paginated accessor. `hasMore` is the over-fetch signal for more\n"
+                out += "    /// rows in the current paging direction.\n"
+                out += "    \(access) func \(method)(\n"
+                out += "        limit: Int,\n"
+                out += "        afterCursor: String? = nil,\n"
+                out += "        beforeCursor: String? = nil,\n"
+                out += "        direction: CursorDirection = .forward\n"
+                out += "    ) throws -> PagedQueryResult<\(targetType)> {\n"
+                out += "        let page = try JsBaoClient.requireDefault()\n"
+                out += "            .hasManyThroughShared(\n"
+                out += "                target: \(targetType).primitiveSchema,\n"
+                out += "                joinModel: \(joinType).primitiveSchema,\n"
+                out += "                sourceId: id,\n"
+                out += "                joinModelLocalField: \(quoted(localField)),\n"
+                out += "                joinModelRelatedField: \(quoted(relatedField))\(joinOrderArgs),\n"
+                out += "                limit: limit,\n"
+                out += "                afterCursor: afterCursor,\n"
+                out += "                beforeCursor: beforeCursor,\n"
+                out += "                direction: direction\n"
+                out += "            )\n"
+                out += "        return PagedQueryResult(\n"
+                out += "            data: page.data.compactMap { \(targetType)(row: $0) },\n"
+                out += "            nextCursor: page.nextCursor,\n"
+                out += "            prevCursor: page.prevCursor,\n"
+                out += "            hasMore: page.hasMore\n"
+                out += "        )\n"
+                out += "    }\n\n"
+                out += "    /// Typed query-time include payload for `\(rname)`, when present in `related`.\n"
+                out += "    /// Query-time includes do not yet build `hasManyThrough` payloads, so\n"
+                out += "    /// this is populated only if `_related[\(quoted(rname))]` was attached manually.\n"
+                out += "    \(access) var \(relatedAccessor): [\(targetType)] {\n"
+                out += "        if related.contains(\(quoted(rname))) {\n"
+                out += "            return related.many(\(quoted(rname)), as: \(targetType).self)\n"
+                out += "        }\n"
+                out += "        return related.many(\(targetType).modelName, as: \(targetType).self)\n"
                 out += "    }\n\n"
             default:
                 break
@@ -569,16 +715,30 @@ struct SwiftEmitter {
         return out
     }
 
-    /// Render the trailing `orderByField:` / `orderDirection:` argument
-    /// fragment for a `hasMany` accessor — empty when no order is declared.
-    /// Leading comma + newline so it folds into the multi-line call.
-    private func relationshipOrderArgs(field: String?, direction: String?) -> String {
+    /// Render the trailing order-argument fragment for a relationship
+    /// accessor — empty when no order is declared. Leading comma + newline
+    /// so it folds into the multi-line call. The labels default to
+    /// `hasMany`'s `orderByField:` / `orderDirection:`; the `hasManyThrough`
+    /// join leg overrides them with `joinModelOrderByField:` /
+    /// `joinModelOrderDirection:`.
+    private func relationshipOrderArgs(
+        field: String?,
+        direction: String?,
+        fieldLabel: String = "orderByField",
+        directionLabel: String = "orderDirection"
+    ) -> String {
         guard let field else { return "" }
-        var s = ",\n                orderByField: \(quoted(field))"
+        var s = ",\n                \(fieldLabel): \(quoted(field))"
         if let direction {
-            s += ",\n                orderDirection: \(quoted(direction))"
+            s += ",\n                \(directionLabel): \(quoted(direction))"
         }
         return s
+    }
+
+    private func includeSortDefault(field: String?, direction: String?) -> String {
+        guard let field else { return "nil" }
+        let descending = direction?.uppercased() == "DESC"
+        return "[\(quoted(field)): \(descending ? "-1" : "1")]"
     }
 
     /// Resolve a target model name to its Swift type for relationship
@@ -810,6 +970,7 @@ struct SwiftEmitter {
         for fname in displayFieldOrder(schema) {
             out += "        self.\(propName(fname)) = \(propName(fname))\n"
         }
+        out += "        self.related = .empty\n"
         out += "    }\n"
         return out
     }
@@ -852,6 +1013,7 @@ struct SwiftEmitter {
                 out += "        self.\(propName(fname)) = record[\(quoted(fname))]?.\(acc)\n"
             }
         }
+        out += "        self.related = .empty\n"
         out += "    }\n"
         return out
     }
@@ -901,6 +1063,7 @@ struct SwiftEmitter {
                 out += "        self.\(propName(fname)) = \(rowReadExpression(f, key: quoted(fname)))\n"
             }
         }
+        out += "        self.related = RelatedRecords(raw: row[\"_related\"] as? [String: Any] ?? [:])\n"
         out += "    }\n"
         return out
     }

@@ -45,7 +45,7 @@ final class IndexedFlagTests: XCTestCase {
         let model = DynamicModel(doc: doc, schema: schema)
 
         // Force lazy engine init.
-        _ = model.query()
+        _ = try? model.query()
 
         let indexes = userCreatedIndexes(in: model.queryEngineInternal,
                                           table: "indexed_tasks")
@@ -77,7 +77,7 @@ final class IndexedFlagTests: XCTestCase {
         let doc = YDocument()
         SchemaSync.clearCache()
         let model = DynamicModel(doc: doc, schema: schema)
-        _ = model.query()
+        _ = try? model.query()
 
         XCTAssertEqual(
             userCreatedIndexes(in: model.queryEngineInternal,

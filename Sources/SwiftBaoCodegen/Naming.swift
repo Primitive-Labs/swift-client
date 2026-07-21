@@ -112,10 +112,15 @@ enum Naming {
         var used: [String: Int] = [:]
         var out: [(String, String)] = []
         for v in values {
-            let base = enumCaseIdentifier(v)
-            let count = used[base, default: 0]
-            used[base] = count + 1
-            let name = count == 0 ? base : "\(base)_\(count + 1)"
+            // `enumCaseIdentifier` may return a backtick-escaped keyword
+            // (e.g. `` `default` ``). Dedup and build the `_N` suffix on the
+            // UN-escaped base, then re-escape once — appending the suffix to
+            // the escaped form would produce "`default`_2" (the digit outside
+            // the backticks), which is not a legal Swift identifier.
+            let bare = enumCaseIdentifier(v).replacingOccurrences(of: "`", with: "")
+            let count = used[bare, default: 0]
+            used[bare] = count + 1
+            let name = escapeIfReserved(count == 0 ? bare : "\(bare)_\(count + 1)")
             out.append((name, v))
         }
         return out

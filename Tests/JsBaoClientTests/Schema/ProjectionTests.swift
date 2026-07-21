@@ -48,7 +48,7 @@ final class ProjectionTests: XCTestCase {
     /// Projection `{ title: 1 }` returns only `id` + `title`.
     func testProjectionIncludeModeReturnsOnlyListedFields() throws {
         let model = try seeded()
-        let rows = model.query(
+        let rows = try model.query(
             ["id": "p1"],
             options: QueryOptions(projection: ["title": 1])
         )
@@ -64,7 +64,7 @@ final class ProjectionTests: XCTestCase {
     /// mode projection.
     func testProjectionAlwaysIncludesId() throws {
         let model = try seeded()
-        let rows = model.query(nil, options: QueryOptions(
+        let rows = try model.query(nil, options: QueryOptions(
             sortOrder: [("id", 1)], projection: ["title": 1]
         ))
         XCTAssertEqual(rows.compactMap { $0["id"] as? String }, ["p1", "p2"])
@@ -74,7 +74,7 @@ final class ProjectionTests: XCTestCase {
     /// stringset populated as `[String]`, not omitted.
     func testProjectionIncludeModeWithStringsetField() throws {
         let model = try seeded()
-        let rows = model.query(
+        let rows = try model.query(
             ["id": "p1"],
             options: QueryOptions(projection: ["tags": 1])
         )
@@ -89,7 +89,7 @@ final class ProjectionTests: XCTestCase {
     /// Projection `{ body: 0 }` returns every field EXCEPT body.
     func testProjectionExcludeModeOmitsListedFields() throws {
         let model = try seeded()
-        let rows = model.query(
+        let rows = try model.query(
             ["id": "p1"],
             options: QueryOptions(projection: ["body": 0])
         )
@@ -105,7 +105,7 @@ final class ProjectionTests: XCTestCase {
     /// Exclude-mode projection that names a stringset field omits it.
     func testProjectionExcludeModeOmitsStringsetField() throws {
         let model = try seeded()
-        let rows = model.query(
+        let rows = try model.query(
             ["id": "p1"],
             options: QueryOptions(projection: ["tags": 0])
         )
@@ -222,17 +222,22 @@ final class ProjectionTests: XCTestCase {
         }
     }
 
-    /// The non-throwing `query()` wrapper must NOT crash on a mixed
-    /// projection: it routes through the throwing core, logs, and
-    /// returns no rows. (Throws-aware `query` is tracked as #1119.)
-    func testMixedProjectionOnQueryReturnsEmptyInsteadOfCrashing() throws {
+    /// `query()` now THROWS on a mixed projection rather than swallowing
+    /// the error into `[]` — the throws-aware read surface from #1119.
+    func testMixedProjectionOnQueryThrows() throws {
         let model = try seeded()
-        let rows = model.query(
-            nil,
-            options: QueryOptions(projection: ["title": 1, "body": 0])
-        )
-        XCTAssertEqual(rows.count, 0,
-                       "mixed projection is invalid input; query() returns []")
+        XCTAssertThrowsError(
+            try model.query(
+                nil,
+                options: QueryOptions(projection: ["title": 1, "body": 0])
+            )
+        ) { error in
+            guard let jbe = error as? JsBaoError else {
+                XCTFail("expected JsBaoError, got \(error)"); return
+            }
+            XCTAssertEqual(jbe.code, .invalidArgument)
+            XCTAssertTrue(jbe.message.contains("mix inclusion and exclusion"))
+        }
     }
 
     /// Pure include / pure exclude projections still work after the
@@ -240,10 +245,10 @@ final class ProjectionTests: XCTestCase {
     func testPureProjectionsStillWorkAfterValidationChange() throws {
         let model = try seeded()
         XCTAssertEqual(
-            model.query(nil, options: QueryOptions(projection: ["title": 1])).count, 2
+            try model.query(nil, options: QueryOptions(projection: ["title": 1])).count, 2
         )
         XCTAssertEqual(
-            model.query(nil, options: QueryOptions(projection: ["body": 0])).count, 2
+            try model.query(nil, options: QueryOptions(projection: ["body": 0])).count, 2
         )
     }
 }

@@ -24,6 +24,58 @@ public protocol PrimitiveModel {
     func primitiveValues() -> [String: PrimitiveValue]
 }
 
+/// A generated model that can decode directly from a SQLite-backed query row.
+/// The codegen'd facade uses this for query-time includes: the base row and
+/// any `_related` rows are all row dictionaries at the storage boundary.
+public protocol PrimitiveRowDecodable {
+    init?(row: [String: Any])
+}
+
+/// Related records attached by query-time includes. Mirrors JS rows' `_related`
+/// bag while keeping the generated Swift model surface typed through
+/// `one(_:as:)` and `many(_:as:)`.
+public struct RelatedRecords: @unchecked Sendable, Codable, Equatable, Hashable {
+    public static let empty = RelatedRecords(raw: [:])
+
+    public let raw: [String: Any]
+
+    public init(raw: [String: Any] = [:]) {
+        self.raw = raw
+    }
+
+    public subscript(key: String) -> Any? {
+        raw[key]
+    }
+
+    public func contains(_ key: String) -> Bool {
+        raw[key] != nil
+    }
+
+    public func one<T: PrimitiveRowDecodable>(_ key: String, as type: T.Type = T.self) -> T? {
+        guard let row = raw[key] as? [String: Any] else { return nil }
+        return T(row: row)
+    }
+
+    public func many<T: PrimitiveRowDecodable>(_ key: String, as type: T.Type = T.self) -> [T] {
+        guard let rows = raw[key] as? [[String: Any]] else { return [] }
+        return rows.compactMap { T(row: $0) }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.raw = [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        // `_related` is a query result attachment, not persisted model data.
+    }
+
+    public static func == (lhs: RelatedRecords, rhs: RelatedRecords) -> Bool {
+        true
+    }
+
+    public func hash(into hasher: inout Hasher) {}
+}
+
 /// A stored row exists but no longer decodes as its generated typed model —
 /// the persisted data has drifted from the typed schema (e.g. a required
 /// field is missing or holds the wrong type).

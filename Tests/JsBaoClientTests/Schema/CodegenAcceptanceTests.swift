@@ -92,7 +92,7 @@ final class CodegenAcceptanceTests: XCTestCase {
             id: "c1", requiredTags: ["a"], email: "x@y.z", boundedName: "first"
         ).save(in: doc, upsertOn: "email")
         XCTAssertEqual(inserted.id, "c1")
-        XCTAssertEqual(CrashTestRecord.count(), 1)
+        XCTAssertEqual(try CrashTestRecord.count(), 1)
 
         // #1122: a DIFFERENT *explicit* id (designated init) colliding on
         // the unique field is now a hard conflict, mirroring js-bao's
@@ -105,7 +105,7 @@ final class CodegenAcceptanceTests: XCTestCase {
             XCTAssertEqual(error as? UpsertError,
                            .explicitIdConflict(supplied: "c2", existing: "c1"))
         }
-        XCTAssertEqual(CrashTestRecord.count(), 1, "conflict must not insert a row")
+        XCTAssertEqual(try CrashTestRecord.count(), 1, "conflict must not insert a row")
 
         // Match with an AUTO-generated id (the id-less convenience init) →
         // silent merge into c1; resolved record keeps the existing id and
@@ -116,7 +116,7 @@ final class CodegenAcceptanceTests: XCTestCase {
         ).save(in: doc, upsertOn: "email")
         XCTAssertEqual(merged.id, "c1", "merge must resolve to the existing record's id")
         XCTAssertEqual(merged.boundedName, "second")
-        XCTAssertEqual(CrashTestRecord.count(), 1, "upsertOn must merge, not duplicate")
+        XCTAssertEqual(try CrashTestRecord.count(), 1, "upsertOn must merge, not duplicate")
 
         // upsertOn against a field with no single-field unique constraint
         // throws (boundedName is only part of the compound constraint).
@@ -166,14 +166,14 @@ final class CodegenAcceptanceTests: XCTestCase {
         ).upsertByUnique("name_score_combo", in: doc)
         XCTAssertEqual(merged.id, "k1")
         XCTAssertEqual(merged.active, false)
-        XCTAssertEqual(CrashTestRecord.count(), 1)
+        XCTAssertEqual(try CrashTestRecord.count(), 1)
 
         // Different score → different compound key → second record.
         let other = try CrashTestRecord(
             id: "k3", requiredTags: ["a"], boundedName: "ada", score: 200
         ).upsertByUnique("name_score_combo", in: doc)
         XCTAssertEqual(other.id, "k3")
-        XCTAssertEqual(CrashTestRecord.count(), 2)
+        XCTAssertEqual(try CrashTestRecord.count(), 2)
 
         // A record missing a constraint field can't build the lookup key.
         XCTAssertThrowsError(
@@ -188,8 +188,8 @@ final class CodegenAcceptanceTests: XCTestCase {
     // MARK: - Relationship instance accessors (#1151) — through the REAL generated methods
     //
     // The generated value-type structs expose idiomatic INSTANCE accessors
-    // that auto-resolve the related model — `try await rel.task()` (refersTo),
-    // `try await profile.profile()` (hasMany), `try await rel.viaJoin()`
+    // that auto-resolve the related model — `try rel.task()` (refersTo),
+    // `try profile.profile()` (hasMany), `try rel.viaJoin()`
     // (hasManyThrough) — mirroring the JS client's instance methods. These
     // exercise the emitted code itself against a live cross-document store.
 
@@ -210,20 +210,20 @@ final class CodegenAcceptanceTests: XCTestCase {
         _ = try RelTestRecord(id: "r2").save(in: doc)                       // FK unset
         _ = try RelTestRecord(id: "r3", taskId: "missing").save(in: doc)    // FK dangling
 
-        let r1Found = try await RelTestRecord.find("r1")
+        let r1Found = try RelTestRecord.find("r1")
         let r1 = try XCTUnwrap(r1Found)
-        let resolved = try await r1.task()
+        let resolved = try r1.task()
         XCTAssertEqual(resolved?.id, "task1")
         XCTAssertEqual(resolved?.title, "Write tests")
 
-        let r2Found = try await RelTestRecord.find("r2")
+        let r2Found = try RelTestRecord.find("r2")
         let r2 = try XCTUnwrap(r2Found)
-        let none = try await r2.task()
+        let none = try r2.task()
         XCTAssertNil(none, "unset foreign key resolves to nil")
 
-        let r3Found = try await RelTestRecord.find("r3")
+        let r3Found = try RelTestRecord.find("r3")
         let r3 = try XCTUnwrap(r3Found)
-        let dangling = try await r3.task()
+        let dangling = try r3.task()
         XCTAssertNil(dangling, "dangling foreign key resolves to nil")
     }
 
@@ -247,13 +247,46 @@ final class CodegenAcceptanceTests: XCTestCase {
         _ = try UserProfileRecord(id: "p3", displayName: "Bob", ownerId: "owner1").save(in: doc)
         _ = try UserProfileRecord(id: "p4", displayName: "Zoe", ownerId: "other").save(in: doc)
 
-        let ownerFound = try await RelTestRecord.find("owner1")
+        let ownerFound = try RelTestRecord.find("owner1")
         let owner = try XCTUnwrap(ownerFound)
-        let profiles = try await owner.profile()
+        let profiles = try owner.profile()
         XCTAssertEqual(
             profiles.map(\.displayName), ["Alice", "Bob", "Charlie"],
             "hasMany must return only matching records, sorted by displayName asc"
         )
+    }
+
+    /// Query-time include through the generated typed facade (#1161):
+    /// callers can build an include from the generated model, query typed
+    /// rows, and read typed related payloads without dropping to
+    /// `DynamicModel` or `[[String: Any]]`.
+    func testGeneratedQueryIncludeReturnsTypedRelatedRows() async throws {
+        let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
+        JsBaoClient.configureDefault(client)
+        defer { JsBaoClient.clearDefault() }
+        SchemaSync.clearCache()
+        client.registerModels([RelTestRecord.self, TaskRecord.self, UserProfileRecord.self])
+
+        let (doc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+
+        _ = try TaskRecord(id: "task1", title: "Included task").save(in: doc)
+        _ = try RelTestRecord(id: "r1", taskId: "task1").save(in: doc)
+        _ = try UserProfileRecord(id: "p2", displayName: "Beta", ownerId: "r1").save(in: doc)
+        _ = try UserProfileRecord(id: "p1", displayName: "Alpha", ownerId: "r1").save(in: doc)
+
+        let rows = try RelTestRecord.query(
+            ["id": "r1"],
+            include: [
+                RelTestRecord.includeTask(),
+                RelTestRecord.includeProfile(),
+            ]
+        )
+
+        let row = try XCTUnwrap(rows.first)
+        XCTAssertEqual(row.relatedTask?.id, "task1")
+        XCTAssertEqual(row.relatedTask?.title, "Included task")
+        XCTAssertEqual(row.relatedProfile.map(\.displayName), ["Alpha", "Beta"])
+        XCTAssertEqual(row.related.one("task", as: TaskRecord.self)?.id, "task1")
     }
 
     /// `hasManyThrough`: `relTest.viaJoin` reaches `user_profile` through
@@ -277,9 +310,9 @@ final class CodegenAcceptanceTests: XCTestCase {
         _ = try BareBonesRecord(id: "j1").save(in: doc)
         _ = try UserProfileRecord(id: "j1", displayName: "Linked").save(in: doc)
 
-        let sourceFound = try await RelTestRecord.find("j1")
+        let sourceFound = try RelTestRecord.find("j1")
         let source = try XCTUnwrap(sourceFound)
-        let linked = try await source.viaJoin()
+        let linked = try source.viaJoin()
         XCTAssertEqual(linked.map(\.id), ["j1"])
         XCTAssertEqual(linked.first?.displayName, "Linked")
     }

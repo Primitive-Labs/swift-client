@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-internal struct BareBonesRecord: PrimitiveModel, Equatable, Hashable, Codable {
+internal struct BareBonesRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
     internal static let modelName = "barebones"
     internal static let primitiveSchema = PrimitiveSchema(
         name: "barebones",
@@ -14,6 +14,8 @@ internal struct BareBonesRecord: PrimitiveModel, Equatable, Hashable, Codable {
     )
 
     internal var id: String
+
+    internal var related: RelatedRecords = .empty
 
     /// `true` when the caller pinned `id` via the designated
     /// initializer; `false` when it was auto-generated. Drives the
@@ -26,6 +28,7 @@ internal struct BareBonesRecord: PrimitiveModel, Equatable, Hashable, Codable {
         id: String
     ) {
         self.id = id
+        self.related = .empty
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -35,11 +38,13 @@ internal struct BareBonesRecord: PrimitiveModel, Equatable, Hashable, Codable {
     /// id-less `new Model({...})` constructor.
     internal init() {
         self.id = PrimitiveSchemaRegistry.newId()
+        self.related = .empty
         self._explicitId = false
     }
 
     internal init?(record: PrimitiveRecord) {
         self.id = record.id
+        self.related = .empty
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
@@ -47,6 +52,7 @@ internal struct BareBonesRecord: PrimitiveModel, Equatable, Hashable, Codable {
         guard let id = row["id"] as? String
         else { return nil }
         self.id = id
+        self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
     }
 
     internal func primitiveValues() -> [String: PrimitiveValue] {
@@ -77,9 +83,18 @@ internal extension BareBonesRecord {
 
     /// Query across all open documents. Rows that fail to decode (schema
     /// drift) are skipped. Scope to one/some docs via `options.documents`.
-    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [BareBonesRecord] {
-        JsBaoClient.requireDefault()
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [BareBonesRecord] {
+        try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: filter, options: options)
+            .compactMap { BareBonesRecord(row: $0) }
+    }
+
+    /// Query across all open documents and batch-prefetch related
+    /// records into each row's `related` bag. Mirrors JS
+    /// `BaseModel.query(filter, { include })`.
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [BareBonesRecord] {
+        try JsBaoClient.requireDefault()
+            .queryShared(primitiveSchema, filter: filter, options: options, include: include)
             .compactMap { BareBonesRecord(row: $0) }
     }
 
@@ -98,17 +113,30 @@ internal extension BareBonesRecord {
         )
     }
 
-    /// Count across all open documents.
-    static func count(_ filter: DocumentFilter? = nil) -> Int {
-        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    /// Paginated query with query-time relationship includes.
+    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<BareBonesRecord> {
+        let page = try JsBaoClient.requireDefault()
+            .queryPagedShared(primitiveSchema, filter: filter, options: options, include: include)
+        return PagedQueryResult(
+            data: page.data.compactMap { BareBonesRecord(row: $0) },
+            nextCursor: page.nextCursor,
+            prevCursor: page.prevCursor,
+            hasMore: page.hasMore
+        )
     }
 
-    /// Every record across all open documents. `async` to match the JS
-    /// client's `Model.findAll()` call shape (#992). Throws
-    /// `PrimitiveDecodeError` if any stored row no longer decodes as
-    /// `BareBonesRecord` — JS `findAll` never drops rows, so schema drift
-    /// surfaces loudly instead of silently shrinking the result.
-    static func findAll() async throws -> [BareBonesRecord] {
+    /// Count across all open documents.
+    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    }
+
+    /// Every record across all open documents. Synchronous like the
+    /// rest of the facade reads (#1156) — the shared store never
+    /// suspends. Throws `PrimitiveDecodeError` if any stored row no
+    /// longer decodes as `BareBonesRecord` — JS `findAll` never drops rows,
+    /// so schema drift surfaces loudly instead of silently shrinking
+    /// the result.
+    static func findAll() throws -> [BareBonesRecord] {
         try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: nil, options: nil)
             .map { row in
@@ -120,11 +148,11 @@ internal extension BareBonesRecord {
     }
 
     /// First record with `id` across all open documents; `nil` only when
-    /// no open document has it. `async` to match the JS client's
-    /// `Model.find(id)` call shape (#992). Throws `PrimitiveDecodeError`
-    /// when the row exists but no longer decodes as `BareBonesRecord` —
-    /// distinct from the `nil` not-found case.
-    static func find(_ id: String) async throws -> BareBonesRecord? {
+    /// no open document has it. Synchronous like the rest of the facade
+    /// reads (#1156) — the shared store never suspends. Throws
+    /// `PrimitiveDecodeError` when the row exists but no longer decodes
+    /// as `BareBonesRecord` — distinct from the `nil` not-found case.
+    static func find(_ id: String) throws -> BareBonesRecord? {
         guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {
             return nil
         }
@@ -148,9 +176,19 @@ internal extension BareBonesRecord {
     /// The first record matching `filter` across all open documents,
     /// or `nil`. Equivalent to `query(filter, options).first` — mirrors
     /// the JS client's `Model.queryOne(filter, options)`.
-    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> BareBonesRecord? {
-        JsBaoClient.requireDefault()
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> BareBonesRecord? {
+        try JsBaoClient.requireDefault()
             .queryOneShared(primitiveSchema, filter: filter, options: options)
+            .flatMap { BareBonesRecord(row: $0) }
+    }
+
+    /// The first record matching `filter` with query-time relationship
+    /// includes attached under `related`, or `nil`. Equivalent to
+    /// `query(filter, options, include:).first` — mirrors the JS client's
+    /// `Model.queryOne(filter, { include })`.
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> BareBonesRecord? {
+        try JsBaoClient.requireDefault()
+            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)
             .flatMap { BareBonesRecord(row: $0) }
     }
 
@@ -162,8 +200,8 @@ internal extension BareBonesRecord {
     }
 
     /// Aggregate (group / count / sum / avg / …) across all open documents.
-    static func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
-        JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
+    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+        try JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
     }
 
     // MARK: Writes (target one document; throw if it isn't open)

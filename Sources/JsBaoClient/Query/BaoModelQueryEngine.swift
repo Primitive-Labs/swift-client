@@ -47,6 +47,15 @@ public class BaoModelQueryEngine {
     /// `DocumentQueryTranslator.ts:309` field-type gate (which throws).
     private var stringFieldsByModel: [String: Set<String>] = [:]
 
+    /// Per-model map of field name → type name (`"number"`, `"string"`,
+    /// `"stringset"`, `"boolean"`, `"json"`), captured at `ensureTable`
+    /// time. Threaded into `QueryTranslator` so a thrown substring-op
+    /// error can carry the offending field's `fieldType` in its details,
+    /// mirroring js-bao's `InvalidOperatorError`. Derived from the
+    /// storage-level `FieldType` (lossy: dates/ids read back as `string`,
+    /// json as `json`), plus the separately-tracked stringset set.
+    private var fieldTypeNamesByModel: [String: [String: String]] = [:]
+
     public init() {
         var db: OpaquePointer?
         // Use in-memory SQLite for query indexing (separate from persistence)
@@ -101,6 +110,26 @@ public class BaoModelQueryEngine {
         // consult the same record without re-walking the field list.
         stringFieldsByModel[modelName] = Set(
             fields.compactMap { $0.type == .string ? $0.name : nil }
+        )
+
+        // Capture each field's type name for substring-op error details.
+        // Stringset fields win over the lossy column type (they store as
+        // a json column under the hood but report as `stringset`).
+        fieldTypeNamesByModel[modelName] = Dictionary(
+            uniqueKeysWithValues: fields.map { field in
+                let name: String
+                if stringsetFields.contains(field.name) {
+                    name = "stringset"
+                } else {
+                    switch field.type {
+                    case .number:  name = "number"
+                    case .boolean: name = "boolean"
+                    case .json:    name = "json"
+                    case .string:  name = "string"
+                    }
+                }
+                return (field.name, name)
+            }
         )
 
         let tableName = sanitizedTableName(modelName)
@@ -644,36 +673,30 @@ public class BaoModelQueryEngine {
         options: QueryOptions? = nil,
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = []
-    ) -> [[String: Any]] {
+    ) throws -> [[String: Any]] {
         // Take the lock only for the base SELECT so the post-query
         // stringset population (which re-enters the engine via
         // junction sub-queries) doesn't deadlock against a non-
         // reentrant NSLock.
+        //
+        // Errors from `buildSelectSQL` — the cursor decoder, the
+        // projection validator (mixed include/exclude, #1118), and the
+        // substring-op validator (#1119) — now propagate to the caller
+        // instead of being swallowed into `[]`, matching js-bao, which
+        // throws on the same bad input.
         let tableName = sanitizedTableName(modelName)
-        var rows: [[String: Any]] = {
+        var rows: [[String: Any]] = try {
             lock.lock()
             defer { lock.unlock() }
-            do {
-                let (sql, params) = try buildSelectSQL(
-                    tableName: tableName,
-                    modelName: modelName,
-                    filter: filter,
-                    options: options,
-                    scopedToDocId: scopedToDocId,
-                    stringsetFields: stringsetFields
-                )
-                return executeQuery(sql, params: params)
-            } catch {
-                // Non-throwing public API — the cursor decoder and the
-                // projection validator (mixed include/exclude, #1118)
-                // throw here, and both indicate a caller bug. Log and
-                // return no rows rather than crashing the host app.
-                // Callers that need error visibility should use
-                // `queryPaged`, which propagates the JsBaoError.
-                // (A fully throws-aware `query` is tracked as #1119.)
-                NSLog("[BaoModelQueryEngine] query failed for '\(modelName)': \(error)")
-                return []
-            }
+            let (sql, params) = try buildSelectSQL(
+                tableName: tableName,
+                modelName: modelName,
+                filter: filter,
+                options: options,
+                scopedToDocId: scopedToDocId,
+                stringsetFields: stringsetFields
+            )
+            return executeQuery(sql, params: params)
         }()
         populateStringsets(
             rows: &rows, modelName: modelName,
@@ -744,6 +767,16 @@ public class BaoModelQueryEngine {
             hasMore: hasMore,
             isFirstPage: isFirstPage
         )
+        // D8 (#1607) — backward pages are fetched nearest-to-cursor first
+        // (`buildSelectSQL` reverses each ORDER BY direction for backward),
+        // so return them in declared order: callers always see the page in
+        // ascending sort order regardless of paging direction. The cursors
+        // above are generated from the paging-order rows, matching js-bao's
+        // `BaseModel.query`. Without this, bare delegation would flip
+        // backward-page row order versus the pre-#1632 relationship wrapper.
+        if (options?.direction ?? .forward) == .backward {
+            rows.reverse()
+        }
         return PagedQueryResult(
             data: rows,
             nextCursor: next,
@@ -836,9 +869,10 @@ public class BaoModelQueryEngine {
         }
 
         if let filter, !filter.isEmpty {
-            let (where_, whereParams) = QueryTranslator.translate(
+            let (where_, whereParams) = try QueryTranslator.translate(
                 filter, stringsetFields: stringsetFields,
                 stringFields: stringFieldsByModel[modelName],
+                fieldTypes: fieldTypeNamesByModel[modelName],
                 tableName: tableName
             )
             whereParts.append("(\(where_))")
@@ -890,7 +924,7 @@ public class BaoModelQueryEngine {
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = [],
         documents: [String]? = nil
-    ) -> Int {
+    ) throws -> Int {
         lock.lock()
         defer { lock.unlock() }
 
@@ -913,9 +947,10 @@ public class BaoModelQueryEngine {
             }
         }
         if let filter, !filter.isEmpty {
-            let (where_, whereParams) = QueryTranslator.translate(
+            let (where_, whereParams) = try QueryTranslator.translate(
                 filter, stringsetFields: stringsetFields,
                 stringFields: stringFieldsByModel[modelName],
+                fieldTypes: fieldTypeNamesByModel[modelName],
                 tableName: tableName
             )
             whereParts.append("(\(where_))")
@@ -938,7 +973,7 @@ public class BaoModelQueryEngine {
         options: AggregateOptions,
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = []
-    ) -> [[String: Any]] {
+    ) throws -> [[String: Any]] {
         lock.lock()
         defer { lock.unlock() }
 
@@ -947,10 +982,11 @@ public class BaoModelQueryEngine {
         // (and qualifies it with the table name) so the doc-scope bind
         // param lands after any membership-JOIN params — a plain string
         // splice can't do that safely once JOINs add placeholders.
-        let (sql, params) = QueryTranslator.buildAggregation(
+        let (sql, params) = try QueryTranslator.buildAggregation(
             tableName: tableName, options: options,
             stringsetFields: stringsetFields,
             stringFields: stringFieldsByModel[modelName],
+            fieldTypes: fieldTypeNamesByModel[modelName],
             scopedToDocId: scopedToDocId
         )
         return executeQuery(sql, params: params)

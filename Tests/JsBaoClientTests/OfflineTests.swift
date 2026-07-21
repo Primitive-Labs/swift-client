@@ -339,31 +339,27 @@ final class OfflineTests: XCTestCase {
         ))
         XCTAssertTrue(client.isPendingCreate(docIdB), "Doc B should be pending")
 
-        // Go online and manually commit B
+        // Go online. Reconnecting auto-commits pending creates:
+        // runOnlineAuthHandoff re-drives every pending create through
+        // scheduleCommitRetry → commitOfflineCreate (JsBaoClient.swift:1607-1608).
+        // Local doc IDs are ULIDs since #852 (createDocument uses ULID.generate),
+        // so the server accepts the offline-create commit. We assert the end
+        // state rather than racing the background commit with a second manual
+        // commitOfflineCreate — that manual call would hit the "Document is not a
+        // pending create" guard (DocumentManager.swift:905) once auto-commit has
+        // already cleared doc B from the pending set.
         await client.goOnline()
-        try await delay(1) // Allow reconnection
 
-        do {
-            let result = try await client.documentManager.commitOfflineCreate(
-                documentId: docIdB,
-                onExists: "link"
-            )
-
-            // Should have created or linked
-            let created = result["created"] as? Bool ?? false
-            let linked = result["linked"] as? Bool ?? false
-            XCTAssertTrue(created || linked, "Commit should succeed with created or linked")
-            XCTAssertFalse(client.isPendingCreate(docIdB), "Doc B should no longer be pending after commit")
-        } catch {
-            // Known limitation: locally-generated document IDs use UUID format,
-            // but the server expects ULID format. The cancel flow (tested above)
-            // is the important part; commit requires ULID generation to be fixed.
-            let msg = String(describing: error)
-            XCTAssertTrue(
-                msg.contains("ULID") || msg.contains("invalid documentId"),
-                "Expected ULID validation error, got: \(msg)"
-            )
+        // Poll for the background auto-commit to clear doc B from the pending
+        // set (a fixed delay would be timing-fragile against reconnection).
+        var committed = false
+        for _ in 0..<24 {
+            if !client.isPendingCreate(docIdB) { committed = true; break }
+            try await delay(0.25)
         }
+        XCTAssertTrue(committed, "Doc B should be auto-committed on reconnect and no longer pending")
+        XCTAssertFalse(client.isPendingCreate(docIdB), "Doc B should no longer be pending after auto-commit")
+        XCTAssertTrue(client.hasLocalCopy(docIdB), "Doc B should remain a known local document after commit")
     }
 
     // MARK: - Data available immediately after network sync (evict + reopen)

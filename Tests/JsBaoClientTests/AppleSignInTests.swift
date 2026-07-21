@@ -101,6 +101,40 @@ final class AppleSignInUnitTests: XCTestCase {
         XCTAssertFalse(body.keys.contains("lastName"))
     }
 
+    func testCallbackBodyIncludesInviteTokenWhenPresent() {
+        // #1467 parity with signInWithGoogle(inviteToken:): a supplied invite
+        // token rides the callback body so the server accepts the invitation
+        // and resolves deferred grants during signup.
+        let body = AppleSignInHelpers.callbackBody(
+            identityToken: "tok",
+            rawNonce: "nonce",
+            user: "user",
+            inviteToken: "invite-token-abc123"
+        )
+        XCTAssertEqual(body["inviteToken"] as? String, "invite-token-abc123")
+    }
+
+    func testCallbackBodyOmitsNilOrEmptyInviteToken() {
+        // Nil and empty-string tokens are omitted from the wire body — the
+        // same omission rule as the email/name hints (no "" placeholders).
+        let nilBody = AppleSignInHelpers.callbackBody(
+            identityToken: "tok",
+            rawNonce: "nonce",
+            user: "user",
+            inviteToken: nil
+        )
+        XCTAssertFalse(nilBody.keys.contains("inviteToken"))
+        XCTAssertEqual(nilBody.count, 3)
+
+        let emptyBody = AppleSignInHelpers.callbackBody(
+            identityToken: "tok",
+            rawNonce: "nonce",
+            user: "user",
+            inviteToken: ""
+        )
+        XCTAssertFalse(emptyBody.keys.contains("inviteToken"))
+    }
+
     func testCallbackBodySerializesToJSON() throws {
         // The body must be JSONSerialization-clean (it's posted as JSON).
         let body = AppleSignInHelpers.callbackBody(

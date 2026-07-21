@@ -121,7 +121,7 @@ final class SubscribeTests: XCTestCase {
         let unsub = model.subscribe {
             // Re-entering the model from the callback: requires the
             // write transaction to be closed.
-            observedCounts.append(model.query().count)
+            observedCounts.append((try? model.query())?.count ?? 0)
         }
 
         try model.transact {
@@ -181,7 +181,7 @@ final class SubscribeTests: XCTestCase {
 
         var observedCounts: [Int] = []
         let unsub = model.subscribe {
-            observedCounts.append(model.query().count)
+            observedCounts.append((try? model.query())?.count ?? 0)
         }
 
         try model.transact {

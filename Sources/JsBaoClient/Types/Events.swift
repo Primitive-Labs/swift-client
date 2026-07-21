@@ -145,14 +145,6 @@ public enum JsBaoEvent: String, Sendable {
     case workflowStarted
     case documentSyncStateChanged
 
-    /// Derived from a `docMetadata` frame with `action: "deleted"`.
-    /// Covers both "the doc was hard-deleted server-side" and "your
-    /// access to the doc was revoked" — the server collapses both to
-    /// the same wire shape, so subscribers can't distinguish from the
-    /// payload alone. Detail views that have the doc open should
-    /// dismiss themselves on this event regardless of cause.
-    case documentDeleted
-
     // ── Cache lifecycle (parity with JS KvCache) ──────────────────
     /// Fires after a successful network refresh of a cached entry.
     /// Mirrors JS `KvCache`'s `cacheUpdated` (`src/client/kv-cache.ts`),
@@ -300,18 +292,6 @@ public struct DocumentMetadataChangedEvent: @unchecked Sendable {
         self.changedFields = changedFields
         self.source = source
     }
-}
-
-/// Derived event fired when the server signals that a doc is no
-/// longer visible to the user (server-side delete OR access
-/// revocation — see `JsBaoEvent.documentDeleted` docstring). Detail
-/// views should subscribe to this and dismiss themselves.
-public struct DocumentDeletedEvent: Sendable {
-    public let documentId: String
-    /// Best-effort source classification:
-    ///  - `"server-push"` — the server sent a `docMetadata` deletion frame
-    ///  - `"local-delete"` — `documents.delete(...)` was called locally
-    public let source: String
 }
 
 /// Payload for `blobs:upload-progress`. Mirrors the JS client's

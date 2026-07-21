@@ -97,13 +97,17 @@ enum AppleSignInHelpers {
     /// Build the JSON body for `POST /auth/apple/callback`. Required fields
     /// `identityToken` / `nonce` (raw) / `user`; the email/name hints are
     /// included only when Apple provided them (first authorization only).
+    /// `inviteToken` (#1467) rides along only when non-empty — same omission
+    /// rule as the hints — so the server accepts the invitation and resolves
+    /// its deferred grants during signup.
     static func callbackBody(
         identityToken: String,
         rawNonce: String,
         user: String,
         email: String? = nil,
         firstName: String? = nil,
-        lastName: String? = nil
+        lastName: String? = nil,
+        inviteToken: String? = nil
     ) -> [String: Any] {
         var body: [String: Any] = [
             "identityToken": identityToken,
@@ -113,6 +117,7 @@ enum AppleSignInHelpers {
         if let email, !email.isEmpty { body["email"] = email }
         if let firstName, !firstName.isEmpty { body["firstName"] = firstName }
         if let lastName, !lastName.isEmpty { body["lastName"] = lastName }
+        if let inviteToken, !inviteToken.isEmpty { body["inviteToken"] = inviteToken }
         return body
     }
 
@@ -151,17 +156,28 @@ extension JsBaoClient {
     /// the server app config to have Apple auth enabled with the app's
     /// bundle ID registered as an allowed audience.
     ///
-    /// - Parameter presentationAnchor: The window to present the sheet
-    ///   from. Pass `nil` to let the system pick a default anchor.
+    /// - Parameters:
+    ///   - presentationAnchor: The window to present the sheet from. Pass
+    ///     `nil` to let the system pick a default anchor.
+    ///   - inviteToken: Optional invitation token (#1467) — parity with
+    ///     `signInWithGoogle(..., inviteToken:)`. When present, the server
+    ///     accepts the named invitation during a first sign-in and resolves
+    ///     its deferred grants to the new user, so no follow-up
+    ///     `invitations.accept(inviteToken:)` call is needed. On repeat
+    ///     sign-ins (existing Apple user) grants are not resolved — use
+    ///     `invitations.accept` for that case.
     /// - Returns: `AppleSignInResult` with the signed-in `userId` and the
     ///   server's `isNewUser` flag.
     /// - Throws: `AppleSignInError.cancelled` when the user dismisses the
     ///   sheet; `.providerError` / `.missingIdentityToken` /
     ///   `.notConfigured` for the other flow failures; `HttpError` /
-    ///   `JsBaoError` for server-side failures.
+    ///   `JsBaoError` for server-side failures (including
+    ///   `INVITE_TOKEN_INVALID` when the token is invalid, expired, or
+    ///   already used).
     @MainActor
     public func signInWithApple(
-        presentationAnchor: ASPresentationAnchor? = nil
+        presentationAnchor: ASPresentationAnchor? = nil,
+        inviteToken: String? = nil
     ) async throws -> AppleSignInResult {
         // 1. Fresh nonce pair: raw → server, SHA-256 hex → Apple.
         let rawNonce = AppleSignInHelpers.generateRawNonce()
@@ -197,7 +213,8 @@ extension JsBaoClient {
                 user: credential.user,
                 email: credential.email,
                 firstName: credential.fullName?.givenName,
-                lastName: credential.fullName?.familyName
+                lastName: credential.fullName?.familyName,
+                inviteToken: inviteToken
             )
         } catch {
             throw AppleSignInHelpers.mapServerError(error)

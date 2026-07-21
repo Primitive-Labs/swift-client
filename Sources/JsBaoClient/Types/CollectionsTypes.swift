@@ -43,6 +43,9 @@ public struct CollectionInfo: Decodable, Sendable, Equatable {
     public let collectionType: String
     /// Per-instance context identifier (e.g. a class ID). `nil` for
     /// collections not bound to any context. Immutable after create.
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `CollectionInfo.contextId`.
+    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
     public let contextId: String?
     public let documentCount: Int
     public let createdAt: String
@@ -145,13 +148,34 @@ public struct CreateCollectionParams: Encodable, Sendable {
     public var collectionType: String?
     /// Ties the collection to an external entity, exposed to CEL rules as
     /// `collection.contextId`. Must not contain `"#"`. Immutable after create.
-    public var contextId: String?
+    ///
+    /// Deprecated — mirrors js-bao's `@deprecated` on `CreateCollectionParams.contextId`.
+    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
+    public var contextId: String? = nil
 
+    /// Non-deprecated initializer. Set `contextId` through the deprecated
+    /// overload below so that binding a context surfaces the warning at the call
+    /// site (annotating only the stored property does not).
+    public init(
+        name: String,
+        description: String? = nil,
+        collectionType: String? = nil
+    ) {
+        self.name = name
+        self.description = description
+        self.collectionType = collectionType
+    }
+
+    /// Deprecated overload that accepts `contextId`, so
+    /// `CreateCollectionParams(…, contextId:)` call sites receive the
+    /// deprecation warning. `contextId` has no default here so it does not
+    /// collide with the non-deprecated initializer when omitted.
+    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
     public init(
         name: String,
         description: String? = nil,
         collectionType: String? = nil,
-        contextId: String? = nil
+        contextId: String?
     ) {
         self.name = name
         self.description = description

@@ -92,23 +92,23 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         try CrossDocNote(id: "b1", title: "gamma", done: false).save(in: docB)
 
         // Reads span every open doc by default.
-        XCTAssertEqual(CrossDocNote.count(), 3)
-        let all = try await CrossDocNote.findAll()
+        XCTAssertEqual(try CrossDocNote.count(), 3)
+        let all = try CrossDocNote.findAll()
         XCTAssertEqual(Set(all.map(\.id)), ["a1", "a2", "b1"])
-        let b1 = try await CrossDocNote.find("b1")
+        let b1 = try CrossDocNote.find("b1")
         XCTAssertEqual(b1?.title, "gamma")
 
         // Filters apply across the union.
-        XCTAssertEqual(Set(CrossDocNote.query(["done": false]).map(\.id)), ["a1", "b1"])
+        XCTAssertEqual(Set(try CrossDocNote.query(["done": false]).map(\.id)), ["a1", "b1"])
 
         // Single-doc opt-in via options.documents (matches js-bao).
-        let onlyA = CrossDocNote.query(nil, options: QueryOptions(documents: [docA]))
+        let onlyA = try CrossDocNote.query(nil, options: QueryOptions(documents: [docA]))
         XCTAssertEqual(Set(onlyA.map(\.id)), ["a1", "a2"])
 
         // Closing a document drops its rows from later cross-doc reads.
         await client.closeDocument(docB)
-        XCTAssertEqual(CrossDocNote.count(), 2)
-        let remaining = try await CrossDocNote.findAll()
+        XCTAssertEqual(try CrossDocNote.count(), 2)
+        let remaining = try CrossDocNote.findAll()
         XCTAssertEqual(Set(remaining.map(\.id)), ["a1", "a2"])
     }
 
@@ -136,15 +136,15 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
         // First save inserts.
         try CrossDocNote(id: "n1", title: "draft", done: false).save(in: docA)
-        XCTAssertEqual(CrossDocNote.count(), 1)
-        let inserted = try await CrossDocNote.find("n1")
+        XCTAssertEqual(try CrossDocNote.count(), 1)
+        let inserted = try CrossDocNote.find("n1")
         XCTAssertEqual(inserted?.title, "draft")
         XCTAssertEqual(inserted?.done, false)
 
         // Second save with the same id updates in place — no duplicate row.
         try CrossDocNote(id: "n1", title: "final", done: true).save(in: docA)
-        XCTAssertEqual(CrossDocNote.count(), 1)
-        let updated = try await CrossDocNote.find("n1")
+        XCTAssertEqual(try CrossDocNote.count(), 1)
+        let updated = try CrossDocNote.find("n1")
         XCTAssertEqual(updated?.title, "final")
         XCTAssertEqual(updated?.done, true)
     }
@@ -155,13 +155,13 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
         client.registerModels([CrossDocNote.self])
-        XCTAssertEqual(CrossDocNote.count(), 0)
+        XCTAssertEqual(try CrossDocNote.count(), 0)
 
         let (docA, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
         try CrossDocNote(id: "a1", title: "alpha", done: false).save(in: docA)
 
-        XCTAssertEqual(CrossDocNote.count(), 1)
-        let firstNote = try await CrossDocNote.findAll().first
+        XCTAssertEqual(try CrossDocNote.count(), 1)
+        let firstNote = try CrossDocNote.findAll().first
         XCTAssertEqual(firstNote?.title, "alpha")
     }
 
@@ -174,10 +174,10 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         // Open a doc BEFORE the model is ever registered/queried.
         let (docA, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
 
-        XCTAssertEqual(CrossDocNote.count(), 0)   // lazily registers here
+        XCTAssertEqual(try CrossDocNote.count(), 0)   // lazily registers here
         // The first write also lazily connects the already-open doc.
         try CrossDocNote(id: "a1", title: "alpha", done: false).save(in: docA)
-        XCTAssertEqual(CrossDocNote.count(), 1)
+        XCTAssertEqual(try CrossDocNote.count(), 1)
     }
 
     // MARK: - subscribe fires across documents
@@ -214,11 +214,75 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         try CrossDocNote(id: "a2", title: "beta", done: true).save(in: docA)
 
         // A filter that matches exactly one row returns it.
-        XCTAssertEqual(CrossDocNote.queryOne(["title": "beta"])?.id, "a2")
+        XCTAssertEqual(try CrossDocNote.queryOne(["title": "beta"])?.id, "a2")
         // A filter that matches nothing returns nil.
-        XCTAssertNil(CrossDocNote.queryOne(["title": "nope"]))
+        XCTAssertNil(try CrossDocNote.queryOne(["title": "nope"]))
         // queryOne(nil) returns *some* record when any exist.
-        XCTAssertNotNil(CrossDocNote.queryOne())
+        XCTAssertNotNil(try CrossDocNote.queryOne())
+    }
+
+    // MARK: - queryOne with query-time includes (#1216)
+    //
+    // Closes the typed parity hole #1194 left: query/queryPaged took an
+    // `include:` overload but queryOne did not, so a typed Swift app could
+    // not load related data for a single record without dropping to the
+    // untyped DynamicModel path. The overload returns the first match with
+    // its `_related` bag populated, reachable through the typed accessor —
+    // equivalent to `query(filter, include:).first`.
+
+    func testQueryOneWithIncludeReturnsFirstMatchWithRelated() async throws {
+        let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
+        JsBaoClient.configureDefault(client)
+        client.registerModels([IncAuthor.self, IncPost.self])
+
+        let (authorsDoc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+        let (postsDoc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+
+        try IncAuthor(id: "au1", name: "Alice").save(in: authorsDoc)
+        try IncAuthor(id: "au2", name: "Bob").save(in: authorsDoc)
+        // Two posts by Alice so the filter matches more than one row — proves
+        // queryOne returns the FIRST and still resolves its include.
+        try IncPost(id: "p1", authorId: "au1", title: "alpha").save(in: postsDoc)
+        try IncPost(id: "p2", authorId: "au1", title: "beta").save(in: postsDoc)
+        try IncPost(id: "p3", authorId: "au2", title: "gamma").save(in: postsDoc)
+
+        // First match (by id sort) for Alice's posts, with the author included.
+        let post = try IncPost.queryOne(
+            ["authorId": "au1"],
+            options: QueryOptions(sort: ["id": 1]),
+            include: [IncPost.includeAuthor()]
+        )
+        XCTAssertEqual(post?.id, "p1", "queryOne returns the first matching row")
+        XCTAssertEqual(post?.relatedAuthor?.id, "au1")
+        XCTAssertEqual(post?.relatedAuthor?.name, "Alice",
+                       "the author lives in a different doc — the include must still resolve")
+
+        // Equivalent to `query(filter, include:).first`.
+        let firstOfQuery = try IncPost.query(
+            ["authorId": "au1"],
+            options: QueryOptions(sort: ["id": 1]),
+            include: [IncPost.includeAuthor()]
+        ).first
+        XCTAssertEqual(post?.id, firstOfQuery?.id)
+        XCTAssertEqual(post?.relatedAuthor?.id, firstOfQuery?.relatedAuthor?.id)
+    }
+
+    func testQueryOneWithIncludeReturnsNilWhenNoMatch() async throws {
+        let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
+        JsBaoClient.configureDefault(client)
+        client.registerModels([IncAuthor.self, IncPost.self])
+
+        let (authorsDoc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+        let (postsDoc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+        try IncAuthor(id: "au1", name: "Alice").save(in: authorsDoc)
+        try IncPost(id: "p1", authorId: "au1", title: "alpha").save(in: postsDoc)
+
+        // A filter that matches nothing returns nil — no related decode attempted.
+        let none = try IncPost.queryOne(
+            ["authorId": "nobody"],
+            include: [IncPost.includeAuthor()]
+        )
+        XCTAssertNil(none)
     }
 
     // MARK: - findByUnique + save(in:upsertOn:) (unique-constraint facade)
@@ -235,7 +299,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let inserted = try UniqueNote(id: "u1", slug: "intro", body: "first")
             .save(in: docA, upsertOn: "slug")
         XCTAssertEqual(inserted.id, "u1", "no-match upsert inserts under the struct's id")
-        XCTAssertEqual(UniqueNote.count(), 1)
+        XCTAssertEqual(try UniqueNote.count(), 1)
 
         // findByUnique resolves the record by its unique slug.
         let found = try UniqueNote.findByUnique("by_slug", .string("intro"))
@@ -260,7 +324,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
             .save(in: docA, upsertOn: "slug")
         XCTAssertEqual(merged.id, "u1", "merge must resolve to the existing record's id")
         XCTAssertEqual(merged.body, "rewritten")
-        XCTAssertEqual(UniqueNote.count(), 1, "upsertOn should merge, not duplicate")
+        XCTAssertEqual(try UniqueNote.count(), 1, "upsertOn should merge, not duplicate")
         XCTAssertEqual(try UniqueNote.findByUnique("by_slug", .string("intro"))?.body, "rewritten")
         XCTAssertEqual(try UniqueNote.findByUnique("by_slug", .string("intro"))?.id, "u1")
 
@@ -268,8 +332,8 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let again = try UniqueNote(slug: "intro", body: "rewritten")
             .save(in: docA, upsertOn: "slug")
         XCTAssertEqual(again.id, "u1")
-        XCTAssertEqual(UniqueNote.count(), 1)
-        XCTAssertNil(UniqueNote.find("u2"))
+        XCTAssertEqual(try UniqueNote.count(), 1)
+        XCTAssertNil(try UniqueNote.find("u2"))
 
         // A slug with no record returns nil.
         XCTAssertNil(try UniqueNote.findByUnique("by_slug", .string("missing")))
@@ -313,11 +377,11 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         try CrossDocNote(id: "ok", title: "fine", done: false).save(in: docA)
 
         // Not found → nil (no throw).
-        let missing = try await CrossDocNote.find("definitely-not-there")
+        let missing = try CrossDocNote.find("definitely-not-there")
         XCTAssertNil(missing)
 
         // Found and well-shaped → the record.
-        let ok = try await CrossDocNote.find("ok")
+        let ok = try CrossDocNote.find("ok")
         XCTAssertEqual(ok?.title, "fine")
     }
 
@@ -336,7 +400,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
         // …but the typed find must throw a decode error, NOT return nil.
         do {
-            let result = try await CrossDocNote.find("drifted")
+            let result = try CrossDocNote.find("drifted")
             XCTFail("expected PrimitiveDecodeError, got \(String(describing: result))")
         } catch let error as PrimitiveDecodeError {
             XCTAssertEqual(error.modelName, CrossDocNote.modelName)
@@ -354,12 +418,12 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         // One healthy row, one drifted row.
         try CrossDocNote(id: "ok", title: "fine", done: true).save(in: docA)
         try insertDriftedRow(id: "drifted", into: docA, client: client)
-        XCTAssertEqual(CrossDocNote.count(), 2,
+        XCTAssertEqual(try CrossDocNote.count(), 2,
                        "precondition: both rows must be stored")
 
         // findAll must surface the drift loudly — never a silently short list.
         do {
-            let result = try await CrossDocNote.findAll()
+            let result = try CrossDocNote.findAll()
             XCTFail("expected PrimitiveDecodeError, got \(result.count) rows")
         } catch let error as PrimitiveDecodeError {
             XCTAssertEqual(error.modelName, CrossDocNote.modelName)
@@ -369,7 +433,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         // With the drifted row gone, findAll succeeds again.
         try JsBaoClient.requireDefault()
             .deleteShared(CrossDocNote.primitiveSchema, id: "drifted", in: docA)
-        let healthy = try await CrossDocNote.findAll()
+        let healthy = try CrossDocNote.findAll()
         XCTAssertEqual(healthy.map(\.id), ["ok"])
     }
 
@@ -386,7 +450,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let inserted = try UniqueNote(id: "n1", slug: "guide", body: "v1")
             .upsertByUnique("by_slug", in: docA)
         XCTAssertEqual(inserted.id, "n1")
-        XCTAssertEqual(UniqueNote.count(), 1)
+        XCTAssertEqual(try UniqueNote.count(), 1)
 
         // #1122: a DIFFERENT *explicit* id colliding on the slug throws.
         XCTAssertThrowsError(
@@ -403,8 +467,8 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
             .upsertByUnique("by_slug", in: docA)
         XCTAssertEqual(merged.id, "n1", "merge must keep the existing record's id")
         XCTAssertEqual(merged.body, "v2")
-        XCTAssertEqual(UniqueNote.count(), 1, "upsertByUnique should merge, not duplicate")
-        XCTAssertNil(UniqueNote.find("n2"))
+        XCTAssertEqual(try UniqueNote.count(), 1, "upsertByUnique should merge, not duplicate")
+        XCTAssertNil(try UniqueNote.find("n2"))
 
         // .mustExist on a missing key → UpsertByUniqueError.recordNotFound
         // (JS `objectMustExist` → RecordNotFoundError).
@@ -436,7 +500,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let fresh = try UniqueNote(id: "n6", slug: "other", body: "y")
             .upsertByUnique("by_slug", mode: .mustNotExist, in: docA)
         XCTAssertEqual(fresh.id, "n6")
-        XCTAssertEqual(UniqueNote.count(), 2)
+        XCTAssertEqual(try UniqueNote.count(), 2)
 
         // An undeclared constraint name throws (JS: "Unique constraint
         // named '…' not found for upsert.").
@@ -465,7 +529,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let seeded = try UniqueNote(id: "b1", slug: "shared", body: "v1")
             .upsertByUnique("by_slug", in: docB)
         XCTAssertEqual(seeded.id, "b1")
-        XCTAssertEqual(UniqueNote.count(), 1)
+        XCTAssertEqual(try UniqueNote.count(), 1)
 
         // Upsert the same slug targeting docA — the cross-doc search must
         // find docB's record, then save the resolved id through docA
@@ -476,18 +540,18 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
             .upsertByUnique("by_slug", in: docA)
         XCTAssertEqual(merged.id, "b1", "must resolve docB's existing record id")
         XCTAssertEqual(merged.body, "v2")
-        let scopedToDocA = JsBaoClient.requireDefault()
+        let scopedToDocA = try JsBaoClient.requireDefault()
             .queryShared(UniqueNote.primitiveSchema, options: QueryOptions(documents: [docA]))
             .compactMap { UniqueNote(row: $0) }
         XCTAssertTrue(scopedToDocA.contains { $0.id == "b1" && $0.body == "v2" },
                       "targetDocument parity writes the resolved id into docA")
-        let scopedToDocB = JsBaoClient.requireDefault()
+        let scopedToDocB = try JsBaoClient.requireDefault()
             .queryShared(UniqueNote.primitiveSchema, options: QueryOptions(documents: [docB]))
             .compactMap { UniqueNote(row: $0) }
         XCTAssertTrue(scopedToDocB.contains { $0.id == "b1" && $0.body == "v1" },
                       "JS parity keeps the original matching row in its source doc")
         XCTAssertEqual(
-            UniqueNote.count(), 2,
+            try UniqueNote.count(), 2,
             "targetDocument parity can leave the same resolved id in two open docs"
         )
 
@@ -495,24 +559,238 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let fresh = try UniqueNote(id: "a1", slug: "fresh", body: "y")
             .upsertByUnique("by_slug", in: docA)
         XCTAssertEqual(fresh.id, "a1")
-        XCTAssertEqual(UniqueNote.count(), 3)
+        XCTAssertEqual(try UniqueNote.count(), 3)
+    }
+
+    // MARK: - hasManyThrough shared traversal (generated-accessor backend)
+
+    private static let throughTagSchema = PrimitiveSchema(
+        name: "through_tags",
+        fields: [
+            "id":   FieldDescriptor(type: .id),
+            "name": FieldDescriptor(type: .string),
+        ]
+    )
+
+    private static let throughLinkSchema = PrimitiveSchema(
+        name: "through_post_tag_links",
+        fields: [
+            "id":       FieldDescriptor(type: .id),
+            "postId":   FieldDescriptor(type: .string, indexed: true),
+            "tagId":    FieldDescriptor(type: .string, indexed: true),
+            // Required (non-null) so it passes the D7 nullable-order-field
+            // guard, but non-unique so pages can straddle a tie. Default 0
+            // lets links that don't exercise ordering omit it.
+            "position": FieldDescriptor(type: .number, required: true, default: .scalar(.number(0))),
+            // Nullable — drives the D7 rejection test below.
+            "weight":   FieldDescriptor(type: .number),
+        ]
+    )
+
+    /// `hasManyThroughShared` returns targets in **target `id ASC`** —
+    /// the declared join order picks which join rows, but the batched
+    /// `id: { $in: [...] }` query re-sorts the output, matching js-bao.
+    /// (#1201: previously it returned targets in join-row order.)
+    func testHasManyThroughSharedReturnsTargetIdAscending() async throws {
+        let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
+        JsBaoClient.configureDefault(client)
+        client.registerModels([Self.throughTagSchema, Self.throughLinkSchema])
+
+        let (doc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+        try client.saveShared(Self.throughTagSchema, id: "t1", values: ["name": .string("red")], in: doc)
+        try client.saveShared(Self.throughTagSchema, id: "t2", values: ["name": .string("blue")], in: doc)
+        // Join rows inserted so join-row order ([t2, t1]) differs from
+        // target id ASC; position ASC selects t1-then-t2.
+        try client.saveShared(Self.throughLinkSchema, id: "l1",
+            values: ["postId": .string("p1"), "tagId": .string("t2"), "position": .number(1)], in: doc)
+        try client.saveShared(Self.throughLinkSchema, id: "l2",
+            values: ["postId": .string("p1"), "tagId": .string("t1"), "position": .number(2)], in: doc)
+
+        // Default (no declared join order) → target id ASC.
+        let defaultRows = try client.hasManyThroughShared(
+            target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
+            sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId"
+        )
+        XCTAssertEqual(defaultRows.compactMap { $0["id"] as? String }, ["t1", "t2"],
+                       "no declared join order → defaults to target id ASC")
+
+        // DESC join order still yields target id ASC (the $in re-sort wins).
+        let descRows = try client.hasManyThroughShared(
+            target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
+            sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
+            joinModelOrderByField: "position", joinModelOrderDirection: "DESC"
+        )
+        XCTAssertEqual(descRows.compactMap { $0["id"] as? String }, ["t1", "t2"],
+                       "DESC join leg selects t2-then-t1 but output stays target id ASC")
+    }
+
+    /// Paginated `hasManyThroughShared` (#1230, rerouted #1607) pages the
+    /// join leg by `position` through the shared composite-cursor engine
+    /// and `$in`-resolves each page. Seeds six tags/links so `limit: 2`
+    /// produces three pages; walks forward via `nextCursor`, then steps
+    /// back. Cursors are now OPAQUE `String` tokens copied verbatim from
+    /// the join leg's paged envelope, so the test feeds them back rather
+    /// than asserting their bytes.
+    func testHasManyThroughSharedPaginatesJoinLeg() async throws {
+        let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
+        JsBaoClient.configureDefault(client)
+        client.registerModels([Self.throughTagSchema, Self.throughLinkSchema])
+
+        let (doc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+        // Position i points at tag t{i}, so position ASC and target id ASC
+        // agree — each page's rows read as a clean id-ordered slice.
+        for i in 1...6 {
+            try client.saveShared(Self.throughTagSchema, id: "t\(i)", values: ["name": .string("n\(i)")], in: doc)
+            try client.saveShared(Self.throughLinkSchema, id: "l\(i)",
+                values: ["postId": .string("p1"), "tagId": .string("t\(i)"), "position": .number(Double(i))], in: doc)
+        }
+
+        func page(after: String? = nil, before: String? = nil,
+                  direction: CursorDirection = .forward) throws -> PagedQueryResult<[String: Any]> {
+            try client.hasManyThroughShared(
+                target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
+                sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
+                joinModelOrderByField: "position",
+                limit: 2, afterCursor: after, beforeCursor: before, direction: direction
+            )
+        }
+        func ids(_ p: PagedQueryResult<[String: Any]>) -> [String] { p.data.compactMap { $0["id"] as? String } }
+
+        // Page 1 — first page: prevCursor nil, nextCursor present.
+        let p1 = try page()
+        XCTAssertEqual(ids(p1), ["t1", "t2"])
+        XCTAssertNotNil(p1.nextCursor)
+        XCTAssertNil(p1.prevCursor)
+        XCTAssertTrue(p1.hasMore)
+
+        // Page 2 — no overlap, no gap with page 1. Feeding the opaque
+        // cursor back proves it round-trips through the shared decoder.
+        let p2 = try page(after: p1.nextCursor)
+        XCTAssertEqual(ids(p2), ["t3", "t4"])
+        XCTAssertNotNil(p2.nextCursor)
+        XCTAssertNotNil(p2.prevCursor)
+        XCTAssertTrue(p2.hasMore)
+
+        // Page 3 — last page: nextCursor nil, hasMore false.
+        let p3 = try page(after: p2.nextCursor)
+        XCTAssertEqual(ids(p3), ["t5", "t6"])
+        XCTAssertNil(p3.nextCursor)
+        XCTAssertFalse(p3.hasMore)
+
+        // Backward from page 3's prevCursor lands back on page 2's rows,
+        // returned in declared order. `hasMore` tracks the backward
+        // direction (earlier rows remain), the over-fetch signal.
+        let back = try page(before: p3.prevCursor, direction: .backward)
+        XCTAssertEqual(ids(back), ["t3", "t4"])
+        XCTAssertTrue(back.hasMore,
+                      "backward hasMore should track earlier rows remaining, not nextCursor")
+
+        // limit larger than the set → whole set, no next page.
+        let all = try client.hasManyThroughShared(
+            target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
+            sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
+            joinModelOrderByField: "position", limit: 50
+        )
+        XCTAssertEqual(ids(all), ["t1", "t2", "t3", "t4", "t5", "t6"])
+        XCTAssertNil(all.nextCursor)
+        XCTAssertFalse(all.hasMore)
+
+        // Empty join set → empty page. Cursors copy the (empty) join
+        // leg's envelope: no rows means no cursors either.
+        let empty = try client.hasManyThroughShared(
+            target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
+            sourceId: "no-such-post", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
+            joinModelOrderByField: "position", limit: 2
+        )
+        XCTAssertTrue(empty.data.isEmpty)
+        XCTAssertNil(empty.nextCursor)
+        XCTAssertNil(empty.prevCursor)
+        XCTAssertFalse(empty.hasMore)
+    }
+
+    /// Straddling-tie regression (#1607, Swift analog of JS scenario8 /
+    /// scenario50) for the cross-document shared path. A join set whose
+    /// `position` value repeats ACROSS a page boundary must page with no
+    /// skips and no duplicates — the composite `(position, id)` cursor
+    /// handles the tie the old raw-scalar cursor mis-cut.
+    func testHasManyThroughSharedStraddlingTiePagesCleanly() async throws {
+        let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
+        JsBaoClient.configureDefault(client)
+        client.registerModels([Self.throughTagSchema, Self.throughLinkSchema])
+
+        let (doc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+        // positions 1,2,2,3,3,4 — ties straddle both limit-2 boundaries.
+        let positions = [1, 2, 2, 3, 3, 4]
+        for i in 1...6 {
+            try client.saveShared(Self.throughTagSchema, id: "t\(i)", values: ["name": .string("n\(i)")], in: doc)
+            try client.saveShared(Self.throughLinkSchema, id: "l\(i)",
+                values: ["postId": .string("p1"), "tagId": .string("t\(i)"),
+                         "position": .number(Double(positions[i - 1]))], in: doc)
+        }
+
+        var seen: [String] = []
+        var cursor: String? = nil
+        var guardCount = 0
+        repeat {
+            let p = try client.hasManyThroughShared(
+                target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
+                sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
+                joinModelOrderByField: "position",
+                limit: 2, afterCursor: cursor
+            )
+            seen.append(contentsOf: p.data.compactMap { $0["id"] as? String })
+            cursor = p.hasMore ? p.nextCursor : nil
+            guardCount += 1
+            XCTAssertLessThan(guardCount, 10, "pagination should terminate")
+        } while cursor != nil
+
+        XCTAssertEqual(seen.sorted(), ["t1", "t2", "t3", "t4", "t5", "t6"],
+                       "every row visited exactly once despite ties on the boundary")
+        XCTAssertEqual(seen.count, Set(seen).count, "no duplicate rows across pages")
+    }
+
+    /// D7 / Fork B (#1607, relaxed): ordering the shared paginated join leg
+    /// by a NULLABLE field is now ACCEPTED (it warns rather than throwing).
+    /// The composite `(field, id)` cursor's `id` tiebreaker keeps a
+    /// not-`required` order field deterministic, so paging must succeed and
+    /// return the linked tag. See `warnIfOrderFieldNullable`.
+    func testHasManyThroughSharedNullableOrderFieldIsAccepted() async throws {
+        let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
+        JsBaoClient.configureDefault(client)
+        client.registerModels([Self.throughTagSchema, Self.throughLinkSchema])
+
+        let (doc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
+        try client.saveShared(Self.throughTagSchema, id: "t1", values: ["name": .string("n1")], in: doc)
+        try client.saveShared(Self.throughLinkSchema, id: "l1",
+            values: ["postId": .string("p1"), "tagId": .string("t1"),
+                     "position": .number(1), "weight": .number(1)], in: doc)
+
+        let page = try client.hasManyThroughShared(
+            target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
+            sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
+            joinModelOrderByField: "weight", limit: 2
+        )
+        XCTAssertEqual(
+            page.data.compactMap { $0["id"] as? String }, ["t1"],
+            "paging the shared join leg by a nullable order field should succeed"
+        )
     }
 }
 
 // Mirrors `SwiftEmitter.crossDocumentFacade(schema:)` output — keep in sync
 // with the emitter if its template changes.
 extension CrossDocumentStaticQueryTests.CrossDocNote {
-    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [CrossDocumentStaticQueryTests.CrossDocNote] {
-        JsBaoClient.requireDefault()
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [CrossDocumentStaticQueryTests.CrossDocNote] {
+        try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: filter, options: options)
             .compactMap { CrossDocumentStaticQueryTests.CrossDocNote(row: $0) }
     }
 
-    static func count(_ filter: DocumentFilter? = nil) -> Int {
-        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
     }
 
-    static func findAll() async throws -> [CrossDocumentStaticQueryTests.CrossDocNote] {
+    static func findAll() throws -> [CrossDocumentStaticQueryTests.CrossDocNote] {
         try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: nil, options: nil)
             .map { row in
@@ -523,7 +801,7 @@ extension CrossDocumentStaticQueryTests.CrossDocNote {
             }
     }
 
-    static func find(_ id: String) async throws -> CrossDocumentStaticQueryTests.CrossDocNote? {
+    static func find(_ id: String) throws -> CrossDocumentStaticQueryTests.CrossDocNote? {
         guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {
             return nil
         }
@@ -533,8 +811,8 @@ extension CrossDocumentStaticQueryTests.CrossDocNote {
         return decoded
     }
 
-    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> CrossDocumentStaticQueryTests.CrossDocNote? {
-        JsBaoClient.requireDefault()
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> CrossDocumentStaticQueryTests.CrossDocNote? {
+        try JsBaoClient.requireDefault()
             .queryOneShared(primitiveSchema, filter: filter, options: options)
             .flatMap { CrossDocumentStaticQueryTests.CrossDocNote(row: $0) }
     }
@@ -617,11 +895,13 @@ extension CrossDocumentStaticQueryTests {
 }
 
 extension CrossDocumentStaticQueryTests.UniqueNote {
-    static func count(_ filter: DocumentFilter? = nil) -> Int {
-        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
     }
 
-    static func find(_ id: String) -> CrossDocumentStaticQueryTests.UniqueNote? {
+    // Mirrors the emitter's sync-throws `find(_:)` (#1156); previously this
+    // mirror diverged as a non-throwing accessor.
+    static func find(_ id: String) throws -> CrossDocumentStaticQueryTests.UniqueNote? {
         JsBaoClient.requireDefault().findShared(primitiveSchema, id: id)
             .flatMap { CrossDocumentStaticQueryTests.UniqueNote(row: $0) }
     }
@@ -648,6 +928,142 @@ extension CrossDocumentStaticQueryTests.UniqueNote {
         var copy = self
         copy.id = result.record.id
         return copy
+    }
+}
+
+// MARK: - IncAuthor / IncPost: a model PAIR with a refersTo relationship
+//
+// Exercises the typed query-time include facade (#1216 `queryOne(_:options:include:)`).
+// Hand-written to mirror `SwiftEmitter.crossDocumentFacade(schema:)`'s
+// `query(...,include:)` / `queryOne(...,include:)` overloads, the per-relationship
+// `relatedAuthor` accessor over `RelatedRecords`, and the `includeAuthor()` builder.
+extension CrossDocumentStaticQueryTests {
+    struct IncAuthor: PrimitiveModel, PrimitiveRowDecodable, Equatable {
+        static let modelName = "inc_authors"
+        static let primitiveSchema = PrimitiveSchema(
+            name: "inc_authors",
+            fields: [
+                "id":   FieldDescriptor(type: .id),
+                "name": FieldDescriptor(type: .string, required: true),
+            ]
+        )
+
+        var id: String
+        var name: String
+
+        init(id: String, name: String) { self.id = id; self.name = name }
+
+        init?(record: PrimitiveRecord) {
+            guard let name = record["name"]?.asString else { return nil }
+            self.id = record.id; self.name = name
+        }
+
+        init?(row: [String: Any]) {
+            guard let id = row["id"] as? String, let name = row["name"] as? String
+            else { return nil }
+            self.id = id; self.name = name
+        }
+
+        func primitiveValues() -> [String: PrimitiveValue] { ["name": .string(name)] }
+    }
+
+    struct IncPost: PrimitiveModel, PrimitiveRowDecodable, Equatable {
+        static let modelName = "inc_posts"
+        static let primitiveSchema = PrimitiveSchema(
+            name: "inc_posts",
+            fields: [
+                "id":       FieldDescriptor(type: .id),
+                "authorId": FieldDescriptor(type: .string, indexed: true),
+                "title":    FieldDescriptor(type: .string, required: true),
+            ],
+            relationships: [
+                "author": RelationshipDescriptor(properties: [
+                    "type": "refersTo", "model": "inc_authors", "relatedIdField": "authorId",
+                ]),
+            ]
+        )
+
+        var id: String
+        var authorId: String
+        var title: String
+        // Mirrors the emitter's `var related: RelatedRecords = .empty`, populated
+        // from `row["_related"]` in `init?(row:)`.
+        var related: RelatedRecords = .empty
+
+        init(id: String, authorId: String, title: String) {
+            self.id = id; self.authorId = authorId; self.title = title
+        }
+
+        init?(record: PrimitiveRecord) {
+            guard let authorId = record["authorId"]?.asString,
+                  let title = record["title"]?.asString
+            else { return nil }
+            self.id = record.id; self.authorId = authorId; self.title = title
+            self.related = .empty
+        }
+
+        init?(row: [String: Any]) {
+            guard let id = row["id"] as? String,
+                  let authorId = row["authorId"] as? String,
+                  let title = row["title"] as? String
+            else { return nil }
+            self.id = id; self.authorId = authorId; self.title = title
+            self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
+        }
+
+        func primitiveValues() -> [String: PrimitiveValue] {
+            ["authorId": .string(authorId), "title": .string(title)]
+        }
+
+        // `related` is a query-result attachment — exclude it from equality so
+        // it never affects record identity (mirrors the emitter).
+        static func == (lhs: IncPost, rhs: IncPost) -> Bool {
+            lhs.id == rhs.id && lhs.authorId == rhs.authorId && lhs.title == rhs.title
+        }
+    }
+}
+
+extension CrossDocumentStaticQueryTests.IncAuthor {
+    @discardableResult
+    func save(in documentId: String) throws -> CrossDocumentStaticQueryTests.IncAuthor {
+        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
+        return self
+    }
+}
+
+extension CrossDocumentStaticQueryTests.IncPost {
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [CrossDocumentStaticQueryTests.IncPost] {
+        try JsBaoClient.requireDefault()
+            .queryShared(primitiveSchema, filter: filter, options: options, include: include)
+            .compactMap { CrossDocumentStaticQueryTests.IncPost(row: $0) }
+    }
+
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> CrossDocumentStaticQueryTests.IncPost? {
+        try JsBaoClient.requireDefault()
+            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)
+            .flatMap { CrossDocumentStaticQueryTests.IncPost(row: $0) }
+    }
+
+    /// Typed query-time include payload for `author`, when present in `related`.
+    var relatedAuthor: CrossDocumentStaticQueryTests.IncAuthor? {
+        related.one("author", as: CrossDocumentStaticQueryTests.IncAuthor.self)
+            ?? related.one(CrossDocumentStaticQueryTests.IncAuthor.modelName, as: CrossDocumentStaticQueryTests.IncAuthor.self)
+    }
+
+    /// Build a query-time include for `author`.
+    static func includeAuthor(resultKey: String? = "author") -> Include {
+        Include(
+            type: .refersTo,
+            target: JsBaoClient.requireDefault().includeTarget(for: CrossDocumentStaticQueryTests.IncAuthor.primitiveSchema),
+            sourceField: "authorId",
+            resultKey: resultKey
+        )
+    }
+
+    @discardableResult
+    func save(in documentId: String) throws -> CrossDocumentStaticQueryTests.IncPost {
+        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
+        return self
     }
 }
 

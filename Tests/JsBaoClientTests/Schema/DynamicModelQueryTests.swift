@@ -38,26 +38,26 @@ final class DynamicModelQueryTests: XCTestCase {
 
     func testQueryAll() throws {
         let model = try seeded()
-        let rows = model.query()
+        let rows = try model.query()
         XCTAssertEqual(rows.count, 3)
     }
 
     func testQueryWithFilter() throws {
         let model = try seeded()
-        let done = model.query(["done": true])
+        let done = try model.query(["done": true])
         XCTAssertEqual(done.count, 2)
         XCTAssertEqual(Set(done.compactMap { $0["title"] as? String }), ["beta", "gamma"])
     }
 
     func testCountWithFilter() throws {
         let model = try seeded()
-        XCTAssertEqual(model.count(["done": true]), 2)
-        XCTAssertEqual(model.count(), 3)
+        XCTAssertEqual(try model.count(["done": true]), 2)
+        XCTAssertEqual(try model.count(), 3)
     }
 
     func testAggregateGrouped() throws {
         let model = try seeded()
-        let stats = model.aggregate(AggregateOptions(
+        let stats = try model.aggregate(AggregateOptions(
             groupBy: ["done"],
             operations: [
                 AggregateOperation(type: .count),

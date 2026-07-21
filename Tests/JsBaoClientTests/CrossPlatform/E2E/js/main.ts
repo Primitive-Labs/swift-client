@@ -105,7 +105,7 @@ function schemaFor(modelName: string): any {
 // from a stale TOML, the import-time check inside the barrel itself
 // throws; this guard catches the symmetric case (the TOML lacks a
 // model the harness depends on).
-for (const name of ["tasks", "everything", "users", "posts", "tags", "post_tag_links"]) {
+for (const name of ["tasks", "everything", "users", "posts", "tags", "post_tag_links", "labels", "post_label_links"]) {
   if (!CLASS_BY_MODEL_NAME[name] || !schemaFor(name)) {
     emitError(
       "E2EMiniApp(js): missing schema for '" + name +
@@ -355,7 +355,13 @@ async function cmdResolveRelationship(
   docB64: string,
   modelName: string,
   id: string,
-  relationship: string
+  relationship: string,
+  pagination?: {
+    limit?: number;
+    afterCursor?: string;
+    beforeCursor?: string;
+    direction?: "forward" | "backward";
+  }
 ): Promise<void> {
   const ModelCls = MODELS[modelName] as any;
   if (!ModelCls) emitError("unknown model: " + modelName);
@@ -370,10 +376,15 @@ async function cmdResolveRelationship(
     );
   }
   const targetModelName = relCfg.model;
+  // Pagination (#1230) is only meaningful for hasManyThrough — pass the
+  // pagination args straight through to the generated accessor and echo
+  // its `nextCursor` / `prevCursor` back so the parity test can walk pages.
+  const paginate =
+    pagination?.limit != null && relCfg.type === "hasManyThrough";
 
   const out = await withFreshDoc(docB64, async (doc) => {
     const inst = await ModelCls.find(id);
-    if (!inst) return [];
+    if (!inst) return { list: [] as any[] };
     const accessor = inst[relationship];
     if (typeof accessor !== "function") {
       emitError(
@@ -381,19 +392,42 @@ async function cmdResolveRelationship(
         "' missing on model '" + modelName + "'"
       );
     }
-    const raw = await accessor.call(inst);
-    if (raw == null) return [];
+    const raw = paginate
+      ? await accessor.call(inst, pagination)
+      : await accessor.call(inst);
+    if (raw == null) return { list: [] as any[] };
     let list: any[];
+    let nextCursor: unknown = null;
+    let prevCursor: unknown = null;
+    let hasMore = false;
     if (Array.isArray(raw)) {
       list = raw;
     } else if (raw && Array.isArray(raw.data)) {
       list = raw.data;
+      nextCursor = raw.nextCursor ?? null;
+      prevCursor = raw.prevCursor ?? null;
+      hasMore = raw.hasMore ?? false;
     } else {
       list = [raw];
     }
-    return list.map((r: any) => instanceToJson(r, doc, targetModelName));
+    return {
+      list: list.map((r: any) => instanceToJson(r, doc, targetModelName)),
+      nextCursor,
+      prevCursor,
+      hasMore,
+    };
   });
-  emit({ results: out });
+  // Cursors are the shared engine's OPAQUE base64 tokens now (#1607): the
+  // JS relationship accessor delegates the page cut to `BaseModel.query`,
+  // which mints a composite `(field, id)` cursor. Echoed verbatim so the
+  // parity test can DECODE both clients' tokens and compare their structure
+  // (values + sortFields + direction) — never the raw bytes, since JS and
+  // Swift may serialize the JSON key order differently. A token minted on
+  // one side still decodes and resolves the same page on the other.
+  const payload: Record<string, any> = { results: out.list, hasMore: out.hasMore };
+  if (out.nextCursor != null) payload.nextCursor = out.nextCursor;
+  if (out.prevCursor != null) payload.prevCursor = out.prevCursor;
+  emit(payload);
 }
 
 /**
@@ -483,7 +517,15 @@ async function main(): Promise<void> {
             return emitError("resolveRelationship: missing doc/id/relationship");
           }
           await cmdResolveRelationship(
-            cmd.doc, modelName, cmd.id, cmd.relationship
+            cmd.doc, modelName, cmd.id, cmd.relationship,
+            cmd.limit != null
+              ? {
+                  limit: cmd.limit,
+                  afterCursor: cmd.afterCursor,
+                  beforeCursor: cmd.beforeCursor,
+                  direction: cmd.direction,
+                }
+              : undefined
           );
           break;
         default:

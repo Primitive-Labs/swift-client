@@ -749,9 +749,9 @@ public final class DynamicModel {
     /// up-to-date; remote writes are picked up asynchronously via
     /// the root-map observer. We drain that queue before reading so
     /// callers always see the latest state.
-    public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [[String: Any]] {
+    public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [[String: Any]] {
         awaitObserverDrain()
-        return queryEngine.query(
+        return try queryEngine.query(
             modelName: schema.name, filter: filter, options: options,
             scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
@@ -778,7 +778,7 @@ public final class DynamicModel {
         include: [Include]
     ) throws -> [[String: Any]] {
         awaitObserverDrain()
-        var rows = queryEngine.query(
+        var rows = try queryEngine.query(
             modelName: schema.name, filter: filter, options: options,
             scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
@@ -826,17 +826,17 @@ public final class DynamicModel {
         )
     }
 
-    public func count(_ filter: DocumentFilter? = nil) -> Int {
+    public func count(_ filter: DocumentFilter? = nil) throws -> Int {
         awaitObserverDrain()
-        return queryEngine.count(
+        return try queryEngine.count(
             modelName: schema.name, filter: filter, scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
         )
     }
 
-    public func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
+    public func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
         awaitObserverDrain()
-        return queryEngine.aggregate(
+        return try queryEngine.aggregate(
             modelName: schema.name, options: options, scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
         )

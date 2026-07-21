@@ -76,7 +76,7 @@ final class CrossDocQueryTests: XCTestCase {
 
     func testOrOperatorAcrossDocs() throws {
         let multi = try seededTrio()
-        let rows = multi.query([
+        let rows = try multi.query([
             "$or": [
                 ["rank": 1] as [String: Any],
                 ["rank": 7] as [String: Any],
@@ -89,7 +89,7 @@ final class CrossDocQueryTests: XCTestCase {
     func testAndOperatorAcrossDocs() throws {
         let multi = try seededTrio()
         // tag = red AND rank >= 4 → a2 (red,4) and c3 (red,7)
-        let rows = multi.query([
+        let rows = try multi.query([
             "$and": [
                 ["tag": "red"] as [String: Any],
                 ["rank": ["$gte": 4]] as [String: Any],
@@ -101,14 +101,14 @@ final class CrossDocQueryTests: XCTestCase {
 
     func testInOperatorAcrossDocs() throws {
         let multi = try seededTrio()
-        let rows = multi.query(["rank": ["$in": [2, 5, 6]]])
+        let rows = try multi.query(["rank": ["$in": [2, 5, 6]]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["b1", "b2", "c2"])
     }
 
     func testContainsTextOperatorAcrossDocs() throws {
         let multi = try seededTrio()
-        let rows = multi.query(["title": ["$containsText": "alpha"]])
+        let rows = try multi.query(["title": ["$containsText": "alpha"]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["a1", "a2", "b2", "c2"],
                        "All four items with 'alpha' in title, spanning docA/docB/docC")
@@ -121,7 +121,7 @@ final class CrossDocQueryTests: XCTestCase {
     /// fails both branches (not green, not <=4).
     func testNestedCombinatorsAcrossDocs() throws {
         let multi = try seededTrio()
-        let rows = multi.query([
+        let rows = try multi.query([
             "$or": [
                 ["$and": [
                     ["tag": "red"] as [String: Any],

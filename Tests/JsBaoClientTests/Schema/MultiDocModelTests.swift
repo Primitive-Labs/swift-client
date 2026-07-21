@@ -124,7 +124,7 @@ final class MultiDocModelTests: XCTestCase {
 
     func testQueryFiltersFanOutAndMerge() throws {
         let multi = try seededPair()
-        let rows = multi.query(["rank": ["$gte": 2]])
+        let rows = try multi.query(["rank": ["$gte": 2]])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["a2", "b1"])
     }
@@ -133,7 +133,7 @@ final class MultiDocModelTests: XCTestCase {
     /// query, not a per-doc fetch+merge.
     func testQuerySortAppliesAcrossMergedResult() throws {
         let multi = try seededPair()
-        let rows = multi.query(nil, options: QueryOptions(
+        let rows = try multi.query(nil, options: QueryOptions(
             sortOrder: [("rank", 1)]
         ))
         XCTAssertEqual(rows.map { $0["id"] as? String },
@@ -144,7 +144,7 @@ final class MultiDocModelTests: XCTestCase {
     /// Limit is applied by SQL LIMIT on the merged result.
     func testQueryLimitAppliesAfterMerge() throws {
         let multi = try seededPair()
-        let rows = multi.query(nil, options: QueryOptions(
+        let rows = try multi.query(nil, options: QueryOptions(
             sortOrder: [("rank", 1)], limit: 2
         ))
         XCTAssertEqual(rows.map { $0["id"] as? String }, ["a1", "b1"])
@@ -154,7 +154,7 @@ final class MultiDocModelTests: XCTestCase {
     /// callers can filter by it to scope a query to one doc.
     func testQueryCanFilterByMetaDocId() throws {
         let multi = try seededPair()
-        let rows = multi.query(["_meta_doc_id": "docA"])
+        let rows = try multi.query(["_meta_doc_id": "docA"])
         let ids = Set(rows.compactMap { $0["id"] as? String })
         XCTAssertEqual(ids, ["a1", "a2"])
     }
@@ -163,12 +163,12 @@ final class MultiDocModelTests: XCTestCase {
 
     func testCountSumsAcrossDocs() throws {
         let multi = try seededPair()
-        XCTAssertEqual(multi.count(), 3)
+        XCTAssertEqual(try multi.count(), 3)
     }
 
     func testCountWithFilterSumsAcrossDocs() throws {
         let multi = try seededPair()
-        XCTAssertEqual(multi.count(["rank": ["$gte": 2]]), 2)
+        XCTAssertEqual(try multi.count(["rank": ["$gte": 2]]), 2)
     }
 
     // MARK: - aggregate (new: cross-doc via shared store)
@@ -178,7 +178,7 @@ final class MultiDocModelTests: XCTestCase {
     /// merging of per-doc aggregates.
     func testAggregateSumsAcrossDocs() throws {
         let multi = try seededPair()
-        let result = multi.aggregate(AggregateOptions(
+        let result = try multi.aggregate(AggregateOptions(
             operations: [
                 AggregateOperation(type: .sum, field: "rank")
             ]
@@ -194,7 +194,7 @@ final class MultiDocModelTests: XCTestCase {
     /// SQL query — this is the thing fan-out couldn't do cleanly.
     func testAggregateGroupByDocId() throws {
         let multi = try seededPair()
-        let rows = multi.aggregate(AggregateOptions(
+        let rows = try multi.aggregate(AggregateOptions(
             groupBy: ["_meta_doc_id"],
             operations: [
                 AggregateOperation(type: .count, outputField: "n"),
@@ -214,7 +214,7 @@ final class MultiDocModelTests: XCTestCase {
 
     func testAggregateWithFilter() throws {
         let multi = try seededPair()
-        let rows = multi.aggregate(AggregateOptions(
+        let rows = try multi.aggregate(AggregateOptions(
             operations: [AggregateOperation(type: .count, outputField: "n")],
             filter: ["rank": ["$gte": 2]]
         ))
@@ -225,7 +225,7 @@ final class MultiDocModelTests: XCTestCase {
 
     func testConnectAddsANewDoc() throws {
         let multi = try seededPair()
-        XCTAssertEqual(multi.count(), 3)
+        XCTAssertEqual(try multi.count(), 3)
 
         SchemaSync.clearCache()
         let modelC = multi.connect(docId: "docC", doc: YDocument())
@@ -234,7 +234,7 @@ final class MultiDocModelTests: XCTestCase {
             "rank": .number(10),
         ])
 
-        XCTAssertEqual(multi.count(), 4)
+        XCTAssertEqual(try multi.count(), 4)
         XCTAssertEqual(multi.find(id: "c1")?.docId, "docC")
     }
 
@@ -244,9 +244,9 @@ final class MultiDocModelTests: XCTestCase {
     /// data is still there if the doc is re-connected.
     func testDisconnectRemovesRowsFromSharedStore() throws {
         let multi = try seededPair()
-        XCTAssertEqual(multi.count(), 3)
+        XCTAssertEqual(try multi.count(), 3)
         multi.disconnect(docId: "docB")
-        XCTAssertEqual(multi.count(), 2)
+        XCTAssertEqual(try multi.count(), 2)
         XCTAssertNil(multi.find(id: "b1"))
         XCTAssertNil(multi.member(docId: "docB"))
     }
@@ -263,7 +263,7 @@ final class MultiDocModelTests: XCTestCase {
             "email": .string("ed@a.com"), "name": .string("Ed-A"),
             "rank": .number(9),
         ])
-        XCTAssertEqual(multi.count(), 4)
+        XCTAssertEqual(try multi.count(), 4)
     }
 
     // MARK: - Empty doc tolerance
@@ -280,7 +280,7 @@ final class MultiDocModelTests: XCTestCase {
         SchemaSync.clearCache()
         _ = multi.connect(docId: "docEmpty", doc: YDocument())
 
-        XCTAssertEqual(multi.count(), 1)
+        XCTAssertEqual(try multi.count(), 1)
         XCTAssertEqual(multi.findAll().count, 1)
     }
 

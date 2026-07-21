@@ -33,11 +33,11 @@ public struct GroupMemberInfo: Decodable, Sendable, Equatable {
 
 /// One of the current user's (or a queried user's) group memberships.
 /// Mirrors JS `GroupMembershipInfo`. `name`/`description` are joined from
-/// the `AppGroup` row at call time.
+/// the group record at call time.
 public struct GroupMembershipInfo: Decodable, Sendable, Equatable {
     public let groupType: String
     public let groupId: String
-    /// Display name of the group (joined from AppGroup at call time).
+    /// Display name of the group (joined from the group record at call time).
     public let name: String
     /// Optional description; omitted when the group has no description set.
     public let description: String?
@@ -82,6 +82,10 @@ public struct PendingGroupInvitationEntry: Decodable, Sendable, Equatable {
     /// Role the user will hold after signup. Always `"member"` today.
     public let role: String
     public let invitationId: String
+    /// Deferred-grant id for this pending invitation. Pass to
+    /// `client.invitations.revokeDeferredGrant(deferredId:type:)` with
+    /// `.group` to cancel it. Required — mirrors JS `deferredId: string`.
+    public let deferredId: String
     public let createdAt: String
     public let expiresAt: String
     public let addedBy: String?
@@ -90,12 +94,14 @@ public struct PendingGroupInvitationEntry: Decodable, Sendable, Equatable {
 // MARK: Create / update / list inputs
 
 /// Parameters for `create`. Mirrors JS `CreateGroupParams` —
-/// `groupType`, `groupId`, and `name` are required.
+/// `groupType` and `name` are required; `groupId` is optional (the server
+/// assigns a ULID when it is omitted and returns it in the response).
 public struct CreateGroupParams: Encodable, Sendable {
     /// The type category for the group (e.g., `"team"`, `"organization"`).
     public var groupType: String
-    /// A unique identifier for the group within its type.
-    public var groupId: String
+    /// A unique identifier for the group within its type. Optional — when
+    /// `nil`, the server assigns a ULID.
+    public var groupId: String?
     /// Display name for the group.
     public var name: String
     /// Optional human-readable description of the group's purpose.
@@ -103,7 +109,7 @@ public struct CreateGroupParams: Encodable, Sendable {
 
     public init(
         groupType: String,
-        groupId: String,
+        groupId: String? = nil,
         name: String,
         description: String? = nil
     ) {

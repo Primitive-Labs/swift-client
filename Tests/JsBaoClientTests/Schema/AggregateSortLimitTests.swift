@@ -43,7 +43,7 @@ final class AggregateSortLimitTests: XCTestCase {
 
     func testSortByCountDescendingOrdersGroups() throws {
         let model = try seeded()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .count, outputField: "n")],
             sort: AggregateSort(field: "n", direction: -1)
@@ -57,7 +57,7 @@ final class AggregateSortLimitTests: XCTestCase {
 
     func testSortByCountAscending() throws {
         let model = try seeded()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .count, outputField: "n")],
             sort: AggregateSort(field: "n", direction: 1)
@@ -72,7 +72,7 @@ final class AggregateSortLimitTests: XCTestCase {
 
     func testSortByGroupFieldOrders() throws {
         let model = try seeded()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .count, outputField: "n")],
             sort: AggregateSort(field: "kind", direction: 1)
@@ -87,7 +87,7 @@ final class AggregateSortLimitTests: XCTestCase {
 
     func testLimitCapsResults() throws {
         let model = try seeded()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .count, outputField: "n")],
             sort: AggregateSort(field: "n", direction: -1),
@@ -101,7 +101,7 @@ final class AggregateSortLimitTests: XCTestCase {
     /// + limit. Exercises the primary use case.
     func testSortBySumAndLimit() throws {
         let model = try seeded()
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .sum, field: "score", outputField: "total")],
             sort: AggregateSort(field: "total", direction: -1),
@@ -122,7 +122,7 @@ final class AggregateSortLimitTests: XCTestCase {
         // login first; signup and purchase tie — id-implicit tie-break
         // isn't part of the aggregate contract; we just check the
         // top-1 is login.
-        let rows = model.aggregate(AggregateOptions(
+        let rows = try model.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .count, outputField: "n")],
             filter: ["score": ["$gte": 5]],
@@ -151,7 +151,7 @@ final class AggregateSortLimitTests: XCTestCase {
         // COUNT(*) across the (scoped) doc, with sort + limit. Without
         // groupBy this is a single-row aggregate — sort/limit are
         // degenerate but the SQL must still be valid.
-        let rows = a.aggregate(AggregateOptions(
+        let rows = try a.aggregate(AggregateOptions(
             operations: [AggregateOperation(type: .count, outputField: "n")],
             sort: AggregateSort(field: "n", direction: -1),
             limit: 1
@@ -199,7 +199,7 @@ final class AggregateSortLimitTests: XCTestCase {
 
         // Count docA's records tagged "red", grouped by kind. docB's
         // matching record must be excluded by the scope predicate.
-        let rows = a.aggregate(AggregateOptions(
+        let rows = try a.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .count, outputField: "n")],
             filter: ["tags": ["$contains": "red"]],
@@ -226,7 +226,7 @@ final class AggregateSortLimitTests: XCTestCase {
         let b = multi.connect(docId: "docB", doc: YDocument())
         _ = try b.create(id: "b1", values: ["kind": .string("login"), "score": .number(1)])
 
-        let rows = multi.aggregate(AggregateOptions(
+        let rows = try multi.aggregate(AggregateOptions(
             groupBy: ["kind"],
             operations: [AggregateOperation(type: .count, outputField: "n")],
             sort: AggregateSort(field: "n", direction: -1),

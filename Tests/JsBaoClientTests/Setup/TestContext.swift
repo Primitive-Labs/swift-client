@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 @testable import JsBaoClient
 
 struct TestApp {
@@ -278,81 +277,27 @@ final class TestContext {
         return token
     }
 
-    /// Forge a refresh JWT for an existing access token, signed with the
-    /// dev-server's test secret. Used by the cold-start refresh-cookie test.
+    /// Mint a server-signed refresh token for an existing app user via the
+    /// dev-server's `mint-test-jwt` endpoint (test-features-gated, prod-blocked).
     ///
-    /// We do this client-side rather than via the server because the server's
-    /// `mint-test-jwt` admin endpoint only returns an access token — there's
-    /// no public route for minting a refresh token for test purposes. See
-    /// `docs/feedback/swift-client.md` entry 2026-04-21: the upstream ask is
-    /// for that endpoint to return both. Until then, we sign here using the
-    /// shared test secret that the dev server's .dev.vars already pins.
-    ///
-    /// This is strictly test infrastructure — it requires JWT_SECRET (or its
-    /// dev-server default "test-jwt-secret-only-for-tests") and cannot impact
-    /// production.
-    func forgeRefreshJwt(fromAccessToken accessToken: String) throws -> String {
-        let secret = TestConfig.jwtSecret
-        guard !secret.isEmpty else {
+    /// The server signs the refresh token with its own `JWT_SECRET` and records
+    /// a `Session`, exactly as a real login does — so the cold-start
+    /// refresh-cookie test no longer forges a token against a guessed secret
+    /// (`TestConfig.jwtSecret`). That forge approach broke whenever the test's
+    /// secret didn't match the server's (the /auth/refresh call then 401s), which
+    /// is exactly what the nightly hit. See `docs/feedback/swift-client.md`
+    /// entry 2026-04-21 for the original ask.
+    func mintRefreshToken(appId: String, userId: String) async throws -> String {
+        let result = try await adminPost(
+            "/admin/api/apps/\(appId)/users/\(userId)/mint-test-jwt",
+            body: ["includeRefreshToken": true]
+        )
+        guard let refreshToken = result["refreshToken"] as? String else {
             throw TestSetupError(
-                "TEST_JWT_SECRET env var is required for refresh-cookie tests."
+                "Failed to mint refresh token: missing refreshToken in response \(result)"
             )
         }
-
-        let parts = accessToken.split(separator: ".")
-        guard parts.count == 3 else {
-            throw TestSetupError("Access token is not a JWT")
-        }
-        guard var payload = TestContext.decodeJwtPayload(String(parts[1])) else {
-            throw TestSetupError("Failed to decode access-token payload")
-        }
-
-        // Switch type to "refresh" and give it a 7-day lifetime, matching
-        // what the server's /auth/refresh flow normally issues.
-        payload["type"] = "refresh"
-        payload["iat"] = Int(Date().timeIntervalSince1970)
-        payload["exp"] = Int(Date().addingTimeInterval(7 * 24 * 60 * 60).timeIntervalSince1970)
-
-        return try TestContext.signHS256Jwt(payload: payload, secret: secret)
-    }
-
-    private static func decodeJwtPayload(_ segment: String) -> [String: Any]? {
-        var base64 = segment
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        while base64.count % 4 != 0 { base64.append("=") }
-        guard let data = Data(base64Encoded: base64),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return json
-    }
-
-    private static func signHS256Jwt(payload: [String: Any], secret: String) throws -> String {
-        let header: [String: Any] = ["alg": "HS256", "typ": "JWT"]
-        // sort_keys: false — jsonwebtoken doesn't sort, and though signature
-        // verification only cares about the exact bytes being re-encoded
-        // consistently, we preserve whatever ordering JSONSerialization emits.
-        let headerData = try JSONSerialization.data(withJSONObject: header, options: [])
-        let payloadData = try JSONSerialization.data(withJSONObject: payload, options: [])
-        let headerSegment = TestContext.base64UrlEncode(headerData)
-        let payloadSegment = TestContext.base64UrlEncode(payloadData)
-        let signingInput = "\(headerSegment).\(payloadSegment)"
-
-        let key = SymmetricKey(data: Data(secret.utf8))
-        let signature = HMAC<SHA256>.authenticationCode(
-            for: Data(signingInput.utf8),
-            using: key
-        )
-        let signatureSegment = TestContext.base64UrlEncode(Data(signature))
-        return "\(signingInput).\(signatureSegment)"
-    }
-
-    private static func base64UrlEncode(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        return refreshToken
     }
 
     @discardableResult

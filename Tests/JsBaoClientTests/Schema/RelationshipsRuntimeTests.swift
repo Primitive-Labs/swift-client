@@ -57,6 +57,33 @@ final class RelationshipsRuntimeTests: XCTestCase {
                     joinModelLocalField: "postId",
                     joinModelRelatedField: "tagId"
                 ),
+                "tagsByPositionDesc": .hasManyThrough(
+                    model: "tags_rel",
+                    joinModel: "post_tag_links_rel",
+                    joinModelLocalField: "postId",
+                    joinModelRelatedField: "tagId",
+                    joinModelOrderByField: "position",
+                    joinModelOrderDirection: "DESC"
+                ),
+                "tagsByPositionAsc": .hasManyThrough(
+                    model: "tags_rel",
+                    joinModel: "post_tag_links_rel",
+                    joinModelLocalField: "postId",
+                    joinModelRelatedField: "tagId",
+                    joinModelOrderByField: "position",
+                    joinModelOrderDirection: "ASC"
+                ),
+                // Orders by a NULLABLE join field — exercises the D7 /
+                // Fork B rejection (a NULL order value has no stable
+                // cursor position).
+                "tagsByWeight": .hasManyThrough(
+                    model: "tags_rel",
+                    joinModel: "post_tag_links_rel",
+                    joinModelLocalField: "postId",
+                    joinModelRelatedField: "tagId",
+                    joinModelOrderByField: "weight",
+                    joinModelOrderDirection: "ASC"
+                ),
             ]
         ))
         tags = DynamicModel(doc: doc, schema: PrimitiveSchema(
@@ -69,9 +96,17 @@ final class RelationshipsRuntimeTests: XCTestCase {
         postTagLinks = DynamicModel(doc: doc, schema: PrimitiveSchema(
             name: "post_tag_links_rel",
             fields: [
-                "id":     FieldDescriptor(type: .id),
-                "postId": FieldDescriptor(type: .string, indexed: true),
-                "tagId":  FieldDescriptor(type: .string, indexed: true),
+                "id":       FieldDescriptor(type: .id),
+                "postId":   FieldDescriptor(type: .string, indexed: true),
+                "tagId":    FieldDescriptor(type: .string, indexed: true),
+                // `position` is REQUIRED (non-null) but non-unique — a
+                // valid pagination order field that can still hold tie
+                // values across a page boundary. A default (0) lets the
+                // many tests that don't care about ordering create links
+                // without spelling it out. `weight` is left nullable to
+                // drive the D7 rejection test.
+                "position": FieldDescriptor(type: .number, required: true, default: .scalar(.number(0))),
+                "weight":   FieldDescriptor(type: .number),
             ]
         ))
     }
@@ -226,14 +261,17 @@ final class RelationshipsRuntimeTests: XCTestCase {
         XCTAssertEqual(lazy.map(\.id), ["pB", "pC", "pA"])
     }
 
-    /// hasManyThrough join rows resolve in join-id order (the query
-    /// engine's deterministic `id ASC` default — same default js-bao's
-    /// generated accessor uses for `joinModelOrderByField`).
-    func testHasManyThroughOrderIsJoinIdAscending() throws {
+    /// hasManyThrough returns targets in **target `id ASC`** — matching
+    /// js-bao, where the join leg picks which rows/page but the final
+    /// `id: { $in: [...] }` query re-sorts the output by target `id ASC`
+    /// (relationshipManager.ts → `CursorManager.buildOrderClause`). The
+    /// declared join order governs selection, not the output order.
+    func testHasManyThroughOrderIsTargetIdAscending() throws {
         _ = try posts.create(id: "p1", values: ["title": .string("Post")])
         _ = try tags.create(id: "t1", values: ["name": .string("red")])
         _ = try tags.create(id: "t2", values: ["name": .string("blue")])
-        // Insert join rows out of id order.
+        // Insert join rows out of id order: the buggy join-row-order path
+        // would return [t2, t1]; the correct contract is target id ASC.
         _ = try postTagLinks.create(id: "l2", values: [
             "postId": .string("p1"), "tagId": .string("t1"),
         ])
@@ -245,8 +283,36 @@ final class RelationshipsRuntimeTests: XCTestCase {
         let result = try post.hasManyThrough(
             relationship: "tags", joinModel: postTagLinks, target: tags
         )
-        XCTAssertEqual(result.map(\.id), ["t2", "t1"],
-                       "targets resolve in join-row id order (l1 -> t2, l2 -> t1)")
+        XCTAssertEqual(result.map(\.id), ["t1", "t2"],
+                       "targets resolve in target id ASC, re-sorted by the $in query")
+    }
+
+    /// A DESC `joinModelOrderDirection` selects join rows in DESC of the
+    /// declared order field, but the target output is still **target
+    /// `id ASC`** — the `$in` re-sort overrides the join leg's direction,
+    /// exactly as js-bao does. This locks in that the join direction does
+    /// not leak into the final order.
+    func testHasManyThroughDescJoinDirectionStillReturnsTargetIdAscending() throws {
+        _ = try posts.create(id: "p1", values: ["title": .string("Post")])
+        _ = try tags.create(id: "t1", values: ["name": .string("red")])
+        _ = try tags.create(id: "t2", values: ["name": .string("blue")])
+        // position ASC would order the join leg t1-then-t2; with DESC the
+        // join leg is t2-then-t1 — yet the target output stays id ASC.
+        _ = try postTagLinks.create(id: "l1", values: [
+            "postId": .string("p1"), "tagId": .string("t1"),
+            "position": .number(1),
+        ])
+        _ = try postTagLinks.create(id: "l2", values: [
+            "postId": .string("p1"), "tagId": .string("t2"),
+            "position": .number(2),
+        ])
+
+        let post = posts.find(id: "p1")!
+        let result = try post.hasManyThrough(
+            relationship: "tagsByPositionDesc", joinModel: postTagLinks, target: tags
+        )
+        XCTAssertEqual(result.map(\.id), ["t1", "t2"],
+                       "DESC join leg selects t2-then-t1, but $in re-sorts to target id ASC")
     }
 
     // MARK: - hasManyThrough
@@ -281,6 +347,158 @@ final class RelationshipsRuntimeTests: XCTestCase {
             target: tags
         )
         XCTAssertEqual(result.count, 0)
+    }
+
+    // MARK: - hasManyThrough pagination (#1230, rerouted #1607)
+
+    /// Paginated dynamic-path `hasManyThrough`. The `tags` relationship
+    /// declares no join order, so the paginated overload defaults to
+    /// **join-model `id ASC`** and pages the join leg through the shared
+    /// composite-cursor engine. Cursors are now OPAQUE `String` tokens
+    /// (not raw join-row ids), so the test feeds them back verbatim rather
+    /// than asserting their bytes. Seeds six tags/links so `limit: 2`
+    /// yields three pages; walks forward, then steps back.
+    func testHasManyThroughPaginatesJoinLeg() throws {
+        _ = try posts.create(id: "p1", values: ["title": .string("Post")])
+        for i in 1...6 {
+            _ = try tags.create(id: "t\(i)", values: ["name": .string("n\(i)")])
+            _ = try postTagLinks.create(id: "l\(i)", values: [
+                "postId": .string("p1"), "tagId": .string("t\(i)"),
+            ])
+        }
+        let post = posts.find(id: "p1")!
+
+        func page(after: String? = nil, before: String? = nil,
+                  direction: CursorDirection = .forward) throws -> PagedQueryResult<PrimitiveRecord> {
+            try post.hasManyThrough(
+                relationship: "tags", joinModel: postTagLinks, target: tags,
+                limit: 2, afterCursor: after, beforeCursor: before, direction: direction
+            )
+        }
+
+        let p1 = try page()
+        XCTAssertEqual(p1.data.map(\.id), ["t1", "t2"])
+        XCTAssertNotNil(p1.nextCursor)
+        XCTAssertNil(p1.prevCursor, "first page has no prevCursor")
+        XCTAssertTrue(p1.hasMore)
+
+        let p2 = try page(after: p1.nextCursor)
+        XCTAssertEqual(p2.data.map(\.id), ["t3", "t4"])
+        XCTAssertNotNil(p2.nextCursor)
+        XCTAssertNotNil(p2.prevCursor)
+        XCTAssertTrue(p2.hasMore)
+
+        let p3 = try page(after: p2.nextCursor)
+        XCTAssertEqual(p3.data.map(\.id), ["t5", "t6"])
+        XCTAssertNil(p3.nextCursor, "last page has no nextCursor")
+        XCTAssertFalse(p3.hasMore)
+
+        // Backward from page 3's prevCursor returns page 2's rows in
+        // DECLARED order. `hasMore` tracks the BACKWARD paging direction
+        // (more earlier rows remain) — the over-fetch signal, not
+        // "nextCursor is present". Page 2 has page 1 before it → hasMore.
+        let back = try page(before: p3.prevCursor, direction: .backward)
+        XCTAssertEqual(back.data.map(\.id), ["t3", "t4"],
+                       "backward page returns rows in declared (ascending) order")
+        XCTAssertTrue(back.hasMore,
+                      "backward hasMore tracks earlier rows remaining, not nextCursor")
+    }
+
+    /// Straddling-tie regression (#1607, Swift analog of JS scenario8 /
+    /// scenario50). A join set whose order-field value repeats ACROSS a
+    /// page boundary must page with NO skips and NO duplicates. The old
+    /// hand-rolled raw-scalar cursor used the bare order value in a
+    /// `$gt`/`$lt` filter, so a tie straddling the boundary was either
+    /// skipped (`$gt`) or duplicated (`$lt`). Routing through the
+    /// composite `(position, id)` cursor fixes it.
+    func testHasManyThroughStraddlingTiePagesWithoutSkipOrDuplicate() throws {
+        _ = try posts.create(id: "p1", values: ["title": .string("Post")])
+        // positions: l1=1, l2=2, l3=2, l4=3, l5=3, l6=4 — ties at 2 (l2/l3)
+        // and 3 (l4/l5) straddle the limit-2 page boundaries.
+        let positions = [1, 2, 2, 3, 3, 4]
+        for i in 1...6 {
+            _ = try tags.create(id: "t\(i)", values: ["name": .string("n\(i)")])
+            _ = try postTagLinks.create(id: "l\(i)", values: [
+                "postId": .string("p1"), "tagId": .string("t\(i)"),
+                "position": .number(Double(positions[i - 1])),
+            ])
+        }
+        let post = posts.find(id: "p1")!
+
+        func page(after: String? = nil) throws -> PagedQueryResult<PrimitiveRecord> {
+            try post.hasManyThrough(
+                relationship: "tagsByPositionAsc",
+                joinModel: postTagLinks, target: tags,
+                limit: 2, afterCursor: after
+            )
+        }
+
+        // Walk every page forward, accumulating ids.
+        var seen: [String] = []
+        var cursor: String? = nil
+        var guardCount = 0
+        repeat {
+            let p = try page(after: cursor)
+            seen.append(contentsOf: p.data.map(\.id))
+            cursor = p.hasMore ? p.nextCursor : nil
+            guardCount += 1
+            XCTAssertLessThan(guardCount, 10, "pagination should terminate")
+        } while cursor != nil
+
+        XCTAssertEqual(seen.sorted(), ["t1", "t2", "t3", "t4", "t5", "t6"],
+                       "every row visited exactly once despite ties on the boundary")
+        XCTAssertEqual(seen.count, Set(seen).count, "no duplicate rows across pages")
+    }
+
+    /// A non-positive `limit` returns an empty page without querying
+    /// (#1230). The paginated accessor guards it before delegating.
+    func testHasManyThroughNonPositiveLimitReturnsEmptyPage() throws {
+        _ = try posts.create(id: "p1", values: ["title": .string("Post")])
+        for i in 1...3 {
+            _ = try tags.create(id: "t\(i)", values: ["name": .string("n\(i)")])
+            _ = try postTagLinks.create(id: "l\(i)", values: [
+                "postId": .string("p1"), "tagId": .string("t\(i)"),
+            ])
+        }
+        let post = posts.find(id: "p1")!
+
+        for badLimit in [0, -1, -5] {
+            let page = try post.hasManyThrough(
+                relationship: "tags", joinModel: postTagLinks, target: tags,
+                limit: badLimit
+            )
+            XCTAssertTrue(page.data.isEmpty, "limit=\(badLimit) should yield no rows")
+            XCTAssertNil(page.nextCursor)
+            XCTAssertNil(page.prevCursor)
+            XCTAssertFalse(page.hasMore)
+        }
+    }
+
+    /// D7 / Fork B (#1607, relaxed): a `hasManyThrough` whose join order
+    /// field is nullable/optional is now ACCEPTED (it warns rather than
+    /// throwing). The composite `(field, id)` cursor appends the `id`
+    /// tiebreaker, so a non-unique/not-`required` order field paginates
+    /// deterministically. `weight` is declared without `required: true`;
+    /// paging by it must succeed and return the linked tag. (A hard throw
+    /// here broke existing valid schemas that order by a non-required field —
+    /// see `warnIfOrderFieldNullable`.)
+    func testHasManyThroughNullableOrderFieldIsAccepted() throws {
+        _ = try posts.create(id: "p1", values: ["title": .string("Post")])
+        _ = try tags.create(id: "t1", values: ["name": .string("n1")])
+        _ = try postTagLinks.create(id: "l1", values: [
+            "postId": .string("p1"), "tagId": .string("t1"),
+            "position": .number(1), "weight": .number(1),
+        ])
+        let post = posts.find(id: "p1")!
+
+        let page = try post.hasManyThrough(
+            relationship: "tagsByWeight",
+            joinModel: postTagLinks, target: tags, limit: 2
+        )
+        XCTAssertEqual(
+            page.data.map { $0.id }, ["t1"],
+            "paging by a nullable order field should succeed and return the linked tag"
+        )
     }
 
     // MARK: - Error cases

@@ -1,10 +1,13 @@
 import XCTest
 @testable import JsBaoClient
 
-/// Live end-to-end test for `client.links` alias resolution (#931):
-/// create a document bound to an alias on the dev server, build the
-/// share URL with `links.shareURL`, and resolve it back to the
-/// document id through `GET /document-aliases/{scope}/{aliasKey}`.
+/// Live end-to-end test for `client.links` share links (#931):
+/// create a document on the dev server, build the share URL with
+/// `links.shareURL`, and resolve it back to the document id.
+///
+/// Alias-based share links were removed with app-scoped aliases (#1168):
+/// a user-scoped alias key carries no owner user id, so a recipient
+/// cannot resolve it — only concrete-id share links remain.
 final class LinksLiveTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -15,9 +18,6 @@ final class LinksLiveTests: XCTestCase {
         try await ctx.initialize()
         testApp = try await ctx.createTestApp(name: "swift-links")
 
-        // App-scoped aliases can only be created by app admins
-        // (document-aliases-controller: "Only admins can create
-        // app-scoped aliases"), so the test user is an admin.
         let user = try await ctx.createTestUser(
             appId: testApp.appId, role: "admin", email: "links-user@test.local"
         )
@@ -31,49 +31,41 @@ final class LinksLiveTests: XCTestCase {
         await ctx.cleanup()
     }
 
-    func testResolveAliasShareLinkEndToEnd() async throws {
-        let aliasKey = "spring-planning-\(UUID().uuidString.prefix(8).lowercased())"
-
-        // Create the document bound to an app-scoped alias.
+    func testDocumentShareLinkEndToEnd() async throws {
+        // `documents.create` returns only metadata; `createWithAlias`
+        // (user-scope) is the create variant that returns the id.
+        let aliasKey = "links-e2e-\(UUID().uuidString.prefix(8).lowercased())"
         let created = try await client.documents.createWithAlias(
             options: CreateWithAliasOptions(
                 title: "Links E2E Doc",
-                alias: AliasRef(scope: .app, aliasKey: aliasKey)
+                alias: AliasRef(scope: .user, aliasKey: aliasKey)
             )
         )
 
         // Build the share URL the way an app would.
         client.links.appBaseURL = URL(string: "https://links-e2e.example.com")
         let url = try XCTUnwrap(
-            client.links.shareURL(forDocument: created.documentId, alias: aliasKey)
+            client.links.shareURL(forDocument: created.documentId)
         )
         XCTAssertEqual(
             url.absoluteString,
-            "https://links-e2e.example.com/document/\(aliasKey)"
+            "https://links-e2e.example.com/document/\(created.documentId)"
         )
 
-        // Resolve it as if the OS handed the link to the app.
+        // Resolve it as if the OS handed the link to the app — purely,
+        // no server hop.
         let target = try await client.links.resolve(url: url)
         XCTAssertEqual(target, .document(id: created.documentId))
-
-        // The concrete-id share link resolves purely, no alias hop.
-        let idURL = try XCTUnwrap(
-            client.links.shareURL(forDocument: created.documentId)
-        )
-        let idTarget = try await client.links.resolve(url: idURL)
-        XCTAssertEqual(idTarget, .document(id: created.documentId))
     }
 
-    func testResolveUnknownAliasThrows() async throws {
+    func testNonUlidDocumentLinkIsUnknown() async throws {
+        // A `/document/{segment}` link whose segment is not a ULID is no
+        // longer treated as an alias (#1168) — it parses as `.unknown`.
         client.links.appBaseURL = URL(string: "https://links-e2e.example.com")
         let url = try XCTUnwrap(
             URL(string: "https://links-e2e.example.com/document/never-bound-alias")
         )
-        do {
-            _ = try await client.links.resolve(url: url)
-            XCTFail("expected aliasNotFound")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .aliasNotFound)
-        }
+        let target = try await client.links.resolve(url: url)
+        XCTAssertEqual(target, .unknown(url))
     }
 }

@@ -8,7 +8,7 @@ import Foundation
 /// batched FK lookup.
 public protocol IncludeTarget: AnyObject {
     var modelName: String { get }
-    func query(_ filter: DocumentFilter?, options: QueryOptions?) -> [[String: Any]]
+    func query(_ filter: DocumentFilter?, options: QueryOptions?) throws -> [[String: Any]]
 }
 
 extension DynamicModel: IncludeTarget {}
@@ -193,7 +193,7 @@ enum IncludeResolver {
         if let extra = spec.filter {
             for (k, v) in extra { filter[k] = v }
         }
-        let relatedRows = spec.target.query(
+        let relatedRows = try spec.target.query(
             filter,
             options: spec.projection.map { QueryOptions(projection: $0) }
         )
@@ -265,7 +265,7 @@ enum IncludeResolver {
             }
             return nil
         }()
-        let targetRows = spec.target.query(filter, options: targetOptions)
+        let targetRows = try spec.target.query(filter, options: targetOptions)
 
         // Build both a lookup (for O(1) membership) and preserve the
         // sorted order by walking `targetRows` directly.
@@ -333,7 +333,7 @@ enum IncludeResolver {
             projection: spec.projection, fkField: fkField
         )
         let opts = QueryOptions(sort: spec.sort, projection: queryProjection)
-        let allRelated = spec.target.query(filter, options: opts)
+        let allRelated = try spec.target.query(filter, options: opts)
 
         var grouped: [String: [[String: Any]]] = [:]
         for r in allRelated {

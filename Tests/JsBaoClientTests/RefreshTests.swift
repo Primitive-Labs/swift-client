@@ -116,13 +116,17 @@ final class RefreshTests: XCTestCase {
         let dbPath = tempDir + "auth.sqlite"
         let namespace = testApp.appId
 
-        // 1. Forge a refresh JWT for the app owner. The existing owner access
-        // token already has the right payload; we only need to flip its
-        // `type` to "refresh" and re-sign with the dev-server test secret.
-        // This avoids any server-side test helper — see feedback doc
-        // 2026-04-21 for the upstream ask to return a refresh token from
-        // `mint-test-jwt`.
-        let refreshToken = try ctx.forgeRefreshJwt(fromAccessToken: testApp.ownerJWT)
+        // 1. Get a refresh JWT for the app owner from the server. The
+        // `mint-test-jwt` admin endpoint (test-features-gated) mints it via the
+        // real login path (`createSession`), signed with the server's own
+        // `JWT_SECRET`. This replaces the previous client-side forge, which
+        // re-signed with a guessed secret (`TestConfig.jwtSecret`) and 401'd on
+        // /auth/refresh whenever that secret didn't match the server's — the
+        // pre-existing nightly failure this test now avoids.
+        let refreshToken = try await ctx.mintRefreshToken(
+            appId: testApp.appId,
+            userId: testApp.ownerUserId
+        )
 
         // 2. Install the refresh token as an `rt-{appId}` cookie — the state
         // URLSession would have been in after a prior successful login.

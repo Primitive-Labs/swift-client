@@ -162,6 +162,121 @@ public final class WorkflowsAPI: @unchecked Sendable {
         return try JSONCoding.decode(WorkflowStatusResult.self, from: result)
     }
 
+    // MARK: - Typed generic overloads (#1547)
+    //
+    // The published SDK surface for the CLI-generated typed workflow invoker
+    // (`primitive workflows codegen --lang swift`). The generated per-workflow
+    // factory binds `<Key>Input`/`<Key>Output` over these; only THESE overloads
+    // are library surface (the generated invoker structs are app-target code).
+    // Each delegates to the untyped method above — encoding the `Codable` input
+    // into the opaque `rootInput` object and decoding the opaque `output` blob
+    // into `Output` — so no request/response behavior diverges from the untyped
+    // path. `input` is optional so an omitted input sends `{}` (parity with the
+    // JS client's `input ?? {}`).
+
+    /// Synchronously run a workflow with a typed `Codable` input and a typed
+    /// `Output`. Mirrors the JS `runSync<I, O>`. Returns a `RunSyncResult<Output>`
+    /// whose `output` is decoded into `Output`; only transport errors throw.
+    public func runSync<Input: Encodable, Output: Decodable & Sendable>(
+        workflowKey: String,
+        input: Input?,
+        runKey: String? = nil,
+        contextDocId: String? = nil,
+        meta: [String: Any]? = nil,
+        timeoutMs: Int? = nil
+    ) async throws -> RunSyncResult<Output> {
+        let encoded = try Self.encodeInputObject(input)
+        let untyped = try await runSync(
+            workflowKey: workflowKey,
+            input: encoded,
+            runKey: runKey,
+            contextDocId: contextDocId,
+            meta: meta,
+            timeoutMs: timeoutMs
+        )
+        return RunSyncResult(
+            runId: untyped.runId,
+            runKey: untyped.runKey,
+            status: untyped.status,
+            output: try Self.decodeTypedOutput(untyped.output),
+            error: untyped.error,
+            run: untyped.run,
+            existing: untyped.existing
+        )
+    }
+
+    /// Start a workflow with a typed `Codable` input. Mirrors the JS
+    /// `start<I>` — the start result (`StartWorkflowResult`) is not output-typed
+    /// on either client, so only the input is generic here.
+    @discardableResult
+    public func start<Input: Encodable>(
+        workflowKey: String,
+        input: Input?,
+        runKey: String? = nil,
+        contextDocId: String? = nil,
+        meta: [String: Any]? = nil,
+        forceRerun: Bool? = nil
+    ) async throws -> StartWorkflowResult {
+        let encoded = try Self.encodeInputObject(input)
+        let options = StartWorkflowOptions(
+            workflowKey: workflowKey,
+            input: encoded,
+            runKey: runKey,
+            contextDocId: contextDocId,
+            meta: meta,
+            forceRerun: forceRerun
+        )
+        return try await start(
+            workflowKey: workflowKey,
+            input: encoded,
+            options: options
+        )
+    }
+
+    /// Fetch a run's status with a typed `output` bound to `Output`. Mirrors the
+    /// JS `getStatus<O>`. Returns a `WorkflowStatus<Output>` whose `output` is
+    /// decoded into `Output`.
+    public func getStatus<Output: Decodable & Sendable>(
+        workflowKey: String,
+        runKey: String,
+        contextDocId: String? = nil
+    ) async throws -> WorkflowStatus<Output> {
+        let untyped = try await getStatus(
+            workflowKey: workflowKey,
+            runKey: runKey,
+            contextDocId: contextDocId
+        )
+        return WorkflowStatus(
+            status: untyped.status,
+            output: try Self.decodeTypedOutput(untyped.output),
+            error: untyped.error,
+            run: untyped.run
+        )
+    }
+
+    /// Encode a typed `Codable` input into the `[String: Any]` object the
+    /// server takes as `rootInput`. A `nil` input (optional-input workflow with
+    /// no argument) sends `{}`; a non-object encoding also falls back to `{}`
+    /// (the server's `rootInput` is always an object), matching the untyped
+    /// `input: [String: Any] = [:]` contract.
+    private static func encodeInputObject<Input: Encodable>(
+        _ input: Input?
+    ) throws -> [String: Any] {
+        guard let input else { return [:] }
+        let any = try JSONCoding.jsonObject(from: input)
+        return (any as? [String: Any]) ?? [:]
+    }
+
+    /// Decode the opaque `output` blob into the typed `Output`. An absent or
+    /// `.null` output maps to `nil` (no typed output to surface).
+    private static func decodeTypedOutput<Output: Decodable>(
+        _ value: JSONValue?
+    ) throws -> Output? {
+        guard let value, !value.isNull else { return nil }
+        let any = try JSONCoding.jsonObject(from: value)
+        return try JSONCoding.decode(Output.self, from: any)
+    }
+
     /// Terminates a running workflow.
     ///
     /// - Parameter contextDocId: optional doc-scope for the terminate

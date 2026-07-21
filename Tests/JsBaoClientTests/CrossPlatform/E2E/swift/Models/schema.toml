@@ -146,6 +146,21 @@ order_by_field = "createdAt"
 # separate issue — TOML's lowercase convention should round-trip.)
 order_direction = "ASC"
 
+# Order-less hasMany — declares NO order_by_field / order_direction.
+# Regression guard for #1160: an order-less hasMany must resolve to a
+# globally `id`-ascending list on BOTH clients. JS defaults
+# orderByField="id"/orderDirection="ASC" in
+# relationshipManager.ts:51-52 (sort `{ id: 1 }`); Swift's query engine
+# appends `id ASC` in resolveSort (BaoModelQueryEngine.swift:787-792),
+# always emitted by buildSelectSQL (:879). This is an existing
+# guarantee — the parity tests lock it in, they are not a fix.
+# Reuses the `posts` model so no new model/field is needed; differs
+# from `posts` above only in declaring no order.
+[models.users.relationships.postsUnordered]
+type = "hasMany"
+model = "posts"
+related_id_field = "userId"
+
 [models.posts]
 class_name = "Post"
 [models.posts.fields.id]
@@ -155,8 +170,13 @@ type = "string"
 required = true
 [models.posts.fields.userId]
 type = "string"
+# REQUIRED (non-null): the `users.posts` hasMany above orders by this field,
+# and the D7 / Fork B guard (#1607) rejects a nullable relationship order
+# field on both clients at model-registration time. A non-null order field
+# is required for stable cursor pagination.
 [models.posts.fields.createdAt]
 type = "string"
+required = true
 
 [models.posts.relationships.author]
 type = "refersTo"
@@ -169,6 +189,11 @@ model = "tags"
 join_model = "post_tag_links"
 join_model_local_field = "postId"
 join_model_related_field = "tagId"
+# Declares a join-leg order (#1201). Both clients sort the join rows by
+# `position`, then resolve targets via `id: { $in: [...] }` — whose `id ASC`
+# tiebreaker makes the OUTPUT order target `id ASC` on both sides. The
+# declared order governs which join rows are selected, not the final order.
+join_model_order_by_field = "position"
 
 [models.tags]
 class_name = "Tag"
@@ -185,4 +210,46 @@ type = "id"
 [models.post_tag_links.fields.postId]
 type = "string"
 [models.post_tag_links.fields.tagId]
+type = "string"
+# Join-leg order field for `posts.tags` (#1201). REQUIRED (non-null): the
+# D7 / Fork B guard (#1607) rejects a nullable relationship order field on
+# both clients at definition time, so a paginated join order MUST be a
+# required field. It can still hold non-unique (tie) values across a page
+# boundary — the composite `(position, id)` cursor handles those.
+[models.post_tag_links.fields.position]
+type = "number"
+required = true
+
+# A second hasManyThrough on `posts`, to a DISTINCT target (`labels`) via a
+# distinct join model (`post_label_links`) with NO declared join order — so
+# both clients default the join sort to join-model `id ASC` (#1230). Used by
+# the cross-language pagination parity test to exercise a join ordered by the
+# string `id` field. The `posts.tags` relationship above orders by the numeric
+# `position` field. Cursors are now the shared engine's OPAQUE composite
+# `(field, id)` tokens (#1607), so both branches prove the SAME thing: a token
+# minted on one client decodes and resolves the same page on the other. A
+# distinct target is required because the JS codegen refuses two hasManyThrough
+# on one model that target the same class (duplicate add/remove mutators).
+[models.posts.relationships.labels]
+type = "hasManyThrough"
+model = "labels"
+join_model = "post_label_links"
+join_model_local_field = "postId"
+join_model_related_field = "labelId"
+
+[models.labels]
+class_name = "Label"
+[models.labels.fields.id]
+type = "id"
+[models.labels.fields.name]
+type = "string"
+required = true
+
+[models.post_label_links]
+class_name = "PostLabelLink"
+[models.post_label_links.fields.id]
+type = "id"
+[models.post_label_links.fields.postId]
+type = "string"
+[models.post_label_links.fields.labelId]
 type = "string"

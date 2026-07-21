@@ -43,15 +43,15 @@ final class TypedModel<T: PrimitiveModel> {
     func delete(id: String) { dynamic.delete(id: id) }
     func delete(_ id: String) { delete(id: id) }
 
-    func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [T] {
-        dynamic.query(filter, options: options).compactMap { row in
+    func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [T] {
+        try dynamic.query(filter, options: options).compactMap { row in
             guard let id = row["id"] as? String else { return nil }
             return find(id: id)
         }
     }
 
-    func queryOne(_ filter: DocumentFilter? = nil) -> T? {
-        query(filter, options: QueryOptions(limit: 1)).first
+    func queryOne(_ filter: DocumentFilter? = nil) throws -> T? {
+        try query(filter, options: QueryOptions(limit: 1)).first
     }
 
     func update(_ id: String, _ updates: [String: Any]) {

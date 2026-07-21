@@ -33,6 +33,25 @@ final class GroupsTests: XCTestCase {
         XCTAssertEqual(result.name, "Swift Test Group")
     }
 
+    func testCreateGroupWithoutGroupIdGetsServerAssignedId() async throws {
+        // Issue #1353 — `groupId` is optional; the server assigns a ULID.
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+
+        let result = try await client.groups.create(params: CreateGroupParams(
+            groupType: "team",
+            name: "Swift Auto-ID Group"
+        ))
+
+        XCTAssertEqual(result.name, "Swift Auto-ID Group")
+        // ULID: 26 chars, Crockford base32.
+        XCTAssertEqual(result.groupId.count, 26, "Server-assigned groupId should be a ULID")
+
+        // The group is fetchable via the returned ID.
+        let fetched = try await client.groups.get(groupType: "team", groupId: result.groupId)
+        XCTAssertEqual(fetched.groupId, result.groupId)
+    }
+
     // MARK: - Add/Remove Member
 
     func testAddRemoveMember() async throws {

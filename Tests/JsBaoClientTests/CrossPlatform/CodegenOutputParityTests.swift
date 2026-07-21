@@ -56,6 +56,8 @@ final class CodegenOutputParityTests: XCTestCase {
         ("posts",          "Post"),
         ("tags",           "Tag"),
         ("post_tag_links", "PostTagLink"),
+        ("labels",           "Label"),
+        ("post_label_links", "PostLabelLink"),
     ]
 
     /// Per-model field set that should be present on BOTH sides.
@@ -68,7 +70,9 @@ final class CodegenOutputParityTests: XCTestCase {
         "users":          ["id", "name"],
         "posts":          ["id", "title", "userId", "createdAt"],
         "tags":           ["id", "name"],
-        "post_tag_links": ["id", "postId", "tagId"],
+        "post_tag_links": ["id", "postId", "tagId", "position"],
+        "labels":           ["id", "name"],
+        "post_label_links": ["id", "postId", "labelId"],
     ]
 
     /// Per-model relationship names that should appear on BOTH sides.
@@ -77,11 +81,33 @@ final class CodegenOutputParityTests: XCTestCase {
     private static let expectedRelationships: [String: Set<String>] = [
         "tasks":          [],
         "everything":     [],
-        "users":          ["posts"],
-        "posts":          ["author", "tags"],
+        "users":          ["posts", "postsUnordered"],
+        "posts":          ["author", "tags", "labels"],
         "tags":           [],
         "post_tag_links": [],
+        "labels":           [],
+        "post_label_links": [],
     ]
+
+    // MARK: - Harness preflight
+
+    /// Touch this suite's external dependencies before any assertion runs
+    /// so a missing tool registers as a **skip**, not a failure. An
+    /// `XCTSkip` thrown from inside an `XCTAssert*` / `XCTUnwrap` autoclosure
+    /// is caught and reported as a failure; thrown from `setUpWithError` it
+    /// registers correctly as a skip.
+    ///
+    /// This class needs only Node and the two codegen binaries
+    /// (`SwiftBaoCodegen`, `js-bao-codegen-v2`) — NOT `vite-node` or the
+    /// `E2EMiniApp` runtime binary that `E2EQueryParityTests` uses. Keeping
+    /// the preflight per-class means a missing E2E binary doesn't over-skip
+    /// codegen parity.
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        _ = try locateSwiftCodegenBinary()
+        _ = try CrossPlatformHarness.nodePath()
+        _ = try locateTsCodegenBinary()
+    }
 
     // MARK: - The single big test
 

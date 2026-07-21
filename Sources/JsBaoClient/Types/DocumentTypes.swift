@@ -11,9 +11,10 @@ import YSwift
 
 // MARK: Aliases
 
-/// Whether a document alias is global to the app or scoped to one user.
+/// Document alias scope. Only `.user` is supported — app-scoped aliases were
+/// removed in #1168 (they conferred no access and named a document every caller
+/// had to already be permitted to open).
 public enum DocumentAliasScope: String, Codable, Sendable {
-    case app
     case user
 }
 
@@ -86,12 +87,24 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// Opaque, round-tripped metadata blob (≤ 4 KB). The platform does not
     /// introspect it; the shape is the caller's to define.
     public let metadata: JSONValue?
+    /// How the caller's effective permission was obtained. Only the
+    /// single-document GET populates this; `nil` on list entries.
+    public let accessSource: DocumentAccessSource?
+    /// The document's "anyone with the link" access level, or `nil` when link
+    /// access is off. Visible to everyone who can open the document.
+    ///
+    /// To read this for a document you can *manage* but not read (an app owner
+    /// inspecting a member's private document), use
+    /// `documents.getLinkAccess(documentId:)` — the document GET is gated on
+    /// content access and would fail.
+    public let linkAccess: DocumentLinkAccessLevel?
 
     private enum CodingKeys: String, CodingKey {
         case documentId, title, createdBy, createdAt
         case lastModified, modifiedAt
         case permission, invitationAccepted, upgradedFromPermission
         case grantedAt, tags, thumbnailBlobId, metadata
+        case accessSource, linkAccess
     }
 
     public init(from decoder: Decoder) throws {
@@ -109,6 +122,8 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         tags = try c.decodeIfPresent([String].self, forKey: .tags)
         thumbnailBlobId = try c.decodeIfPresent(String.self, forKey: .thumbnailBlobId)
         metadata = try c.decodeIfPresent(JSONValue.self, forKey: .metadata)
+        accessSource = try c.decodeIfPresent(DocumentAccessSource.self, forKey: .accessSource)
+        linkAccess = try c.decodeIfPresent(DocumentLinkAccessLevel.self, forKey: .linkAccess)
     }
 }
 
@@ -400,6 +415,43 @@ public enum DocumentPermissionTarget: Sendable, ExpressibleByStringLiteral {
     case userId(String)
     case email(String)
     public init(stringLiteral value: String) { self = .userId(value) }
+}
+
+// MARK: Link access ("anyone with the link")
+
+/// The level an "anyone with the link" share confers. Mirrors js-bao's
+/// `"reader" | "read-write"` union on `documents.setLinkAccess`. A deliberate
+/// subset of `DocumentPermission`: link access can never confer `owner` or
+/// `admin`.
+public enum DocumentLinkAccessLevel: String, Codable, Sendable {
+    case reader
+    case readWrite = "read-write"
+}
+
+/// How the caller's effective permission on a document was obtained. Mirrors
+/// js-bao's `DocumentInfo.accessSource`. `.link` means the level came from the
+/// document's "anyone with the link" access floor rather than an explicit
+/// grant — a link-opened document does NOT appear in `me/shared-documents`, so
+/// an app that wants a "get back to it" affordance must track it itself.
+public enum DocumentAccessSource: String, Codable, Sendable {
+    case owner
+    case grant
+    case group
+    case link
+}
+
+/// Result of `documents.setLinkAccess` / `clearLinkAccess` / `getLinkAccess`.
+/// Mirrors js-bao's `LinkAccessResult`. `linkAccess` is `nil` when link access
+/// is off — which is what `clearLinkAccess` always returns.
+///
+/// `linkAccessUpdatedBy` / `linkAccessUpdatedAt` are absent for a document
+/// whose link access has never been set, and the server's clear response omits
+/// them too, so both stay optional.
+public struct LinkAccessResult: Decodable, Sendable, Equatable {
+    public let documentId: String
+    public let linkAccess: DocumentLinkAccessLevel?
+    public let linkAccessUpdatedBy: String?
+    public let linkAccessUpdatedAt: String?
 }
 
 /// A user's permission entry on a document.

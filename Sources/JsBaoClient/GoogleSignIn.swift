@@ -242,7 +242,7 @@ extension JsBaoClient {
         )
 
         // 4. Exchange the code. This applies the session token (cause
-        //    "oauth"), emits .authSuccess/.authState, and reconnects the
+        //    "google"), emits .authSuccess/.authState, and reconnects the
         //    WebSocket per the JS oauth:callback sequencing.
         let (code, state) = try GoogleSignInHelpers.parseOAuthCallback(url: callbackUrl)
         let response = try await handleOAuthCallback(code: code, state: state)

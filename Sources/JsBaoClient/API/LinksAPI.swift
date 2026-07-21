@@ -27,13 +27,14 @@ public enum LinkTarget: Sendable, Equatable {
     /// A document share link carrying a concrete document id
     /// (26-char ULID, the server's id format —
     /// `src/app-api/services/document-service.ts:59`).
+    ///
+    /// A `/document/{segment}` link whose trailing segment is not a ULID
+    /// parses as `.unknown`: alias-based share links were built on
+    /// app-scoped aliases, which were removed in #1168. A user-scoped
+    /// alias is keyed to its owner, and a share URL carries no owner user
+    /// id, so a recipient would resolve the key against their *own*
+    /// aliases — the wrong document, or none.
     case document(id: String)
-    /// A document share link whose trailing segment is not a ULID —
-    /// treated as an app-scoped document alias key. `resolve(url:)`
-    /// resolves this to `.document` via the server
-    /// (`GET /document-aliases/{scope}/{aliasKey}`); `parse(url:)`
-    /// returns it unresolved for offline/pure use.
-    case documentAlias(AliasRef)
     /// An invitation accept link. Feed the token to
     /// `client.invitations.accept(inviteToken:)`.
     case invitation(token: String)
@@ -59,7 +60,7 @@ public enum LinkTarget: Sendable, Equatable {
 /// case .document(let id): openEditor(id)
 /// case .invitation(let token): try await client.invitations.accept(inviteToken: token)
 /// case .magicLink(let token, _): try await verifyMagicLink(token)
-/// case .documentAlias, .unknown: fallBackToOwnRouting()
+/// case .unknown: fallBackToOwnRouting()
 /// }
 ///
 /// // Outgoing share link
@@ -79,7 +80,6 @@ public enum LinkTarget: Sendable, Equatable {
 /// > domain-ownership problem tracked for passkey `webcredentials` in
 /// > Primitive-Labs/js-bao-wss#1130; universal links need the same answer.
 public final class LinksAPI: @unchecked Sendable {
-    private let aliases: DocumentAliasesAPI
     private let lock = NSLock()
     private var _appBaseURL: URL?
 
@@ -122,17 +122,13 @@ public final class LinksAPI: @unchecked Sendable {
         pattern: "^[0-9A-HJKMNP-TV-Z]{26}$"
     )
 
-    public init(aliases: DocumentAliasesAPI, appBaseURL: URL? = nil) {
-        self.aliases = aliases
+    public init(appBaseURL: URL? = nil) {
         self._appBaseURL = appBaseURL
     }
 
     // MARK: - Parsing (pure)
 
     /// Parse a URL into a `LinkTarget` without any network access.
-    /// Alias share links come back as `.documentAlias` — use
-    /// `resolve(url:)` to have them resolved to `.document` via the
-    /// server.
     ///
     /// Both `https://` universal links and custom-scheme links
     /// (`myapp://document/abc` or `myapp:///document/abc`) are
@@ -171,43 +167,31 @@ public final class LinksAPI: @unchecked Sendable {
             )
         }
 
-        // 3. Document share link: `{base}/document/{id-or-alias}`
-        //    (sample-app ShareDialog.tsx:130-132). ULID → concrete id,
-        //    anything else → app-scoped alias key.
+        // 3. Document share link: `{base}/document/{id}`
+        //    (sample-app ShareDialog.tsx:130-132). Only a concrete ULID is a
+        //    document target: alias share links were an app-scope feature
+        //    removed in #1168, and a user-scoped alias key without its owner's
+        //    user id cannot be resolved cross-user (see `LinkTarget.document`).
         let components = pathSegments(of: url)
         if components.count >= 2,
            components[components.count - 2] == "document" {
             let segment = components[components.count - 1]
-            if !segment.isEmpty {
-                if Self.isUlid(segment) {
-                    return .document(id: segment)
-                }
-                return .documentAlias(AliasRef(scope: .app, aliasKey: segment))
+            if !segment.isEmpty, Self.isUlid(segment) {
+                return .document(id: segment)
             }
         }
 
         return .unknown(url)
     }
 
-    // MARK: - Resolution (server-assisted where needed)
+    // MARK: - Resolution
 
-    /// Resolve an incoming URL to a routing target. Pure parse where
-    /// possible; document-alias links are resolved to a concrete
-    /// `.document(id:)` via `GET /document-aliases/{scope}/{aliasKey}`
-    /// (requires the client to be authenticated). Throws
-    /// `JsBaoError(.aliasNotFound)` when the alias does not resolve.
+    /// Resolve an incoming URL to a routing target. Since alias share
+    /// links were removed (#1168) every target parses purely — this is
+    /// now equivalent to `parse(url:)`. The `async throws` signature is
+    /// kept so existing `try await` call sites stay source-compatible.
     public func resolve(url: URL) async throws -> LinkTarget {
-        let target = parse(url: url)
-        guard case .documentAlias(let ref) = target else {
-            return target
-        }
-        guard let info = try await aliases.resolve(ref) else {
-            throw JsBaoError(
-                code: .aliasNotFound,
-                message: "Alias `\(ref.aliasKey)` did not resolve to a document"
-            )
-        }
-        return .document(id: info.documentId)
+        return parse(url: url)
     }
 
     #if canImport(ObjectiveC)
@@ -231,17 +215,16 @@ public final class LinksAPI: @unchecked Sendable {
 
     /// Build a document share URL: `{appBaseURL}/document/{documentId}`,
     /// matching the share link the reference web app copies to the
-    /// clipboard (sample-app `ShareDialog.tsx:130-132`). When `alias` is
-    /// provided the alias key is used as the path segment instead of the
-    /// id, producing a stable vanity link that `resolve(url:)` resolves
-    /// back to the document via the server.
+    /// clipboard (sample-app `ShareDialog.tsx:130-132`).
+    ///
+    /// The former `alias:` variant was removed with app-scoped aliases
+    /// (#1168): a user-scoped alias key is meaningless to a recipient,
+    /// so an alias-based link cannot work as a share URL.
     ///
     /// Returns `nil` until `appBaseURL` is configured.
-    public func shareURL(forDocument documentId: String, alias: String? = nil) -> URL? {
-        guard let base = appBaseURL else { return nil }
-        let segment = alias ?? documentId
-        guard !segment.isEmpty else { return nil }
-        let encoded = encodePathSegment(segment)
+    public func shareURL(forDocument documentId: String) -> URL? {
+        guard let base = appBaseURL, !documentId.isEmpty else { return nil }
+        let encoded = encodePathSegment(documentId)
         return URL(string: "\(normalizedBase(base))/document/\(encoded)")
     }
 

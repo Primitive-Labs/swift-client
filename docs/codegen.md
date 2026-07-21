@@ -1241,8 +1241,13 @@ fixture or the emitter:
 ```sh
 swift run swift-bao-codegen \
   --input  Tests/JsBaoClientTests/Schema/CodegenAcceptance/fixture.toml \
-  --output Tests/JsBaoClientTests/Schema/CodegenAcceptance/Generated
+  --output Tests/JsBaoClientTests/Schema/CodegenAcceptance/Generated \
+  --access internal
 ```
+
+`--access internal` matches how the `JsBaoCodegenPlugin` emits (and how these
+goldens are committed); the CLI otherwise defaults to `--access public` and the
+regen would flip every declaration's access modifier.
 
 A second guarantee falls out of this layout: if `JsBaoClient`'s public
 API changes in a way that breaks generated code, the test target

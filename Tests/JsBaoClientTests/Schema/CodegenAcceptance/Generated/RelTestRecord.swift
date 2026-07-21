@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
+internal struct RelTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
     internal static let modelName = "relTest"
     internal static let primitiveSchema = PrimitiveSchema(
         name: "relTest",
@@ -24,6 +24,8 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
     internal var taskId: String?
     internal var profileId: String?
 
+    internal var related: RelatedRecords = .empty
+
     /// `true` when the caller pinned `id` via the designated
     /// initializer; `false` when it was auto-generated. Drives the
     /// explicit-id-conflict check on `save(in:upsertOn:)` /
@@ -39,6 +41,7 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.id = id
         self.taskId = taskId
         self.profileId = profileId
+        self.related = .empty
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -53,6 +56,7 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.id = PrimitiveSchemaRegistry.newId()
         self.taskId = taskId
         self.profileId = profileId
+        self.related = .empty
         self._explicitId = false
     }
 
@@ -60,6 +64,7 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.id = record.id
         self.taskId = record["taskId"]?.asString
         self.profileId = record["profileId"]?.asString
+        self.related = .empty
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
@@ -69,6 +74,7 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.id = id
         self.taskId = row["taskId"] as? String
         self.profileId = row["profileId"] as? String
+        self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
     }
 
     internal func primitiveValues() -> [String: PrimitiveValue] {
@@ -99,8 +105,8 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
     /// across all open documents, applying any emitted
     /// `order_by_field` / `order_direction`. Mirrors the JS
     /// `profile()` instance accessor.
-    internal func profile() async throws -> [UserProfileRecord] {
-        JsBaoClient.requireDefault()
+    internal func profile() throws -> [UserProfileRecord] {
+        try JsBaoClient.requireDefault()
             .hasManyShared(
                 target: UserProfileRecord.primitiveSchema,
                 relatedIdField: "ownerId",
@@ -111,22 +117,79 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
             .compactMap { UserProfileRecord(row: $0) }
     }
 
+    /// Typed query-time include payload for `profile`, when present in `related`.
+    internal var relatedProfile: [UserProfileRecord] {
+        if related.contains("profile") {
+            return related.many("profile", as: UserProfileRecord.self)
+        }
+        return related.many(UserProfileRecord.modelName, as: UserProfileRecord.self)
+    }
+
+    /// Build a query-time include for `profile`.
+    internal static func includeProfile(
+        filter: DocumentFilter? = nil,
+        sort: [String: Int]? = ["displayName": 1],
+        limit: Int? = nil,
+        projection: [String: Int]? = nil,
+        resultKey: String? = "profile",
+        include: [Include]? = nil
+    ) -> Include {
+        Include(
+            type: .hasMany,
+            target: JsBaoClient.requireDefault().includeTarget(for: UserProfileRecord.primitiveSchema),
+            foreignKey: "ownerId",
+            localField: "id",
+            filter: filter,
+            sort: sort,
+            limit: limit,
+            projection: projection,
+            resultKey: resultKey,
+            include: include
+        )
+    }
+
     /// Follow the `task` relationship (refersTo → `tasks`):
     /// resolve the `TaskRecord` this record's `taskId` points at, across
     /// all open documents. Returns `nil` when the foreign key is unset
     /// or points at a missing record. Mirrors the JS `task()`
     /// instance accessor.
-    internal func task() async throws -> TaskRecord? {
+    internal func task() throws -> TaskRecord? {
         JsBaoClient.requireDefault()
             .refersToShared(target: TaskRecord.primitiveSchema, foreignKey: taskId)
             .flatMap { TaskRecord(row: $0) }
     }
 
+    /// Typed query-time include payload for `task`, when present in `related`.
+    internal var relatedTask: TaskRecord? {
+        related.one("task", as: TaskRecord.self)
+            ?? related.one(TaskRecord.modelName, as: TaskRecord.self)
+    }
+
+    /// Build a query-time include for `task`.
+    internal static func includeTask(
+        filter: DocumentFilter? = nil,
+        projection: [String: Int]? = nil,
+        resultKey: String? = "task",
+        include: [Include]? = nil
+    ) -> Include {
+        Include(
+            type: .refersTo,
+            target: JsBaoClient.requireDefault().includeTarget(for: TaskRecord.primitiveSchema),
+            sourceField: "taskId",
+            filter: filter,
+            projection: projection,
+            resultKey: resultKey,
+            include: include
+        )
+    }
+
     /// Follow the `viaJoin` relationship (hasManyThrough → `user_profile`)
-    /// via the `barebones` join model, across all open documents.
-    /// Mirrors the JS `viaJoin()` instance accessor.
-    internal func viaJoin() async throws -> [UserProfileRecord] {
-        JsBaoClient.requireDefault()
+    /// via the `barebones` join model, across all open documents,
+    /// applying any emitted `join_model_order_by_field` /
+    /// `join_model_order_direction` to the join leg. Mirrors the JS
+    /// `viaJoin()` instance accessor.
+    internal func viaJoin() throws -> [UserProfileRecord] {
+        try JsBaoClient.requireDefault()
             .hasManyThroughShared(
                 target: UserProfileRecord.primitiveSchema,
                 joinModel: BareBonesRecord.primitiveSchema,
@@ -135,6 +198,52 @@ internal struct RelTestRecord: PrimitiveModel, Equatable, Hashable, Codable {
                 joinModelRelatedField: "id"
             )
             .compactMap { UserProfileRecord(row: $0) }
+    }
+
+    /// Paginated `viaJoin` — pages the `barebones` join leg by its
+    /// declared order (default `id ASC`) through the shared
+    /// composite-cursor engine, then `$in`-resolves the page against
+    /// `user_profile`. The cursor is the engine's opaque `String`
+    /// token (a composite `(field, id)` cursor), so it round-trips
+    /// through the same decoder as the JS client; `limit:` is required
+    /// so the bare `viaJoin()` overload above still binds. Mirrors the
+    /// JS `viaJoin({ limit, afterCursor, beforeCursor, direction })`
+    /// paginated accessor. `hasMore` is the over-fetch signal for more
+    /// rows in the current paging direction.
+    internal func viaJoin(
+        limit: Int,
+        afterCursor: String? = nil,
+        beforeCursor: String? = nil,
+        direction: CursorDirection = .forward
+    ) throws -> PagedQueryResult<UserProfileRecord> {
+        let page = try JsBaoClient.requireDefault()
+            .hasManyThroughShared(
+                target: UserProfileRecord.primitiveSchema,
+                joinModel: BareBonesRecord.primitiveSchema,
+                sourceId: id,
+                joinModelLocalField: "id",
+                joinModelRelatedField: "id",
+                limit: limit,
+                afterCursor: afterCursor,
+                beforeCursor: beforeCursor,
+                direction: direction
+            )
+        return PagedQueryResult(
+            data: page.data.compactMap { UserProfileRecord(row: $0) },
+            nextCursor: page.nextCursor,
+            prevCursor: page.prevCursor,
+            hasMore: page.hasMore
+        )
+    }
+
+    /// Typed query-time include payload for `viaJoin`, when present in `related`.
+    /// Query-time includes do not yet build `hasManyThrough` payloads, so
+    /// this is populated only if `_related["viaJoin"]` was attached manually.
+    internal var relatedViaJoin: [UserProfileRecord] {
+        if related.contains("viaJoin") {
+            return related.many("viaJoin", as: UserProfileRecord.self)
+        }
+        return related.many(UserProfileRecord.modelName, as: UserProfileRecord.self)
     }
 }
 
@@ -148,9 +257,18 @@ internal extension RelTestRecord {
 
     /// Query across all open documents. Rows that fail to decode (schema
     /// drift) are skipped. Scope to one/some docs via `options.documents`.
-    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [RelTestRecord] {
-        JsBaoClient.requireDefault()
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [RelTestRecord] {
+        try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: filter, options: options)
+            .compactMap { RelTestRecord(row: $0) }
+    }
+
+    /// Query across all open documents and batch-prefetch related
+    /// records into each row's `related` bag. Mirrors JS
+    /// `BaseModel.query(filter, { include })`.
+    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [RelTestRecord] {
+        try JsBaoClient.requireDefault()
+            .queryShared(primitiveSchema, filter: filter, options: options, include: include)
             .compactMap { RelTestRecord(row: $0) }
     }
 
@@ -169,17 +287,30 @@ internal extension RelTestRecord {
         )
     }
 
-    /// Count across all open documents.
-    static func count(_ filter: DocumentFilter? = nil) -> Int {
-        JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    /// Paginated query with query-time relationship includes.
+    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<RelTestRecord> {
+        let page = try JsBaoClient.requireDefault()
+            .queryPagedShared(primitiveSchema, filter: filter, options: options, include: include)
+        return PagedQueryResult(
+            data: page.data.compactMap { RelTestRecord(row: $0) },
+            nextCursor: page.nextCursor,
+            prevCursor: page.prevCursor,
+            hasMore: page.hasMore
+        )
     }
 
-    /// Every record across all open documents. `async` to match the JS
-    /// client's `Model.findAll()` call shape (#992). Throws
-    /// `PrimitiveDecodeError` if any stored row no longer decodes as
-    /// `RelTestRecord` — JS `findAll` never drops rows, so schema drift
-    /// surfaces loudly instead of silently shrinking the result.
-    static func findAll() async throws -> [RelTestRecord] {
+    /// Count across all open documents.
+    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+    }
+
+    /// Every record across all open documents. Synchronous like the
+    /// rest of the facade reads (#1156) — the shared store never
+    /// suspends. Throws `PrimitiveDecodeError` if any stored row no
+    /// longer decodes as `RelTestRecord` — JS `findAll` never drops rows,
+    /// so schema drift surfaces loudly instead of silently shrinking
+    /// the result.
+    static func findAll() throws -> [RelTestRecord] {
         try JsBaoClient.requireDefault()
             .queryShared(primitiveSchema, filter: nil, options: nil)
             .map { row in
@@ -191,11 +322,11 @@ internal extension RelTestRecord {
     }
 
     /// First record with `id` across all open documents; `nil` only when
-    /// no open document has it. `async` to match the JS client's
-    /// `Model.find(id)` call shape (#992). Throws `PrimitiveDecodeError`
-    /// when the row exists but no longer decodes as `RelTestRecord` —
-    /// distinct from the `nil` not-found case.
-    static func find(_ id: String) async throws -> RelTestRecord? {
+    /// no open document has it. Synchronous like the rest of the facade
+    /// reads (#1156) — the shared store never suspends. Throws
+    /// `PrimitiveDecodeError` when the row exists but no longer decodes
+    /// as `RelTestRecord` — distinct from the `nil` not-found case.
+    static func find(_ id: String) throws -> RelTestRecord? {
         guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {
             return nil
         }
@@ -219,9 +350,19 @@ internal extension RelTestRecord {
     /// The first record matching `filter` across all open documents,
     /// or `nil`. Equivalent to `query(filter, options).first` — mirrors
     /// the JS client's `Model.queryOne(filter, options)`.
-    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> RelTestRecord? {
-        JsBaoClient.requireDefault()
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> RelTestRecord? {
+        try JsBaoClient.requireDefault()
             .queryOneShared(primitiveSchema, filter: filter, options: options)
+            .flatMap { RelTestRecord(row: $0) }
+    }
+
+    /// The first record matching `filter` with query-time relationship
+    /// includes attached under `related`, or `nil`. Equivalent to
+    /// `query(filter, options, include:).first` — mirrors the JS client's
+    /// `Model.queryOne(filter, { include })`.
+    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> RelTestRecord? {
+        try JsBaoClient.requireDefault()
+            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)
             .flatMap { RelTestRecord(row: $0) }
     }
 
@@ -233,8 +374,8 @@ internal extension RelTestRecord {
     }
 
     /// Aggregate (group / count / sum / avg / …) across all open documents.
-    static func aggregate(_ options: AggregateOptions) -> [[String: Any]] {
-        JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
+    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+        try JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
     }
 
     // MARK: Writes (target one document; throw if it isn't open)

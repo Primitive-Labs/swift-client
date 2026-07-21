@@ -9,12 +9,15 @@ import Foundation
 /// the HTTP layer.
 ///
 ///  - `data`: the page's rows, in query order.
-///  - `nextCursor`: opaque cursor to pass back to request the next
-///    page. Nil on the last page.
-///  - `prevCursor`: opaque cursor for the previous page. Nil on the
-///    first page.
+///  - `nextCursor`: opaque cursor that continues paging in the CURRENT
+///    direction. Nil when `hasMore` is false (no further rows that way).
+///  - `prevCursor`: opaque cursor that reverses the paging direction.
+///    Nil on the first page.
 ///  - `hasMore`: `true` iff more rows exist past `data`'s last row in
-///    the current direction.
+///    the current paging direction (the over-fetch signal — one extra
+///    row was seen and dropped). It is NOT "a prevCursor is present":
+///    backward pages report `hasMore` for earlier rows the same way
+///    forward pages report it for later rows.
 public struct PagedQueryResult<Row>: Sendable where Row: Sendable {
     public let data: [Row]
     public let nextCursor: String?

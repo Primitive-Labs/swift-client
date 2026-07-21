@@ -28,8 +28,8 @@ final class SwiftEmitterTests: XCTestCase {
         """)
         let body = try XCTUnwrap(src["TRecord"])
         XCTAssertTrue(
-            body.contains("struct TRecord: PrimitiveModel, Equatable, Hashable, Codable"),
-            "generated struct should conform to PrimitiveModel + Equatable, Hashable, Codable so synthesis fires"
+            body.contains("struct TRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable"),
+            "generated struct should conform to PrimitiveModel + row decoding + Equatable, Hashable, Codable"
         )
     }
 
@@ -61,30 +61,48 @@ final class SwiftEmitterTests: XCTestCase {
         XCTAssertTrue(body.contains("extension NoteRecord {"),
                       "facade extension should be emitted")
         // Reads (cross-document statics)
-        XCTAssertTrue(body.contains("static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> [NoteRecord]"))
+        XCTAssertTrue(body.contains("static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [NoteRecord]"),
+                      "query facade must throw (substring-op input errors surface, #1119)")
+        XCTAssertTrue(body.contains("static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [NoteRecord]"),
+                      "query-time include facade must be emitted")
+        XCTAssertTrue(body.contains(".queryShared(primitiveSchema, filter: filter, options: options, include: include)"),
+                      "include query should delegate to the shared include engine")
         // Paginated read — exposes nextCursor/hasMore so callers can page (#946).
         XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<NoteRecord>"))
-        XCTAssertTrue(body.contains("static func count(_ filter: DocumentFilter? = nil) -> Int"))
-        // find/findAll are async + decode-loud (#992): async matches the JS
-        // call shape; a row that exists but fails typed decode throws
+        XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<NoteRecord>"),
+                      "paginated include facade must be emitted")
+        XCTAssertTrue(body.contains("static func count(_ filter: DocumentFilter? = nil) throws -> Int"))
+        // find/findAll are synchronous throws + decode-loud (#1156): all facade
+        // reads share one sync convention (the shared store never suspends), and
+        // a row that exists but fails typed decode still throws
         // PrimitiveDecodeError instead of vanishing (find) or being silently
         // dropped from the result (findAll).
-        XCTAssertTrue(body.contains("static func findAll() async throws -> [NoteRecord]"))
-        XCTAssertTrue(body.contains("static func find(_ id: String) async throws -> NoteRecord?"))
+        XCTAssertTrue(body.contains("static func findAll() throws -> [NoteRecord]"))
+        XCTAssertFalse(body.contains("static func findAll() async throws"),
+                       "findAll must be synchronous throws, not async (#1156)")
+        XCTAssertTrue(body.contains("static func find(_ id: String) throws -> NoteRecord?"))
+        XCTAssertFalse(body.contains("static func find(_ id: String) async throws"),
+                       "find must be synchronous throws, not async (#1156)")
         XCTAssertTrue(body.contains("throw PrimitiveDecodeError(modelName: modelName, row: row)"),
                       "decode misses in find/findAll must throw, not return nil / drop rows")
         XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping () -> Void) -> () -> Void"))
-        XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) -> [[String: Any]]"))
+        XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]]"))
         // Cross-document unique lookup + single-result query (JS parity:
         // findByUnique / queryOne).
         XCTAssertTrue(body.contains("static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> NoteRecord?"),
                       "findByUnique facade must be emitted")
         XCTAssertTrue(body.contains("findByUniqueShared(primitiveSchema, constraint: constraint, value: value)"),
                       "findByUnique should delegate to findByUniqueShared")
-        XCTAssertTrue(body.contains("static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) -> NoteRecord?"),
+        XCTAssertTrue(body.contains("static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> NoteRecord?"),
                       "queryOne facade must be emitted")
         XCTAssertTrue(body.contains("queryOneShared(primitiveSchema, filter: filter, options: options)"),
                       "queryOne should delegate to queryOneShared")
+        // queryOne with query-time relationship includes (#1216) — the typed
+        // parity hole left after #1194 added include only to query/queryPaged.
+        XCTAssertTrue(body.contains("static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> NoteRecord?"),
+                      "queryOne include overload must be emitted")
+        XCTAssertTrue(body.contains("queryOneShared(primitiveSchema, filter: filter, options: options, include: include)"),
+                      "queryOne include overload should delegate to queryOneShared(...,include:)")
         // Writes (per-document instance methods — the save() API from #923)
         XCTAssertTrue(body.contains("func save(in documentId: String) throws -> NoteRecord"),
                       "instance save(in:) (create-or-update) must be emitted")
@@ -117,6 +135,10 @@ final class SwiftEmitterTests: XCTestCase {
         // merges; the designated init leaves the default `true`.
         XCTAssertTrue(body.contains("var _explicitId: Bool = true"),
                       "explicit-id provenance flag must be emitted")
+        XCTAssertTrue(body.contains("var related: RelatedRecords = .empty"),
+                      "query-time include payload bag must be emitted")
+        XCTAssertTrue(body.contains("self.related = RelatedRecords(raw: row[\"_related\"] as? [String: Any] ?? [:])"),
+                      "row init must preserve `_related` include payloads")
         XCTAssertTrue(body.contains("self.id = PrimitiveSchemaRegistry.newId()"),
                       "auto-id convenience init must be emitted")
         XCTAssertTrue(body.contains("self._explicitId = false"),
@@ -639,21 +661,34 @@ final class SwiftEmitterTests: XCTestCase {
     """
 
     // Relationship accessors are idiomatic INSTANCE methods that
-    // auto-resolve the target model (#1151) — `try await post.author()`,
-    // `try await user.posts()` — mirroring the JS client's generated
+    // auto-resolve the target model (#1151) — `try post.author()`,
+    // `try user.posts()` — mirroring the JS client's generated
     // instance methods. They delegate to the default client's
-    // cross-document relationship helpers.
+    // cross-document relationship helpers. Synchronous throws (#1156):
+    // the shared store never suspends.
 
     func testRefersToAccessorReturnsTypedOptional() throws {
         let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
         let posts = try XCTUnwrap(files["PostsRecord"])
         XCTAssertTrue(
-            posts.contains("func author() async throws -> UsersRecord?"),
+            posts.contains("func author() throws -> UsersRecord?"),
             "expected an instance accessor returning the target's optional typed record"
         )
         XCTAssertTrue(
             posts.contains(#".refersToShared(target: UsersRecord.primitiveSchema, foreignKey: userId)"#),
             "refersTo accessor should resolve via the default client, reading its own FK field"
+        )
+        XCTAssertTrue(
+            posts.contains("var relatedAuthor: UsersRecord?")
+            && posts.contains(#"related.one("author", as: UsersRecord.self)"#)
+            && posts.contains("related.one(UsersRecord.modelName, as: UsersRecord.self)"),
+            "refersTo should expose a typed query-time include accessor"
+        )
+        XCTAssertTrue(
+            posts.contains("static func includeAuthor(")
+            && posts.contains("type: .refersTo")
+            && posts.contains(#"sourceField: "userId""#),
+            "refersTo should expose a generated query-time include builder"
         )
         XCTAssertFalse(
             posts.contains("static func author("),
@@ -665,7 +700,7 @@ final class SwiftEmitterTests: XCTestCase {
         let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
         let users = try XCTUnwrap(files["UsersRecord"])
         XCTAssertTrue(
-            users.contains("func posts() async throws -> [PostsRecord]"),
+            users.contains("func posts() throws -> [PostsRecord]"),
             "hasMany accessor should be an instance method returning an array of the target's typed record"
         )
         XCTAssertTrue(
@@ -679,13 +714,26 @@ final class SwiftEmitterTests: XCTestCase {
             users.contains(#"orderByField: "createdAt""#),
             "hasMany accessor should forward the declared order_by_field"
         )
+        XCTAssertTrue(
+            users.contains("var relatedPosts: [PostsRecord]")
+            && users.contains(#"related.many("posts", as: PostsRecord.self)"#)
+            && users.contains("related.many(PostsRecord.modelName, as: PostsRecord.self)"),
+            "hasMany should expose a typed query-time include accessor"
+        )
+        XCTAssertTrue(
+            users.contains("static func includePosts(")
+            && users.contains("type: .hasMany")
+            && users.contains(#"foreignKey: "userId""#)
+            && users.contains(#"sort: [String: Int]? = ["createdAt": 1]"#),
+            "hasMany should expose a generated query-time include builder with relationship sort defaults"
+        )
     }
 
     func testHasManyThroughAccessorTakesJoinModel() throws {
         let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
         let posts = try XCTUnwrap(files["PostsRecord"])
         XCTAssertTrue(
-            posts.contains("func tags() async throws -> [TagsRecord]"),
+            posts.contains("func tags() throws -> [TagsRecord]"),
             "hasManyThrough accessor should be an instance method returning the target array"
         )
         XCTAssertTrue(
@@ -695,6 +743,108 @@ final class SwiftEmitterTests: XCTestCase {
             && posts.contains(#"joinModelLocalField: "postId""#)
             && posts.contains(#"joinModelRelatedField: "tagId""#),
             "hasManyThrough accessor should auto-resolve both target and join model"
+        )
+        XCTAssertTrue(
+            posts.contains("var relatedTags: [TagsRecord]")
+            && posts.contains(#"related.many("tags", as: TagsRecord.self)"#)
+            && posts.contains("related.many(TagsRecord.modelName, as: TagsRecord.self)"),
+            "hasManyThrough should expose a typed query-time include accessor"
+        )
+        XCTAssertFalse(
+            posts.contains("static func includeTags("),
+            "query-time Include does not currently support hasManyThrough, so codegen must not emit a misleading builder"
+        )
+    }
+
+    /// The emitter also generates a PAGINATED `hasManyThrough` overload
+    /// beside the flat one (#1230, rerouted in #1607): a required `limit:`
+    /// (so the bare `tags()` still binds), `afterCursor` / `beforeCursor` /
+    /// `direction`, returning `PagedQueryResult<Target>` and delegating to
+    /// the runtime helper's paginated overload. Cursors are the engine's
+    /// opaque `String` tokens, shared with the JS client's composite cursor.
+    func testHasManyThroughAccessorEmitsPaginatedOverload() throws {
+        let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
+        let posts = try XCTUnwrap(files["PostsRecord"])
+        // The bare overload still generates alongside the paginated one.
+        XCTAssertTrue(
+            posts.contains("func tags() throws -> [TagsRecord]"),
+            "the unpaginated hasManyThrough accessor must still be generated"
+        )
+        XCTAssertTrue(
+            posts.contains("func tags(\n")
+            && posts.contains("limit: Int,")
+            && posts.contains("afterCursor: String? = nil,")
+            && posts.contains("beforeCursor: String? = nil,")
+            && posts.contains("direction: CursorDirection = .forward")
+            && posts.contains(") throws -> PagedQueryResult<TagsRecord>"),
+            "paginated hasManyThrough accessor should take limit/afterCursor/beforeCursor/direction and return PagedQueryResult<Target>"
+        )
+        XCTAssertTrue(
+            posts.contains("limit: limit,")
+            && posts.contains("afterCursor: afterCursor,")
+            && posts.contains("beforeCursor: beforeCursor,")
+            && posts.contains("direction: direction"),
+            "paginated accessor should forward its pagination args into hasManyThroughShared"
+        )
+        XCTAssertTrue(
+            posts.contains("nextCursor: page.nextCursor,")
+            && posts.contains("prevCursor: page.prevCursor,")
+            && posts.contains("hasMore: page.hasMore"),
+            "paginated accessor should preserve the runtime helper's cursors"
+        )
+    }
+
+    /// The order-less fixture declares no join order, so the generated
+    /// `hasManyThrough` accessor must NOT forward join-order args.
+    func testHasManyThroughAccessorOmitsJoinOrderWhenUndeclared() throws {
+        let (files, _, _) = try emitWithNameMap(Self.relationshipFixture)
+        let posts = try XCTUnwrap(files["PostsRecord"])
+        XCTAssertFalse(
+            posts.contains("joinModelOrderByField:"),
+            "no declared join order → emitter must omit joinModelOrderByField:"
+        )
+        XCTAssertFalse(
+            posts.contains("joinModelOrderDirection:"),
+            "no declared join order → emitter must omit joinModelOrderDirection:"
+        )
+    }
+
+    /// A `hasManyThrough` with a declared `join_model_order_by_field` /
+    /// `join_model_order_direction` must forward those into the generated
+    /// accessor's `hasManyThroughShared` call (mirrors how `hasMany`
+    /// forwards `order_by_field`). Previously these props were parsed but
+    /// dropped (#1201).
+    func testHasManyThroughAccessorForwardsDeclaredJoinOrder() throws {
+        let fixture = """
+        [models.posts]
+        [models.posts.fields.id]
+        type = "id"
+        [models.posts.relationships.tags]
+        type = "hasManyThrough"
+        model = "tags"
+        join_model = "post_tag_links"
+        join_model_local_field = "postId"
+        join_model_related_field = "tagId"
+        join_model_order_by_field = "position"
+        join_model_order_direction = "DESC"
+
+        [models.tags]
+        [models.tags.fields.id]
+        type = "id"
+
+        [models.post_tag_links]
+        [models.post_tag_links.fields.id]
+        type = "id"
+        """
+        let (files, _, _) = try emitWithNameMap(fixture)
+        let posts = try XCTUnwrap(files["PostsRecord"])
+        XCTAssertTrue(
+            posts.contains(#"joinModelOrderByField: "position""#),
+            "hasManyThrough accessor should forward the declared join_model_order_by_field"
+        )
+        XCTAssertTrue(
+            posts.contains(#"joinModelOrderDirection: "DESC""#),
+            "hasManyThrough accessor should forward the declared join_model_order_direction"
         )
     }
 
