@@ -52,7 +52,7 @@ public final class AuthController: @unchecked Sendable {
     private var pendingCodeVerifier: String?
 
     // Request function (set externally to break circular dependency)
-    var makeRequest: ((String, String, Any?) async throws -> Any)?
+    var makeRequest: ((String, String, Any?) async throws -> Any?)?
 
     public init(
         appId: String,
@@ -76,37 +76,29 @@ public final class AuthController: @unchecked Sendable {
     // MARK: - Token Management
 
     public func getToken() -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return currentToken
+        return lock.withLock { currentToken }
     }
 
     public func getUserId() -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return currentUserId
+        return lock.withLock { currentUserId }
     }
 
     public func isAuthenticated() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return currentToken != nil && currentUserId != nil
+        return lock.withLock { currentToken != nil && currentUserId != nil }
     }
 
     public func getAuthState() -> AuthState {
-        lock.lock()
-        defer { lock.unlock() }
-        return AuthState(
-            authenticated: currentToken != nil,
-            mode: networkMode,
-            userId: currentUserId
-        )
+        return lock.withLock {
+            AuthState(
+                authenticated: currentToken != nil,
+                mode: networkMode,
+                userId: currentUserId
+            )
+        }
     }
 
     public func getJwtPayload() -> [String: Any]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return jwtPayload
+        return lock.withLock { jwtPayload }
     }
 
     /// Bootstrap with an initial token (on startup)
@@ -136,33 +128,37 @@ public final class AuthController: @unchecked Sendable {
 
     /// Apply a new token, updating internal state and emitting events
     func applyToken(_ token: String?, previous: String?, cause: String?) {
-        lock.lock()
         // Logout race guard: a refresh/restore that resolves AFTER the
         // user logged out must not silently sign them back in (or
         // re-persist the JWT). Drop non-interactive token applications
         // until an explicit interactive login clears the flag.
-        if token != nil, blockNonInteractiveAuth, !Self.isInteractiveLogin(cause) {
-            lock.unlock()
+        // The check-and-mutate stays atomic in one critical section; a
+        // `nil` result signals the guard dropped the application so we
+        // log and return outside the lock exactly as before.
+        let applied: (newUserId: String?, newToken: String?)? = lock.withLock {
+            if token != nil, blockNonInteractiveAuth, !Self.isInteractiveLogin(cause) {
+                return nil
+            }
+            if token != nil, Self.isInteractiveLogin(cause) {
+                blockNonInteractiveAuth = false
+            }
+            currentToken = token
+
+            if let token = token {
+                let payload = Self.parseJwtPayload(token: token)
+                jwtPayload = payload
+                currentUserId = payload?["userId"] as? String ?? payload?["sub"] as? String
+            } else {
+                jwtPayload = nil
+                currentUserId = nil
+            }
+            return (currentUserId, currentToken)
+        }
+
+        guard let (newUserId, newToken) = applied else {
             logger.debug("Ignoring token application (cause:", cause ?? "unknown", ") — logged out, awaiting explicit login")
             return
         }
-        if token != nil, Self.isInteractiveLogin(cause) {
-            blockNonInteractiveAuth = false
-        }
-        let oldUserId = currentUserId
-        currentToken = token
-
-        if let token = token {
-            let payload = Self.parseJwtPayload(token: token)
-            jwtPayload = payload
-            currentUserId = payload?["userId"] as? String ?? payload?["sub"] as? String
-        } else {
-            jwtPayload = nil
-            currentUserId = nil
-        }
-        let newUserId = currentUserId
-        let newToken = currentToken
-        lock.unlock()
 
         if let newToken = newToken {
             logger.debug("Token applied", "userId:", newUserId ?? "nil", "cause:", cause ?? "unknown")
@@ -197,9 +193,7 @@ public final class AuthController: @unchecked Sendable {
                     logger.warn("Failed to persist JWT:", error.localizedDescription)
                 }
             }
-            lock.lock()
-            pendingPersistTask = task
-            lock.unlock()
+            lock.withLock { pendingPersistTask = task }
         }
     }
 
@@ -208,9 +202,7 @@ public final class AuthController: @unchecked Sendable {
     /// SQLite connection out from under a queued write. Safe to call
     /// when no Task is in flight (no-op).
     public func awaitPendingPersistence() async {
-        lock.lock()
-        let task = pendingPersistTask
-        lock.unlock()
+        let task = lock.withLock { pendingPersistTask }
         await task?.value
     }
 
@@ -228,24 +220,36 @@ public final class AuthController: @unchecked Sendable {
 
     public func refreshAccessToken(cause: String? = nil) async -> RefreshOutcome {
         // Coalesce: if another caller is already running a refresh,
-        // await its outcome instead of starting a new round trip.
-        lock.lock()
-        if let inFlight = pendingRefresh {
-            lock.unlock()
-            return await inFlight.value
+        // await its outcome instead of starting a new round trip. The
+        // check-and-register must be atomic so a burst of concurrent
+        // callers registers exactly one refresh Task — hence a single
+        // `withLock`. The refresh itself runs in the escaping `Task{}`
+        // and is awaited OUTSIDE the lock (never hold the lock across an
+        // `await`); single-flight is preserved.
+        enum RefreshStart {
+            case existing(Task<RefreshOutcome, Never>)
+            case started(Task<RefreshOutcome, Never>)
         }
-        let task = Task<RefreshOutcome, Never> { [weak self] in
-            guard let self = self else { return .network }
-            return await self._refreshAccessTokenImpl(cause: cause)
+        let start: RefreshStart = lock.withLock {
+            if let inFlight = pendingRefresh {
+                return .existing(inFlight)
+            }
+            let task = Task<RefreshOutcome, Never> { [weak self] in
+                guard let self = self else { return .network }
+                return await self._refreshAccessTokenImpl(cause: cause)
+            }
+            pendingRefresh = task
+            return .started(task)
         }
-        pendingRefresh = task
-        lock.unlock()
 
-        let outcome = await task.value
-        lock.lock()
-        pendingRefresh = nil
-        lock.unlock()
-        return outcome
+        switch start {
+        case .existing(let inFlight):
+            return await inFlight.value
+        case .started(let task):
+            let outcome = await task.value
+            lock.withLock { pendingRefresh = nil }
+            return outcome
+        }
     }
 
     private func _refreshAccessTokenImpl(cause: String? = nil) async -> RefreshOutcome {
@@ -260,9 +264,7 @@ public final class AuthController: @unchecked Sendable {
                 newToken = try await refreshDirect()
             }
 
-            lock.lock()
-            refreshBackoffMs = refreshBackoffBase
-            lock.unlock()
+            lock.withLock { refreshBackoffMs = refreshBackoffBase }
 
             let previous = getToken()
             applyToken(newToken, previous: previous, cause: "refresh")
@@ -277,9 +279,7 @@ public final class AuthController: @unchecked Sendable {
         } catch {
             logger.warn("Token refresh network error:", error.localizedDescription)
 
-            lock.lock()
-            refreshBackoffMs = min(refreshBackoffMs * 2, refreshBackoffMax)
-            lock.unlock()
+            lock.withLock { refreshBackoffMs = min(refreshBackoffMs * 2, refreshBackoffMax) }
 
             emitter?.emit(.authRefreshDeferred, [
                 "status": "scheduled",
@@ -368,9 +368,7 @@ public final class AuthController: @unchecked Sendable {
         // don't support PKCE yet simply ignore the extra parameters.
         let verifier = Self.generatePkceVerifier()
         let challenge = Self.pkceChallenge(forVerifier: verifier)
-        lock.lock()
-        pendingCodeVerifier = verifier
-        lock.unlock()
+        lock.withLock { pendingCodeVerifier = verifier }
 
         let state = try Self.encodeOAuthState(
             redirectUri: redirectUri,
@@ -405,16 +403,17 @@ public final class AuthController: @unchecked Sendable {
         // can't leak into a later attempt. Callers that never went through
         // startOAuthFlow (e.g. resuming a web-started flow) have no verifier
         // and the legacy GET path is used — same wire shape as before.
-        lock.lock()
-        let codeVerifier = pendingCodeVerifier
-        pendingCodeVerifier = nil
-        lock.unlock()
+        let codeVerifier = lock.withLock { () -> String? in
+            let verifier = pendingCodeVerifier
+            pendingCodeVerifier = nil
+            return verifier
+        }
 
         // The server only reads the verifier from the native JSON endpoint
         // (`POST /auth/oauth/callback`, body `{code, state, codeVerifier}` —
         // OAuthController.callbackJson); the web `GET /oauth/callback` never
         // looks at a code_verifier param. So: verifier → POST, none → GET.
-        let response: Any
+        let response: Any?
         if let codeVerifier {
             response = try await makeRequest(
                 "POST",
@@ -869,18 +868,14 @@ public final class AuthController: @unchecked Sendable {
         // Block any in-flight refresh/restore from re-authenticating after
         // this logout (see `blockNonInteractiveAuth`). Set before clearing
         // the token so a refresh resolving mid-logout is caught.
-        lock.lock()
-        blockNonInteractiveAuth = true
-        lock.unlock()
+        lock.withLock { blockNonInteractiveAuth = true }
         let previous = getToken()
         applyToken(nil, previous: previous, cause: "logout")
 
         // Default-true in JS: drop the in-memory offline identity unless the
         // caller explicitly opts out.
         if options.clearOfflineIdentity {
-            lock.lock()
-            offlineIdentity = nil
-            lock.unlock()
+            lock.withLock { offlineIdentity = nil }
         }
 
         if options.revokeOffline {
@@ -917,47 +912,47 @@ public final class AuthController: @unchecked Sendable {
     // MARK: - Network Mode
 
     public func setNetworkMode(_ mode: NetworkMode) {
-        lock.lock()
-        networkMode = mode
-        lock.unlock()
+        lock.withLock { networkMode = mode }
         // Note: event emission is handled by JsBaoClient.setNetworkMode()
         // to avoid duplicate events.
     }
 
     public func getNetworkMode() -> NetworkMode {
-        lock.lock()
-        defer { lock.unlock() }
-        return networkMode
+        return lock.withLock { networkMode }
     }
 
     // MARK: - Auth Ready
 
     public func waitForAuthReady() async {
-        lock.lock()
-        if authReady {
-            lock.unlock()
+        if lock.withLock({ authReady }) {
             return
         }
-        lock.unlock()
 
         await withCheckedContinuation { continuation in
-            lock.lock()
-            if authReady {
-                lock.unlock()
-                continuation.resume()
-                return
+            // Register the waiter atomically with the ready check so a
+            // `markAuthReady()` racing this closure can't slip between the
+            // check and the append (which would strand the continuation).
+            // The resume happens outside the lock.
+            let alreadyReady = lock.withLock { () -> Bool in
+                if authReady {
+                    return true
+                }
+                authReadyContinuations.append(continuation)
+                return false
             }
-            authReadyContinuations.append(continuation)
-            lock.unlock()
+            if alreadyReady {
+                continuation.resume()
+            }
         }
     }
 
     private func markAuthReady() {
-        lock.lock()
-        authReady = true
-        let continuations = authReadyContinuations
-        authReadyContinuations.removeAll()
-        lock.unlock()
+        let continuations = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            authReady = true
+            let pending = authReadyContinuations
+            authReadyContinuations.removeAll()
+            return pending
+        }
 
         for continuation in continuations {
             continuation.resume()
@@ -1102,17 +1097,17 @@ public final class AuthController: @unchecked Sendable {
         // Also store in OfflineStore for metadata access
         try await offlineStore.putGrant(appId: appId, userId: userId, key: "grant", record: grant)
 
-        lock.lock()
-        offlineIdentity = OfflineIdentity(
-            userId: grant.userId,
-            appId: grant.appId,
-            rootDocId: grant.rootDocId,
-            email: grant.email,
-            name: grant.name,
-            expiresAt: grant.expiresAt,
-            method: grant.method ?? "signed"
-        )
-        lock.unlock()
+        lock.withLock {
+            offlineIdentity = OfflineIdentity(
+                userId: grant.userId,
+                appId: grant.appId,
+                rootDocId: grant.rootDocId,
+                email: grant.email,
+                name: grant.name,
+                expiresAt: grant.expiresAt,
+                method: grant.method ?? "signed"
+            )
+        }
 
         emitter?.emit(.offlineAuthEnabled, ["method": grant.method ?? "signed"] as [String: Any])
 
@@ -1139,19 +1134,19 @@ public final class AuthController: @unchecked Sendable {
                 return false
             }
 
-            lock.lock()
-            offlineIdentity = OfflineIdentity(
-                userId: grant.userId,
-                appId: grant.appId,
-                rootDocId: grant.rootDocId,
-                email: grant.email,
-                name: grant.name,
-                expiresAt: grant.expiresAt,
-                method: grant.method ?? "signed"
-            )
-            // Set user context from grant
-            currentUserId = grant.userId
-            lock.unlock()
+            lock.withLock {
+                offlineIdentity = OfflineIdentity(
+                    userId: grant.userId,
+                    appId: grant.appId,
+                    rootDocId: grant.rootDocId,
+                    email: grant.email,
+                    name: grant.name,
+                    expiresAt: grant.expiresAt,
+                    method: grant.method ?? "signed"
+                )
+                // Set user context from grant
+                currentUserId = grant.userId
+            }
 
             emitter?.emit(.offlineAuthUnlocked, ["userId": grant.userId] as [String: Any])
             return true
@@ -1172,9 +1167,7 @@ public final class AuthController: @unchecked Sendable {
 
     /// Get the status of the offline grant (availability, expiry, method).
     public func getOfflineGrantStatus() -> OfflineGrantStatus {
-        lock.lock()
-        let identity = offlineIdentity
-        lock.unlock()
+        let identity = lock.withLock { offlineIdentity }
 
         guard let identity = identity else {
             return OfflineGrantStatus(
@@ -1217,18 +1210,14 @@ public final class AuthController: @unchecked Sendable {
         let userId = getUserId() ?? ""
         try? await offlineStore.deleteGrant(appId: appId, userId: userId, key: "grant")
 
-        lock.lock()
-        offlineIdentity = nil
-        lock.unlock()
+        lock.withLock { offlineIdentity = nil }
 
         emitter?.emit(.offlineAuthRevoked, ["wipeLocal": options.wipeLocal] as [String: Any])
     }
 
     /// Get the stored offline identity (available after unlockOffline succeeds).
     public func getOfflineIdentity() -> OfflineIdentity? {
-        lock.lock()
-        defer { lock.unlock() }
-        return offlineIdentity
+        return lock.withLock { offlineIdentity }
     }
 
     // MARK: - Private Helpers

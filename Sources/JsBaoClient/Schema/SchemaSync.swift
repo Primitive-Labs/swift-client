@@ -24,7 +24,10 @@ public enum SchemaSync {
     // a deallocated YDocument's ObjectIdentifier can get re-issued to a
     // fresh YDocument and produce false cache hits across tests. (Ask me
     // how I know.)
-    private static let cache = NSMapTable<YDocument, NSMutableSet>(
+    // Every access to `cache` goes through `cacheLock` (see the cached*
+    // accessors below), so the shared mutable `NSMapTable` is safe despite
+    // not being `Sendable` — hence `nonisolated(unsafe)`.
+    nonisolated(unsafe) private static let cache = NSMapTable<YDocument, NSMutableSet>(
         keyOptions: [.weakMemory, .objectPointerPersonality],
         valueOptions: .strongMemory
     )

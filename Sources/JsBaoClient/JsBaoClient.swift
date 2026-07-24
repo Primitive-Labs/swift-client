@@ -1,5 +1,10 @@
 import Foundation
-import YSwift
+// `@preconcurrency` downgrades Sendable-related diagnostics that originate
+// from YSwift's own (non-Sendable) types — YSwift predates strict
+// concurrency and isn't annotated. It only suppresses warnings sourced
+// from that module; genuine Sendable issues in our own types still surface.
+// The upstream YSwift fork (#1911) will annotate these properly.
+@preconcurrency import YSwift
 import Yniffi
 #if canImport(UIKit)
 import UIKit
@@ -453,16 +458,16 @@ public final class JsBaoClient: @unchecked Sendable {
                          "Open the document before mapping a model to it."
             )
         }
-        lock.lock()
-        modelToDocumentId[modelName] = documentId
-        lock.unlock()
+        lock.withLock {
+            modelToDocumentId[modelName] = documentId
+        }
     }
 
     /// Remove a `modelName → documentId` mapping. No-op if none exists.
     public func clearDocumentModelMapping(modelName: String) {
-        lock.lock()
-        modelToDocumentId.removeValue(forKey: modelName)
-        lock.unlock()
+        lock.withLock {
+            _ = modelToDocumentId.removeValue(forKey: modelName)
+        }
     }
 
     /// Resolve a `modelName` to its registered doc, or the default
@@ -470,9 +475,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// is set. Matches js-bao's `getDocumentIdForModel` /
     /// `getDocumentModelMapping`.
     public func getDocumentModelMapping(modelName: String) -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return modelToDocumentId[modelName] ?? defaultDocumentId
+        return lock.withLock {
+            modelToDocumentId[modelName] ?? defaultDocumentId
+        }
     }
 
     /// Set the doc used as a fallback when no per-model mapping
@@ -485,22 +490,19 @@ public final class JsBaoClient: @unchecked Sendable {
                          "Open the document before setting it as the default."
             )
         }
-        lock.lock()
-        defaultDocumentId = documentId
-        lock.unlock()
+        lock.withLock {
+            defaultDocumentId = documentId
+        }
     }
 
     public func clearDefaultDocumentId() {
-        lock.lock()
-        defaultDocumentId = nil
-        lock.unlock()
+        lock.withLock {
+            defaultDocumentId = nil
+        }
     }
 
     public func getDefaultDocumentId() -> String? {
-        lock.lock()
-        let id = defaultDocumentId
-        lock.unlock()
-        return id
+        lock.withLock { defaultDocumentId }
     }
 
     // MARK: - Cross-document model store (parity with js-bao `initJsBao({ models })`)
@@ -526,28 +528,31 @@ public final class JsBaoClient: @unchecked Sendable {
     /// on first use. Internal — app code uses the codegen'd `Model.*` facade.
     @discardableResult
     func sharedModel(for schema: PrimitiveSchema) -> MultiDocModel {
-        lock.lock()
-        if let existing = sharedModels[schema.name] {
-            lock.unlock()
-            return existing
+        // Fast path returns an already-registered store without the connect
+        // sweep; only a freshly-created store connects the open documents.
+        var newlyCreated = false
+        let created: MultiDocModel = lock.withLock {
+            if let existing = sharedModels[schema.name] {
+                return existing
+            }
+            let model = MultiDocModel(schema: schema)
+            sharedModels[schema.name] = model
+            newlyCreated = true
+            return model
         }
-        let model = MultiDocModel(schema: schema)
-        sharedModels[schema.name] = model
-        lock.unlock()
+        guard newlyCreated else { return created }
         // Connect docs opened before this model was registered. Done
         // outside `lock` because `connect` takes the document manager's
         // lock; holding both risks a lock-ordering inversion.
         for entry in documentManager.openDocumentsSnapshot() {
-            model.connect(docId: entry.documentId, doc: entry.doc)
+            created.connect(docId: entry.documentId, doc: entry.doc)
         }
-        return model
+        return created
     }
 
     /// The shared store for an already-registered model, or `nil`. Internal.
     func sharedModel(_ modelName: String) -> MultiDocModel? {
-        lock.lock()
-        defer { lock.unlock() }
-        return sharedModels[modelName]
+        return lock.withLock { sharedModels[modelName] }
     }
 
     /// Public include target for generated query-time include builders.
@@ -904,9 +909,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// one open document — so the inspector can surface cross-document data
     /// without apps binding per-doc models by hand.
     public func inspectableSharedMembers() -> [(modelName: String, documentId: String, model: DynamicModel)] {
-        lock.lock()
-        let models = sharedModels
-        lock.unlock()
+        let models = lock.withLock { sharedModels }
         var out: [(modelName: String, documentId: String, model: DynamicModel)] = []
         for (name, shared) in models {
             for docId in shared.connectedDocIds {
@@ -951,25 +954,24 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Called from the open/create paths; safe to call repeatedly (a
     /// re-connect re-seeds the doc's rows).
     private func connectToSharedModels(documentId: String, doc: YDocument) {
-        lock.lock()
-        let models = Array(sharedModels.values)
-        lock.unlock()
+        let models = lock.withLock { Array(sharedModels.values) }
         for model in models { model.connect(docId: documentId, doc: doc) }
     }
 
     /// Drop a closing document's rows from every shared store so later
     /// cross-document reads don't return stale state.
     private func disconnectFromSharedModels(documentId: String) {
-        lock.lock()
-        let models = Array(sharedModels.values)
-        lock.unlock()
+        let models = lock.withLock { Array(sharedModels.values) }
         for model in models { model.disconnect(docId: documentId) }
     }
 
     // MARK: - Default client (backs the codegen'd `Model.query()` facade)
 
     private static let defaultClientLock = NSLock()
-    private static var _defaultClient: JsBaoClient?
+    // Every access to `_defaultClient` goes through `defaultClientLock`
+    // (see the accessors below), so the mutable static is safe despite not
+    // being concurrency-checked — hence `nonisolated(unsafe)`.
+    nonisolated(unsafe) private static var _defaultClient: JsBaoClient?
 
     /// Configure the process-wide default client that the codegen'd static
     /// query facade (`TodoRecord.query()`, `.count()`, `.findAll()`,
@@ -977,24 +979,22 @@ public final class JsBaoClient: @unchecked Sendable {
     /// in a `PrimitiveApp` host this is wired for you. Replacing it (e.g.
     /// across a sign-out/sign-in) is allowed.
     public static func configureDefault(_ client: JsBaoClient) {
-        defaultClientLock.lock()
-        _defaultClient = client
-        defaultClientLock.unlock()
+        defaultClientLock.withLock {
+            _defaultClient = client
+        }
     }
 
     /// The configured default client, or `nil` if `configureDefault` was
     /// never called.
     public static var `default`: JsBaoClient? {
-        defaultClientLock.lock()
-        defer { defaultClientLock.unlock() }
-        return _defaultClient
+        defaultClientLock.withLock { _defaultClient }
     }
 
     /// Clear the default client. Mainly for test teardown.
     public static func clearDefault() {
-        defaultClientLock.lock()
-        _defaultClient = nil
-        defaultClientLock.unlock()
+        defaultClientLock.withLock {
+            _defaultClient = nil
+        }
     }
 
     /// The default client or a precondition failure with remediation. Used
@@ -1080,9 +1080,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Enforcement runs immediately and again as docs open/close
     /// (which is when `lastOpenedAt` / `localBytes` shift).
     public func setRetentionPolicy(_ policy: RetentionPolicy) {
-        lock.lock()
-        retentionPolicy = policy
-        lock.unlock()
+        lock.withLock {
+            retentionPolicy = policy
+        }
         Task { [policy, weak self] in
             await self?.documentManager.enforceRetentionPolicy(
                 ttlMs: policy.ttlMs,
@@ -1094,9 +1094,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Inspect the active retention policy.
     public func getRetentionPolicy() -> RetentionPolicy {
-        lock.lock()
-        defer { lock.unlock() }
-        return retentionPolicy
+        lock.withLock { retentionPolicy }
     }
 
     /// Mark a doc as deleted locally — wipes the in-memory metadata
@@ -1134,11 +1132,10 @@ public final class JsBaoClient: @unchecked Sendable {
         }
     }
 
-    /// One-shot sync gate: returns as soon as the doc reports synced
-    /// once. Alias for `waitForInitialSync` in this Swift surface —
-    /// JS treats them slightly differently around reconnect (JS resets
-    /// the gate on disconnect; Swift's `isSynced` already does), so
-    /// they're behaviorally identical here.
+    /// One-shot sync gate: returns as soon as the doc reports its initial
+    /// sync complete. Alias for `waitForInitialSync` in this Swift surface,
+    /// matching js-bao, whose `waitForSync` also just forwards to
+    /// `waitForInitialSync`.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `waitForSync`.
     @available(*, deprecated, message: "Use waitForInitialSync(documentId:timeoutMs:pollMs:) instead.")
@@ -1152,39 +1149,80 @@ public final class JsBaoClient: @unchecked Sendable {
         )
     }
 
-    /// Continuous sync gate: waits until the doc is synced *and stays
-    /// synced* through one poll cycle past the first true reading.
-    /// Matches js-bao's `waitForInSync` semantics where the consumer
-    /// needs to be sure the doc isn't about to flip back to syncing.
+    /// Wait until the client and server hold identical document state.
+    /// Polls the live `checkStateVector` round trip until it reports
+    /// `inSync`, throwing on timeout. Mirrors js-bao's `waitForInSync`.
+    /// Because it depends on a real server round trip, it correctly does
+    /// NOT confirm while the socket is down or a local edit is still in the
+    /// outbound debounce — `checkStateVector` reports `(false, false)` then.
     public func waitForInSync(
         documentId: String,
         timeoutMs: Int = 10_000,
         pollMs: Int = 200
     ) async throws {
-        var stableReadings = 0
-        let stableTarget = 2  // two consecutive true readings
-        try await pollUntil(timeoutMs: timeoutMs, pollMs: pollMs) {
-            if self.documentManager.isSynced(documentId) {
-                stableReadings += 1
-                return stableReadings >= stableTarget
-            }
-            stableReadings = 0
-            return false
-        }
+        try await awaitStateVector(
+            documentId: documentId,
+            timeoutMs: timeoutMs,
+            pollMs: pollMs,
+            operation: "waitForInSync"
+        ) { $0.inSync }
     }
 
-    /// Wait until any pending local writes for the doc have been
-    /// acknowledged by the server. Implementation: a sync gate, since
-    /// `isSynced` flips to true only after both inbound and outbound
-    /// sync drains. Mirrors js-bao's
-    /// `waitForWriteConfirmation(docId, timeoutMs)`.
+    /// Wait until the server confirms it holds all of this client's writes.
+    /// Polls the live `checkStateVector` round trip until it reports
+    /// `includesWrites`, throwing on timeout. Mirrors js-bao's
+    /// `waitForWriteConfirmation`. Because it depends on a real server round
+    /// trip, it correctly does NOT confirm a write that's still in the 50ms
+    /// outbound debounce or unsendable because the socket is down —
+    /// `checkStateVector` reports `(false, false)` then.
     public func waitForWriteConfirmation(
         documentId: String,
         timeoutMs: Int = 10_000,
         pollMs: Int = 200
     ) async throws {
-        try await waitForInSync(
-            documentId: documentId, timeoutMs: timeoutMs, pollMs: pollMs
+        try await awaitStateVector(
+            documentId: documentId,
+            timeoutMs: timeoutMs,
+            pollMs: pollMs,
+            operation: "waitForWriteConfirmation"
+        ) { $0.includesWrites }
+    }
+
+    /// Poll the live `checkStateVector` round trip until `satisfied` reports
+    /// true or the caller's `timeoutMs` elapses, throwing `.unavailable` on
+    /// timeout. Each inner round trip is bounded by the caller's *remaining*
+    /// time, not `checkStateVector`'s default 5s: when the socket is open but
+    /// the server never answers a `stateVectorCheck`, an unbounded inner call
+    /// would block for the full 5s before the outer deadline was re-checked,
+    /// so a short-timeout waiter (e.g. `waitForInSync(timeoutMs: 300)`) could
+    /// block for ~5s instead of the requested 300ms (issue #1979).
+    private func awaitStateVector(
+        documentId: String,
+        timeoutMs: Int,
+        pollMs: Int,
+        operation: String,
+        satisfied: (_ verdict: (includesWrites: Bool, inSync: Bool)) -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        while true {
+            let remainingMs = Int((deadline.timeIntervalSinceNow * 1000).rounded())
+            if remainingMs <= 0 { break }
+            // Bound the round trip by the time the caller still has, so a
+            // silent server can't stretch the wait past `timeoutMs`.
+            if satisfied(await checkStateVector(documentId: documentId, timeoutMs: remainingMs)) {
+                return
+            }
+            // Sleep the poll interval, but never past the deadline.
+            let leftMs = Int((deadline.timeIntervalSinceNow * 1000).rounded())
+            if leftMs <= 0 { break }
+            let sleepMs = min(max(0, pollMs), leftMs)
+            if sleepMs > 0 {
+                try await Task.sleep(nanoseconds: UInt64(sleepMs) * 1_000_000)
+            }
+        }
+        throw JsBaoError(
+            code: .unavailable,
+            message: "\(operation) timeout for \(documentId)"
         )
     }
 
@@ -1232,11 +1270,11 @@ public final class JsBaoClient: @unchecked Sendable {
 
         let waiterId = UUID()
         return await withCheckedContinuation { (continuation: CheckedContinuation<(includesWrites: Bool, inSync: Bool), Never>) in
-            stateVectorLock.lock()
-            stateVectorWaiters[documentId, default: []].append(
-                StateVectorWaiter(id: waiterId, continuation: continuation)
-            )
-            stateVectorLock.unlock()
+            stateVectorLock.withLock {
+                stateVectorWaiters[documentId, default: []].append(
+                    StateVectorWaiter(id: waiterId, continuation: continuation)
+                )
+            }
 
             // Resolve to a failure verdict if no response lands in time.
             DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(timeoutMs)) { [weak self] in
@@ -1262,20 +1300,20 @@ public final class JsBaoClient: @unchecked Sendable {
         documentId: String,
         result: (includesWrites: Bool, inSync: Bool)
     ) {
-        stateVectorLock.lock()
-        guard var waiters = stateVectorWaiters[documentId],
-              let idx = waiters.firstIndex(where: { $0.id == id }) else {
-            stateVectorLock.unlock()
-            return
+        let resolved: StateVectorWaiter? = stateVectorLock.withLock {
+            guard var waiters = stateVectorWaiters[documentId],
+                  let idx = waiters.firstIndex(where: { $0.id == id }) else {
+                return nil
+            }
+            let waiter = waiters.remove(at: idx)
+            if waiters.isEmpty {
+                stateVectorWaiters.removeValue(forKey: documentId)
+            } else {
+                stateVectorWaiters[documentId] = waiters
+            }
+            return waiter
         }
-        let waiter = waiters.remove(at: idx)
-        if waiters.isEmpty {
-            stateVectorWaiters.removeValue(forKey: documentId)
-        } else {
-            stateVectorWaiters[documentId] = waiters
-        }
-        stateVectorLock.unlock()
-        waiter.continuation.resume(returning: result)
+        resolved?.continuation.resume(returning: result)
     }
 
     /// Route an incoming `stateVectorCheckResponse` to every waiter parked
@@ -1285,9 +1323,9 @@ public final class JsBaoClient: @unchecked Sendable {
         includesWrites: Bool,
         inSync: Bool
     ) {
-        stateVectorLock.lock()
-        let waiters = stateVectorWaiters.removeValue(forKey: documentId) ?? []
-        stateVectorLock.unlock()
+        let waiters = stateVectorLock.withLock {
+            stateVectorWaiters.removeValue(forKey: documentId) ?? []
+        }
         for waiter in waiters {
             waiter.continuation.resume(returning: (includesWrites, inSync))
         }
@@ -1314,7 +1352,13 @@ public final class JsBaoClient: @unchecked Sendable {
     private func pollUntil(
         timeoutMs: Int,
         pollMs: Int,
-        predicate: @escaping @Sendable () -> Bool
+        // The predicate is invoked synchronously on this method's own
+        // executor, once per poll iteration, and is never stored or sent
+        // to another task — so it doesn't need to be `@Sendable`. Dropping
+        // `@Sendable` lets a caller's predicate mutate captured state without
+        // a false concurrent-mutation diagnostic (the closure never escapes
+        // to concurrent execution).
+        predicate: @escaping () -> Bool
     ) async throws {
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
         while Date() < deadline {
@@ -1545,17 +1589,12 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Get current network mode
     public func getNetworkMode() -> NetworkMode {
-        lock.lock()
-        defer { lock.unlock() }
-        return networkMode
+        lock.withLock { networkMode }
     }
 
     /// Get detailed network status
     public func getNetworkStatus() -> NetworkStatus {
-        lock.lock()
-        let mode = networkMode
-        let lastOnline = lastOnlineAt
-        lock.unlock()
+        let (mode, lastOnline) = lock.withLock { (networkMode, lastOnlineAt) }
         return NetworkStatus(
             mode: mode,
             isOnline: mode != .offline,
@@ -1616,9 +1655,9 @@ public final class JsBaoClient: @unchecked Sendable {
         _ mode: NetworkMode,
         options: SetNetworkModeOptions = SetNetworkModeOptions()
     ) {
-        lock.lock()
-        networkMode = mode
-        lock.unlock()
+        lock.withLock {
+            networkMode = mode
+        }
         authController.setNetworkMode(mode)
         events.emit(.networkMode, NetworkModeEvent(
             mode: mode,
@@ -1644,22 +1683,33 @@ public final class JsBaoClient: @unchecked Sendable {
     /// and disconnect — never connect without a token. With a usable
     /// token, just connect.
     internal func runOnlineAuthHandoff() async {
-        lock.lock()
-        if let inFlight = pendingOnlineHandoff {
-            lock.unlock()
-            await inFlight.value
-            return
+        // Single-flight: check the in-flight handoff and register a new one in
+        // ONE lock hold (matching AuthController's refresh coalescing), then
+        // await outside the lock. Only the caller that started the task clears
+        // `pendingOnlineHandoff` — a coalesced caller just awaits and returns,
+        // exactly as the raw-lock version did.
+        enum HandoffStart {
+            case existing(Task<Void, Never>)
+            case started(Task<Void, Never>)
         }
-        let task = Task<Void, Never> { [weak self] in
-            await self?.runOnlineAuthHandoffImpl()
+        let start: HandoffStart = lock.withLock {
+            if let inFlight = pendingOnlineHandoff {
+                return .existing(inFlight)
+            }
+            let task = Task<Void, Never> { [weak self] in
+                await self?.runOnlineAuthHandoffImpl()
+            }
+            pendingOnlineHandoff = task
+            return .started(task)
         }
-        pendingOnlineHandoff = task
-        lock.unlock()
 
-        await task.value
-        lock.lock()
-        pendingOnlineHandoff = nil
-        lock.unlock()
+        switch start {
+        case .existing(let inFlight):
+            await inFlight.value
+        case .started(let task):
+            await task.value
+            lock.withLock { pendingOnlineHandoff = nil }
+        }
     }
 
     private func runOnlineAuthHandoffImpl() async {
@@ -1807,16 +1857,15 @@ public final class JsBaoClient: @unchecked Sendable {
                     let resumedLock = NSLock()
 
                     func isResumed() -> Bool {
-                        resumedLock.lock()
-                        defer { resumedLock.unlock() }
-                        return resumed.value
+                        resumedLock.withLock { resumed.value }
                     }
 
                     func resumeOnce() {
-                        resumedLock.lock()
-                        let alreadyResumed = resumed.value
-                        resumed.value = true
-                        resumedLock.unlock()
+                        let alreadyResumed = resumedLock.withLock { () -> Bool in
+                            let was = resumed.value
+                            resumed.value = true
+                            return was
+                        }
                         if !alreadyResumed {
                             cont.resume()
                         }
@@ -1871,12 +1920,12 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Close a document
     public func closeDocument(_ documentId: String, options: CloseDocumentOptions = CloseDocumentOptions()) async {
-        lock.lock()
-        subscribedDocuments.remove(documentId)
-        outboundDebounceTimers[documentId]?.cancel()
-        outboundDebounceTimers.removeValue(forKey: documentId)
-        pendingUpdates.removeValue(forKey: documentId)
-        lock.unlock()
+        lock.withLock {
+            subscribedDocuments.remove(documentId)
+            outboundDebounceTimers[documentId]?.cancel()
+            outboundDebounceTimers.removeValue(forKey: documentId)
+            pendingUpdates.removeValue(forKey: documentId)
+        }
 
         // Drop this doc's rows from every cross-document store before the
         // YDocument is torn down, so later `Model.query()` reads don't
@@ -1996,6 +2045,14 @@ public final class JsBaoClient: @unchecked Sendable {
             fatalError("Document \(documentId) is not open")
         }
 
+        // `YDocument` isn't `Sendable`, but every access below runs under
+        // the doc's exclusive FFI lock (`withExclusiveAccess`), which
+        // serializes it against observer registration on other threads
+        // (#1126) — a guarantee the compiler can't see. Alias it as
+        // `nonisolated(unsafe)` so the cross-thread capture into the
+        // `DispatchQueue.global` closure is allowed while keeping the lock
+        // discipline that actually makes it safe.
+        nonisolated(unsafe) let unsafeDoc = doc
         let result: (T, [UInt8]) = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 // Use raw YrsDoc to bypass syncQueue entirely. Raw access
@@ -2003,8 +2060,8 @@ public final class JsBaoClient: @unchecked Sendable {
                 // registration (model connect, doc open) on another thread
                 // while one of these transactions is live panics in yrs and
                 // aborts the process (#1126).
-                let payload: (T, [UInt8]) = doc.withExclusiveAccess {
-                    let rawDoc = doc.document
+                let payload: (T, [UInt8]) = unsafeDoc.withExclusiveAccess {
+                    let rawDoc = unsafeDoc.document
 
                     // 1. Get state vector before write
                     let svTxn = rawDoc.transact(origin: nil)
@@ -2141,9 +2198,9 @@ public final class JsBaoClient: @unchecked Sendable {
     public func startNetworkSync(documentId: String) async {
         guard let message = documentManager.buildSyncStep1Message(documentId: documentId) else { return }
 
-        lock.lock()
-        subscribedDocuments.insert(documentId)
-        lock.unlock()
+        lock.withLock {
+            _ = subscribedDocuments.insert(documentId)
+        }
 
         do {
             try await wsManager.send(message)
@@ -2242,8 +2299,12 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - HTTP API
 
-    /// Make an authenticated HTTP request
-    public func makeRequest(_ method: String, _ path: String, _ data: Any? = nil) async throws -> Any {
+    /// Make an authenticated HTTP request.
+    ///
+    /// Returns `nil` for a 2xx response with an empty body (the honest
+    /// `Any?`); non-empty responses return the decoded JSON graph. Callers
+    /// narrow with `as?` / `try?` as before.
+    public func makeRequest(_ method: String, _ path: String, _ data: Any? = nil) async throws -> Any? {
         try await httpClient.request(method: method, path: path, data: data)
     }
 
@@ -2366,14 +2427,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `logSessionEndEvent`.
     private func logSessionEndEvent(reason: String) {
         guard options.analyticsAutoEvents.sessionEnd else { return }
-        lock.lock()
-        if sessionEndLogged {
-            lock.unlock()
-            return
+        let start: Date? = lock.withLock {
+            if sessionEndLogged { return nil }
+            sessionEndLogged = true
+            return sessionStartAt
         }
-        sessionEndLogged = true
-        let start = sessionStartAt
-        lock.unlock()
+        guard let start else { return }
 
         let durationMs = max(0, Int(Date().timeIntervalSince(start) * 1000))
         analyticsQueue.logEvent(
@@ -2422,19 +2481,20 @@ public final class JsBaoClient: @unchecked Sendable {
         ) { [weak self] _ in
             self?.triggerReturnActiveEvent(trigger: "didBecomeActive")
         }
-        lock.lock()
-        lifecycleObservers = [background, terminate, foreground]
-        lock.unlock()
+        lock.withLock {
+            lifecycleObservers = [background, terminate, foreground]
+        }
         #endif
     }
 
     /// Remove any registered lifecycle observers. Safe to call multiple
     /// times; clears the stored tokens.
     private func removeLifecycleObservers() {
-        lock.lock()
-        let observers = lifecycleObservers
-        lifecycleObservers = []
-        lock.unlock()
+        let observers = lock.withLock { () -> [NSObjectProtocol] in
+            let current = lifecycleObservers
+            lifecycleObservers = []
+            return current
+        }
         #if canImport(UIKit)
         for token in observers {
             NotificationCenter.default.removeObserver(token)
@@ -2494,16 +2554,17 @@ public final class JsBaoClient: @unchecked Sendable {
         // download-only `bytesTransferred/totalBytes`, not an upload-start
         // signal). Left unwired; flagged in the report.
 
-        lock.lock()
-        analyticsEventSubscriptions = subs
-        lock.unlock()
+        lock.withLock {
+            analyticsEventSubscriptions = subs
+        }
     }
 
     private func removeAnalyticsAutoEventObservers() {
-        lock.lock()
-        let subs = analyticsEventSubscriptions
-        analyticsEventSubscriptions = []
-        lock.unlock()
+        let subs = lock.withLock { () -> [EventSubscription] in
+            let current = analyticsEventSubscriptions
+            analyticsEventSubscriptions = []
+            return current
+        }
         for sub in subs { sub.cancel() }
     }
 
@@ -2518,38 +2579,36 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `ensureAnalyticsMetadataHydrated`. Resets the mirror when the user
     /// changes.
     private func ensureAnalyticsMetadataHydrated(userId: String) async {
-        lock.lock()
-        if analyticsMetadataHydrated && analyticsMetadataUserId == userId {
-            lock.unlock()
-            return
+        let alreadyHydrated = lock.withLock { () -> Bool in
+            if analyticsMetadataHydrated && analyticsMetadataUserId == userId {
+                return true
+            }
+            // User changed (or first hydrate) — clear and reload.
+            if analyticsMetadataUserId != userId {
+                lastDailyAuthDate = nil
+                lastReturnActiveAt = nil
+            }
+            return false
         }
-        // User changed (or first hydrate) — clear and reload.
-        if analyticsMetadataUserId != userId {
-            lastDailyAuthDate = nil
-            lastReturnActiveAt = nil
-        }
-        lock.unlock()
+        guard !alreadyHydrated else { return }
 
         let record = try? await offlineStore.loadAnalyticsMetadata(appId: options.appId, userId: userId)
-        lock.lock()
-        lastDailyAuthDate = record?.lastDailyAuthDate
-        if let raw = record?.lastReturnActiveAt, let ms = Double(raw) {
-            lastReturnActiveAt = Date(timeIntervalSince1970: ms / 1000.0)
-        } else {
-            lastReturnActiveAt = nil
+        lock.withLock {
+            lastDailyAuthDate = record?.lastDailyAuthDate
+            if let raw = record?.lastReturnActiveAt, let ms = Double(raw) {
+                lastReturnActiveAt = Date(timeIntervalSince1970: ms / 1000.0)
+            } else {
+                lastReturnActiveAt = nil
+            }
+            analyticsMetadataHydrated = true
+            analyticsMetadataUserId = userId
         }
-        analyticsMetadataHydrated = true
-        analyticsMetadataUserId = userId
-        lock.unlock()
     }
 
     /// Persist the in-memory analytics-metadata mirror. Mirrors js-bao's
     /// `persistAnalyticsMetadata` — writes `nil` (delete) when empty.
     private func persistAnalyticsMetadata(userId: String) async {
-        lock.lock()
-        let date = lastDailyAuthDate
-        let returnAt = lastReturnActiveAt
-        lock.unlock()
+        let (date, returnAt) = lock.withLock { (lastDailyAuthDate, lastReturnActiveAt) }
 
         var record = AnalyticsMetadataRecord()
         if let date { record.lastDailyAuthDate = date }
@@ -2577,15 +2636,14 @@ public final class JsBaoClient: @unchecked Sendable {
             guard let self else { return }
             await self.ensureAnalyticsMetadataHydrated(userId: userId)
             let today = Self.analyticsDayString(Date())
-            self.lock.lock()
-            if self.lastDailyAuthDate == today {
-                self.lock.unlock()
-                return
+            let alreadyLogged = self.lock.withLock { () -> Bool in
+                if self.lastDailyAuthDate == today { return true }
+                self.lastDailyAuthDate = today
+                self.analyticsMetadataHydrated = true
+                self.analyticsMetadataUserId = userId
+                return false
             }
-            self.lastDailyAuthDate = today
-            self.analyticsMetadataHydrated = true
-            self.analyticsMetadataUserId = userId
-            self.lock.unlock()
+            guard !alreadyLogged else { return }
 
             self.analyticsQueue.logEvent(
                 AnalyticsEventInput(action: "user_active_daily", feature: "session")
@@ -2605,18 +2663,19 @@ public final class JsBaoClient: @unchecked Sendable {
             guard let self else { return }
             await self.ensureAnalyticsMetadataHydrated(userId: userId)
             let now = Date()
-            self.lock.lock()
-            if let last = self.lastReturnActiveAt {
-                let elapsedMs = now.timeIntervalSince(last) * 1000
-                if elapsedMs < Double(minResumeMs) {
-                    self.lock.unlock()
-                    return
+            let withinCooldown = self.lock.withLock { () -> Bool in
+                if let last = self.lastReturnActiveAt {
+                    let elapsedMs = now.timeIntervalSince(last) * 1000
+                    if elapsedMs < Double(minResumeMs) {
+                        return true
+                    }
                 }
+                self.lastReturnActiveAt = now
+                self.analyticsMetadataHydrated = true
+                self.analyticsMetadataUserId = userId
+                return false
             }
-            self.lastReturnActiveAt = now
-            self.analyticsMetadataHydrated = true
-            self.analyticsMetadataUserId = userId
-            self.lock.unlock()
+            guard !withinCooldown else { return }
 
             self.analyticsQueue.logEvent(
                 AnalyticsEventInput(
@@ -2636,16 +2695,17 @@ public final class JsBaoClient: @unchecked Sendable {
         guard options.analyticsAutoEvents.syncErrorsEnabled else { return }
         let minIntervalMs = options.analyticsAutoEvents.syncErrorsMinIntervalMs
         let now = Date()
-        lock.lock()
-        if let last = lastSyncErrorEventAt {
-            let elapsedMs = now.timeIntervalSince(last) * 1000
-            if elapsedMs < Double(minIntervalMs) {
-                lock.unlock()
-                return
+        let withinCooldown = lock.withLock { () -> Bool in
+            if let last = lastSyncErrorEventAt {
+                let elapsedMs = now.timeIntervalSince(last) * 1000
+                if elapsedMs < Double(minIntervalMs) {
+                    return true
+                }
             }
+            lastSyncErrorEventAt = now
+            return false
         }
-        lastSyncErrorEventAt = now
-        lock.unlock()
+        guard !withinCooldown else { return }
 
         analyticsQueue.logEvent(
             AnalyticsEventInput(
@@ -2664,13 +2724,12 @@ public final class JsBaoClient: @unchecked Sendable {
     private func handleBlobUploadComplete(_ event: BlobUploadCompletedEvent) {
         guard options.analyticsAutoEvents.blobUploadsSuccess else { return }
         let key = event.blobId
-        lock.lock()
-        if key.isEmpty || blobUploadSuccessLogged.contains(key) {
-            lock.unlock()
-            return
+        let alreadyLogged = lock.withLock { () -> Bool in
+            if key.isEmpty || blobUploadSuccessLogged.contains(key) { return true }
+            blobUploadSuccessLogged.insert(key)
+            return false
         }
-        blobUploadSuccessLogged.insert(key)
-        lock.unlock()
+        guard !alreadyLogged else { return }
 
         analyticsQueue.logEvent(
             AnalyticsEventInput(
@@ -2690,13 +2749,12 @@ public final class JsBaoClient: @unchecked Sendable {
     private func handleBlobUploadFailed(_ event: BlobUploadFailedEvent) {
         guard options.analyticsAutoEvents.blobUploadsFailure else { return }
         let key = event.blobId
-        lock.lock()
-        if key.isEmpty || blobUploadFailureLogged.contains(key) {
-            lock.unlock()
-            return
+        let alreadyLogged = lock.withLock { () -> Bool in
+            if key.isEmpty || blobUploadFailureLogged.contains(key) { return true }
+            blobUploadFailureLogged.insert(key)
+            return false
         }
-        blobUploadFailureLogged.insert(key)
-        lock.unlock()
+        guard !alreadyLogged else { return }
 
         analyticsQueue.logEvent(
             AnalyticsEventInput(
@@ -2736,7 +2794,7 @@ public final class JsBaoClient: @unchecked Sendable {
             documentId: documentId,
             client: self,
             blobManager: blobManager,
-            makeRequest: makeRequest
+            makeRequest: { try await self.makeRequest($0, $1, $2) as Any }
         )
     }
 
@@ -2744,15 +2802,14 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Destroy the client and clean up resources
     public func destroy() async {
-        lock.lock()
-        guard !isDestroyed else {
-            lock.unlock()
-            return
+        let alreadyDestroyed = lock.withLock { () -> Bool in
+            if isDestroyed { return true }
+            isDestroyed = true
+            outboundDebounceTimers.values.forEach { $0.cancel() }
+            outboundDebounceTimers.removeAll()
+            return false
         }
-        isDestroyed = true
-        outboundDebounceTimers.values.forEach { $0.cancel() }
-        outboundDebounceTimers.removeAll()
-        lock.unlock()
+        guard !alreadyDestroyed else { return }
 
         await disconnect()
         await documentManager.destroy()
@@ -2811,7 +2868,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // Wire blob manager dependencies
         blobManager.makeRequest = { [weak self] method, path, data in
             guard let self = self else { throw JsBaoError(code: .unavailable) }
-            return try await self.makeRequest(method, path, data)
+            return try await self.makeRequest(method, path, data) as Any
         }
         blobManager.makeRawRequest = { [weak self] method, path, data, headers in
             guard let self = self else { throw JsBaoError(code: .unavailable) }
@@ -2840,7 +2897,7 @@ public final class JsBaoClient: @unchecked Sendable {
     private func setupSubApis() {
         let request: (String, String, Any?) async throws -> Any = { [weak self] method, path, data in
             guard let self = self else { throw JsBaoError(code: .unavailable) }
-            return try await self.makeRequest(method, path, data)
+            return try await self.makeRequest(method, path, data) as Any
         }
 
         let cacheFacade = CacheFacade(
@@ -2898,10 +2955,13 @@ public final class JsBaoClient: @unchecked Sendable {
             let response = try await self.httpClient.requestRaw(
                 method: method, path: path, data: data, options: options
             )
+            // `requestRaw` decodes the body into `text` (and, for JSON,
+            // `data`); it never carries raw bytes, so reconstruct them
+            // from `text`. (Previously this checked `response.data as? Data`
+            // first, but `data` was never a `Data` value — that branch
+            // never matched — and it is now a `Sendable` `JSONValue?`.)
             let bodyData: Data
-            if let raw = response.data as? Data {
-                bodyData = raw
-            } else if let text = response.text {
+            if let text = response.text {
                 bodyData = Data(text.utf8)
             } else {
                 bodyData = Data()
@@ -3073,87 +3133,83 @@ public final class JsBaoClient: @unchecked Sendable {
 
     private func setupStorage() {
         Task {
-            do {
-                let provider: StorageProvider
-                let authProvider: StorageProvider
-                switch options.storageConfig {
-                case .sqlite(let directory):
-                    // One provider, shared across general + auth namespaces.
-                    //
-                    // Two providers pointing at the same file would each open
-                    // their own SQLite handle. WAL mode allows concurrent
-                    // reads, but a JWT write running on the auth provider
-                    // while the general provider writes (analytics queue
-                    // restore, doc metadata, etc.) hits the file lock and
-                    // returns SQLITE_BUSY ("database is locked"). The
-                    // historical motivation for two providers was that
-                    // `initialize(namespace:)` used to silently re-bind the
-                    // open DB when namespaces differed — that was fixed in
-                    // the same commit (initialize is now idempotent for the
-                    // same path, throws on re-bind), and with `databasePath`
-                    // explicitly set, every initialize call resolves to the
-                    // same file and the second is a no-op. The kv_store
-                    // `store` column already namespaces auth records vs
-                    // everything else, so they don't collide on rows either.
-                    //
-                    // #853: when the app passes `.sqlite()` (no
-                    // directory), resolve a stable per-appId path here
-                    // rather than letting `SQLiteStorageProvider` fall
-                    // back to namespace-derived directories. Without
-                    // this, the auth namespace (`auth:<appId>:…`) and
-                    // the user namespace (`<appId>:<userId>`) resolved
-                    // to different files and the second `initialize`
-                    // tripped the re-bind guard mid-`createDocument`.
-                    let resolvedPath = directory
-                        ?? SQLiteStorageProvider.defaultDatabasePath(appId: options.appId)
-                    let sqlite = try SQLiteStorageProvider(path: resolvedPath)
-                    provider = sqlite
-                    authProvider = sqlite
-                case .memory:
-                    provider = MemoryStorageProvider()
-                    authProvider = MemoryStorageProvider()
-                }
-
-                offlineStore.setStorageProvider(provider)
-                offlineStore.setAuthStorageProvider(authProvider)
-                kvCache.setStorageProvider(provider)
-
-                // Bootstrap auth
-                if let token = options.token {
-                    authController.bootstrapToken(token)
-                } else {
-                    // Restore from persisted JWT — and, if it's aged out,
-                    // attempt a cookie-based refresh before declaring the
-                    // session dead. Access tokens live 1h; the refresh cookie
-                    // persisted by URLSession lives 7d.
-                    await authController.tryRestoreSession()
-                }
-
-                // Snapshot the restored user into the user-scoped managers and
-                // load that user's local metadata.
-                await bindCurrentUserScopedStorage()
-
-                // Restore analytics queue
-                await analyticsQueue.restoreBuffer()
-
-                // Storage init is fully settled — token restored (or none) and
-                // the user-scoped state (documentManager.userId + metadata)
-                // snapshotted. Signal now, BEFORE the optional network
-                // auto-connect, so waiters unblock on local readiness without
-                // waiting on the network (#1780).
-                markStorageReady()
-
-                // Auto-connect if online
-                if options.autoNetwork && isOnline() {
-                    try? await connect()
-                }
-            } catch {
-                logger.error("Storage setup failed:", error.localizedDescription)
+            let provider: StorageProvider
+            let authProvider: StorageProvider
+            switch options.storageConfig {
+            case .sqlite(let directory):
+                // One provider, shared across general + auth namespaces.
+                //
+                // Two providers pointing at the same file would each open
+                // their own SQLite handle. WAL mode allows concurrent
+                // reads, but a JWT write running on the auth provider
+                // while the general provider writes (analytics queue
+                // restore, doc metadata, etc.) hits the file lock and
+                // returns SQLITE_BUSY ("database is locked"). The
+                // historical motivation for two providers was that
+                // `initialize(namespace:)` used to silently re-bind the
+                // open DB when namespaces differed — that was fixed in
+                // the same commit (initialize is now idempotent for the
+                // same path, throws on re-bind), and with `databasePath`
+                // explicitly set, every initialize call resolves to the
+                // same file and the second is a no-op. The kv_store
+                // `store` column already namespaces auth records vs
+                // everything else, so they don't collide on rows either.
+                //
+                // #853: when the app passes `.sqlite()` (no
+                // directory), resolve a stable per-appId path here
+                // rather than letting `SQLiteStorageProvider` fall
+                // back to namespace-derived directories. Without
+                // this, the auth namespace (`auth:<appId>:…`) and
+                // the user namespace (`<appId>:<userId>`) resolved
+                // to different files and the second `initialize`
+                // tripped the re-bind guard mid-`createDocument`.
+                let resolvedPath = directory
+                    ?? SQLiteStorageProvider.defaultDatabasePath(appId: options.appId)
+                // `SQLiteStorageProvider.init(path:)` only stores the path;
+                // the connection binds lazily at `initialize()` first-use
+                // time, which is where an open failure surfaces. Nothing
+                // here throws, so there is no error path to catch.
+                let sqlite = SQLiteStorageProvider(path: resolvedPath)
+                provider = sqlite
+                authProvider = sqlite
+            case .memory:
+                provider = MemoryStorageProvider()
+                authProvider = MemoryStorageProvider()
             }
-            // Idempotent guarantee: fire the signal even if setup threw before
-            // reaching the marker above, so `waitForStorageReady` never stalls
-            // a caller on the error path.
+
+            offlineStore.setStorageProvider(provider)
+            offlineStore.setAuthStorageProvider(authProvider)
+            kvCache.setStorageProvider(provider)
+
+            // Bootstrap auth
+            if let token = options.token {
+                authController.bootstrapToken(token)
+            } else {
+                // Restore from persisted JWT — and, if it's aged out,
+                // attempt a cookie-based refresh before declaring the
+                // session dead. Access tokens live 1h; the refresh cookie
+                // persisted by URLSession lives 7d.
+                await authController.tryRestoreSession()
+            }
+
+            // Snapshot the restored user into the user-scoped managers and
+            // load that user's local metadata.
+            await bindCurrentUserScopedStorage()
+
+            // Restore analytics queue
+            await analyticsQueue.restoreBuffer()
+
+            // Storage init is fully settled — token restored (or none) and
+            // the user-scoped state (documentManager.userId + metadata)
+            // snapshotted. Signal now, BEFORE the optional network
+            // auto-connect, so waiters unblock on local readiness without
+            // waiting on the network (#1780).
             markStorageReady()
+
+            // Auto-connect if online
+            if options.autoNetwork && isOnline() {
+                try? await connect()
+            }
         }
     }
 
@@ -3220,15 +3276,14 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Resume all parked waiters and latch the ready flag. Idempotent.
     private func markStorageReady() {
-        storageReadyLock.lock()
-        if storageReady {
-            storageReadyLock.unlock()
-            return
+        let waiters: [CheckedContinuation<Void, Never>]? = storageReadyLock.withLock {
+            if storageReady { return nil }
+            storageReady = true
+            let pending = Array(storageReadyWaiters.values)
+            storageReadyWaiters.removeAll()
+            return pending
         }
-        storageReady = true
-        let waiters = Array(storageReadyWaiters.values)
-        storageReadyWaiters.removeAll()
-        storageReadyLock.unlock()
+        guard let waiters else { return }
         for waiter in waiters { waiter.resume() }
     }
 
@@ -3240,22 +3295,18 @@ public final class JsBaoClient: @unchecked Sendable {
         let id = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                storageReadyLock.lock()
                 // `Task.isCancelled` closes the race where cancellation fires
                 // before this continuation is parked: the `onCancel` handler
                 // would find nothing to resume, so resume here instead.
-                if storageReady || Task.isCancelled {
-                    storageReadyLock.unlock()
-                    continuation.resume()
-                    return
+                let resumeNow = storageReadyLock.withLock { () -> Bool in
+                    if storageReady || Task.isCancelled { return true }
+                    storageReadyWaiters[id] = continuation
+                    return false
                 }
-                storageReadyWaiters[id] = continuation
-                storageReadyLock.unlock()
+                if resumeNow { continuation.resume() }
             }
         } onCancel: {
-            storageReadyLock.lock()
-            let waiter = storageReadyWaiters.removeValue(forKey: id)
-            storageReadyLock.unlock()
+            let waiter = storageReadyLock.withLock { storageReadyWaiters.removeValue(forKey: id) }
             waiter?.resume()
         }
     }
@@ -3314,6 +3365,7 @@ public final class JsBaoClient: @unchecked Sendable {
         case "syncComplete":
             guard let roomId = roomId else { return }
             documentManager.handleSyncComplete(documentId: roomId)
+            reconcileUnsyncedAfterSync(documentId: roomId)
 
         case "stateVectorCheckResponse":
             // Server's verdict for a `checkStateVector` round-trip. The
@@ -3535,33 +3587,76 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Queue and debounce local document updates for sending
     func queueOutboundUpdate(documentId: String, update: [UInt8]) {
-        lock.lock()
-        var updates = pendingUpdates[documentId] ?? []
-        updates.append(update)
-        pendingUpdates[documentId] = updates
+        lock.withLock {
+            var updates = pendingUpdates[documentId] ?? []
+            updates.append(update)
+            pendingUpdates[documentId] = updates
 
-        // Cancel existing timer
-        outboundDebounceTimers[documentId]?.cancel()
+            // Cancel existing timer
+            outboundDebounceTimers[documentId]?.cancel()
 
-        let debounceMs = options.sync.outboundDebounceMs
-        outboundDebounceTimers[documentId] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(debounceMs) * 1_000_000)
-            await self?.flushOutboundUpdates(documentId: documentId)
+            let debounceMs = options.sync.outboundDebounceMs
+            outboundDebounceTimers[documentId] = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(debounceMs) * 1_000_000)
+                await self?.flushOutboundUpdates(documentId: documentId)
+            }
         }
-        lock.unlock()
+
+        // Mark the doc unsynced the moment an edit is queued — it holds local
+        // state the server doesn't have yet. Cleared only once the send
+        // actually reaches the socket (in `flushOutboundUpdates`). Done outside
+        // `lock` because `DocumentManager` guards this flag with its own lock.
+        documentManager.markUnsyncedLocalChanges(documentId, true)
     }
 
     private func flushOutboundUpdates(documentId: String) async {
-        lock.lock()
-        guard let updates = pendingUpdates.removeValue(forKey: documentId), !updates.isEmpty else {
-            lock.unlock()
-            return
+        let updates: [[UInt8]]? = lock.withLock {
+            guard let pending = pendingUpdates.removeValue(forKey: documentId), !pending.isEmpty else {
+                return nil
+            }
+            return pending
         }
-        lock.unlock()
+        guard let updates else { return }
 
-        // Send each update
+        // Send each update, tracking whether every one reached the socket.
+        var allSent = true
         for update in updates {
-            await documentManager.sendLocalUpdate(documentId: documentId, update: update)
+            let sent = await documentManager.sendLocalUpdate(documentId: documentId, update: update)
+            if !sent { allSent = false }
+        }
+
+        // Clear the unsynced flag only if every update reached the socket AND no
+        // fresh edit was queued while we were flushing. A send failure (socket
+        // down) or a newly-queued edit leaves the doc flagged unsynced, so the
+        // evict guard keeps protecting it.
+        if allSent {
+            let stillPending = lock.withLock { !(pendingUpdates[documentId]?.isEmpty ?? true) }
+            if !stillPending {
+                documentManager.markUnsyncedLocalChanges(documentId, false)
+            }
+        }
+    }
+
+    /// Reconcile the outbound-unsynced flag after a (re)sync completes.
+    ///
+    /// The flush above leaves the flag set when a send fails (socket dropped
+    /// mid-flush): `pendingUpdates` was already removed but `allSent` is false,
+    /// so `markUnsyncedLocalChanges(_, false)` never runs. A later reconnect
+    /// re-syncs the document through the normal `syncStep1`/`syncStep2`
+    /// exchange — which re-delivers the local diff to the server — but that
+    /// path never cleared the flag, so `documents.evict`/`evictAll` kept
+    /// rejecting the doc without `force` even after the server had caught up
+    /// (issue #1979 codex review).
+    ///
+    /// So once a sync completes, clear the flag — but only when no fresh edit
+    /// is still queued for send. A non-empty `pendingUpdates` means a real
+    /// local edit hasn't drained yet; clearing then would reintroduce the
+    /// original lost-edit-on-evict bug, so we leave it set and let
+    /// `flushOutboundUpdates` clear it once that edit reaches the socket.
+    func reconcileUnsyncedAfterSync(documentId: String) {
+        let hasQueuedEdit = lock.withLock { !(pendingUpdates[documentId]?.isEmpty ?? true) }
+        if !hasQueuedEdit {
+            documentManager.markUnsyncedLocalChanges(documentId, false)
         }
     }
 }
@@ -3604,9 +3699,9 @@ extension JsBaoClient: WebSocketManagerDelegate {
     public func webSocketManagerOnStatusChange(_ status: ConnectionStatus) {
         events.emit(.status, StatusChangedEvent(status: status))
         if status == .connected {
-            lock.lock()
-            lastOnlineAt = Date()
-            lock.unlock()
+            lock.withLock {
+                lastOnlineAt = Date()
+            }
         }
     }
 

@@ -263,12 +263,17 @@ public enum GroupAddMemberResult: Decodable, Sendable, Equatable {
 // it to `Decodable` so the typed `groups` returns can decode straight into
 // it without redeclaring the type.
 extension PaginatedResult: Decodable where T: Decodable {
-    private enum CodingKeys: String, CodingKey { case items, cursor }
+    private enum CodingKeys: String, CodingKey {
+        case items, cursor, nextCursor, hasMore
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let items = try c.decodeIfPresent([T].self, forKey: .items) ?? []
+        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
         let cursor = try c.decodeIfPresent(String.self, forKey: .cursor)
-        self.init(items: items, cursor: cursor)
+        let nextCursor = try c.decodeIfPresent(String.self, forKey: .nextCursor)
+        let hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore)
+        self.init(items: items, cursor: cursor, nextCursor: nextCursor, hasMore: hasMore)
     }
 }

@@ -54,6 +54,20 @@ let package = Package(
                 .product(name: "TOMLKit", package: "TOMLKit"),
             ],
             path: "Sources/JsBaoClient",
+            // Swift 6 language mode is NOT yet enabled on this target.
+            // Issue #1910 eliminated the 231 `unavailable from
+            // asynchronous contexts` warnings (hard errors under Swift 6)
+            // by converting raw NSLock lock/unlock to scoped `withLock`.
+            // Turning on the language mode here
+            // (`swiftSettings: [.swiftLanguageMode(.v6)]`, plus a
+            // `swift-tools-version` 6.0 bump and a package-level
+            // `swiftLanguageModes: [.v5]` pin to keep the flip scoped to
+            // this one target) then surfaces ~851 further strict-
+            // concurrency errors — ~740 of them `Sendable`-conformance on
+            // the public generic model API (`Any` payloads, `YDocument`,
+            // the `R` model parameter) — which is a substantial adoption
+            // beyond the NSLock refactor's scope. Tracked in #1946; flip
+            // this target once that lands.
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]

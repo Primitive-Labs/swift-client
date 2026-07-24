@@ -92,10 +92,14 @@ public final class InvitationsAPI: @unchecked Sendable {
     ///   - type: Filter to `.document` or `.group` only.
     ///   - email: Filter to grants targeting this email.
     ///   - limit: Page size.
+    ///   - cursor: Continuation token from a previous page's `nextCursor`
+    ///     (#1316). Without it the server's real position cursor is
+    ///     unreachable and a caller can never advance past page one.
     public func listDeferredGrants(
         type: DeferredGrantType? = nil,
         email: String? = nil,
-        limit: Int? = nil
+        limit: Int? = nil,
+        cursor: String? = nil
     ) async throws -> DeferredGrantListResult {
         var qs: [String] = []
         if let type { qs.append("type=\(type.rawValue)") }
@@ -104,6 +108,10 @@ public final class InvitationsAPI: @unchecked Sendable {
             qs.append("email=\(escaped)")
         }
         if let limit { qs.append("limit=\(limit)") }
+        if let cursor,
+           let escaped = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            qs.append("cursor=\(escaped)")
+        }
         let path = qs.isEmpty
             ? "/deferred-grants"
             : "/deferred-grants?\(qs.joined(separator: "&"))"

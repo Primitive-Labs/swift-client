@@ -58,6 +58,7 @@ public final class MeAPI: @unchecked Sendable {
             },
             options: mergedOptions
         )
+        guard let value = value else { return nil }
         return try? JSONCoding.decode(UserProfile.self, from: value)
     }
 

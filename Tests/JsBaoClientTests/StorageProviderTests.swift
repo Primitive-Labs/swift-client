@@ -150,4 +150,42 @@ final class StorageProviderTests: XCTestCase {
         await provider.close()
         XCTAssertFalse(provider.isReady())
     }
+
+    // MARK: - Memory Concurrency (issue #1910 — NSLock → withLock)
+
+    /// Concurrent fan-out over `MemoryStorageProvider`'s lock-guarded public
+    /// ops after the `NSLock.lock()/unlock()` → `withLock` conversion. Many
+    /// tasks race `put`/`get`/`has` against the same store; the invariant is
+    /// no lost update — every key written must be readable and `keys()` must
+    /// contain all of them. A non-atomic critical section (e.g. a dropped
+    /// `withLock` around the entries read-modify-write) would lose writes.
+    func testMemoryProviderConcurrentPutsDoNotLoseUpdates() async throws {
+        let provider = MemoryStorageProvider()
+        try await provider.initialize(namespace: "concurrency")
+
+        let count = 300
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for i in 0..<count {
+                group.addTask {
+                    try await provider.put(store: "s", key: "key-\(i)", value: i, metadata: nil)
+                    // Interleave reads with the writes to exercise the lock
+                    // under mixed access.
+                    _ = try await provider.has(store: "s", key: "key-\(i)")
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let keys = try await provider.keys(store: "s")
+        XCTAssertEqual(keys.count, count, "every concurrent put must survive — no lost update")
+        XCTAssertEqual(Set(keys), Set((0..<count).map { "key-\($0)" }))
+
+        // Spot-check a sample of values round-tripped correctly.
+        for i in stride(from: 0, to: count, by: 37) {
+            let record: StorageRecord<Int>? = try await provider.get(store: "s", key: "key-\(i)")
+            XCTAssertEqual(record?.value, i)
+        }
+
+        await provider.close()
+    }
 }

@@ -73,6 +73,14 @@ public final class DocumentManager: @unchecked Sendable {
     // Flag to suppress update observer during remote update application
     private var applyingRemoteUpdate: [String: Bool] = [:]
 
+    /// Docs holding a local edit that hasn't been transmitted to the server
+    /// yet — set when an update is queued for outbound send, cleared once the
+    /// send actually reaches the socket. Mirrors js-bao's
+    /// `hasUnsyncedLocalChangesByDoc`. This is the real outbound-drain signal
+    /// the evict guard relies on; `docSyncStates` only records the initial
+    /// sync round-trip and never resets on a later local edit or a disconnect.
+    private var unconfirmedLocalWrites: Set<String> = []
+
     /// Per-doc debounce tasks for local-first SQLite persistence. Every
     /// YDoc update (local edit OR remote-applied sync) reschedules a
     /// `persistDocumentToLocal` call after a short delay so bursty
@@ -110,6 +118,15 @@ public final class DocumentManager: @unchecked Sendable {
         self.logger = logger.forScope(scope: "docMgr")
     }
 
+    /// Decision produced under `lock` in `openDocument` so the trailing
+    /// `await` runs OUTSIDE the lock: return an already-open doc, await
+    /// another caller's in-flight open, or claim the slot ourselves.
+    private enum OpenOutcome {
+        case existing(YDocument)
+        case awaitInFlight(Task<YDocument, Error>)
+        case started(Task<YDocument, Error>)
+    }
+
     // MARK: - Document Lifecycle
 
     /// Open a document, restoring from local persistence if available.
@@ -124,41 +141,51 @@ public final class DocumentManager: @unchecked Sendable {
         documentId: String,
         options: OpenDocumentOptions
     ) async throws -> YDocument {
-        // Fast path: already fully open
-        lock.lock()
-        if let existing = openDocs[documentId] {
-            lock.unlock()
-            return existing
-        }
-        // Coalesce: another caller is already opening this docId — await
-        // their Task instead of starting a duplicate open.
-        if let inFlight = pendingOpens[documentId] {
-            lock.unlock()
-            return try await inFlight.value
-        }
-        // Claim the slot atomically by registering a Task that will
-        // run the full open lifecycle. Subsequent callers in the
-        // window before this Task completes will see `pendingOpens`
-        // and await it.
-        let task = Task<YDocument, Error> { [weak self] in
-            guard let self = self else {
-                throw NSError(
-                    domain: "DocumentManager",
-                    code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "DocumentManager deallocated mid-open"]
-                )
+        // Fast path / coalesce: decide under one lock hold. The check
+        // for an already-open doc, the check for another caller's
+        // in-flight open, and claiming the slot by registering our own
+        // Task are atomic together — without that atomicity two callers
+        // could both miss `pendingOpens` and each start a duplicate
+        // open. The `await` that follows always runs OUTSIDE the lock.
+        let outcome: OpenOutcome = lock.withLock {
+            // Fast path: already fully open
+            if let existing = openDocs[documentId] {
+                return .existing(existing)
             }
-            return try await self._openDocumentImpl(documentId: documentId, options: options)
+            // Coalesce: another caller is already opening this docId —
+            // await their Task instead of starting a duplicate open.
+            if let inFlight = pendingOpens[documentId] {
+                return .awaitInFlight(inFlight)
+            }
+            // Claim the slot atomically by registering a Task that will
+            // run the full open lifecycle. Subsequent callers in the
+            // window before this Task completes will see `pendingOpens`
+            // and await it.
+            let task = Task<YDocument, Error> { [weak self] in
+                guard let self = self else {
+                    throw NSError(
+                        domain: "DocumentManager",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "DocumentManager deallocated mid-open"]
+                    )
+                }
+                return try await self._openDocumentImpl(documentId: documentId, options: options)
+            }
+            pendingOpens[documentId] = task
+            return .started(task)
         }
-        pendingOpens[documentId] = task
-        lock.unlock()
 
-        defer {
-            lock.lock()
-            pendingOpens.removeValue(forKey: documentId)
-            lock.unlock()
+        switch outcome {
+        case .existing(let existing):
+            return existing
+        case .awaitInFlight(let inFlight):
+            return try await inFlight.value
+        case .started(let task):
+            defer {
+                lock.withLock { _ = pendingOpens.removeValue(forKey: documentId) }
+            }
+            return try await task.value
         }
-        return try await task.value
     }
 
     /// Actual open-document implementation. Always runs inside the
@@ -170,18 +197,16 @@ public final class DocumentManager: @unchecked Sendable {
         let doc = YDocument()
         let startTime = CFAbsoluteTimeGetCurrent()
 
-        lock.lock()
-        openDocs[documentId] = doc
-        docOpenStartTime[documentId] = startTime
-        docSyncStates[documentId] = false
-        docAwareness[documentId] = AwarenessEntry()
-        lock.unlock()
+        lock.withLock {
+            openDocs[documentId] = doc
+            docOpenStartTime[documentId] = startTime
+            docSyncStates[documentId] = false
+            docAwareness[documentId] = AwarenessEntry()
+        }
 
         // Create sync protocol for this document
         let syncProtocol = YProtocol(document: doc)
-        lock.lock()
-        syncProtocols[documentId] = syncProtocol
-        lock.unlock()
+        lock.withLock { syncProtocols[documentId] = syncProtocol }
 
         // Wire up SQLite-backed Y.Doc persistence for this document.
         // Previously `docPersistence` was declared but never populated —
@@ -203,9 +228,7 @@ public final class DocumentManager: @unchecked Sendable {
                 storageProvider: storageProvider,
                 documentId: documentId
             )
-            lock.lock()
-            docPersistence[documentId] = persistence
-            lock.unlock()
+            lock.withLock { docPersistence[documentId] = persistence }
 
             // Restore from SQLite: load the serialized Y.Doc state and
             // apply it inside a transaction so BaoModel<T> queries work
@@ -272,24 +295,24 @@ public final class DocumentManager: @unchecked Sendable {
 
         // Load metadata
         if let metadata = try? await offlineStore?.getMetadata(appId: appId, userId: userId, documentId: documentId) {
-            lock.lock()
-            metadataIndex[documentId] = metadata
-            if let permStr = metadata.permission, let perm = DocumentPermission(rawValue: permStr) {
-                docPermissions[documentId] = perm
+            lock.withLock {
+                metadataIndex[documentId] = metadata
+                if let permStr = metadata.permission, let perm = DocumentPermission(rawValue: permStr) {
+                    docPermissions[documentId] = perm
+                }
             }
-            lock.unlock()
         }
 
         // Stamp `lastOpenedAt` so retention policy enforcement can
         // sort and TTL-evict by recency. Mirrors js-bao
         // `documentManager._openCore` line 676.
         let nowIso = ISO8601DateFormatter().string(from: Date())
-        lock.lock()
-        var meta = metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
-        meta.lastOpenedAt = nowIso
-        metadataIndex[documentId] = meta
-        let metaSnapshot = meta
-        lock.unlock()
+        let metaSnapshot: LocalMetadataEntry = lock.withLock {
+            var meta = metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
+            meta.lastOpenedAt = nowIso
+            metadataIndex[documentId] = meta
+            return meta
+        }
         try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
 
         // Register update observer — equivalent to JS `doc.on("update", handler)`.
@@ -301,10 +324,9 @@ public final class DocumentManager: @unchecked Sendable {
             // holding the lock, so a remote-update apply that arrives between
             // the read and the dispatch can't reclassify a local update as
             // remote (or vice-versa).
-            self.lock.lock()
-            let isRemote = self.applyingRemoteUpdate[docId] == true
-            let callback = self.onLocalUpdate
-            self.lock.unlock()
+            let (isRemote, callback) = self.lock.withLock {
+                (self.applyingRemoteUpdate[docId] == true, self.onLocalUpdate)
+            }
             if !isRemote {
                 callback?(docId, update)
             }
@@ -317,9 +339,7 @@ public final class DocumentManager: @unchecked Sendable {
             // YDoc state. Closes the durability gap left by #852.
             self.schedulePersist(documentId: docId)
         }
-        lock.lock()
-        updateSubscriptions[documentId] = subscription
-        lock.unlock()
+        lock.withLock { updateSubscriptions[documentId] = subscription }
 
         return doc
     }
@@ -339,18 +359,19 @@ public final class DocumentManager: @unchecked Sendable {
             await persistDocumentToLocal(documentId: documentId)
         }
 
-        lock.lock()
-        let doc = openDocs.removeValue(forKey: documentId)
-        docSyncStates.removeValue(forKey: documentId)
-        docOpenStartTime.removeValue(forKey: documentId)
-        docServerBytes.removeValue(forKey: documentId)
-        syncProtocols.removeValue(forKey: documentId)
-        updateSubscriptions.removeValue(forKey: documentId)?.cancel()
-        docAwareness.removeValue(forKey: documentId)
-        docPersistence.removeValue(forKey: documentId)
-        syncPerfRequestedDocs.remove(documentId)
-        clientSyncTimings.removeValue(forKey: documentId)
-        lock.unlock()
+        lock.withLock {
+            _ = openDocs.removeValue(forKey: documentId)
+            docSyncStates.removeValue(forKey: documentId)
+            unconfirmedLocalWrites.remove(documentId)
+            docOpenStartTime.removeValue(forKey: documentId)
+            docServerBytes.removeValue(forKey: documentId)
+            syncProtocols.removeValue(forKey: documentId)
+            updateSubscriptions.removeValue(forKey: documentId)?.cancel()
+            docAwareness.removeValue(forKey: documentId)
+            docPersistence.removeValue(forKey: documentId)
+            syncPerfRequestedDocs.remove(documentId)
+            clientSyncTimings.removeValue(forKey: documentId)
+        }
 
         if options.evictLocal {
             await evictLocalData(documentId: documentId)
@@ -363,13 +384,10 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Generate syncStep1 message (state vector) for a document
     public func buildSyncStep1Message(documentId: String) -> String? {
-        lock.lock()
-        guard let doc = openDocs[documentId] else {
-            lock.unlock()
-            return nil
+        let syncProto: YProtocol? = lock.withLock {
+            guard openDocs[documentId] != nil else { return nil }
+            return syncProtocols[documentId]
         }
-        let syncProto = syncProtocols[documentId]
-        lock.unlock()
 
         guard let syncProto = syncProto else { return nil }
 
@@ -406,20 +424,18 @@ public final class DocumentManager: @unchecked Sendable {
     /// Mark a document as wanting server sync-perf timings on its next
     /// sync round-trips. Mirrors JS `setSyncPerfRequested`.
     public func setSyncPerfRequested(_ documentId: String, _ value: Bool) {
-        lock.lock()
-        if value {
-            syncPerfRequestedDocs.insert(documentId)
-        } else {
-            syncPerfRequestedDocs.remove(documentId)
+        lock.withLock {
+            if value {
+                syncPerfRequestedDocs.insert(documentId)
+            } else {
+                syncPerfRequestedDocs.remove(documentId)
+            }
         }
-        lock.unlock()
     }
 
     /// Mirrors JS `isSyncPerfRequested`.
     public func isSyncPerfRequested(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return syncPerfRequestedDocs.contains(documentId)
+        lock.withLock { syncPerfRequestedDocs.contains(documentId) }
     }
 
     // MARK: - Client sync-perf instrumentation
@@ -434,37 +450,31 @@ public final class DocumentManager: @unchecked Sendable {
     /// Record a single client-side timing value for a document. Mirrors
     /// JS `DocumentManager.setSyncTiming`.
     public func setSyncTiming(_ documentId: String, _ key: String, _ value: Double) {
-        lock.lock()
-        defer { lock.unlock() }
-        var timings = clientSyncTimings[documentId] ?? [:]
-        timings[key] = value
-        clientSyncTimings[documentId] = timings
+        lock.withLock {
+            var timings = clientSyncTimings[documentId] ?? [:]
+            timings[key] = value
+            clientSyncTimings[documentId] = timings
+        }
     }
 
     /// Read the raw client-side timing map for a document (including the
     /// internal `syncStep1SentAt` anchor). Mirrors JS
     /// `DocumentManager.getSyncTimings`.
     public func getSyncTimings(_ documentId: String) -> [String: Double]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return clientSyncTimings[documentId]
+        lock.withLock { clientSyncTimings[documentId] }
     }
 
     /// Drop all client-side timings for a document. Mirrors JS
     /// `DocumentManager.clearSyncTimings`.
     public func clearSyncTimings(_ documentId: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        clientSyncTimings.removeValue(forKey: documentId)
+        lock.withLock { _ = clientSyncTimings.removeValue(forKey: documentId) }
     }
 
     /// Reset and anchor a fresh sync-timing window for a document.
     /// Mirrors JS `sendSyncStep1`, which clears prior timings and stamps
     /// `syncStep1SentAt` immediately before sending the syncStep1 frame.
     public func markSyncStep1Sent(_ documentId: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        clientSyncTimings[documentId] = ["syncStep1SentAt": Self.nowMs()]
+        lock.withLock { clientSyncTimings[documentId] = ["syncStep1SentAt": Self.nowMs()] }
     }
 
     /// Capture the per-phase timings that JS records inside `handleUpdate`
@@ -474,9 +484,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// caller. Mirrors the `clientRoundTripMs` / `clientUpdateBytes` /
     /// `clientApplyMs` writes in JS `handleUpdate`.
     private func recordUpdatePhaseTimings(documentId: String, updateBytes: Int, applyMs: Double) {
-        lock.lock()
-        let sentAt = clientSyncTimings[documentId]?["syncStep1SentAt"]
-        lock.unlock()
+        let sentAt = lock.withLock { clientSyncTimings[documentId]?["syncStep1SentAt"] }
         if let sentAt = sentAt {
             setSyncTiming(documentId, "clientRoundTripMs", Self.nowMs() - sentAt)
         }
@@ -487,12 +495,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// Build a syncStep2 response message given the server's state vector.
     /// This sends the client's diff back to the server so it gets any data we have that it doesn't.
     public func buildSyncStep2Response(documentId: String, serverStateVectorBase64: String) -> String? {
-        lock.lock()
-        guard let doc = openDocs[documentId] else {
-            lock.unlock()
-            return nil
-        }
-        lock.unlock()
+        guard let doc = lock.withLock({ openDocs[documentId] }) else { return nil }
 
         guard let svData = Data(base64Encoded: serverStateVectorBase64) else { return nil }
         let serverSV = [UInt8](svData)
@@ -525,19 +528,16 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Handle syncStep2 response from server
     public func handleSyncStep2(documentId: String, updateBase64: String) {
-        lock.lock()
-        guard let doc = openDocs[documentId] else {
-            lock.unlock()
-            return
+        let doc: YDocument? = lock.withLock {
+            guard let d = openDocs[documentId] else { return nil }
+            applyingRemoteUpdate[documentId] = true
+            return d
         }
-        applyingRemoteUpdate[documentId] = true
-        lock.unlock()
+        guard let doc else { return }
 
         guard let updateData = Data(base64Encoded: updateBase64) else {
             logger.warn("Invalid base64 in syncStep2 for doc:", documentId)
-            lock.lock()
-            applyingRemoteUpdate[documentId] = false
-            lock.unlock()
+            lock.withLock { applyingRemoteUpdate[documentId] = false }
             return
         }
 
@@ -553,14 +553,10 @@ public final class DocumentManager: @unchecked Sendable {
         }
         let applyMs = Self.nowMs() - applyStartMs
 
-        lock.lock()
-        applyingRemoteUpdate[documentId] = false
-        lock.unlock()
+        lock.withLock { applyingRemoteUpdate[documentId] = false }
 
         let bytes = updateData.count
-        lock.lock()
-        docServerBytes[documentId] = (docServerBytes[documentId] ?? 0) + bytes
-        lock.unlock()
+        lock.withLock { docServerBytes[documentId] = (docServerBytes[documentId] ?? 0) + bytes }
 
         // Mirror JS `handleUpdate` (which handles both syncStep2 and
         // incremental update frames): capture round-trip, byte count, and
@@ -570,19 +566,16 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Handle an incremental update from server
     public func handleUpdate(documentId: String, updateBase64: String) {
-        lock.lock()
-        guard let doc = openDocs[documentId] else {
-            lock.unlock()
-            return
+        let doc: YDocument? = lock.withLock {
+            guard let d = openDocs[documentId] else { return nil }
+            applyingRemoteUpdate[documentId] = true
+            return d
         }
-        applyingRemoteUpdate[documentId] = true
-        lock.unlock()
+        guard let doc else { return }
 
         guard let updateData = Data(base64Encoded: updateBase64) else {
             logger.warn("Invalid base64 in update for doc:", documentId)
-            lock.lock()
-            applyingRemoteUpdate[documentId] = false
-            lock.unlock()
+            lock.withLock { applyingRemoteUpdate[documentId] = false }
             return
         }
 
@@ -598,9 +591,7 @@ public final class DocumentManager: @unchecked Sendable {
         }
         let applyMs = Self.nowMs() - applyStartMs
 
-        lock.lock()
-        applyingRemoteUpdate[documentId] = false
-        lock.unlock()
+        lock.withLock { applyingRemoteUpdate[documentId] = false }
 
         // Mirror JS `handleUpdate`: capture round-trip, byte count, and
         // apply duration for `syncPerf.clientTimings`.
@@ -609,12 +600,14 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Handle syncComplete message
     public func handleSyncComplete(documentId: String) {
-        lock.lock()
-        docSyncStates[documentId] = true
-        let startTime = docOpenStartTime[documentId]
-        let bytes = docServerBytes[documentId]
-        let syncStep1SentAt = clientSyncTimings[documentId]?["syncStep1SentAt"]
-        lock.unlock()
+        let (startTime, bytes, syncStep1SentAt): (CFAbsoluteTime?, Int?, Double?) = lock.withLock {
+            docSyncStates[documentId] = true
+            return (
+                docOpenStartTime[documentId],
+                docServerBytes[documentId],
+                clientSyncTimings[documentId]?["syncStep1SentAt"]
+            )
+        }
 
         // Mirror JS `syncComplete` handler: total time from syncStep1 send
         // to sync completion, for `syncPerf.clientTimings.clientTotalMs`.
@@ -641,18 +634,23 @@ public final class DocumentManager: @unchecked Sendable {
 
             // Also persist metadata so hasLocalCopy works across sessions
             if self.offlineStore != nil {
-                self.lock.lock()
-                var entry = self.metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
-                entry.metadataSyncedAt = ISO8601DateFormatter().string(from: Date())
-                self.metadataIndex[documentId] = entry
-                self.lock.unlock()
+                let entry: LocalMetadataEntry = self.lock.withLock {
+                    var e = self.metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
+                    e.metadataSyncedAt = ISO8601DateFormatter().string(from: Date())
+                    self.metadataIndex[documentId] = e
+                    return e
+                }
                 try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: entry)
             }
         }
     }
 
-    /// Send a local update to the server
-    public func sendLocalUpdate(documentId: String, update: [UInt8]) async {
+    /// Send a local update to the server. Returns `true` when the update was
+    /// handed to the socket, `false` when there is no socket wired or the send
+    /// threw (e.g. the connection is down). Callers use this to decide whether
+    /// the doc's outbound edits have actually drained.
+    @discardableResult
+    public func sendLocalUpdate(documentId: String, update: [UInt8]) async -> Bool {
         let base64 = Data(update).base64EncodedString()
         let message: [String: Any] = [
             "type": "update",
@@ -662,37 +660,34 @@ public final class DocumentManager: @unchecked Sendable {
 
         guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            return
+            return false
         }
 
+        guard let send = sendWebSocketMessage else { return false }
         do {
-            try await sendWebSocketMessage?(jsonString)
+            try await send(jsonString)
+            return true
         } catch {
             logger.warn("Failed to send update for doc:", documentId, error.localizedDescription)
+            return false
         }
     }
 
     // MARK: - Document State
 
     public func getDocument(_ documentId: String) -> YDocument? {
-        lock.lock()
-        defer { lock.unlock() }
-        return openDocs[documentId]
+        lock.withLock { openDocs[documentId] }
     }
 
     /// Snapshot of every currently-open `(documentId, YDocument)`. Used by
     /// `JsBaoClient.registerModels` to connect already-open documents to a
     /// model's shared cross-document store the moment it's registered.
     public func openDocumentsSnapshot() -> [(documentId: String, doc: YDocument)] {
-        lock.lock()
-        defer { lock.unlock() }
-        return openDocs.map { (documentId: $0.key, doc: $0.value) }
+        lock.withLock { openDocs.map { (documentId: $0.key, doc: $0.value) } }
     }
 
     public func isSynced(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return docSyncStates[documentId] ?? false
+        lock.withLock { docSyncStates[documentId] ?? false }
     }
 
     /// Whether any CRDT updates have been applied to the open ydoc.
@@ -702,9 +697,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// checking shared-type sizes, which can read 0 before the shared
     /// types are materialized after an applyUpdate.
     public func ydocHasData(_ documentId: String) -> Bool {
-        lock.lock()
-        let doc = openDocs[documentId]
-        lock.unlock()
+        let doc = lock.withLock { openDocs[documentId] }
         guard let doc else { return false }
         var stateVectorLength = 0
         doc.transactSync { txn in
@@ -714,54 +707,38 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     public func isOpen(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return openDocs[documentId] != nil
+        lock.withLock { openDocs[documentId] != nil }
     }
 
     public func getPermission(_ documentId: String) -> DocumentPermission? {
-        lock.lock()
-        defer { lock.unlock() }
-        return docPermissions[documentId]
+        lock.withLock { docPermissions[documentId] }
     }
 
     public func setPermission(_ documentId: String, permission: DocumentPermission) {
-        lock.lock()
-        docPermissions[documentId] = permission
-        lock.unlock()
+        lock.withLock { docPermissions[documentId] = permission }
         emitter?.emit(.permission, PermissionEvent(documentId: documentId, permission: permission))
     }
 
     public func isReadOnly(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return docPermissions[documentId] == .reader
+        lock.withLock { docPermissions[documentId] == .reader }
     }
 
     public func listOpenDocuments() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return Array(openDocs.keys)
+        lock.withLock { Array(openDocs.keys) }
     }
 
     // MARK: - Metadata
 
     public func getMetadataIndex() -> [String: LocalMetadataEntry] {
-        lock.lock()
-        defer { lock.unlock() }
-        return metadataIndex
+        lock.withLock { metadataIndex }
     }
 
     public func getLocalMetadata(_ documentId: String) -> LocalMetadataEntry? {
-        lock.lock()
-        defer { lock.unlock() }
-        return metadataIndex[documentId]
+        lock.withLock { metadataIndex[documentId] }
     }
 
     public func setMetadata(_ documentId: String, entry: LocalMetadataEntry) {
-        lock.lock()
-        metadataIndex[documentId] = entry
-        lock.unlock()
+        lock.withLock { metadataIndex[documentId] = entry }
     }
 
     /// Encode a `LocalMetadataEntry` to a `[String: Any]` for event
@@ -791,9 +768,7 @@ public final class DocumentManager: @unchecked Sendable {
 
             if let permStr = docData["permission"] as? String,
                let perm = DocumentPermission(rawValue: permStr) {
-                lock.lock()
-                docPermissions[documentId] = perm
-                lock.unlock()
+                lock.withLock { docPermissions[documentId] = perm }
             }
 
             // Persist
@@ -816,15 +791,11 @@ public final class DocumentManager: @unchecked Sendable {
     // MARK: - Pending Creates
 
     public func isPendingCreate(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return pendingCreates.contains(documentId)
+        lock.withLock { pendingCreates.contains(documentId) }
     }
 
     public func isLocalOnly(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return localOnlyDocs.contains(documentId)
+        lock.withLock { localOnlyDocs.contains(documentId) }
     }
 
     /// Create a document locally (offline or local-only). Pass
@@ -866,18 +837,18 @@ public final class DocumentManager: @unchecked Sendable {
         // the first save, mirroring `_openDocumentImpl`'s deferred path.)
         let syncProtocol = YProtocol(document: doc)
 
-        lock.lock()
-        openDocs[documentId] = doc
-        docSyncStates[documentId] = false
-        syncProtocols[documentId] = syncProtocol
-        docAwareness[documentId] = AwarenessEntry()
-        metadataIndex[documentId] = metadata
-        if localOnly {
-            localOnlyDocs.insert(documentId)
-        } else {
-            pendingCreates.insert(documentId)
+        lock.withLock {
+            openDocs[documentId] = doc
+            docSyncStates[documentId] = false
+            syncProtocols[documentId] = syncProtocol
+            docAwareness[documentId] = AwarenessEntry()
+            metadataIndex[documentId] = metadata
+            if localOnly {
+                localOnlyDocs.insert(documentId)
+            } else {
+                pendingCreates.insert(documentId)
+            }
         }
-        lock.unlock()
 
         // Persist metadata
         try await offlineStore?.putMetadata(appId: appId, userId: userId, record: metadata)
@@ -924,50 +895,50 @@ public final class DocumentManager: @unchecked Sendable {
                 throw JsBaoError(code: .unavailable, message: "Remote create not configured")
             }
 
-            let result = try await createRemote(body)
+            _ = try await createRemote(body)
 
             // Success
-            lock.lock()
-            pendingCreates.remove(documentId)
-            if var meta = metadataIndex[documentId] {
+            let metaToPersist: LocalMetadataEntry? = lock.withLock {
+                pendingCreates.remove(documentId)
+                guard var meta = metadataIndex[documentId] else { return nil }
                 meta.pendingCreate = false
                 meta.commitError = nil
                 metadataIndex[documentId] = meta
-                lock.unlock()
-                try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: meta)
-            } else {
-                lock.unlock()
+                return meta
+            }
+            if let metaToPersist {
+                try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
             }
 
             return ["created": true]
         } catch let error as HttpError where error.status == 409 {
             if onExists == "link" {
-                lock.lock()
-                pendingCreates.remove(documentId)
-                if var meta = metadataIndex[documentId] {
+                let metaToPersist: LocalMetadataEntry? = lock.withLock {
+                    pendingCreates.remove(documentId)
+                    guard var meta = metadataIndex[documentId] else { return nil }
                     meta.pendingCreate = false
                     metadataIndex[documentId] = meta
-                    lock.unlock()
-                    try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: meta)
-                } else {
-                    lock.unlock()
+                    return meta
+                }
+                if let metaToPersist {
+                    try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
                 }
                 return ["linked": true]
             }
             return ["reason": "exists"]
         } catch {
             // Record error and schedule retry
-            lock.lock()
-            if var meta = metadataIndex[documentId] {
+            let metaToPersist: LocalMetadataEntry? = lock.withLock {
+                guard var meta = metadataIndex[documentId] else { return nil }
                 meta.commitError = CommitError(
                     message: error.localizedDescription,
                     at: ISO8601DateFormatter().string(from: Date())
                 )
                 metadataIndex[documentId] = meta
-                lock.unlock()
-                try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: meta)
-            } else {
-                lock.unlock()
+                return meta
+            }
+            if let metaToPersist {
+                try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
             }
 
             emitter?.emit(.pendingCreateFailed, ["documentId": documentId, "error": error.localizedDescription] as [String: Any])
@@ -1002,15 +973,15 @@ public final class DocumentManager: @unchecked Sendable {
                 let nowIso = ISO8601DateFormatter().string(from: Date())
 
                 // Record the error + bump the retry counter, then persist.
-                self.lock.lock()
-                if var meta = self.metadataIndex[documentId] {
+                let metaAfterError: LocalMetadataEntry? = self.lock.withLock {
+                    guard var meta = self.metadataIndex[documentId] else { return nil }
                     meta.commitError = CommitError(message: message, at: nowIso)
                     meta.commitRetryCount = (meta.commitRetryCount ?? 0) + 1
                     self.metadataIndex[documentId] = meta
-                    self.lock.unlock()
-                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: meta)
-                } else {
-                    self.lock.unlock()
+                    return meta
+                }
+                if let metaAfterError {
+                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: metaAfterError)
                 }
 
                 self.emitter?.emit(
@@ -1019,9 +990,15 @@ public final class DocumentManager: @unchecked Sendable {
                 )
 
                 // Exponential backoff: min(maxMs, baseMs * factor^attempt), jittered.
-                var delayMs = min(
-                    backoff.maxMs,
-                    Int(Double(backoff.baseMs) * pow(backoff.factor, Double(attempt)))
+                // Cap in Double BEFORE converting: the `pow` term grows past
+                // Int.max (and reaches +infinity) at high attempt counts, and
+                // `Int(_:)` traps on such a value — capping after the
+                // conversion never runs.
+                var delayMs = Int(
+                    min(
+                        Double(backoff.maxMs),
+                        Double(backoff.baseMs) * pow(backoff.factor, Double(attempt))
+                    )
                 )
                 if backoff.jitter, delayMs > 0 {
                     delayMs = Int.random(in: 0...delayMs)
@@ -1031,14 +1008,14 @@ public final class DocumentManager: @unchecked Sendable {
                 let nextAtIso = ISO8601DateFormatter().string(
                     from: Date().addingTimeInterval(Double(delayMs) / 1000.0)
                 )
-                self.lock.lock()
-                if var meta = self.metadataIndex[documentId] {
+                let metaAfterSchedule: LocalMetadataEntry? = self.lock.withLock {
+                    guard var meta = self.metadataIndex[documentId] else { return nil }
                     meta.nextCommitAttemptAt = nextAtIso
                     self.metadataIndex[documentId] = meta
-                    self.lock.unlock()
-                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: meta)
-                } else {
-                    self.lock.unlock()
+                    return meta
+                }
+                if let metaAfterSchedule {
+                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: metaAfterSchedule)
                 }
 
                 // Give up after maxAttempts.
@@ -1054,40 +1031,36 @@ public final class DocumentManager: @unchecked Sendable {
                 }
 
                 // Schedule the next attempt.
-                self.lock.lock()
-                self.pendingCreateRetryTimers[documentId]?.cancel()
-                let timer = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(max(0, delayMs)) * 1_000_000)
-                    if Task.isCancelled { return }
-                    guard let self else { return }
-                    self.lock.lock()
-                    self.pendingCreateRetryTimers.removeValue(forKey: documentId)
-                    self.lock.unlock()
-                    self.scheduleCommitRetry(documentId: documentId, attempt: attempt + 1)
+                self.lock.withLock {
+                    self.pendingCreateRetryTimers[documentId]?.cancel()
+                    let timer = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(max(0, delayMs)) * 1_000_000)
+                        if Task.isCancelled { return }
+                        guard let self else { return }
+                        self.lock.withLock { _ = self.pendingCreateRetryTimers.removeValue(forKey: documentId) }
+                        self.scheduleCommitRetry(documentId: documentId, attempt: attempt + 1)
+                    }
+                    self.pendingCreateRetryTimers[documentId] = timer
                 }
-                self.pendingCreateRetryTimers[documentId] = timer
-                self.lock.unlock()
             }
         }
     }
 
     /// Cancel a pending create
     public func cancelPendingCreate(_ documentId: String) async {
-        lock.lock()
-        pendingCreates.remove(documentId)
-        pendingCreateRetryTimers[documentId]?.cancel()
-        pendingCreateRetryTimers.removeValue(forKey: documentId)
-        let _ = openDocs.removeValue(forKey: documentId)
-        metadataIndex.removeValue(forKey: documentId)
-        lock.unlock()
+        lock.withLock {
+            pendingCreates.remove(documentId)
+            pendingCreateRetryTimers[documentId]?.cancel()
+            pendingCreateRetryTimers.removeValue(forKey: documentId)
+            let _ = openDocs.removeValue(forKey: documentId)
+            _ = metadataIndex.removeValue(forKey: documentId)
+        }
 
         try? await offlineStore?.deleteMetadata(appId: appId, userId: userId, documentId: documentId)
     }
 
     public func listPendingCreates() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return Array(pendingCreates)
+        lock.withLock { Array(pendingCreates) }
     }
 
     // MARK: - Awareness State
@@ -1101,22 +1074,20 @@ public final class DocumentManager: @unchecked Sendable {
         _ documentId: String,
         state: [String: Any]
     ) -> (previousState: [String: Any]?, exists: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard var entry = docAwareness[documentId] else {
-            return (nil, false)
+        lock.withLock {
+            guard var entry = docAwareness[documentId] else {
+                return (nil, false)
+            }
+            let previous = entry.localState
+            entry.localState = state
+            docAwareness[documentId] = entry
+            return (previous, true)
         }
-        let previous = entry.localState
-        entry.localState = state
-        docAwareness[documentId] = entry
-        return (previous, true)
     }
 
     /// Get the full awareness snapshot for a document (local + remote states).
     public func getAwarenessSnapshot(_ documentId: String) -> AwarenessEntry? {
-        lock.lock()
-        defer { lock.unlock() }
-        return docAwareness[documentId]
+        lock.withLock { docAwareness[documentId] }
     }
 
     /// Apply an incoming remote awareness frame for a document and return
@@ -1130,14 +1101,13 @@ public final class DocumentManager: @unchecked Sendable {
         _ documentId: String,
         states: [[Any]]
     ) -> AwarenessDelta {
-        lock.lock()
-        defer { lock.unlock() }
-        guard var entry = docAwareness[documentId] else {
-            return AwarenessDelta()
-        }
+        lock.withLock {
+            guard var entry = docAwareness[documentId] else {
+                return AwarenessDelta()
+            }
 
-        var delta = AwarenessDelta()
-        for tuple in states {
+            var delta = AwarenessDelta()
+            for tuple in states {
             guard tuple.count >= 2, let clientId = tuple[0] as? String else { continue }
             let rawState = tuple[1]
             if rawState is NSNull {
@@ -1156,8 +1126,9 @@ public final class DocumentManager: @unchecked Sendable {
                 }
             }
         }
-        docAwareness[documentId] = entry
-        return delta
+            docAwareness[documentId] = entry
+            return delta
+        }
     }
 
     /// Remove awareness states for specific clients. Returns the IDs that
@@ -1171,57 +1142,55 @@ public final class DocumentManager: @unchecked Sendable {
         clientIds: [String],
         removeLocal: Bool = false
     ) -> [String] {
-        lock.lock()
-        guard var entry = docAwareness[documentId] else {
-            lock.unlock()
-            return []
-        }
-        var removed: [String] = []
-        for clientId in clientIds {
-            if entry.remoteStates.removeValue(forKey: clientId) != nil {
-                removed.append(clientId)
+        lock.withLock {
+            guard var entry = docAwareness[documentId] else {
+                return []
             }
+            var removed: [String] = []
+            for clientId in clientIds {
+                if entry.remoteStates.removeValue(forKey: clientId) != nil {
+                    removed.append(clientId)
+                }
+            }
+            if removeLocal {
+                entry.localState = nil
+            }
+            docAwareness[documentId] = entry
+            return removed
         }
-        if removeLocal {
-            entry.localState = nil
-        }
-        docAwareness[documentId] = entry
-        lock.unlock()
-        return removed
     }
 
     // MARK: - Local Data Management
 
     public func hasLocalCopy(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return metadataIndex[documentId] != nil || docPersistence[documentId] != nil
+        lock.withLock { metadataIndex[documentId] != nil || docPersistence[documentId] != nil }
     }
 
     public func evictLocalData(documentId: String) async {
         cancelPendingPersist(documentId: documentId)
-        lock.lock()
-        metadataIndex.removeValue(forKey: documentId)
-        docPersistence.removeValue(forKey: documentId)
-        lock.unlock()
+        lock.withLock {
+            metadataIndex.removeValue(forKey: documentId)
+            _ = docPersistence.removeValue(forKey: documentId)
+        }
 
         try? await offlineStore?.deleteMetadata(appId: appId, userId: userId, documentId: documentId)
     }
 
     public func evictAllLocalData() async {
-        lock.lock()
-        metadataIndex.removeAll()
-        docPersistence.removeAll()
-        openDocs.removeAll()
-        docSyncStates.removeAll()
-        docPermissions.removeAll()
-        pendingCreates.removeAll()
-        localOnlyDocs.removeAll()
-        pendingCreateRetryTimers.values.forEach { $0.cancel() }
-        pendingCreateRetryTimers.removeAll()
-        persistDebounceTasks.values.forEach { $0.cancel() }
-        persistDebounceTasks.removeAll()
-        lock.unlock()
+        lock.withLock {
+            metadataIndex.removeAll()
+            docPersistence.removeAll()
+            openDocs.removeAll()
+            docSyncStates.removeAll()
+            unconfirmedLocalWrites.removeAll()
+            docPermissions.removeAll()
+            pendingCreates.removeAll()
+            localOnlyDocs.removeAll()
+            pendingCreateRetryTimers.values.forEach { $0.cancel() }
+            pendingCreateRetryTimers.removeAll()
+            persistDebounceTasks.values.forEach { $0.cancel() }
+            persistDebounceTasks.removeAll()
+        }
 
         // Purge BOTH on-disk stores at the store level — the metadata store
         // (`meta`) AND the Yjs CRDT store (`yjs_docs`). A per-document delete
@@ -1259,11 +1228,9 @@ public final class DocumentManager: @unchecked Sendable {
         // Snapshot the metadata under the lock; eviction itself is
         // async and takes the lock, so we can't hold it across the
         // whole loop.
-        lock.lock()
-        let entries = Array(metadataIndex.values)
-        let openSet = Set(openDocs.keys)
-        let pendingSet = pendingCreates
-        lock.unlock()
+        let (entries, openSet, pendingSet) = lock.withLock {
+            (Array(metadataIndex.values), Set(openDocs.keys), pendingCreates)
+        }
 
         // TTL: evict any doc whose lastOpenedAt is older than ttlMs.
         if let ttlMs {
@@ -1280,11 +1247,10 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         // Re-snapshot after TTL pass; we may have evicted some entries.
-        lock.lock()
-        var remaining = Array(metadataIndex.values)
-        let openSet2 = Set(openDocs.keys)
-        let pendingSet2 = pendingCreates
-        lock.unlock()
+        let (remainingSnapshot, openSet2, pendingSet2) = lock.withLock {
+            (Array(metadataIndex.values), Set(openDocs.keys), pendingCreates)
+        }
+        var remaining = remainingSnapshot
 
         // Sort oldest-first by lastOpenedAt; treat missing as epoch.
         remaining.sort { a, b in
@@ -1310,11 +1276,10 @@ public final class DocumentManager: @unchecked Sendable {
         // maxBytes: drop the oldest until total bytes fits.
         if let maxBytes {
             // Re-snapshot post-maxDocs pass.
-            lock.lock()
-            var after = Array(metadataIndex.values)
-            let openSet3 = Set(openDocs.keys)
-            let pendingSet3 = pendingCreates
-            lock.unlock()
+            let (afterSnapshot, openSet3, pendingSet3) = lock.withLock {
+                (Array(metadataIndex.values), Set(openDocs.keys), pendingCreates)
+            }
+            var after = afterSnapshot
             after.sort { a, b in
                 let aTs = a.lastOpenedAt.flatMap { formatter.date(from: $0)?.timeIntervalSince1970 } ?? 0
                 let bTs = b.lastOpenedAt.flatMap { formatter.date(from: $0)?.timeIntervalSince1970 } ?? 0
@@ -1335,12 +1300,7 @@ public final class DocumentManager: @unchecked Sendable {
     // MARK: - Document Hash
 
     public func getDocHash(documentId: String) -> String? {
-        lock.lock()
-        guard let doc = openDocs[documentId] else {
-            lock.unlock()
-            return nil
-        }
-        lock.unlock()
+        guard let doc = lock.withLock({ openDocs[documentId] }) else { return nil }
 
         // Use state vector as a content hash for the document
         let stateVector: [UInt8] = doc.transactSync { txn in
@@ -1354,12 +1314,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// `stateVectorCheck` round-trip so it can report `includesWrites` /
     /// `inSync`. Mirrors js-bao's `toBase64(Y.encodeStateVector(ydoc))`.
     public func encodeStateVectorBase64(_ documentId: String) -> String? {
-        lock.lock()
-        guard let doc = openDocs[documentId] else {
-            lock.unlock()
-            return nil
-        }
-        lock.unlock()
+        guard let doc = lock.withLock({ openDocs[documentId] }) else { return nil }
 
         let stateVector: [UInt8] = doc.transactSync { txn in
             txn.transactionStateVector()
@@ -1368,17 +1323,40 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     /// `true` when the document holds local state the server may not have
-    /// yet — a pending offline create, or an open doc whose writes haven't
-    /// drained (`isSynced == false`). Drives the `evict` / `evictAll`
-    /// guard, mirroring js-bao's `hasUnsyncedLocalChangesByDoc` check.
+    /// yet. Drives the `evict` / `evictAll` guard, mirroring js-bao's
+    /// `hasUnsyncedLocalChangesByDoc` check. A doc is unsynced when any of:
+    ///   - it's a pending offline create (never persisted server-side), or
+    ///   - it has a local edit queued for send that hasn't reached the socket
+    ///     yet (still in the outbound debounce, or the send failed because the
+    ///     connection is down) — the real outbound-drain signal, and
+    ///   - it's open but hasn't completed its initial sync round-trip.
+    /// The middle clause is what makes this honest after initial sync:
+    /// `docSyncStates` sticks at `true` once initial sync completes and never
+    /// resets on a later edit or disconnect, so it alone can't protect a
+    /// just-made edit from eviction.
     public func hasUnsyncedLocalChanges(_ documentId: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if pendingCreates.contains(documentId) { return true }
-        if openDocs[documentId] != nil, !(docSyncStates[documentId] ?? false) {
-            return true
+        lock.withLock {
+            if pendingCreates.contains(documentId) { return true }
+            if unconfirmedLocalWrites.contains(documentId) { return true }
+            if openDocs[documentId] != nil, !(docSyncStates[documentId] ?? false) {
+                return true
+            }
+            return false
         }
-        return false
+    }
+
+    /// Record whether a doc has a local edit that hasn't reached the server
+    /// yet. Set `true` when an update is queued for outbound send, `false`
+    /// once the send actually reaches the socket. Mirrors js-bao's
+    /// `documentManager.markUnsyncedLocalChanges(documentId, value)`.
+    public func markUnsyncedLocalChanges(_ documentId: String, _ value: Bool) {
+        lock.withLock {
+            if value {
+                unconfirmedLocalWrites.insert(documentId)
+            } else {
+                unconfirmedLocalWrites.remove(documentId)
+            }
+        }
     }
 
     // MARK: - Persistence
@@ -1396,16 +1374,16 @@ public final class DocumentManager: @unchecked Sendable {
     /// are cheap and get replaced on the next update; full cleanup
     /// happens in `closeDocument` / `evictLocalData` / `evictAllLocalData`.
     private func schedulePersist(documentId: String) {
-        lock.lock()
-        persistDebounceTasks[documentId]?.cancel()
-        let task = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.persistDebounceNanos)
-            if Task.isCancelled { return }
-            guard let self = self else { return }
-            await self.persistDocumentToLocal(documentId: documentId)
+        lock.withLock {
+            persistDebounceTasks[documentId]?.cancel()
+            let task = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: Self.persistDebounceNanos)
+                if Task.isCancelled { return }
+                guard let self = self else { return }
+                await self.persistDocumentToLocal(documentId: documentId)
+            }
+            persistDebounceTasks[documentId] = task
         }
-        persistDebounceTasks[documentId] = task
-        lock.unlock()
     }
 
     /// Cancel a pending debounced persist for one doc, if any. Called
@@ -1413,18 +1391,11 @@ public final class DocumentManager: @unchecked Sendable {
     /// `evictLocalData`) so we don't race the immediate save / delete
     /// against the debounce.
     private func cancelPendingPersist(documentId: String) {
-        lock.lock()
-        persistDebounceTasks.removeValue(forKey: documentId)?.cancel()
-        lock.unlock()
+        lock.withLock { persistDebounceTasks.removeValue(forKey: documentId)?.cancel() }
     }
 
     private func persistDocumentToLocal(documentId: String) async {
-        lock.lock()
-        guard let doc = openDocs[documentId] else {
-            lock.unlock()
-            return
-        }
-        lock.unlock()
+        guard let doc = lock.withLock({ openDocs[documentId] }) else { return }
 
         // Get full document state as an update.
         // Use raw YrsDoc to avoid blocking the cooperative thread pool on
@@ -1447,12 +1418,9 @@ public final class DocumentManager: @unchecked Sendable {
         // identical from the outside (nothing in `kv_store`, no error
         // because the original code wrapped the whole thing in `try?`).
         let persistence: YjsSQLitePersistence? = {
-            lock.lock()
-            if let existing = docPersistence[documentId] {
-                lock.unlock()
+            if let existing = lock.withLock({ docPersistence[documentId] }) {
                 return existing
             }
-            lock.unlock()
             guard let offlineStore = offlineStore,
                   let provider = offlineStore.getStorageProvider() else {
                 return nil
@@ -1462,14 +1430,16 @@ public final class DocumentManager: @unchecked Sendable {
             // documentId could both reach this point and double-late-bind.
             // The instances would share a backing store and last-writer-
             // wins (no data loss), but log noise + redundant work. Keep
-            // the first one that won the race.
-            lock.lock()
-            if let winner = docPersistence[documentId] {
-                lock.unlock()
-                return winner
+            // the first one that won the race. The whole check-and-register
+            // is one atomic `withLock`: returning a winner means someone
+            // else registered first (use theirs); returning nil means we
+            // registered `p`.
+            let existingWinner: YjsSQLitePersistence? = lock.withLock {
+                if let winner = docPersistence[documentId] { return winner }
+                docPersistence[documentId] = p
+                return nil
             }
-            docPersistence[documentId] = p
-            lock.unlock()
+            if let existingWinner { return existingWinner }
             logger.log(
                 "persistDocumentToLocal: late-bound persistence for",
                 documentId,
@@ -1504,13 +1474,13 @@ public final class DocumentManager: @unchecked Sendable {
         // Mirrors js-bao `documentManager._closeDocCore` lines 945–953.
         let bytes = state.count
         let nowIso = ISO8601DateFormatter().string(from: Date())
-        lock.lock()
-        var meta = metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
-        meta.localBytes = bytes
-        meta.lastOpenedAt = nowIso
-        metadataIndex[documentId] = meta
-        let metaSnapshot = meta
-        lock.unlock()
+        let metaSnapshot: LocalMetadataEntry = lock.withLock {
+            var meta = metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
+            meta.localBytes = bytes
+            meta.lastOpenedAt = nowIso
+            metadataIndex[documentId] = meta
+            return meta
+        }
         try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
     }
 
@@ -1521,12 +1491,13 @@ public final class DocumentManager: @unchecked Sendable {
     /// OTP signs in a different account than the restored session (#1780). The
     /// caller reloads the new user's metadata via `loadLocalMetadata()` after.
     public func resetInMemoryUserState(userId newUserId: String) async {
-        lock.lock()
-        metadataIndex.removeAll()
-        pendingCreates.removeAll()
-        localOnlyDocs.removeAll()
-        userId = newUserId
-        lock.unlock()
+        lock.withLock {
+            metadataIndex.removeAll()
+            pendingCreates.removeAll()
+            unconfirmedLocalWrites.removeAll()
+            localOnlyDocs.removeAll()
+            userId = newUserId
+        }
     }
 
     /// Load all local metadata from storage
@@ -1534,35 +1505,33 @@ public final class DocumentManager: @unchecked Sendable {
         guard let offlineStore = offlineStore else { return }
         guard let entries = try? await offlineStore.loadAllMetadata(appId: appId, userId: userId) else { return }
 
-        lock.lock()
-        for entry in entries {
-            metadataIndex[entry.documentId] = entry
-            if entry.pendingCreate == true {
-                pendingCreates.insert(entry.documentId)
-            }
-            if entry.localOnly == true {
-                localOnlyDocs.insert(entry.documentId)
+        lock.withLock {
+            for entry in entries {
+                metadataIndex[entry.documentId] = entry
+                if entry.pendingCreate == true {
+                    pendingCreates.insert(entry.documentId)
+                }
+                if entry.localOnly == true {
+                    localOnlyDocs.insert(entry.documentId)
+                }
             }
         }
-        lock.unlock()
     }
 
     // MARK: - Cleanup
 
     public func destroy() async {
-        lock.lock()
-        let docIds = Array(openDocs.keys)
-        lock.unlock()
+        let docIds = lock.withLock { Array(openDocs.keys) }
 
         for docId in docIds {
             await closeDocument(documentId: docId)
         }
 
-        lock.lock()
-        pendingCreateRetryTimers.values.forEach { $0.cancel() }
-        pendingCreateRetryTimers.removeAll()
-        syncProtocols.removeAll()
-        lock.unlock()
+        lock.withLock {
+            pendingCreateRetryTimers.values.forEach { $0.cancel() }
+            pendingCreateRetryTimers.removeAll()
+            syncProtocols.removeAll()
+        }
     }
 }
 

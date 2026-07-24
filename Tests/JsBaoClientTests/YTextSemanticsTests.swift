@@ -93,17 +93,14 @@ final class YTextSemanticsTests: XCTestCase {
     /// (it goes through the document's syncQueue internally — fine on a background queue).
     func testGetOrCreateTextDoesNotDeadlock() {
         let doc = YDocument()
-        let semaphore = DispatchSemaphore(value: 0)
         var success = false
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        assertCompletes("getOrCreateText off the main thread") {
             // No raw transact open — this is the safe pattern.
             let _ = doc.getOrCreateText(named: "t")
             success = true
-            semaphore.signal()
         }
 
-        XCTAssertEqual(semaphore.wait(timeout: .now() + 3), .success)
         XCTAssertTrue(success)
     }
 

@@ -189,19 +189,39 @@ public struct BucketBlobInfo: Decodable, Sendable, Equatable {
 /// Mirrors JS `BucketBlobListResult`.
 public struct BucketBlobListResult: Decodable, Sendable, Equatable {
     public let items: [BucketBlobInfo]
+    /// Continuation token for the next page (#1316).
+    public let nextCursor: String?
+    /// True when a next page exists (#1316).
+    public let hasMore: Bool
+    /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
     public let cursor: String?
 
-    private enum CodingKeys: String, CodingKey { case items, cursor }
+    private enum CodingKeys: String, CodingKey {
+        case items, cursor, nextCursor, hasMore
+    }
 
-    public init(items: [BucketBlobInfo], cursor: String? = nil) {
+    public init(
+        items: [BucketBlobInfo],
+        cursor: String? = nil,
+        nextCursor: String? = nil,
+        hasMore: Bool? = nil
+    ) {
         self.items = items
-        self.cursor = cursor
+        let next = nextCursor ?? cursor
+        self.nextCursor = next
+        self.cursor = next
+        self.hasMore = hasMore ?? (next != nil)
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         items = try c.decodeIfPresent([BucketBlobInfo].self, forKey: .items) ?? []
-        cursor = try c.decodeIfPresent(String.self, forKey: .cursor)
+        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
+        let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
+            ?? c.decodeIfPresent(String.self, forKey: .cursor)
+        nextCursor = next
+        cursor = next
+        hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
 }
 

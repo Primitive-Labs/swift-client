@@ -22,11 +22,11 @@ public final class EventEmitter: @unchecked Sendable {
                 handler(typed)
             }
         }
-        lock.lock()
-        var list = closureHandlers[event.rawValue] ?? []
-        list.append(Entry(id: id, handler: wrapped))
-        closureHandlers[event.rawValue] = list
-        lock.unlock()
+        lock.withLock {
+            var list = closureHandlers[event.rawValue] ?? []
+            list.append(Entry(id: id, handler: wrapped))
+            closureHandlers[event.rawValue] = list
+        }
         return EventSubscription { [weak self] in
             self?.removeClosure(event: event.rawValue, id: id)
         }
@@ -36,11 +36,11 @@ public final class EventEmitter: @unchecked Sendable {
     @discardableResult
     public func onAny(_ event: JsBaoEvent, handler: @escaping (Any) -> Void) -> EventSubscription {
         let id = allocateId()
-        lock.lock()
-        var list = closureHandlers[event.rawValue] ?? []
-        list.append(Entry(id: id, handler: handler))
-        closureHandlers[event.rawValue] = list
-        lock.unlock()
+        lock.withLock {
+            var list = closureHandlers[event.rawValue] ?? []
+            list.append(Entry(id: id, handler: handler))
+            closureHandlers[event.rawValue] = list
+        }
         return EventSubscription { [weak self] in
             self?.removeClosure(event: event.rawValue, id: id)
         }
@@ -48,9 +48,7 @@ public final class EventEmitter: @unchecked Sendable {
 
     /// Emit an event with a payload
     public func emit(_ event: JsBaoEvent, _ payload: Any) {
-        lock.lock()
-        let list = closureHandlers[event.rawValue] ?? []
-        lock.unlock()
+        let list = lock.withLock { closureHandlers[event.rawValue] ?? [] }
         for entry in list {
             entry.handler(payload)
         }
@@ -63,34 +61,30 @@ public final class EventEmitter: @unchecked Sendable {
 
     /// Remove all handlers for an event
     public func removeAll(for event: JsBaoEvent) {
-        lock.lock()
-        closureHandlers[event.rawValue] = nil
-        lock.unlock()
+        lock.withLock { closureHandlers[event.rawValue] = nil }
     }
 
     /// Remove all handlers
     public func removeAll() {
-        lock.lock()
-        closureHandlers.removeAll()
-        lock.unlock()
+        lock.withLock { closureHandlers.removeAll() }
     }
 
     // MARK: - Private
 
     private func allocateId() -> UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        nextHandlerId += 1
-        return nextHandlerId
+        lock.withLock {
+            nextHandlerId += 1
+            return nextHandlerId
+        }
     }
 
     private func removeClosure(event: String, id: UInt64) {
-        lock.lock()
-        if var list = closureHandlers[event] {
-            list.removeAll { $0.id == id }
-            closureHandlers[event] = list
+        lock.withLock {
+            if var list = closureHandlers[event] {
+                list.removeAll { $0.id == id }
+                closureHandlers[event] = list
+            }
         }
-        lock.unlock()
     }
 }
 
@@ -125,39 +119,48 @@ public func waitForEvent(
     timeout: TimeInterval = 10,
     predicate: ((Any) -> Bool)? = nil
 ) async throws -> Any {
-    try await withCheckedThrowingContinuation { continuation in
+    // Shared resume-once state, guarded by an internal lock. Hoisted into an
+    // `@unchecked Sendable` holder so the event handler closure and the
+    // timeout `Task` capture one Sendable reference rather than mutable local
+    // `var`s. Behavior is unchanged — the same lock still guards the same
+    // resume-once flag; this only makes the safety the code already had
+    // legible to the concurrency checker (matches the codebase's other
+    // `@unchecked Sendable` + `NSLock` holders).
+    final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var resumed = false
         var subscription: EventSubscription?
         var timeoutTask: Task<Void, Never>?
-        var resumed = false
-        let lock = NSLock()
+    }
+    let state = State()
 
-        subscription = emitter.onAny(event) { payload in
-            lock.lock()
-            guard !resumed else {
-                lock.unlock()
-                return
+    return try await withCheckedThrowingContinuation { continuation in
+        state.subscription = emitter.onAny(event) { payload in
+            let shouldResume = state.lock.withLock { () -> Bool in
+                guard !state.resumed else { return false }
+                if let predicate = predicate, !predicate(payload) { return false }
+                state.resumed = true
+                return true
             }
-            if let predicate = predicate, !predicate(payload) {
-                lock.unlock()
-                return
-            }
-            resumed = true
-            lock.unlock()
-            timeoutTask?.cancel()
-            subscription?.cancel()
-            continuation.resume(returning: payload)
+            guard shouldResume else { return }
+            state.timeoutTask?.cancel()
+            state.subscription?.cancel()
+            // `payload` is `Any` (non-Sendable); the resume-once guard above
+            // guarantees a single hand-off, so annotate the capture as
+            // reviewed-safe (same pattern as `unsafeDoc` in JsBaoClient).
+            nonisolated(unsafe) let capturedPayload = payload
+            continuation.resume(returning: capturedPayload)
         }
 
-        timeoutTask = Task {
+        state.timeoutTask = Task {
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            lock.lock()
-            guard !resumed else {
-                lock.unlock()
-                return
+            let shouldResume = state.lock.withLock { () -> Bool in
+                guard !state.resumed else { return false }
+                state.resumed = true
+                return true
             }
-            resumed = true
-            lock.unlock()
-            subscription?.cancel()
+            guard shouldResume else { return }
+            state.subscription?.cancel()
             continuation.resume(throwing: JsBaoError(code: .unavailable, message: "Timeout waiting for event: \(event.rawValue)"))
         }
     }

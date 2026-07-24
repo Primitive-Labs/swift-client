@@ -25,43 +25,35 @@ public final class OfflineStore: @unchecked Sendable {
     // MARK: - Provider Setup
 
     public func setStorageProvider(_ provider: StorageProvider) {
-        lock.lock()
-        self.storageProvider = provider
-        lock.unlock()
+        lock.withLock { self.storageProvider = provider }
     }
 
     public func setAuthStorageProvider(_ provider: StorageProvider) {
-        lock.lock()
-        self.authStorageProvider = provider
-        lock.unlock()
+        lock.withLock { self.authStorageProvider = provider }
     }
 
     public func getStorageProvider() -> StorageProvider? {
-        lock.lock()
-        defer { lock.unlock() }
-        return storageProvider
+        lock.withLock { storageProvider }
     }
 
     // MARK: - Initialization
 
     public func ensureMetadataDb(appId: String, userId: String) async throws {
         let namespace = "\(appId):\(userId)"
-        lock.lock()
-        guard let provider = storageProvider else {
-            lock.unlock()
-            return
+        let existing: (provider: StorageProvider, alreadyInit: Bool)? = lock.withLock {
+            guard let provider = storageProvider else { return nil }
+            return (provider, currentNamespace == namespace && isInitialized)
         }
-        let alreadyInit = currentNamespace == namespace && isInitialized
-        lock.unlock()
+        guard let existing else { return }
 
-        if alreadyInit { return }
+        if existing.alreadyInit { return }
 
-        try await provider.initialize(namespace: namespace)
+        try await existing.provider.initialize(namespace: namespace)
 
-        lock.lock()
-        currentNamespace = namespace
-        isInitialized = true
-        lock.unlock()
+        lock.withLock {
+            currentNamespace = namespace
+            isInitialized = true
+        }
     }
 
     // MARK: - Metadata Operations
@@ -219,12 +211,13 @@ public final class OfflineStore: @unchecked Sendable {
     // MARK: - Lifecycle
 
     public func closeStorage() async {
-        lock.lock()
-        let provider = storageProvider
-        let authProvider = authStorageProvider
-        isInitialized = false
-        currentNamespace = nil
-        lock.unlock()
+        let (provider, authProvider) = lock.withLock { () -> (StorageProvider?, StorageProvider?) in
+            let provider = storageProvider
+            let authProvider = authStorageProvider
+            isInitialized = false
+            currentNamespace = nil
+            return (provider, authProvider)
+        }
 
         // Await both closes so the SQLite handles are fully released
         // before this returns. A subsequent client that opens the same

@@ -6,8 +6,10 @@ public final class AnalyticsQueue: @unchecked Sendable {
 
     /// Shared formatter — `ISO8601DateFormatter` is expensive to construct,
     /// so we reuse one instance instead of allocating per event. The class
-    /// is documented as thread-safe for `string(from:)` calls.
-    private static let timestampFormatter = ISO8601DateFormatter()
+    /// is documented as thread-safe for `string(from:)` calls, so the
+    /// immutable shared instance is safe to read concurrently even though
+    /// `ISO8601DateFormatter` is not `Sendable` — hence `nonisolated(unsafe)`.
+    nonisolated(unsafe) private static let timestampFormatter = ISO8601DateFormatter()
 
     private let lock = NSLock()
     private let logger: Logger
@@ -50,6 +52,14 @@ public final class AnalyticsQueue: @unchecked Sendable {
     /// Never set in production code.
     var onEventLogged: (([String: Any]) -> Void)?
 
+    /// Test-observability hook: invoked once each time `scheduleFlush()`
+    /// actually creates a new flush timer (not on calls that find one
+    /// already scheduled). Internal (visible only via `@testable import`)
+    /// — the #1985 concurrency test uses it to assert that a burst of
+    /// concurrent `logEvent`s schedules exactly one timer. Never set in
+    /// production code.
+    var onFlushScheduled: (() -> Void)?
+
     public init(logger: Logger) {
         self.logger = logger.forScope(scope: "analytics")
     }
@@ -58,16 +68,12 @@ public final class AnalyticsQueue: @unchecked Sendable {
 
     /// Override the plan field on all subsequent analytics events.
     public func setPlanOverride(_ plan: String?) {
-        lock.lock()
-        planOverride = plan
-        lock.unlock()
+        lock.withLock { planOverride = plan }
     }
 
     /// Override the app version field on all subsequent analytics events.
     public func setAppVersionOverride(_ version: String?) {
-        lock.lock()
-        appVersionOverride = version
-        lock.unlock()
+        lock.withLock { appVersionOverride = version }
     }
 
     // MARK: - Event Logging
@@ -93,10 +99,10 @@ public final class AnalyticsQueue: @unchecked Sendable {
         preparedEvent["timestamp"] = Self.timestampFormatter.string(from: Date())
 
         // Apply overrides
-        lock.lock()
-        if let plan = planOverride { preparedEvent["plan"] = plan }
-        if let version = appVersionOverride { preparedEvent["app_version"] = version }
-        lock.unlock()
+        lock.withLock {
+            if let plan = planOverride { preparedEvent["plan"] = plan }
+            if let version = appVersionOverride { preparedEvent["app_version"] = version }
+        }
 
         // Trim context_json if too large
         if let contextJson = preparedEvent["context_json"] as? [String: Any] {
@@ -105,9 +111,7 @@ public final class AnalyticsQueue: @unchecked Sendable {
             }
         }
 
-        lock.lock()
-        buffer.append(preparedEvent)
-        lock.unlock()
+        lock.withLock { buffer.append(preparedEvent) }
 
         onEventLogged?(preparedEvent)
 
@@ -117,20 +121,16 @@ public final class AnalyticsQueue: @unchecked Sendable {
     // MARK: - Flush
 
     public func flush() {
-        lock.lock()
-        guard !buffer.isEmpty else {
-            lock.unlock()
-            return
+        let events: [[String: Any]] = lock.withLock {
+            let events = buffer
+            buffer.removeAll()
+            return events
         }
-        let events = buffer
-        buffer.removeAll()
-        lock.unlock()
+        guard !events.isEmpty else { return }
 
         guard let connectionId = getConnectionId?() else {
             // Re-buffer for later
-            lock.lock()
-            buffer.insert(contentsOf: events, at: 0)
-            lock.unlock()
+            lock.withLock { buffer.insert(contentsOf: events, at: 0) }
             return
         }
 
@@ -150,15 +150,11 @@ public final class AnalyticsQueue: @unchecked Sendable {
                 try await sendMessage?(jsonString)
             } catch {
                 // Persist failed events
-                lock.lock()
-                buffer.insert(contentsOf: events, at: 0)
-                lock.unlock()
+                lock.withLock { buffer.insert(contentsOf: events, at: 0) }
                 await persistBuffer()
             }
         }
-        lock.lock()
-        pendingFlushTask = task
-        lock.unlock()
+        lock.withLock { pendingFlushTask = task }
     }
 
     /// Wait for any in-flight flush task to drain. Called from
@@ -166,9 +162,7 @@ public final class AnalyticsQueue: @unchecked Sendable {
     /// flush timer and triggers the final flush — without awaiting,
     /// the persist-on-failure path could race the SQLite close.
     public func awaitPendingPersistence() async {
-        lock.lock()
-        let task = pendingFlushTask
-        lock.unlock()
+        let task = lock.withLock { pendingFlushTask }
         await task?.value
     }
 
@@ -181,9 +175,7 @@ public final class AnalyticsQueue: @unchecked Sendable {
         // of every persist (analyticsQueue.ts).
         enforcePersistenceCap()
 
-        lock.lock()
-        let events = buffer
-        lock.unlock()
+        let events = lock.withLock { buffer }
 
         guard !events.isEmpty, let userId = getUserId?() else { return }
 
@@ -199,20 +191,19 @@ public final class AnalyticsQueue: @unchecked Sendable {
     /// `enforcePersistenceCap()`. Byte count is the UTF-8 length of the
     /// JSON-serialized buffer — the same payload the OfflineStore persists.
     private func enforcePersistenceCap() {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.withLock {
+            var totalBytes = estimatedBufferBytes(buffer)
+            if totalBytes <= maxPersistedBytes { return }
 
-        var totalBytes = estimatedBufferBytes(buffer)
-        if totalBytes <= maxPersistedBytes { return }
+            logger.warn(
+                "Offline analytics queue exceeded capacity; truncating oldest events",
+                "totalBytes=\(totalBytes) limit=\(maxPersistedBytes)"
+            )
 
-        logger.warn(
-            "Offline analytics queue exceeded capacity; truncating oldest events",
-            "totalBytes=\(totalBytes) limit=\(maxPersistedBytes)"
-        )
-
-        while !buffer.isEmpty && totalBytes > maxPersistedBytes {
-            buffer.removeFirst()
-            totalBytes = estimatedBufferBytes(buffer)
+            while !buffer.isEmpty && totalBytes > maxPersistedBytes {
+                buffer.removeFirst()
+                totalBytes = estimatedBufferBytes(buffer)
+            }
         }
     }
 
@@ -231,9 +222,7 @@ public final class AnalyticsQueue: @unchecked Sendable {
         do {
             let events = try await offlineStore?.loadAnalyticsQueue(appId: appId, userId: userId) ?? []
             if !events.isEmpty {
-                lock.lock()
-                buffer.insert(contentsOf: events, at: 0)
-                lock.unlock()
+                lock.withLock { buffer.insert(contentsOf: events, at: 0) }
                 scheduleFlush()
             }
         } catch {
@@ -244,8 +233,15 @@ public final class AnalyticsQueue: @unchecked Sendable {
     // MARK: - Lifecycle
 
     public func destroy() {
-        flushTimer?.cancel()
-        flushTimer = nil
+        // Read and clear the timer under the lock (same synchronization as
+        // scheduleFlush), then cancel and flush outside it — flush() takes the
+        // lock itself, so we must not hold it here (issue #1985).
+        let timer: Task<Void, Never>? = lock.withLock {
+            let current = flushTimer
+            flushTimer = nil
+            return current
+        }
+        timer?.cancel()
         flush()
     }
 
@@ -261,42 +257,48 @@ public final class AnalyticsQueue: @unchecked Sendable {
     // MARK: - Private
 
     private func scheduleFlush() {
-        lock.lock()
-        guard flushTimer == nil else {
-            lock.unlock()
-            return
+        // Check-and-schedule must be atomic: the `flushTimer != nil` check and
+        // the assignment both happen under the SAME lock hold, so two
+        // concurrent `logEvent`s can't both see "no timer" and each schedule
+        // one (issue #1985). Creating the Task doesn't run its body or take
+        // the lock, so doing it under the lock introduces no re-entrancy — the
+        // timer's own body (sleep, then flush) runs later, outside this hold.
+        let created: Bool = lock.withLock {
+            guard flushTimer == nil else { return false }
+            flushTimer = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(self?.flushIntervalMs ?? 100) * 1_000_000)
+                guard let self else { return }
+                self.lock.withLock { self.flushTimer = nil }
+                self.flush()
+            }
+            return true
         }
-        lock.unlock()
-
-        flushTimer = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(self?.flushIntervalMs ?? 100) * 1_000_000)
-            self?.flushTimer = nil
-            self?.flush()
-        }
+        // Fire the test hook outside the lock, and only for the single racer
+        // that actually created the timer.
+        if created { onFlushScheduled?() }
     }
 
     private func isWithinRateLimit() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.withLock {
+            let now = Date()
+            let windowElapsed = now.timeIntervalSince(rateWindowStart)
 
-        let now = Date()
-        let windowElapsed = now.timeIntervalSince(rateWindowStart)
+            if windowElapsed >= 60 {
+                rateCounter = 0
+                rateWindowStart = now
+            }
 
-        if windowElapsed >= 60 {
-            rateCounter = 0
-            rateWindowStart = now
+            if rateCounter >= rateLimit {
+                return false
+            }
+
+            // Burst check
+            if rateCounter >= burstCap && windowElapsed < 10 {
+                return false
+            }
+
+            rateCounter += 1
+            return true
         }
-
-        if rateCounter >= rateLimit {
-            return false
-        }
-
-        // Burst check
-        if rateCounter >= burstCap && windowElapsed < 10 {
-            return false
-        }
-
-        rateCounter += 1
-        return true
     }
 }
