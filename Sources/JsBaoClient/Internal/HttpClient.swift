@@ -45,15 +45,22 @@ public enum RefreshOutcome: String, Sendable {
     case network
 }
 
-/// Response from raw HTTP request
+/// Response from raw HTTP request.
+///
+/// `data` holds the parsed JSON body as a `Sendable` `JSONValue?` (an
+/// object body decodes to `.object`, an array to `.array`, and so on; a
+/// non-JSON body is carried on `text`). It was previously `Any?` — the
+/// parsed `JSONSerialization` graph — which made the struct only
+/// nominally `Sendable`. Consumers that need the loosely-typed Foundation
+/// graph can bridge back with `JSONCoding.jsonObject(from:)`.
 public struct HttpClientResponse: Sendable {
     public let ok: Bool
     public let status: Int
     public let headers: [String: String]
-    public let data: Any?
+    public let data: JSONValue?
     public let text: String?
 
-    public init(ok: Bool, status: Int, headers: [String: String], data: Any?, text: String?) {
+    public init(ok: Bool, status: Int, headers: [String: String], data: JSONValue?, text: String?) {
         self.ok = ok
         self.status = status
         self.headers = headers
@@ -120,7 +127,7 @@ public final class HttpClient: @unchecked Sendable {
         data: Any? = nil,
         options: RequestOptions? = nil
     ) async throws -> Any? {
-        let result = try await requestRaw(method: method, path: path, data: data, options: options)
+        let result = try await fetchParsed(method: method, path: path, data: data, options: options)
         if !result.ok {
             // #850 — parse the structured `{code, error/message}` body
             // so callers see "This app is invite-only..." instead of
@@ -135,6 +142,8 @@ public final class HttpClient: @unchecked Sendable {
                 serverMessage: parsed.message
             )
         }
+        // Hand back the raw `JSONSerialization` graph unchanged — typed
+        // decoders downstream cast it with `as? [String: Any]` etc.
         return result.data
     }
 
@@ -145,6 +154,29 @@ public final class HttpClient: @unchecked Sendable {
         data: Any? = nil,
         options: RequestOptions? = nil
     ) async throws -> HttpClientResponse {
+        let result = try await fetchParsed(method: method, path: path, data: data, options: options)
+        // Wrap the raw parsed graph in a `Sendable` `JSONValue?` for the
+        // public response surface. A non-JSON body stays `nil` here and is
+        // carried on `text`, matching the previous `Any?` behavior.
+        return HttpClientResponse(
+            ok: result.ok,
+            status: result.status,
+            headers: result.headers,
+            data: result.data.flatMap { try? JSONCoding.decode(JSONValue.self, from: $0) },
+            text: result.text
+        )
+    }
+
+    /// Perform the request and parse the body once, returning the raw
+    /// `JSONSerialization` graph (`Any?`) alongside the response metadata.
+    /// `request` returns the raw graph verbatim to typed decoders;
+    /// `requestRaw` wraps it in a `Sendable` `JSONValue?`.
+    private func fetchParsed(
+        method: String,
+        path: String,
+        data: Any? = nil,
+        options: RequestOptions? = nil
+    ) async throws -> (data: Any?, ok: Bool, status: Int, headers: [String: String], text: String?) {
         await refreshIfExpiring()
 
         let (responseData, response) = try await fetchWithRefresh(
@@ -172,11 +204,11 @@ public final class HttpClient: @unchecked Sendable {
         }
 
         let statusCode = httpResponse.statusCode
-        return HttpClientResponse(
+        return (
+            data: parsed,
             ok: (200..<300).contains(statusCode),
             status: statusCode,
             headers: serializeHeaders(httpResponse),
-            data: parsed,
             text: text
         )
     }
@@ -246,16 +278,12 @@ public final class HttpClient: @unchecked Sendable {
     }
 
     private func refreshIfExpiring() async {
-        do {
-            guard let token = config.getToken() else { return }
-            guard let exp = getTokenExpiry(token) else { return }
-            let now = Date().timeIntervalSince1970
-            if exp - now < 120 {
-                let outcome = await tryRefreshAccessToken()
-                config.onRefreshOutcome(outcome)
-            }
-        } catch {
-            // Swallow errors silently, matching JS behavior
+        guard let token = config.getToken() else { return }
+        guard let exp = getTokenExpiry(token) else { return }
+        let now = Date().timeIntervalSince1970
+        if exp - now < 120 {
+            let outcome = await tryRefreshAccessToken()
+            config.onRefreshOutcome(outcome)
         }
     }
 

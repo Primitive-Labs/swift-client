@@ -28,34 +28,28 @@ public final class KvCache: @unchecked Sendable {
     /// `JsBaoClient` constructs `KvCache()` before its `EventEmitter`
     /// wiring is complete, so the emitter is set here in `setupSubApis`.
     public func setEmitter(_ emit: @escaping @Sendable (JsBaoEvent, Any) -> Void) {
-        lock.lock()
-        self.emit = emit
-        lock.unlock()
+        lock.withLock { self.emit = emit }
     }
 
     /// Snapshot the emitter under the lock so emission happens off-lock.
     private func currentEmitter() -> (@Sendable (JsBaoEvent, Any) -> Void)? {
-        lock.lock()
-        defer { lock.unlock() }
-        return emit
+        lock.withLock { emit }
     }
 
     // MARK: - Setup
 
     public func setStorageProvider(_ provider: StorageProvider) {
-        lock.lock()
-        self.storageProvider = provider
-        lock.unlock()
+        lock.withLock { self.storageProvider = provider }
     }
 
     public func setUserId(_ userId: String?) {
-        lock.lock()
-        self.userId = userId
-        if userId == nil {
-            memCache.removeAll()
-            isInitialized = false
+        lock.withLock {
+            self.userId = userId
+            if userId == nil {
+                memCache.removeAll()
+                isInitialized = false
+            }
         }
-        lock.unlock()
     }
 
     // MARK: - Core Operations
@@ -71,9 +65,10 @@ public final class KvCache: @unchecked Sendable {
         let refreshIfOlderThanMs = options.refreshIfOlderThanMs
 
         if !refreshNetwork {
-            lock.lock()
-            if let cached = memCache[key] {
-                lock.unlock()
+            // Region 1: in-memory cache check (read memCache[key] under lock,
+            // then evaluate staleness off-lock — exactly as before).
+            let cached = lock.withLock { memCache[key] }
+            if let cached = cached {
                 // Check staleness
                 if let maxAge = refreshIfOlderThanMs,
                    let updatedAt = cached.updatedAtMs {
@@ -84,79 +79,83 @@ public final class KvCache: @unchecked Sendable {
                 } else {
                     return cached.value as? T
                 }
-            } else {
-                lock.unlock()
             }
 
-            // Check persistent storage
+            // Region 2: persistent storage load (awaited off-lock), then a
+            // separate lock hold to write the loaded record into memCache.
             if let record = await loadFromStorage(key: key) {
                 if let maxAge = refreshIfOlderThanMs,
                    let updatedAt = record.updatedAtMs {
                     let age = Date().timeIntervalSince1970 * 1000 - updatedAt
                     if age < Double(maxAge) {
-                        lock.lock()
-                        memCache[key] = record
-                        lock.unlock()
+                        lock.withLock { memCache[key] = record }
                         return record.value as? T
                     }
                 } else {
-                    lock.lock()
-                    memCache[key] = record
-                    lock.unlock()
+                    lock.withLock { memCache[key] = record }
                     return record.value as? T
                 }
             }
         }
 
-        // Deduplicate in-flight requests
-        lock.lock()
-        if let existing = inflightRequests[key] {
-            lock.unlock()
-            return try await existing.value as? T
+        // Region 3: in-flight request dedup. The existence check and the
+        // new-task registration must be atomic (one lock hold), so both live
+        // in a single `withLock` that returns either the existing task or a
+        // freshly-created-and-registered one. Awaiting the task happens
+        // off-lock, below.
+        let dedup: (task: Task<Any?, Error>, isExisting: Bool) = lock.withLock {
+            if let existing = inflightRequests[key] {
+                return (existing, true)
+            }
+
+            let task = Task<Any?, Error> { [weak self] in
+                // Always remove the inflight entry on completion, regardless of
+                // success or failure. Without this `defer`, a thrown error from
+                // `fetcher()` would leave a stale entry in the dictionary that
+                // makes every subsequent call for the same key re-throw the
+                // original error forever.
+                defer {
+                    self?.lock.withLock {
+                        _ = self?.inflightRequests.removeValue(forKey: key)
+                    }
+                }
+                do {
+                    let value = try await fetcher()
+                    await self?.set(key: key, value: value)
+                    // Mirror JS `KvCache`: fire `cacheUpdated` after a successful
+                    // network refresh (`src/client/kv-cache.ts`). `source` is
+                    // always "server" — this only runs on the network path.
+                    self?.currentEmitter()?(
+                        .cacheUpdated,
+                        CacheUpdatedEvent(
+                            key: key,
+                            updatedAt: ISO8601DateFormatter().string(from: Date()),
+                            source: "server",
+                            value: value
+                        )
+                    )
+                    return value
+                } catch {
+                    // Mirror JS `KvCache`: fire `cacheUpdateFailed` on a refresh
+                    // error (`src/client/kv-cache.ts`) before rethrowing.
+                    self?.currentEmitter()?(
+                        .cacheUpdateFailed,
+                        CacheUpdateFailedEvent(
+                            key: key,
+                            error: (error as? JsBaoError)?.message ?? "\(error)"
+                        )
+                    )
+                    throw error
+                }
+            }
+            inflightRequests[key] = task
+            return (task, false)
         }
 
-        let task = Task<Any?, Error> { [weak self] in
-            // Always remove the inflight entry on completion, regardless of
-            // success or failure. Without this `defer`, a thrown error from
-            // `fetcher()` would leave a stale entry in the dictionary that
-            // makes every subsequent call for the same key re-throw the
-            // original error forever.
-            defer {
-                self?.lock.lock()
-                self?.inflightRequests.removeValue(forKey: key)
-                self?.lock.unlock()
-            }
-            do {
-                let value = try await fetcher()
-                await self?.set(key: key, value: value)
-                // Mirror JS `KvCache`: fire `cacheUpdated` after a successful
-                // network refresh (`src/client/kv-cache.ts`). `source` is
-                // always "server" — this only runs on the network path.
-                self?.currentEmitter()?(
-                    .cacheUpdated,
-                    CacheUpdatedEvent(
-                        key: key,
-                        updatedAt: ISO8601DateFormatter().string(from: Date()),
-                        source: "server",
-                        value: value
-                    )
-                )
-                return value
-            } catch {
-                // Mirror JS `KvCache`: fire `cacheUpdateFailed` on a refresh
-                // error (`src/client/kv-cache.ts`) before rethrowing.
-                self?.currentEmitter()?(
-                    .cacheUpdateFailed,
-                    CacheUpdateFailedEvent(
-                        key: key,
-                        error: (error as? JsBaoError)?.message ?? "\(error)"
-                    )
-                )
-                throw error
-            }
+        let task = dedup.task
+        if dedup.isExisting {
+            return try await task.value as? T
         }
-        inflightRequests[key] = task
-        lock.unlock()
 
         // Honor `serverTimeoutMs`: bound the network fetch. On timeout, fall
         // back to any cached (possibly stale) value; otherwise surface a
@@ -214,9 +213,7 @@ public final class KvCache: @unchecked Sendable {
             updatedAtMs: now.timeIntervalSince1970 * 1000
         )
 
-        lock.lock()
-        memCache[key] = record
-        lock.unlock()
+        lock.withLock { memCache[key] = record }
 
         await saveToStorage(key: key, record: record)
     }
@@ -227,17 +224,12 @@ public final class KvCache: @unchecked Sendable {
     /// read. Still used internally by `fetchCached` (stale fallback) and the
     /// same-module `CacheFacade`.
     func get(key: String) async -> Any? {
-        lock.lock()
-        if let cached = memCache[key] {
-            lock.unlock()
+        if let cached = lock.withLock({ memCache[key] }) {
             return cached.value
         }
-        lock.unlock()
 
         if let record = await loadFromStorage(key: key) {
-            lock.lock()
-            memCache[key] = record
-            lock.unlock()
+            lock.withLock { memCache[key] = record }
             return record.value
         }
 
@@ -246,9 +238,7 @@ public final class KvCache: @unchecked Sendable {
 
     /// Get cache entry info
     public func info(key: String) async -> (updatedAt: String?, ageMs: Double?) {
-        lock.lock()
-        let cached = memCache[key]
-        lock.unlock()
+        let cached = lock.withLock { memCache[key] }
 
         let record: KvCacheRecord?
         if let cached = cached {
@@ -270,9 +260,7 @@ public final class KvCache: @unchecked Sendable {
 
     /// Clear a specific cache entry
     public func clear(key: String) async {
-        lock.lock()
-        memCache.removeValue(forKey: key)
-        lock.unlock()
+        lock.withLock { _ = memCache.removeValue(forKey: key) }
 
         if let provider = storageProvider {
             try? await provider.delete(store: Self.storeName, key: key)
@@ -281,9 +269,7 @@ public final class KvCache: @unchecked Sendable {
 
     /// Clear all cache entries
     public func clearAll() async {
-        lock.lock()
-        memCache.removeAll()
-        lock.unlock()
+        lock.withLock { memCache.removeAll() }
 
         if let provider = storageProvider {
             try? await provider.clear(store: Self.storeName)

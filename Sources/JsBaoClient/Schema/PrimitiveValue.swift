@@ -156,13 +156,17 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
 
     // MARK: - Helpers
 
-    private static let isoDateFormatter: ISO8601DateFormatter = {
+    // Immutable shared `ISO8601DateFormatter`s. The class is documented as
+    // thread-safe for formatting/parsing, and these are configured once and
+    // never mutated, so concurrent reads are safe even though the type is
+    // not `Sendable` — hence `nonisolated(unsafe)`.
+    nonisolated(unsafe) private static let isoDateFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
 
-    private static let isoDateFormatterFractional: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let isoDateFormatterFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f

@@ -83,8 +83,10 @@ public final class IntegrationsAPI: @unchecked Sendable {
             throw createIntegrationError(raw)
         }
 
-        // Validate the proxy envelope shape before unwrapping.
-        guard let data = raw.data as? [String: Any] else {
+        // Validate the proxy envelope shape before unwrapping. `raw.data`
+        // is a `Sendable` `JSONValue?`; bridge it back to the loosely-typed
+        // Foundation graph this envelope parsing walks with `as?` casts.
+        guard let data = raw.data.flatMap({ try? JSONCoding.jsonObject(from: $0) }) as? [String: Any] else {
             throw JsBaoError(
                 code: .integrationProxyFailed,
                 message: "Integration response malformed"
@@ -164,7 +166,7 @@ public final class IntegrationsAPI: @unchecked Sendable {
     /// the JS error categorization so a cross-platform caller sees the
     /// same code for the same upstream condition.
     private func createIntegrationError(_ response: HttpClientResponse) -> JsBaoError {
-        let payload = response.data as? [String: Any]
+        let payload = response.data.flatMap { try? JSONCoding.jsonObject(from: $0) } as? [String: Any]
         let upstreamCode = (payload?["errorCode"] as? String)
             ?? (payload?["code"] as? String)
             ?? ((payload?["details"] as? [String: Any])?["code"] as? String)

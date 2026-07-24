@@ -109,32 +109,26 @@ final class YDocumentDeadlockTests: XCTestCase {
         let consumer = YDocument()
 
         // Apply the update on a background queue (mirroring handleSyncStep2 dispatch).
-        let applySem = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
+        assertCompletes("applying remote update") {
             let txn = consumer.document.transact(origin: nil)
             try? txn.transactionApplyUpdate(update: producerUpdate)
             txn.free()
-            applySem.signal()
         }
-        XCTAssertEqual(applySem.wait(timeout: .now() + 3), .success, "applying remote update should not hang")
 
         // ----- Now read via the FIXED readCurrentState pattern -----
-        let readSem = DispatchSemaphore(value: 0)
         var readNote: String?
         var readCounter: String?
 
         // Hoist getMap BEFORE the txn (the fix)
         let map = consumer.document.getMap(name: "liveDemo")
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        assertCompletes("fixed read after remote apply") {
             let txn = consumer.document.transact(origin: nil)
             defer { txn.free() }
             readNote = try? map.get(tx: txn, key: "note")
             readCounter = try? map.get(tx: txn, key: "counter")
-            readSem.signal()
         }
 
-        XCTAssertEqual(readSem.wait(timeout: .now() + 3), .success, "fixed read should not hang")
         XCTAssertEqual(readNote, "\"hello from producer\"")
         XCTAssertEqual(readCounter, "42")
     }
@@ -149,10 +143,9 @@ final class YDocumentDeadlockTests: XCTestCase {
         preMap.insert(tx: preTxn, key: "note", value: "\"hello\"")
         preTxn.free()
 
-        let semaphore = DispatchSemaphore(value: 0)
         var readNote: String?
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        assertCompletes("fixed readCurrentState pattern") {
             // FIX: get the map BEFORE opening the transaction
             let map = doc.document.getMap(name: "liveDemo")
 
@@ -162,11 +155,8 @@ final class YDocumentDeadlockTests: XCTestCase {
             if let raw = try? map.get(tx: txn, key: "note") {
                 readNote = raw as? String
             }
-            semaphore.signal()
         }
 
-        let result = semaphore.wait(timeout: .now() + 3)
-        XCTAssertEqual(result, .success, "Fixed pattern should not hang")
         XCTAssertEqual(readNote, "\"hello\"")
     }
 }

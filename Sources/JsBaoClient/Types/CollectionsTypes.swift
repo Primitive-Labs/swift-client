@@ -337,14 +337,20 @@ public enum CollectionAddMemberResult: Decodable, Sendable, Equatable {
 struct CollectionInfoPage: Decodable {
     let items: [CollectionInfo]
     let cursor: String?
+    let nextCursor: String?
+    let hasMore: Bool?
 }
 
 struct CollectionDocumentPage: Decodable {
     let items: [CollectionDocumentInfo]
     let cursor: String?
+    let nextCursor: String?
+    let hasMore: Bool?
 }
 
 struct DocumentCollectionPage: Decodable {
     let items: [DocumentCollectionInfo]
     let cursor: String?
+    let nextCursor: String?
+    let hasMore: Bool?
 }

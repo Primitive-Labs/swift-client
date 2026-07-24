@@ -26,34 +26,31 @@ public final class MemoryStorageProvider: StorageProvider, @unchecked Sendable {
     // MARK: - StorageProvider
 
     public func initialize(namespace: String) async throws {
-        lock.lock()
-        defer { lock.unlock() }
-        stores = [:]
-        _isReady = true
+        lock.withLock {
+            stores = [:]
+            _isReady = true
+        }
     }
 
     public func close() async {
-        lock.lock()
-        defer { lock.unlock() }
-        stores = [:]
-        _isReady = false
+        lock.withLock {
+            stores = [:]
+            _isReady = false
+        }
     }
 
     public func isReady() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _isReady
+        lock.withLock { _isReady }
     }
 
     public func get<T: Codable>(store: String, key: String) async throws -> StorageRecord<T>? {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard let entries = stores[store],
-              let pair = entries.first(where: { $0.key == key }) else {
-            return nil
+        try lock.withLock { () throws -> StorageRecord<T>? in
+            guard let entries = stores[store],
+                  let pair = entries.first(where: { $0.key == key }) else {
+                return nil
+            }
+            return try decodeRecord(key: key, entry: pair.entry)
         }
-        return try decodeRecord(key: key, entry: pair.entry)
     }
 
     public func put<T: Codable>(store: String, key: String, value: T, metadata: [String: String]?) async throws {
@@ -61,16 +58,15 @@ public final class MemoryStorageProvider: StorageProvider, @unchecked Sendable {
         let now = Self.iso8601Now()
         let entry = Entry(valueData: data, metadata: metadata, updatedAt: now)
 
-        lock.lock()
-        defer { lock.unlock() }
-
-        var entries = stores[store] ?? []
-        if let index = entries.firstIndex(where: { $0.key == key }) {
-            entries[index] = (key: key, entry: entry)
-        } else {
-            entries.append((key: key, entry: entry))
+        lock.withLock {
+            var entries = stores[store] ?? []
+            if let index = entries.firstIndex(where: { $0.key == key }) {
+                entries[index] = (key: key, entry: entry)
+            } else {
+                entries.append((key: key, entry: entry))
+            }
+            stores[store] = entries
         }
-        stores[store] = entries
     }
 
     public func putBatch<T: Codable>(store: String, records: [(key: String, value: T, metadata: [String: String]?)]) async throws {
@@ -82,39 +78,33 @@ public final class MemoryStorageProvider: StorageProvider, @unchecked Sendable {
             encoded.append((key: record.key, entry: entry))
         }
 
-        lock.lock()
-        defer { lock.unlock() }
-
-        var entries = stores[store] ?? []
-        for item in encoded {
-            if let index = entries.firstIndex(where: { $0.key == item.key }) {
-                entries[index] = item
-            } else {
-                entries.append(item)
+        lock.withLock {
+            var entries = stores[store] ?? []
+            for item in encoded {
+                if let index = entries.firstIndex(where: { $0.key == item.key }) {
+                    entries[index] = item
+                } else {
+                    entries.append(item)
+                }
             }
+            stores[store] = entries
         }
-        stores[store] = entries
     }
 
     public func delete(store: String, key: String) async throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        stores[store]?.removeAll(where: { $0.key == key })
+        lock.withLock {
+            _ = stores[store]?.removeAll(where: { $0.key == key })
+        }
     }
 
     public func clear(store: String) async throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        stores[store] = nil
+        lock.withLock {
+            stores[store] = nil
+        }
     }
 
     public func iterate<T: Codable>(store: String, callback: @escaping (StorageRecord<T>) throws -> Void) async throws {
-        let snapshot: [(key: String, entry: Entry)]
-        lock.lock()
-        snapshot = stores[store] ?? []
-        lock.unlock()
+        let snapshot: [(key: String, entry: Entry)] = lock.withLock { stores[store] ?? [] }
 
         for pair in snapshot {
             let record: StorageRecord<T> = try decodeRecord(key: pair.key, entry: pair.entry)
@@ -123,17 +113,15 @@ public final class MemoryStorageProvider: StorageProvider, @unchecked Sendable {
     }
 
     public func keys(store: String) async throws -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-
-        return (stores[store] ?? []).map { $0.key }
+        lock.withLock {
+            (stores[store] ?? []).map { $0.key }
+        }
     }
 
     public func has(store: String, key: String) async throws -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        return stores[store]?.contains(where: { $0.key == key }) ?? false
+        lock.withLock {
+            stores[store]?.contains(where: { $0.key == key }) ?? false
+        }
     }
 
     // MARK: - Private helpers

@@ -357,11 +357,24 @@ public struct PaginationOptions: Sendable {
 
 public struct PaginatedResult<T: Sendable>: Sendable {
     public let items: [T]
+    /// Continuation token for the next page (#1316).
+    public let nextCursor: String?
+    /// True when a next page exists (#1316).
+    public let hasMore: Bool
+    /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
     public let cursor: String?
 
-    public init(items: [T], cursor: String? = nil) {
+    public init(
+        items: [T],
+        cursor: String? = nil,
+        nextCursor: String? = nil,
+        hasMore: Bool? = nil
+    ) {
         self.items = items
-        self.cursor = cursor
+        let next = nextCursor ?? cursor
+        self.nextCursor = next
+        self.cursor = next
+        self.hasMore = hasMore ?? (next != nil)
     }
 }
 

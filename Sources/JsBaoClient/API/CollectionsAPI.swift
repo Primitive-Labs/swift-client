@@ -25,7 +25,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     public func list(options: PaginationOptions? = nil) async throws -> PaginatedResult<CollectionInfo> {
         let result = try await makeRequest("GET", "/collections\(Self.queryString(options))", nil)
         let page = try JSONCoding.decode(CollectionInfoPage.self, from: result)
-        return PaginatedResult(items: page.items, cursor: page.cursor)
+        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// List every collection in the app (admin-only). Non-admin callers
@@ -38,7 +38,7 @@ public final class CollectionsAPI: @unchecked Sendable {
         let qs = Self.queryString(PaginationOptions(limit: limit, cursor: cursor))
         let result = try await makeRequest("GET", "/admin/collections\(qs)", nil)
         let page = try JSONCoding.decode(CollectionInfoPage.self, from: result)
-        return PaginatedResult(items: page.items, cursor: page.cursor)
+        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// Get collection info by ID. Callers without any access receive a 404
@@ -81,7 +81,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     public func listDocuments(collectionId: String, options: PaginationOptions? = nil) async throws -> PaginatedResult<CollectionDocumentInfo> {
         let result = try await makeRequest("GET", "/collections/\(collectionId)/documents\(Self.queryString(options))", nil)
         let page = try JSONCoding.decode(CollectionDocumentPage.self, from: result)
-        return PaginatedResult(items: page.items, cursor: page.cursor)
+        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// List collections that contain a specific document. For non-admin
@@ -89,7 +89,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     public func listCollectionsForDocument(documentId: String, options: PaginationOptions? = nil) async throws -> PaginatedResult<DocumentCollectionInfo> {
         let result = try await makeRequest("GET", "/documents/\(documentId)/collections\(Self.queryString(options))", nil)
         let page = try JSONCoding.decode(DocumentCollectionPage.self, from: result)
-        return PaginatedResult(items: page.items, cursor: page.cursor)
+        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     // MARK: - Access

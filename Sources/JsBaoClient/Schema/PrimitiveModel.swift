@@ -9,7 +9,13 @@ import Foundation
 /// Conformers declare their schema and how to (de)serialize to/from a
 /// `PrimitiveRecord`. `init?(record:)` is failable so the typed layer degrades
 /// gracefully when a stored record drifts from the typed expectation.
-public protocol PrimitiveModel {
+/// Refines `Sendable`: every codegen'd conformer is a value struct whose
+/// stored properties are all `Sendable` (scalars, `String`, `Set<String>`,
+/// nested value enums, and `RelatedRecords`, which is `@unchecked Sendable`),
+/// so the conformance is satisfied automatically. This makes the metatype
+/// `any PrimitiveModel.Type` `Sendable`, which lets it be stored on the
+/// `Sendable` `CsvImportOptions.model` field without an escape hatch.
+public protocol PrimitiveModel: Sendable {
     static var modelName: String { get }
     static var primitiveSchema: PrimitiveSchema { get }
 
