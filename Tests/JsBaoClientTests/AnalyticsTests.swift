@@ -3,6 +3,11 @@ import XCTest
 
 /// Port of tests/client/js-bao-client-analytics.test.ts
 /// Tests analytics event queuing.
+///
+/// Uses the `Async` twins (#1993 Phase D3) rather than the deprecated
+/// synchronous members: awaiting is what makes "log, then connect, then assert"
+/// deterministic. The deprecated synchronous surface has its own behavioral
+/// guard in `DeprecationWindowInternalUseTests`.
 final class AnalyticsTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -22,7 +27,7 @@ final class AnalyticsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         // Log an analytics event -- should not throw
-        client.logAnalyticsEvent([
+        await client.logAnalyticsEventAsync([
             "action": "button_click",
             "feature": "cta",
             "context_json": ["marker": "swift-test"],
@@ -35,7 +40,7 @@ final class AnalyticsTests: XCTestCase {
 
         // Queue events while not connected
         for i in 0..<5 {
-            client.logAnalyticsEvent([
+            await client.logAnalyticsEventAsync([
                 "action": "test_event_\(i)",
                 "feature": "queue_test",
             ])
@@ -55,7 +60,7 @@ final class AnalyticsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         // Queue events first
-        client.logAnalyticsEvent([
+        await client.logAnalyticsEventAsync([
             "action": "pre_connect_event",
             "feature": "flush_test",
         ])
@@ -75,7 +80,7 @@ final class AnalyticsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         // Log an event with known action/feature
-        client.logAnalyticsEvent([
+        await client.logAnalyticsEventAsync([
             "action": "button_click",
             "feature": "cta",
             "context_json": ["marker": "structure-test"],
@@ -100,7 +105,7 @@ final class AnalyticsTests: XCTestCase {
 
         // Queue many events while not connected (offline)
         for i in 0..<10 {
-            client.logAnalyticsEvent([
+            await client.logAnalyticsEventAsync([
                 "action": "offline_event_\(i)",
                 "feature": "offline_persistence",
             ])
@@ -129,7 +134,7 @@ final class AnalyticsTests: XCTestCase {
         // Fire 65 events rapidly -- burst cap is 60
         let eventsToSend = 65
         for i in 0..<eventsToSend {
-            client.logAnalyticsEvent([
+            await client.logAnalyticsEventAsync([
                 "action": "rapid_event_\(i)",
                 "feature": "rate_limit_test",
             ])
@@ -156,7 +161,7 @@ final class AnalyticsTests: XCTestCase {
 
         // Log events in batches to test batching behavior
         for i in 0..<20 {
-            client.logAnalyticsEvent([
+            await client.logAnalyticsEventAsync([
                 "action": "batch_event_\(i)",
                 "feature": "batch_test",
                 "context_json": ["index": i],
@@ -184,7 +189,7 @@ final class AnalyticsTests: XCTestCase {
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Analytics Doc Test")
 
         // Log a "doc_open" analytics event
-        client.logAnalyticsEvent([
+        await client.logAnalyticsEventAsync([
             "action": "doc_open",
             "feature": "documents",
             "context_json": ["documentId": docId],
@@ -195,7 +200,7 @@ final class AnalyticsTests: XCTestCase {
         try await waitForSync(client: client, documentId: docId)
 
         // Log a "doc_sync" analytics event
-        client.logAnalyticsEvent([
+        await client.logAnalyticsEventAsync([
             "action": "doc_sync",
             "feature": "documents",
             "context_json": ["documentId": docId],
@@ -207,7 +212,7 @@ final class AnalyticsTests: XCTestCase {
         await client.closeDocument(docId)
 
         // Log a "doc_close" analytics event
-        client.logAnalyticsEvent([
+        await client.logAnalyticsEventAsync([
             "action": "doc_close",
             "feature": "documents",
             "context_json": ["documentId": docId],
@@ -229,7 +234,7 @@ final class AnalyticsTests: XCTestCase {
 
         // Create a large context payload (> 1024 bytes)
         let largePayload = String(repeating: "x", count: 4096)
-        client.logAnalyticsEvent([
+        await client.logAnalyticsEventAsync([
             "action": "big_context",
             "feature": "truncation_test",
             "context_json": ["payload": largePayload],

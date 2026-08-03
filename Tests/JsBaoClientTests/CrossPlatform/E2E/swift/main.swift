@@ -336,7 +336,7 @@ func cmdQuery(
         let dyn = DynamicModel(doc: doc, schema: schema)
         do {
             let page = try dyn.queryPaged(filter, options: opts)
-            emitPage(rows: page.data.map(dynamicRowToJson),
+            emitPage(rows: page.data.map { dynamicRowToJson($0.raw) },
                      nextCursor: page.nextCursor)
         } catch {
             emitError("queryPaged failed: \(error)")

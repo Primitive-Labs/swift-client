@@ -49,7 +49,6 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     // Connect continuation (the in-flight connect() call's own continuation)
     private var connectContinuation: CheckedContinuation<Void, Error>?
-    private var hasActiveConnectContinuation = false
 
     // Additional callers that hit connect() while one is already in flight.
     // They are all resumed atomically when the in-flight attempt finishes —
@@ -127,6 +126,18 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     public var isConnecting: Bool {
         return lock.withLock { _connecting }
+    }
+
+    /// The transport state as a single `ConnectionStatus`, read under one lock
+    /// hold so `connected` and `connecting` can't be observed inconsistently
+    /// (reading `isConnected` then `isConnecting` separately is two lock hops
+    /// and can race). `.connected` wins over `.connecting`.
+    public var connectionStatus: ConnectionStatus {
+        return lock.withLock {
+            if _connected { return .connected }
+            if _connecting { return .connecting }
+            return .disconnected
+        }
     }
 
     public func setMaxReconnectDelay(_ ms: Int) {
@@ -245,7 +256,6 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.lock.withLock {
                 self.connectContinuation = continuation
-                self.hasActiveConnectContinuation = true
             }
 
             // Now start the connection
@@ -275,7 +285,6 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
                 let continuation = connectContinuation
                 connectContinuation = nil
-                hasActiveConnectContinuation = false
                 let waiters = pendingConnectWaiters
                 pendingConnectWaiters.removeAll()
                 return (continuation, waiters)
@@ -328,7 +337,6 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
                 }
                 let continuation = connectContinuation
                 connectContinuation = nil
-                hasActiveConnectContinuation = false
                 let waiters = pendingConnectWaiters
                 pendingConnectWaiters.removeAll()
                 _connecting = false
@@ -341,20 +349,13 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         for waiter in drained.waiters {
             waiter.resume(throwing: error)
         }
-        handleConnectionClosed(code: nil, reason: error.localizedDescription)
-    }
-
-    /// Polls until connection completes (for secondary callers waiting on an in-flight connect).
-    private func waitForConnection() async throws {
-        for _ in 0..<100 {
-            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
-            let (connected, connecting) = lock.withLock { (_connected, _connecting) }
-            if connected { return }
-            if !connecting {
-                throw WebSocketError.connectionFailed("Connection attempt ended without success")
-            }
-        }
-        throw WebSocketError.connectionFailed("Timed out waiting for existing connection")
+        // Transport-level failure. Route the error through handleConnectionClosed
+        // so its once-only `wasTask` guard emits `.connectionError` exactly once,
+        // whether the failure surfaces here (connect-time) or via the receive-loop
+        // catch (an already-established connection). handleConnectionClosed also
+        // emits the paired close, mirroring the JS client's 'error' + 'close' pair
+        // (`handleWebSocketError`).
+        handleConnectionClosed(code: nil, reason: error.localizedDescription, error: error)
     }
 
     // MARK: - Receive Loop
@@ -388,9 +389,15 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
                     if stillCurrentTask {
                         self.logger.log("Disconnected from WebSocket server. Error:", error.localizedDescription)
+                        // Established-connection transport failure: pass the error
+                        // so `.connectionError` fires (once, via the guard in
+                        // handleConnectionClosed). Deliberate closes cancel this
+                        // receive loop first, so `Task.isCancelled` short-circuits
+                        // above and never reaches here — no spurious error.
                         self.handleConnectionClosed(
                             code: (error as? URLError)?.errorCode,
-                            reason: error.localizedDescription
+                            reason: error.localizedDescription,
+                            error: error
                         )
                     }
                     return
@@ -401,7 +408,7 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     // MARK: - Connection Closed Handler
 
-    private func handleConnectionClosed(code: Int?, reason: String?) {
+    private func handleConnectionClosed(code: Int?, reason: String?, error: Error? = nil) {
         let snapshot: (
             wasTask: URLSessionWebSocketTask?,
             pendingConnect: CheckedContinuation<Void, Error>?,
@@ -428,7 +435,6 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
             // Reject pending connect continuation and any extra waiters
             let pendingConnect = connectContinuation
             connectContinuation = nil
-            hasActiveConnectContinuation = false
             let drainedWaiters = pendingConnectWaiters
             pendingConnectWaiters.removeAll()
 
@@ -459,6 +465,18 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
             )
         }
 
+        // `.connectionError` fires here exactly once per transport failure. The
+        // atomic `wasTask` claim in the snapshot above is the once-only guard:
+        // whichever path (didCompleteWithError or the receive-loop catch) first
+        // enters with a live task nils it, so a second entry for the same failure
+        // sees `wasTask == nil` and does not re-emit. A graceful close
+        // (didCloseWith) passes `error: nil` and emits no error — mirroring the JS
+        // client emitting 'error' only on a transport error and 'close' on every
+        // close. Emitted before the close so subscribers see error-then-close.
+        if let error, snapshot.wasTask != nil {
+            delegate?.webSocketManagerOnError(error)
+        }
+
         delegate?.webSocketManagerOnStatusChange(.disconnected)
         delegate?.webSocketManagerOnClose(code: code, reason: reason)
 
@@ -470,10 +488,16 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
             waiter.resume(throwing: closeError)
         }
 
-        // Clean up session
+        // Clean up session. Capture-and-nil `session` atomically under the lock
+        // (it is written under the lock elsewhere, so reading it unlocked is a
+        // data race), then invalidate the captured reference outside the lock.
         if snapshot.wasTask != nil {
-            session?.invalidateAndCancel()
-            lock.withLock { session = nil }
+            let staleSession: URLSession? = lock.withLock {
+                let s = session
+                session = nil
+                return s
+            }
+            staleSession?.invalidateAndCancel()
         }
 
         if snapshot.wasDisconnecting {
@@ -536,18 +560,30 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     private func calculateReconnectDelay() -> Int {
         return lock.withLock {
-            let baseDelayMs = 200
-            let maxSeconds = max(1, maxReconnectDelayMs / 1000)
-            // Cap in Double BEFORE converting: `pow` grows past Int.max (and
-            // reaches +infinity) once reconnectAttempts gets large, and
-            // `Int(_:)` traps on such a value — the cap has to apply first or
-            // the process dies instead of backing off.
-            let cappedSeconds = Int(
-                min(pow(2.0, Double(reconnectAttempts)), Double(maxSeconds))
+            let delay = Self.reconnectDelayMs(
+                attempts: reconnectAttempts,
+                maxReconnectDelayMs: maxReconnectDelayMs
             )
             reconnectAttempts += 1
-            return baseDelayMs + cappedSeconds * 1000
+            return delay
         }
+    }
+
+    /// Pure exponential-backoff delay computation, split out so it can be unit
+    /// tested independently of the manager's locking and socket state.
+    ///
+    /// The cap is applied in the `Double` domain *before* converting to `Int`.
+    /// Doing the `min` in `Int` (via `Int(pow(2.0, …))` first) traps once
+    /// `attempts` reaches ~63, where `pow(2, attempts)` exceeds `Int.max` and
+    /// the `Double → Int` conversion crashes before the cap can clamp it. In
+    /// `Double`, an overflowing `pow` simply yields `.infinity`, and
+    /// `min(.infinity, Double(maxSeconds))` picks the finite cap, so the final
+    /// `Int(...)` is always in range regardless of how high `attempts` climbs.
+    static func reconnectDelayMs(attempts: Int, maxReconnectDelayMs: Int) -> Int {
+        let baseDelayMs = 200
+        let maxSeconds = max(1, maxReconnectDelayMs / 1000)
+        let cappedSeconds = Int(min(pow(2.0, Double(attempts)), Double(maxSeconds)))
+        return baseDelayMs + cappedSeconds * 1000
     }
 
     // MARK: - Disconnect
@@ -690,20 +726,17 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
                 }
             }
 
-            let (connected, connecting): (Bool, Bool) = lock.withLock {
-                self.shouldConnect = true
-                return (_connected, _connecting)
-            }
+            lock.withLock { self.shouldConnect = true }
 
-            if !connected && !connecting {
-                do {
-                    try await connect()
-                } catch {
-                    logger.debug("[WSM][debug] connect failed in setDesiredConnection:", error.localizedDescription)
-                }
-            } else if connecting {
-                // Wait for existing connection attempt
-                try? await waitForConnection()
+            // `connect()` is idempotent: it returns immediately if already
+            // connected, registers on the `pendingConnectWaiters` list if a
+            // connect is already in flight, or starts a fresh connect. Calling
+            // it unconditionally replaces the old branch that hand-rolled a
+            // 50ms polling wait (`waitForConnection`) for the in-flight case.
+            do {
+                try await connect()
+            } catch {
+                logger.debug("[WSM][debug] connect failed in setDesiredConnection:", error.localizedDescription)
             }
         } else {
             lock.withLock { self.shouldConnect = false }
@@ -780,7 +813,6 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         pendingConnectWaiters.removeAll()
         if let continuation = connectContinuation {
             connectContinuation = nil
-            hasActiveConnectContinuation = false
             _connecting = false
             let err = WebSocketError.connectionFailed("Connection closed: \(initiator)")
             continuation.resume(throwing: err)

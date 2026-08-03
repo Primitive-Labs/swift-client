@@ -36,6 +36,19 @@ public struct QueryOptions: Sendable {
     public var sortOrder: [(String, Int)]?
     /// Maximum number of results per page.
     public var limit: Int?
+
+    /// Internal, non-deprecated storage for offset-based pagination.
+    ///
+    /// The query engine (`BaoModelQueryEngine`) reads this field directly so
+    /// the client's own implementation can keep honoring offset queries
+    /// during the deprecation window without tripping the public `offset`
+    /// deprecation. External callers never touch it — they go through the
+    /// deprecated computed `offset` accessor and the deprecated initializer
+    /// overload below, both of which warn as intended. Named `internal`
+    /// (not a `_`-prefixed private-looking name) because it is genuine
+    /// module-internal state read across files.
+    internal var offsetForQuery: Int?
+
     /// Offset-based pagination — DEPRECATED.
     ///
     /// Offset is unstable in CRDT-backed datasets: concurrent inserts
@@ -46,8 +59,15 @@ public struct QueryOptions: Sendable {
     /// unique key value and survives concurrent mutations to other
     /// rows. js-bao deliberately doesn't expose offset for the same
     /// reason; this field is the only cross-language outlier.
+    ///
+    /// This is a computed accessor over `offsetForQuery`: external reads and
+    /// post-construction mutations (`opts.offset = N`) still work and still
+    /// warn, while the engine reads `offsetForQuery` without a warning.
     @available(*, deprecated, message: "Offset is unstable under concurrent inserts in CRDT-backed docs. Use `cursor` + `direction` for stable pagination.")
-    public var offset: Int?
+    public var offset: Int? {
+        get { offsetForQuery }
+        set { offsetForQuery = newValue }
+    }
 
     /// Opaque cursor from a previous `queryPaged` call. Pass
     /// `result.nextCursor` or `result.prevCursor` back here to advance
@@ -73,11 +93,17 @@ public struct QueryOptions: Sendable {
     /// `nil` returns every field.
     public var projection: [String: Int]?
 
+    /// Non-deprecated initializer — the default. It has no `offset`
+    /// parameter, so ordinary construction steers callers to `cursor` +
+    /// `direction`. Set `offset` through the deprecated overload below (or
+    /// the deprecated `offset` setter) so binding it surfaces the warning at
+    /// the call site; annotating only the stored/computed property does not.
+    /// Mirrors the #1816 initializer-overload pattern used by
+    /// `CreateDatabaseParams` / `CreateCollectionParams`.
     public init(
         sort: [String: Int]? = nil,
         sortOrder: [(String, Int)]? = nil,
         limit: Int? = nil,
-        offset: Int? = nil,
         cursor: String? = nil,
         direction: CursorDirection = .forward,
         documents: [String]? = nil,
@@ -86,7 +112,34 @@ public struct QueryOptions: Sendable {
         self.sort = sort
         self.sortOrder = sortOrder
         self.limit = limit
-        self.offset = offset
+        self.offsetForQuery = nil
+        self.cursor = cursor
+        self.direction = direction
+        self.documents = documents
+        self.projection = projection
+    }
+
+    /// Deprecated overload that accepts `offset`, so `QueryOptions(…,
+    /// offset:)` call sites receive the deprecation warning. `offset` has no
+    /// default here so it does not collide with the non-deprecated
+    /// initializer when omitted. Writes `offsetForQuery` directly (not the
+    /// deprecated `offset` setter) so the assignment inside this initializer
+    /// does not itself warn.
+    @available(*, deprecated, message: "Offset is unstable under concurrent inserts in CRDT-backed docs. Use `cursor` + `direction` for stable pagination.")
+    public init(
+        sort: [String: Int]? = nil,
+        sortOrder: [(String, Int)]? = nil,
+        limit: Int? = nil,
+        offset: Int?,
+        cursor: String? = nil,
+        direction: CursorDirection = .forward,
+        documents: [String]? = nil,
+        projection: [String: Int]? = nil
+    ) {
+        self.sort = sort
+        self.sortOrder = sortOrder
+        self.limit = limit
+        self.offsetForQuery = offset
         self.cursor = cursor
         self.direction = direction
         self.documents = documents

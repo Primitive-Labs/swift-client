@@ -1,6 +1,75 @@
 import Foundation
 
 /// Manages authentication state, token lifecycle, OAuth flows, and offline access.
+///
+/// ## A sync-adjacent boundary type (#1993 Phase D)
+///
+/// The concurrency epic actorized the async service managers (`OfflineStore`,
+/// `KvCache`, `AnalyticsQueue`). This controller was deliberately left out of
+/// that set by the sponsor (Fork 2, Option A): it has 13 synchronous public
+/// members that callers reach from synchronous contexts, and `HttpClient`'s
+/// 401 path calls into it, so converting it belongs in its own change. That
+/// conversion is tracked as #2173. Until then the class-plus-lock model here is
+/// the contract, and this argument is what stands in for compiler checking.
+///
+/// ## `@unchecked Sendable` safety argument
+///
+/// One `NSLock`, held in `lock`, guards **all** mutable state: `currentToken`,
+/// `jwtPayload`, `currentUserId`, `networkMode`, `authReady`,
+/// `authReadyContinuations`, `blockNonInteractiveAuth`, the refresh-backoff
+/// bookkeeping (`refreshBackoffDelayMs`, `refreshBackoffAccumMs`,
+/// `refreshRetryTask`, `refreshRetryScheduled`, `refreshRetryEpoch`) and its
+/// tuning fields (`refreshBackoffBaseMs`, `refreshBackoffCapMs`,
+/// `refreshBackoffMultiplier` — `var`s so tests can shorten a backoff, read in
+/// production only from inside `handleRefreshDeferred`'s locked region),
+/// `destroyed`, `pendingPersistTask`, `pendingRefresh`, `offlineIdentity`,
+/// `pendingCodeVerifier` and `_transport`. Reads that only need one field go
+/// through the small locked accessors (`getToken`, `getUserId`,
+/// `getNetworkMode`, `getJwtPayload`, `getAuthState`) rather than touching the
+/// storage directly, so a field is never read off-lock for convenience.
+///
+/// Four properties of the design make that single lock sufficient:
+///
+///  1. **No lock is held across an `await`.** Every suspension-crossing path
+///     copies what it needs out of the critical section first — `refreshAccessToken`
+///     registers or joins the single-flight `Task` inside one `withLock` and
+///     awaits it outside; `requireTransport` copies the `any Transport`
+///     existential out under the lock; `handleRefreshDeferred` computes a
+///     `Decision` value inside the lock and emits/schedules outside it.
+///  2. **Every decision that must be atomic is one critical section.** The
+///     refresh single-flight (check-and-register), the backoff
+///     check-and-schedule, the logout guard (`blockNonInteractiveAuth` +
+///     `offlineIdentity`) and the retry-epoch validation are each a single
+///     `withLock`, not a read followed by a separate write. This is the same
+///     invariant the actorized managers restate as "no `await` inside a
+///     decision region"; here the lock provides it directly.
+///  3. **`NSLock` is not recursive, so no locked region calls back out.** The
+///     event emissions, the logger calls and the `onLogoutDisconnect` /
+///     `setClientNetworkMode` hooks all run after the lock is released.
+///  4. **The write-once fields are confined to construction.** `_transport` is
+///     installed by `setTransport`, which `precondition`s on a second call, and
+///     writes under `lock`. The one other writer is the `DEBUG`-only
+///     `replaceTransportForTesting`, which also writes under `lock` — so the
+///     field is lock-confined either way; only the "written exactly once"
+///     characterization is relaxed in test builds. `emitter` is a `weak var`
+///     assigned only in `init` and never rebound. `setClientNetworkMode` and
+///     `onLogoutDisconnect` are wired once by `JsBaoClient` while it is still
+///     constructing itself, before the client is handed to any other thread,
+///     and are never reassigned; their reads are therefore unsynchronized by
+///     design, not by omission.
+///
+/// The one documented exception to (1) is `deinit`, which cancels
+/// `refreshRetryTask` without taking `lock`. By then the last strong reference
+/// is gone — the retry `Task` captures `[weak self]`, so it cannot be the
+/// concurrent reader — and taking a lock in `deinit` would risk blocking a
+/// deallocation. Same exception, same reasoning, as the sync domain's
+/// `DynamicModel`.
+///
+/// Known gap, closed: the design pass for #1993 recorded an unsynchronized read
+/// of the backoff delay while building the `authRefreshDeferred` payload
+/// (#2174). #2022's rewrite replaced that read with the `Decision` enum above,
+/// which carries the delay out of the locked region as a value, so the race no
+/// longer exists on this tree.
 public final class AuthController: @unchecked Sendable {
     private let lock = NSLock()
 
@@ -28,11 +97,52 @@ public final class AuthController: @unchecked Sendable {
     /// (`google`/`oauth`/`apple`/`magic_link`/`otp`/`passkey`). Guarded by `lock`.
     private var blockNonInteractiveAuth = false
 
-    // Refresh backoff
-    private var refreshBackoffMs: Int = 2000
-    private let refreshBackoffBase: Int = 2000
-    private let refreshBackoffMax: Int = 300_000
-    private var lastRefreshAttempt: Date?
+    // Refresh-retry backoff (#2022) — the port of the JS client's
+    // `handleRefreshDeferred` / `scheduleRefreshRetry`
+    // (src/client/internal/authController.ts). A network-failed refresh
+    // schedules a background retry after `refreshBackoffDelayMs`, doubling the
+    // delay each time and accumulating the total in `refreshBackoffAccumMs`;
+    // once the projected total reaches the cap the controller stops retrying
+    // and takes the client offline instead. `nextAttemptMs` in the public
+    // `authRefreshDeferred` event reports the delay of the attempt actually
+    // scheduled.
+    //
+    // `refreshBackoffDelayMs` starts at 0 (not at the base) so the FIRST
+    // deferral reports the base delay and only then doubles — matching JS.
+    private var refreshBackoffDelayMs: Int = 0
+    private var refreshBackoffAccumMs: Int = 0
+
+    // Backoff policy. Same values as the JS client. `internal` rather than
+    // `private` only so tests can shrink the delays to milliseconds; nothing
+    // in production mutates them.
+    var refreshBackoffBaseMs: Int = 2000
+    var refreshBackoffCapMs: Int = 300_000
+    var refreshBackoffMultiplier: Int = 2
+
+    // The pending retry. `refreshRetryScheduled` is the logical "a retry is
+    // pending" flag the already-scheduled fast path reads; the Task is kept
+    // only so cancellation can reach it. They're separate because a very short
+    // delay lets the Task run to completion before `scheduleRefreshRetry`
+    // stores it, and the flag must clear in that case too. `refreshRetryEpoch`
+    // invalidates a Task whose reset/cancel raced its wakeup.
+    private var refreshRetryTask: Task<Void, Never>?
+    private var refreshRetryScheduled = false
+    private var refreshRetryEpoch: Int = 0
+
+    // Set by `destroy()`. Cancelling the pending retry Task is not enough on
+    // its own: a `refreshAccessToken` that was already in flight when teardown
+    // began can fail with a network error afterwards, reach
+    // `handleRefreshDeferred`, and schedule a fresh retry against a
+    // client/storage layer that is already gone. Once this is set, deferrals
+    // are ignored and no new retry is scheduled. Guarded by `lock`.
+    private var destroyed = false
+
+    /// Set the client-level network mode. Wired by `JsBaoClient` to
+    /// `client.setNetworkMode(_:)` so the backoff-cap transition emits the
+    /// `networkMode` event exactly like a caller-initiated switch — the
+    /// Swift equivalent of the JS `deps.setNetworkMode`. When the controller
+    /// runs standalone (unit tests) it falls back to setting its own mode.
+    var setClientNetworkMode: (@Sendable (NetworkMode) -> Void)?
 
     // In-flight JWT persistence task. Tracked so destroy() can await
     // outstanding writes before the storage layer closes the SQLite
@@ -51,8 +161,12 @@ public final class AuthController: @unchecked Sendable {
     // via PKCE (RFC 7636) instead. Guarded by `lock`.
     private var pendingCodeVerifier: String?
 
-    // Request function (set externally to break circular dependency)
-    var makeRequest: ((String, String, Any?) async throws -> Any?)?
+    // The typed HTTP transport, injected externally to break the circular
+    // dependency with `JsBaoClient`. Written exactly once through
+    // `setTransport` and only ever read under `lock` — the existential is
+    // copied out of the critical section so no lock is ever held across an
+    // `await`.
+    private var _transport: (any Transport)?
 
     public init(
         appId: String,
@@ -71,6 +185,43 @@ public final class AuthController: @unchecked Sendable {
         self.refreshProxy = refreshProxy
         self.persistConfig = persistConfig
         self.keychainHelper = KeychainHelper(service: "com.primitive.\(appId).offline")
+    }
+
+    // MARK: - Transport injection
+
+    /// Install the typed HTTP transport. **One-shot**: calling it a second
+    /// time is a programming error and traps, because every request path
+    /// reads the stored existential and a mid-flight swap would silently
+    /// route some calls through the old client.
+    ///
+    /// The write happens under `lock`; every read copies the existential out
+    /// under the same lock and releases it before awaiting.
+    public func setTransport(_ transport: any Transport) {
+        lock.withLock {
+            precondition(
+                _transport == nil,
+                "AuthController.setTransport may only be called once"
+            )
+            _transport = transport
+        }
+    }
+
+    #if DEBUG
+    /// Test-only escape hatch from the one-shot rule: point an
+    /// already-wired controller at a fake transport. `internal` and
+    /// `DEBUG`-only, so no shipping code can swap the transport mid-flight.
+    func replaceTransportForTesting(_ transport: any Transport) {
+        lock.withLock { _transport = transport }
+    }
+    #endif
+
+    /// The installed transport, copied out under `lock`. Throws the same
+    /// "HTTP client not configured" error the unwired legacy closure did.
+    private func requireTransport() throws -> any Transport {
+        guard let transport = lock.withLock({ _transport }) else {
+            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+        }
+        return transport
     }
 
     // MARK: - Token Management
@@ -160,22 +311,39 @@ public final class AuthController: @unchecked Sendable {
             return
         }
 
+        // A token landing from ANY path (bootstrap, interactive login, a
+        // successful refresh, logout clearing it) makes a deferred refresh
+        // moot: cancel the pending retry and clear the accumulated backoff.
+        // Mirrors the JS `resetRefreshBackoff("bootstrap" / "token-updated")`
+        // calls in `bootstrapToken` / `updateToken`.
+        resetRefreshBackoff("token-updated")
+
+        // The mode is read through the locked accessor at each construction
+        // site below rather than hoisted into a local here. Hoisting would be
+        // one fewer lock acquisition, but an `.authSuccess` listener that
+        // switches the client online — a realistic reaction to signing in —
+        // would then see a stale mode in the `AuthStateEvent` that follows,
+        // where the pre-#1993 code read the stored property inline at each
+        // event. Reading through the accessor keeps the `@unchecked Sendable`
+        // argument's "every mutable field is lock-confined" claim true without
+        // changing when the value is sampled.
+
         if let newToken = newToken {
             logger.debug("Token applied", "userId:", newUserId ?? "nil", "cause:", cause ?? "unknown")
-            emitter?.emit(.authSuccess, AuthSuccessEvent(
+            emitter?.emit(AuthSuccessEvent(
                 token: newToken,
                 previousToken: previous,
                 cause: cause
             ))
-            emitter?.emit(.authState, AuthStateEvent(
+            emitter?.emit(AuthStateEvent(
                 authenticated: true,
-                mode: networkMode,
+                mode: getNetworkMode(),
                 userId: newUserId
             ))
         } else if previous != nil {
-            emitter?.emit(.authState, AuthStateEvent(
+            emitter?.emit(AuthStateEvent(
                 authenticated: false,
-                mode: networkMode,
+                mode: getNetworkMode(),
                 userId: nil
             ))
         }
@@ -264,31 +432,196 @@ public final class AuthController: @unchecked Sendable {
                 newToken = try await refreshDirect()
             }
 
-            lock.withLock { refreshBackoffMs = refreshBackoffBase }
+            resetRefreshBackoff("refresh-success")
 
             let previous = getToken()
             applyToken(newToken, previous: previous, cause: "refresh")
             return .success
         } catch let error as HttpError where error.status == 401 || error.status == 403 {
             logger.warn("Token refresh returned invalid:", error.status)
-            emitter?.emit(.authFailed, AuthFailedEvent(
+            resetRefreshBackoff("refresh-invalid")
+            emitter?.emit(AuthFailedEvent(
                 message: "Token refresh failed: \(error.message)",
                 reason: "invalid_token"
             ))
             return .invalid
         } catch {
             logger.warn("Token refresh network error:", error.localizedDescription)
-
-            lock.withLock { refreshBackoffMs = min(refreshBackoffMs * 2, refreshBackoffMax) }
-
-            emitter?.emit(.authRefreshDeferred, [
-                "status": "scheduled",
-                "cause": cause ?? "network_error",
-                "nextAttemptMs": refreshBackoffMs,
-            ] as [String: Any])
-
+            handleRefreshDeferred(cause: cause ?? "network_error", error: error)
             return .network
         }
+    }
+
+    // MARK: - Refresh Retry Backoff (#2022)
+
+    /// Handle a refresh that failed for connectivity reasons: schedule the
+    /// next attempt, re-report an already-scheduled one, or give up and go
+    /// offline once the accumulated backoff reaches the cap. Port of the JS
+    /// `handleRefreshDeferred`.
+    private func handleRefreshDeferred(cause: String?, error: Error?) {
+        enum Decision {
+            case destroyed
+            case alreadyOffline
+            case alreadyScheduled(delayMs: Int)
+            case capReached
+            case schedule(delayMs: Int)
+        }
+
+        // One critical section so two concurrent deferrals can't both decide
+        // to schedule (which would stack timers and double the retry rate).
+        let decision: Decision = lock.withLock {
+            // A refresh that was in flight when `destroy()` ran can land here
+            // afterwards; scheduling a retry now would run background work
+            // against a torn-down client.
+            if destroyed {
+                return .destroyed
+            }
+            if networkMode == .offline {
+                return .alreadyOffline
+            }
+            if refreshRetryScheduled {
+                return .alreadyScheduled(delayMs: refreshBackoffDelayMs)
+            }
+
+            let nextDelay = refreshBackoffDelayMs == 0
+                ? refreshBackoffBaseMs
+                : min(refreshBackoffDelayMs, refreshBackoffCapMs)
+
+            let projectedAccum = refreshBackoffAccumMs + nextDelay
+            if projectedAccum >= refreshBackoffCapMs {
+                return .capReached
+            }
+
+            refreshBackoffAccumMs = projectedAccum
+            refreshBackoffDelayMs = min(nextDelay * refreshBackoffMultiplier, refreshBackoffCapMs)
+            refreshRetryScheduled = true
+            refreshRetryEpoch += 1
+            return .schedule(delayMs: nextDelay)
+        }
+
+        switch decision {
+        case .destroyed:
+            logger.debug("Ignoring deferred refresh after destroy", "cause:", cause ?? "unknown")
+
+        case .alreadyOffline:
+            emitAuthRefreshDeferred(status: "offline", cause: cause)
+
+        case .alreadyScheduled(let delayMs):
+            emitAuthRefreshDeferred(status: "scheduled", cause: cause, nextAttemptMs: delayMs)
+
+        case .capReached:
+            resetRefreshBackoff("backoff-cap-reached")
+            applyOfflineNetworkMode()
+            emitAuthRefreshDeferred(
+                status: "offline",
+                cause: cause,
+                error: error?.localizedDescription
+            )
+
+        case .schedule(let delayMs):
+            emitAuthRefreshDeferred(status: "scheduled", cause: cause, nextAttemptMs: delayMs)
+            scheduleRefreshRetry(afterMs: delayMs, cause: cause)
+        }
+    }
+
+    /// Start the background retry. The caller has already marked
+    /// `refreshRetryScheduled` and bumped `refreshRetryEpoch` inside the
+    /// decision lock, so the fast path is correct even if this Task finishes
+    /// before the `refreshRetryTask` assignment below.
+    private func scheduleRefreshRetry(afterMs: Int, cause: String?) {
+        let epoch = lock.withLock { refreshRetryEpoch }
+        let task = Task<Void, Never> { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, afterMs)) * 1_000_000)
+            guard let self = self, !Task.isCancelled else { return }
+
+            // A reset (success / invalid / new token / destroy) that landed
+            // while this Task slept bumped the epoch — that retry is stale.
+            let stillCurrent = self.lock.withLock { () -> Bool in
+                guard !self.destroyed,
+                      self.refreshRetryEpoch == epoch,
+                      self.refreshRetryScheduled else {
+                    return false
+                }
+                self.refreshRetryScheduled = false
+                self.refreshRetryTask = nil
+                return true
+            }
+            guard stillCurrent else { return }
+
+            self.logger.debug(
+                "Retrying refresh after backoff",
+                "delayMs:", String(afterMs),
+                "cause:", cause ?? "unknown"
+            )
+            _ = await self.refreshAccessToken(cause: "backoff-retry")
+        }
+
+        // Only hold on to the Task while it's still the current one; if it
+        // already ran (or was reset) there's nothing left to cancel.
+        lock.withLock {
+            if refreshRetryEpoch == epoch, refreshRetryScheduled {
+                refreshRetryTask = task
+            }
+        }
+    }
+
+    /// Cancel any pending retry and clear the accumulated backoff. Port of the
+    /// JS `resetRefreshBackoff`. Safe to call from inside the retry Task (it
+    /// clears its own bookkeeping first, so this finds nothing to cancel).
+    private func resetRefreshBackoff(_ reason: String) {
+        let pending: Task<Void, Never>? = lock.withLock {
+            let task = refreshRetryTask
+            refreshRetryTask = nil
+            refreshRetryScheduled = false
+            refreshRetryEpoch += 1
+            refreshBackoffDelayMs = 0
+            refreshBackoffAccumMs = 0
+            return task
+        }
+        pending?.cancel()
+        logger.debug("Refresh backoff reset", "reason:", reason)
+    }
+
+    /// Take the client offline after the backoff cap. Goes through the
+    /// client-level hook when wired so the `networkMode` event fires once;
+    /// falls back to the controller's own mode when standalone.
+    private func applyOfflineNetworkMode() {
+        if let setClientNetworkMode = setClientNetworkMode {
+            setClientNetworkMode(.offline)
+        } else {
+            setNetworkMode(.offline)
+        }
+    }
+
+    private func emitAuthRefreshDeferred(
+        status: String,
+        cause: String?,
+        nextAttemptMs: Int? = nil,
+        error: String? = nil
+    ) {
+        logger.debug("Emitting auth-refresh-deferred", "status:", status)
+        emitter?.emit(AuthRefreshDeferredEvent(
+            status: status,
+            cause: cause,
+            nextAttemptMs: nextAttemptMs,
+            error: error
+        ))
+    }
+
+    /// Cancel background work owned by the controller. Called from
+    /// `JsBaoClient.destroy()`; also runs on `deinit` as a safety net so a
+    /// dropped controller can't fire a refresh afterwards.
+    ///
+    /// Marks the controller destroyed *before* cancelling the current retry, so
+    /// a refresh that is still in flight can't slip its network failure past
+    /// the cancellation and schedule a replacement retry. Idempotent.
+    public func destroy() {
+        lock.withLock { destroyed = true }
+        resetRefreshBackoff("destroy")
+    }
+
+    deinit {
+        refreshRetryTask?.cancel()
     }
 
     /// Handle a 401 challenge from the server
@@ -344,16 +677,13 @@ public final class AuthController: @unchecked Sendable {
         waitlist: OAuthWaitlist? = nil,
         inviteToken: String? = nil
     ) async throws -> URL {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+        let transport = try requireTransport()
 
-        let response = try await makeRequest("GET", "/oauth-config", nil)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid OAuth config response")
-        }
-        guard let googleClientId = dict["googleClientId"] as? String,
-              !googleClientId.isEmpty else {
+        let config: AuthConfigInfo = try await transport.request(
+            method: .get,
+            path: "/oauth-config"
+        )
+        guard let googleClientId = config.googleClientId, !googleClientId.isEmpty else {
             throw JsBaoError(code: .unavailable, message: "OAuth not configured")
         }
 
@@ -390,13 +720,11 @@ public final class AuthController: @unchecked Sendable {
     /// the `rt-{appId}` HttpOnly refresh cookie (handled transparently by
     /// `URLSession`'s shared cookie storage). Applies the token with cause
     /// `"google"`, which emits `.authSuccess` / `.authState` like every other
-    /// interactive sign-in path. Returns the raw server response so callers
+    /// interactive sign-in path. Returns the typed server response so callers
     /// can read `isNewUser`.
     @discardableResult
-    public func handleOAuthCallback(code: String, state: String) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+    public func handleOAuthCallback(code: String, state: String) async throws -> OAuthCallbackResult {
+        let transport = try requireTransport()
 
         // PKCE: consume the verifier from the most recent startOAuthFlow.
         // Cleared whether the exchange succeeds or fails so a stale verifier
@@ -413,25 +741,26 @@ public final class AuthController: @unchecked Sendable {
         // (`POST /auth/oauth/callback`, body `{code, state, codeVerifier}` —
         // OAuthController.callbackJson); the web `GET /oauth/callback` never
         // looks at a code_verifier param. So: verifier → POST, none → GET.
-        let response: Any?
+        let result: OAuthCallbackResult
         if let codeVerifier {
-            response = try await makeRequest(
-                "POST",
-                "/auth/oauth/callback",
-                ["code": code, "state": state, "codeVerifier": codeVerifier]
+            let body: [String: JSONValue] = [
+                "code": .string(code),
+                "state": .string(state),
+                "codeVerifier": .string(codeVerifier),
+            ]
+            result = try await transport.request(
+                method: .post,
+                path: "/auth/oauth/callback",
+                body: body
             )
         } else {
             let path = try Self.oauthCallbackPath(code: code, state: state)
-            response = try await makeRequest("GET", path, nil)
-        }
-        guard let dict = response as? [String: Any],
-              let token = dict["token"] as? String else {
-            throw JsBaoError(code: .unavailable, message: "Invalid OAuth callback response")
+            result = try await transport.request(method: .get, path: path)
         }
 
         let previous = getToken()
-        applyToken(token, previous: previous, cause: "google")
-        return dict
+        applyToken(result.token, previous: previous, cause: "google")
+        return result
     }
 
     // MARK: - Sign in with Apple
@@ -454,7 +783,7 @@ public final class AuthController: @unchecked Sendable {
     /// refresh cookie (handled by `URLSession`'s cookie storage). Applies
     /// the token with cause `"apple"`, emitting `.authSuccess` /
     /// `.authState` like the other interactive sign-in paths. Returns the
-    /// raw server response so callers can read `isNewUser`.
+    /// typed server response so callers can read `isNewUser`.
     @discardableResult
     public func handleAppleCallback(
         identityToken: String,
@@ -464,10 +793,8 @@ public final class AuthController: @unchecked Sendable {
         firstName: String? = nil,
         lastName: String? = nil,
         inviteToken: String? = nil
-    ) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+    ) async throws -> OAuthCallbackResult {
+        let transport = try requireTransport()
 
         let body = AppleSignInHelpers.callbackBody(
             identityToken: identityToken,
@@ -478,15 +805,15 @@ public final class AuthController: @unchecked Sendable {
             lastName: lastName,
             inviteToken: inviteToken
         )
-        let response = try await makeRequest("POST", "/auth/apple/callback", body)
-        guard let dict = response as? [String: Any],
-              let token = dict["token"] as? String else {
-            throw JsBaoError(code: .unavailable, message: "Invalid Apple sign-in response")
-        }
+        let result: OAuthCallbackResult = try await transport.request(
+            method: .post,
+            path: "/auth/apple/callback",
+            body: body
+        )
 
         let previous = getToken()
-        applyToken(token, previous: previous, cause: "apple")
-        return dict
+        applyToken(result.token, previous: previous, cause: "apple")
+        return result
     }
 
     // MARK: - OAuth URL helpers (pure, unit-testable)
@@ -501,28 +828,28 @@ public final class AuthController: @unchecked Sendable {
         inviteToken: String? = nil,
         nonce: String = UUID().uuidString
     ) throws -> String {
-        var state: [String: Any] = [
-            "nonce": nonce,
-            "redirectUri": redirectUri,
+        var state: [String: JSONValue] = [
+            "nonce": .string(nonce),
+            "redirectUri": .string(redirectUri),
         ]
         if let continueUrl, !continueUrl.isEmpty {
-            state["continueUrl"] = continueUrl
+            state["continueUrl"] = .string(continueUrl)
         }
         // #466 parity: enroll the user in the waitlist via the OAuth state bag.
         // JS trims both fields and clamps each to 255 chars, and only attaches
         // the `waitlist` key when at least one field survives trimming.
         if let waitlist {
-            var entry: [String: Any] = [:]
+            var entry: [String: JSONValue] = [:]
             if let source = waitlist.source?.trimmingCharacters(in: .whitespacesAndNewlines),
                !source.isEmpty {
-                entry["source"] = String(source.prefix(255))
+                entry["source"] = .string(String(source.prefix(255)))
             }
             if let note = waitlist.note?.trimmingCharacters(in: .whitespacesAndNewlines),
                !note.isEmpty {
-                entry["note"] = String(note.prefix(255))
+                entry["note"] = .string(String(note.prefix(255)))
             }
             if !entry.isEmpty {
-                state["waitlist"] = entry
+                state["waitlist"] = .object(entry)
             }
         }
         // #466 parity: thread the (trimmed) invite token through the state bag.
@@ -531,9 +858,9 @@ public final class AuthController: @unchecked Sendable {
         // user even when the OAuth email differs from the invited email.
         if let inviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines),
            !inviteToken.isEmpty {
-            state["inviteToken"] = inviteToken
+            state["inviteToken"] = .string(inviteToken)
         }
-        let data = try JSONSerialization.data(withJSONObject: state)
+        let data = try JSONCoding.encodeData(state)
         return data.base64EncodedString()
     }
 
@@ -623,26 +950,68 @@ public final class AuthController: @unchecked Sendable {
         return encoded
     }
 
+    /// Apply a verify endpoint's access token, then decode the rest of its
+    /// envelope.
+    ///
+    /// Two rules live here, shared by magic-link / OTP / passkey-finish:
+    ///
+    /// * **The token is required.** A 2xx without one used to return a
+    ///   fully-populated "success" result while the client stayed signed
+    ///   out — and since the typed surface no longer exposes the token, the
+    ///   caller had no way to notice. The server always sends it on 2xx, so
+    ///   its absence is a broken contract and is reported as one.
+    /// * **The token is applied first.** Magic-link and OTP tokens are
+    ///   single-use: decoding the whole envelope before applying the token
+    ///   means a mismatch on a sibling field (say a future `user` shape
+    ///   change) burns the credential server-side and leaves the user with
+    ///   no session and no retry.
+    private func applyVerifiedToken<Envelope: Decodable & Sendable>(
+        _ type: Envelope.Type,
+        from raw: JSONValue,
+        path: String,
+        cause: String
+    ) throws -> Envelope {
+        guard let accessToken = raw["token"]?.stringValue, !accessToken.isEmpty else {
+            throw JsBaoError(
+                code: .unavailable,
+                message: "Verify response carried no access token"
+            )
+        }
+        let previous = getToken()
+        applyToken(accessToken, previous: previous, cause: cause)
+
+        do {
+            return try JSONCoding.decodeData(Envelope.self, from: JSONCoding.encodeData(raw))
+        } catch {
+            // `path` is credential-bearing, so the factory redacts the body.
+            throw HttpError.decodingFailure(
+                path: path,
+                expected: Envelope.self,
+                body: nil,
+                underlying: error
+            )
+        }
+    }
+
     // MARK: - Magic Link
 
     public func magicLinkRequest(email: String, redirectUri: String) async throws -> Bool {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+        let transport = try requireTransport()
 
-        let body: [String: Any] = ["email": email, "redirectUri": redirectUri]
-        let response = try await makeRequest("POST", "/auth/magic-link/request", body)
-        guard let dict = response as? [String: Any],
-              let success = dict["success"] as? Bool else {
-            return false
-        }
-        return success
+        let body: [String: JSONValue] = [
+            "email": .string(email),
+            "redirectUri": .string(redirectUri),
+        ]
+        let response: SuccessResponse? = try await transport.requestOptional(
+            method: .post,
+            path: "/auth/magic-link/request",
+            body: body
+        )
+        return response?.success ?? false
     }
 
-    public func magicLinkVerify(token: String, inviteToken: String? = nil) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+    public func magicLinkVerify(token: String, inviteToken: String? = nil) async throws -> MagicLinkVerifyResult {
+        let transport = try requireTransport()
 
         // #466: thread the (trimmed) invite token through verify so deferred
         // grants resolve to the signing-in user. Mirrors JS magicLinkVerify.
@@ -650,61 +1019,60 @@ public final class AuthController: @unchecked Sendable {
         let resolvedInviteToken = (trimmedInviteToken?.isEmpty == false) ? trimmedInviteToken : nil
 
         let endpoint: String
-        var body: [String: Any]
+        var body: [String: JSONValue]
 
         if let proxy = refreshProxy, proxy.enabled {
             endpoint = "\(proxy.baseUrl)/auth/magic-link/verify"
-            body = ["token": token, "appId": appId]
+            body = ["token": .string(token), "appId": .string(appId)]
         } else {
             endpoint = "/auth/magic-link/verify"
-            body = ["token": token]
+            body = ["token": .string(token)]
         }
         if let resolvedInviteToken = resolvedInviteToken {
-            body["inviteToken"] = resolvedInviteToken
+            body["inviteToken"] = .string(resolvedInviteToken)
         }
 
-        let response = try await makeRequest("POST", endpoint, body)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid magic link verify response")
-        }
+        let raw: JSONValue = try await transport.request(
+            method: .post,
+            path: endpoint,
+            body: body
+        )
+        let envelope: MagicLinkVerifyEnvelope = try applyVerifiedToken(
+            MagicLinkVerifyEnvelope.self, from: raw, path: endpoint, cause: "magic_link"
+        )
 
-        if let accessToken = dict["token"] as? String {
-            let previous = getToken()
-            applyToken(accessToken, previous: previous, cause: "magic_link")
-        }
-
-        return dict
+        return MagicLinkVerifyResult(
+            user: envelope.user,
+            promptAddPasskey: envelope.promptAddPasskey,
+            isNewUser: envelope.isNewUser
+        )
     }
 
     // MARK: - OTP
 
     public func otpRequest(email: String) async throws -> Bool {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+        let transport = try requireTransport()
 
-        let body: [String: Any] = ["email": email]
-        let response = try await makeRequest("POST", "/auth/otp/request", body)
-        guard let dict = response as? [String: Any],
-              let success = dict["success"] as? Bool else {
-            return false
-        }
-        return success
+        let body: [String: JSONValue] = ["email": .string(email)]
+        let response: SuccessResponse? = try await transport.requestOptional(
+            method: .post,
+            path: "/auth/otp/request",
+            body: body
+        )
+        return response?.success ?? false
     }
 
-    public func otpVerify(email: String, code: String, inviteToken: String? = nil) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+    public func otpVerify(email: String, code: String, inviteToken: String? = nil) async throws -> OtpVerifyResult {
+        let transport = try requireTransport()
 
         // #466: thread the (trimmed) invite token through verify so deferred
         // grants resolve to the signing-in user. Mirrors JS otpVerify.
         let trimmedInviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedInviteToken = (trimmedInviteToken?.isEmpty == false) ? trimmedInviteToken : nil
 
-        var body: [String: Any] = ["email": email, "code": code]
+        var body: [String: JSONValue] = ["email": .string(email), "code": .string(code)]
         if let resolvedInviteToken = resolvedInviteToken {
-            body["inviteToken"] = resolvedInviteToken
+            body["inviteToken"] = .string(resolvedInviteToken)
         }
 
         let endpoint: String
@@ -714,17 +1082,16 @@ public final class AuthController: @unchecked Sendable {
             endpoint = "/auth/otp/verify"
         }
 
-        let response = try await makeRequest("POST", endpoint, body)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid OTP verify response")
-        }
+        let raw: JSONValue = try await transport.request(
+            method: .post,
+            path: endpoint,
+            body: body
+        )
+        let envelope: OtpVerifyEnvelope = try applyVerifiedToken(
+            OtpVerifyEnvelope.self, from: raw, path: endpoint, cause: "otp"
+        )
 
-        if let accessToken = dict["token"] as? String {
-            let previous = getToken()
-            applyToken(accessToken, previous: previous, cause: "otp")
-        }
-
-        return dict
+        return OtpVerifyResult(user: envelope.user, isNewUser: envelope.isNewUser)
     }
 
     // MARK: - Passkeys (#929)
@@ -733,123 +1100,123 @@ public final class AuthController: @unchecked Sendable {
     // The native AuthenticationServices orchestration lives in
     // `AuthAPI+NativePasskeys.swift`; these methods only speak HTTP.
 
-    /// `POST /passkey/auth/start` (no auth). Returns the raw response dict:
-    /// WebAuthn request options spread at the top level plus `challengeToken`.
-    public func passkeyAuthStart() async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
-        let response = try await makeRequest("POST", "/passkey/auth/start", [String: Any]())
-        guard let dict = response as? [String: Any],
-              dict["challengeToken"] is String else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey auth start response")
-        }
-        return dict
+    /// `POST /passkey/auth/start` (no auth). The server spreads the WebAuthn
+    /// request options at the top level alongside `challengeToken`; the
+    /// options travel as an opaque `JSONValue` because the SDK hands them
+    /// straight to `PasskeyWire` / AuthenticationServices.
+    public func passkeyAuthStart() async throws -> PasskeyAuthStartResult {
+        let transport = try requireTransport()
+        let response: JSONValue = try await transport.request(
+            method: .post,
+            path: "/passkey/auth/start",
+            body: [String: JSONValue]()
+        )
+        let split = try Self.splitChallengeToken(
+            response,
+            message: "Invalid passkey auth start response"
+        )
+        return PasskeyAuthStartResult(options: split.options, challengeToken: split.challengeToken)
     }
 
     /// `POST /passkey/auth/finish` (no auth). On success applies the
     /// returned access token (cause `"passkey"`) — the session lands exactly
-    /// like the magic-link / OTP paths — and returns the response dict
-    /// (`{ token, expiresAt, user, isNewUser }`).
-    public func passkeyAuthFinish(credential: [String: Any], challengeToken: String) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
-        let body: [String: Any] = [
+    /// like the magic-link / OTP paths — and returns the typed result.
+    public func passkeyAuthFinish(
+        credential: JSONValue,
+        challengeToken: String
+    ) async throws -> PasskeySignInResult {
+        let transport = try requireTransport()
+        let body: [String: JSONValue] = [
             "credential": credential,
-            "challengeToken": challengeToken,
+            "challengeToken": .string(challengeToken),
         ]
-        let response = try await makeRequest("POST", "/passkey/auth/finish", body)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey auth finish response")
-        }
-        if let accessToken = dict["token"] as? String {
-            let previous = getToken()
-            applyToken(accessToken, previous: previous, cause: "passkey")
-        }
-        return dict
+        let raw: JSONValue = try await transport.request(
+            method: .post,
+            path: "/passkey/auth/finish",
+            body: body
+        )
+        let envelope: PasskeyAuthFinishEnvelope = try applyVerifiedToken(
+            PasskeyAuthFinishEnvelope.self,
+            from: raw,
+            path: "/passkey/auth/finish",
+            cause: "passkey"
+        )
+        return PasskeySignInResult(user: envelope.user, isNewUser: envelope.isNewUser)
     }
 
-    /// `POST /passkey/register/start` (requires auth). Returns the raw
-    /// response dict: WebAuthn creation options plus `challengeToken`.
-    public func passkeyRegisterStart() async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
+    /// `POST /passkey/register/start` (requires auth). WebAuthn creation
+    /// options plus `challengeToken`, same split as `passkeyAuthStart`.
+    public func passkeyRegisterStart() async throws -> PasskeyRegisterStartResult {
+        let transport = try requireTransport()
+        let response: JSONValue = try await transport.request(
+            method: .post,
+            path: "/passkey/register/start",
+            body: [String: JSONValue]()
+        )
+        let split = try Self.splitChallengeToken(
+            response,
+            message: "Invalid passkey register start response"
+        )
+        return PasskeyRegisterStartResult(options: split.options, challengeToken: split.challengeToken)
+    }
+
+    /// Split a passkey `start` response into `{options, challengeToken}`:
+    /// the server spreads the WebAuthn options at the top level, so the
+    /// options are everything except `challengeToken`.
+    private static func splitChallengeToken(
+        _ response: JSONValue,
+        message: String
+    ) throws -> (options: JSONValue, challengeToken: String) {
+        guard var object = response.objectValue,
+              let challengeToken = object["challengeToken"]?.stringValue else {
+            throw JsBaoError(code: .unavailable, message: message)
         }
-        let response = try await makeRequest("POST", "/passkey/register/start", [String: Any]())
-        guard let dict = response as? [String: Any],
-              dict["challengeToken"] is String else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey register start response")
-        }
-        return dict
+        object.removeValue(forKey: "challengeToken")
+        return (.object(object), challengeToken)
     }
 
     /// `POST /passkey/register/finish` (requires auth). Returns
     /// `{ success, credentialBackedUp?, invitation? }`. `inviteToken` (#466)
     /// folds invitation acceptance into the registration call.
     public func passkeyRegisterFinish(
-        credential: [String: Any],
+        credential: JSONValue,
         challengeToken: String,
         deviceName: String? = nil,
         inviteToken: String? = nil
-    ) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
-        var body: [String: Any] = [
+    ) async throws -> PasskeyRegistrationResult {
+        let transport = try requireTransport()
+        var body: [String: JSONValue] = [
             "credential": credential,
-            "challengeToken": challengeToken,
+            "challengeToken": .string(challengeToken),
         ]
         if let deviceName = deviceName, !deviceName.isEmpty {
-            body["deviceName"] = deviceName
+            body["deviceName"] = .string(deviceName)
         }
         let trimmedInviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmedInviteToken = trimmedInviteToken, !trimmedInviteToken.isEmpty {
-            body["inviteToken"] = trimmedInviteToken
+            body["inviteToken"] = .string(trimmedInviteToken)
         }
-        let response = try await makeRequest("POST", "/passkey/register/finish", body)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey register finish response")
-        }
-        return dict
+        return try await transport.request(method: .post, path: "/passkey/register/finish", body: body)
     }
 
     /// `GET /passkey/list` (requires auth). Returns `{ passkeys: [...] }`.
-    public func passkeyList() async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
-        let response = try await makeRequest("GET", "/passkey/list", nil)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey list response")
-        }
-        return dict
+    public func passkeyList() async throws -> PasskeyListResult {
+        let transport = try requireTransport()
+        return try await transport.request(method: .get, path: "/passkey/list")
     }
 
     /// `DELETE /passkey/{passkeyId}` (requires auth). Returns `{ success }`.
-    public func passkeyDelete(passkeyId: String) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
-        let response = try await makeRequest("DELETE", "/passkey/\(passkeyId)", nil)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey delete response")
-        }
-        return dict
+    public func passkeyDelete(passkeyId: String) async throws -> PasskeyDeleteResult {
+        let transport = try requireTransport()
+        return try await transport.request(method: .delete, path: "/passkey/\(passkeyId)")
     }
 
     /// `PATCH /passkey/{passkeyId}` (requires auth). Renames a passkey;
     /// returns `{ passkey: {...} }`.
-    public func passkeyUpdate(passkeyId: String, deviceName: String) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
-        let body: [String: Any] = ["deviceName": deviceName]
-        let response = try await makeRequest("PATCH", "/passkey/\(passkeyId)", body)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey update response")
-        }
-        return dict
+    public func passkeyUpdate(passkeyId: String, deviceName: String) async throws -> PasskeyUpdateResult {
+        let transport = try requireTransport()
+        let body: [String: JSONValue] = ["deviceName": .string(deviceName)]
+        return try await transport.request(method: .patch, path: "/passkey/\(passkeyId)", body: body)
     }
 
     // MARK: - Logout
@@ -863,7 +1230,7 @@ public final class AuthController: @unchecked Sendable {
         // first statement of `JsBaoClient.logout()`, before any teardown.
         // Every Swift logout path funnels through this method, so emitting
         // here covers `client.logout(...)` and `client.auth.logout(...)`.
-        emitter?.emit(.authLogout, AuthLogoutEvent())
+        emitter?.emit(AuthLogoutEvent())
 
         // Block any in-flight refresh/restore from re-authenticating after
         // this logout (see `blockNonInteractiveAuth`). Set before clearing
@@ -893,7 +1260,7 @@ public final class AuthController: @unchecked Sendable {
         // JS parity (#1059): JS emits `auth:logout:complete` (payload `{}`)
         // after the best-effort server logout, networking shutdown, and
         // `auth.logout(...)` teardown have all finished.
-        emitter?.emit(.authLogoutComplete, AuthLogoutCompleteEvent())
+        emitter?.emit(AuthLogoutCompleteEvent())
     }
 
     /// Backward-compatible overload retained for the `JsBaoClient` wiring
@@ -1046,20 +1413,19 @@ public final class AuthController: @unchecked Sendable {
     // MARK: - Offline Access Grants
 
     /// Enable offline access by requesting a grant from the server and storing it in the Keychain.
-    public func enableOfflineAccess(options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()) async throws -> [String: Any] {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
+    public func enableOfflineAccess(options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()) async throws -> EnableOfflineAccessResult {
+        let transport = try requireTransport()
 
-        guard networkMode != .offline else {
+        guard getNetworkMode() != .offline else {
             throw JsBaoError(code: .invalidArgument, message: "Cannot enable offline access while in offline mode")
         }
 
-        let body: [String: Any] = ["ttlDays": options.ttlDays]
-        let response = try await makeRequest("POST", "/auth/offline-grant", body)
-        guard let dict = response as? [String: Any] else {
-            throw JsBaoError(code: .unavailable, message: "Invalid offline grant response")
-        }
+        let body: [String: JSONValue] = ["ttlDays": .number(Double(options.ttlDays))]
+        let response: OfflineGrantResponse = try await transport.request(
+            method: .post,
+            path: "/auth/offline-grant",
+            body: body
+        )
 
         // Grant-method selection (mirrors JS authController.enableOfflineAccess):
         // the default grant is the non-biometric "signed" method. Biometric is
@@ -1082,10 +1448,10 @@ public final class AuthController: @unchecked Sendable {
             key: "grant",
             userId: userId,
             appId: appId,
-            rootDocId: dict["rootDocId"] as? String,
-            email: dict["email"] as? String,
-            name: dict["name"] as? String,
-            expiresAt: dict["expiresAt"] as? String,
+            rootDocId: response.rootDocId,
+            email: response.email,
+            name: response.name,
+            expiresAt: response.expiresAt,
             method: method
         )
 
@@ -1109,9 +1475,16 @@ public final class AuthController: @unchecked Sendable {
             )
         }
 
-        emitter?.emit(.offlineAuthEnabled, ["method": grant.method ?? "signed"] as [String: Any])
+        emitter?.emit(OfflineAuthEnabledEvent(method: grant.method ?? "signed"))
 
-        return dict
+        // Same projection `AuthAPI` used to perform on the raw grant dict:
+        // a decodable response counts as enabled unless the server says
+        // otherwise, and `method`/`reason` pass through when present.
+        return EnableOfflineAccessResult(
+            enabled: response.enabled ?? true,
+            method: response.method,
+            reason: response.reason
+        )
     }
 
     /// Unlock offline access by reading the grant from the Keychain.
@@ -1130,7 +1503,7 @@ public final class AuthController: @unchecked Sendable {
                let date = ISO8601DateFormatter().date(from: expiresAt),
                date < Date() {
                 logger.warn("Offline grant expired")
-                emitter?.emit(.offlineAuthFailed, ["reason": "expired"] as [String: Any])
+                emitter?.emit(OfflineAuthFailedEvent(reason: "expired"))
                 return false
             }
 
@@ -1148,14 +1521,14 @@ public final class AuthController: @unchecked Sendable {
                 currentUserId = grant.userId
             }
 
-            emitter?.emit(.offlineAuthUnlocked, ["userId": grant.userId] as [String: Any])
+            emitter?.emit(OfflineAuthUnlockedEvent(userId: grant.userId))
             return true
         } catch KeychainError.biometricCancelled {
-            emitter?.emit(.offlineAuthFailed, ["reason": "biometric_cancelled"] as [String: Any])
+            emitter?.emit(OfflineAuthFailedEvent(reason: "biometric_cancelled"))
             return false
         } catch {
             logger.warn("Failed to unlock offline:", error.localizedDescription)
-            emitter?.emit(.offlineAuthFailed, ["reason": error.localizedDescription] as [String: Any])
+            emitter?.emit(OfflineAuthFailedEvent(reason: error.localizedDescription))
             return false
         }
     }
@@ -1194,12 +1567,12 @@ public final class AuthController: @unchecked Sendable {
 
     /// Renew the offline grant while online by requesting a new grant from the server.
     public func renewOfflineGrantOnline(options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()) async throws -> Bool {
-        guard networkMode != .offline else {
+        guard getNetworkMode() != .offline else {
             throw JsBaoError(code: .invalidArgument, message: "Must be online to renew offline grant")
         }
 
         let _ = try await enableOfflineAccess(options: options)
-        emitter?.emit(.offlineAuthRenewed, [:] as [String: Any])
+        emitter?.emit(OfflineAuthRenewedEvent())
         return true
     }
 
@@ -1212,7 +1585,7 @@ public final class AuthController: @unchecked Sendable {
 
         lock.withLock { offlineIdentity = nil }
 
-        emitter?.emit(.offlineAuthRevoked, ["wipeLocal": options.wipeLocal] as [String: Any])
+        emitter?.emit(OfflineAuthRevokedEvent(wipeLocal: options.wipeLocal))
     }
 
     /// Get the stored offline identity (available after unlockOffline succeeds).
@@ -1223,19 +1596,22 @@ public final class AuthController: @unchecked Sendable {
     // MARK: - Private Helpers
 
     private func refreshDirect() async throws -> String {
-        guard let makeRequest = makeRequest else {
-            throw JsBaoError(code: .unavailable, message: "HTTP client not configured")
-        }
-        let response = try await makeRequest("POST", "/auth/refresh", nil)
-        guard let dict = response as? [String: Any],
-              let token = dict["token"] as? String else {
-            throw JsBaoError(code: .unavailable, message: "Invalid refresh response")
-        }
-        return token
+        let transport = try requireTransport()
+        let response: RefreshResponse = try await transport.request(
+            method: .post,
+            path: "/auth/refresh"
+        )
+        return response.token
     }
 
     private func refreshViaProxy(proxy: RefreshProxyConfig) async throws -> String {
-        let url = "\(proxy.baseUrl)/auth/refresh"
+        // Strip a single trailing slash off the proxy base so a trailing-slash
+        // config (`.../proxy/`) yields `.../proxy/auth/refresh` rather than a
+        // double-slash `.../proxy//auth/refresh` that strict proxy routes 404.
+        // This preserves the normalization the removed HttpClient refresh path
+        // applied before this refresh moved to AuthController (#1983).
+        let base = proxy.baseUrl.hasSuffix("/") ? String(proxy.baseUrl.dropLast()) : proxy.baseUrl
+        let url = "\(base)/auth/refresh"
         var request = URLRequest(url: URL(string: url)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1255,10 +1631,62 @@ public final class AuthController: @unchecked Sendable {
             throw HttpError(status: httpResponse.statusCode, message: "Refresh failed")
         }
 
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let token = json["token"] as? String else {
+        guard let decoded = try? JSONCoding.decodeData(RefreshResponse.self, from: data) else {
             throw JsBaoError(code: .unavailable, message: "Invalid refresh response")
         }
-        return token
+        return decoded.token
     }
+}
+
+// MARK: - Wire envelopes (internal)
+//
+// The response shapes `AuthController` decodes. Each one is the typed
+// replacement for a `[String: Any]` cast chain: the public DTOs the auth
+// surface returns carry no access token, so the envelopes below add the
+// `token` field the controller applies before handing the public result back.
+
+/// `{ success }` — magic-link / OTP request endpoints.
+struct SuccessResponse: Decodable, Sendable {
+    let success: Bool?
+}
+
+/// `{ token }` — `POST /auth/refresh` (direct and via the refresh proxy).
+struct RefreshResponse: Decodable, Sendable {
+    let token: String
+}
+
+// The three verify envelopes below carry no `token` field: the token is read
+// off the raw response and applied by `applyVerifiedToken` *before* these
+// decode, so a decode failure here can never burn a single-use credential.
+
+/// `POST /auth/magic-link/verify` — the `MagicLinkVerifyResult` fields.
+struct MagicLinkVerifyEnvelope: Decodable, Sendable {
+    let user: AuthUser
+    let promptAddPasskey: Bool?
+    let isNewUser: Bool?
+}
+
+/// `POST /auth/otp/verify` — the `OtpVerifyResult` fields.
+struct OtpVerifyEnvelope: Decodable, Sendable {
+    let user: AuthUser
+    let isNewUser: Bool?
+}
+
+/// `POST /passkey/auth/finish` — the `PasskeySignInResult` fields.
+struct PasskeyAuthFinishEnvelope: Decodable, Sendable {
+    let user: AuthUser
+    let isNewUser: Bool?
+}
+
+/// `POST /auth/offline-grant` — the grant fields the controller stores in the
+/// Keychain, plus the `enabled`/`method`/`reason` projection the public
+/// `EnableOfflineAccessResult` exposes.
+struct OfflineGrantResponse: Decodable, Sendable {
+    let rootDocId: String?
+    let email: String?
+    let name: String?
+    let expiresAt: String?
+    let enabled: Bool?
+    let method: String?
+    let reason: String?
 }

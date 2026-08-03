@@ -48,7 +48,7 @@ final class InvitationWSTests: XCTestCase {
         // Subscribe via the typed path (#1146). Pre-#1146 `.invitation`
         // delivered the raw `[String: Any]`, so a `(e: InvitationEvent)`
         // handler would silently never fire; now it's a fully-typed struct.
-        let sub = inviteeClient.events.on(.invitation) { (e: InvitationEvent) in
+        let sub = inviteeClient.eventEmitter.subscribe(InvitationEvent.self) { e in
             lock.lock()
             invitationReceived = true
             receivedEvent = e

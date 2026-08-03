@@ -646,7 +646,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         }
 
         func page(after: String? = nil, before: String? = nil,
-                  direction: CursorDirection = .forward) throws -> PagedQueryResult<[String: Any]> {
+                  direction: CursorDirection = .forward) throws -> PagedQueryResult<PrimitiveRow> {
             try client.hasManyThroughShared(
                 target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
                 sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
@@ -654,7 +654,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
                 limit: 2, afterCursor: after, beforeCursor: before, direction: direction
             )
         }
-        func ids(_ p: PagedQueryResult<[String: Any]>) -> [String] { p.data.compactMap { $0["id"] as? String } }
+        func ids(_ p: PagedQueryResult<PrimitiveRow>) -> [String] { p.data.compactMap { $0["id"] as? String } }
 
         // Page 1 — first page: prevCursor nil, nextCursor present.
         let p1 = try page()
@@ -818,7 +818,7 @@ extension CrossDocumentStaticQueryTests.CrossDocNote {
     }
 
     @discardableResult
-    static func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+    static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)
     }
 

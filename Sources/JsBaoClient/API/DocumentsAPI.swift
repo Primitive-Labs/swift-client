@@ -4,7 +4,7 @@ import YSwift
 // MARK: - DocumentsAPI
 
 public final class DocumentsAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
     private let blobManager: BlobManager
     /// Optional document-manager hook for local-only operations
     /// (`isOpen`, `listPendingCreates`, `cancelPendingCreate`,
@@ -22,17 +22,36 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     public let aliases: DocumentAliasesAPI
 
+    /// Designated initializer — the typed transport spine.
     public init(
+        transport: any Transport,
+        blobManager: BlobManager,
+        documentManager: DocumentManager? = nil,
+        client: JsBaoClient? = nil
+    ) {
+        self.transport = transport
+        self.blobManager = blobManager
+        self.documentManager = documentManager
+        self.client = client
+        self.aliases = DocumentAliasesAPI(transport: transport)
+    }
+
+    /// Deprecated: construct with a `Transport` instead. The legacy closure is
+    /// wrapped in an adapter so existing call sites keep working for one major
+    /// cycle.
+    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         blobManager: BlobManager,
         documentManager: DocumentManager? = nil,
         client: JsBaoClient? = nil
     ) {
-        self.makeRequest = makeRequest
-        self.blobManager = blobManager
-        self.documentManager = documentManager
-        self.client = client
-        self.aliases = DocumentAliasesAPI(makeRequest: makeRequest)
+        self.init(
+            transport: ClosureTransport(makeRequest: makeRequest),
+            blobManager: blobManager,
+            documentManager: documentManager,
+            client: client
+        )
     }
 
     // MARK: - CRUD
@@ -52,9 +71,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         guard let client else {
             // No client to route through (tests / isolated construction):
             // fall back to the direct server POST.
-            let body = try JSONCoding.jsonObject(from: options)
-            let result = try await makeRequest("POST", "/documents", body)
-            return try JSONCoding.decode(CreateDocumentResult.self, from: result)
+            return try await transport.request(method: .post, path: "/documents", body: options)
         }
 
         // Delegate to the authoritative local-first create, exactly as
@@ -112,33 +129,26 @@ public final class DocumentsAPI: @unchecked Sendable {
         // `includeRoot` may arrive either as the dedicated parameter (legacy
         // Swift call sites) or inside `options` (js-bao parity). Either enables it.
         let includeRoot = includeRootArg || (options?.includeRoot == true)
-        var params: [String] = []
-        if includeRoot { params.append("includeRoot=true") }
+        var query = URLQuery()
+        if includeRoot { query.append("includeRoot", "true") }
         if let limit = options?.limit, limit > 0 {
-            params.append("limit=\(limit)")
+            query.append("limit", limit)
         }
         if let cursor = options?.cursor, !cursor.isEmpty {
-            let encoded = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cursor
-            params.append("cursor=\(encoded)")
+            query.append("cursor", cursor)
         }
         if let tag = options?.tag, !tag.isEmpty {
-            let encoded = tag.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? tag
-            params.append("tag=\(encoded)")
+            query.append("tag", tag)
         }
-        if options?.forward == true { params.append("forward=true") }
-        let qs = params.isEmpty ? "" : "?\(params.joined(separator: "&"))"
-        let result = try await makeRequest("GET", "/documents\(qs)", nil)
+        if options?.forward == true { query.append("forward", "true") }
         // The server may return either a bare array or an `{ items, cursor }`
         // (or legacy `{ documents }`) envelope — accept both.
-        var items: [DocumentInfo]
-        var cursor: String? = nil
-        if let arr = try? JSONCoding.decode([DocumentInfo].self, from: result) {
-            items = arr
-        } else {
-            let page = try JSONCoding.decode(DocumentListPage.self, from: result)
-            items = page.items
-            cursor = page.cursor
-        }
+        let response: DocumentListEnvelope = try await transport.request(
+            method: .get,
+            path: "/documents\(query.queryString)"
+        )
+        var items = response.items
+        let cursor = response.cursor
         // Do not filter the root when filtering by tag — a root that carries
         // the requested tag should be returned (mirrors js-bao's `filterRoot`).
         if !includeRoot, options?.tag == nil {
@@ -172,15 +182,12 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Get a document by ID.
     public func get(documentId: String) async throws -> DocumentInfo {
-        let result = try await makeRequest("GET", "/documents/\(documentId)", nil)
-        return try JSONCoding.decode(DocumentInfo.self, from: result)
+        try await transport.request(method: .get, path: "/documents/\(documentId)")
     }
 
     /// Update a document's metadata.
     public func update(documentId: String, data: UpdateDocumentData) async throws -> DocumentInfo {
-        let body = try JSONCoding.jsonObject(from: data)
-        let result = try await makeRequest("PUT", "/documents/\(documentId)", body)
-        return try JSONCoding.decode(DocumentInfo.self, from: result)
+        try await transport.request(method: .put, path: "/documents/\(documentId)", body: data)
     }
 
     /// Delete a document.
@@ -211,7 +218,7 @@ public final class DocumentsAPI: @unchecked Sendable {
             await documentManager?.closeDocument(documentId: documentId)
         }
         do {
-            _ = try await makeRequest("DELETE", "/documents/\(documentId)", nil)
+            try await transport.send(method: .delete, path: "/documents/\(documentId)")
         } catch {
             // js-bao treats not-found / offline / pending-create deletes as a
             // successful *local* delete and still reconciles (documentsApi.ts:
@@ -227,8 +234,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         // Reconcile local state to match js-bao: evict the document's local
         // data and notify listeners via `documentMetadataChanged` (#961).
         await client?.evictLocalDocument(documentId)
-        client?.events.emit(
-            .documentMetadataChanged,
+        client?.eventEmitter.emit(
             DocumentMetadataChangedEvent(documentId: documentId, action: "deleted", source: "local")
         )
     }
@@ -254,8 +260,7 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Get the list of members (permission entries) for a document.
     public func getPermissions(documentId: String) async throws -> [DocumentPermissionEntry] {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/permissions", nil)
-        return try JSONCoding.decode([DocumentPermissionEntry].self, from: result)
+        try await transport.request(method: .get, path: "/documents/\(documentId)/permissions")
     }
 
     /// Revoke a user's access, or cancel a pending email invitation. `target`
@@ -271,15 +276,21 @@ public final class DocumentsAPI: @unchecked Sendable {
         }
         switch target {
         case let .email(email):
-            let escaped = email.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? email
-            _ = try await makeRequest("DELETE", "/documents/\(documentId)/permissions?email=\(escaped)", nil)
+            var query = URLQuery()
+            query.append("email", email)
+            try await transport.send(
+                method: .delete,
+                path: "/documents/\(documentId)/permissions\(query.queryString)"
+            )
         case let .userId(userId):
-            _ = try await makeRequest("DELETE", "/documents/\(documentId)/permissions/\(userId)", nil)
+            try await transport.send(
+                method: .delete,
+                path: "/documents/\(documentId)/permissions/\(userId)"
+            )
             // Self-removal: revoking your own access drops local sync — notify
             // and evict, matching js-bao (documentsApi.ts:1837-1862) (#961).
             if userId == client?.getUserId() {
-                client?.events.emit(
-                    .documentMetadataChanged,
+                client?.eventEmitter.emit(
                     DocumentMetadataChangedEvent(documentId: documentId, action: "deleted", source: "local")
                 )
                 await client?.evictLocalDocument(documentId)
@@ -289,8 +300,11 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Transfer ownership of a document to another user.
     public func transferOwnership(documentId: String, newOwnerId: String) async throws {
-        let body: [String: Any] = ["newOwnerId": newOwnerId]
-        _ = try await makeRequest("POST", "/documents/\(documentId)/permissions/transfer", body)
+        try await transport.send(
+            method: .post,
+            path: "/documents/\(documentId)/permissions/transfer",
+            body: ["newOwnerId": newOwnerId]
+        )
     }
 
     // MARK: - Group Permissions
@@ -303,24 +317,27 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///   excluded by default. Mirrors js-bao's `{ includeSystem }` option
     ///   (#506).
     public func listGroupPermissions(documentId: String, includeSystem: Bool = false) async throws -> [DocumentGroupPermissionEntry] {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/group-permissions", nil)
-        let all = try JSONCoding.decode([DocumentGroupPermissionEntry].self, from: result)
+        let all: [DocumentGroupPermissionEntry] = try await transport.request(
+            method: .get,
+            path: "/documents/\(documentId)/group-permissions"
+        )
         return includeSystem ? all : all.filter { !$0.groupType.hasPrefix("_") }
     }
 
     /// Grant a group permission on a document.
     public func grantGroupPermission(documentId: String, params: GrantGroupPermissionParams) async throws -> DocumentGroupPermissionEntry {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("POST", "/documents/\(documentId)/group-permissions", body)
-        return try JSONCoding.decode(DocumentGroupPermissionEntry.self, from: result)
+        try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/group-permissions",
+            body: params
+        )
     }
 
     // MARK: - Access
 
     /// Validate the current user's access to a document.
     public func validateAccess(documentId: String) async throws -> DocumentAccessResult {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/access", nil)
-        return try JSONCoding.decode(DocumentAccessResult.self, from: result)
+        try await transport.request(method: .get, path: "/documents/\(documentId)/access")
     }
 
     /// Accept a pending invitation to a document.
@@ -331,8 +348,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// with the token from the invitation email (issue #619).
     @available(*, deprecated, message: "Per-doc accept removed. Email-matched shares auto-resolve; cross-identity uses client.invitations.accept(inviteToken:) (issue #619).")
     public func acceptInvitation(documentId: String) async throws -> DocumentAccessResult {
-        let result = try await makeRequest("POST", "/documents/\(documentId)/validate-access", nil)
-        return try JSONCoding.decode(DocumentAccessResult.self, from: result)
+        try await transport.request(method: .post, path: "/documents/\(documentId)/validate-access")
     }
 
     // MARK: - Invitations
@@ -343,11 +359,11 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Mirrors js-bao's `documents.listPendingInvitations` (issue #619).
     /// Sends `GET /documents/:documentId/pending-invitations`.
     public func listPendingInvitations(documentId: String) async throws -> [PendingInvitationEntry] {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/pending-invitations", nil)
-        if let dict = result as? [String: Any], let items = dict["items"] {
-            return try JSONCoding.decode([PendingInvitationEntry].self, from: items)
-        }
-        return try JSONCoding.decode([PendingInvitationEntry].self, from: result)
+        let response: ItemsEnvelope<PendingInvitationEntry> = try await transport.request(
+            method: .get,
+            path: "/documents/\(documentId)/pending-invitations"
+        )
+        return response.items
     }
 
     /// List invitations for a document.
@@ -358,8 +374,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// remain visible here until they drain.
     @available(*, deprecated, message: "Use documents.listPendingInvitations(documentId:) — reads new DeferredDocumentPermission rows (issue #619).")
     public func listInvitations(documentId: String) async throws -> [DocumentInvitation] {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/invitations", nil)
-        return try JSONCoding.decode([DocumentInvitation].self, from: result)
+        try await transport.request(method: .get, path: "/documents/\(documentId)/invitations")
     }
 
     /// Send an invitation to a document.
@@ -369,12 +384,11 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// unified deferred-grant flow.
     @available(*, deprecated, message: "Use documents.updatePermissions(documentId:, params:) with .email(...) (issue #619).")
     public func sendInvitation(documentId: String, email: String, permission: String, options: InvitationEmailOptions? = nil) async throws -> DocumentInvitationResponse {
-        var body: [String: Any] = ["email": email, "permission": permission]
-        if let options, let opt = try JSONCoding.jsonObject(from: options) as? [String: Any] {
-            for (key, value) in opt { body[key] = value }
-        }
-        let result = try await makeRequest("POST", "/documents/\(documentId)/invitations", body)
-        return try JSONCoding.decode(DocumentInvitationResponse.self, from: result)
+        try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/invitations",
+            body: InvitationBody(email: email, permission: permission, options: options)
+        )
     }
 
     /// Get a specific invitation by email (client-side filter from list).
@@ -384,8 +398,10 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// filtered by email for the doc-scoped deferred grant.
     @available(*, deprecated, message: "Use client.invitations.get(invitationId:) or documents.listPendingInvitations(documentId:) filtered by email (issue #619).")
     public func getInvitation(documentId: String, email: String) async throws -> DocumentInvitation? {
-        let invitations = try await makeRequest("GET", "/documents/\(documentId)/invitations", nil)
-        let list = try JSONCoding.decode([DocumentInvitation].self, from: invitations)
+        let list: [DocumentInvitation] = try await transport.request(
+            method: .get,
+            path: "/documents/\(documentId)/invitations"
+        )
         return list.first { $0.email == email }
     }
 
@@ -395,12 +411,11 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// idempotent — re-call it with the new permission to upsert.
     @available(*, deprecated, message: "Use documents.updatePermissions(documentId:, params:) — it's idempotent (issue #619).")
     public func updateInvitation(documentId: String, email: String, permission: String, options: InvitationEmailOptions? = nil) async throws -> DocumentInvitationResponse {
-        var body: [String: Any] = ["email": email, "permission": permission]
-        if let options, let opt = try JSONCoding.jsonObject(from: options) as? [String: Any] {
-            for (key, value) in opt { body[key] = value }
-        }
-        let result = try await makeRequest("POST", "/documents/\(documentId)/invitations", body)
-        return try JSONCoding.decode(DocumentInvitationResponse.self, from: result)
+        try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/invitations",
+            body: InvitationBody(email: email, permission: permission, options: options)
+        )
     }
 
     /// Delete an invitation.
@@ -411,8 +426,10 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// invitations.
     @available(*, deprecated, message: "Use documents.removePermission(documentId:, email:) or client.invitations.delete(invitationId:) (issue #619).")
     public func deleteInvitation(documentId: String, invitationId: String) async throws -> MessageResult {
-        let result = try await makeRequest("DELETE", "/documents/\(documentId)/invitations/\(invitationId)", nil)
-        return try JSONCoding.decode(MessageResult.self, from: result)
+        try await transport.request(
+            method: .delete,
+            path: "/documents/\(documentId)/invitations/\(invitationId)"
+        )
     }
 
     /// Decline an invitation (as the invitee).
@@ -423,8 +440,10 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// with your own user ID (issue #630, won't-fix).
     @available(*, deprecated, message: "No invitee-side decline verb. Pending invitations expire automatically; self-remove via removePermission(documentId:, userId:) after acceptance (issue #619).")
     public func declineInvitation(documentId: String, invitationId: String) async throws -> MessageResult {
-        let result = try await makeRequest("POST", "/documents/\(documentId)/invitations/\(invitationId)/decline", nil)
-        return try JSONCoding.decode(MessageResult.self, from: result)
+        try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/invitations/\(invitationId)/decline"
+        )
     }
 
     /// Update document permissions for a user.
@@ -438,9 +457,11 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Build `params` with the `.user(...)`, `.email(...)`, or `.batch(...)`
     /// factories on `UpdatePermissionsData`.
     public func updatePermissions(documentId: String, params: UpdatePermissionsData) async throws -> PermissionUpdateResult {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("PUT", "/documents/\(documentId)/permissions", body)
-        return try JSONCoding.decode(PermissionUpdateResult.self, from: result)
+        try await transport.request(
+            method: .put,
+            path: "/documents/\(documentId)/permissions",
+            body: params
+        )
     }
 
     // MARK: - Link Access ("anyone with the link")
@@ -462,9 +483,11 @@ public final class DocumentsAPI: @unchecked Sendable {
         if client?.isRootDocument(documentId) == true {
             throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be shared")
         }
-        let body: [String: Any] = ["level": level.rawValue]
-        let result = try await makeRequest("PUT", "/documents/\(documentId)/link-access", body)
-        return try JSONCoding.decode(LinkAccessResult.self, from: result)
+        return try await transport.request(
+            method: .put,
+            path: "/documents/\(documentId)/link-access",
+            body: ["level": level.rawValue]
+        )
     }
 
     /// Read the current "anyone with the link" state for a document.
@@ -478,8 +501,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// root-document guard: the server answers root documents with a 403,
     /// matching js-bao, which does not pre-check either.
     public func getLinkAccess(documentId: String) async throws -> LinkAccessResult {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/link-access", nil)
-        return try JSONCoding.decode(LinkAccessResult.self, from: result)
+        try await transport.request(method: .get, path: "/documents/\(documentId)/link-access")
     }
 
     /// Turn off "anyone with the link" access for a document. Existing explicit
@@ -493,16 +515,17 @@ public final class DocumentsAPI: @unchecked Sendable {
         if client?.isRootDocument(documentId) == true {
             throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be shared")
         }
-        let result = try await makeRequest("DELETE", "/documents/\(documentId)/link-access", nil)
-        return try JSONCoding.decode(LinkAccessResult.self, from: result)
+        return try await transport.request(
+            method: .delete,
+            path: "/documents/\(documentId)/link-access"
+        )
     }
 
     // MARK: - Root Document
 
     /// Get the root document for the app.
     public func getRoot() async throws -> DocumentInfo {
-        let result = try await makeRequest("GET", "/documents/root", nil)
-        return try JSONCoding.decode(DocumentInfo.self, from: result)
+        try await transport.request(method: .get, path: "/documents/root")
     }
 
     // MARK: - Tags
@@ -511,28 +534,22 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// js-bao's `[String]` return). Falls back to an empty list if
     /// the server response is shaped differently.
     public func addTag(documentId: String, tag: String) async throws -> [String] {
-        let body: [String: Any] = ["tag": tag]
-        let result = try await makeRequest("POST", "/documents/\(documentId)/tags", body)
-        return Self.extractTags(from: result)
+        let response: TagListResponse? = try await transport.requestOptional(
+            method: .post,
+            path: "/documents/\(documentId)/tags",
+            body: ["tag": tag]
+        )
+        return response?.tags ?? []
     }
 
     /// Remove a tag from a document. Returns the updated tag list.
     public func removeTag(documentId: String, tag: String) async throws -> [String] {
-        let encodedTag = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tag
-        let result = try await makeRequest("DELETE", "/documents/\(documentId)/tags/\(encodedTag)", nil)
-        return Self.extractTags(from: result)
-    }
-
-    /// Pull a `[String]` tag list out of the dict the server returns
-    /// regardless of whether the field is called `tags`, the response
-    /// itself is the array, or the response is empty.
-    private static func extractTags(from result: Any) -> [String] {
-        if let arr = result as? [String] { return arr }
-        if let dict = result as? [String: Any],
-           let arr = dict["tags"] as? [String] {
-            return arr
-        }
-        return []
+        let encodedTag = URLEncoding.encodeComponent(tag)
+        let response: TagListResponse? = try await transport.requestOptional(
+            method: .delete,
+            path: "/documents/\(documentId)/tags/\(encodedTag)"
+        )
+        return response?.tags ?? []
     }
 
     // MARK: - Create With Alias
@@ -547,9 +564,11 @@ public final class DocumentsAPI: @unchecked Sendable {
         guard !options.alias.aliasKey.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "alias.aliasKey is required")
         }
-        let body = try JSONCoding.jsonObject(from: options)
-        let result = try await makeRequest("POST", "/documents/create-with-alias", body)
-        return try JSONCoding.decode(CreateWithAliasResult.self, from: result)
+        return try await transport.request(
+            method: .post,
+            path: "/documents/create-with-alias",
+            body: options
+        )
     }
 
     // MARK: - Group permissions
@@ -560,14 +579,12 @@ public final class DocumentsAPI: @unchecked Sendable {
         groupType: String,
         groupId: String
     ) async throws -> SuccessResult {
-        let gType = groupType.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? groupType
-        let gId = groupId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? groupId
-        let result = try await makeRequest(
-            "DELETE",
-            "/documents/\(documentId)/group-permissions/\(gType)/\(gId)",
-            nil
+        let gType = URLEncoding.encodeComponent(groupType)
+        let gId = URLEncoding.encodeComponent(groupId)
+        return try await transport.request(
+            method: .delete,
+            path: "/documents/\(documentId)/group-permissions/\(gType)/\(gId)"
         )
-        return try JSONCoding.decode(SuccessResult.self, from: result)
     }
 
     // MARK: - Access requests
@@ -580,25 +597,21 @@ public final class DocumentsAPI: @unchecked Sendable {
         documentId: String,
         options: RequestAccessOptions
     ) async throws -> DocumentAccessRequestResponse {
-        let body = try JSONCoding.jsonObject(from: options)
-        let result = try await makeRequest(
-            "POST",
-            "/documents/\(documentId)/access-requests",
-            body
+        try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/access-requests",
+            body: options
         )
-        return try JSONCoding.decode(DocumentAccessRequestResponse.self, from: result)
     }
 
     /// List pending access requests for a document. Owner/admin only.
     public func listAccessRequests(
         documentId: String
     ) async throws -> [DocumentAccessRequest] {
-        let result = try await makeRequest(
-            "GET",
-            "/documents/\(documentId)/access-requests",
-            nil
+        try await transport.request(
+            method: .get,
+            path: "/documents/\(documentId)/access-requests"
         )
-        return try JSONCoding.decode([DocumentAccessRequest].self, from: result)
     }
 
     /// Approve a pending access request. Owner/admin only.
@@ -607,13 +620,13 @@ public final class DocumentsAPI: @unchecked Sendable {
         requestId: String,
         options: ApproveAccessRequestOptions? = nil
     ) async throws -> AccessRequestResult {
-        let body: Any = try options.map { try JSONCoding.jsonObject(from: $0) } ?? [String: Any]()
-        let result = try await makeRequest(
-            "POST",
-            "/documents/\(documentId)/access-requests/\(requestId)/approve",
-            body
+        // A `nil` options object sends `{}`, as the untyped body did — every
+        // field is optional, so the default value encodes to an empty object.
+        try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/access-requests/\(requestId)/approve",
+            body: options ?? ApproveAccessRequestOptions()
         )
-        return try JSONCoding.decode(AccessRequestResult.self, from: result)
     }
 
     /// Deny a pending access request. Owner/admin only.
@@ -622,13 +635,12 @@ public final class DocumentsAPI: @unchecked Sendable {
         requestId: String,
         options: DenyAccessRequestOptions? = nil
     ) async throws -> AccessRequestResult {
-        let body: Any = try options.map { try JSONCoding.jsonObject(from: $0) } ?? [String: Any]()
-        let result = try await makeRequest(
-            "POST",
-            "/documents/\(documentId)/access-requests/\(requestId)/deny",
-            body
+        // A `nil` options object sends `{}`, as the untyped body did.
+        try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/access-requests/\(requestId)/deny",
+            body: options ?? DenyAccessRequestOptions()
         )
-        return try JSONCoding.decode(AccessRequestResult.self, from: result)
     }
 
     // MARK: - Local-only methods (delegate to DocumentManager)
@@ -761,7 +773,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     public func blobs(documentId: String) -> DocumentBlobContext {
         return DocumentBlobContext(
             documentId: documentId,
-            makeRequest: makeRequest,
+            transport: transport,
             blobManager: blobManager
         )
     }
@@ -775,11 +787,40 @@ public final class DocumentsAPI: @unchecked Sendable {
     // (via `blobs(documentId:)`); these app-wide forms forward to the
     // already cross-document-capable `BlobManager` (`documentId: nil`).
 
+    // `BlobManager` became an `actor` in #2172, so none of these can read or
+    // mutate the queue synchronously any more. Two shapes, per the sponsor's
+    // 2026-08-02 decisions:
+    //
+    //  * **Reads and result-returning mutators** (`uploads`, `pauseUpload`,
+    //    `resumeUpload`, `getUploadConcurrency`) have no honest synchronous
+    //    form — a snapshot would answer from a stale image, and a `Bool` from a
+    //    mutation that has not run yet would be a lie. They stay in the source
+    //    as `@available(*, unavailable, renamed:)` stubs so the compiler
+    //    rejects the call with a one-click rename fix-it instead of "no such
+    //    member", and they are deleted with the rest of the deprecation window.
+    //  * **Void-returning mutators** (`pauseAllUploads`, `resumeAllUploads`,
+    //    `setUploadConcurrency`) keep working, fire-and-forget, marked
+    //    `@available(*, deprecated)` beside an `Async` twin — the shape D3
+    //    shipped for the analytics surface.
+    //
+    // The twins are deliberately **distinctly named** rather than same-name
+    // `async` overloads: Swift prefers an `async` overload in an asynchronous
+    // context, so a same-name twin would turn every existing un-`await`ed call
+    // into a compile error — the break the window exists to avoid.
+
     /// List tracked blob uploads, newest first. With `documentId == nil`
     /// (the default) returns uploads across **all** documents; pass a
     /// `documentId` to scope to one. Mirrors JS `documents.uploads(documentId?)`.
+    @available(*, unavailable, renamed: "uploadsAsync(documentId:)")
     public func uploads(documentId: String? = nil) -> [BlobUploadStatus] {
-        return blobManager.listUploads(documentId: documentId)
+        fatalError("unavailable — use uploadsAsync(documentId:)")
+    }
+
+    /// List tracked blob uploads, newest first. With `documentId == nil`
+    /// (the default) returns uploads across **all** documents; pass a
+    /// `documentId` to scope to one. Mirrors JS `documents.uploads(documentId?)`.
+    public func uploadsAsync(documentId: String? = nil) async -> [BlobUploadStatus] {
+        return await blobManager.listUploads(documentId: documentId)
     }
 
     /// Pause a tracked upload by blob ID. With `documentId == nil` the
@@ -787,9 +828,29 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// the match. Returns `false` if no matching, pausable upload is
     /// tracked. Mirrors JS `documents.pauseUpload(documentId, blobId)`
     /// (Swift makes `documentId` optional for the cross-document form).
+    @available(*, unavailable, renamed: "pauseUploadAsync(blobId:documentId:)")
     @discardableResult
     public func pauseUpload(blobId: String, documentId: String? = nil) -> Bool {
-        return blobManager.pauseUpload(blobId, documentId: documentId)
+        fatalError("unavailable — use pauseUploadAsync(blobId:documentId:)")
+    }
+
+    /// Pause a tracked upload by blob ID. With `documentId == nil` the
+    /// blob is matched across all documents; pass a `documentId` to scope
+    /// the match. Returns `false` if no matching, pausable upload is
+    /// tracked. Mirrors JS `documents.pauseUpload(documentId, blobId)`.
+    @discardableResult
+    public func pauseUploadAsync(blobId: String, documentId: String? = nil) async -> Bool {
+        return await blobManager.pauseUpload(blobId, documentId: documentId)
+    }
+
+    /// Resume a paused upload by blob ID. With `documentId == nil` the
+    /// blob is matched across all documents; pass a `documentId` to scope
+    /// the match. Returns `false` if no matching, paused upload is
+    /// tracked. Mirrors JS `documents.resumeUpload(documentId, blobId)`.
+    @available(*, unavailable, renamed: "resumeUploadAsync(blobId:documentId:)")
+    @discardableResult
+    public func resumeUpload(blobId: String, documentId: String? = nil) -> Bool {
+        fatalError("unavailable — use resumeUploadAsync(blobId:documentId:)")
     }
 
     /// Resume a paused upload by blob ID. With `documentId == nil` the
@@ -797,34 +858,67 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// the match. Returns `false` if no matching, paused upload is
     /// tracked. Mirrors JS `documents.resumeUpload(documentId, blobId)`.
     @discardableResult
-    public func resumeUpload(blobId: String, documentId: String? = nil) -> Bool {
-        return blobManager.resumeUpload(blobId, documentId: documentId)
+    public func resumeUploadAsync(blobId: String, documentId: String? = nil) async -> Bool {
+        return await blobManager.resumeUpload(blobId, documentId: documentId)
     }
 
     /// Pause all in-progress uploads. With `documentId == nil` (the
     /// default) pauses uploads across **all** documents; pass a
     /// `documentId` to scope. Mirrors JS `documents.pauseAllUploads(documentId?)`.
+    @available(*, deprecated, message: "Use pauseAllUploadsAsync(documentId:) — the synchronous version schedules the pause without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a following resumeAllUploads() can apply FIRST, no-op, and leave every upload paused. Removed in the next major release.")
     public func pauseAllUploads(documentId: String? = nil) {
-        blobManager.pauseAll(documentId: documentId)
+        let blobManager = self.blobManager
+        Task { await blobManager.pauseAll(documentId: documentId) }
+    }
+
+    /// Pause all in-progress uploads, returning once every matching upload is
+    /// paused. With `documentId == nil` (the default) pauses uploads across
+    /// **all** documents; pass a `documentId` to scope.
+    public func pauseAllUploadsAsync(documentId: String? = nil) async {
+        await blobManager.pauseAll(documentId: documentId)
     }
 
     /// Resume all paused uploads. With `documentId == nil` (the default)
     /// resumes uploads across **all** documents; pass a `documentId` to
     /// scope. Mirrors JS `documents.resumeAllUploads(documentId?)`.
+    @available(*, deprecated, message: "Use resumeAllUploadsAsync(documentId:) — the synchronous version schedules the resume without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a preceding pauseAllUploads() can apply AFTER it, leaving every upload paused. Removed in the next major release.")
     public func resumeAllUploads(documentId: String? = nil) {
-        blobManager.resumeAll(documentId: documentId)
+        let blobManager = self.blobManager
+        Task { await blobManager.resumeAll(documentId: documentId) }
+    }
+
+    /// Resume all paused uploads, returning once every matching upload is back
+    /// in the retry rotation. With `documentId == nil` (the default) resumes
+    /// uploads across **all** documents; pass a `documentId` to scope.
+    public func resumeAllUploadsAsync(documentId: String? = nil) async {
+        await blobManager.resumeAll(documentId: documentId)
     }
 
     /// Set the maximum number of concurrent blob uploads (app-wide).
     /// Mirrors JS `documents.setUploadConcurrency(concurrency)`.
+    @available(*, deprecated, message: "Use setUploadConcurrencyAsync(_:) — the synchronous version applies the setting without waiting, so a read right after it may still see the old value, and two calls are not ordered against each other: setUploadConcurrency(1) then setUploadConcurrency(5) can settle on 1. Removed in the next major release.")
     public func setUploadConcurrency(_ concurrency: Int) {
-        blobManager.setUploadConcurrency(concurrency)
+        let blobManager = self.blobManager
+        Task { await blobManager.setUploadConcurrency(concurrency) }
+    }
+
+    /// Set the maximum number of concurrent blob uploads (app-wide),
+    /// returning once the setting is in effect.
+    public func setUploadConcurrencyAsync(_ concurrency: Int) async {
+        await blobManager.setUploadConcurrency(concurrency)
     }
 
     /// The current maximum number of concurrent blob uploads (app-wide).
     /// Mirrors JS `documents.getUploadConcurrency()`.
+    @available(*, unavailable, renamed: "getUploadConcurrencyAsync()")
     public func getUploadConcurrency() -> Int {
-        return blobManager.getUploadConcurrency()
+        fatalError("unavailable — use getUploadConcurrencyAsync()")
+    }
+
+    /// The current maximum number of concurrent blob uploads (app-wide).
+    /// Mirrors JS `documents.getUploadConcurrency()`.
+    public func getUploadConcurrencyAsync() async -> Int {
+        return await blobManager.getUploadConcurrency()
     }
 
     // MARK: - Get-or-create with alias (P1)
@@ -849,20 +943,21 @@ public final class DocumentsAPI: @unchecked Sendable {
             userId = client?.getUserId()
         }
 
-        var aliasPayload: [String: Any] = [
-            "scope": alias.scope.rawValue,
-            "aliasKey": alias.aliasKey,
-        ]
-        if let userId { aliasPayload["userId"] = userId }
-
-        var body: [String: Any] = ["alias": aliasPayload]
-        if let title = options.title { body["title"] = title }
-        if let tags = options.tags, !tags.isEmpty { body["tags"] = tags }
-
-        let result = try await makeRequest(
-            "POST", "/documents/get-or-create-with-alias", body
+        let body = GetOrCreateWithAliasBody(
+            alias: GetOrCreateWithAliasBody.Alias(
+                scope: alias.scope.rawValue,
+                aliasKey: alias.aliasKey,
+                userId: userId
+            ),
+            title: options.title,
+            tags: (options.tags?.isEmpty == false) ? options.tags : nil
         )
-        return try JSONCoding.decode(GetOrCreateWithAliasResult.self, from: result)
+
+        return try await transport.request(
+            method: .post,
+            path: "/documents/get-or-create-with-alias",
+            body: body
+        )
     }
 
     // MARK: - Ergonomic wrappers around top-level client methods (P1)
@@ -1073,33 +1168,48 @@ public final class DocumentsAPI: @unchecked Sendable {
 // MARK: - DocumentAliasesAPI
 
 public final class DocumentAliasesAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
 
-    public init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.makeRequest = makeRequest
+    /// Designated initializer — the typed transport spine.
+    public init(transport: any Transport) {
+        self.transport = transport
+    }
+
+    /// Deprecated: construct with a `Transport` instead. The legacy closure is
+    /// wrapped in an adapter so existing call sites keep working for one major
+    /// cycle.
+    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
+        self.init(transport: ClosureTransport(makeRequest: makeRequest))
     }
 
     /// Create or update a document alias.
     public func set(_ params: SetAliasParams) async throws -> DocumentAliasInfo {
-        let encodedKey = params.aliasKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? params.aliasKey
-        var body: [String: Any] = ["documentId": params.documentId]
-        if let userId = params.userId { body["userId"] = userId }
-        if params.mustNotExist == true { body["mustNotExist"] = true }
-        let result = try await makeRequest("PUT", "/document-aliases/\(params.scope.rawValue)/\(encodedKey)", body)
-        return try JSONCoding.decode(DocumentAliasInfo.self, from: result)
+        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
+        let body = SetAliasBody(
+            documentId: params.documentId,
+            userId: params.userId,
+            mustNotExist: params.mustNotExist == true ? true : nil
+        )
+        return try await transport.request(
+            method: .put,
+            path: "/document-aliases/\(params.scope.rawValue)/\(encodedKey)",
+            body: body
+        )
     }
 
     /// Resolve a document alias, returning nil if not found.
     public func resolve(_ params: AliasRef) async throws -> DocumentAliasInfo? {
-        let encodedKey = params.aliasKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? params.aliasKey
+        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
         var path = "/document-aliases/\(params.scope.rawValue)/\(encodedKey)"
         if params.scope == .user, let userId = params.userId {
-            let encodedUserId = userId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? userId
-            path += "?userId=\(encodedUserId)"
+            var query = URLQuery()
+            query.append("userId", userId)
+            path += query.queryString
         }
         do {
-            let result = try await makeRequest("GET", path, nil)
-            return try JSONCoding.decode(DocumentAliasInfo.self, from: result)
+            let info: DocumentAliasInfo = try await transport.request(method: .get, path: path)
+            return info
         } catch {
             if isNotFoundError(error) { return nil }
             throw error
@@ -1108,14 +1218,15 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
 
     /// Delete a document alias.
     public func delete(_ params: AliasRef) async throws {
-        let encodedKey = params.aliasKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? params.aliasKey
+        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
         var path = "/document-aliases/\(params.scope.rawValue)/\(encodedKey)"
         if params.scope == .user, let userId = params.userId {
-            let encodedUserId = userId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? userId
-            path += "?userId=\(encodedUserId)"
+            var query = URLQuery()
+            query.append("userId", userId)
+            path += query.queryString
         }
         do {
-            _ = try await makeRequest("DELETE", path, nil)
+            try await transport.send(method: .delete, path: path)
         } catch {
             if isNotFoundError(error) { return }
             throw error
@@ -1129,16 +1240,16 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
     /// return retained legacy `scope: "app"` rows, and one such row must
     /// not fail the whole response (the remaining user aliases are valid).
     public func listForDocument(documentId: String) async throws -> [DocumentAliasInfo] {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/aliases", nil)
-        let entries = try JSONCoding.decode(
-            [FailableEntry<DocumentAliasInfo>].self, from: result
+        let entries: [FailableEntry<DocumentAliasInfo>] = try await transport.request(
+            method: .get,
+            path: "/documents/\(documentId)/aliases"
         )
         return entries.compactMap(\.value)
     }
 
     /// Wrapper that swallows a single element's decode failure instead of
     /// failing the surrounding array.
-    private struct FailableEntry<T: Decodable>: Decodable {
+    private struct FailableEntry<T: Decodable & Sendable>: Decodable, Sendable {
         let value: T?
         init(from decoder: Decoder) throws {
             value = try? T(from: decoder)
@@ -1155,17 +1266,34 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
 
 public final class DocumentBlobContext: @unchecked Sendable {
     private let documentId: String
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
     private let blobManager: BlobManager
 
+    /// Designated initializer — the typed transport spine.
     public init(
+        documentId: String,
+        transport: any Transport,
+        blobManager: BlobManager
+    ) {
+        self.documentId = documentId
+        self.transport = transport
+        self.blobManager = blobManager
+    }
+
+    /// Deprecated: construct with a `Transport` instead. The legacy closure is
+    /// wrapped in an adapter so existing call sites keep working for one major
+    /// cycle.
+    @available(*, deprecated, message: "Use init(documentId:transport:blobManager:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(
         documentId: String,
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         blobManager: BlobManager
     ) {
-        self.documentId = documentId
-        self.makeRequest = makeRequest
-        self.blobManager = blobManager
+        self.init(
+            documentId: documentId,
+            transport: ClosureTransport(makeRequest: makeRequest),
+            blobManager: blobManager
+        )
     }
 
     /// Upload a blob to the document.
@@ -1183,30 +1311,24 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// JS `BlobListResult<BlobInfo>`. A bare-array response (no envelope) is
     /// normalized into a result with `cursor == nil`.
     public func list(limit: Int? = nil, cursor: String? = nil) async throws -> DocumentBlobListResult {
-        var query: [String] = []
+        var query = URLQuery()
         if let limit = limit {
-            query.append("limit=\(limit)")
+            query.append("limit", limit)
         }
         if let cursor = cursor, !cursor.isEmpty {
-            let encoded = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cursor
-            query.append("cursor=\(encoded)")
+            query.append("cursor", cursor)
         }
-        var path = "/documents/\(documentId)/blobs"
-        if !query.isEmpty {
-            path += "?" + query.joined(separator: "&")
-        }
-        let result = try await makeRequest("GET", path, nil)
-        if result is [Any] {
-            let items = try JSONCoding.decode([BlobInfo].self, from: result)
-            return DocumentBlobListResult(items: items, cursor: nil)
-        }
-        return try JSONCoding.decode(DocumentBlobListResult.self, from: result)
+        let path = "/documents/\(documentId)/blobs\(query.queryString)"
+        let response: DocumentBlobListResponse = try await transport.request(
+            method: .get,
+            path: path
+        )
+        return response.result
     }
 
     /// Get metadata for a specific blob.
     public func get(blobId: String) async throws -> BlobInfo {
-        let result = try await makeRequest("GET", "/documents/\(documentId)/blobs/\(blobId)", nil)
-        return try JSONCoding.decode(BlobInfo.self, from: result)
+        try await transport.request(method: .get, path: "/documents/\(documentId)/blobs/\(blobId)")
     }
 
     /// Build a download URL for a blob.
@@ -1235,9 +1357,12 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// cancels the in-flight transfer, a later `read` won't serve the deleted
     /// blob stale from cache, and `queue-drained` fires once the queue empties.
     public func delete(blobId: String) async throws -> BlobDeleteResult {
-        let result = try await makeRequest("DELETE", "/documents/\(documentId)/blobs/\(blobId)", nil)
-        blobManager.cancelQueuedUpload(documentId: documentId, blobId: blobId)
-        return try JSONCoding.decode(BlobDeleteResult.self, from: result)
+        let result: BlobDeleteResult = try await transport.request(
+            method: .delete,
+            path: "/documents/\(documentId)/blobs/\(blobId)"
+        )
+        await blobManager.cancelQueuedUpload(documentId: documentId, blobId: blobId)
+        return result
     }
 
     /// Read (download) the raw blob data.
@@ -1304,33 +1429,167 @@ public final class DocumentBlobContext: @unchecked Sendable {
         )
     }
 
+    // The per-document mirror of the app-wide surface on `DocumentsAPI` — same
+    // two shapes for the same reasons (#2172): `unavailable, renamed:` stubs
+    // for the reads and the result-returning mutators, deprecated
+    // fire-and-forget originals beside `Async` twins for the void mutators.
+    // `downloadUrl` above is deliberately untouched: it stays synchronous
+    // permanently.
+
     /// The current status of all tracked uploads for this document, newest
     /// first. Mirrors JS `uploads()` (scoped to this document's id).
+    @available(*, unavailable, renamed: "uploadsAsync()")
     public func uploads() -> [BlobUploadStatus] {
-        return blobManager.listUploads(documentId: documentId)
+        fatalError("unavailable — use uploadsAsync()")
+    }
+
+    /// The current status of all tracked uploads for this document, newest
+    /// first. Mirrors JS `uploads()` (scoped to this document's id).
+    public func uploadsAsync() async -> [BlobUploadStatus] {
+        return await blobManager.listUploads(documentId: documentId)
+    }
+
+    /// Pause an in-progress upload for this document by blob ID. Returns `false`
+    /// if no matching, pausable upload is tracked. Mirrors JS `pauseUpload`.
+    @available(*, unavailable, renamed: "pauseUploadAsync(blobId:)")
+    @discardableResult
+    public func pauseUpload(blobId: String) -> Bool {
+        fatalError("unavailable — use pauseUploadAsync(blobId:)")
     }
 
     /// Pause an in-progress upload for this document by blob ID. Returns `false`
     /// if no matching, pausable upload is tracked. Mirrors JS `pauseUpload`.
     @discardableResult
-    public func pauseUpload(blobId: String) -> Bool {
-        return blobManager.pauseUpload(blobId, documentId: documentId)
+    public func pauseUploadAsync(blobId: String) async -> Bool {
+        return await blobManager.pauseUpload(blobId, documentId: documentId)
+    }
+
+    /// Resume a paused upload for this document by blob ID. Returns `false` if
+    /// no matching, paused upload is tracked. Mirrors JS `resumeUpload`.
+    @available(*, unavailable, renamed: "resumeUploadAsync(blobId:)")
+    @discardableResult
+    public func resumeUpload(blobId: String) -> Bool {
+        fatalError("unavailable — use resumeUploadAsync(blobId:)")
     }
 
     /// Resume a paused upload for this document by blob ID. Returns `false` if
     /// no matching, paused upload is tracked. Mirrors JS `resumeUpload`.
     @discardableResult
-    public func resumeUpload(blobId: String) -> Bool {
-        return blobManager.resumeUpload(blobId, documentId: documentId)
+    public func resumeUploadAsync(blobId: String) async -> Bool {
+        return await blobManager.resumeUpload(blobId, documentId: documentId)
     }
 
     /// Pause all in-progress uploads for this document. Mirrors JS `pauseAll`.
+    @available(*, deprecated, message: "Use pauseAllAsync() — the synchronous version schedules the pause without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a following resumeAll() can apply FIRST, no-op, and leave every upload paused. Removed in the next major release.")
     public func pauseAll() {
-        blobManager.pauseAll(documentId: documentId)
+        let blobManager = self.blobManager
+        let documentId = self.documentId
+        Task { await blobManager.pauseAll(documentId: documentId) }
+    }
+
+    /// Pause all in-progress uploads for this document, returning once they
+    /// are paused. Mirrors JS `pauseAll`.
+    public func pauseAllAsync() async {
+        await blobManager.pauseAll(documentId: documentId)
     }
 
     /// Resume all paused uploads for this document. Mirrors JS `resumeAll`.
+    @available(*, deprecated, message: "Use resumeAllAsync() — the synchronous version schedules the resume without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a preceding pauseAll() can apply AFTER it, leaving every upload paused. Removed in the next major release.")
     public func resumeAll() {
-        blobManager.resumeAll(documentId: documentId)
+        let blobManager = self.blobManager
+        let documentId = self.documentId
+        Task { await blobManager.resumeAll(documentId: documentId) }
+    }
+
+    /// Resume all paused uploads for this document, returning once they are
+    /// back in the retry rotation. Mirrors JS `resumeAll`.
+    public func resumeAllAsync() async {
+        await blobManager.resumeAll(documentId: documentId)
+    }
+}
+
+// MARK: - Request / response shims
+
+/// Body of `POST /documents/:id/invitations` — `{ email, permission }` plus
+/// the optional email-notification settings. Replaces the hand-merged untyped
+/// dictionary: `InvitationEmailOptions`' three fields are flattened in and
+/// omitted when `nil`, exactly as the merge did.
+private struct InvitationBody: Encodable, Sendable {
+    let email: String
+    let permission: String
+    let sendEmail: Bool?
+    let documentUrl: String?
+    let note: String?
+
+    init(email: String, permission: String, options: InvitationEmailOptions?) {
+        self.email = email
+        self.permission = permission
+        self.sendEmail = options?.sendEmail
+        self.documentUrl = options?.documentUrl
+        self.note = options?.note
+    }
+}
+
+/// Body of `POST /documents/get-or-create-with-alias`. `userId` / `title` /
+/// `tags` are omitted when `nil`, matching the conditional inserts the untyped
+/// dictionary body used.
+private struct GetOrCreateWithAliasBody: Encodable, Sendable {
+    struct Alias: Encodable, Sendable {
+        let scope: String
+        let aliasKey: String
+        let userId: String?
+    }
+
+    let alias: Alias
+    let title: String?
+    let tags: [String]?
+}
+
+/// Body of `PUT /document-aliases/:scope/:key`.
+private struct SetAliasBody: Encodable, Sendable {
+    let documentId: String
+    let userId: String?
+    let mustNotExist: Bool?
+}
+
+
+
+/// The tag endpoints answer with either a bare `[String]` array or a
+/// `{ tags }` envelope; anything else yields an empty list — the same
+/// tolerance the previous `extractTags` cast chain had. An empty response
+/// body is handled one level up by `requestOptional`.
+private struct TagListResponse: Decodable, Sendable {
+    let tags: [String]
+
+    private enum CodingKeys: String, CodingKey { case tags }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.singleValueContainer(),
+           let list = try? container.decode([String].self) {
+            tags = list
+            return
+        }
+        if let container = try? decoder.container(keyedBy: CodingKeys.self),
+           let list = try? container.decode([String].self, forKey: .tags) {
+            tags = list
+            return
+        }
+        tags = []
+    }
+}
+
+/// The document blob-list endpoint returns either a bare array of blobs or an
+/// `{ items, cursor }` envelope. A bare array is normalized into a result with
+/// no cursor.
+private struct DocumentBlobListResponse: Decodable, Sendable {
+    let result: DocumentBlobListResult
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.singleValueContainer(),
+           let list = try? container.decode([BlobInfo].self) {
+            result = DocumentBlobListResult(items: list, cursor: nil)
+            return
+        }
+        result = try DocumentBlobListResult(from: decoder)
     }
 }

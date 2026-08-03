@@ -22,12 +22,12 @@ final class RefreshTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         // Token in memory should work for a simple request
-        let result = try await client.makeRequest("GET", "/me", nil)
-        guard let dict = result as? [String: Any] else {
-            XCTFail("Expected dictionary response")
+        let result = try await client.requestJSON(method: .get, path: "/me")
+        guard let object = result?.objectValue else {
+            XCTFail("Expected object response")
             return
         }
-        XCTAssertNotNil(dict["userId"])
+        XCTAssertNotNil(object["userId"]?.stringValue)
     }
 
     func testInvalidTokenFailsGracefully() async throws {
@@ -36,7 +36,7 @@ final class RefreshTests: XCTestCase {
 
         // Request with invalid token should throw
         do {
-            _ = try await client.makeRequest("GET", "/me", nil)
+            _ = try await client.requestJSON(method: .get, path: "/me")
             XCTFail("Should have thrown with invalid token")
         } catch {
             // Expected: auth failure
@@ -164,7 +164,7 @@ final class RefreshTests: XCTestCase {
         // 2h so the bootstrap path sees it as stale.
         let bootstrapStore = OfflineStore()
         let bootstrapProvider = SQLiteStorageProvider(path: dbPath)
-        bootstrapStore.setStorageProvider(bootstrapProvider)
+        await bootstrapStore.setStorageProvider(bootstrapProvider)
 
         let iso = ISO8601DateFormatter()
         let expiredRecord = PersistedJwtRecord(

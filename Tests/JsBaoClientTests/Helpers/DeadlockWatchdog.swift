@@ -43,3 +43,62 @@ func assertCompletes(
         )
     }
 }
+
+/// The `async` counterpart, for critical sections that became **actor
+/// isolation** rather than a lock (#1993 Phase D, #2172). Same contract as the
+/// synchronous form: the work runs detached and the *test* fails rather than
+/// the suite hanging when it does not finish in time.
+///
+/// It polls a flag instead of blocking on a `DispatchSemaphore`, because
+/// blocking inside an `async` test would occupy a cooperative-pool thread — the
+/// very resource a hung actor call needs to make progress. A genuinely stuck
+/// task is leaked when the timeout fires, exactly as the synchronous form leaks
+/// its stuck thread: an actor call that never returns cannot be cancelled.
+func assertCompletesAsync(
+    within timeout: TimeInterval = 3,
+    _ description: String = "operation",
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ work: @escaping @Sendable () async -> Void
+) async {
+    if await completesAsync(within: timeout, work) { return }
+    XCTFail(
+        "Deadlock watchdog: \(description) did not complete within \(timeout)s — likely an isolated call that never returns.",
+        file: file,
+        line: line
+    )
+}
+
+/// The detection half of `assertCompletesAsync`, without the `XCTFail`: runs
+/// `work` detached and reports whether it finished inside `timeout`.
+///
+/// It is split out so the timeout decision can be self-tested directly.
+/// `XCTExpectFailure` cannot be used for that: `assertCompletesAsync` records
+/// its failure after an `await` hop, on a cooperative-pool thread rather than
+/// the test's own, and the expected-failure scope does not reach across that.
+/// With the seam, the self-test asserts on the returned verdict instead and
+/// only the one-line `XCTFail` above is left uncovered.
+@discardableResult
+func completesAsync(
+    within timeout: TimeInterval,
+    _ work: @escaping @Sendable () async -> Void
+) async -> Bool {
+    let finished = WatchdogFlag()
+    Task.detached {
+        await work()
+        finished.set()
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    while !finished.value && Date() < deadline {
+        try? await Task.sleep(nanoseconds: 10 * 1_000_000)
+    }
+    return finished.value
+}
+
+/// Thread-safe completion flag for `assertCompletesAsync`.
+private final class WatchdogFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value = false
+    func set() { lock.withLock { _value = true } }
+    var value: Bool { lock.withLock { _value } }
+}

@@ -8,7 +8,30 @@ import SQLite3
 /// explicit calls to `sync()` after mutations.
 ///
 /// This replaces the JS client's IndexedDB/sql.js approach with native SQLite.
-public class BaoModelQueryEngine {
+///
+/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+///
+/// The engine is a class with mutable state and no compiler-visible isolation,
+/// so the conformance is unchecked. What makes it sound is that **every**
+/// stored property is confined to one lock, `lock` (`NSLock`, non-reentrant):
+///
+/// | State | Confinement |
+/// |---|---|
+/// | `db` (`OpaquePointer?`, the SQLite handle) | written once in `init` and closed in `deinit`, both at points where no other reference to the instance can exist (the `PRAGMA` calls in `init` are the only unlocked uses, and they run before the instance escapes). Between those, every use goes through `execute` / `prepare` / `executeQuery`, which are only ever called from a method holding `lock` |
+/// | `_rowWriteCount` | mutated under `lock`; read through the `rowWriteCount` accessor, which takes `lock` |
+/// | `registeredJunctions` | read + written inside `ensureJunctionTable`, called only from `ensureTable`, which holds `lock` |
+/// | `stringFieldsByModel`, `fieldTypeNamesByModel` | written in `ensureTable` under `lock`; read in `buildSelectSQL` / `count` / `aggregate`, all under `lock` |
+///
+/// `lock` is **non-reentrant**, so the lock is deliberately scoped to the base
+/// SELECT in `query` / `queryPaged`: the stringset population that follows
+/// re-enters the engine through junction sub-queries and takes `lock` again.
+/// That is why those two methods lock a closure rather than the whole body.
+///
+/// `final` since #1992: an `@unchecked Sendable` claim on an open class would
+/// be inherited by subclasses that could add unsynchronized state, which would
+/// make the argument above unverifiable. Nothing in the package or its tests
+/// subclassed it.
+public final class BaoModelQueryEngine: @unchecked Sendable {
 
     /// The `_meta_doc_id` value used when no explicit document id is
     /// supplied (single-doc / legacy mode). Matches js-bao's
@@ -29,7 +52,21 @@ public class BaoModelQueryEngine {
     /// Stringset junction-row writes are also counted here. A mutation
     /// on a K-member stringset field therefore adds up to K rows to
     /// this counter (one per member, plus one for the main-row upsert).
-    internal private(set) var rowWriteCount: Int = 0
+    ///
+    /// Read through the `rowWriteCount` accessor below, which takes `lock`.
+    /// The raw storage is only ever mutated on paths that already hold `lock`
+    /// (`upsertRecord`, `deleteRecord`, `writeJunction`) — `lock` is
+    /// non-reentrant, so those paths must NOT go through the accessor.
+    private var _rowWriteCount: Int = 0
+
+    /// Test-only read of the row-write counter. Takes `lock` so a test
+    /// sampling the counter while another thread writes is a synchronized
+    /// read rather than a torn one (#1992: the counter was previously a
+    /// `private(set)` property read with no synchronization at all, which the
+    /// `@unchecked Sendable` safety argument could not have covered).
+    internal var rowWriteCount: Int {
+        lock.withLock { _rowWriteCount }
+    }
 
     /// Every junction table registered so far, keyed by its SQLite
     /// name. If two distinct `(model, field)` pairs would produce the
@@ -325,7 +362,7 @@ public class BaoModelQueryEngine {
                 }
                 sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
-                rowWriteCount += 1
+                _rowWriteCount += 1
             }
         }
 
@@ -398,7 +435,7 @@ public class BaoModelQueryEngine {
             idx += 1
             sqlite3_bind_text(stmt, idx, (member as NSString).utf8String, -1, nil)
             sqlite3_step(stmt)
-            rowWriteCount += 1
+            _rowWriteCount += 1
         }
         sqlite3_finalize(stmt)
     }
@@ -437,7 +474,7 @@ public class BaoModelQueryEngine {
         }
         sqlite3_step(stmt)
         sqlite3_finalize(stmt)
-        rowWriteCount += 1
+        _rowWriteCount += 1
     }
 
     /// Sweep every junction row belonging to one docId across the
@@ -709,28 +746,36 @@ public class BaoModelQueryEngine {
     /// Paginated variant of `query`. Returns a `PaginatedResult` with
     /// next/prev cursors for forward/backward navigation. Mirrors
     /// js-bao's `BaseModel.query` Promise<PaginatedResult>.
+    ///
+    /// Rows come back as `PrimitiveRow`, the shared `Sendable` row bag, so the
+    /// page as a whole is `Sendable` and can cross an isolation boundary
+    /// (#1992). Read fields with the same `row["field"] as? T` subscript the
+    /// raw dictionary took, or reach `row.raw` for the dictionary itself. The
+    /// unpaginated `query` above still returns `[[String: Any]]` — it makes no
+    /// `Sendable` claim to keep honest.
     public func queryPaged(
         modelName: String,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = []
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         let tableName = sanitizedTableName(modelName)
         let resolved = resolveSort(options: options)
         // Pull `limit + 1` rows to detect whether more rows exist past
         // this page; the extra row is trimmed before returning.
         let limit = options?.limit
-        let queryOptionsWithOverLimit = QueryOptions(
-            sort: options?.sort,
-            sortOrder: options?.sortOrder,
-            limit: limit.map { $0 + 1 },
-            offset: options?.offset,
-            cursor: options?.cursor,
-            direction: options?.direction ?? .forward,
-            documents: options?.documents,
-            projection: options?.projection
-        )
+        // Copy the caller's options by value and bump only the limit. A plain
+        // struct value-copy cannot silently drop a field the way the old
+        // manual rebuild could (the dropped-`projection` bug class, #1607).
+        // The copy also preserves `direction`'s `.forward` default explicitly:
+        // an absent `options` becomes `QueryOptions()` whose `direction`
+        // defaults to `.forward`, and a supplied `options` carries its own
+        // `direction` through unchanged (`direction` is non-optional). It also
+        // carries `offsetForQuery` across without naming the deprecated
+        // `offset` accessor.
+        var queryOptionsWithOverLimit = options ?? QueryOptions()
+        queryOptionsWithOverLimit.limit = limit.map { $0 + 1 }
         // Scope the lock to just the base SELECT. Stringset population
         // reacquires the lock (see `query()`).
         var rows: [[String: Any]] = try {
@@ -777,8 +822,10 @@ public class BaoModelQueryEngine {
         if (options?.direction ?? .forward) == .backward {
             rows.reverse()
         }
+        // Wrap AFTER every mutation is done. The bag's `raw` is immutable by
+        // contract, so it is only ever built from a finished row.
         return PagedQueryResult(
-            data: rows,
+            data: rows.map(PrimitiveRow.init(raw:)),
             nextCursor: next,
             prevCursor: prev,
             hasMore: hasMore
@@ -912,7 +959,11 @@ public class BaoModelQueryEngine {
         }
         sql += " ORDER BY \(orderParts.joined(separator: ", "))"
 
-        sql += " \(QueryTranslator.buildLimitOffset(limit: options?.limit, offset: options?.offset))"
+        // Read the internal, non-deprecated `offsetForQuery` storage rather
+        // than the deprecated public `offset` accessor — honoring an
+        // offset-based query during the deprecation window must not trip the
+        // client's own `offset` deprecation.
+        sql += " \(QueryTranslator.buildLimitOffset(limit: options?.limit, offset: options?.offsetForQuery))"
         return (sql, params)
     }
 

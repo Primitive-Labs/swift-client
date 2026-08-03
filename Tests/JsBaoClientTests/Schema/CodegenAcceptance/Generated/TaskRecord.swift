@@ -243,8 +243,13 @@ internal extension TaskRecord {
 
     /// Fire `callback` after any add/update/delete in any open document's
     /// copy of this model (local or remote). Returns an unsubscribe closure.
+    ///
+    /// The callback is `@Sendable` (#1992): it runs on whichever thread
+    /// committed the change — a local writer's thread, or the
+    /// observer-drain queue — so state it captures must be safe to touch
+    /// from either.
     @discardableResult
-    static func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+    static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)
     }
 

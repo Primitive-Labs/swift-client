@@ -204,7 +204,7 @@ final class PersistenceTests: XCTestCase {
         try await storageProvider.initialize(namespace: "hydration-test")
 
         let offlineStore = OfflineStore()
-        offlineStore.setStorageProvider(storageProvider)
+        await offlineStore.setStorageProvider(storageProvider)
 
         let docId = "test-doc-\(UUID().uuidString.prefix(6))"
 

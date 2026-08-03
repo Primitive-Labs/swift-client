@@ -77,6 +77,16 @@ public struct CreateDatabaseParams: Encodable, Sendable {
     /// Deprecated — mirrors js-bao's `@deprecated` on `CreateDatabaseParams.celContext`.
     @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — separate readRule/writeRule — and read it from CEL as md.self.<category>.<key>. This field still works.")
     public var celContext: [String: JSONValue]? = nil
+    /// Create-time resource metadata to stamp on the new database, keyed by
+    /// category name → that category's values (issue #1420). Distinct from
+    /// `celContext`: these are per-category resource-metadata rows,
+    /// schema-validated with the category `writeRule` waived — creation
+    /// authority covers the initial stamp. At most 10 categories; any invalid
+    /// entry fails the whole create.
+    ///
+    /// The stamped values are read from CEL as `md.self.<category>.<key>`.
+    /// Mirrors js-bao's `CreateDatabaseParams.initialMetadata`.
+    public var initialMetadata: [String: [String: JSONValue]]? = nil
 
     /// Non-deprecated initializer for the plain case (no CEL context). Bind a
     /// CEL context through the deprecated `metadata:` or `celContext:` overloads
@@ -84,10 +94,12 @@ public struct CreateDatabaseParams: Encodable, Sendable {
     /// (annotating only the stored property does not).
     public init(
         title: String,
-        databaseType: String
+        databaseType: String,
+        initialMetadata: [String: [String: JSONValue]]? = nil
     ) {
         self.title = title
         self.databaseType = databaseType
+        self.initialMetadata = initialMetadata
     }
 
     /// Deprecated overload that accepts the legacy `metadata` alias, so
@@ -99,11 +111,13 @@ public struct CreateDatabaseParams: Encodable, Sendable {
     public init(
         title: String,
         databaseType: String,
-        metadata: [String: JSONValue]?
+        metadata: [String: JSONValue]?,
+        initialMetadata: [String: [String: JSONValue]]? = nil
     ) {
         self.title = title
         self.databaseType = databaseType
         self.metadata = metadata
+        self.initialMetadata = initialMetadata
     }
 
     /// Deprecated overload that accepts `celContext`, so `CreateDatabaseParams(…,
@@ -115,12 +129,14 @@ public struct CreateDatabaseParams: Encodable, Sendable {
         title: String,
         databaseType: String,
         metadata: [String: JSONValue]? = nil,
-        celContext: [String: JSONValue]?
+        celContext: [String: JSONValue]?,
+        initialMetadata: [String: [String: JSONValue]]? = nil
     ) {
         self.title = title
         self.databaseType = databaseType
         self.metadata = metadata
         self.celContext = celContext
+        self.initialMetadata = initialMetadata
     }
 }
 
@@ -647,3 +663,16 @@ public struct DatabaseSubscribeOptions: @unchecked Sendable {
         self.onChange = onChange
     }
 }
+
+// MARK: Paginated decode envelope
+//
+// `GET /databases` returns `{ items, hasMore, nextCursor?, cursor? }` (#1958 —
+// it used to return a bare array). No per-surface page type is needed:
+// `PaginatedResult<DatabaseInfo>` decodes that envelope directly through the
+// constrained `Decodable` extension in `Types/GroupsTypes.swift`, the same way
+// `groups.list` does.
+//
+// `listPage` reads it through the shared `PaginatedPageEnvelope` in
+// `Types/ResponseEnvelopes.swift`, which adds one thing on top: a server older
+// than #1958 still answers with the bare array, and that decodes as a single
+// page instead of throwing (#2245).

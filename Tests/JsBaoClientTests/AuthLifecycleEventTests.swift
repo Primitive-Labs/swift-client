@@ -32,10 +32,10 @@ final class AuthLifecycleEventTests: XCTestCase {
         try await waitForConnection(client: client)
 
         let order = OrderRecorder()
-        let logoutSub = client.events.on(.authLogout) { (_: AuthLogoutEvent) in
+        let logoutSub = client.eventEmitter.subscribe(AuthLogoutEvent.self) { _ in
             order.append("logout")
         }
-        let completeSub = client.events.on(.authLogoutComplete) { (_: AuthLogoutCompleteEvent) in
+        let completeSub = client.eventEmitter.subscribe(AuthLogoutCompleteEvent.self) { _ in
             order.append("complete")
         }
 
@@ -60,10 +60,10 @@ final class AuthLifecycleEventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let order = OrderRecorder()
-        let logoutSub = client.events.on(.authLogout) { (_: AuthLogoutEvent) in
+        let logoutSub = client.eventEmitter.subscribe(AuthLogoutEvent.self) { _ in
             order.append("logout")
         }
-        let completeSub = client.events.on(.authLogoutComplete) { (_: AuthLogoutCompleteEvent) in
+        let completeSub = client.eventEmitter.subscribe(AuthLogoutCompleteEvent.self) { _ in
             order.append("complete")
         }
 
@@ -90,7 +90,7 @@ final class AuthLifecycleEventTests: XCTestCase {
         XCTAssertNil(client.auth.getToken())
 
         let order = OrderRecorder()
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 
@@ -124,10 +124,10 @@ final class AuthLifecycleEventTests: XCTestCase {
         XCTAssertNil(client.auth.getToken())
 
         let order = OrderRecorder()
-        let modeSub = client.events.on(.networkMode) { (e: NetworkModeEvent) in
+        let modeSub = client.eventEmitter.subscribe(NetworkModeEvent.self) { e in
             order.append("networkMode:\(e.mode.rawValue)")
         }
-        let authSub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let authSub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 
@@ -156,7 +156,7 @@ final class AuthLifecycleEventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let order = OrderRecorder()
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 
@@ -178,7 +178,7 @@ final class AuthLifecycleEventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let order = OrderRecorder()
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 

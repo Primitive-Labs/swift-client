@@ -190,7 +190,7 @@ final class ProjectionTests: XCTestCase {
                 sortOrder: [("id", 1)], limit: 1, projection: ["body": 0]
             )
         )
-        let row = page.data.first ?? [:]
+        let row = page.data.first ?? PrimitiveRow.empty
         XCTAssertEqual(row["title"] as? String, "first")
         XCTAssertNil(row["body"])
         XCTAssertEqual(row["score"] as? Double, 10)

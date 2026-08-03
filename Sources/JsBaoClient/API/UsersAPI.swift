@@ -3,17 +3,29 @@ import Foundation
 // MARK: - UsersAPI
 
 public final class UsersAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
     private let cache: CacheFacade?
 
     private static let defaultRefreshIfOlderThanMs = 5 * 60 * 1000 // 5 minutes
 
+    /// Designated initializer — the typed transport spine.
     public init(
+        transport: any Transport,
+        cache: CacheFacade? = nil
+    ) {
+        self.transport = transport
+        self.cache = cache
+    }
+
+    /// Deprecated: construct with a `Transport` instead. The legacy closure is
+    /// wrapped in an adapter so existing call sites keep working for one major
+    /// cycle.
+    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         cache: CacheFacade? = nil
     ) {
-        self.makeRequest = makeRequest
-        self.cache = cache
+        self.init(transport: ClosureTransport(makeRequest: makeRequest), cache: cache)
     }
 
     /// Retrieves basic profile information for a user by their ID.
@@ -23,7 +35,7 @@ public final class UsersAPI: @unchecked Sendable {
             throw JsBaoError(code: .invalidArgument, message: "userId is required")
         }
 
-        let encodedUserId = userId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? userId
+        let encodedUserId = URLEncoding.encodeComponent(userId)
 
         guard let cache = cache else {
             // No cache facade injected (only the standalone-test construction
@@ -41,8 +53,10 @@ public final class UsersAPI: @unchecked Sendable {
                 // return.
                 throw JsBaoError(code: .notFound, message: "User \(userId) not found")
             case .network, .localIfAvailableElseNetwork:
-                let result = try await makeRequest("GET", "/users/\(encodedUserId)/basic", nil)
-                return try JSONCoding.decode(BasicUserInfo.self, from: result)
+                return try await transport.request(
+                    method: .get,
+                    path: "/users/\(encodedUserId)/basic"
+                )
             }
         }
 
@@ -63,8 +77,15 @@ public final class UsersAPI: @unchecked Sendable {
         // is typed.
         let value = try await cache.fetchCached(
             key: cacheKey,
-            fetcher: { [makeRequest] in
-                try await makeRequest("GET", "/users/\(encodedUserId)/basic", nil)
+            fetcher: { [transport] () async throws -> Any in
+                // The response is decoded as a `JSONValue` and handed to the
+                // cache as the JSON graph it persists (it round-trips through
+                // `KvCache`'s storage); the typed decode happens below.
+                let json: JSONValue = try await transport.request(
+                    method: .get,
+                    path: "/users/\(encodedUserId)/basic"
+                )
+                return try JSONCoding.jsonObject(from: json)
             },
             options: mergedOptions
         )
@@ -87,25 +108,51 @@ public final class UsersAPI: @unchecked Sendable {
                 message: "userIds must be a non-empty array"
             )
         }
-        let body: [String: Any] = ["userIds": userIds]
-        let result = try await makeRequest("POST", "/users/profiles", body)
         // The server wraps the array in a `{ profiles }` envelope; accept a
         // bare array too for resilience. Users that don't exist or don't
         // belong to the current app are silently omitted.
-        if let dict = result as? [String: Any], let profiles = dict["profiles"] {
-            return try JSONCoding.decode([BatchUserProfile].self, from: profiles)
-        }
-        return (try? JSONCoding.decode([BatchUserProfile].self, from: result)) ?? []
+        let response: BatchUserProfilesResponse = try await transport.request(
+            method: .post,
+            path: "/users/profiles",
+            body: ["userIds": userIds]
+        )
+        return response.profiles
     }
 
     /// Look up a user by email in the current app. Returns a
     /// `UserLookupResult` with an `exists` flag and an optional `user`
     /// summary (`userId`, `name`, `email`).
     public func lookup(email: String) async throws -> UserLookupResult {
-        let escaped = email.addingPercentEncoding(
-            withAllowedCharacters: .urlQueryAllowed
-        ) ?? email
-        let result = try await makeRequest("GET", "/users/lookup?email=\(escaped)", nil)
-        return try JSONCoding.decode(UserLookupResult.self, from: result)
+        var query = URLQuery()
+        query.append("email", email)
+        return try await transport.request(method: .get, path: "/users/lookup\(query.queryString)")
+    }
+}
+
+// MARK: - Response shims
+
+/// The batch-profiles endpoint returns a `{ profiles }` envelope; a bare
+/// array is also accepted for resilience, and any other shape yields no
+/// profiles (matching the previous `try?`-based leniency). Expressing that in
+/// a `Decodable` keeps the shape probe out of the call site now that
+/// responses are decoded straight from the wire bytes.
+private struct BatchUserProfilesResponse: Decodable, Sendable {
+    let profiles: [BatchUserProfile]
+
+    private enum CodingKeys: String, CodingKey { case profiles }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.container(keyedBy: CodingKeys.self),
+           container.contains(.profiles) {
+            // The envelope is present — decode it strictly, as before.
+            profiles = try container.decode([BatchUserProfile].self, forKey: .profiles)
+            return
+        }
+        if let container = try? decoder.singleValueContainer(),
+           let list = try? container.decode([BatchUserProfile].self) {
+            profiles = list
+            return
+        }
+        profiles = []
     }
 }

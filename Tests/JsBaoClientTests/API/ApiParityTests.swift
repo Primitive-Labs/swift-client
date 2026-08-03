@@ -75,7 +75,10 @@ final class ApiParityTests: XCTestCase {
         ]
         _ = try await api.get(collectionType: "my type/with slash")
         XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/collection-type-configs/my%20type/with%20slash")
+        // #2076: a path-segment value now escapes `/` too (encodeURIComponent
+        // parity), so the type stays a single segment. The old `.urlPathAllowed`
+        // charset left `/` literal, splitting it into extra path segments.
+        XCTAssertEqual(r.path, "/collection-type-configs/my%20type%2Fwith%20slash")
     }
 
     func test_collectionTypeConfigs_create_POSTsParams() async throws {
@@ -460,7 +463,10 @@ final class ApiParityTests: XCTestCase {
         r.response = ["exists": false]
         _ = try await api.lookup(email: "alice@example.com")
         XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/users/lookup?email=alice@example.com")
+        // #2076: `@` is now encoded to `%40` (encodeURIComponent / JS
+        // `URLSearchParams` parity). The server decodes it back to the same
+        // address; the old `.urlQueryAllowed` charset left `@` literal.
+        XCTAssertEqual(r.path, "/users/lookup?email=alice%40example.com")
     }
 
     // MARK: - DocumentsAPI new methods

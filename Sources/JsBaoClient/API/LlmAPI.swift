@@ -3,7 +3,7 @@ import Foundation
 // MARK: - LlmAPI
 
 public final class LlmAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
 
     /// Emits a lifecycle analytics event. Injected by the client so the API
     /// can fire `prompt_started` / `prompt_succeeded` / `prompt_failed`
@@ -13,12 +13,27 @@ public final class LlmAPI: @unchecked Sendable {
     /// callers/tests that construct `LlmAPI(makeRequest:)` keep working.
     private let logAnalytics: (AnalyticsEventInput) -> Void
 
+    /// Designated initializer — the typed transport spine.
     public init(
+        transport: any Transport,
+        logAnalytics: @escaping (AnalyticsEventInput) -> Void = { _ in }
+    ) {
+        self.transport = transport
+        self.logAnalytics = logAnalytics
+    }
+
+    /// Deprecated: construct with a `Transport` instead. The legacy closure is
+    /// wrapped in an adapter so existing call sites keep working for one major
+    /// cycle.
+    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         logAnalytics: @escaping (AnalyticsEventInput) -> Void = { _ in }
     ) {
-        self.makeRequest = makeRequest
-        self.logAnalytics = logAnalytics
+        self.init(
+            transport: ClosureTransport(makeRequest: makeRequest),
+            logAnalytics: logAnalytics
+        )
     }
 
     /// Sends a chat completion request to the configured LLM provider.
@@ -30,7 +45,6 @@ public final class LlmAPI: @unchecked Sendable {
     ///   `annotations`, and the provider `raw` response.
     @available(*, deprecated, message: "The direct LLM client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow llm.chat step instead.")
     public func chat(options: LlmChatOptions) async throws -> LlmChatResponse {
-        let body = try JSONCoding.jsonObject(from: options)
         let startedAt = Date()
 
         // `prompt_started`: model + message/attachment counts. Mirrors the
@@ -48,7 +62,11 @@ public final class LlmAPI: @unchecked Sendable {
         )
 
         do {
-            let result = try await makeRequest("POST", "/llm/chat", body)
+            let response: LlmChatResponse = try await transport.request(
+                method: .post,
+                path: "/llm/chat",
+                body: options
+            )
             // `prompt_succeeded`: model + duration.
             logAnalytics(
                 AnalyticsEventInput(
@@ -60,7 +78,7 @@ public final class LlmAPI: @unchecked Sendable {
                     ])
                 )
             )
-            return try JSONCoding.decode(LlmChatResponse.self, from: result)
+            return response
         } catch {
             // `prompt_failed`: model + duration + error message.
             logAnalytics(
@@ -96,7 +114,6 @@ public final class LlmAPI: @unchecked Sendable {
     /// - Returns: The `models` array and the `defaultModel` name.
     @available(*, deprecated, message: "The direct LLM client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow llm.chat step instead.")
     public func models() async throws -> LlmModelsResponse {
-        let result = try await makeRequest("GET", "/llm/models", nil)
-        return try JSONCoding.decode(LlmModelsResponse.self, from: result)
+        try await transport.request(method: .get, path: "/llm/models")
     }
 }

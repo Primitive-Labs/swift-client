@@ -101,11 +101,12 @@ final class CollectionsTests: XCTestCase {
 
     func testGrantGroupPermissionAndSeeInAccess() async throws {
         // Create a group via HTTP
-        _ = try await client.makeRequest("POST", "/groups", [
+        let devGroup: [String: JSONValue] = [
             "groupType": "team",
             "groupId": "devs",
             "name": "Developers",
-        ])
+        ]
+        _ = try await client.requestJSON(method: .post, path: "/groups", body: devGroup)
 
         let created = try await client.collections.create(params: CreateCollectionParams(name: "group-perm-test"))
         let collectionId = created.collectionId
@@ -129,11 +130,12 @@ final class CollectionsTests: XCTestCase {
 
     func testRevokeGroupPermission() async throws {
         // Create a group via HTTP (may already exist from previous test, ignore error)
-        _ = try? await client.makeRequest("POST", "/groups", [
+        let revokeGroup: [String: JSONValue] = [
             "groupType": "team",
             "groupId": "revoke-devs",
             "name": "Revoke Developers",
-        ])
+        ]
+        _ = try? await client.requestJSON(method: .post, path: "/groups", body: revokeGroup)
 
         let created = try await client.collections.create(params: CreateCollectionParams(name: "revoke-perm-test"))
         let collectionId = created.collectionId

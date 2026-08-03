@@ -17,9 +17,51 @@ import Foundation
 ///
 /// Intentionally self-contained and synchronous — the owning
 /// `DatabasesAPI` / `JsBaoClient` send the `db.subscribe` frame; this
-/// registry never touches the network layer. Thread-safe via `lock`
-/// because `register` / `dispatch` / `list` can be called from any thread
-/// (subscribe call site, WS receive task, reconnect task).
+/// registry never touches the network layer.
+///
+/// ## A sync-adjacent boundary type (#1993 Phase D)
+///
+/// The concurrency epic actorized the async service managers (`OfflineStore`,
+/// `KvCache`, `AnalyticsQueue`). This registry was deliberately **dropped**
+/// from that list by the sponsor and stays class-plus-lock permanently: it
+/// does no I/O and has no `await` anywhere, so an actor would buy nothing and
+/// would cost `DatabasesAPI.subscribe` its synchronous shape (it is
+/// sync-throwing and returns a synchronous unsubscribe closure). Do not
+/// convert it — see the "Decisions of record" on #1993.
+///
+/// ## `@unchecked Sendable` safety argument
+///
+/// The conformance is unchecked because the registry stores two values the
+/// compiler cannot prove are safe to share: `Registration.onChange`, a plain
+/// (non-`@Sendable`) escaping closure supplied by app code, and
+/// `Registration.params` / `OriginContext`'s two lookup closures, which are
+/// likewise untyped and non-`@Sendable`. The argument that it is nonetheless
+/// safe has three parts:
+///
+///  1. **Every mutable field is `lock`-confined.** `registrations` and
+///     `originContext` are the only mutable state, both `private`, and every
+///     read and write of either goes through the one `NSLock` held in `lock`.
+///     There is no second lock, so there is no acquisition order to get wrong,
+///     and no lock is ever held across an `await` because the type has no
+///     `async` member at all.
+///  2. **The stored closures never run under the lock.** `dispatch` copies the
+///     matching `Registration` and the `originContext` out of the critical
+///     section, releases `lock`, and only then calls `ctx.getConnectionId()` /
+///     `ctx.getCurrentUserId()` and `reg.onChange(event)`. So an app callback
+///     that re-enters the registry (`unregister` from inside `onChange` is the
+///     realistic case) cannot deadlock against a non-recursive `NSLock`, and a
+///     slow callback never blocks a concurrent `register`.
+///  3. **No registry-owned state escapes by reference.** `list()` returns
+///     value copies of `(databaseId, subscriptionKey, params)`; the `onChange`
+///     closures stay inside the registry. The copy is one level deep — a
+///     reference type an app stored *inside* `params` is shared with that app,
+///     as it was before the copy — so the claim is about the registry's own
+///     tables, not about everything reachable from them. Each closure is therefore invoked from exactly one
+///     place, on whichever thread delivered the frame — the same contract the
+///     JS client's registry has.
+///
+/// `logger` is a `let`, so it is not part of the mutable state the lock
+/// confines; `Logger` does its own internal locking.
 final class DatabaseSubscriptionRegistry: @unchecked Sendable {
     /// Lookups used to synthesize `isOrigin` / `isOriginUser` on inbound
     /// frames. Resolved lazily at dispatch time (not at register time)
@@ -83,12 +125,6 @@ final class DatabaseSubscriptionRegistry: @unchecked Sendable {
         registrations.removeValue(forKey: makeKey(databaseId, subscriptionKey))
     }
 
-    func has(databaseId: String, subscriptionKey: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return registrations[makeKey(databaseId, subscriptionKey)] != nil
-    }
-
     /// Snapshot of all live registrations, for reconnect re-subscribe.
     func list() -> [(databaseId: String, subscriptionKey: String, params: [String: Any])] {
         lock.lock()
@@ -96,13 +132,6 @@ final class DatabaseSubscriptionRegistry: @unchecked Sendable {
         return registrations.values.map {
             ($0.databaseId, $0.subscriptionKey, $0.params)
         }
-    }
-
-    /// Clear all registrations (client destroy).
-    func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        registrations.removeAll()
     }
 
     /// Route an inbound `db.change` frame (already parsed to `[String: Any]`)

@@ -109,8 +109,8 @@ public enum SchemaDiscovery {
         let unique     = decodeBool(fieldMap.value(tx: tx, key: "unique"))     ?? false
         let required   = decodeBool(fieldMap.value(tx: tx, key: "required"))   ?? false
         let autoAssign = decodeBool(fieldMap.value(tx: tx, key: "autoAssign")) ?? false
-        let maxLength  = decodeNumber(fieldMap.value(tx: tx, key: "maxLength")).map { Int($0) }
-        let maxCount   = decodeNumber(fieldMap.value(tx: tx, key: "maxCount")).map { Int($0) }
+        let maxLength  = boundedInt(decodeNumber(fieldMap.value(tx: tx, key: "maxLength")))
+        let maxCount   = boundedInt(decodeNumber(fieldMap.value(tx: tx, key: "maxCount")))
 
         var defaultValue: DefaultValue? = nil
         if let raw = fieldMap.value(tx: tx, key: "default") {
@@ -237,6 +237,24 @@ public enum SchemaDiscovery {
         case "false": return false
         default:      return nil
         }
+    }
+
+    /// Convert a number decoded from document data to `Int`, yielding `nil`
+    /// (field absent) for a non-finite or out-of-range value.
+    ///
+    /// Uses `Int(exactly:)` rather than `Int(_:)`: these values come from
+    /// document data, so a corrupt one would otherwise trap and abort the
+    /// process (#2056). `.towardZero` keeps the old truncation semantics for
+    /// in-range values. Internal rather than private so it can be unit tested.
+    ///
+    /// Note the downstream reading: `nil` means "no limit" to the validators in
+    /// `Schema/DynamicModel.swift`, so an out-of-range `maxLength`/`maxCount`
+    /// fails open rather than rejecting the field. That is the deliberate
+    /// choice here — a bound so large it does not fit in `Int` cannot
+    /// meaningfully constrain anything, and failing open beats trapping.
+    static func boundedInt(_ value: Double?) -> Int? {
+        guard let value = value, value.isFinite else { return nil }
+        return Int(exactly: value.rounded(.towardZero))
     }
 
     private static func decodeNumber(_ raw: String?) -> Double? {

@@ -104,36 +104,26 @@ final class AuthOptionSurfaceTests: XCTestCase {
 
     // MARK: - magicLinkVerify inviteToken (#466)
 
-    /// Captures the most recent request the stub closure was asked to make.
-    private final class CallRecorder: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        /// Canned magic-link-verify response with no "token" key, so the
-        /// controller doesn't try to apply/parse a JWT.
-        var response: Any = [
-            "user": ["userId": "u1", "email": "ml@example.com"],
-            "isNewUser": false,
-        ]
+    /// Canned magic-link-verify response. It carries a real (decodable) JWT
+    /// because a 2xx verify without a `token` is a broken server contract the
+    /// controller rejects (#1991 Phase B3). These tests only assert the
+    /// outbound request body, so the token just has to be applicable.
+    private static let magicLinkResponse = #"""
+    {"token": "\#(makeTestJwt(userId: "u1"))", "user": {"userId": "u1", "email": "ml@example.com"}, "isNewUser": false}
+    """#
 
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
-        }
+    private func makeRecorder() -> RecordingTransport {
+        RecordingTransport(json: Self.magicLinkResponse)
     }
 
-    private func makeClient(_ recorder: CallRecorder) -> JsBaoClient {
+    private func makeClient(_ recorder: RecordingTransport) -> JsBaoClient {
         let client = JsBaoClient(options: JsBaoClientOptions(
             apiUrl: "http://localhost:8787",
             wsUrl: "ws://localhost:8787",
             appId: "test-app",
             offline: true
         ))
-        client.authController.makeRequest = { method, path, data in
-            try await recorder.make(method, path, data)
-        }
+        client.authController.replaceTransportForTesting(recorder)
         return client
     }
 
@@ -141,42 +131,42 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// forwards `inviteToken` to the auth controller. The Swift wrapper
     /// previously dropped it.
     func test_topLevel_magicLinkVerify_forwardsInviteToken() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
         _ = try await client.magicLinkVerify(token: "ml-token", inviteToken: "invite-tok-ml")
 
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/auth/magic-link/verify")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["token"] as? String, "ml-token")
-        XCTAssertEqual(body?["inviteToken"] as? String, "invite-tok-ml")
+        XCTAssertEqual(r.lastCall?.method, .post)
+        XCTAssertEqual(r.lastCall?.path, "/auth/magic-link/verify")
+        let body = r.lastCall?.jsonBody
+        XCTAssertEqual(body?["token"]?.stringValue, "ml-token")
+        XCTAssertEqual(body?["inviteToken"]?.stringValue, "invite-tok-ml")
     }
 
     /// Source compatibility: the one-arg call still works and sends no
     /// inviteToken (same body shape JS sends: just the token).
     func test_topLevel_magicLinkVerify_omitsInviteToken_whenNotPassed() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
         _ = try await client.magicLinkVerify(token: "ml-token")
 
-        let body = r.body as? [String: Any]
+        let body = r.lastCall?.jsonBody
         XCTAssertNotNil(body)
         XCTAssertNil(body?["inviteToken"])
-        XCTAssertEqual(body?["token"] as? String, "ml-token")
+        XCTAssertEqual(body?["token"]?.stringValue, "ml-token")
     }
 
     func test_topLevel_magicLinkVerify_trimsAndOmitsBlankInviteToken() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
         _ = try await client.magicLinkVerify(token: "ml-token", inviteToken: "   ")
 
-        let body = r.body as? [String: Any]
+        let body = r.lastCall?.jsonBody
         XCTAssertNil(body?["inviteToken"])
     }
 
@@ -188,7 +178,7 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// surface exists and forwards. (The controller-level honoring of each
     /// field is covered by the auth-controller logout tests.)
     func test_topLevel_logout_acceptsFullOptionBag() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
@@ -205,7 +195,7 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// Source compatibility: the original `logout(wipeLocal:)` overload still
     /// works and is equivalent to `logout(options: .init(wipeLocal:))`.
     func test_topLevel_logout_wipeLocalOverload_stillWorks() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
@@ -217,7 +207,7 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// top-level client cleanup path, not directly to `AuthController`, so
     /// `wipeLocal` clears cached document data.
     func test_auth_logout_options_wipeLocal_clearsLocalDocuments() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 

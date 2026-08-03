@@ -3,8 +3,7 @@ import Foundation
 // MARK: - MeAPI
 
 public final class MeAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
-    private let makeRawRequest: ((String, String, Data?, [String: String]) async throws -> (Data, Int))?
+    private let transport: any Transport
     private let cache: CacheFacade?
     /// Snapshot of the local document-metadata cache (`documentId` →
     /// `LocalMetadataEntry`). Drives the offline-first merge in
@@ -20,28 +19,48 @@ public final class MeAPI: @unchecked Sendable {
 
     private static let defaultRefreshIfOlderThanMs = 5 * 60 * 1000 // 5 minutes
 
+    /// Designated initializer — the typed transport spine.
     public init(
+        transport: any Transport,
+        cache: CacheFacade? = nil,
+        localMetadata: @escaping () -> [String: LocalMetadataEntry] = { [:] },
+        isOnline: @escaping () -> Bool = { true }
+    ) {
+        self.transport = transport
+        self.cache = cache
+        self.localMetadata = localMetadata
+        self.isOnline = isOnline
+    }
+
+    @available(*, deprecated, message: "Use init(transport:cache:localMetadata:isOnline:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         cache: CacheFacade? = nil,
         makeRawRequest: ((String, String, Data?, [String: String]) async throws -> (Data, Int))? = nil,
         localMetadata: @escaping () -> [String: LocalMetadataEntry] = { [:] },
         isOnline: @escaping () -> Bool = { true }
     ) {
-        self.makeRequest = makeRequest
-        self.cache = cache
-        self.makeRawRequest = makeRawRequest
-        self.localMetadata = localMetadata
-        self.isOnline = isOnline
+        self.init(
+            transport: ClosureTransport(makeRequest: makeRequest, makeRawRequest: makeRawRequest),
+            cache: cache,
+            localMetadata: localMetadata,
+            isOnline: isOnline
+        )
     }
 
     /// Retrieves the current user's profile, using the cache when available.
     /// Returns `nil` when there is no current user. Mirrors js-bao's
     /// `me.get(options)` → `UserProfile | null`. `FetchCachedOptions` maps
     /// field-for-field to JS's `GetMeOptions`.
+    ///
+    /// Deliberately lenient about the response body (JS parity): an empty
+    /// body **and** a body that doesn't decode as a `UserProfile` both yield
+    /// `nil` rather than throwing — the `try?` here is the one intentional
+    /// response-body leniency left on the typed path. Non-2xx statuses still
+    /// throw, as everywhere else.
     public func get(options: FetchCachedOptions? = nil) async throws -> UserProfile? {
         guard let cache = cache else {
-            let result = try await makeRequest("GET", "/me", nil)
-            return try? JSONCoding.decode(UserProfile.self, from: result)
+            return Self.userProfile(from: try await fetchProfile())
         }
 
         let mergedOptions = FetchCachedOptions(
@@ -51,15 +70,37 @@ public final class MeAPI: @unchecked Sendable {
             serverTimeoutMs: options?.serverTimeoutMs
         )
 
-        let value = try await cache.fetchCached(
+        let value = try await cache.fetchCachedJSON(
             key: "me",
-            fetcher: { [makeRequest] in
-                try await makeRequest("GET", "/me", nil)
+            fetcher: { [weak self] in
+                guard let self = self else { return nil }
+                return try await self.fetchProfile()
             },
             options: mergedOptions
         )
-        guard let value = value else { return nil }
-        return try? JSONCoding.decode(UserProfile.self, from: value)
+        return Self.userProfile(from: value)
+    }
+
+    /// One `GET /me`, tolerant of a body that is not a decodable profile.
+    ///
+    /// `requestOptional` already maps an empty 2xx body to `nil`; the catch
+    /// restores the other half of the legacy leniency — before the typed
+    /// spine, a malformed JSON body came back as text and the `try?` decode
+    /// turned it into `nil`. Only a decode failure is swallowed; non-2xx and
+    /// transport errors still propagate.
+    private func fetchProfile() async throws -> JSONValue? {
+        do {
+            return try await transport.requestOptional(method: .get, path: "/me")
+        } catch let error as HttpError where error.serverCode == HttpError.decodingFailedCode {
+            return nil
+        }
+    }
+
+    /// Decode the cached/fetched JSON document as a `UserProfile`, or `nil`
+    /// when it isn't one.
+    private static func userProfile(from value: JSONValue?) -> UserProfile? {
+        guard let value = value, let data = try? JSONCoding.encodeData(value) else { return nil }
+        return try? JSONCoding.decodeData(UserProfile.self, from: data)
     }
 
     /// Returns cache metadata for the current user's profile entry.
@@ -110,21 +151,14 @@ public final class MeAPI: @unchecked Sendable {
             return SharedDocumentListResult(items: items, cursor: nil)
         }
 
-        var qs: [String] = []
-        if let cursor,
-           let escaped = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            qs.append("cursor=\(escaped)")
-        }
-        if let limit { qs.append("limit=\(limit)") }
-        if let tag,
-           let escaped = tag.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            qs.append("tag=\(escaped)")
-        }
-        let path = qs.isEmpty
-            ? "/me/shared-documents"
-            : "/me/shared-documents?\(qs.joined(separator: "&"))"
-        let result = try await makeRequest("GET", path, nil)
-        let page = try JSONCoding.decode(SharedDocumentListResult.self, from: result)
+        var query = URLQuery()
+        query.appendIfPresent("cursor", cursor)
+        if let limit { query.append("limit", limit) }
+        query.appendIfPresent("tag", tag)
+        let page: SharedDocumentListResult = try await transport.request(
+            method: .get,
+            path: "/me/shared-documents\(query.queryString)"
+        )
 
         // Merge: server rows win on `documentId`; append local-only shares the
         // server page didn't return. (Mirrors js-bao `_listImpl`'s by-id map:
@@ -219,35 +253,21 @@ public final class MeAPI: @unchecked Sendable {
             return DocumentListPage(items: items, cursor: nil)
         }
 
-        var qs: [String] = []
+        var query = URLQuery()
         // JS order: includeRoot, limit, cursor, tag, forward.
-        if options?.includeRoot == true { qs.append("includeRoot=true") }
-        if let limit { qs.append("limit=\(limit)") }
-        if let cursor,
-           let escaped = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            qs.append("cursor=\(escaped)")
-        }
-        if let tag,
-           let escaped = tag.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            qs.append("tag=\(escaped)")
-        }
-        if options?.forward == true { qs.append("forward=true") }
-        let path = qs.isEmpty
-            ? "/me/owned-documents"
-            : "/me/owned-documents?\(qs.joined(separator: "&"))"
-        let result = try await makeRequest("GET", path, nil)
+        if options?.includeRoot == true { query.append("includeRoot", "true") }
+        if let limit { query.append("limit", limit) }
+        query.appendIfPresent("cursor", cursor)
+        query.appendIfPresent("tag", tag)
+        if options?.forward == true { query.append("forward", "true") }
         // Accept either a bare array or an `{ items, cursor }` (legacy
         // `{ documents }`) envelope — matching `documents.list`.
-        let serverItems: [DocumentInfo]
-        let serverCursor: String?
-        if let arr = try? JSONCoding.decode([DocumentInfo].self, from: result) {
-            serverItems = arr
-            serverCursor = nil
-        } else {
-            let decoded = try JSONCoding.decode(DocumentListPage.self, from: result)
-            serverItems = decoded.items
-            serverCursor = decoded.cursor
-        }
+        let page: DocumentListEnvelope = try await transport.request(
+            method: .get,
+            path: "/me/owned-documents\(query.queryString)"
+        )
+        let serverItems = page.items
+        let serverCursor = page.cursor
 
         // Merge: server rows win on `documentId`; append local-only owned docs
         // the server list didn't return (e.g. a just-created pendingCreate doc
@@ -309,28 +329,40 @@ public final class MeAPI: @unchecked Sendable {
     /// source of truth for field defaults. Local rows only carry a subset of
     /// the server fields; the rest fall back to the decoders' defaults
     /// (`createdBy`/`createdAt` → `""`, `permission` → `reader`).
-    private static func documentJSON(from entry: LocalMetadataEntry) -> [String: Any] {
-        var obj: [String: Any] = ["documentId": entry.documentId]
-        if let title = entry.title { obj["title"] = title }
-        if let permission = entry.permission { obj["permission"] = permission }
-        if let createdBy = entry.createdBy { obj["createdBy"] = createdBy }
-        if let createdAt = entry.createdAt { obj["createdAt"] = createdAt }
-        if let modifiedAt = entry.modifiedAt { obj["modifiedAt"] = modifiedAt }
-        if let tags = entry.tags { obj["tags"] = tags }
+    private static func documentJSON(from entry: LocalMetadataEntry) -> [String: JSONValue] {
+        var obj: [String: JSONValue] = ["documentId": .string(entry.documentId)]
+        if let title = entry.title { obj["title"] = .string(title) }
+        if let permission = entry.permission { obj["permission"] = .string(permission) }
+        if let createdBy = entry.createdBy { obj["createdBy"] = .string(createdBy) }
+        if let createdAt = entry.createdAt { obj["createdAt"] = .string(createdAt) }
+        if let modifiedAt = entry.modifiedAt { obj["modifiedAt"] = .string(modifiedAt) }
+        if let tags = entry.tags { obj["tags"] = .array(tags.map { .string($0) }) }
         return obj
+    }
+
+    /// Decode one of the local-row projections above. The dictionary is
+    /// built from a `LocalMetadataEntry` in this file, so encoding it never
+    /// realistically fails — a `nil` here means the target type rejected the
+    /// subset of fields a local row carries.
+    private static func decodeLocalRow<T: Decodable>(
+        _ type: T.Type,
+        from object: [String: JSONValue]
+    ) -> T? {
+        guard let data = try? JSONCoding.encodeData(object) else { return nil }
+        return try? JSONCoding.decodeData(T.self, from: data)
     }
 
     /// Map a local owner row to the `DocumentInfo` result element. On the
     /// (practically impossible) decode failure, falls back to a minimal row
     /// carrying just the id so the doc still surfaces.
     private static func documentInfo(from entry: LocalMetadataEntry) -> DocumentInfo {
-        if let info = try? JSONCoding.decode(DocumentInfo.self, from: documentJSON(from: entry)) {
+        if let info = decodeLocalRow(DocumentInfo.self, from: documentJSON(from: entry)) {
             return info
         }
-        return (try? JSONCoding.decode(
+        return decodeLocalRow(
             DocumentInfo.self,
-            from: ["documentId": entry.documentId]
-        ))!
+            from: ["documentId": .string(entry.documentId)]
+        )!
     }
 
     /// Map a local shared row to the `SharedDocument` result element. The
@@ -339,30 +371,45 @@ public final class MeAPI: @unchecked Sendable {
     /// `nil` — the base document fields are what the merge needs.
     private static func sharedDocument(from entry: LocalMetadataEntry) -> SharedDocument {
         var obj = documentJSON(from: entry)
-        if let createdBy = entry.createdBy { obj["grantedBy"] = createdBy }
-        if let info = try? JSONCoding.decode(SharedDocument.self, from: obj) {
+        if let createdBy = entry.createdBy { obj["grantedBy"] = .string(createdBy) }
+        if let info = decodeLocalRow(SharedDocument.self, from: obj) {
             return info
         }
-        return (try? JSONCoding.decode(
+        return decodeLocalRow(
             SharedDocument.self,
-            from: ["documentId": entry.documentId]
-        ))!
+            from: ["documentId": .string(entry.documentId)]
+        )!
     }
 
     /// Lists pending document invitations for the current user.
     public func pendingDocumentInvitations() async throws -> [PendingDocumentInvitation] {
-        let result = try await makeRequest("GET", "/me/document-invitations", nil)
-        return try JSONCoding.decode([PendingDocumentInvitation].self, from: result)
+        try await transport.request(method: .get, path: "/me/document-invitations")
     }
 
     /// Update the current user's profile (name and/or external avatar URL).
     /// Mirrors js-bao's `me.update(params)` → `UserProfile`. Pass
     /// `avatarUrl: .clear` to remove the current avatar (JS `avatarUrl: null`).
     public func update(params: UpdateMeParams) async throws -> UserProfile {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("PATCH", "/me", body)
-        await clearCache()
-        return try JSONCoding.decode(UserProfile.self, from: result)
+        // The cache is cleared whether or not the response body decodes: on a
+        // 2xx the server-side update has already happened, so a cached profile
+        // is stale either way. A rejected update (400/403/404/409) changed
+        // nothing server-side, so its cache entry is still good and is kept —
+        // an offline-first `me.get()` after a rejected update still has a
+        // profile to serve.
+        do {
+            let profile: UserProfile = try await transport.request(
+                method: .patch,
+                path: "/me",
+                body: params
+            )
+            await clearCache()
+            return profile
+        } catch let error as HttpError
+            where error.serverCode == HttpError.decodingFailedCode
+                || error.serverCode == HttpError.emptyBodyCode {
+            await clearCache()
+            throw error
+        }
     }
 
     /// Upload an avatar image for the current user. Sends the bytes as
@@ -374,30 +421,24 @@ public final class MeAPI: @unchecked Sendable {
     ///   (`image/png`, `image/jpeg`, `image/gif`, `image/webp`) — mirrors
     ///   js-bao's typed union, so an invalid MIME is a compile error rather
     ///   than a server-side rejection. Routed via the `Content-Type` header
-    ///   when the raw HTTP closure is wired (always in production); the
-    ///   previous build silently dropped this argument, so any server
-    ///   that strictly validated `Content-Type` would reject the upload.
+    ///   on the raw-bytes request.
     ///
     /// Returns a typed `AvatarUploadResult` carrying the new `avatarUrl`,
     /// mirroring js-bao's `{ avatarUrl }`.
     public func uploadAvatar(imageData: Data, contentType: AvatarContentType) async throws -> AvatarUploadResult {
-        if let makeRawRequest {
-            let headers = ["Content-Type": contentType.rawValue]
-            let (body, status) = try await makeRawRequest("POST", "/me/avatar", imageData, headers)
-            guard (200..<300).contains(status) else {
-                throw HttpError(
-                    status: status, message: "Avatar upload failed",
-                    body: String(data: body, encoding: .utf8)
-                )
-            }
-            await clearCache()
-            return try JSONCoding.decoder.decode(AvatarUploadResult.self, from: body)
+        let (body, status) = try await transport.requestData(
+            method: .post,
+            path: "/me/avatar",
+            body: imageData,
+            options: RequestOptions(customHeaders: ["Content-Type": contentType.rawValue])
+        )
+        guard (200..<300).contains(status) else {
+            throw HttpError(
+                status: status, message: "Avatar upload failed",
+                body: String(data: body, encoding: .utf8)
+            )
         }
-        // Fallback when no raw closure is wired (tests that construct
-        // MeAPI directly): use the JSON path. The server typically
-        // accepts the bytes either way for the avatar endpoint.
-        let result = try await makeRequest("POST", "/me/avatar", imageData)
         await clearCache()
-        return try JSONCoding.decode(AvatarUploadResult.self, from: result)
+        return try JSONCoding.decodeData(AvatarUploadResult.self, from: body)
     }
 }

@@ -28,7 +28,7 @@ final class EventTests: XCTestCase {
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Event Test Doc")
 
         var loadedEvents: [DocumentLoadedEvent] = []
-        let sub = client.events.on(.documentLoaded) { (e: DocumentLoadedEvent) in
+        let sub = client.eventEmitter.subscribe(DocumentLoadedEvent.self) { e in
             loadedEvents.append(e)
         }
 
@@ -62,7 +62,7 @@ final class EventTests: XCTestCase {
         try await waitForSync(client: client, documentId: docId)
 
         var closedEvents: [DocumentClosedEvent] = []
-        let sub = client.events.on(.documentClosed) { (e: DocumentClosedEvent) in
+        let sub = client.eventEmitter.subscribe(DocumentClosedEvent.self) { e in
             closedEvents.append(e)
         }
 
@@ -86,7 +86,7 @@ final class EventTests: XCTestCase {
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
 
         var syncEvents: [SyncEvent] = []
-        let sub = client.events.on(.sync) { (e: SyncEvent) in
+        let sub = client.eventEmitter.subscribe(SyncEvent.self) { e in
             syncEvents.append(e)
         }
 
@@ -116,7 +116,7 @@ final class EventTests: XCTestCase {
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "SyncPerf Test Doc")
 
         var perfEvents: [SyncPerfEvent] = []
-        let sub = client.events.on(.syncPerf) { (e: SyncPerfEvent) in
+        let sub = client.eventEmitter.subscribe(SyncPerfEvent.self) { e in
             perfEvents.append(e)
         }
         defer { sub.cancel() }
@@ -156,7 +156,7 @@ final class EventTests: XCTestCase {
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "SyncPerf ClientTimings Doc")
 
         var perfEvents: [SyncPerfEvent] = []
-        let sub = client.events.on(.syncPerf) { (e: SyncPerfEvent) in
+        let sub = client.eventEmitter.subscribe(SyncPerfEvent.self) { e in
             perfEvents.append(e)
         }
         defer { sub.cancel() }
@@ -201,7 +201,7 @@ final class EventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         var statusEvents: [StatusChangedEvent] = []
-        let sub = client.events.on(.status) { (e: StatusChangedEvent) in
+        let sub = client.eventEmitter.subscribe(StatusChangedEvent.self) { e in
             statusEvents.append(e)
         }
 
@@ -222,7 +222,7 @@ final class EventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         var networkEvents: [NetworkModeEvent] = []
-        let sub = client.events.on(.networkMode) { (e: NetworkModeEvent) in
+        let sub = client.eventEmitter.subscribe(NetworkModeEvent.self) { e in
             networkEvents.append(e)
         }
 
@@ -280,7 +280,7 @@ final class EventTests: XCTestCase {
         try await waitForSync(client: reader, documentId: docId)
 
         let syncedStates = ThreadSafeBox<[String]>([])
-        let sub = reader.events.on(.documentSyncStateChanged) { (e: DocumentSyncStateChangedEvent) in
+        let sub = reader.eventEmitter.subscribe(DocumentSyncStateChangedEvent.self) { e in
             if e.documentId == docId {
                 syncedStates.mutate { $0.append(e.state) }
             }
@@ -293,7 +293,7 @@ final class EventTests: XCTestCase {
         try await waitForSync(client: writer, documentId: docId)
 
         let writerMap: YMap<String> = writerDoc.getOrCreateMap(named: "data")
-        writer.transactAndSync(docId) { txn in
+        try writer.transactAndSync(docId) { txn in
             writerMap.updateValue("from-writer", forKey: "key", transaction: txn)
         }
 

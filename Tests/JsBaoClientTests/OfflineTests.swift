@@ -86,17 +86,22 @@ final class OfflineTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        // Default should be online
-        XCTAssertTrue(client.isOnline())
+        // Default mode is .auto. `isOnline()` is now reporting-only and
+        // reflects transport, so it is false while the socket is disconnected;
+        // the internal networking gate stays open (reachable defaults true).
         XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertFalse(client.isConnected)
+        XCTAssertFalse(client.isOnline())
+        XCTAssertTrue(client.networkingAllowed())
 
         // Go offline
         await client.goOffline()
         XCTAssertFalse(client.isOnline())
+        XCTAssertFalse(client.networkingAllowed())
         XCTAssertEqual(client.getNetworkMode(), .offline)
         XCTAssertFalse(client.isConnected)
 
-        // Go online
+        // Go online — explicit `.online` reports online regardless of transport
         await client.goOnline()
         XCTAssertTrue(client.isOnline())
     }
@@ -106,8 +111,11 @@ final class OfflineTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let status = client.getNetworkStatus()
-        XCTAssertTrue(status.isOnline)
-        XCTAssertNotEqual(status.mode, .offline)
+        // Default `.auto` + disconnected socket → reporting-only isOnline false,
+        // transport reflects the WS manager.
+        XCTAssertEqual(status.mode, .auto)
+        XCTAssertEqual(status.transport, .disconnected)
+        XCTAssertFalse(status.isOnline)
     }
 
     // MARK: - Offline document creation then sync when going online
@@ -201,10 +209,12 @@ final class OfflineTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        // Default state
+        // Default state: mode .auto, socket disconnected. Reporting-only
+        // isOnline() now reflects transport, so it is false here.
         let s1 = client.getNetworkStatus()
-        XCTAssertTrue(s1.isOnline)
-        XCTAssertNotEqual(s1.mode, .offline)
+        XCTAssertEqual(s1.mode, .auto)
+        XCTAssertEqual(s1.transport, .disconnected)
+        XCTAssertFalse(s1.isOnline)
 
         // Go offline
         await client.goOffline()
@@ -245,7 +255,7 @@ final class OfflineTests: XCTestCase {
         // Offline: HTTP requests should fail (no network)
         // The server is unreachable, so this should throw or return an error
         do {
-            _ = try await client.makeRequest("GET", "/documents/\(docId)", nil)
+            _ = try await client.requestJSON(method: .get, path: "/documents/\(docId)")
             // If it doesn't throw, that's fine — some impls may return cached data
         } catch {
             // Expected — network requests fail while offline
@@ -391,7 +401,7 @@ final class OfflineTests: XCTestCase {
 
         // Write data
         let map1: YMap<String> = ydoc1.getOrCreateMap(named: "testData")
-        client.transactAndSync(docId) { txn in
+        try client.transactAndSync(docId) { txn in
             map1.updateValue("Alice", forKey: "name", transaction: txn)
             map1.updateValue("alice@test.com", forKey: "email", transaction: txn)
         }
@@ -493,7 +503,7 @@ final class OfflineTests: XCTestCase {
 
         // Mutate
         let map1: YMap<String> = ydoc1.getOrCreateMap(named: "sample")
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             map1.updateValue("\(Date().timeIntervalSince1970)", forKey: "ts", transaction: txn)
         }
         try await delay(2)
@@ -624,7 +634,7 @@ final class OfflineTests: XCTestCase {
 
         // Write initial data while online
         let map: YMap<String> = ydoc.getOrCreateMap(named: "testData")
-        client.transactAndSync(docId) { txn in
+        try client.transactAndSync(docId) { txn in
             map.updateValue("initial", forKey: "phase", transaction: txn)
         }
         try await delay(1)

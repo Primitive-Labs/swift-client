@@ -106,6 +106,29 @@ final class DatabaseTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(list.count, 1)
     }
 
+    /// The `owner` filter narrows the listing to one creator (#2245, parity
+    /// with the JS client's `databases.list({ owner })`). The caller here is
+    /// the app owner, so this goes through the server's app-wide-authority
+    /// branch — the one that reads the creator's own index partition.
+    func testListDatabasesFilteredByOwner() async throws {
+        let mine = try await client.databases.list(owner: testApp.ownerUserId)
+        XCTAssertTrue(mine.contains { $0.databaseId == databaseId })
+        XCTAssertTrue(
+            mine.allSatisfy { $0.createdBy == testApp.ownerUserId },
+            "owner filter returned a database created by someone else"
+        )
+
+        // An owner who created nothing is an empty list, not an error. A
+        // synthetic id is enough to reach that branch, and keeps the check off
+        // the admin user-creation endpoint.
+        let strangerId = "01" + UUID().uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .uppercased()
+            .prefix(24)
+        let theirs = try await client.databases.list(owner: strangerId)
+        XCTAssertTrue(theirs.isEmpty)
+    }
+
     func testUpdateDatabase() async throws {
         let result = try await client.databases.update(databaseId: databaseId, params: UpdateDatabaseParams(
             title: "Updated Title"

@@ -21,7 +21,6 @@ public struct JsBaoClientOptions: Sendable {
     public let sync: SyncConfig
     public let commitRetryBackoff: CommitRetryBackoff
     public let autoNetwork: Bool
-    public let connectivityProbeTimeoutMs: Int
     /// Per-feature gating for the analytics auto-events the client emits
     /// without explicit app calls (#963). Mirrors js-bao's
     /// `analyticsAutoEvents` option.
@@ -43,7 +42,6 @@ public struct JsBaoClientOptions: Sendable {
         sync: SyncConfig = SyncConfig(),
         commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff(),
         autoNetwork: Bool = true,
-        connectivityProbeTimeoutMs: Int = 2000,
         analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig()
     ) {
         self.apiUrl = apiUrl
@@ -61,7 +59,6 @@ public struct JsBaoClientOptions: Sendable {
         self.sync = sync
         self.commitRetryBackoff = commitRetryBackoff
         self.autoNetwork = autoNetwork
-        self.connectivityProbeTimeoutMs = connectivityProbeTimeoutMs
         self.analyticsAutoEvents = analyticsAutoEvents
     }
 }
@@ -382,9 +379,27 @@ public struct PaginatedResult<T: Sendable>: Sendable {
 
 public struct NetworkStatus: Sendable {
     public let mode: NetworkMode
+    /// The WebSocket transport state, reusing the existing `ConnectionStatus`
+    /// enum (`.connected`/`.connecting`/`.disconnected`). Mirrors the JS
+    /// client's `getNetworkStatus().transport`.
+    public let transport: ConnectionStatus
     public let isOnline: Bool
     public let lastOnlineAt: Date?
     public let reason: String?
+
+    public init(
+        mode: NetworkMode,
+        transport: ConnectionStatus,
+        isOnline: Bool,
+        lastOnlineAt: Date?,
+        reason: String?
+    ) {
+        self.mode = mode
+        self.transport = transport
+        self.isOnline = isOnline
+        self.lastOnlineAt = lastOnlineAt
+        self.reason = reason
+    }
 }
 
 // MARK: - Workflow Options

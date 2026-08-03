@@ -72,10 +72,20 @@ doc.transactSync { txn in
     map.updateValue("world", forKey: "hello", transaction: txn)
 }
 
-// Listen for events
-client.events.on(.sync) { (event: SyncEvent) in
+// Listen for events. The payload type names its own event, so there is no
+// separate event argument to get wrong.
+for await event in client.stream(for: SyncEvent.self) {
     print("Document \(event.documentId) synced: \(event.synced)")
 }
+
+// For a callback instead of a loop — an ObservableObject wiring itself up, say
+// — `observeOnMainActor` runs the handler on the main actor. Hold the returned
+// EventSubscription for as long as you want the handler live.
+syncSubscription = client.observeOnMainActor(SyncEvent.self) { event in
+    print("Document \(event.documentId) synced: \(event.synced)")
+}
+
+// For one occurrence: `try await client.nextEvent(SyncEvent.self, timeout: 30)`.
 ```
 
 ## Status
@@ -84,12 +94,24 @@ This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method
 
 ## Breaking changes in the current parity batch
 
+- The whole untyped event surface — `client.events`, `on`, `onAny`,
+  `emit(_:_:)` and the free `waitForEvent(emitter:...)` — is **deprecated** and
+  is removed in the next major release. Migrate to
+  `client.stream(for:buffering:replayingLatest:)`,
+  `client.observeOnMainActor(_:handler:)` and
+  `client.nextEvent(_:timeout:where:)`, which derive the event key from the
+  payload type. Deprecated calls keep working — and keep their synchronous,
+  in-registration-order delivery — for the whole window.
 - `.invitation` event handlers now receive `InvitationEvent`, not the raw
   `[String: Any]` WebSocket dictionary. Existing subscribers written as
   `client.events.on(.invitation) { (payload: [String: Any]) in ... }` will no
   longer match the typed payload. Migrate to
-  `client.events.on(.invitation) { (event: InvitationEvent) in ... }`, or use
-  `onAny(.invitation)` during a temporary migration window.
+  `for await event in client.stream(for: InvitationEvent.self)`.
+- Nine events that used to be emitted as bare `[String: Any]` dictionaries are
+  typed payloads now (`meUpdated`, `pendingCreateFailed`, `authRefreshDeferred`,
+  the five `offlineAuth*` events, and `blobsQueueDrained`). A handler still
+  annotated `[String: Any]` keeps receiving the pre-conversion dictionary for
+  the whole deprecation window.
 
 ## Parity policy
 

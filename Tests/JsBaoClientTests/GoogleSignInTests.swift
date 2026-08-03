@@ -168,15 +168,15 @@ final class GoogleSignInUnitTests: XCTestCase {
             refreshProxy: nil,
             persistConfig: AuthConfig()
         )
-        controller.makeRequest = { _, _, _ in
-            ["token": "token-google", "isNewUser": false]
-        }
+        controller.setTransport(RecordingTransport(
+            json: #"{"token": "token-google", "isNewUser": false}"#
+        ))
 
-        let events = try await collectEvents(from: emitter, event: .authSuccess) {
+        let events = try await collectEvents(from: emitter, event: AuthSuccessEvent.self) {
             _ = try await controller.handleOAuthCallback(code: "code", state: "state")
         }
 
-        let success = try XCTUnwrap(events.first as? AuthSuccessEvent)
+        let success = try XCTUnwrap(events.first)
         XCTAssertEqual(success.token, "token-google")
         XCTAssertEqual(success.cause, "google")
     }
@@ -308,10 +308,12 @@ final class GoogleSignInLiveTests: XCTestCase {
         // `com.googleusercontent.apps.*:/oauth2redirect/google` shape) can't
         // be registered against today's server. Use an https URI here — the
         // client-side flow under test is identical either way.
+        // `googleClientSecret` is deliberately not set: it is reference-only
+        // (#2256), so a literal is rejected with 400, and the authorize URL this
+        // test builds is derived from `googleClientId` alone.
         let redirectUri = "https://example.com/oauth/callback"
         _ = try await ctx.updateTestApp(appId: testApp.appId, fields: [
             "googleClientId": "test-123.apps.googleusercontent.com",
-            "googleClientSecret": "test-secret",
             "googleOAuthEnabled": true,
             "redirectUris": [redirectUri],
         ])

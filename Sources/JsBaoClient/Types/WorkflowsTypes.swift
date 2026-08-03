@@ -49,6 +49,37 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
     /// Error message when `status == "failed"`, `null` otherwise. Mirrors JS
     /// `WorkflowRun.errorMessage`. Decoded when present.
     public let errorMessage: String?
+    /// #2074 — normalized form of `errorMessage`, with ids, numbers, URLs and
+    /// quoted literals replaced by placeholder tokens, so runs that failed for
+    /// the same reason share one title you can group on. It is also the string
+    /// `analytics errors-groups` titles its groups with. `nil` when the run did
+    /// not fail. Mirrors JS `WorkflowRun.errorTitle`. Decoded when present.
+    public let errorTitle: String?
+    /// #2074 — id of the step that failed the run: the lowest-index step whose
+    /// status is `failed`.
+    ///
+    /// A durable run (`workflows.start()`) that aborted during setup, before
+    /// any of its own steps ran, reads `"__setup__"` with
+    /// `failedStepKind == "setup"` — a synthetic step, so it will not be found
+    /// in the workflow definition. The same abort on a `syncCallable` workflow
+    /// (`workflows.runSync()`) reads `nil` here, with the reason still in
+    /// `errorMessage`.
+    ///
+    /// `nil` when the run did not fail, and for the failures that hold no step
+    /// results at all: a run rejected at launch, a run reclaimed after its
+    /// executor died, or one whose output failed schema validation after every
+    /// step completed. Mirrors JS `WorkflowRun.failedStepId`. Decoded when
+    /// present.
+    public let failedStepId: String?
+    /// #2074 — kind of the failed step (`"database.query"`, `"llm"`,
+    /// `"setup"` for the synthetic setup-phase step of a durable run, …).
+    /// `nil` whenever `failedStepId` is `nil`. Mirrors JS
+    /// `WorkflowRun.failedStepKind`. Decoded when present.
+    public let failedStepKind: String?
+    /// #2074 — normalized title of the failed step's own error, for grouping
+    /// failures by step-level cause. `nil` whenever `failedStepId` is `nil`.
+    /// Mirrors JS `WorkflowRun.failedStepErrorTitle`. Decoded when present.
+    public let failedStepErrorTitle: String?
     /// User-defined metadata attached to the run (max 1 KB). Opaque blob.
     public let meta: JSONValue?
     /// User who started the run, when the server records it. Not present in
@@ -60,7 +91,9 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
         case runId, runKey, instanceId, workflowId, workflowKey
         case revisionId, contextDocId, status, createdAt, startedAt
         case executionStartedAt, queueDelayMs, createCallDurationMs, endedAt
-        case errorMessage, meta
+        case errorMessage, errorTitle
+        case failedStepId, failedStepKind, failedStepErrorTitle
+        case meta
         case startedByUserId
     }
 
@@ -81,6 +114,11 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
         createCallDurationMs = try c.decodeIfPresent(Int.self, forKey: .createCallDurationMs)
         endedAt = try c.decodeIfPresent(String.self, forKey: .endedAt)
         errorMessage = try c.decodeIfPresent(String.self, forKey: .errorMessage)
+        errorTitle = try c.decodeIfPresent(String.self, forKey: .errorTitle)
+        failedStepId = try c.decodeIfPresent(String.self, forKey: .failedStepId)
+        failedStepKind = try c.decodeIfPresent(String.self, forKey: .failedStepKind)
+        failedStepErrorTitle = try c.decodeIfPresent(
+            String.self, forKey: .failedStepErrorTitle)
         meta = try c.decodeIfPresent(JSONValue.self, forKey: .meta)
         startedByUserId = try c.decodeIfPresent(String.self, forKey: .startedByUserId)
     }
@@ -139,6 +177,22 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         let error: String?
     }
 
+    /// Memberwise init. Used by the shared status normalizer
+    /// (`WorkflowsAPI.normalizeWorkflowStatus`) to rebuild a result with the
+    /// canonical `status` derived from the raw Cloudflare status + the DB run's
+    /// apply-flow state.
+    public init(
+        status: String,
+        output: JSONValue?,
+        error: String?,
+        run: WorkflowRunInfo?
+    ) {
+        self.status = status
+        self.output = output
+        self.error = error
+        self.run = run
+    }
+
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         // The server returns `{ status: <CF status object>, run }`, where the
@@ -173,9 +227,21 @@ public struct ListWorkflowRunsResult: Decodable, Sendable, Equatable {
     public let hasMore: Bool
     /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
     public let cursor: String?
+    /// How many runs the server examined to produce this page (#2237).
+    ///
+    /// A `status`-filtered listing cannot be served by the index, so the server
+    /// walks recent runs under a fixed budget. With `nextCursor` this tells a
+    /// short page apart from a complete answer: no `nextCursor` means the walk
+    /// reached the end of history; a `nextCursor` with fewer items than
+    /// requested means it stopped at its budget after `scanned` runs and more
+    /// history remains. `nil` on unfiltered listings, on `contextDocId`
+    /// listings (that view spans every user's runs against the document, so its
+    /// row count is not the caller's to see), and against a server that
+    /// predates the field — treat it as "unknown", never as zero.
+    public let scanned: Int?
 
     private enum CodingKeys: String, CodingKey {
-        case items, cursor, nextCursor, hasMore
+        case items, cursor, nextCursor, hasMore, scanned
     }
 
     public init(from decoder: Decoder) throws {
@@ -187,6 +253,8 @@ public struct ListWorkflowRunsResult: Decodable, Sendable, Equatable {
         nextCursor = next
         cursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
+        // Optional so an older server still decodes.
+        scanned = try c.decodeIfPresent(Int.self, forKey: .scanned)
     }
 }
 
@@ -433,4 +501,90 @@ public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
         self.error = error
         self.run = run
     }
+}
+
+// MARK: - waitFor (#1443 / #1582)
+//
+// Ports the JS client's `workflows.waitFor` (#1443). A workflow completion that
+// occurs while the socket is down (iOS backgrounding, offline, reconnecting) is
+// still delivered after reconnect — instead of depending on a single, never-
+// replayed `workflowStatus` WS frame. See `WorkflowsAPI.waitFor`.
+
+/// Options for `WorkflowsAPI.waitFor`. Mirrors JS `WaitForWorkflowOptions`.
+public struct WaitForWorkflowOptions: Sendable {
+    /// Maximum time to wait for the run to reach a terminal state before
+    /// throwing a `.workflowWaitTimeout` `JsBaoError`. Defaults to 15 minutes
+    /// (900_000 ms).
+    ///
+    /// Set to `0` (or any non-positive value) to disable the timeout entirely.
+    /// WARNING: with no timeout the call (and its `workflowStatus`/`status`
+    /// listeners) lives until the run terminates — only use this for runs you
+    /// know will end.
+    public var timeoutMs: Int?
+
+    public init(timeoutMs: Int? = nil) {
+        self.timeoutMs = timeoutMs
+    }
+}
+
+/// Result from `WorkflowsAPI.waitFor`. Resolved once the run reaches a terminal
+/// state. Mirrors JS `WaitForWorkflowResult`.
+///
+/// `status` is a plain `String` (not a closed enum) so a future server-added
+/// terminal-like state never turns "workflow finished" into a decode failure —
+/// matching every other Swift workflow status field. It is one of
+/// `completed` / `failed` / `terminated` / `apply_pending` / `apply_claimed`
+/// (never `running`). Use `isTerminal` / `isFailure` for common checks.
+public struct WaitForWorkflowResult: Sendable {
+    /// Terminal status of the run. Never `running`.
+    public let status: String
+    /// Final output of the run, when available. Opaque blob.
+    public let output: JSONValue?
+    /// Error message when `status == "failed"`.
+    public let error: String?
+
+    public init(status: String, output: JSONValue?, error: String?) {
+        self.status = status
+        self.output = output
+        self.error = error
+    }
+
+    /// `true` for any terminal-for-waiting status. Always `true` on a resolved
+    /// `waitFor` result (it only settles on a terminal state) — provided for
+    /// call-site clarity.
+    public var isTerminal: Bool { Self.terminalStatuses.contains(status) }
+
+    /// `true` when the run reported failure (`status == "failed"`). A failed run
+    /// resolves normally (does not throw), so branch on this rather than a
+    /// `catch`.
+    public var isFailure: Bool { status == "failed" }
+
+    static let terminalStatuses: Set<String> = [
+        "completed", "failed", "terminated", "apply_pending", "apply_claimed",
+    ]
+}
+
+/// Typed result of the generic `WorkflowsAPI.waitFor` overload. Mirrors
+/// `WaitForWorkflowResult` but with the opaque `output` blob decoded into
+/// `Output`. Named separately from `WaitForWorkflowResult` because Swift does
+/// not allow a generic and a non-generic type to share a name — same split as
+/// `RunSyncWorkflowResult` / `RunSyncResult<Output>`.
+public struct WaitForResult<Output: Decodable & Sendable>: Sendable {
+    /// Terminal status of the run. Never `running`.
+    public let status: String
+    /// Final output decoded into `Output` when present; `nil` otherwise.
+    public let output: Output?
+    /// Error message when `status == "failed"`.
+    public let error: String?
+
+    public init(status: String, output: Output?, error: String?) {
+        self.status = status
+        self.output = output
+        self.error = error
+    }
+
+    /// See `WaitForWorkflowResult.isTerminal`.
+    public var isTerminal: Bool { WaitForWorkflowResult.terminalStatuses.contains(status) }
+    /// See `WaitForWorkflowResult.isFailure`.
+    public var isFailure: Bool { status == "failed" }
 }

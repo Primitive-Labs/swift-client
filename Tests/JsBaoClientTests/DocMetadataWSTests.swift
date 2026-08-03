@@ -54,7 +54,7 @@ final class DocMetadataWSTests: XCTestCase {
 
         // Write Yjs data
         let writeMap: YMap<String> = ydoc.getOrCreateMap(named: "test")
-        client.transactAndSync(docId) { txn in
+        try client.transactAndSync(docId) { txn in
             writeMap.updateValue("preserved", forKey: "field", transaction: txn)
         }
         try await delay(1)

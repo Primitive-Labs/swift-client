@@ -174,7 +174,7 @@ final class WorkflowRunSyncTests: XCTestCase {
         try await waitForConnection(client: client)
 
         let recorder = StartedEventRecorder()
-        let sub = client.events.on(.workflowStarted) { (e: WorkflowStartedEvent) in
+        let sub = client.eventEmitter.subscribe(WorkflowStartedEvent.self) { e in
             recorder.append(e)
         }
         defer { sub.cancel() }

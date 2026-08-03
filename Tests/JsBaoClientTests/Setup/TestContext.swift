@@ -349,8 +349,11 @@ final class TestContext {
         try await appRequest(method: "POST", appId: appId, path: path, body: body, jwt: jwt)
     }
 
+    /// Raw app-API request as a given user. Internal (not private) so tests can
+    /// exercise endpoints the Swift client does not expose yet — e.g. the
+    /// metadata-category configs and metadata read/write routes (#1451).
     @discardableResult
-    private func appRequest(method: String, appId: String, path: String, body: [String: Any]?, jwt: String) async throws -> [String: Any] {
+    func appRequest(method: String, appId: String, path: String, body: [String: Any]?, jwt: String) async throws -> [String: Any] {
         let url = URL(string: "\(TestConfig.httpUrl)/app/\(appId)/api\(path)")!
         var request = URLRequest(url: url)
         request.httpMethod = method

@@ -78,7 +78,7 @@ final class AppCleanupTests: XCTestCase {
         defer { Task { await deadClient.destroy() } }
 
         do {
-            _ = try await deadClient.makeRequest("GET", "/me", nil)
+            _ = try await deadClient.requestJSON(method: .get, path: "/me")
             // If this succeeds, the app may still be accessible briefly after deletion
         } catch {
             // Expected: app no longer exists or token is invalid

@@ -81,7 +81,7 @@ final class ConcurrentWritesTests: XCTestCase {
             let ydoc = ydocs[i]
             let map: YMap<String> = ydoc.getOrCreateMap(named: "concurrent")
             for j in 0..<writesPerClient {
-                client.transactAndSync(docId) { txn in
+                try client.transactAndSync(docId) { txn in
                     map.updateValue("client\(i)-write\(j)", forKey: "client\(i)-\(j)", transaction: txn)
                 }
             }
@@ -165,7 +165,7 @@ final class ConcurrentWritesTests: XCTestCase {
             let ydoc = ydocs[i]
             let map: YMap<String> = ydoc.getOrCreateMap(named: "conflictTest")
             for j in 0..<5 {
-                clients[i].transactAndSync(docId) { txn in
+                try clients[i].transactAndSync(docId) { txn in
                     map.updateValue("Client \(i) iteration \(j)", forKey: "sharedKey", transaction: txn)
                 }
                 try await delay(0.1)

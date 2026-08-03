@@ -33,7 +33,13 @@ public final class DocumentManager: @unchecked Sendable {
     /// each construct a new `YDocument` and the second insert into
     /// `openDocs` would silently clobber the first, leaving the loser
     /// caller holding an orphaned doc with no observer wiring.
-    private var pendingOpens: [String: Task<YDocument, Error>] = [:]
+    ///
+    /// The Task's success type is `ConfinedYDocument` — the shared holder
+    /// Phase C landed (`Types/DocumentTypes.swift`) — because a `Task`
+    /// result crosses an isolation boundary and `YDocument` is not
+    /// `Sendable`. It still carries the one live document, so the
+    /// coalescing guarantee above is unchanged (#1993, Phase D1).
+    private var pendingOpens: [String: Task<ConfinedYDocument, Error>] = [:]
     private var docSyncStates: [String: Bool] = [:]
     private var docPermissions: [String: DocumentPermission] = [:]
     private var docOpenStartTime: [String: CFAbsoluteTime] = [:]
@@ -122,9 +128,11 @@ public final class DocumentManager: @unchecked Sendable {
     /// `await` runs OUTSIDE the lock: return an already-open doc, await
     /// another caller's in-flight open, or claim the slot ourselves.
     private enum OpenOutcome {
+        /// Never leaves this call's isolation domain — the already-open doc is
+        /// handed straight back, so it needs no confinement holder.
         case existing(YDocument)
-        case awaitInFlight(Task<YDocument, Error>)
-        case started(Task<YDocument, Error>)
+        case awaitInFlight(Task<ConfinedYDocument, Error>)
+        case started(Task<ConfinedYDocument, Error>)
     }
 
     // MARK: - Document Lifecycle
@@ -161,7 +169,7 @@ public final class DocumentManager: @unchecked Sendable {
             // run the full open lifecycle. Subsequent callers in the
             // window before this Task completes will see `pendingOpens`
             // and await it.
-            let task = Task<YDocument, Error> { [weak self] in
+            let task = Task<ConfinedYDocument, Error> { [weak self] in
                 guard let self = self else {
                     throw NSError(
                         domain: "DocumentManager",
@@ -169,7 +177,9 @@ public final class DocumentManager: @unchecked Sendable {
                         userInfo: [NSLocalizedDescriptionKey: "DocumentManager deallocated mid-open"]
                     )
                 }
-                return try await self._openDocumentImpl(documentId: documentId, options: options)
+                return ConfinedYDocument(
+                    try await self._openDocumentImpl(documentId: documentId, options: options)
+                )
             }
             pendingOpens[documentId] = task
             return .started(task)
@@ -179,12 +189,12 @@ public final class DocumentManager: @unchecked Sendable {
         case .existing(let existing):
             return existing
         case .awaitInFlight(let inFlight):
-            return try await inFlight.value
+            return try await inFlight.value.document
         case .started(let task):
             defer {
                 lock.withLock { _ = pendingOpens.removeValue(forKey: documentId) }
             }
-            return try await task.value
+            return try await task.value.document
         }
     }
 
@@ -223,7 +233,7 @@ public final class DocumentManager: @unchecked Sendable {
         // wiring and `persistDocumentToLocal` will late-bind on the
         // first save attempt instead. Logging makes that path visible.
         if let offlineStore = offlineStore,
-           let storageProvider = offlineStore.getStorageProvider() {
+           let storageProvider = await offlineStore.getStorageProvider() {
             let persistence = YjsSQLitePersistence(
                 storageProvider: storageProvider,
                 documentId: documentId
@@ -265,7 +275,7 @@ public final class DocumentManager: @unchecked Sendable {
                 }
                 if applied {
                     let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-                    emitter?.emit(.documentLoaded, DocumentLoadedEvent(
+                    emitter?.emit(DocumentLoadedEvent(
                         // Matches js-bao's `documentLoaded.source` value
                         // for offline-store hydration. JS emits one of
                         // `"local"` (offline store), `"server"` (fresh
@@ -377,7 +387,7 @@ public final class DocumentManager: @unchecked Sendable {
             await evictLocalData(documentId: documentId)
         }
 
-        emitter?.emit(.documentClosed, DocumentClosedEvent(documentId: documentId))
+        emitter?.emit(DocumentClosedEvent(documentId: documentId))
     }
 
     // MARK: - Sync Protocol
@@ -526,8 +536,17 @@ public final class DocumentManager: @unchecked Sendable {
         return jsonString
     }
 
-    /// Handle syncStep2 response from server
-    public func handleSyncStep2(documentId: String, updateBase64: String) {
+    /// Apply a remote update from the server. Handles both `syncStep2` responses
+    /// and incremental `update` frames — the JS client routes both through a
+    /// single `handleUpdate`, so this mirrors that (including always accumulating
+    /// `docServerBytes`, which the previous split Swift `handleUpdate` omitted).
+    ///
+    /// Internal message-router plumbing: the sole caller is `JsBaoClient`'s own
+    /// message handler (same module). It replaces the previous `handleSyncStep2`
+    /// / `handleUpdate` pair, which were `public` only incidentally — they lived
+    /// in `Internal/` and were never a supported entry point. Kept `internal` so
+    /// that accidental public surface is not recreated.
+    func handleRemoteUpdate(documentId: String, updateBase64: String) {
         let doc: YDocument? = lock.withLock {
             guard let d = openDocs[documentId] else { return nil }
             applyingRemoteUpdate[documentId] = true
@@ -536,7 +555,7 @@ public final class DocumentManager: @unchecked Sendable {
         guard let doc else { return }
 
         guard let updateData = Data(base64Encoded: updateBase64) else {
-            logger.warn("Invalid base64 in syncStep2 for doc:", documentId)
+            logger.warn("Invalid base64 in remote update for doc:", documentId)
             lock.withLock { applyingRemoteUpdate[documentId] = false }
             return
         }
@@ -546,9 +565,9 @@ public final class DocumentManager: @unchecked Sendable {
         doc.transactSync { [self] txn in
             do {
                 try txn.transactionApplyUpdate(update: updateBytes)
-                self.logger.debug("SyncStep2 applied for doc:", documentId)
+                self.logger.debug("Remote update applied for doc:", documentId)
             } catch {
-                self.logger.warn("Failed to apply syncStep2 for doc:", documentId, error.localizedDescription)
+                self.logger.warn("Failed to apply remote update for doc:", documentId, error.localizedDescription)
             }
         }
         let applyMs = Self.nowMs() - applyStartMs
@@ -556,46 +575,13 @@ public final class DocumentManager: @unchecked Sendable {
         lock.withLock { applyingRemoteUpdate[documentId] = false }
 
         let bytes = updateData.count
+        // Accumulate server bytes applied for first-sync metrics — JS does this
+        // for both syncStep2 and update frames (`incrementServerBytes`).
         lock.withLock { docServerBytes[documentId] = (docServerBytes[documentId] ?? 0) + bytes }
 
-        // Mirror JS `handleUpdate` (which handles both syncStep2 and
-        // incremental update frames): capture round-trip, byte count, and
-        // apply duration for `syncPerf.clientTimings`.
+        // Mirror JS `handleUpdate`: capture round-trip, byte count, and apply
+        // duration for `syncPerf.clientTimings`.
         recordUpdatePhaseTimings(documentId: documentId, updateBytes: bytes, applyMs: applyMs)
-    }
-
-    /// Handle an incremental update from server
-    public func handleUpdate(documentId: String, updateBase64: String) {
-        let doc: YDocument? = lock.withLock {
-            guard let d = openDocs[documentId] else { return nil }
-            applyingRemoteUpdate[documentId] = true
-            return d
-        }
-        guard let doc else { return }
-
-        guard let updateData = Data(base64Encoded: updateBase64) else {
-            logger.warn("Invalid base64 in update for doc:", documentId)
-            lock.withLock { applyingRemoteUpdate[documentId] = false }
-            return
-        }
-
-        let updateBytes = [UInt8](updateData)
-        let applyStartMs = Self.nowMs()
-        doc.transactSync { [self] txn in
-            do {
-                try txn.transactionApplyUpdate(update: updateBytes)
-                self.logger.debug("Update applied for doc:", documentId)
-            } catch {
-                self.logger.warn("Failed to apply update for doc:", documentId, error.localizedDescription)
-            }
-        }
-        let applyMs = Self.nowMs() - applyStartMs
-
-        lock.withLock { applyingRemoteUpdate[documentId] = false }
-
-        // Mirror JS `handleUpdate`: capture round-trip, byte count, and
-        // apply duration for `syncPerf.clientTimings`.
-        recordUpdatePhaseTimings(documentId: documentId, updateBytes: updateData.count, applyMs: applyMs)
     }
 
     /// Handle syncComplete message
@@ -617,7 +603,7 @@ public final class DocumentManager: @unchecked Sendable {
 
         let elapsed = startTime.map { (CFAbsoluteTimeGetCurrent() - $0) * 1000 } ?? 0
 
-        emitter?.emit(.documentLoaded, DocumentLoadedEvent(
+        emitter?.emit(DocumentLoadedEvent(
             documentId: documentId,
             source: "server",
             hadData: (bytes ?? 0) > 0,
@@ -625,7 +611,7 @@ public final class DocumentManager: @unchecked Sendable {
             elapsedMs: elapsed
         ))
 
-        emitter?.emit(.sync, SyncEvent(documentId: documentId, synced: true))
+        emitter?.emit(SyncEvent(documentId: documentId, synced: true))
 
         // Persist to local storage
         Task { [weak self] in
@@ -716,7 +702,7 @@ public final class DocumentManager: @unchecked Sendable {
 
     public func setPermission(_ documentId: String, permission: DocumentPermission) {
         lock.withLock { docPermissions[documentId] = permission }
-        emitter?.emit(.permission, PermissionEvent(documentId: documentId, permission: permission))
+        emitter?.emit(PermissionEvent(documentId: documentId, permission: permission))
     }
 
     public func isReadOnly(_ documentId: String) -> Bool {
@@ -778,7 +764,7 @@ public final class DocumentManager: @unchecked Sendable {
             // (`src/client/internal/documentManager.ts`): action "updated",
             // source "server". (#996 — was a single untyped `[:]` emit that
             // typed subscribers never received.)
-            emitter?.emit(.documentMetadataChanged, DocumentMetadataChangedEvent(
+            emitter?.emit(DocumentMetadataChangedEvent(
                 documentId: documentId,
                 action: "updated",
                 metadata: metadataDictionary(entry),
@@ -856,7 +842,7 @@ public final class DocumentManager: @unchecked Sendable {
         // Typed event (#996 — was an untyped dict that typed subscribers
         // never received). A local create originates on-device: source
         // "local", matching JS's local-first create path.
-        emitter?.emit(.documentMetadataChanged, DocumentMetadataChangedEvent(
+        emitter?.emit(DocumentMetadataChangedEvent(
             documentId: documentId,
             action: "created",
             metadata: metadataDictionary(metadata),
@@ -941,7 +927,7 @@ public final class DocumentManager: @unchecked Sendable {
                 try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
             }
 
-            emitter?.emit(.pendingCreateFailed, ["documentId": documentId, "error": error.localizedDescription] as [String: Any])
+            emitter?.emit(PendingCreateFailedEvent(documentId: documentId, error: error.localizedDescription))
             throw error
         }
     }
@@ -985,7 +971,6 @@ public final class DocumentManager: @unchecked Sendable {
                 }
 
                 self.emitter?.emit(
-                    .documentCreateCommitFailed,
                     DocumentCreateCommitFailedEvent(documentId: documentId, reason: message)
                 )
 
@@ -994,15 +979,19 @@ public final class DocumentManager: @unchecked Sendable {
                 // Int.max (and reaches +infinity) at high attempt counts, and
                 // `Int(_:)` traps on such a value — capping after the
                 // conversion never runs.
-                var delayMs = Int(
+                //
+                // Bound as a `let`: the retry timer below captures this value
+                // in a `Task`, and a captured `var` would be mutable state
+                // shared between this task and the timer.
+                let cappedDelayMs = Int(
                     min(
                         Double(backoff.maxMs),
                         Double(backoff.baseMs) * pow(backoff.factor, Double(attempt))
                     )
                 )
-                if backoff.jitter, delayMs > 0 {
-                    delayMs = Int.random(in: 0...delayMs)
-                }
+                let delayMs = backoff.jitter && cappedDelayMs > 0
+                    ? Int.random(in: 0...cappedDelayMs)
+                    : cappedDelayMs
 
                 // Persist the next-attempt timestamp.
                 let nextAtIso = ISO8601DateFormatter().string(
@@ -1021,7 +1010,6 @@ public final class DocumentManager: @unchecked Sendable {
                 // Give up after maxAttempts.
                 if attempt >= backoff.maxAttempts {
                     self.emitter?.emit(
-                        .documentCreateCommitFailed,
                         DocumentCreateCommitFailedEvent(
                             documentId: documentId,
                             reason: "max retries exceeded (\(backoff.maxAttempts))"
@@ -1357,7 +1345,17 @@ public final class DocumentManager: @unchecked Sendable {
                 unconfirmedLocalWrites.remove(documentId)
             }
         }
+        // Called outside `lock` so a test can block here (to drive an
+        // interleaving) without wedging `hasUnsyncedLocalChanges`.
+        onMarkUnsyncedForTest?(documentId, value)
     }
+
+    /// Test-observability hook: invoked after each unsynced-flag transition,
+    /// outside `lock`. Internal (visible only via `@testable import`) — the
+    /// outbound flag-ordering tests use it to hold a thread between marking a
+    /// document unsynced and queueing the update itself. Never set in
+    /// production code.
+    var onMarkUnsyncedForTest: ((String, Bool) -> Void)?
 
     // MARK: - Persistence
 
@@ -1417,23 +1415,31 @@ public final class DocumentManager: @unchecked Sendable {
         // skipped persistence, and every subsequent save+sync looked
         // identical from the outside (nothing in `kv_store`, no error
         // because the original code wrapped the whole thing in `try?`).
-        let persistence: YjsSQLitePersistence? = {
+        //
+        // This used to be a *synchronous* immediately-invoked closure. It
+        // cannot be one any more: `OfflineStore` is an actor since #1993 Phase
+        // D2, so the provider lookup suspends. It is an `async` closure now —
+        // the sequence, the lock holds and the race handling below are
+        // otherwise unchanged.
+        let persistence: YjsSQLitePersistence? = await {
             if let existing = lock.withLock({ docPersistence[documentId] }) {
                 return existing
             }
             guard let offlineStore = offlineStore,
-                  let provider = offlineStore.getStorageProvider() else {
+                  let provider = await offlineStore.getStorageProvider() else {
                 return nil
             }
             let p = YjsSQLitePersistence(storageProvider: provider, documentId: documentId)
             // Re-check under the lock — concurrent persists for the same
-            // documentId could both reach this point and double-late-bind.
-            // The instances would share a backing store and last-writer-
-            // wins (no data loss), but log noise + redundant work. Keep
-            // the first one that won the race. The whole check-and-register
-            // is one atomic `withLock`: returning a winner means someone
-            // else registered first (use theirs); returning nil means we
-            // registered `p`.
+            // documentId could both reach this point and double-late-bind
+            // (the `await` above is now an explicit suspension point where
+            // that interleaving can happen, where before it was merely
+            // possible across threads). The instances would share a backing
+            // store and last-writer-wins (no data loss), but log noise +
+            // redundant work. Keep the first one that won the race. The whole
+            // check-and-register is one atomic `withLock`: returning a winner
+            // means someone else registered first (use theirs); returning nil
+            // means we registered `p`.
             let existingWinner: YjsSQLitePersistence? = lock.withLock {
                 if let winner = docPersistence[documentId] { return winner }
                 docPersistence[documentId] = p

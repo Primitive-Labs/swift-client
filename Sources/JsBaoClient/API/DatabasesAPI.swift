@@ -3,7 +3,7 @@ import Foundation
 // MARK: - DatabasesAPI
 
 public final class DatabasesAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
 
     // MARK: - Realtime subscription plumbing
     //
@@ -15,7 +15,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Shared registry that routes inbound `db.change` frames. Exposed so
     /// `JsBaoClient`'s WS message router can `dispatch(...)` and its
     /// reconnect path can `list()` for re-subscribe. `nil` only in the
-    /// bare `init(makeRequest:)` path.
+    /// bare `init(transport:)` path.
     let subscriptionRegistry: DatabaseSubscriptionRegistry?
 
     /// Send a JSON-encoded control frame over the WebSocket. Fire-and-
@@ -32,8 +32,9 @@ public final class DatabasesAPI: @unchecked Sendable {
 
     private let logger: Logger?
 
-    public init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.makeRequest = makeRequest
+    /// Designated initializer — the typed transport spine.
+    public init(transport: any Transport) {
+        self.transport = transport
         self.subscriptionRegistry = nil
         self.sendWSMessage = nil
         self.isWebSocketOpen = { false }
@@ -44,6 +45,32 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Full init used by `JsBaoClient` — wires the realtime subscription
     /// machinery (`databases.subscribe`).
     init(
+        transport: any Transport,
+        subscriptionRegistry: DatabaseSubscriptionRegistry,
+        sendWSMessage: @escaping (String) -> Void,
+        isWebSocketOpen: @escaping () -> Bool,
+        connectWebSocket: @escaping () -> Void,
+        logger: Logger? = nil
+    ) {
+        self.transport = transport
+        self.subscriptionRegistry = subscriptionRegistry
+        self.sendWSMessage = sendWSMessage
+        self.isWebSocketOpen = isWebSocketOpen
+        self.connectWebSocket = connectWebSocket
+        self.logger = logger
+    }
+
+    /// Deprecated: construct with a `Transport` instead. The legacy closure is
+    /// wrapped in an adapter so existing call sites keep working for one major
+    /// cycle.
+    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
+        self.init(transport: ClosureTransport(makeRequest: makeRequest))
+    }
+
+    /// Deprecated closure form of the full init used by `JsBaoClient`.
+    @available(*, deprecated, message: "Use init(transport:subscriptionRegistry:…) — the untyped makeRequest closure is removed in the next major release.")
+    convenience init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         subscriptionRegistry: DatabaseSubscriptionRegistry,
         sendWSMessage: @escaping (String) -> Void,
@@ -51,12 +78,14 @@ public final class DatabasesAPI: @unchecked Sendable {
         connectWebSocket: @escaping () -> Void,
         logger: Logger? = nil
     ) {
-        self.makeRequest = makeRequest
-        self.subscriptionRegistry = subscriptionRegistry
-        self.sendWSMessage = sendWSMessage
-        self.isWebSocketOpen = isWebSocketOpen
-        self.connectWebSocket = connectWebSocket
-        self.logger = logger
+        self.init(
+            transport: ClosureTransport(makeRequest: makeRequest),
+            subscriptionRegistry: subscriptionRegistry,
+            sendWSMessage: sendWSMessage,
+            isWebSocketOpen: isWebSocketOpen,
+            connectWebSocket: connectWebSocket,
+            logger: logger
+        )
     }
 
     // MARK: - Realtime subscriptions
@@ -175,49 +204,117 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// management. Mirrors js-bao's `client.databases.connect(databaseId)`.
     ///
     /// The returned handle is scoped to `databaseId` and routes through the
-    /// same `makeRequest` closure this API uses, so it inherits the bearer
-    /// token and `X-JB-Connection-Id` header automatically — matching the
-    /// connection attribution the JS `connect()` arranges by hand. The handle
-    /// is stateless beyond the bound ID, so it's cheap to create and safe to
+    /// same transport this API uses, so it inherits the bearer token and
+    /// `X-JB-Connection-Id` header automatically — matching the connection
+    /// attribution the JS `connect()` arranges by hand. The handle is
+    /// stateless beyond the bound ID, so it's cheap to create and safe to
     /// hold or discard.
     public func connect(databaseId: String) -> DoDb {
-        DoDb(databaseId: databaseId, makeRequest: makeRequest)
+        DoDb(databaseId: databaseId, transport: transport)
     }
 
     // MARK: - CRUD
 
     /// Create a new database.
     public func create(params: CreateDatabaseParams) async throws -> DatabaseInfo {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("POST", "/databases", body)
-        return try JSONCoding.decode(DatabaseInfo.self, from: result)
+        try await transport.request(method: .post, path: "/databases", body: params)
     }
 
-    /// List all databases the current user can access.
+    /// List the databases the current user can access.
     ///
     /// Pass `databaseType` to filter to a single type server-side (mirrors
     /// js-bao's `databases.list({ databaseType })`, #962).
-    public func list(databaseType: String? = nil) async throws -> [DatabaseInfo] {
-        var path = "/databases"
-        if let databaseType,
-           let escaped = databaseType.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            path += "?type=\(escaped)"
+    ///
+    /// Pass `owner` to narrow the listing to the databases that user created
+    /// (mirrors js-bao's `databases.list({ owner })` and the CLI's
+    /// `primitive databases list --owner <user-id>`, #1965). Like
+    /// `databaseType` it only narrows, never widens: an app admin gets that
+    /// user's databases, an ordinary member gets the subset of their own
+    /// grants that user created. An owner with no databases is an empty list,
+    /// not an error.
+    ///
+    /// Results are paged at 100 per call (#1958). This returns the first
+    /// page's items; use ``listPage(databaseType:owner:limit:cursor:)`` when
+    /// you need the continuation token.
+    ///
+    /// An app admin or app owner (promoted in-app or holding console access)
+    /// lists every database in the app, and each row comes back with
+    /// `permission == "owner"` — the field reports capability, not ownership.
+    /// To pick out the databases the caller created, compare `createdBy`
+    /// against `client.getUserId()`.
+    public func list(
+        databaseType: String? = nil,
+        owner: String? = nil
+    ) async throws -> [DatabaseInfo] {
+        try await listPage(databaseType: databaseType, owner: owner).items
+    }
+
+    /// One page of the databases the current user can access, with the
+    /// continuation token.
+    ///
+    /// Mirrors js-bao's `databases.list({ limit, cursor, returnPage: true })`.
+    /// `limit` defaults to and is capped at 100; follow `nextCursor` until it
+    /// is `nil` to enumerate every database.
+    ///
+    /// A cursor belongs to the listing that produced it: replaying one after
+    /// changing `owner` (or dropping it) fails with a 400 rather than
+    /// returning a page from the wrong partition — start a new listing when
+    /// the filter changes.
+    public func listPage(
+        databaseType: String? = nil,
+        owner: String? = nil,
+        limit: Int? = nil,
+        cursor: String? = nil
+    ) async throws -> PaginatedResult<DatabaseInfo> {
+        var query = URLQuery()
+        // Parameter order matches the JS client's (`type`, `owner`, `limit`,
+        // `cursor`) so both clients produce the same URL.
+        query.appendIfPresent("type", databaseType)
+        query.appendIfPresent("owner", owner)
+        if let limit { query.append("limit", limit) }
+        query.appendIfPresent("cursor", cursor)
+        // `PaginatedResult` already conforms to `Decodable` (see the
+        // constrained extension in `Types/GroupsTypes.swift`) and decodes
+        // `items`/`cursor`/`nextCursor`/`hasMore` with the `nextCursor ?? cursor`
+        // precedence, so the envelope decodes straight into the shared type —
+        // no per-surface page struct and re-map to drift. It is wrapped in
+        // `PaginatedPageEnvelope` only to also accept the bare array a server
+        // older than #1958 still returns (#2245).
+        let envelope: PaginatedPageEnvelope<DatabaseInfo> = try await transport.request(
+            method: .get,
+            path: "/databases\(query.queryString)"
+        )
+        // An empty `owner` is "no filter", matching the JS client's
+        // `if (options?.owner)` and the CLI's truthiness guard — and the
+        // server, which treats `?owner=` as absent. Without the `isEmpty`
+        // check `list(owner: "")` would filter the legacy page to
+        // `createdBy == ""` and come back empty against a server that returns
+        // the full list.
+        guard let owner, !owner.isEmpty, envelope.isLegacyArray else {
+            return envelope.page
         }
-        let result = try await makeRequest("GET", path, nil)
-        return try JSONCoding.decode([DatabaseInfo].self, from: result)
+        // A server old enough to answer with a bare array (pre-#1958) also
+        // predates the `owner` filter (#1965) and ignores the unknown query
+        // parameter, so it just returned its full list. Without this guard the
+        // tolerant decode would hand those rows back as if they were filtered.
+        // The legacy rows carry `createdBy`, so filtering here reproduces the
+        // server's own post-join filter, and it can only narrow the page the
+        // caller was already allowed to see. The JS client and the CLI apply
+        // the same guard on their legacy path (#2245).
+        return PaginatedResult(
+            items: envelope.page.items.filter { $0.createdBy == owner },
+            hasMore: false
+        )
     }
 
     /// Get database info by ID.
     public func get(databaseId: String) async throws -> DatabaseInfo {
-        let result = try await makeRequest("GET", "/databases/\(databaseId)", nil)
-        return try JSONCoding.decode(DatabaseInfo.self, from: result)
+        try await transport.request(method: .get, path: "/databases/\(databaseId)")
     }
 
     /// Update a database's title or type.
     public func update(databaseId: String, params: UpdateDatabaseParams) async throws -> DatabaseInfo {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("PATCH", "/databases/\(databaseId)", body)
-        return try JSONCoding.decode(DatabaseInfo.self, from: result)
+        try await transport.request(method: .patch, path: "/databases/\(databaseId)", body: params)
     }
 
     /// Update a database's CEL context dict.
@@ -225,9 +322,11 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.updateMetadata`.
     @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). A category has separate readRule/writeRule, so a writer no longer inherits update from read access. Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API, write its values, and read them from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated updateCelContext.")
     public func updateMetadata(databaseId: String, metadata: [String: JSONValue]) async throws -> DatabaseInfo {
-        let body = try JSONCoding.jsonObject(from: metadata)
-        let result = try await makeRequest("PATCH", "/databases/\(databaseId)/metadata", body)
-        return try JSONCoding.decode(DatabaseInfo.self, from: result)
+        try await transport.request(
+            method: .patch,
+            path: "/databases/\(databaseId)/metadata",
+            body: metadata
+        )
     }
 
     /// Read a database's CEL context dict.
@@ -235,23 +334,20 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.getMetadata`.
     @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). A category has separate readRule/writeRule (read no longer implies update). Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read its values from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated getCelContext.")
     public func getMetadata(databaseId: String) async throws -> CelContextResult {
-        let result = try await makeRequest("GET", "/databases/\(databaseId)/metadata", nil)
-        return try JSONCoding.decode(CelContextResult.self, from: result)
+        try await transport.request(method: .get, path: "/databases/\(databaseId)/metadata")
     }
 
     /// Delete a database.
     @discardableResult
     public func delete(databaseId: String) async throws -> DatabaseSuccessResult {
-        let result = try await makeRequest("DELETE", "/databases/\(databaseId)", nil)
-        return try JSONCoding.decode(DatabaseSuccessResult.self, from: result)
+        try await transport.request(method: .delete, path: "/databases/\(databaseId)")
     }
 
     // MARK: - Permissions
 
     /// List all permission entries for a database.
     public func listPermissions(databaseId: String) async throws -> [DatabasePermissionEntry] {
-        let result = try await makeRequest("GET", "/databases/\(databaseId)/permissions", nil)
-        return try JSONCoding.decode([DatabasePermissionEntry].self, from: result)
+        try await transport.request(method: .get, path: "/databases/\(databaseId)/permissions")
     }
 
     /// Grant a user permission to access a database.
@@ -259,9 +355,11 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.grantPermission`.
     @available(*, deprecated, message: "Use databases.addManager(databaseId:params:) instead.")
     public func grantPermission(databaseId: String, params: GrantPermissionParams) async throws -> DatabasePermissionEntry {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("PUT", "/databases/\(databaseId)/permissions", body)
-        return try JSONCoding.decode(DatabasePermissionEntry.self, from: result)
+        try await transport.request(
+            method: .put,
+            path: "/databases/\(databaseId)/permissions",
+            body: params
+        )
     }
 
     /// Revoke a user's permission to a database.
@@ -270,54 +368,65 @@ public final class DatabasesAPI: @unchecked Sendable {
     @available(*, deprecated, message: "Use databases.removeManager(databaseId:userId:) instead.")
     @discardableResult
     public func revokePermission(databaseId: String, userId: String) async throws -> DatabaseSuccessResult {
-        let escapedId = userId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? userId
-        let result = try await makeRequest("DELETE", "/databases/\(databaseId)/permissions/\(escapedId)", nil)
-        return try JSONCoding.decode(DatabaseSuccessResult.self, from: result)
+        let escapedId = URLEncoding.encodeComponent(userId)
+        return try await transport.request(
+            method: .delete,
+            path: "/databases/\(databaseId)/permissions/\(escapedId)"
+        )
     }
 
     /// Transfer database ownership to another user.
     public func transferOwnership(databaseId: String, newOwnerId: String) async throws -> DatabaseOwnershipTransferResult {
-        let body: [String: Any] = ["newOwnerId": newOwnerId]
-        let result = try await makeRequest("POST", "/databases/\(databaseId)/permissions/transfer", body)
-        return try JSONCoding.decode(DatabaseOwnershipTransferResult.self, from: result)
+        try await transport.request(
+            method: .post,
+            path: "/databases/\(databaseId)/permissions/transfer",
+            body: ["newOwnerId": newOwnerId]
+        )
     }
 
     // MARK: - Operations
 
     /// Create a new operation (query or mutation) on a database.
     public func createOperation(databaseId: String, params: CreateOperationParams) async throws -> DatabaseOperationInfo {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("POST", "/databases/\(databaseId)/operations", body)
-        return try JSONCoding.decode(DatabaseOperationInfo.self, from: result)
+        try await transport.request(
+            method: .post,
+            path: "/databases/\(databaseId)/operations",
+            body: params
+        )
     }
 
     /// List all operations registered on a database.
     public func listOperations(databaseId: String) async throws -> [DatabaseOperationInfo] {
-        let result = try await makeRequest("GET", "/databases/\(databaseId)/operations", nil)
-        return try JSONCoding.decode([DatabaseOperationInfo].self, from: result)
+        try await transport.request(method: .get, path: "/databases/\(databaseId)/operations")
     }
 
     /// Get a single operation by name.
     public func getOperation(databaseId: String, name: String) async throws -> DatabaseOperationInfo {
-        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
-        let result = try await makeRequest("GET", "/databases/\(databaseId)/operations/\(encodedName)", nil)
-        return try JSONCoding.decode(DatabaseOperationInfo.self, from: result)
+        let encodedName = URLEncoding.encodeComponent(name)
+        return try await transport.request(
+            method: .get,
+            path: "/databases/\(databaseId)/operations/\(encodedName)"
+        )
     }
 
     /// Update an existing operation's definition or access level.
     public func updateOperation(databaseId: String, name: String, params: UpdateOperationParams) async throws -> DatabaseOperationInfo {
-        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("PATCH", "/databases/\(databaseId)/operations/\(encodedName)", body)
-        return try JSONCoding.decode(DatabaseOperationInfo.self, from: result)
+        let encodedName = URLEncoding.encodeComponent(name)
+        return try await transport.request(
+            method: .patch,
+            path: "/databases/\(databaseId)/operations/\(encodedName)",
+            body: params
+        )
     }
 
     /// Delete an operation from a database.
     @discardableResult
     public func deleteOperation(databaseId: String, name: String) async throws -> DatabaseSuccessResult {
-        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
-        let result = try await makeRequest("DELETE", "/databases/\(databaseId)/operations/\(encodedName)", nil)
-        return try JSONCoding.decode(DatabaseSuccessResult.self, from: result)
+        let encodedName = URLEncoding.encodeComponent(name)
+        return try await transport.request(
+            method: .delete,
+            path: "/databases/\(databaseId)/operations/\(encodedName)"
+        )
     }
 
     /// Execute a registered operation by name, with optional parameters and
@@ -325,10 +434,15 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// mutation acknowledgement, count, aggregate), so it is returned as an
     /// opaque `JSONValue` — JS returns `any` here.
     public func executeOperation(databaseId: String, name: String, options: ExecuteOperationOptions? = nil) async throws -> JSONValue {
-        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
-        let body: Any = try options.map { try JSONCoding.jsonObject(from: $0) } ?? [String: Any]()
-        let result = try await makeRequest("POST", "/databases/\(databaseId)/operations/\(encodedName)/execute", body)
-        return try JSONCoding.decode(JSONValue.self, from: result)
+        let encodedName = URLEncoding.encodeComponent(name)
+        // A `nil` options object sends `{}`, as the untyped body did — every
+        // field on `ExecuteOperationOptions` is optional, so the default value
+        // encodes to an empty JSON object.
+        return try await transport.request(
+            method: .post,
+            path: "/databases/\(databaseId)/operations/\(encodedName)/execute",
+            body: options ?? ExecuteOperationOptions()
+        )
     }
 
     // MARK: - Typed generic overload (#1547)
@@ -380,23 +494,26 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.importBulk`.
     @available(*, deprecated, message: "Use databases.executeBatch(databaseId:operationName:batch:) instead.")
     public func importBulk(databaseId: String, operationName: String, batch: [DatabaseBatchOperation]) async throws -> DatabaseBatchResult {
-        let encodedName = operationName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? operationName
-        let body: Any = ["batch": try JSONCoding.jsonObject(from: batch)]
-        let result = try await makeRequest("POST", "/databases/\(databaseId)/operations/\(encodedName)/import-bulk", body)
-        return try JSONCoding.decode(DatabaseBatchResult.self, from: result)
+        let encodedName = URLEncoding.encodeComponent(operationName)
+        return try await transport.request(
+            method: .post,
+            path: "/databases/\(databaseId)/operations/\(encodedName)/import-bulk",
+            body: DatabaseBatchBody(batch: batch)
+        )
     }
 
     // MARK: - Schema
 
     /// Get the field schema for a model in a database.
     public func describe(databaseId: String, modelName: String) async throws -> [ModelFieldInfo] {
-        let encodedModel = modelName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? modelName
-        let result = try await makeRequest("GET", "/databases/\(databaseId)/records/describe?modelName=\(encodedModel)", nil)
+        var query = URLQuery()
+        query.append("modelName", modelName)
         // The server may wrap the field list in a `{ fields }` envelope.
-        if let dict = result as? [String: Any], let fields = dict["fields"] {
-            return try JSONCoding.decode([ModelFieldInfo].self, from: fields)
-        }
-        return try JSONCoding.decode([ModelFieldInfo].self, from: result)
+        let response: ModelFieldsEnvelope = try await transport.request(
+            method: .get,
+            path: "/databases/\(databaseId)/records/describe\(query.queryString)"
+        )
+        return response.fields
     }
 
     // MARK: - CEL Context
@@ -411,8 +528,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.getCelContext`.
     @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). The metadataAccess gate that controls this read uses one CEL expression for read AND update, so read implies update. A metadata category has separate readRule/writeRule; read its values from CEL as md.self.<category>.<key>.")
     public func getCelContext(databaseId: String) async throws -> CelContextResult {
-        let result = try await makeRequest("GET", "/databases/\(databaseId)/metadata", nil)
-        return try JSONCoding.decode(CelContextResult.self, from: result)
+        try await transport.request(method: .get, path: "/databases/\(databaseId)/metadata")
     }
 
     /// Merge new key-value pairs into a database's CEL context dict.
@@ -423,9 +539,11 @@ public final class DatabasesAPI: @unchecked Sendable {
         databaseId: String,
         celContext: [String: JSONValue]
     ) async throws -> DatabaseInfo {
-        let body = try JSONCoding.jsonObject(from: celContext)
-        let result = try await makeRequest("PATCH", "/databases/\(databaseId)/metadata", body)
-        return try JSONCoding.decode(DatabaseInfo.self, from: result)
+        try await transport.request(
+            method: .patch,
+            path: "/databases/\(databaseId)/metadata",
+            body: celContext
+        )
     }
 
     // MARK: - Managers
@@ -443,9 +561,11 @@ public final class DatabasesAPI: @unchecked Sendable {
         databaseId: String,
         params: AddManagerParams
     ) async throws -> DatabasePermissionEntry {
-        let body: [String: Any] = ["userId": params.userId, "permission": "manager"]
-        let result = try await makeRequest("PUT", "/databases/\(databaseId)/permissions", body)
-        return try JSONCoding.decode(DatabasePermissionEntry.self, from: result)
+        try await transport.request(
+            method: .put,
+            path: "/databases/\(databaseId)/permissions",
+            body: ["userId": params.userId, "permission": "manager"]
+        )
     }
 
     /// Remove a manager from a database.
@@ -454,9 +574,11 @@ public final class DatabasesAPI: @unchecked Sendable {
         databaseId: String,
         userId: String
     ) async throws -> DatabaseSuccessResult {
-        let escapedId = userId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? userId
-        let result = try await makeRequest("DELETE", "/databases/\(databaseId)/permissions/\(escapedId)", nil)
-        return try JSONCoding.decode(DatabaseSuccessResult.self, from: result)
+        let escapedId = URLEncoding.encodeComponent(userId)
+        return try await transport.request(
+            method: .delete,
+            path: "/databases/\(databaseId)/permissions/\(escapedId)"
+        )
     }
 
     // MARK: - Group Permissions
@@ -469,8 +591,10 @@ public final class DatabasesAPI: @unchecked Sendable {
         includeSystem: Bool = false
     ) async throws -> [DatabaseGroupPermissionEntry] {
         let qs = includeSystem ? "?includeSystem=true" : ""
-        let result = try await makeRequest("GET", "/databases/\(databaseId)/group-permissions\(qs)", nil)
-        return try JSONCoding.decode([DatabaseGroupPermissionEntry].self, from: result)
+        return try await transport.request(
+            method: .get,
+            path: "/databases/\(databaseId)/group-permissions\(qs)"
+        )
     }
 
     /// Grant a group permission on a database. Members of the specified
@@ -479,9 +603,11 @@ public final class DatabasesAPI: @unchecked Sendable {
         databaseId: String,
         params: GrantDatabaseGroupPermissionParams
     ) async throws -> DatabaseGroupPermissionEntry {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("POST", "/databases/\(databaseId)/group-permissions", body)
-        return try JSONCoding.decode(DatabaseGroupPermissionEntry.self, from: result)
+        try await transport.request(
+            method: .post,
+            path: "/databases/\(databaseId)/group-permissions",
+            body: params
+        )
     }
 
     /// Revoke a group's permission on a database.
@@ -491,14 +617,12 @@ public final class DatabasesAPI: @unchecked Sendable {
         groupType: String,
         groupId: String
     ) async throws -> DatabaseSuccessResult {
-        let gType = groupType.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? groupType
-        let gId = groupId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? groupId
-        let result = try await makeRequest(
-            "DELETE",
-            "/databases/\(databaseId)/group-permissions/\(gType)/\(gId)",
-            nil
+        let gType = URLEncoding.encodeComponent(groupType)
+        let gId = URLEncoding.encodeComponent(groupId)
+        return try await transport.request(
+            method: .delete,
+            path: "/databases/\(databaseId)/group-permissions/\(gType)/\(gId)"
         )
-        return try JSONCoding.decode(DatabaseSuccessResult.self, from: result)
     }
 
     // MARK: - Batch operations
@@ -510,14 +634,12 @@ public final class DatabasesAPI: @unchecked Sendable {
         operationName: String,
         batch: [DatabaseBatchOperation]
     ) async throws -> DatabaseBatchResult {
-        let encodedName = operationName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? operationName
-        let body: Any = ["batch": try JSONCoding.jsonObject(from: batch)]
-        let result = try await makeRequest(
-            "POST",
-            "/databases/\(databaseId)/operations/\(encodedName)/batch",
-            body
+        let encodedName = URLEncoding.encodeComponent(operationName)
+        return try await transport.request(
+            method: .post,
+            path: "/databases/\(databaseId)/operations/\(encodedName)/batch",
+            body: DatabaseBatchBody(batch: batch)
         )
-        return try JSONCoding.decode(DatabaseBatchResult.self, from: result)
     }
 
     /// Import a parsed list of rows into a database via a named mutation
@@ -887,6 +1009,14 @@ public final class DatabasesAPI: @unchecked Sendable {
         }
     }
 }
+
+// MARK: - Request / response shims
+
+/// Body of the batch / bulk-import endpoints: `{ batch: [...] }`.
+private struct DatabaseBatchBody: Encodable, Sendable {
+    let batch: [DatabaseBatchOperation]
+}
+
 
 /// Errors thrown by `databases.importCsv` before any network call. Mirror the
 /// guard clauses in js-bao's `importCsv`.

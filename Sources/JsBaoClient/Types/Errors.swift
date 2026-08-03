@@ -22,6 +22,13 @@ public enum JsBaoErrorCode: String, Sendable {
     case integrationRequestInvalid = "INTEGRATION_REQUEST_INVALID"
     case integrationProxyFailed = "INTEGRATION_PROXY_FAILED"
     case workflowApplyNotConfirmed = "WORKFLOW_APPLY_NOT_CONFIRMED"
+    /// `workflows.waitFor` gave up after `timeoutMs` without the run reaching
+    /// a terminal state. Mirrors the JS client's `WORKFLOW_WAIT_TIMEOUT`.
+    case workflowWaitTimeout = "WORKFLOW_WAIT_TIMEOUT"
+    /// `locks.acquire` reached its `timeoutMs` deadline without winning the
+    /// key. Mirrors the JS client's `LockTimeoutError` (`LOCK_TIMEOUT`); the
+    /// error's `details` carry `key` and `timeoutMs`.
+    case lockTimeout = "LOCK_TIMEOUT"
 }
 
 /// Main error type for the JsBao client library
@@ -145,6 +152,88 @@ public struct HttpError: Error, Sendable {
             ?? dict["message"] as? String
             ?? (dict["details"] as? [String: Any])?["error"] as? String
         return (code, message)
+    }
+}
+
+// MARK: - Client-side transport failures
+
+/// `HttpError` is a struct, not an enum, so the transport layer's two
+/// non-HTTP failure modes (a required body that arrived empty, and a body
+/// that would not decode) are expressed as factory methods rather than new
+/// cases. Both carry a **client-side sentinel** in `serverCode`: the server
+/// sent no `code`, so the value identifies where the failure came from
+/// without pretending it was reported by the server.
+public extension HttpError {
+    /// `serverCode` on the error thrown when a 2xx response carried no body
+    /// but the call site required a value.
+    static let emptyBodyCode = "CLIENT_EMPTY_RESPONSE_BODY"
+    /// `serverCode` on the error thrown when a 2xx body could not be decoded
+    /// into the expected type.
+    static let decodingFailedCode = "CLIENT_DECODE_FAILED"
+
+    /// A 2xx response with an empty body where the call site required a
+    /// value. `status` is the real HTTP status of the (successful) response —
+    /// see `Transport.request`; use `requestOptional` when "nothing" is a
+    /// legitimate answer, or `send` for pure side effects.
+    static func emptyBody(
+        path: String,
+        expected: Any.Type,
+        status: Int = 200
+    ) -> HttpError {
+        HttpError(
+            status: status,
+            message: "Empty response body from \(path) (expected \(expected))",
+            body: nil,
+            serverCode: emptyBodyCode,
+            serverMessage: nil
+        )
+    }
+
+    /// Stands in for a response body that was withheld because the endpoint
+    /// returns credentials — see `isCredentialBearingPath`.
+    static let redactedBodyPlaceholder = "<redacted: credential-bearing response body>"
+
+    /// A 2xx body that would not decode into the expected type. Carries the
+    /// path and expected type so a decode failure is diagnosable without
+    /// re-running the request; the raw body is preserved on `body` — except
+    /// on the credential-bearing paths, where it is redacted.
+    static func decodingFailure(
+        path: String,
+        expected: Any.Type,
+        status: Int = 200,
+        body: String?,
+        underlying: Error
+    ) -> HttpError {
+        HttpError(
+            status: status,
+            message: "Failed to decode \(expected) from \(path): \(underlying)",
+            body: redactedBody(body, path: path),
+            serverCode: decodingFailedCode,
+            serverMessage: nil
+        )
+    }
+
+    /// The 2xx bodies of the auth and passkey endpoints carry a live access
+    /// token. A decode failure is exactly the error an app forwards to a
+    /// crash reporter, and `body` is a `public let` that
+    /// `String(describing:)` prints — so on those paths the body is replaced
+    /// by a placeholder, keeping only the structured `code`/`error` fields
+    /// that make the failure diagnosable.
+    static func redactedBody(_ body: String?, path: String) -> String? {
+        guard let body = body, isCredentialBearingPath(path) else { return body }
+        let parsed = parseBody(body)
+        var kept: [String] = [redactedBodyPlaceholder]
+        if let code = parsed.code { kept.append("code=\(code)") }
+        if let message = parsed.message { kept.append("error=\(message)") }
+        return kept.joined(separator: " ")
+    }
+
+    /// `true` for the paths whose success bodies contain an access token.
+    /// Matched by substring, not prefix: the refresh-proxy paths arrive as
+    /// absolute URLs (`https://proxy.example/auth/otp/verify`).
+    static func isCredentialBearingPath(_ path: String) -> Bool {
+        let lowered = path.lowercased()
+        return lowered.contains("/auth/") || lowered.contains("/passkey/")
     }
 }
 

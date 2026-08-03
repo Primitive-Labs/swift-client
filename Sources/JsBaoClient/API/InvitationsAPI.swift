@@ -7,10 +7,19 @@ import Foundation
 /// from the per-document invitation methods on `client.documents.*`,
 /// which were the only invitation surface before this PR.
 public final class InvitationsAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
 
-    public init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.makeRequest = makeRequest
+    /// Designated initializer — the typed transport spine.
+    public init(transport: any Transport) {
+        self.transport = transport
+    }
+
+    /// Deprecated: construct with a `Transport` instead. The legacy closure is
+    /// wrapped in an adapter so existing call sites keep working for one major
+    /// cycle.
+    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
+    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
+        self.init(transport: ClosureTransport(makeRequest: makeRequest))
     }
 
     // MARK: - Invitations
@@ -18,17 +27,14 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// Check the caller's invitation quota. Admins/owners always get
     /// `unlimited: true`.
     public func quota() async throws -> InvitationQuota {
-        let result = try await makeRequest("GET", "/invitations/quota", nil)
-        return try JSONCoding.decode(InvitationQuota.self, from: result)
+        try await transport.request(method: .get, path: "/invitations/quota")
     }
 
     /// Create an app-level invitation. Members can create invitations
     /// when `memberInvitationsEnabled` is true; admins/owners always can.
     /// Only `params.email` is required.
     public func create(params: CreateInvitationParams) async throws -> AppInvitationInfo {
-        let body = try JSONCoding.jsonObject(from: params)
-        let result = try await makeRequest("POST", "/invitations", body)
-        return try JSONCoding.decode(AppInvitationInfo.self, from: result)
+        try await transport.request(method: .post, path: "/invitations", body: params)
     }
 
     /// List app-level invitations (admin/owner only). Returns a typed
@@ -37,30 +43,23 @@ public final class InvitationsAPI: @unchecked Sendable {
         limit: Int? = nil,
         cursor: String? = nil
     ) async throws -> InvitationListResult {
-        var qs: [String] = []
-        if let limit { qs.append("limit=\(limit)") }
-        if let cursor,
-           let escaped = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            qs.append("cursor=\(escaped)")
-        }
-        let path = qs.isEmpty ? "/invitations" : "/invitations?\(qs.joined(separator: "&"))"
-        let result = try await makeRequest("GET", path, nil)
-        return try JSONCoding.decode(InvitationListResult.self, from: result)
+        var query = URLQuery()
+        if let limit { query.append("limit", limit) }
+        query.appendIfPresent("cursor", cursor)
+        return try await transport.request(method: .get, path: "/invitations\(query.queryString)")
     }
 
     /// Fetch a single app invitation by id. Includes `inviteToken` so
     /// callers can build their own accept-page CTA.
     /// Permissions: app admin/owner, OR the original inviter.
     public func get(invitationId: String) async throws -> AppInvitationInfo {
-        let result = try await makeRequest("GET", "/invitations/\(invitationId)", nil)
-        return try JSONCoding.decode(AppInvitationInfo.self, from: result)
+        try await transport.request(method: .get, path: "/invitations/\(invitationId)")
     }
 
     /// Delete an app-level invitation (admin/owner only). Cascade-deletes
     /// any linked deferred grants.
     public func delete(invitationId: String) async throws -> InvitationDeleteResult {
-        let result = try await makeRequest("DELETE", "/invitations/\(invitationId)", nil)
-        return try JSONCoding.decode(InvitationDeleteResult.self, from: result)
+        try await transport.request(method: .delete, path: "/invitations/\(invitationId)")
     }
 
     /// Accept an invitation via its invite token (#466). For an
@@ -73,11 +72,11 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// (the server collapses invalid / expired / already-accepted to one
     /// shape so existence isn't leaked to probing).
     public func accept(inviteToken: String) async throws -> AcceptInviteResult {
-        let result = try await makeRequest(
-            "POST", "/invitations/accept",
-            ["inviteToken": inviteToken]
+        try await transport.request(
+            method: .post,
+            path: "/invitations/accept",
+            body: ["inviteToken": inviteToken]
         )
-        return try JSONCoding.decode(AcceptInviteResult.self, from: result)
     }
 
     // MARK: - Deferred grants
@@ -101,22 +100,15 @@ public final class InvitationsAPI: @unchecked Sendable {
         limit: Int? = nil,
         cursor: String? = nil
     ) async throws -> DeferredGrantListResult {
-        var qs: [String] = []
-        if let type { qs.append("type=\(type.rawValue)") }
-        if let email,
-           let escaped = email.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            qs.append("email=\(escaped)")
-        }
-        if let limit { qs.append("limit=\(limit)") }
-        if let cursor,
-           let escaped = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            qs.append("cursor=\(escaped)")
-        }
-        let path = qs.isEmpty
-            ? "/deferred-grants"
-            : "/deferred-grants?\(qs.joined(separator: "&"))"
-        let result = try await makeRequest("GET", path, nil)
-        return try JSONCoding.decode(DeferredGrantListResult.self, from: result)
+        var query = URLQuery()
+        if let type { query.append("type", type.rawValue) }
+        query.appendIfPresent("email", email)
+        if let limit { query.append("limit", limit) }
+        query.appendIfPresent("cursor", cursor)
+        return try await transport.request(
+            method: .get,
+            path: "/deferred-grants\(query.queryString)"
+        )
     }
 
     /// Revoke a deferred grant. Admins/owners can revoke any; the
@@ -128,9 +120,9 @@ public final class InvitationsAPI: @unchecked Sendable {
         deferredId: String,
         type: DeferredGrantType
     ) async throws -> DeferredGrantRevokeResult {
-        let result = try await makeRequest(
-            "DELETE", "/deferred-grants/\(deferredId)?type=\(type.rawValue)", nil
+        try await transport.request(
+            method: .delete,
+            path: "/deferred-grants/\(deferredId)?type=\(type.rawValue)"
         )
-        return try JSONCoding.decode(DeferredGrantRevokeResult.self, from: result)
     }
 }

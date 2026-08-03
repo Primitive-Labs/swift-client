@@ -14,27 +14,19 @@ final class AuthOtpInviteTokenTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Captures the most recent request the stub closure was asked to make.
-    final class CallRecorder: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        /// Canned OTP-verify response (no "token" key, so the controller
-        /// doesn't try to apply/parse a JWT).
-        var response: Any = [
-            "user": ["userId": "u1", "email": "otp@example.com"],
-            "isNewUser": false,
-        ]
+    /// Canned OTP-verify response. It carries a real (decodable) JWT because
+    /// a 2xx verify without a `token` is a broken server contract the
+    /// controller rejects (#1991 Phase B3). These tests only assert the
+    /// outbound request body, so the token just has to be applicable.
+    static let otpResponse = #"""
+    {"token": "\#(makeTestJwt(userId: "u1"))", "user": {"userId": "u1", "email": "otp@example.com"}, "isNewUser": false}
+    """#
 
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
-        }
+    private func makeRecorder() -> RecordingTransport {
+        RecordingTransport(json: Self.otpResponse)
     }
 
-    private func makeController(_ recorder: CallRecorder) -> AuthController {
+    private func makeController(_ recorder: RecordingTransport) -> AuthController {
         let controller = AuthController(
             appId: "test-app",
             apiUrl: "http://localhost:8787",
@@ -44,16 +36,14 @@ final class AuthOtpInviteTokenTests: XCTestCase {
             refreshProxy: nil,
             persistConfig: AuthConfig()
         )
-        controller.makeRequest = { method, path, data in
-            try await recorder.make(method, path, data)
-        }
+        controller.setTransport(recorder)
         return controller
     }
 
     // MARK: - AuthController wire shape
 
     func test_otpVerify_sendsInviteToken_inBody() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let controller = makeController(r)
 
         _ = try await controller.otpVerify(
@@ -62,16 +52,16 @@ final class AuthOtpInviteTokenTests: XCTestCase {
             inviteToken: "invite-tok-1"
         )
 
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/auth/otp/verify")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["email"] as? String, "otp@example.com")
-        XCTAssertEqual(body?["code"] as? String, "123456")
-        XCTAssertEqual(body?["inviteToken"] as? String, "invite-tok-1")
+        XCTAssertEqual(r.lastCall?.method, .post)
+        XCTAssertEqual(r.lastCall?.path, "/auth/otp/verify")
+        let body = r.lastCall?.jsonBody
+        XCTAssertEqual(body?["email"]?.stringValue, "otp@example.com")
+        XCTAssertEqual(body?["code"]?.stringValue, "123456")
+        XCTAssertEqual(body?["inviteToken"]?.stringValue, "invite-tok-1")
     }
 
     func test_otpVerify_trimsInviteToken() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let controller = makeController(r)
 
         _ = try await controller.otpVerify(
@@ -80,25 +70,25 @@ final class AuthOtpInviteTokenTests: XCTestCase {
             inviteToken: "  invite-tok-2 \n"
         )
 
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["inviteToken"] as? String, "invite-tok-2")
+        let body = r.lastCall?.jsonBody
+        XCTAssertEqual(body?["inviteToken"]?.stringValue, "invite-tok-2")
     }
 
     func test_otpVerify_omitsInviteToken_whenNil() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let controller = makeController(r)
 
         _ = try await controller.otpVerify(email: "otp@example.com", code: "123456")
 
-        let body = r.body as? [String: Any]
+        let body = r.lastCall?.jsonBody
         XCTAssertNotNil(body)
         XCTAssertNil(body?["inviteToken"])
         // Same body shape JS sends: just email + code.
-        XCTAssertEqual(body?.count, 2)
+        XCTAssertEqual(body?.objectValue?.count, 2)
     }
 
     func test_otpVerify_omitsInviteToken_whenBlank() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let controller = makeController(r)
 
         _ = try await controller.otpVerify(
@@ -107,7 +97,7 @@ final class AuthOtpInviteTokenTests: XCTestCase {
             inviteToken: "   "
         )
 
-        let body = r.body as? [String: Any]
+        let body = r.lastCall?.jsonBody
         XCTAssertNotNil(body)
         XCTAssertNil(body?["inviteToken"])
     }
@@ -117,16 +107,14 @@ final class AuthOtpInviteTokenTests: XCTestCase {
     /// Builds an offline JsBaoClient whose AuthController.makeRequest is
     /// stubbed, so the top-level `client.otpVerify` wrapper can be
     /// exercised without a network.
-    private func makeClient(_ recorder: CallRecorder) -> JsBaoClient {
+    private func makeClient(_ recorder: RecordingTransport) -> JsBaoClient {
         let client = JsBaoClient(options: JsBaoClientOptions(
             apiUrl: "http://localhost:8787",
             wsUrl: "ws://localhost:8787",
             appId: "test-app",
             offline: true
         ))
-        client.authController.makeRequest = { method, path, data in
-            try await recorder.make(method, path, data)
-        }
+        client.authController.replaceTransportForTesting(recorder)
         return client
     }
 
@@ -134,7 +122,7 @@ final class AuthOtpInviteTokenTests: XCTestCase {
     /// forwards `options.inviteToken` to the auth controller. The Swift
     /// wrapper previously dropped it.
     func test_topLevel_otpVerify_forwardsInviteToken() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
@@ -144,25 +132,25 @@ final class AuthOtpInviteTokenTests: XCTestCase {
             inviteToken: "invite-tok-top"
         )
 
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/auth/otp/verify")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["inviteToken"] as? String, "invite-tok-top")
+        XCTAssertEqual(r.lastCall?.method, .post)
+        XCTAssertEqual(r.lastCall?.path, "/auth/otp/verify")
+        let body = r.lastCall?.jsonBody
+        XCTAssertEqual(body?["inviteToken"]?.stringValue, "invite-tok-top")
     }
 
     /// Source compatibility + JS parity: the two-arg call still works and
     /// sends no inviteToken (same body shape JS sends: email + code only).
     func test_topLevel_otpVerify_omitsInviteToken_whenNotPassed() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
         _ = try await client.otpVerify(email: "otp@example.com", code: "123456")
 
-        let body = r.body as? [String: Any]
+        let body = r.lastCall?.jsonBody
         XCTAssertNotNil(body)
         XCTAssertNil(body?["inviteToken"])
-        XCTAssertEqual(body?.count, 2)
+        XCTAssertEqual(body?.objectValue?.count, 2)
     }
 
     // MARK: - AuthAPI params routing
@@ -175,30 +163,29 @@ final class AuthOtpInviteTokenTests: XCTestCase {
     }
 
     private func makeAuthAPI(_ capture: OtpCapture, wireInviteClosure: Bool) -> AuthAPI {
-        let response: [String: Any] = [
-            "user": ["userId": "u1", "email": "otp@example.com"],
-            "isNewUser": true,
-        ]
+        let user = AuthUser(userId: "u1", email: "otp@example.com", name: nil)
+        let otpResult = OtpVerifyResult(user: user, isNewUser: true)
+        let magicLinkResult = MagicLinkVerifyResult(user: user, promptAddPasskey: nil, isNewUser: true)
         return AuthAPI(
             getUserId: { nil },
             getToken: { nil },
             isAuthenticated: { false },
             magicLinkRequest: { _, _ in true },
-            magicLinkVerify: { _ in response },
+            magicLinkVerify: { _ in magicLinkResult },
             otpRequest: { _ in true },
             otpVerify: { email, code in
                 capture.plainCalls.append((email, code))
-                return response
+                return otpResult
             },
             otpVerifyWithInvite: wireInviteClosure
                 ? { email, code, inviteToken in
                     capture.inviteCalls.append((email, code, inviteToken))
-                    return response
+                    return otpResult
                 }
                 : nil,
-            getAuthConfig: { [String: Any]() },
+            getAuthConfig: { try JSONCoding.decodeData(AuthConfigInfo.self, from: Data("{}".utf8)) },
             logout: { _ in },
-            enableOfflineAccess: { _ in [String: Any]() },
+            enableOfflineAccess: { _ in EnableOfflineAccessResult(enabled: true) },
             unlockOffline: { false },
             getOfflineGrantStatus: {
                 OfflineGrantStatus(available: false, expiresAt: nil, daysLeft: nil, method: nil)

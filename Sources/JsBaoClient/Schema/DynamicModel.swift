@@ -16,7 +16,51 @@ import Yniffi
 ///     ...
 /// _meta_{modelName} (Y.Map — written by SchemaSync.syncModelMeta)
 /// ```
-public final class DynamicModel {
+///
+/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+///
+/// `DynamicModel` is deliberately a class guarded by locks, not an actor:
+/// generated reads are synchronous by design (#1156) and the fork's sync
+/// transaction API is first-class (#1911). The conformance is therefore
+/// unchecked, and this is the argument a reviewer should check it against.
+///
+/// | State | Confinement |
+/// |---|---|
+/// | `schema`, `docId` | `let`, `Sendable` value types |
+/// | `doc` (`YDocument`) | `let`. `YDocument` is a reference type that is not `Sendable`; **every** FFI touch goes through `doc.withExclusiveAccess` / `doc.transact` / `doc.transactSync`, all of which serialize on the doc's single `ffiLock` (`yswift-fork/Sources/YSwift/YDocument.swift:53,61`) |
+/// | `queryEngine` | `let`; `BaoModelQueryEngine` is itself `@unchecked Sendable` under its own `NSLock` |
+/// | `recordSubscriptions`, `rootSubscription` | mutated and read under `observerLock` — including the `init`-time installs, which take it *inside* the open transaction (`ffiLock → observerLock`, the same order `installRecordObserverUnlocked` / `cancelRecordObserverUnlocked` use) — except in `deinit` (see below) |
+/// | `docUpdateSubscription` | assigned in `init` under `observerLock`; read-and-cleared in `deinit` under `observerLock`, with the `cancel()` FFI call made after the lock is released (#1992 — it was previously touched with no lock at all) |
+/// | `listeners` | mutated and read under `listenerLock`; the snapshot taken there is invoked **outside** the lock so a callback may (un)subscribe re-entrantly |
+/// | `observerDrainQueue`, `reconcileQueue`, `drainQueueKey` | `let` Dispatch primitives, themselves thread-safe |
+/// | the `activeTx` / `pendingNotify` transaction bookkeeping | thread-local (`Thread.current.threadDictionary`), so it is per-thread by construction and never shared |
+///
+/// **`ffiLock` is an `NSRecursiveLock`, and that reentrancy is required, not
+/// incidental.** The observer path re-enters `withExclusiveAccess` while a
+/// transaction on the same thread is already open (`deinit` dropping raw
+/// `Yniffi.YSubscription` handles can itself run inside a held transaction),
+/// so a safety argument that claimed mutual exclusion *without* reentrancy
+/// would be wrong. `observerLock` and `listenerLock` are plain `NSLock`s and
+/// are never re-entered.
+///
+/// **`deinit` is the one place `recordSubscriptions` / `rootSubscription` are
+/// touched without `observerLock`** — by then no other reference to the
+/// instance exists, so there is nothing to exclude; they are instead dropped
+/// under the doc's `ffiLock` (`withExclusiveAccess`), which is what actually
+/// matters there: observer deregistration must be serialized against
+/// transactions on the shared doc (#1126).
+///
+/// **Listener closures are `@Sendable` (#1992).** Confining the `listeners`
+/// dictionary under `listenerLock` says nothing about state a callback
+/// captures, and callbacks run on whichever thread committed the change (a
+/// local writer's thread, or the observer-drain queue), so the closure type
+/// carries the requirement rather than the container.
+///
+/// **What the locks do NOT give you.** Sync and async transactions serialize
+/// on separate queues with no cross-paradigm ordering guarantee: never split
+/// one logical batch across `transact` and `transactSync`. That is a review
+/// invariant, not a compiler-checked one.
+public final class DynamicModel: @unchecked Sendable {
     public let schema: PrimitiveSchema
     internal let doc: YDocument
 
@@ -53,6 +97,11 @@ public final class DynamicModel {
     public var inspectionTableName: String {
         BaoModelQueryEngine.sanitizeTableName(schema.name)
     }
+    /// Doc-level `observe_update_v1` handle, kept so `deinit` can cancel it.
+    /// Guarded by `observerLock` like the other subscription handles — it was
+    /// previously assigned in `init` and cancelled in `deinit` with no lock at
+    /// all, which the `@unchecked Sendable` argument above could not have
+    /// covered (#1992).
     private var docUpdateSubscription: YSwift.YSubscription?
 
     // MARK: - Per-record observation
@@ -71,7 +120,7 @@ public final class DynamicModel {
     /// Registered change listeners. Keyed by UUID so unsubscribe can
     /// find and remove its own entry without an identity trick on the
     /// closure. Guarded by `listenerLock`.
-    private var listeners: [UUID: () -> Void] = [:]
+    private var listeners: [UUID: @Sendable () -> Void] = [:]
     private let listenerLock = NSLock()
 
     /// Register a callback that fires after any add, update, or
@@ -87,7 +136,7 @@ public final class DynamicModel {
     /// model (query, write) since no transaction is open when they
     /// run. Keep callbacks fast and non-blocking.
     @discardableResult
-    public func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+    public func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         let id = UUID()
         listenerLock.lock()
         listeners[id] = callback
@@ -388,7 +437,17 @@ public final class DynamicModel {
             guard let root = txn.transactionGetOrInsertMap(name: self.schema.name)
                     as YrsMap? else { return }
             let rootDelegate = RootMapObserver(model: self)
-            self.rootSubscription = root.observe(delegate: rootDelegate)
+            // Assigned under `observerLock` for the same reason as
+            // `docUpdateSubscription` below (#1992): the instance has not
+            // escaped yet, but taking the lock here is what makes the "every
+            // subscription handle is `observerLock`-confined" claim in the
+            // type's safety argument true without an extra exception. This
+            // runs inside `transactSync`, so it nests `ffiLock -> observerLock`
+            // — the same one-directional order the install path at
+            // `installRecordObserverUnlocked` / `cancelRecordObserverUnlocked`
+            // already uses.
+            let subscription = root.observe(delegate: rootDelegate)
+            self.observerLock.withLock { self.rootSubscription = subscription }
             let idCollector = KeyCollector()
             root.keys(tx: txn, delegate: idCollector)
             for recordId in idCollector.keys {
@@ -399,16 +458,30 @@ public final class DynamicModel {
 
         // Keep the doc-level subscription for post-merge unique
         // reconciliation. Cheap: just queues async work.
-        self.docUpdateSubscription = doc.observeUpdate { [weak self] _ in
+        //
+        // Registered under `observerLock` so the handle's lifetime is covered
+        // by the same lock as the other subscription handles (#1992). The
+        // instance has not escaped yet, but taking the lock here is what makes
+        // the "every subscription handle is `observerLock`-confined" claim in
+        // the type's safety argument true without an exception.
+        let subscription = doc.observeUpdate { [weak self] _ in
             guard let self else { return }
             self.reconcileQueue.async { [weak self] in
                 self?.reconcileUniqueConstraints()
             }
         }
+        observerLock.withLock { self.docUpdateSubscription = subscription }
     }
 
     deinit {
-        docUpdateSubscription?.cancel()
+        // Read + clear under `observerLock`, then cancel outside it: `cancel()`
+        // calls into the FFI and must not run with an unrelated lock held.
+        let docSub = observerLock.withLock { () -> YSwift.YSubscription? in
+            let s = docUpdateSubscription
+            docUpdateSubscription = nil
+            return s
+        }
+        docSub?.cancel()
         // `Yniffi.YSubscription` is the raw FFI handle — it auto-cancels on
         // Drop, which calls into yrs to unobserve. That unobserve MUST be
         // serialized against transactions on the same doc: multiple
@@ -789,21 +862,25 @@ public final class DynamicModel {
 
     /// Paginated include variant. Same batching semantics, but the
     /// result carries cursors.
+    ///
+    /// Rows come back as the shared `Sendable` row bag (`PrimitiveRow`, #1992)
+    /// with the `_related` attachment inside `raw` exactly as before.
     public func queryPaged(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         awaitObserverDrain()
         let base = try queryEngine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
             scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
         )
-        var rows = base.data
+        // Unwrap → resolve includes (which mutates the rows in place) → rewrap.
+        var rows = base.data.map(\.raw)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
         return PagedQueryResult(
-            data: rows,
+            data: rows.map(PrimitiveRow.init(raw:)),
             nextCursor: base.nextCursor,
             prevCursor: base.prevCursor,
             hasMore: base.hasMore
@@ -817,7 +894,7 @@ public final class DynamicModel {
     public func queryPaged(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         awaitObserverDrain()
         return try queryEngine.queryPaged(
             modelName: schema.name, filter: filter, options: options,

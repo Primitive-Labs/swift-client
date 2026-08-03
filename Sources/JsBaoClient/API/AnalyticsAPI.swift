@@ -5,66 +5,130 @@ import Foundation
 /// `client.analytics` namespace. Mirrors js-bao's `AnalyticsClient`
 /// interface (`logEvent` / `logSnapshot` / `flush` / `setPlanOverride` /
 /// `setAppVersionOverride`). All calls fan out to the shared
-/// `AnalyticsQueue` the client owns; this struct holds no buffer of its
-/// own and is a thin, injected-closure facade matching the other
-/// `*API` types (see `MeAPI` / `SessionAPI`).
-public final class AnalyticsAPI: @unchecked Sendable {
-    private let logEventClosure: (AnalyticsEventInput) -> Void
-    private let flushClosure: () -> Void
-    private let setPlanOverrideClosure: (String?) -> Void
-    private let setAppVersionOverrideClosure: (String?) -> Void
+/// `AnalyticsQueue` the client owns; this type holds no buffer of its own.
+///
+/// ## The synchronous members are deprecated (#1993, Phase D3)
+///
+/// `AnalyticsQueue` is an `actor` now, so its work is `async`. Every member
+/// below therefore comes in two shapes:
+///
+/// * the original **synchronous** one, kept for the deprecation window. It
+///   hands the work to an unstructured `Task` and returns immediately, so two
+///   consecutive calls are not ordered against each other and a `flush()` may
+///   run before an event logged just before it has been buffered. That event is
+///   not lost — it goes out with the next batch — but it is not in *this* one.
+/// * the **`Async` twin**, which does the work on the caller's task. Two
+///   awaited calls are ordered, and `flushAsync()` returns only once the batch
+///   has reached the socket.
+///
+/// The twins carry a distinct name rather than being `async` overloads of the
+/// same name on purpose: Swift prefers an `async` overload in an asynchronous
+/// context, so a same-name twin turns every existing un-`await`ed call in an
+/// `async` function into a compile error — exactly the source break the
+/// deprecation window exists to avoid.
+public final class AnalyticsAPI: Sendable {
+    private let queue: AnalyticsQueue
     /// Resolves the current user id (ULID) for `logSnapshot`. Returns
     /// nil when there is no authenticated user.
-    private let resolveUserUlid: () -> String?
+    private let resolveUserUlid: @Sendable () -> String?
 
     public init(
-        logEvent: @escaping (AnalyticsEventInput) -> Void,
-        flush: @escaping () -> Void,
-        setPlanOverride: @escaping (String?) -> Void,
-        setAppVersionOverride: @escaping (String?) -> Void,
-        resolveUserUlid: @escaping () -> String?
+        queue: AnalyticsQueue,
+        resolveUserUlid: @escaping @Sendable () -> String?
     ) {
-        self.logEventClosure = logEvent
-        self.flushClosure = flush
-        self.setPlanOverrideClosure = setPlanOverride
-        self.setAppVersionOverrideClosure = setAppVersionOverride
+        self.queue = queue
         self.resolveUserUlid = resolveUserUlid
     }
 
+    // MARK: - logEvent
+
     /// Log a typed analytics event. The queue fills in `user_ulid`,
     /// `timestamp`, and any plan / app-version overrides.
+    @available(*, deprecated, message: "Use logEventAsync(_:) — the synchronous version enqueues without waiting, so it is not ordered against a following flush. Removed in the next major release.")
     public func logEvent(_ event: AnalyticsEventInput) {
-        logEventClosure(event)
+        let prepared = queue.prepared(event)
+        let queue = self.queue
+        Task { await queue.logEvent(prepared) }
     }
+
+    /// Log a typed analytics event, returning once it is buffered. The queue
+    /// fills in `user_ulid`, `timestamp`, and any plan / app-version overrides.
+    public func logEventAsync(_ event: AnalyticsEventInput) async {
+        await queue.logEvent(event)
+    }
+
+    // MARK: - logSnapshot
 
     /// Log a point-in-time state snapshot for the current user. No-ops
     /// when there is no authenticated user (mirrors js-bao's
     /// `analytics.logSnapshot`, which bails when `resolveAnalyticsUserUlid`
     /// returns null). Emits `action: "_snapshot"`, `feature: "_state"`.
+    @available(*, deprecated, message: "Use logSnapshotAsync(context:) — the synchronous version enqueues without waiting. Removed in the next major release.")
     public func logSnapshot(context: JSONValue? = nil) {
-        guard let userUlid = resolveUserUlid() else { return }
-        logEventClosure(
-            AnalyticsEventInput(
-                action: "_snapshot",
-                feature: "_state",
-                user_ulid: userUlid,
-                context_json: context
-            )
+        guard let event = snapshotEvent(context: context) else { return }
+        let prepared = queue.prepared(event)
+        let queue = self.queue
+        Task { await queue.logEvent(prepared) }
+    }
+
+    /// Log a point-in-time state snapshot for the current user, returning once
+    /// it is buffered. No-ops when there is no authenticated user.
+    public func logSnapshotAsync(context: JSONValue? = nil) async {
+        guard let event = snapshotEvent(context: context) else { return }
+        await queue.logEvent(event)
+    }
+
+    private func snapshotEvent(context: JSONValue?) -> AnalyticsEventInput? {
+        guard let userUlid = resolveUserUlid() else { return nil }
+        return AnalyticsEventInput(
+            action: "_snapshot",
+            feature: "_state",
+            user_ulid: userUlid,
+            context_json: context
         )
     }
 
+    // MARK: - flush
+
     /// Flush pending analytics events immediately.
+    @available(*, deprecated, message: "Use flushAsync() — the synchronous version returns before the batch reaches the socket. Removed in the next major release.")
     public func flush() {
-        flushClosure()
+        let queue = self.queue
+        Task { await queue.flush() }
     }
 
+    /// Flush pending analytics events, returning once the batch has reached
+    /// the socket (or, on a send failure, once it has been re-buffered and
+    /// persisted).
+    public func flushAsync() async {
+        await queue.flushAndWait()
+    }
+
+    // MARK: - Overrides
+
     /// Override the plan field on all subsequent analytics events.
+    @available(*, deprecated, message: "Use setPlanOverrideAsync(_:) — the synchronous version applies the override without waiting, so an event logged right after it may not carry it. Removed in the next major release.")
     public func setPlanOverride(_ plan: String?) {
-        setPlanOverrideClosure(plan)
+        let queue = self.queue
+        Task { await queue.setPlanOverride(plan) }
+    }
+
+    /// Override the plan field on all subsequent analytics events, returning
+    /// once the override is in effect.
+    public func setPlanOverrideAsync(_ plan: String?) async {
+        await queue.setPlanOverride(plan)
     }
 
     /// Override the app-version field on all subsequent analytics events.
+    @available(*, deprecated, message: "Use setAppVersionOverrideAsync(_:) — the synchronous version applies the override without waiting, so an event logged right after it may not carry it. Removed in the next major release.")
     public func setAppVersionOverride(_ version: String?) {
-        setAppVersionOverrideClosure(version)
+        let queue = self.queue
+        Task { await queue.setAppVersionOverride(version) }
+    }
+
+    /// Override the app-version field on all subsequent analytics events,
+    /// returning once the override is in effect.
+    public func setAppVersionOverrideAsync(_ version: String?) async {
+        await queue.setAppVersionOverride(version)
     }
 }

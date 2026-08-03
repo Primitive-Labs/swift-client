@@ -33,7 +33,7 @@ final class InterleavedTests: XCTestCase {
 
         // Write
         let map1: YMap<String> = doc1.getOrCreateMap(named: "data")
-        client.transactAndSync(docId) { txn in
+        try client.transactAndSync(docId) { txn in
             map1.updateValue("initial", forKey: "key", transaction: txn)
         }
         try await delay(1)

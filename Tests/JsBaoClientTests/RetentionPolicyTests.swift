@@ -29,7 +29,7 @@ final class RetentionPolicyTests: XCTestCase {
         let storage = SQLiteStorageProvider(path: dbPath)
         try await storage.initialize(namespace: "retention")
         let offline = OfflineStore()
-        offline.setStorageProvider(storage)
+        await offline.setStorageProvider(storage)
 
         let mgr = DocumentManager(logger: Logger(level: .warn, scope: "test"))
         mgr.offlineStore = offline

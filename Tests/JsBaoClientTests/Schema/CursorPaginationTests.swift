@@ -10,7 +10,7 @@ import Yniffi
 /// Contract:
 ///  - Cursor is an opaque base64-encoded JSON payload with
 ///    `{ values, sortFields, direction }`.
-///  - `queryPaged` returns `PagedQueryResult<[String: Any]>` with
+///  - `queryPaged` returns `PagedQueryResult<PrimitiveRow>` with
 ///    `data`, `nextCursor`, `prevCursor`, `hasMore`.
 ///  - Multi-field sort paginates lexicographically: for a sort of
 ///    `[a ASC, id ASC]`, the WHERE becomes

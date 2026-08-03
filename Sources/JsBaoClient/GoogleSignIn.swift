@@ -249,7 +249,7 @@ extension JsBaoClient {
 
         return GoogleSignInResult(
             userId: getUserId(),
-            isNewUser: response["isNewUser"] as? Bool ?? false
+            isNewUser: response.isNewUser ?? false
         )
     }
 }

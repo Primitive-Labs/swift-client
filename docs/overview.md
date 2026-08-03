@@ -45,7 +45,7 @@ Each layer is independently usable in tests. The [architecture doc](architecture
 | `TypedModel<T: PrimitiveModel>` | Generic wrapper. CRUD and query helpers for a typed struct. | When you have a codegen-emitted struct and want type-safe access. |
 | `DynamicModel` | Schemaless view of records in a doc. Same storage, weaker typing. | When the schema isn't known at compile time, or you need a method `TypedModel<T>` doesn't expose yet. |
 | `PrimitiveRecord` | Stringly-typed record dictionary. What `DynamicModel` returns. | Inside `init?(record:)` (codegen-emitted), or when working with `DynamicModel`. |
-| `EventEmitter` / `JsBaoEvent` | Typed event bus. `.sync`, `.connectionState`, etc. | Subscribing to lifecycle events. |
+| `JsBaoEventPayload` payload types (`SyncEvent`, `StatusChangedEvent`, …) | Each names the one event key it is delivered under. Consumed via `client.stream(for:)`, `observeOnMainActor(_:handler:)` or `nextEvent(_:timeout:where:)`. | Subscribing to lifecycle events. |
 | `JsBaoError` / `JsBaoErrorCode` | Error taxonomy. 19 error codes that match JS exactly. | Catching and reasoning about failures. |
 
 ## How a request flows

@@ -85,6 +85,88 @@ TEST_SUPERADMIN_JWT="your-jwt" \
 swift test
 ```
 
+## Concurrency gates
+
+Two gate scripts guard the concurrency work (#1910, #1993, #1994). They are not
+ordinary test suites: each enforces a *budget* that only moves in one direction.
+
+### `scripts/v6-sendable-gate.sh` — the Swift 6 `Sendable` regression gate
+
+The `JsBaoClient` target builds in the **Swift 6 language mode** (#1946), so
+strict concurrency checking is `complete`. The diagnostics the compiler grades
+as errors under that mode — the `Sendable` conformance failures the epic's
+851-error cascade was made of — now fail `swift build` in
+`Sources/JsBaoClient` on their own. The rest of the package —
+`SwiftBaoCodegen`, both test targets, `E2EMiniApp` — is still in Swift 5 mode,
+pinned by `swiftLanguageModes: [.v5]` at the package level.
+
+Not every strict-concurrency diagnostic is error-level, though, so "builds
+clean" is narrower than "no `Sendable` violations". As of Apple Swift 6.3.1 the
+target still emits 11 warning-level `#SendableClosureCaptures` diagnostics, all
+from one site (`Sources/JsBaoClient/Storage/SQLiteStorageProvider.swift`, the
+`work` parameter of `onQueue`). That group is warning-level in this compiler
+under `-swift-version 6` and under `-swift-version 5 -strict-concurrency=complete`
+alike, so the language mode is not what holds it down, and the gate below does
+not count it either — it greps `error:` lines, so its "0 sites" verdict is a
+statement about errors. Clearing that site needs `Sendable` constraints on the
+public `StorageProvider` generic methods, which is a public-API change; it is
+tracked in #2318.
+
+The gate adds three things `swift build` does not:
+
+1. It confirms the mode is still committed, reading it out of
+   `swift package dump-package` rather than the source text. A revert to `.v5`
+   would compile clean and report zero sites, which is the one failure a build
+   cannot catch.
+2. It attributes errors per file, so a regression reads at a glance.
+3. It fails before the test build starts, with a gate-shaped message.
+
+`run-tests.sh` invokes it in assertion mode before every full-suite run, with
+the budget in `V6_MAX_SITES` and the per-file list in `V6_ZERO_FILES`. Both are
+at **zero**. Set `SKIP_V6_SENDABLE_GATE=1` to skip it while iterating; never
+raise the budget to make a change pass.
+
+```bash
+scripts/v6-sendable-gate.sh                                  # measure only
+scripts/v6-sendable-gate.sh --max 0 --require-zero Internal/KvCache.swift
+```
+
+Before #1946 the target compiled in `.v5` and this script installed `.v6`
+itself, by rewriting `Package.swift` into a scratch build and restoring it
+afterwards. That is how the epic's per-phase "this file is at zero sites"
+claims were checkable at all. The rewrite is gone — the mode it simulated is
+now the one the package builds in.
+
+### `scripts/tsan-gate.sh` — the ThreadSanitizer baseline diff
+
+Runs the concurrency suites under ThreadSanitizer. The baseline on `main` is
+**not** clean, so this is a baseline-*diff* gate rather than a clean-run gate:
+it splits the TSan output into per-race blocks and classifies each as KNOWN
+(matching a signature in `BASELINE_RACE_SIGNATURES`) or NEW. Only a NEW race
+fails it.
+
+**Shrinking the baseline.** When a change genuinely fixes one of the documented
+races, remove its signature — but only under two conditions, both of which the
+existing removals follow:
+
+1. **Remove only after a clean run confirms the signature is gone.** Removing an
+   entry on the strength of the reasoning alone leaves the gate green whether or
+   not the fix worked.
+2. **Add the suite that exercises the race to the default filter.** The
+   signatures are type- or method-level, so a removed entry only means anything
+   if something in the default run actually hammers that code. `EventStreamTests`
+   (#1994 Phase E2) and `AnalyticsQueueFlushTimerRaceTests` (#1993 Phase D3)
+   were both added for exactly this reason.
+
+Removals so far: the two `EventEmitter` / `EventSubscription` races (#1994
+Phase E2) and the `AnalyticsQueue` / `flushTimer` pair (#1993 Phase D3, once the
+type became an actor). A race in any of them now **fails** the gate.
+
+```bash
+scripts/tsan-gate.sh              # default concurrency-suite filter
+scripts/tsan-gate.sh MyTests      # custom XCTest filter
+```
+
 ## Test Infrastructure
 
 ### `TestContext`

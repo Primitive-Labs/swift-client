@@ -70,19 +70,72 @@ Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource
 |------|-------------|
 | `Options.swift` | `JsBaoClientOptions`, `AuthConfig`, `SyncConfig`, `StorageConfig`, `OpenDocumentOptions`, etc. |
 | `Events.swift` | `JsBaoEvent` enum + typed payload structs (`SyncEvent`, `AuthStateEvent`, `StatusChangedEvent`, …) |
+| `JsBaoEventPayload.swift` | The payload/event association (`JsBaoEventPayload.eventKey`), the nine payload types converted from dictionaries, and the conformance table the drift guards read |
 | `Errors.swift` | `JsBaoError` / `AuthError` / `HttpError` — error codes match the JS client for cross-platform consistency |
-| `EventEmitter.swift` | Generic typed event bus with `.on()`, `.off()`, `.onAny()`, `waitForEvent()` |
+| `EventEmitter.swift` | The event registry. Serves `AsyncStream` consumers (`client.stream(for:)`, `observeOnMainActor`, `nextEvent`) and the deprecated `on` / `onAny` callback shim from one `emit`, so both keep their delivery contracts |
 
 ## Concurrency Model
 
-The client uses Swift's structured concurrency (`async/await`, `Task`) but does **not** use actors. Instead, shared mutable state is protected by `NSLock`, and types are marked `@unchecked Sendable`. This was a deliberate choice to avoid the rigidity of actor isolation while the API surface was still evolving.
+The client uses Swift's structured concurrency (`async/await`, `Task`) and is split into **two domains** with different isolation models. Which domain a type belongs to is a decision, not an accident — do not move a type across the line without going through the concurrency epic (#1993).
 
-Key concurrency patterns:
+### The async domain — actors
+
+The service managers that own async work are Swift `actor`s. They have no lock and no `Sendable` opt-out; their state is actor-isolated and every value crossing the boundary is `Sendable` (in practice `JSONValue`, never `Any`).
+
+| Actor | Owns |
+|---|---|
+| `OfflineStore` | Storage-provider wiring, the offline metadata DB, the persisted analytics queue |
+| `KvCache` | The two-tier cache, the in-flight fetch dedup table |
+| `AnalyticsQueue` | The event buffer, the batch flush timer, transmission |
+| `BlobManager` | The upload queue, the in-memory blob cache, the upload-concurrency setting, the single coalesced queue timer |
+
+`WebSocketManager` (#2171) and `AuthController` (#2173) are queued for the same treatment and are class-plus-lock today.
+
+`BlobManager` is the one actor here with substantial `nonisolated` surface, and it is worth knowing why. All of the following are `nonisolated`:
+
+- the network transfers — `uploadImmediate`, `uploadFromSource`, `read`, `prefetch`;
+- the queue driver — `processQueue`, `runUploadTask`, and the `makeQueueTimer` task factory;
+- the public queue mutators — `pauseUpload`, `resumeUpload`, `pauseAll`, `resumeAll`, `cancelQueuedUpload` — each of which does its isolated bookkeeping in a named isolated step and then emits from outside it;
+- every emit helper, plus `downloadUrl`, `computeBackoff` and the pure statics.
+
+Only the queue bookkeeping is isolated: the isolated steps those verbs call (`markUploadPaused`, `markAllResumed`, `selectDueTasks`, `enqueue`, `claimQueueTimer`, `recordUploadFailure` and their siblings), plus the reads and setters over `uploadQueue`, `memoryBlobs`, `uploadConcurrency` and the queue-timer fields. That is what keeps concurrent uploads concurrent, keeps a slow event subscriber off the actor, and lets `downloadUrl` stay synchronous for SwiftUI. Its removed synchronous *reads* and result-returning mutators use a second shape beside the twins: an `@available(*, unavailable, renamed:)` stub, so the compiler offers a rename fix-it rather than "no such member" — a snapshot-backed synchronous read would be a second source of truth, and a synchronous `pauseUpload` would return a `Bool` about a mutation that had not happened yet.
+
+Because an actor's members are isolated, a synchronous public member cannot survive a conversion unchanged. The policy for that is **additive `Async` twins plus a one-release deprecation**: the synchronous original stays, marked `@available(*, deprecated)`, beside a distinctly-named `…Async` twin that does the work on the caller's task. The twin is deliberately *not* a same-name `async` overload — Swift prefers the `async` overload in an asynchronous context, so a same-name twin turns every existing un-`await`ed call into a compile error, which is the break the window exists to avoid.
+
+### The sync domain — class plus lock, permanently
+
+The synchronous core keeps `NSLock` and `@unchecked Sendable` **by design**, not as debt: `YDocument` behind the yrs FFI lock, the in-process model store (`DynamicModel`, `MultiDocModel`, `BaoModelQueryEngine`), the generated synchronous reads, and the `JsBaoClient` facade itself, whose public surface has synchronous members. There is no plan to actorize any of them.
+
+A handful of types sit next to that core and are also permanently class-plus-lock — `DatabaseSubscriptionRegistry` is the clearest case: it does no I/O, has no `await` anywhere, and an actor would cost `databases.subscribe(...)` its synchronous shape while buying nothing.
+
+Key patterns in this domain:
 
 - **WebSocketManager**: `NSLock` guards the state machine; strict identity checks prevent callbacks from stale `URLSession` instances
 - **SQLiteStorageProvider**: A serial `DispatchQueue` serializes all database access
 - **DocumentManager**: Lock-protected dictionaries for open documents and sync state
 - **Task-based timers**: Reconnect delays and retry backoff use `Task.sleep` with cancellation
+
+### Review invariants
+
+Two rules carry the correctness the compiler cannot check. Both are worth stopping a review over.
+
+**1. Every `@unchecked Sendable` carries a written safety argument.** The attribute is a claim the compiler does not verify, so the acceptance bar is a doc comment above the declaration that names the specific locks and says which fields they confine, plus any documented exception (`deinit` is the usual one). `SendableModelLayerTests` and `SyncAdjacentBoundaryTypesTests` read the source text and fail if an argument is missing or stops naming its locks — a bare `@unchecked Sendable` cannot be added quietly.
+
+**2. No `await` inside a decision block.** A region that reads state, decides from it, and then commits the decision — check-and-register, check-and-schedule, claim-then-act — must contain no suspension point. Under a lock this came free: one `withLock` was atomic. Under an actor it does **not**: actor isolation is *reentrant*, so an `await` in the middle lets another call interleave between the check and the commit and both callers take the same decision. This is precisely the class of race the actor conversion is supposed to remove, so it is the class most easily reintroduced.
+
+The pattern that keeps the region await-free is to move the body being registered into its own factory method, so constructing the value needs no suspension:
+
+```swift
+// ✅ the decision region has no `await` in it
+func fetch(key: String) async throws -> JSONValue {
+    if let inflight = inflightRequests[key] { return try await inflight.value }  // decide
+    let task = makeFetchTask(key: key)                                          // build, no await
+    inflightRequests[key] = task                                                // commit
+    return try await task.value                                                 // await, after
+}
+```
+
+`KvCache.fetchCachedValue`, `AnalyticsQueue.scheduleFlush` and `BlobManager`'s three regions (`scheduleQueueProcessing`, `selectDueTasks`, `recordUploadFailure`) are the live examples, and each is pinned by a structural test that slices the region out of the comment-stripped source and asserts it contains no `await`. Write the same kind of test for any new decision region.
 
 ### YDocument transactions: the non-reentrant lock rule
 

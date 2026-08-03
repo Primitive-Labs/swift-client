@@ -38,7 +38,7 @@ final class FreshnessTests: XCTestCase {
         try await waitForSync(client: client2, documentId: docId)
 
         let mapWrite: YMap<String> = doc2.getOrCreateMap(named: "data")
-        client2.transactAndSync(docId) { txn in
+        try client2.transactAndSync(docId) { txn in
             mapWrite.updateValue("fresh-data", forKey: "field", transaction: txn)
         }
         try await delay(2)
@@ -70,7 +70,7 @@ final class FreshnessTests: XCTestCase {
         try await waitForSync(client: client1, documentId: docId)
 
         let map1: YMap<String> = ydoc1.getOrCreateMap(named: "data")
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             map1.updateValue("value1", forKey: "test1", transaction: txn)
             map1.updateValue("value2", forKey: "test2", transaction: txn)
         }
@@ -116,12 +116,12 @@ final class FreshnessTests: XCTestCase {
 
         // Write different data to each
         let mapDoc1: YMap<String> = ydoc1.getOrCreateMap(named: "data")
-        client.transactAndSync(docId1) { txn in
+        try client.transactAndSync(docId1) { txn in
             mapDoc1.updateValue("doc1-value", forKey: "field", transaction: txn)
         }
 
         let mapDoc2: YMap<String> = ydoc2.getOrCreateMap(named: "data")
-        client.transactAndSync(docId2) { txn in
+        try client.transactAndSync(docId2) { txn in
             mapDoc2.updateValue("doc2-value", forKey: "field", transaction: txn)
         }
 

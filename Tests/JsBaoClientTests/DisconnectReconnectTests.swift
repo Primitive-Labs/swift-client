@@ -56,7 +56,7 @@ final class DisconnectReconnectTests: XCTestCase {
 
         // Write data
         let writeMap: YMap<String> = ydoc.getOrCreateMap(named: "document")
-        client.transactAndSync(docId) { txn in
+        try client.transactAndSync(docId) { txn in
             writeMap.updateValue("before disconnect", forKey: "state", transaction: txn)
         }
         try await delay(1)
@@ -168,7 +168,7 @@ final class DisconnectReconnectTests: XCTestCase {
 
         // Write data before disconnect
         let map: YMap<String> = ydoc.getOrCreateMap(named: "data")
-        client.transactAndSync(docId) { txn in
+        try client.transactAndSync(docId) { txn in
             map.updateValue("hello", forKey: "key1", transaction: txn)
         }
         try await delay(1)
@@ -251,7 +251,7 @@ final class DisconnectReconnectTests: XCTestCase {
 
         // Write initial data
         let wMap: YMap<String> = writerDoc.getOrCreateMap(named: "data")
-        writer.transactAndSync(docId) { txn in
+        try writer.transactAndSync(docId) { txn in
             wMap.updateValue("before", forKey: "connected_update", transaction: txn)
         }
         try await delay(1)
@@ -261,10 +261,10 @@ final class DisconnectReconnectTests: XCTestCase {
         try await delay(0.5)
 
         // Make updates while disconnected
-        writer.transactAndSync(docId) { txn in
+        try writer.transactAndSync(docId) { txn in
             wMap.updateValue("offline_1", forKey: "offline_update_1", transaction: txn)
         }
-        writer.transactAndSync(docId) { txn in
+        try writer.transactAndSync(docId) { txn in
             wMap.updateValue("offline_2", forKey: "offline_update_2", transaction: txn)
         }
 
@@ -301,7 +301,7 @@ final class DisconnectReconnectTests: XCTestCase {
 
         let map1: YMap<String> = ydoc1.getOrCreateMap(named: "existingData")
         for i in 0..<5 {
-            client1.transactAndSync(docId) { txn in
+            try client1.transactAndSync(docId) { txn in
                 map1.updateValue("value_\(i)", forKey: "key_\(i)", transaction: txn)
             }
         }
@@ -334,7 +334,7 @@ final class DisconnectReconnectTests: XCTestCase {
         clients.append(client)
 
         var statusHistory: [ConnectionStatus] = []
-        let sub = client.events.on(.status) { (e: StatusChangedEvent) in
+        let sub = client.eventEmitter.subscribe(StatusChangedEvent.self) { e in
             statusHistory.append(e.status)
         }
         defer { sub.cancel() }
@@ -398,8 +398,8 @@ final class DisconnectReconnectTests: XCTestCase {
 
         // Verify client2 receives awareness
         var receivedAwareness = false
-        let sub = client2.events.onAny(.awareness) { payload in
-            if let event = payload as? AwarenessEvent, event.documentId == docId {
+        let sub = client2.eventEmitter.subscribe(AwarenessEvent.self) { event in
+            if event.documentId == docId {
                 receivedAwareness = true
             }
         }

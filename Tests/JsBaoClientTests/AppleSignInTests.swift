@@ -61,10 +61,10 @@ final class AppleSignInUnitTests: XCTestCase {
             rawNonce: "raw-nonce-43-chars",
             user: "001234.abcdef.5678"
         )
-        XCTAssertEqual(body["identityToken"] as? String, "eyJ.identity.token")
+        XCTAssertEqual(body["identityToken"]?.stringValue, "eyJ.identity.token")
         // The RAW nonce goes to the server (it re-hashes); never the digest.
-        XCTAssertEqual(body["nonce"] as? String, "raw-nonce-43-chars")
-        XCTAssertEqual(body["user"] as? String, "001234.abcdef.5678")
+        XCTAssertEqual(body["nonce"]?.stringValue, "raw-nonce-43-chars")
+        XCTAssertEqual(body["user"]?.stringValue, "001234.abcdef.5678")
         // First-authorization hints omitted when Apple didn't provide them —
         // no null placeholders on the wire.
         XCTAssertFalse(body.keys.contains("email"))
@@ -82,9 +82,9 @@ final class AppleSignInUnitTests: XCTestCase {
             firstName: "Rhett",
             lastName: "Owen"
         )
-        XCTAssertEqual(body["email"] as? String, "rhett@example.com")
-        XCTAssertEqual(body["firstName"] as? String, "Rhett")
-        XCTAssertEqual(body["lastName"] as? String, "Owen")
+        XCTAssertEqual(body["email"]?.stringValue, "rhett@example.com")
+        XCTAssertEqual(body["firstName"]?.stringValue, "Rhett")
+        XCTAssertEqual(body["lastName"]?.stringValue, "Owen")
     }
 
     func testCallbackBodyOmitsEmptyHints() {
@@ -111,7 +111,7 @@ final class AppleSignInUnitTests: XCTestCase {
             user: "user",
             inviteToken: "invite-token-abc123"
         )
-        XCTAssertEqual(body["inviteToken"] as? String, "invite-token-abc123")
+        XCTAssertEqual(body["inviteToken"]?.stringValue, "invite-token-abc123")
     }
 
     func testCallbackBodyOmitsNilOrEmptyInviteToken() {
@@ -136,18 +136,19 @@ final class AppleSignInUnitTests: XCTestCase {
     }
 
     func testCallbackBodySerializesToJSON() throws {
-        // The body must be JSONSerialization-clean (it's posted as JSON).
+        // The body is `[String: JSONValue]`, so it encodes straight to the
+        // wire bytes the typed transport sends — no `JSONSerialization`
+        // validity question to answer.
         let body = AppleSignInHelpers.callbackBody(
             identityToken: "tok",
             rawNonce: "nonce",
             user: "user",
             email: "a@b.c"
         )
-        let data = try JSONSerialization.data(withJSONObject: body)
-        let roundTrip = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: data) as? [String: Any]
-        )
-        XCTAssertEqual(roundTrip["user"] as? String, "user")
+        let data = try JSONCoding.encodeData(body)
+        let roundTrip = try JSONCoding.decodeData([String: JSONValue].self, from: data)
+        XCTAssertEqual(roundTrip["user"]?.stringValue, "user")
+        XCTAssertEqual(roundTrip["email"]?.stringValue, "a@b.c")
     }
 
     // MARK: - Server error mapping

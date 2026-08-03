@@ -43,6 +43,15 @@ public enum StartNetworkMode: String, Sendable {
 
 // MARK: - Event Types
 
+/// Every event key the client can deliver.
+///
+/// Each key has exactly one `JsBaoEventPayload` type, which is what
+/// `client.stream(for:)` resolves a subscription from. The two exceptions are
+/// `auth` and `blobsUploadQueued`, deprecated and never emitted (#1120).
+///
+/// Not `CaseIterable`: the compiler declines to synthesize it for an enum with
+/// `@available` cases. `JsBaoEventPayloadTests` reads the case list out of this
+/// file instead, so a newly added event still has to come with a payload type.
 public enum JsBaoEvent: String, Sendable {
     case status
     case networkMode
@@ -86,6 +95,11 @@ public enum JsBaoEvent: String, Sendable {
     case permission
     case meUpdated
     case invitation
+    /// Live mirror of a durable in-app notification (#779 / #1601). Payload:
+    /// `NotificationEvent`. Emitted when the signed-in user receives an in-app
+    /// notification while connected. Mirrors the JS client's `notification`
+    /// event; fetch older rows via `client.notifications.list()`.
+    case notification
     case workflowStatus
     case documentMetadataChanged
     case pendingCreateFailed
@@ -553,7 +567,8 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
 
 /// Real-time notification that a document invitation has changed state.
 ///
-/// Payload for `.invitation` (`client.events.on(.invitation) { (e: InvitationEvent) in … }`).
+/// Payload for `.invitation`
+/// (`for await e in client.stream(for: InvitationEvent.self)`).
 /// Mirrors the JS client's `InvitationEvent` (`src/client/JsBaoClient.ts`)
 /// field-for-field, including optionality.
 ///
@@ -639,6 +654,44 @@ public struct InvitationEvent: Sendable, Equatable {
         self.expiresAt = expiresAt
         self.acceptedBy = acceptedBy
         self.document = document
+    }
+}
+
+/// Payload for `.notification`
+/// (`for await e in client.stream(for: NotificationEvent.self)`).
+///
+/// Real-time mirror of a durable in-app notification (#779 / #1601). Mirrors
+/// the JS client's `NotificationEvent` (`src/client/JsBaoClient.ts`)
+/// field-for-field, including optionality. Emitted over the `notification`
+/// channel when the signed-in user receives an in-app notification while
+/// connected. The durable inbox row is the source of truth — fetch it (and
+/// older rows) via `client.notifications.list()`.
+public struct NotificationEvent: Sendable, Equatable {
+    public let notificationId: String
+    public let title: String
+    public let body: String
+    public let iconUrl: String?
+    public let deepLink: String?
+    /// Where the send came from, e.g. `workflowKey:runKey` or `api:<userId>`.
+    public let sourceRef: String?
+    public let createdAt: String
+
+    public init(
+        notificationId: String,
+        title: String,
+        body: String,
+        iconUrl: String? = nil,
+        deepLink: String? = nil,
+        sourceRef: String? = nil,
+        createdAt: String
+    ) {
+        self.notificationId = notificationId
+        self.title = title
+        self.body = body
+        self.iconUrl = iconUrl
+        self.deepLink = deepLink
+        self.sourceRef = sourceRef
+        self.createdAt = createdAt
     }
 }
 

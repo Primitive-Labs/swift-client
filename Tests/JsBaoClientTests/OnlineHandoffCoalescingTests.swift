@@ -86,11 +86,11 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
             storageConfig: .memory,
             autoNetwork: false
         ))
-        client.authController.makeRequest = { _, _, _ in
+        client.authController.replaceTransportForTesting(RecordingTransport(responder: { _ in
             refreshCalls.increment()
             if holdMs > 0 { try await Task.sleep(nanoseconds: holdMs * 1_000_000) }
             throw RefreshUnavailable()
-        }
+        }))
         return client
     }
 
@@ -105,7 +105,7 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
         let client = makeOfflineClient(refreshCalls: refreshCalls, holdMs: 200)
         defer { Task { await client.destroy() } }
 
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             onlineAuthRequired.increment()
         }
         defer { sub.cancel() }
@@ -147,7 +147,7 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
         let client = makeOfflineClient(refreshCalls: refreshCalls, holdMs: 0)
         defer { Task { await client.destroy() } }
 
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             onlineAuthRequired.increment()
         }
         defer { sub.cancel() }

@@ -29,7 +29,54 @@ import YSwift
 /// `Model.*` facade. App code never references this type; it reaches the
 /// store through `JsBaoClient.queryShared`/`saveShared`/etc. (and the
 /// generated facade methods that call them).
-final class MultiDocModel: IncludeTarget {
+///
+/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+///
+/// A class with mutable state, so the conformance is unchecked. Every stored
+/// property is either immutable-and-`Sendable` or confined to a named lock:
+///
+/// | State | Confinement |
+/// |---|---|
+/// | `schema` (`PrimitiveSchema`) | `let`, `Sendable` value type |
+/// | `engine` (`BaoModelQueryEngine`) | `let`; the engine is itself `@unchecked Sendable` under its own `lock` (see its safety argument) |
+/// | `members`, `orderedDocIds` | mutated in `connect`/`disconnect` and read via `snapshotMembersInOrder` / `connectedDocIds`, all under `lock` |
+/// | `activeSubs` | mutated and read only under the **separate** `subscribeLock` |
+///
+/// **Two locks with a fixed acquisition order: `lock` → `subscribeLock`.**
+/// The nesting is real and one-directional. `connect`/`disconnect` hold `lock`
+/// and call `installActiveSubsOn` / `uninstallActiveSubsFrom`, which take
+/// `subscribeLock` inside it. Nothing ever takes `lock` while holding
+/// `subscribeLock`: `subscribe` snapshots members through
+/// `snapshotMembersInOrder()` (which takes and releases `lock`) *before*
+/// touching `subscribeLock`, and the unsubscribe closure only touches
+/// `subscribeLock`. Since both locks are `NSLock` (non-reentrant), the
+/// inner sections also never re-enter their own lock, and callbacks
+/// (`model.subscribe`, the collected `unsub` closures) are always invoked
+/// with `subscribeLock` released.
+///
+/// **A third lock is in that order: the member's `listenerLock`.**
+/// `installActiveSubsOn` / `uninstallActiveSubsFrom` call
+/// `DynamicModel.subscribe` and the collected `unsub` closures, both of which
+/// take the member's `listenerLock` — and `connect`/`disconnect` still hold
+/// `lock` at that point. So the full order is
+/// `lock` → (`subscribeLock` released) → `listenerLock`. Still
+/// one-directional: nothing in `DynamicModel` takes a `MultiDocModel` lock,
+/// so `listenerLock` is always a leaf here and cannot close a cycle.
+///
+/// **Concurrent `connect`/`disconnect` while a cross-doc query iterates.**
+/// The query methods do not hold `lock` for the duration of the query: they
+/// drain observers over a *snapshot* of members and then run one SQL statement
+/// against `engine`, whose own lock serializes it against the row
+/// inserts/deletes a concurrent `connect`/`disconnect` performs. So a query
+/// concurrent with a membership change is not a data race; it returns a page
+/// that is consistent per SQL statement and may or may not include the doc
+/// being connected/disconnected. That is the same visibility contract a remote
+/// change already has, not a new one.
+///
+/// Listener closures are `@Sendable` (#1992): confining the `activeSubs`
+/// dictionary under a lock says nothing about state a callback captures, so
+/// the closure type carries the requirement instead.
+final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     public let schema: PrimitiveSchema
 
     /// Satisfies `IncludeTarget` — derived from the schema so
@@ -408,8 +455,8 @@ final class MultiDocModel: IncludeTarget {
     /// doc's hook and the top-level unsubscribe can tear down every
     /// hook at once.
     private struct ActiveSub {
-        let callback: () -> Void
-        var unsubByDocId: [String: () -> Void]
+        let callback: @Sendable () -> Void
+        var unsubByDocId: [String: @Sendable () -> Void]
     }
     private var activeSubs: [UUID: ActiveSub] = [:]
     private let subscribeLock = NSLock()
@@ -421,13 +468,15 @@ final class MultiDocModel: IncludeTarget {
     /// on the new member; `disconnect` tears down the per-doc hook.
     /// Matches `DynamicModel.subscribe` semantics (js-bao browser.js:3628).
     @discardableResult
-    public func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+    public func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         let id = UUID()
-        // Pre-install on currently-connected members OUTSIDE
-        // subscribeLock so we don't nest locks (members access goes
-        // through the main `lock` via snapshotMembersInOrder). Then
-        // record the active sub.
-        var unsubByDocId: [String: () -> Void] = [:]
+        // Pre-install on currently-connected members BEFORE taking
+        // `subscribeLock` — member access goes through the main `lock` via
+        // `snapshotMembersInOrder`, and taking `lock` while holding
+        // `subscribeLock` would invert the one-directional
+        // `lock` → `subscribeLock` order the type's safety argument relies
+        // on. Then record the active sub.
+        var unsubByDocId: [String: @Sendable () -> Void] = [:]
         for (docId, model) in snapshotMembersInOrder() {
             unsubByDocId[docId] = model.subscribe(callback)
         }
@@ -446,16 +495,19 @@ final class MultiDocModel: IncludeTarget {
 
     /// Install every active subscriber onto a freshly-connected
     /// member. Called from `connectInternal` after the member is
-    /// registered. Caller holds the main `lock`; we take
-    /// `subscribeLock` to snapshot the active-sub set, release both
-    /// before invoking `model.subscribe` (which takes the model's
-    /// own listener lock).
+    /// registered, so the caller still holds the main `lock` — this is
+    /// the `lock` → `subscribeLock` nesting the type's safety argument
+    /// describes. We take `subscribeLock` only to snapshot the
+    /// active-sub set and release it before invoking `model.subscribe`
+    /// (which takes the model's own listener lock); the main `lock`
+    /// stays held throughout, which is fine because nothing on that
+    /// path tries to reacquire it.
     private func installActiveSubsOn(model: DynamicModel, docId: String) {
         subscribeLock.lock()
         let callbacks = activeSubs.map { (id: $0.key, callback: $0.value.callback) }
         subscribeLock.unlock()
         // `model.subscribe` is safe to call without our locks held.
-        var newUnsubs: [(UUID, () -> Void)] = []
+        var newUnsubs: [(UUID, @Sendable () -> Void)] = []
         for entry in callbacks {
             let unsub = model.subscribe(entry.callback)
             newUnsubs.append((entry.id, unsub))
@@ -474,7 +526,7 @@ final class MultiDocModel: IncludeTarget {
     /// chase stale references.
     private func uninstallActiveSubsFrom(docId: String) {
         subscribeLock.lock()
-        var toFire: [() -> Void] = []
+        var toFire: [@Sendable () -> Void] = []
         for (id, var sub) in activeSubs {
             if let unsub = sub.unsubByDocId.removeValue(forKey: docId) {
                 toFire.append(unsub)
@@ -512,7 +564,7 @@ final class MultiDocModel: IncludeTarget {
     public func queryPaged(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         drainAllObservers()
         return try engine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
@@ -526,16 +578,17 @@ final class MultiDocModel: IncludeTarget {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         drainAllObservers()
         let base = try engine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
             stringsetFields: stringsetFieldNames
         )
-        var rows = base.data
+        // Unwrap → resolve includes (in-place mutation) → rewrap (#1992).
+        var rows = base.data.map(\.raw)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
         return PagedQueryResult(
-            data: rows,
+            data: rows.map(PrimitiveRow.init(raw:)),
             nextCursor: base.nextCursor,
             prevCursor: base.prevCursor,
             hasMore: base.hasMore

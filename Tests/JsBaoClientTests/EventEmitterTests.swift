@@ -9,6 +9,10 @@ import XCTest
 /// (fail-not-hang on a lock-ordering deadlock) directly.
 final class EventEmitterTests: XCTestCase {
 
+    /// Payload for the emits below. `.cacheUpdated` is an arbitrary choice —
+    /// these tests are about the registry's thread safety, not the event.
+    private static let sampleEvent = CacheUpdatedEvent(key: "k", updatedAt: "2026-01-01", value: 1)
+
     /// A minimal thread-safe counter for asserting handler-invocation
     /// conservation across concurrent subscribers.
     private final class AtomicCounter: @unchecked Sendable {
@@ -36,14 +40,14 @@ final class EventEmitterTests: XCTestCase {
 
         assertCompletes(within: 5, "concurrent EventEmitter subscribe") {
             DispatchQueue.concurrentPerform(iterations: subscriberCount) { _ in
-                let sub = emitter.onAny(.cacheUpdated) { _ in counter.increment() }
+                let sub = emitter.subscribe(CacheUpdatedEvent.self) { _ in counter.increment() }
                 subsLock.withLock { subscriptions.append(sub) }
             }
         }
 
         XCTAssertEqual(subscriptions.count, subscriberCount)
 
-        emitter.emit(.cacheUpdated, () as Any)
+        emitter.emit(Self.sampleEvent)
         XCTAssertEqual(counter.value, subscriberCount, "every concurrently-registered handler must fire exactly once")
 
         // Keep the subscriptions alive until here.
@@ -61,10 +65,10 @@ final class EventEmitterTests: XCTestCase {
             DispatchQueue.concurrentPerform(iterations: 400) { i in
                 switch i % 4 {
                 case 0:
-                    let sub = emitter.onAny(.cacheUpdated) { _ in counter.increment() }
+                    let sub = emitter.subscribe(CacheUpdatedEvent.self) { _ in counter.increment() }
                     sub.cancel()
                 case 1:
-                    emitter.emit(.cacheUpdated, () as Any)
+                    emitter.emit(Self.sampleEvent)
                 case 2:
                     emitter.removeAll(for: .cacheUpdated)
                 default:

@@ -85,7 +85,7 @@ final class SwiftEmitterTests: XCTestCase {
                        "find must be synchronous throws, not async (#1156)")
         XCTAssertTrue(body.contains("throw PrimitiveDecodeError(modelName: modelName, row: row)"),
                       "decode misses in find/findAll must throw, not return nil / drop rows")
-        XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping () -> Void) -> () -> Void"))
+        XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void"))
         XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]]"))
         // Cross-document unique lookup + single-result query (JS parity:
         // findByUnique / queryOne).

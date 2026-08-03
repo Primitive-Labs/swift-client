@@ -93,7 +93,7 @@ final class YDocumentDeadlockTests: XCTestCase {
 
     /// End-to-end: simulate the live updates scenario after syncStep2.
     /// Client A writes data; we encode it as a Yrs update; client B applies the update
-    /// (mimicking handleSyncStep2); then client B reads via the FIXED pattern.
+    /// (mimicking handleRemoteUpdate); then client B reads via the FIXED pattern.
     /// This closely mirrors the demo's post-sync read path.
     func testLiveUpdatesEndToEndAfterRemoteApply() {
         // ----- Producer doc (mimics another client) -----
@@ -108,7 +108,7 @@ final class YDocumentDeadlockTests: XCTestCase {
         // ----- Consumer doc (mimics LiveUpdatesDemo's local YDocument) -----
         let consumer = YDocument()
 
-        // Apply the update on a background queue (mirroring handleSyncStep2 dispatch).
+        // Apply the update on a background queue (mirroring handleRemoteUpdate dispatch).
         assertCompletes("applying remote update") {
             let txn = consumer.document.transact(origin: nil)
             try? txn.transactionApplyUpdate(update: producerUpdate)

@@ -235,6 +235,12 @@ final class ApiParityRound2Tests: XCTestCase {
 
     // MARK: - CollectionsAPI new list helpers
 
+    /// Marked deprecated so the deliberate reference to `CollectionsAPI`'s
+    /// deprecated `init(makeRequest:)` sits in a deprecated context and emits
+    /// no warning (#1991 Phase B). The test is the compatibility guard: the
+    /// legacy closure initializer must keep behaving identically while the
+    /// class runs on the typed transport spine.
+    @available(*, deprecated, message: "Deprecated context: exercises the deprecated init(makeRequest:) on purpose (#1991).")
     func test_collections_listAll_GET() async throws {
         let r = CallRecorder()
         let api = CollectionsAPI(makeRequest: r.make)
@@ -247,6 +253,12 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(r.path, "/admin/collections?limit=25&cursor=tok")
     }
 
+    /// Marked deprecated so the deliberate reference to `CollectionsAPI`'s
+    /// deprecated `init(makeRequest:)` sits in a deprecated context and emits
+    /// no warning (#1991 Phase B). The test is the compatibility guard: the
+    /// legacy closure initializer must keep behaving identically while the
+    /// class runs on the typed transport spine.
+    @available(*, deprecated, message: "Deprecated context: exercises the deprecated init(makeRequest:) on purpose (#1991).")
     func test_collections_listPendingInvitations_unwrapsItems() async throws {
         let r = CallRecorder()
         let api = CollectionsAPI(makeRequest: r.make)

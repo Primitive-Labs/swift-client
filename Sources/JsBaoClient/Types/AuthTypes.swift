@@ -199,6 +199,25 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
     }
 }
 
+// MARK: OAuth / Apple callback
+
+/// Result of a native OAuth code exchange — `handleOAuthCallback` (Google)
+/// and `handleAppleCallback` (Sign in with Apple). Mirrors the server's
+/// `{ token, isNewUser }` response. The SDK has already applied `token`
+/// (cause `"google"` / `"apple"`) by the time this is returned; callers read
+/// it for `isNewUser` to branch on first-time signup.
+public struct OAuthCallbackResult: Decodable, Sendable, Equatable {
+    /// The access token the SDK applied.
+    public let token: String
+    /// `true` when the exchange created a brand-new account.
+    public let isNewUser: Bool?
+
+    public init(token: String, isNewUser: Bool? = nil) {
+        self.token = token
+        self.isNewUser = isNewUser
+    }
+}
+
 // MARK: OAuth flow options
 
 /// Waitlist enrollment carried through the OAuth state bag. Mirrors the JS

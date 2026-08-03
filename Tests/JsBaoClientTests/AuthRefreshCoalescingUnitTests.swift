@@ -27,21 +27,8 @@ final class AuthRefreshCoalescingUnitTests: XCTestCase {
         var value: Int { lock.withLock { _value } }
     }
 
-    /// A JWT whose payload decodes so `applyToken` parses a userId and the
-    /// controller ends up authenticated (parity with a real refresh). Only
-    /// the payload segment matters — signature is not verified client-side.
-    private func makeJwt(userId: String) -> String {
-        let payload: [String: Any] = ["userId": userId, "sub": userId, "exp": 9_999_999_999]
-        let data = try! JSONSerialization.data(withJSONObject: payload)
-        let b64 = data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        return "h.\(b64).s"
-    }
-
     private func makeController(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any
+        responder: @escaping @Sendable (RecordedRequest) async throws -> TransportResponse
     ) -> AuthController {
         let controller = AuthController(
             appId: "test-app",
@@ -52,7 +39,7 @@ final class AuthRefreshCoalescingUnitTests: XCTestCase {
             refreshProxy: nil,
             persistConfig: AuthConfig()
         )
-        controller.makeRequest = makeRequest
+        controller.setTransport(RecordingTransport(responder: responder))
         return controller
     }
 
@@ -61,16 +48,20 @@ final class AuthRefreshCoalescingUnitTests: XCTestCase {
     /// cannot make.
     func testConcurrentRefreshesCoalesceToSingleRoundTrip() async throws {
         let refreshCalls = AtomicCounter()
-        let token = makeJwt(userId: "u1")
-        let controller = makeController { method, path, _ in
-            XCTAssertEqual(method, "POST")
-            XCTAssertEqual(path, "/auth/refresh")
+        let token = makeTestJwt(userId: "u1")
+        let controller = makeController { call in
+            XCTAssertEqual(call.method, .post)
+            XCTAssertEqual(call.path, "/auth/refresh")
             refreshCalls.increment()
             // Hold the refresh in flight long enough for every concurrent
             // caller to reach the coalescing check (mirrors the KvCache
             // dedup test's approach).
             try await Task.sleep(nanoseconds: 200_000_000)
-            return ["token": token]
+            return TransportResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: Data("{\"token\": \"\(token)\"}".utf8)
+            )
         }
 
         let callerCount = 50
@@ -104,10 +95,14 @@ final class AuthRefreshCoalescingUnitTests: XCTestCase {
     /// permanently deduped to the first.
     func testSequentialRefreshesEachStartNewRoundTrip() async throws {
         let refreshCalls = AtomicCounter()
-        let token = makeJwt(userId: "u1")
-        let controller = makeController { _, _, _ in
+        let token = makeTestJwt(userId: "u1")
+        let controller = makeController { _ in
             refreshCalls.increment()
-            return ["token": token]
+            return TransportResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: Data("{\"token\": \"\(token)\"}".utf8)
+            )
         }
 
         let first = await controller.refreshAccessToken(cause: "first")

@@ -2,8 +2,18 @@ import Foundation
 
 /// Manages offline storage for metadata, grants, analytics, and JWT persistence.
 /// Replaces IndexedDB-based OfflineStore from the JS client with SQLite-backed storage.
-public final class OfflineStore: @unchecked Sendable {
-    private let lock = NSLock()
+///
+/// ## An actor since #1993, Phase D2
+///
+/// This is one of the async-domain service managers: every operation on it
+/// already awaited the storage provider, so there was nothing synchronous worth
+/// preserving. Actor isolation replaces the `NSLock` + `@unchecked Sendable`
+/// pair outright — no snapshot holder survives, so the whole type is
+/// compiler-checked. The provider accessors that used to be synchronous
+/// (`setStorageProvider`, `setAuthStorageProvider`, `getStorageProvider`) are
+/// isolated now and their callers `await`; `DocumentManager` is the only one in
+/// the client, and both of its call sites already sat in `async` functions.
+public actor OfflineStore {
     private var storageProvider: StorageProvider?
     private var authStorageProvider: StorageProvider?
     private var currentNamespace: String?
@@ -25,35 +35,40 @@ public final class OfflineStore: @unchecked Sendable {
     // MARK: - Provider Setup
 
     public func setStorageProvider(_ provider: StorageProvider) {
-        lock.withLock { self.storageProvider = provider }
+        self.storageProvider = provider
     }
 
     public func setAuthStorageProvider(_ provider: StorageProvider) {
-        lock.withLock { self.authStorageProvider = provider }
+        self.authStorageProvider = provider
     }
 
     public func getStorageProvider() -> StorageProvider? {
-        lock.withLock { storageProvider }
+        storageProvider
     }
 
     // MARK: - Initialization
 
+    /// Bind the app+user database, at most once per namespace.
+    ///
+    /// The three steps are the same three the `NSLock` version had — read the
+    /// decision from isolated state, `await` the provider's `initialize` with
+    /// nothing held, then write the result back — and the reentrancy story is
+    /// unchanged with it: the `await` is a suspension point, so two concurrent
+    /// first calls for the same namespace can both pass the guard and both
+    /// initialize. That was equally true under the lock (it was released across
+    /// the same `await`), and every `StorageProvider` in the client treats a
+    /// repeated `initialize` for the same namespace as idempotent. Converting
+    /// this to a single-flight would be a behavior change, not part of the
+    /// conversion, so it is deliberately left alone.
     public func ensureMetadataDb(appId: String, userId: String) async throws {
         let namespace = "\(appId):\(userId)"
-        let existing: (provider: StorageProvider, alreadyInit: Bool)? = lock.withLock {
-            guard let provider = storageProvider else { return nil }
-            return (provider, currentNamespace == namespace && isInitialized)
-        }
-        guard let existing else { return }
+        guard let provider = storageProvider else { return }
+        if currentNamespace == namespace && isInitialized { return }
 
-        if existing.alreadyInit { return }
+        try await provider.initialize(namespace: namespace)
 
-        try await existing.provider.initialize(namespace: namespace)
-
-        lock.withLock {
-            currentNamespace = namespace
-            isInitialized = true
-        }
+        currentNamespace = namespace
+        isInitialized = true
     }
 
     // MARK: - Metadata Operations
@@ -135,10 +150,19 @@ public final class OfflineStore: @unchecked Sendable {
 
     // MARK: - Analytics
 
-    public func persistAnalyticsQueue(appId: String, userId: String, events: [[String: Any]]) async throws {
+    /// Persist the buffered analytics events.
+    ///
+    /// The payload is `[[String: JSONValue]]`, not `[[String: Any]]` (#1993,
+    /// Phase D2): the events cross this type's new isolation boundary, and an
+    /// `Any` cannot do that under Swift 6. `JSONValue` is also what the events
+    /// already had to be — they are serialized to JSON on the very next line —
+    /// so the type now states a constraint the storage format always imposed.
+    /// Since Phase D3 `AnalyticsQueue` buffers `[[String: JSONValue]]` itself,
+    /// so it hands its rows straight over with no bridging step in between.
+    public func persistAnalyticsQueue(appId: String, userId: String, events: [[String: JSONValue]]) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
         guard let provider = storageProvider else { return }
-        let data = try JSONSerialization.data(withJSONObject: events)
+        let data = try JSONCoding.encodeData(events)
         let jsonString = String(data: data, encoding: .utf8) ?? "[]"
         try await provider.put(
             store: Self.storeAnalytics,
@@ -148,13 +172,13 @@ public final class OfflineStore: @unchecked Sendable {
         )
     }
 
-    public func loadAnalyticsQueue(appId: String, userId: String) async throws -> [[String: Any]] {
+    public func loadAnalyticsQueue(appId: String, userId: String) async throws -> [[String: JSONValue]] {
         try await ensureMetadataDb(appId: appId, userId: userId)
         guard let provider = storageProvider else { return [] }
         let record: StorageRecord<String>? = try await provider.get(store: Self.storeAnalytics, key: Self.analyticsQueueKey)
         guard let jsonString = record?.value,
               let data = jsonString.data(using: .utf8),
-              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+              let arr = try? JSONCoding.decodeData([[String: JSONValue]].self, from: data) else {
             return []
         }
         return arr
@@ -211,13 +235,15 @@ public final class OfflineStore: @unchecked Sendable {
     // MARK: - Lifecycle
 
     public func closeStorage() async {
-        let (provider, authProvider) = lock.withLock { () -> (StorageProvider?, StorageProvider?) in
-            let provider = storageProvider
-            let authProvider = authStorageProvider
-            isInitialized = false
-            currentNamespace = nil
-            return (provider, authProvider)
-        }
+        // Read the two providers and reset the init state in one uninterrupted
+        // isolated step — no `await` between them, so a concurrent
+        // `ensureMetadataDb` cannot observe "still initialized" against a
+        // provider that is about to close. (The `lock.withLock` this replaces
+        // was doing exactly that job.)
+        let provider = storageProvider
+        let authProvider = authStorageProvider
+        isInitialized = false
+        currentNamespace = nil
 
         // Await both closes so the SQLite handles are fully released
         // before this returns. A subsequent client that opens the same

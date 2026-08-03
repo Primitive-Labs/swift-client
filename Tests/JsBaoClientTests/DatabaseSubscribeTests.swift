@@ -31,10 +31,13 @@ final class DatabaseSubscribeTests: XCTestCase {
         // Type config FIRST (with schema) — implicit auto-create on
         // `POST /databases` would materialize a schemaless type and the op
         // gate would refuse the seed op with 422 (mirrors the JS setup).
-        _ = try await client.makeRequest("POST", "/databases/types", [
-            "databaseType": databaseType,
-            "schema": Self.taskSchema,
-        ])
+        let typeConfig: [String: JSONValue] = [
+            "databaseType": .string(databaseType),
+            "schema": .string(Self.taskSchema),
+        ]
+        _ = try await client.requestJSON(
+            method: .post, path: "/databases/types", body: typeConfig
+        )
 
         let db = try await client.databases.create(params: CreateDatabaseParams(
             title: "Swift DB Subs",
@@ -43,7 +46,7 @@ final class DatabaseSubscribeTests: XCTestCase {
         databaseId = db.databaseId
 
         // Seed mutation op the tests use to trigger changes.
-        _ = try await client.makeRequest("POST", "/databases/types/\(databaseType)/operations", [
+        let seedOperation: [String: JSONValue] = [
             "name": "seed_save",
             "type": "mutation",
             "modelName": "$params.modelName",
@@ -56,7 +59,12 @@ final class DatabaseSubscribeTests: XCTestCase {
                 "id": ["type": "string", "required": true],
                 "data": ["type": "object", "required": false],
             ],
-        ])
+        ]
+        _ = try await client.requestJSON(
+            method: .post,
+            path: "/databases/types/\(databaseType)/operations",
+            body: seedOperation
+        )
 
         try await client.connect()
         try await waitForConnection(client: client, timeout: 10)
@@ -70,13 +78,18 @@ final class DatabaseSubscribeTests: XCTestCase {
     // MARK: - Helpers
 
     private func createSubscription(key: String) async throws {
-        _ = try await client.makeRequest("POST", "/databases/types/\(databaseType)/subscriptions", [
-            "subscriptionKey": key,
-            "displayName": "Swift \(key)",
+        let subscription: [String: JSONValue] = [
+            "subscriptionKey": .string(key),
+            "displayName": .string("Swift \(key)"),
             "modelName": "Task",
             "filter": "record.modelName == 'Task'",
             "access": "true",
-        ])
+        ]
+        _ = try await client.requestJSON(
+            method: .post,
+            path: "/databases/types/\(databaseType)/subscriptions",
+            body: subscription
+        )
     }
 
     private func saveTask(id: String, title: String) async throws {
