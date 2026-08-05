@@ -12,17 +12,8 @@ import Network
 /// a client constructed with memory storage and no auto-connect.
 final class NetworkReportingTests: XCTestCase {
 
-    /// Thread-safe capture box for values recorded inside `@Sendable` event
-    /// handlers.
-    private final class LockedBox<T>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var _value: T
-        init(_ value: T) { self._value = value }
-        var value: T {
-            get { lock.withLock { _value } }
-            set { lock.withLock { _value = newValue } }
-        }
-    }
+    // Values recorded inside `@Sendable` event handlers go through the shared
+    // `LockedBox` in `Helpers/LockedBox.swift`.
 
     /// A bare client: bootstrapped token, no auto-connect, memory storage —
     /// constructs without any dev server.

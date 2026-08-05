@@ -11,19 +11,15 @@ import YSwift
 /// What each kind of check here is worth:
 ///
 ///  - The `requireSendable(_:)` calls **document** the intended conformance
-///    set at each call site, and they become a compile error the moment the
-///    package flips to Swift 6 language mode (Phase F, #1946). Be clear about
-///    what they are worth *today*: this target ships as `swift-tools-version:
-///    5.9` with no `-strict-concurrency` flag, so passing a non-`Sendable`
-///    type to a `T: Sendable` generic parameter produces **no diagnostic at
-///    all** under `.v5` minimal checking (warning with
-///    `-strict-concurrency=complete`, error under `.v6`). They are not a gate
-///    on their own.
-///  - The gate that *can* fail today is `scripts/v6-sendable-gate.sh`, run
-///    with `--max` / `--require-zero` from `run-tests.sh`: it builds the
-///    target under `.v6` and exits non-zero if any Phase C file regains a
-///    Sendable error site. That is what actually enforces this phase's
-///    headline invariant while the committed mode is still `.v5`.
+///    set at each call site, and since #2310 they also enforce it: this test
+///    target builds in the Swift 6 language mode along with the rest of the
+///    package, so passing a non-`Sendable` type to a `T: Sendable` generic
+///    parameter is a compile error here. (Between #1946 and #2310 the target
+///    was still `.v5`, where the same call produced no diagnostic at all.)
+///  - `scripts/v6-sendable-gate.sh`, run with `--max` / `--max-warnings` /
+///    `--require-zero` from `run-tests.sh`, is the per-file half: it builds
+///    the library target and exits non-zero if any Phase C file regains a
+///    Sendable site, naming the file — which a bare build failure does not.
 ///  - The source-text checks assert the *written safety argument* exists and
 ///    names the actual locks. An `@unchecked Sendable` is only as good as its
 ///    argument, so a future conformance added without one fails here.
@@ -55,10 +51,8 @@ final class SendableModelLayerTests: XCTestCase {
     }
 
     /// Records the intended `Sendable` conformance at a call site. Generic over
-    /// `T: Sendable`, so every use below becomes a compile error once the
-    /// package moves to Swift 6 language mode (#1946, Phase F). Under the
-    /// committed `.v5` mode with minimal checking it is silent — see the note
-    /// on the type; `scripts/v6-sendable-gate.sh` is the check that fails today.
+    /// `T: Sendable`, so every use below is a compile error since #2310 put this
+    /// test target in the Swift 6 language mode — see the note on the type.
     private func requireSendable<T: Sendable>(_ value: T) -> T { value }
 
     // MARK: - Behavior 7 — the conformances exist and are checked
@@ -133,8 +127,17 @@ final class SendableModelLayerTests: XCTestCase {
         _ = try model.create(id: "c1", values: ["title": .string("before")])
 
         let confined = ConfinedYDocument(doc)
-        let sameDocument = await Task { confined.document }.value
-        XCTAssertTrue(sameDocument === doc, "the holder must carry the live document, not a copy")
+        // Read the document on the FAR side of the hop and send back a
+        // `Sendable` identity. `Task { confined.document }` would return the
+        // non-`Sendable` `YDocument` itself, which the `.v6` mode rejects;
+        // hoisting the read to this side (`Task { confined }.value.document`)
+        // would compile but no longer cross the boundary the test exists to
+        // check.
+        let farSideIdentity = await Task { ObjectIdentifier(confined.document) }.value
+        XCTAssertEqual(
+            farSideIdentity, ObjectIdentifier(doc),
+            "the holder must carry the live document, not a copy")
+        let sameDocument = confined.document
 
         // A write made through the model after the hop is visible through the
         // document the far side received.
@@ -395,8 +398,8 @@ final class SendableModelLayerTests: XCTestCase {
         }
     }
 
-    /// The one check that can actually fail while the target compiles in `.v5`
-    /// is the gate script — so make sure it stays wired up as an assertion.
+    /// The gate script is what names the offending file when a Phase C
+    /// regression appears — so make sure it stays wired up as an assertion.
     /// Without `--max` / `--require-zero` it only measures and always exits 0,
     /// which is the state the review flagged.
     func testV6SendableGateIsWiredAsAnAssertion() throws {

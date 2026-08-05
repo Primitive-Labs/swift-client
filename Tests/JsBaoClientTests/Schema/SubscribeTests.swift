@@ -27,7 +27,7 @@ final class SubscribeTests: XCTestCase {
         SchemaSync.clearCache()
         let doc = YDocument()
         let model = DynamicModel(doc: doc, schema: schema)
-        let fired = NSCountedSet()
+        let fired = FireCounter()
         let unsub = model.subscribe { fired.add("x") }
 
         _ = try model.create(id: "r1", values: ["label": .string("one")])
@@ -49,7 +49,7 @@ final class SubscribeTests: XCTestCase {
         let model = DynamicModel(doc: doc, schema: schema)
         _ = try model.create(id: "r1", values: ["label": .string("one")])
 
-        let fired = NSCountedSet()
+        let fired = FireCounter()
         let unsub = model.subscribe { fired.add("x") }
 
         try model.update(id: "r1", values: ["label": .string("updated")])
@@ -68,7 +68,7 @@ final class SubscribeTests: XCTestCase {
         SchemaSync.clearCache()
         let doc = YDocument()
         let model = DynamicModel(doc: doc, schema: schema)
-        let fired = NSCountedSet()
+        let fired = FireCounter()
         let unsub = model.subscribe { fired.add("x") }
 
         _ = try model.create(id: "r1", values: ["label": .string("one")])
@@ -89,16 +89,16 @@ final class SubscribeTests: XCTestCase {
         SchemaSync.clearCache()
         let doc = YDocument()
         let model = DynamicModel(doc: doc, schema: schema)
-        var firedA = 0
-        var firedB = 0
-        let unsubA = model.subscribe { firedA += 1 }
-        let unsubB = model.subscribe { firedB += 1 }
+        let firedA = LockedBox(0)
+        let firedB = LockedBox(0)
+        let unsubA = model.subscribe { firedA.add(1) }
+        let unsubB = model.subscribe { firedB.add(1) }
 
         _ = try model.create(id: "r1", values: ["label": .string("one")])
         awaitListenerDrain(model: model)
 
-        XCTAssertGreaterThanOrEqual(firedA, 1)
-        XCTAssertGreaterThanOrEqual(firedB, 1)
+        XCTAssertGreaterThanOrEqual(firedA.value, 1)
+        XCTAssertGreaterThanOrEqual(firedB.value, 1)
         unsubA()
         unsubB()
     }
@@ -117,11 +117,18 @@ final class SubscribeTests: XCTestCase {
         let doc = YDocument()
         let model = DynamicModel(doc: doc, schema: schema)
 
-        var observedCounts: [Int] = []
+        let observedCounts = LockedBox([Int]())
         let unsub = model.subscribe {
             // Re-entering the model from the callback: requires the
             // write transaction to be closed.
-            observedCounts.append((try? model.query())?.count ?? 0)
+            //
+            // Query OUTSIDE the box's lock. `query()` drains the observer
+            // queue with a `dispatch_sync`, so holding the lock across it
+            // lets a second listener thread own that queue while it waits
+            // on the lock — a lock inversion that hangs the suite (#2310).
+            // The box only has to serialize the append.
+            let count = (try? model.query())?.count ?? 0
+            observedCounts.withValue { $0.append(count) }
         }
 
         try model.transact {
@@ -130,10 +137,11 @@ final class SubscribeTests: XCTestCase {
         }
 
         awaitListenerDrain(model: model)
-        XCTAssertGreaterThanOrEqual(observedCounts.count, 1,
+        let counts = observedCounts.value
+        XCTAssertGreaterThanOrEqual(counts.count, 1,
                                     "Batch must notify at least once")
         XCTAssertEqual(
-            observedCounts, observedCounts.map { _ in 2 },
+            counts, counts.map { _ in 2 },
             "Every notification observes the committed batch (2 records), never partial state"
         )
         unsub()
@@ -147,23 +155,25 @@ final class SubscribeTests: XCTestCase {
         let doc = YDocument()
         let model = DynamicModel(doc: doc, schema: schema)
 
-        let firingThread = Thread.current
-        var syncFires = 0
+        // `Thread` is not `Sendable`, so the handler compares thread
+        // *identities* rather than capturing the thread object itself.
+        let firingThreadId = ObjectIdentifier(Thread.current)
+        let syncFires = LockedBox(0)
         let unsub = model.subscribe {
             // Count only the synchronous post-commit delivery on the
             // writing thread; async observer-drain fires arrive on a
             // different thread.
-            if Thread.current === firingThread { syncFires += 1 }
+            if ObjectIdentifier(Thread.current) == firingThreadId { syncFires.add(1) }
         }
 
         try model.transact {
             _ = try model.create(id: "b1", values: ["label": .string("x")])
             _ = try model.create(id: "b2", values: ["label": .string("y")])
             _ = try model.create(id: "b3", values: ["label": .string("z")])
-            XCTAssertEqual(syncFires, 0,
+            XCTAssertEqual(syncFires.value, 0,
                            "No notification may fire inside the open transaction")
         }
-        XCTAssertEqual(syncFires, 1,
+        XCTAssertEqual(syncFires.value, 1,
                        "Direct write notifications coalesce to one per batch")
         awaitListenerDrain(model: model)
         unsub()
@@ -179,9 +189,12 @@ final class SubscribeTests: XCTestCase {
         // subscribing, so the callback only sees the delete.
         awaitListenerDrain(model: model)
 
-        var observedCounts: [Int] = []
+        let observedCounts = LockedBox([Int]())
         let unsub = model.subscribe {
-            observedCounts.append((try? model.query())?.count ?? 0)
+            // Query outside the box's lock — see the note in
+            // `testSubscriberQuerySeesCommittedBatchState` (#2310).
+            let count = (try? model.query())?.count ?? 0
+            observedCounts.withValue { $0.append(count) }
         }
 
         try model.transact {
@@ -189,8 +202,9 @@ final class SubscribeTests: XCTestCase {
         }
 
         awaitListenerDrain(model: model)
-        XCTAssertGreaterThanOrEqual(observedCounts.count, 1)
-        XCTAssertEqual(observedCounts, observedCounts.map { _ in 0 },
+        let counts = observedCounts.value
+        XCTAssertGreaterThanOrEqual(counts.count, 1)
+        XCTAssertEqual(counts, counts.map { _ in 0 },
                        "Callback observes the committed delete")
         unsub()
     }
@@ -206,15 +220,15 @@ final class SubscribeTests: XCTestCase {
         SchemaSync.clearCache()
         let multi = MultiDocModel(schema: schema)
 
-        var fired = 0
-        let unsub = multi.subscribe { fired += 1 }
+        let fired = LockedBox(0)
+        let unsub = multi.subscribe { fired.add(1) }
 
         // Connect AFTER subscribing. Subsequent writes must reach the
         // subscriber.
         let a = multi.connect(docId: "docA", doc: YDocument())
         _ = try a.create(id: "a1", values: ["label": .string("a")])
         a.awaitObserverDrain()
-        XCTAssertGreaterThan(fired, 0,
+        XCTAssertGreaterThan(fired.value, 0,
                              "Write on a doc connected after subscribe should still notify")
         unsub()
     }
@@ -228,19 +242,19 @@ final class SubscribeTests: XCTestCase {
         SchemaSync.clearCache()
         let b = multi.connect(docId: "docB", doc: YDocument())
 
-        var fired = 0
-        let unsub = multi.subscribe { fired += 1 }
+        let fired = LockedBox(0)
+        let unsub = multi.subscribe { fired.add(1) }
 
         _ = try a.create(id: "a1", values: ["label": .string("a")])
         a.awaitObserverDrain()
-        let afterFirst = fired
+        let afterFirst = fired.value
 
         multi.disconnect(docId: "docA")
 
         // b keeps firing
         _ = try b.create(id: "b1", values: ["label": .string("b")])
         b.awaitObserverDrain()
-        XCTAssertGreaterThan(fired, afterFirst,
+        XCTAssertGreaterThan(fired.value, afterFirst,
                              "Remaining connected doc must still fire the subscriber")
 
         unsub()
@@ -254,18 +268,18 @@ final class SubscribeTests: XCTestCase {
         SchemaSync.clearCache()
         let b = multi.connect(docId: "docB", doc: YDocument())
 
-        var fired = 0
-        let unsub = multi.subscribe { fired += 1 }
+        let fired = LockedBox(0)
+        let unsub = multi.subscribe { fired.add(1) }
 
         _ = try a.create(id: "a1", values: ["label": .string("a")])
         a.awaitObserverDrain()
-        let afterA = fired
+        let afterA = fired.value
 
         _ = try b.create(id: "b1", values: ["label": .string("b")])
         b.awaitObserverDrain()
 
         XCTAssertGreaterThan(afterA, 0, "docA write should fire")
-        XCTAssertGreaterThan(fired, afterA, "docB write should fire too")
+        XCTAssertGreaterThan(fired.value, afterA, "docB write should fire too")
         unsub()
     }
 
@@ -283,8 +297,8 @@ final class SubscribeTests: XCTestCase {
         SchemaSync.clearCache()
         let modelB = DynamicModel(doc: YDocument(), schema: schema)
 
-        var bFired = 0
-        let unsubB = modelB.subscribe { bFired += 1 }
+        let bFired = LockedBox(0)
+        let unsubB = modelB.subscribe { bFired.add(1) }
 
         try modelA.transact {
             _ = try modelA.create(id: "a1", values: ["label": .string("a")])
@@ -296,7 +310,7 @@ final class SubscribeTests: XCTestCase {
         XCTAssertNotNil(modelA.find(id: "a1"), "doc A write must land")
         XCTAssertNotNil(modelB.find(id: "b1"),
                         "doc B write nested in doc A's transact must land in doc B")
-        XCTAssertGreaterThanOrEqual(bFired, 1,
+        XCTAssertGreaterThanOrEqual(bFired.value, 1,
                                     "doc B subscriber fires on its own commit")
         unsubB()
     }

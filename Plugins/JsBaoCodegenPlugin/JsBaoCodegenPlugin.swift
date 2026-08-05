@@ -48,7 +48,7 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         // SwiftPM only allows tools that appear in the plugin's
         // dependency list.
         let tool = try context.tool(named: "SwiftBaoCodegen")
-        let outputDir = context.pluginWorkDirectory.appending("GeneratedModels")
+        let outputDir = context.pluginWorkDirectoryURL.appending(path: "GeneratedModels")
 
         // Find every `*schema.toml` in the target, plus the bare
         // `models.toml` filename js-bao's codegen reads (#944) — so a
@@ -58,10 +58,10 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         // explicit `models.toml` match adds the JS-canonical name.
         let inputs = target.sourceFiles
             .filter {
-                let name = $0.path.lastComponent
+                let name = $0.url.lastPathComponent
                 return name.hasSuffix("schema.toml") || name == "models.toml"
             }
-            .map { $0.path }
+            .map { $0.url }
 
         guard !inputs.isEmpty else { return [] }
 
@@ -72,14 +72,14 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
             // itself remains the canonical writer — this scan only has
             // to agree on which filenames will exist.
             let predicted = try predictGeneratedFiles(at: input)
-            let outputs = predicted.map { outputDir.appending($0) }
+            let outputs = predicted.map { outputDir.appending(path: $0) }
 
             commands.append(.buildCommand(
-                displayName: "swift-bao-codegen \(input.lastComponent)",
-                executable: tool.path,
+                displayName: "swift-bao-codegen \(input.lastPathComponent)",
+                executable: tool.url,
                 arguments: [
-                    "--input", input.string,
-                    "--output", outputDir.string,
+                    "--input", input.path(percentEncoded: false),
+                    "--output", outputDir.path(percentEncoded: false),
                 ],
                 inputFiles: [input],
                 outputFiles: outputs
@@ -96,8 +96,7 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
     /// without a heavyweight dep, and we only need to identify
     /// `[models.X]` headers and any per-model `class_name` override.
     /// The scan mirrors `SwiftBaoCodegen.TomlParser` / `Naming.pascalCase`.
-    private func predictGeneratedFiles(at path: Path) throws -> [String] {
-        let url = URL(fileURLWithPath: path.string)
+    private func predictGeneratedFiles(at url: URL) throws -> [String] {
         let text = try String(contentsOf: url, encoding: .utf8)
 
         // Track ordered set of model names so the same TOML always

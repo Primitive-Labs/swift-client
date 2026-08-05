@@ -16,13 +16,14 @@ set +a
 # Smoke test: core client ops, sync, offline, persistence, lifecycle
 SMOKE_FILTER="JsBaoClientTests.JsBaoClientTests|AvailabilityTests|LifecycleTests|StorageProviderTests|PersistenceTests"
 
-# Swift 6 Sendable regression gate (#1992, repointed by #1946). The
-# `JsBaoClient` target now compiles in the `.v6` language mode, so a `Sendable`
-# violation in the library is a hard build error rather than a counted
-# diagnostic. The gate still runs first because it turns that build failure
-# into a readable, per-file report before the whole test build starts — and
-# because it checks the mode is still committed, which the build cannot: a
-# revert to `.v5` would compile clean and mean nothing.
+# Swift 6 Sendable regression gate (#1992, repointed by #1946, widened by
+# #2310). Every target in this package now compiles in the `.v6` language mode
+# — the package pins `swiftLanguageModes: [.v6]` — so a `Sendable` violation in
+# the library is a hard build error rather than a counted diagnostic. The gate
+# still runs first because it turns that build failure into a readable,
+# per-file report before the whole test build starts — and because it checks
+# the mode is still committed, which the build cannot: a revert to `.v5` would
+# compile clean and mean nothing.
 #
 # Runs on the full-suite invocation only (filtered runs are for iteration).
 # Set SKIP_V6_SENDABLE_GATE=1 to skip it.
@@ -33,7 +34,15 @@ SMOKE_FILTER="JsBaoClientTests.JsBaoClientTests|AvailabilityTests|LifecycleTests
 # and `SendableAsyncManagerTypingTests.testV6GateHoldsThePhaseD1FilesAtZero`
 # check for, so a half-update fails the suite. `V6_MAX_SITES` stays at 0 — under
 # the committed mode nothing above zero builds at all.
+#
+# `V6_MAX_WARNING_SITES` (#2318) is the other half: strict-concurrency
+# diagnostics this compiler grades as WARNINGS never reach the error count, so
+# the flip left 11 of them in `SQLiteStorageProvider` behind a green build and
+# a green gate. The budget is 0 and counts unique sites in `Sources/JsBaoClient`
+# only. Never raise it to make a change pass — a toolchain bump that surfaces a
+# new warning group is the event this is here to catch.
 V6_MAX_SITES=0
+V6_MAX_WARNING_SITES=0
 V6_ZERO_FILES=(
   "JsBaoClient.swift"                  # Phase C (#1992)
   "Schema/DynamicModel.swift"          # Phase C
@@ -45,6 +54,7 @@ V6_ZERO_FILES=(
   "Internal/OfflineStore.swift"        # Phase D2 — new actor boundary
   "Internal/AnalyticsQueue.swift"      # Phase D3 — the actor itself
   "Internal/BlobManager.swift"         # #2172 — new actor boundary
+  "Internal/WebSocketManager.swift"    # #2171 — new actor boundary
 )
 
 run_v6_gate() {
@@ -52,8 +62,8 @@ run_v6_gate() {
     echo "Skipping the Swift 6 Sendable gate (SKIP_V6_SENDABLE_GATE=1)."
     return 0
   fi
-  echo "Running the Swift 6 Sendable gate (max $V6_MAX_SITES sites)..."
-  scripts/v6-sendable-gate.sh --max "$V6_MAX_SITES" --require-zero "${V6_ZERO_FILES[@]}"
+  echo "Running the Swift 6 Sendable gate (max $V6_MAX_SITES error sites, $V6_MAX_WARNING_SITES warning sites)..."
+  scripts/v6-sendable-gate.sh --max "$V6_MAX_SITES" --max-warnings "$V6_MAX_WARNING_SITES" --require-zero "${V6_ZERO_FILES[@]}"
 }
 
 if [ "${1:-}" = "smoke" ]; then

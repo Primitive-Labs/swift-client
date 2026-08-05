@@ -576,7 +576,26 @@ final class TransportSpineTests: XCTestCase {
         // spellings of the shared `Any` → `JSONValue` lowering that entry point
         // (and `KvCache.cacheValue`) now share, which is the seam where an
         // untyped graph is *converted* rather than carried.
-        let outOfScopeUntypedDictionaryCeiling = 131
+        // Raised 131 → 134 after the fact: #2244 (PR #2390) added the
+        // `AnalyticsContext.logEventAsync` twin in `Types/Events.swift` — the
+        // `asyncLogger` stored property, the `logEventAsync:` init parameter,
+        // and the `logEventAsync(_:)` method each carry the same untyped
+        // `[String: Any]` event parameter as the existing `logEvent(_:)`
+        // surface they mirror. That PR's validation ran filtered Swift suites
+        // that did not include this one, so the failure surfaced on `main`
+        // only after merge. The untyped analytics event surface goes away with
+        // the rest of the `Any` surface in the next major; until then these
+        // three sites are budgeted here like the surface they twin.
+        // Raised 134 → 136 by #2360: `Internal/LocalFirstListing.swift`'s
+        // `serverDocumentPayload(_:)` builds the untyped row that
+        // `DocumentManager.handleServerDocuments([[String: Any]])` consumes —
+        // its return type and the `payload` local are the two sites. That
+        // consumer is a public entry point whose untyped signature this issue
+        // does not change, so the payload builder has to speak its shape;
+        // typing it would mean typing `handleServerDocuments`, which belongs
+        // with the rest of the `Any` surface in the next major. Both sites go
+        // away with it.
+        let outOfScopeUntypedDictionaryCeiling = 136
         var outOfScopeUntypedDictionaries = 0
 
         for (relativePath, url) in try allSourceFiles() where budget[relativePath] == nil {

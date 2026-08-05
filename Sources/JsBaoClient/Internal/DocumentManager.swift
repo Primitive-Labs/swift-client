@@ -120,7 +120,8 @@ public final class DocumentManager: @unchecked Sendable {
     /// js-bao's `ctx.isOnline()`). When nil, retries assume online.
     var isOnlineProvider: (() -> Bool)?
 
-    public init(logger: Logger) {
+    // Internal: takes the module-internal `Logger` (#2363).
+    init(logger: Logger) {
         self.logger = logger.forScope(scope: "docMgr")
     }
 

@@ -29,10 +29,17 @@ func assertCompletes(
     _ work: @escaping () -> Void
 ) {
     let semaphore = DispatchSemaphore(value: 0)
+    // `work` is an ordinary (non-`Sendable`) closure — most callers capture a
+    // `YDocument` or another lock-confined value in it — so under the Swift 6
+    // language mode it cannot be captured directly by the `@Sendable` GCD
+    // closure below (#2310). The handover is one-way: the caller builds it,
+    // the worker runs it, and the caller only resumes once the semaphore is
+    // signalled or the watchdog times out. `SendingBox` is that argument.
+    let sending = SendingBox(work)
     // Intentionally leaked on a genuine hang: the worker may be holding a lock
     // with no safe way to free it. Matches YDocumentDeadlockTests.
     DispatchQueue.global(qos: .userInitiated).async {
-        work()
+        sending.value()
         semaphore.signal()
     }
     if semaphore.wait(timeout: .now() + timeout) == .timedOut {

@@ -49,10 +49,17 @@ final class YDocumentDeadlockTests: XCTestCase {
         let doc = YDocument()
         let semaphore = DispatchSemaphore(value: 0)
 
+        // The worker thread is a second consumer of the same document, which is
+        // exactly what `ConfinedYDocument` exists to express (#2310). Handing it
+        // the raw `YDocument` is a non-Sendable capture in a `@Sendable` closure
+        // under the Swift 6 language mode.
+        let confined = ConfinedYDocument(doc)
+
         // NOTE: this thread is intentionally leaked when the deadlock occurs.
         // It's holding the YrsDoc write lock — there is no safe way to free it.
         // Each run of this test leaks one thread. Acceptable for a regression marker.
         DispatchQueue.global(qos: .userInitiated).async {
+            let doc = confined.document
             let txn = doc.document.transact(origin: nil)
             defer { txn.free() }
             let map = doc.document.getMap(name: "liveDemo")
@@ -78,8 +85,10 @@ final class YDocumentDeadlockTests: XCTestCase {
         preTxn.free()
 
         let semaphore = DispatchSemaphore(value: 0)
+        let confined = ConfinedYDocument(doc)
 
         DispatchQueue.global(qos: .userInitiated).async {
+            let doc = confined.document
             let txn = doc.document.transact(origin: nil)
             defer { txn.free() }
             let map = doc.document.getMap(name: "liveDemo")

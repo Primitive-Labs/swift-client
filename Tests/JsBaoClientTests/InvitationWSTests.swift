@@ -66,10 +66,7 @@ final class InvitationWSTests: XCTestCase {
         try await delay(3)
         sub.cancel()
 
-        lock.lock()
-        let received = invitationReceived
-        let event = receivedEvent
-        lock.unlock()
+        let (received, event) = lock.withLock { (invitationReceived, receivedEvent) }
 
         // Previous version of this test cancelled the subscription and
         // returned without asserting. That made it a no-op smoke test

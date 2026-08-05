@@ -243,3 +243,38 @@ extension HttpError: LocalizedError {
         return "HTTP \(status): \(message)"
     }
 }
+
+// MARK: - WebSocketError
+
+/// Errors thrown by the client's WebSocket connect and send paths. Public
+/// because apps catch it; the `WebSocketManager` that raises it is
+/// module-internal (#2363), so the error type lives here with the client's
+/// other public errors rather than in `Internal/`.
+public enum WebSocketError: Error, Sendable {
+    case notConnected
+    case connectionFailed(String)
+    /// A transport-level failure, reduced to a `Sendable` value at the
+    /// `URLSession` delegate boundary (#2171). `URLSession` hands the client a
+    /// bare `Error`, which is not `Sendable` and so cannot travel on the
+    /// manager's ordered delegate-event channel; the message and the
+    /// `URLError` code are carried instead.
+    ///
+    /// `message` is the original error's `localizedDescription`, and
+    /// `errorDescription` returns it **verbatim** — apps read it through
+    /// `ConnectionErrorEvent.message`, and prefixing it here would change that
+    /// text for every transport failure.
+    case transportFailure(message: String, code: Int?)
+}
+
+extension WebSocketError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .notConnected:
+            return "WebSocket is not connected"
+        case .connectionFailed(let reason):
+            return "WebSocket connection failed: \(reason)"
+        case .transportFailure(let message, _):
+            return message
+        }
+    }
+}

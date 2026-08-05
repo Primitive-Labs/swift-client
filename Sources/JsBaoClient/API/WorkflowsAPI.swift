@@ -34,10 +34,30 @@ public final class WorkflowsAPI: @unchecked Sendable {
     private let handlersLock = NSLock()
 
     /// Designated initializer — the typed transport spine.
-    public init(
+    ///
+    /// The client's logger is module-internal (#2363), so it is not a
+    /// parameter here; the internal overload below carries it for
+    /// `JsBaoClient`'s own construction.
+    public convenience init(
         transport: any Transport,
         getConnectionId: @escaping () -> String = { "" },
-        logger: Logger? = nil,
+        events: EventEmitter? = nil
+    ) {
+        self.init(
+            transport: transport,
+            getConnectionId: getConnectionId,
+            logger: nil,
+            events: events
+        )
+    }
+
+    /// In-module initializer — same as the public one plus the internal
+    /// logger. `logger` deliberately has no default value: that is what keeps
+    /// `WorkflowsAPI(transport:)` unambiguous between the two.
+    init(
+        transport: any Transport,
+        getConnectionId: @escaping () -> String = { "" },
+        logger: Logger?,
         events: EventEmitter? = nil
     ) {
         self.transport = transport
@@ -53,13 +73,12 @@ public final class WorkflowsAPI: @unchecked Sendable {
     public convenience init(
         makeRequest: @escaping (String, String, Any?) async throws -> Any,
         getConnectionId: @escaping () -> String = { "" },
-        logger: Logger? = nil,
         events: EventEmitter? = nil
     ) {
         self.init(
             transport: ClosureTransport(makeRequest: makeRequest),
             getConnectionId: getConnectionId,
-            logger: logger,
+            logger: nil,
             events: events
         )
     }
@@ -159,9 +178,16 @@ public final class WorkflowsAPI: @unchecked Sendable {
 
     /// Gets the status of a workflow run. Mirrors the JS client's
     /// `getStatus` — returns a decoded `WorkflowStatusResult` (#954) whose
-    /// `status` (CF status) and `run` (DB record) carry the raw shapes.
-    /// Throws on a response shape mismatch instead of coercing to `[:]`
+    /// `status` is the server's reconciled run status and `run` is the DB
+    /// record. Throws on a response shape mismatch instead of coercing to `[:]`
     /// (#991).
+    ///
+    /// #2348: the server now returns ONE canonical status on the wire — one of
+    /// `queued`, `running`, `apply_pending`, `apply_claimed`, `completed`,
+    /// `failed`, `terminated`, `missing`. Raw Cloudflare spellings (`complete`,
+    /// `errored`) never reach the client, and the server never rolls a terminal
+    /// run back to `running`, so the client passes `status` through verbatim
+    /// instead of re-deriving it from the run row.
     public func getStatus(
         workflowKey: String,
         runKey: String,
@@ -172,8 +198,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
         var query = URLQuery()
         query.appendIfPresent("contextDocId", contextDocId)
         let path = "/workflows/\(encodedKey)/instances/\(encodedRunKey)/status\(query.queryString)"
-        let decoded: WorkflowStatusResult = try await transport.request(method: .get, path: path)
-        return Self.normalizeWorkflowStatus(decoded)
+        return try await transport.request(method: .get, path: path)
     }
 
     // MARK: - Typed generic overloads (#1547)
@@ -478,16 +503,26 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// the core iOS-backgrounding fix). No interval polling.
     ///
     /// A failed run RESOLVES with `status == "failed"` and the error message — it
-    /// does NOT throw. A run whose `endedAt` is set is treated as terminal even
-    /// when its `status` is stale/non-terminal (#1388). Throws only on two
-    /// conditions: the reconcile fetch 404s (unknown or not-owned `runId` →
-    /// `.notFound`), or `timeoutMs` elapses (`.workflowWaitTimeout`). Every exit
-    /// path clears the timer and cancels both event subscriptions.
+    /// does NOT throw. Terminality comes from the server-declared status alone
+    /// (#2348): `completed`, `failed`, `terminated`, `apply_pending`, or
+    /// `apply_claimed`.
+    ///
+    /// If a reconcile lands while a run is finishing — the server reports the
+    /// execution's status until the platform has published the run's `output`,
+    /// while the run record already carries its terminal status — `waitFor`
+    /// re-checks on a one-second timer until the status endpoint agrees, so a
+    /// caller that missed the terminal frame settles in seconds rather than
+    /// waiting out `timeoutMs`.
+    ///
+    /// Throws on three conditions: the reconcile fetch 404s (unknown or
+    /// not-owned `runId` → `.notFound`), the run reports `missing` (its record
+    /// no longer resolves to an execution, so it will never reach a terminal
+    /// state → `.notFound`), or `timeoutMs` elapses (`.workflowWaitTimeout`).
+    /// Every exit path clears the timer and cancels both event subscriptions.
     ///
     /// - Note: reconcile deliberately uses the runId-keyed status endpoint, never
-    ///   the runKey-keyed `getStatus` — per #1551 the latter 404s on a `runSync`
-    ///   run and destructively restamps its persisted status. Keying on `runId`
-    ///   sidesteps that entirely.
+    ///   the runKey-keyed `getStatus`. Keying on `runId` avoids the runKey
+    ///   route's history of answering 404 for a `runSync` run.
     public func waitFor(
         runId: String,
         options: WaitForWorkflowOptions? = nil
@@ -541,8 +576,10 @@ public final class WorkflowsAPI: @unchecked Sendable {
                         // of fetches, no fetch after settle.
                         repeat {
                             do {
-                                let res = try await self.getStatusByRunId(runId: runId)
-                                if let terminal = Self.terminalFromReconcile(res) {
+                                if let terminal = try await self.reconcileTerminal(
+                                    runId: runId,
+                                    isSettled: { coordinator.isSettled }
+                                ) {
                                     finish(.success(terminal))
                                 }
                             } catch {
@@ -569,7 +606,10 @@ public final class WorkflowsAPI: @unchecked Sendable {
                     // workflows are the one wrinkle: the server broadcasts status
                     // "completed" with needsApply true while the run row is
                     // apply_pending; map the frame to apply_pending so the event
-                    // path agrees with the reconcile path.
+                    // path agrees with the reconcile path. This mapping stays
+                    // after #2348 — the frame is the one surface where the apply
+                    // state is only recoverable from `needsApply` (the HTTP
+                    // status endpoints report `apply_pending` directly).
                     let status = event.needsApply ? "apply_pending" : event.status
                     finish(.success(WaitForWorkflowResult(
                         status: status,
@@ -635,108 +675,107 @@ public final class WorkflowsAPI: @unchecked Sendable {
     }
 
     /// Fetch a run's status keyed by `runId` via the #1443 endpoint
-    /// (`GET /workflows/runs/:runId/status`), normalized through the same
-    /// `normalizeWorkflowStatus` used by `getStatus`. A 404 surfaces as an
+    /// (`GET /workflows/runs/:runId/status`). Like `getStatus`, the server's
+    /// canonical `status` is returned verbatim (#2348). A 404 surfaces as an
     /// `HttpError` (status 404) that `waitFor` maps to `.notFound`.
     internal func getStatusByRunId(runId: String) async throws -> WorkflowStatusResult {
         let encoded = URLEncoding.encodeComponent(runId)
-        let decoded: WorkflowStatusResult = try await transport.request(
+        return try await transport.request(
             method: .get,
             path: "/workflows/runs/\(encoded)/status"
         )
-        return Self.normalizeWorkflowStatus(decoded)
     }
 
-    /// Map any known terminal status spelling to its canonical form, or `nil`
-    /// when the value is non-terminal or unrecognised. Covers three vocabularies
-    /// that reach the client on one field or the other:
+    /// How long the finalization re-check waits between fetches, and how many
+    /// times it retries before settling from the run record (#2348).
+    static let finalizeRecheckIntervalMs: UInt64 = 1000
+    static let finalizeMaxRechecks = 30
+
+    /// One reconcile fetch, plus a bounded re-check through the server's
+    /// finalization window (#2348).
     ///
-    /// - Cloudflare instance spellings (`complete`, `errored`, `terminated`) —
-    ///   what the server returns verbatim under `status` (`resolveRunStatus`
-    ///   responds `{ status: rawStatus, run }` with the *unmapped* CF object).
-    /// - The canonical set the rest of the client uses (`completed`, `failed`,
-    ///   `terminated`) — what the server writes to the run row via
-    ///   `mapInstanceStatus`, so it arrives on `run.status`.
-    /// - The legacy `error` spelling, which the pre-`waitFor` `reconcileRun`
-    ///   treated as terminal alongside `failed`/`terminated` (#2011).
-    static func terminalStatus(_ raw: String?) -> String? {
-        switch raw?.lowercased() {
-        case "complete", "completed": return "completed"
-        case "errored", "error", "failed": return "failed"
-        case "terminated": return "terminated"
-        default: return nil
+    /// A workflow writes its own run row terminal from inside the execution, and
+    /// the platform publishes the run's `output` only once that execution
+    /// returns; in between, the server deliberately reports the EXECUTION's
+    /// in-flight status so a status read never carries `completed` with a `nil`
+    /// output. The terminal `workflowStatus` frame fires at the start of that
+    /// window and is never replayed, so a caller that missed it and reconciles
+    /// inside the window has nothing left to wake it and would wait out the
+    /// whole timeout. When the response's own run record says the run has ended,
+    /// re-check on a short timer instead; if the execution still has not
+    /// published after the window, settle from the record rather than hang.
+    ///
+    /// Throws `.notFound` for a `missing` run: its record no longer resolves to
+    /// an execution, so it will never reach a terminal state (the CLI stops on
+    /// `missing` too, and this path used to be a 404).
+    private func reconcileTerminal(
+        runId: String,
+        isSettled: @escaping @Sendable () -> Bool
+    ) async throws -> WaitForWorkflowResult? {
+        var res = try await getStatusByRunId(runId: runId)
+        if let terminal = Self.terminalFromReconcile(res) { return terminal }
+        if res.status == "missing" {
+            throw JsBaoError(
+                code: .notFound,
+                message: "Workflow run \(runId) is no longer resolvable (status: missing)"
+            )
         }
-    }
 
-    /// Shared status normalizer used by `getStatus` and `getStatusByRunId` so the
-    /// two surfaces map the raw Cloudflare status spellings, the DB apply-flow
-    /// states, and the DB terminal states identically: prefer the run row's
-    /// `apply_pending`/`apply_claimed`, then a terminal Cloudflare status, then a
-    /// terminal run-row status, else `running`.
-    ///
-    /// Note (#1975): this intentionally changes existing `getStatus` output — a
-    /// run whose raw Cloudflare status is `complete` now surfaces as `completed`
-    /// (matching the `workflowStatus` frame, `runSync`, and the persisted
-    /// `run.status`). Previously `getStatus` returned the raw CF spelling.
-    ///
-    /// Note (#2011): the run-row fallback restores behavior the `waitFor` port
-    /// dropped. The removed `reconcileRun` switched on `run.status` — including
-    /// `case "failed", "terminated", "error"` — while this normalizer read the
-    /// run row only for the apply-flow states. A run row that is terminal but has
-    /// no `endedAt` therefore normalized to `running`, and `terminalFromReconcile`
-    /// (whose other terminal signal is `endedAt`) had nothing to settle on, so the
-    /// wait ran to its timeout. The JS `normalizeWorkflowStatusResponse` still has
-    /// the narrower shape; bringing it and the WS-frame path into line is #2119.
-    static func normalizeWorkflowStatus(_ decoded: WorkflowStatusResult) -> WorkflowStatusResult {
-        let cfStatus = decoded.status
-        let dbStatus = decoded.run?.status
-        let normalized: String
-        if dbStatus == "apply_pending" {
-            normalized = "apply_pending"
-        } else if dbStatus == "apply_claimed" {
-            normalized = "apply_claimed"
-        } else if let cfTerminal = terminalStatus(cfStatus) {
-            normalized = cfTerminal
-        } else if let dbTerminal = terminalStatus(dbStatus) {
-            normalized = dbTerminal
-        } else {
-            normalized = "running"
+        var attempts = 0
+        while let stored = Self.finalizingTerminalStatus(res), !isSettled() {
+            if attempts >= Self.finalizeMaxRechecks {
+                return WaitForWorkflowResult(
+                    status: stored,
+                    output: res.output,
+                    error: res.error
+                )
+            }
+            attempts += 1
+            try? await Task.sleep(nanoseconds: Self.finalizeRecheckIntervalMs * 1_000_000)
+            if isSettled() { return nil }
+            // A transient failure inside the window must not abandon the
+            // re-check. The caller swallows anything that isn't `.notFound` and
+            // then leaves the `repeat` loop, and inside the window nothing else
+            // would wake the wait — the terminal frame fired at the start of
+            // the window and is never replayed. So keep re-checking here
+            // (still bounded by `finalizeMaxRechecks`) against the last good
+            // response, and propagate only `.notFound`.
+            do {
+                res = try await getStatusByRunId(runId: runId)
+            } catch {
+                if Self.isNotFound(error) { throw error }
+                continue
+            }
+            if let terminal = Self.terminalFromReconcile(res) { return terminal }
         }
-        return WorkflowStatusResult(
-            status: normalized,
-            output: decoded.output,
-            error: decoded.error,
-            run: decoded.run
-        )
+        return nil
     }
 
-    /// Map a normalized reconcile response to a terminal `waitFor` result, or
-    /// `nil` if the run is not yet terminal. A run is terminal when its status is
-    /// a terminal value OR its `run.endedAt` is set regardless of status (#1388
-    /// robustness).
+    /// The run record's terminal status when the server reports a NON-terminal
+    /// status for a run that has already ended — the finalization window. `nil`
+    /// when the report and the record agree.
+    static func finalizingTerminalStatus(_ res: WorkflowStatusResult) -> String? {
+        guard !WaitForWorkflowResult.terminalStatuses.contains(res.status) else { return nil }
+        guard let stored = res.run?.status else { return nil }
+        return WaitForWorkflowResult.terminalStatuses.contains(stored) ? stored : nil
+    }
+
+    /// Map a reconcile response to a terminal `waitFor` result, or `nil` if the
+    /// run is not yet terminal.
+    ///
+    /// #2348: terminality is decided by the server-declared status alone — one
+    /// of `completed`, `failed`, `terminated`, `apply_pending`, `apply_claimed`.
+    /// The client no longer infers a terminal state from `run.endedAt` or from
+    /// the presence of `run.errorMessage`, and no longer maps raw Cloudflare
+    /// spellings: the server reconciles the run before responding, so its
+    /// `status` is authoritative.
     static func terminalFromReconcile(_ res: WorkflowStatusResult) -> WaitForWorkflowResult? {
-        let isTerminalStatus = WaitForWorkflowResult.terminalStatuses.contains(res.status)
-        let endedAtSet = (res.run?.endedAt?.isEmpty == false)
-        guard isTerminalStatus || endedAtSet else { return nil }
+        guard WaitForWorkflowResult.terminalStatuses.contains(res.status) else { return nil }
         return WaitForWorkflowResult(
-            status: toTerminalWaitStatus(res.status, run: res.run),
+            status: res.status,
             output: res.output,
             error: res.error
         )
-    }
-
-    /// Collapse a normalized status into the terminal `waitFor` status. Terminal
-    /// statuses pass through. A `running` status only reaches here when `endedAt`
-    /// is set (#1388): derive the real terminal state from the run row's error
-    /// (failed if an error message is present, otherwise completed).
-    static func toTerminalWaitStatus(_ status: String, run: WorkflowRunInfo?) -> String {
-        if WaitForWorkflowResult.terminalStatuses.contains(status) {
-            return status
-        }
-        if let msg = run?.errorMessage, !msg.isEmpty {
-            return "failed"
-        }
-        return "completed"
     }
 
     /// Recognise a "run not found" (HTTP 404) from either error shape the status
@@ -949,6 +988,14 @@ private final class WaitForCoordinator: @unchecked Sendable {
     /// subscriptions/timer, and resume the continuation (or stash the result for
     /// `setContinuation` if it isn't installed yet). Idempotent — a second call
     /// is a no-op, so the continuation can never be resumed twice.
+    /// Whether the wait has already settled — read by the finalization re-check
+    /// loop so it stops fetching once someone else claimed the resume.
+    var isSettled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return settled
+    }
+
     func settle(_ result: Result<WaitForWorkflowResult, Error>) {
         lock.lock()
         if settled {

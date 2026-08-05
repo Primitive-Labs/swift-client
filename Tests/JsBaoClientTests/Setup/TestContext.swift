@@ -21,11 +21,30 @@ struct TestUser {
 /// Requires TEST_SUPERADMIN_JWT environment variable to be set with a valid super-admin
 /// JWT. Get one by running the JS tests first (which set up the superuser in DynamoDB),
 /// then mint a JWT via the admin API.
-final class TestContext {
-    private var createdApps: [String] = []
+///
+/// `@unchecked Sendable`: the harness is shared by concurrent tasks in several
+/// tests (a `TaskGroup` creating documents in parallel, for instance). Its three
+/// mutable slots are the only shared state and each one lives in a `LockedBox`,
+/// so every read and write of them is serialised. `URLSession` is `Sendable`
+/// already.
+final class TestContext: @unchecked Sendable {
+    private let createdAppsBox = LockedBox([String]())
     private let session: URLSession
-    private var superuserJWT: String = ""
-    private var superuserEmail: String = ""
+    private let superuserJWTBox = LockedBox("")
+    private let superuserEmailBox = LockedBox("")
+
+    private var createdApps: [String] {
+        get { createdAppsBox.value }
+        set { createdAppsBox.value = newValue }
+    }
+    private var superuserJWT: String {
+        get { superuserJWTBox.value }
+        set { superuserJWTBox.value = newValue }
+    }
+    private var superuserEmail: String {
+        get { superuserEmailBox.value }
+        set { superuserEmailBox.value = newValue }
+    }
 
     init() {
         let config = URLSessionConfiguration.default
@@ -120,7 +139,7 @@ final class TestContext {
             throw TestSetupError("Failed to create app: missing appId in response \(appResult)")
         }
 
-        createdApps.append(appId)
+        createdAppsBox.withValue { $0.append(appId) }
 
         // The create-app response includes "createdBy" which is the userId of
         // the owner that was auto-created for the initialAdminEmail.
@@ -261,7 +280,7 @@ final class TestContext {
         for appId in createdApps {
             _ = try? await adminRequest(method: "DELETE", path: "/admin/api/apps/\(appId)", body: nil)
         }
-        createdApps.removeAll()
+        createdAppsBox.withValue { $0.removeAll() }
     }
 
     // MARK: - Private HTTP Helpers

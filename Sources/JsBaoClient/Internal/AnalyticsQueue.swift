@@ -78,7 +78,8 @@ public actor AnalyticsQueue {
     /// production code.
     private var onFlushScheduled: (@Sendable () -> Void)?
 
-    public init(
+    // Internal: takes the module-internal `Logger` (#2363).
+    init(
         logger: Logger,
         appId: String = "",
         offlineStore: OfflineStore? = nil,

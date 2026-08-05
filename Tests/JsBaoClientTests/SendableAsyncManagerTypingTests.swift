@@ -19,9 +19,9 @@ import YSwift
 /// All server-free.
 final class SendableAsyncManagerTypingTests: XCTestCase {
 
-    /// Records the intended `Sendable` conformance at a call site. Silent under
-    /// the committed `.v5` mode; a compile error once the package flips to
-    /// Swift 6 (#1946).
+    /// Records the intended `Sendable` conformance at a call site. A compile
+    /// error since #2310 put this test target in the Swift 6 language mode
+    /// alongside the rest of the package; silent before that, under `.v5`.
     private func requireSendable<T: Sendable>(_ value: T) -> T { value }
 
     /// Thread-safe counter for asserting how many times a fetcher ran.
@@ -34,9 +34,10 @@ final class SendableAsyncManagerTypingTests: XCTestCase {
 
     // MARK: - Behavior 1 — the gate holds both Phase D1 files at zero
 
-    /// The only check that can fail while the target compiles in `.v5` is the
-    /// gate script, so make sure this phase's two files are actually named in
-    /// its assertion — and that the budget came down to zero with them.
+    /// The compiler catches a regression in this phase's files, but not by
+    /// name — the gate script is what reports the offending file. Make sure
+    /// this phase's two files are still named in its assertion, and that the
+    /// budget stayed at zero with them.
     func testV6GateHoldsThePhaseD1FilesAtZero() throws {
         var root = URL(fileURLWithPath: #filePath)
         // .../Tests/JsBaoClientTests/<this file> → the package root.
@@ -57,9 +58,9 @@ final class SendableAsyncManagerTypingTests: XCTestCase {
     /// group boundary. Checked as source text because the constraint is only a
     /// compile error under `.v6`.
     func testWithTimeoutConstrainsItsResultToSendable() throws {
-        let source = try Self.clientSource("Internal/KvCache.swift")
+        let source = try Self.clientSource("Internal/AsyncTimeout.swift")
         XCTAssertTrue(
-            source.contains("static func withTimeout<R: Sendable>"),
+            source.contains("func withTimeout<R: Sendable>"),
             "withTimeout's result crosses a task-group boundary and must be constrained to Sendable"
         )
     }
@@ -80,15 +81,17 @@ final class SendableAsyncManagerTypingTests: XCTestCase {
     /// — the shape every `CacheFacade.fetchHttp` caller uses.
     func testDictionaryRoundTripsThroughFetchCached() async throws {
         let cache = KvCache()
-        let stored: [String: Any] = [
+        // `[String: Any]` is not `Sendable`, so the fetcher hands its dictionary
+        // over in a `SendingBox` rather than capturing a local `let` directly.
+        let stored = SendingBox<[String: Any]>([
             "name": "Ada",
             "score": 42,
             "active": true,
             "tags": ["a", "b"],
             "nested": ["deep": "value"],
-        ]
+        ])
 
-        let written: [String: Any]? = try await cache.fetchCached(key: "dict", fetcher: { stored })
+        let written: [String: Any]? = try await cache.fetchCached(key: "dict", fetcher: { stored.value })
         let readBack: [String: Any]? = try await cache.fetchCached(key: "dict", fetcher: {
             XCTFail("fetcher must not run on a cache hit")
             return [:] as [String: Any]
@@ -269,20 +272,22 @@ final class SendableAsyncManagerTypingTests: XCTestCase {
         let fetcherCalls = AtomicCounter()
         let callerCount = 50
 
-        let results = try await withThrowingTaskGroup(of: [String: Any]?.self) { group -> [[String: Any]?] in
+        // Child results cross an isolation boundary, and `[String: Any]` is not
+        // `Sendable` — each one is handed over in a `SendingBox`.
+        let results = try await withThrowingTaskGroup(of: SendingBox<[String: Any]?>.self) { group in
             for _ in 0..<callerCount {
                 group.addTask {
-                    try await cache.fetchCached(key: "typed-dedup", fetcher: {
+                    SendingBox(try await cache.fetchCached(key: "typed-dedup", fetcher: {
                         fetcherCalls.increment()
                         try await Task.sleep(nanoseconds: 200_000_000)
                         return ["v": "shared"] as [String: Any]
-                    })
+                    }))
                 }
             }
-            var collected: [[String: Any]?] = []
+            var collected: [SendingBox<[String: Any]?>] = []
             for try await value in group { collected.append(value) }
-            return collected
-        }
+            return SendingBox(collected.map(\.value))
+        }.value
 
         XCTAssertEqual(fetcherCalls.value, 1, "concurrent callers must dedupe to one fetcher invocation")
         XCTAssertEqual(results.count, callerCount)

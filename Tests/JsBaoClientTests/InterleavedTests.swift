@@ -64,10 +64,15 @@ final class InterleavedTests: XCTestCase {
         try await client.connect()
         try await waitForConnection(client: client)
 
+        // Hoist out of `self` before the group: the child tasks would otherwise
+        // capture the non-`Sendable` XCTestCase.
+        let ctx = try XCTUnwrap(self.ctx)
+        let appId = testApp.appId
+        let jwt = testApp.ownerJWT
         let docIds = try await withThrowingTaskGroup(of: String.self) { group in
             for i in 0..<3 {
                 group.addTask {
-                    try await self.ctx.createDocument(appId: self.testApp.appId, jwt: self.testApp.ownerJWT, title: "Sequential \(i)")
+                    try await ctx.createDocument(appId: appId, jwt: jwt, title: "Sequential \(i)")
                 }
             }
             var ids: [String] = []

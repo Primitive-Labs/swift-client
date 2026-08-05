@@ -34,7 +34,8 @@ The main class wires everything together and exposes the public API. It owns ins
 |------|----------------|
 | `AuthController.swift` | JWT lifecycle, token refresh with exponential backoff, OAuth/magic-link/OTP flows, optional JWT persistence to SQLite |
 | `DocumentManager.swift` | Document open/close, Yjs sync protocol (syncStep1 → syncStep2 → syncComplete → streaming updates), persistence via `YjsSQLitePersistence`, pending-create queue |
-| `WebSocketManager.swift` | `URLSessionWebSocketTask` connection, reconnection with exponential backoff (200ms base, capped at `maxReconnectDelay`), auth challenge detection (401/403 aborts reconnect) |
+| `WebSocketManager.swift` | `URLSessionWebSocketTask` connection, reconnection with exponential backoff (200ms base, capped at `maxReconnectDelay`), auth challenge detection (401/403 aborts reconnect). An `actor` behind an ordered delegate-event channel — see Concurrency Model below |
+| `WebSocketTransportBoxes.swift` | The two `nonisolated` boxes that survive that conversion: the transport snapshot the synchronous reads serve from, and the weak delegate the client wires at construction |
 | `HttpClient.swift` | `URLSession`-based REST client, automatic 401 → token refresh retry, JSON serialization |
 | `BlobManager.swift` | Upload queue with configurable concurrency, SHA256 integrity, in-memory cache for recent downloads |
 | `OfflineStore.swift` | Domain-scoped storage (meta, grants, analytics, auth, kv) namespaced per `appId:userId` |
@@ -80,7 +81,7 @@ The client uses Swift's structured concurrency (`async/await`, `Task`) and is sp
 
 ### The async domain — actors
 
-The service managers that own async work are Swift `actor`s. They have no lock and no `Sendable` opt-out; their state is actor-isolated and every value crossing the boundary is `Sendable` (in practice `JSONValue`, never `Any`).
+The service managers that own async work are Swift `actor`s. Their state is actor-isolated and every value crossing the boundary is `Sendable` (in practice `JSONValue`, never `Any`). They carry no `Sendable` opt-out, and no lock — with exactly **two** enumerated exceptions, both belonging to `WebSocketManager` and both argued below: the transport snapshot and the weak delegate box (`Internal/WebSocketTransportBoxes.swift`).
 
 | Actor | Owns |
 |---|---|
@@ -88,8 +89,31 @@ The service managers that own async work are Swift `actor`s. They have no lock a
 | `KvCache` | The two-tier cache, the in-flight fetch dedup table |
 | `AnalyticsQueue` | The event buffer, the batch flush timer, transmission |
 | `BlobManager` | The upload queue, the in-memory blob cache, the upload-concurrency setting, the single coalesced queue timer |
+| `WebSocketManager` | The socket and its session, the connect/disconnect state machine and waiter lists, the reconnect backoff and disconnect-timeout timers, the ordered delegate-event channel |
 
-`WebSocketManager` (#2171) and `AuthController` (#2173) are queued for the same treatment and are class-plus-lock today.
+`AuthController` (#2173) is queued for the same treatment and is class-plus-lock today. `WebSocketManager` depends on it staying that way: its delegate methods are synchronous, so `connect()`'s decision region reads the access token without suspending.
+
+#### `WebSocketManager`'s ordered delegate-event channel
+
+`URLSession` delivers its callbacks on a serial delegate queue, so a class could take their ordering for granted. An actor cannot: a `nonisolated` callback that hops onto the actor gets no ordering guarantee against another, and an `open` overtaking a `close` would leave the state machine believing a dead socket is live.
+
+**Invariant: every lifecycle signal that originates outside isolation enters through the channel, and nothing else does.** One `nonisolated let events: AsyncStream<DelegateEvent>` with an `.unbounded` buffering policy, and a single actor-isolated pump task as its only consumer. `AsyncStream` continuations are FIFO and there is one consumer, so ordering is preserved *by construction*. Three consequences:
+
+- The buffer is unbounded on purpose. A bounded policy that discarded an `open` or a `close` would desynchronize the state machine permanently. It needs none of `EventEmitter`'s high-water metering: there is one producer pair and events fire once per connection-lifecycle transition, never per message.
+- The `nonisolated` callbacks cannot read `task`, so they filter nothing — they carry the task's `ObjectIdentifier` and the pump drops stale events, in the same isolated step as the state it guards.
+- `handleConnectionClosed` has exactly one caller: the pump. The receive loop's *message* path deliberately stays off the channel, because `webSocketManagerOnMessage` is `async` and routing messages through the pump would put an `await` inside the ordering region.
+
+The pump is also the reason `WebSocketManager` is the one actor whose `deinit` matters: it runs for as long as the stream is live, so it captures `self` weakly. A strong capture would retain the actor forever, `deinit` would never run, and the `URLSession` would never be invalidated.
+
+#### `WebSocketManager`'s two surviving locks
+
+Both are `nonisolated` boxes in `Internal/WebSocketTransportBoxes.swift`, kept out of the manager's own file so that file stays provably lock-free.
+
+**The transport snapshot** serves the four synchronous reads — `isConnected`, `isConnecting`, `connectionStatus`, `isSocketOpen` — which stay synchronous permanently (sponsor, 2026-08-02). Written only from inside the actor on each transition, read from anywhere. It holds no continuation, no queue and no ordering state, `connected` and `connecting` are written together so `status` can never report them inconsistently, and it stores the `URLSessionWebSocketTask` reference rather than a cached `Bool` so `isSocketOpen` keeps reading the socket's live `state`.
+
+This is **not** the "second source of truth" the `BlobManager` rationale above rejects, and the difference is worth stating because the two paragraphs sit next to each other. `BlobManager`'s removed reads returned a *result about a queue mutation* — a synchronous `pauseUpload` would have had to answer `Bool` about something that had not happened yet, and a snapshot of queue contents would be a second copy of state the actor owns and mutates on its own schedule. The WebSocket box holds connection-*status* reads with exactly the consistency property the class provided: the class also released its lock before calling the delegate, so a read taken during a transition already observed the pre-transition value for one step. Nothing is duplicated — the box *is* the storage those three fields live in, and the actor reads and writes them through it, so there is no second copy to drift. What survives is the lock, not the source of truth.
+
+**The weak delegate box** exists because `JsBaoClient.setupDependencies()` is synchronous and called from `init`: `wsManager.delegate = self` must land before `init` returns or the manager is briefly live with no delegate. The construction-time injection `KvCache` and `AnalyticsQueue` use does not apply, because the delegate *is* the client and cannot be captured before its own `init` completes.
 
 `BlobManager` is the one actor here with substantial `nonisolated` surface, and it is worth knowing why. All of the following are `nonisolated`:
 
@@ -110,7 +134,6 @@ A handful of types sit next to that core and are also permanently class-plus-loc
 
 Key patterns in this domain:
 
-- **WebSocketManager**: `NSLock` guards the state machine; strict identity checks prevent callbacks from stale `URLSession` instances
 - **SQLiteStorageProvider**: A serial `DispatchQueue` serializes all database access
 - **DocumentManager**: Lock-protected dictionaries for open documents and sync state
 - **Task-based timers**: Reconnect delays and retry backoff use `Task.sleep` with cancellation
@@ -135,7 +158,7 @@ func fetch(key: String) async throws -> JSONValue {
 }
 ```
 
-`KvCache.fetchCachedValue`, `AnalyticsQueue.scheduleFlush` and `BlobManager`'s three regions (`scheduleQueueProcessing`, `selectDueTasks`, `recordUploadFailure`) are the live examples, and each is pinned by a structural test that slices the region out of the comment-stripped source and asserts it contains no `await`. Write the same kind of test for any new decision region.
+`KvCache.fetchCachedValue`, `AnalyticsQueue.scheduleFlush`, `BlobManager`'s three regions (`scheduleQueueProcessing`, `selectDueTasks`, `recordUploadFailure`) and `WebSocketManager`'s three (`connectDecision`, `disconnectDecision`, and the pump's `handle(_:)` — which is non-`async`, so the compiler enforces it) are the live examples, and each is pinned by a structural test that slices the region out of the comment-stripped source and asserts it contains no `await`. Write the same kind of test for any new decision region.
 
 ### YDocument transactions: the non-reentrant lock rule
 

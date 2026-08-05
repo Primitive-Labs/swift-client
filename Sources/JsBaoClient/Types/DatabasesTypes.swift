@@ -318,7 +318,19 @@ public struct ExecuteOperationOptions: Encodable, Sendable {
     public var limit: Int?
     public var cursor: String?
     public var direction: SortDirection?
+    /// When `true`, ask the server for its timing breakdown — the response
+    /// carries an extra `_timing` object.
+    ///
+    /// This one is **not** part of the request body: the server reads the flag
+    /// from the `X-Timing` request header, so `executeOperation` lifts it out
+    /// of these options and sends it as a header (same as the JS client). It is
+    /// therefore excluded from `CodingKeys` below.
     public var timing: Bool?
+
+    /// `timing` is deliberately absent — see the property's note.
+    private enum CodingKeys: String, CodingKey {
+        case params, limit, cursor, direction
+    }
 
     public init(
         params: JSONValue? = nil,

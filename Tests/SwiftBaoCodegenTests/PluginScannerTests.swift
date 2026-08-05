@@ -182,7 +182,7 @@ final class PluginScannerTests: XCTestCase {
     private func assertScannerMatchesParser(
         _ toml: String,
         expectedFiles: [String],
-        file: StaticString = #file,
+        file: StaticString = #filePath,
         line: UInt = #line
     ) throws {
         // `expectedFiles` lists the per-model outputs. The tool (and the

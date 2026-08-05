@@ -15,6 +15,11 @@ import XCTest
 /// no production injection seam), so `connect()`'s rewritten decision prologue,
 /// session swap, continuation prologue, and `didOpenWithProtocol` drain are all
 /// exercised on a real socket too.
+///
+/// Both tests survive the #2171 actor conversion unchanged in substance: the
+/// waiter lists are actor state now rather than lock-guarded fields, and the
+/// registration is atomic with the decision that chose it because the
+/// continuation body runs synchronously inside isolation.
 final class WebSocketManagerDisconnectTests: XCTestCase {
 
     /// No-op delegate that supplies a token and the loopback URL. `weak` on the
@@ -56,49 +61,12 @@ final class WebSocketManagerDisconnectTests: XCTestCase {
         return (manager, delegate, server)
     }
 
-    /// Resumes a continuation exactly once — the first caller (body or timeout)
-    /// wins, later ones are ignored. Lets the watchdog return on timeout while
-    /// a hung `body` task is simply leaked.
-    private final class ResumeOnce: @unchecked Sendable {
-        private let lock = NSLock()
-        private var continuation: CheckedContinuation<Bool, Never>?
-        init(_ continuation: CheckedContinuation<Bool, Never>) { self.continuation = continuation }
-        func resume(_ value: Bool) {
-            let toResume: CheckedContinuation<Bool, Never>? = lock.withLock {
-                let c = continuation
-                continuation = nil
-                return c
-            }
-            toResume?.resume(returning: value)
-        }
-    }
-
-    /// Runs `body` and fails (rather than hanging the suite) if it does not
-    /// finish within `timeout`. The async analog of the GCD `assertCompletes`
-    /// watchdog: a stranded disconnect waiter never resumes, so `body` would
-    /// hang forever. The timeout resumes the awaiting continuation and the
-    /// stuck `body` task is leaked — acceptable because it only happens on a
-    /// genuine regression, never in steady state (matches `assertCompletes`).
-    private func assertAsyncCompletes(
-        within timeout: TimeInterval = 8,
-        _ description: String,
-        file: StaticString = #filePath,
-        line: UInt = #line,
-        _ body: @escaping @Sendable () async -> Void
-    ) async {
-        let finished = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let gate = ResumeOnce(continuation)
-            Task { await body(); gate.resume(true) }
-            Task {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                gate.resume(false)
-            }
-        }
-        if !finished {
-            XCTFail("Deadlock watchdog: \(description) did not complete within \(timeout)s — a disconnect waiter was likely stranded.",
-                    file: file, line: line)
-        }
-    }
+    // The local `assertAsyncCompletes` this suite used to carry was folded into
+    // the shared `assertCompletesAsync(within:)` (`Helpers/DeadlockWatchdog.swift`,
+    // added by #2340 for exactly this case) when `WebSocketManager` became an
+    // actor (#2171 behavior 8): the synchronous `assertCompletes(within:)`
+    // takes a non-`async` closure and cannot wrap actor-isolated
+    // `connect()`/`disconnect()`.
 
     /// Behavior 8: fire many concurrent `disconnect()` calls at a connected
     /// manager. Exactly one becomes the in-flight leader; the rest hit the
@@ -111,7 +79,7 @@ final class WebSocketManagerDisconnectTests: XCTestCase {
         _ = delegate // retain the weak delegate for the test's lifetime
 
         let callers = 50
-        await assertAsyncCompletes(within: 8, "50 concurrent disconnect() callers") {
+        await assertCompletesAsync(within: 8, "50 concurrent disconnect() callers") {
             await withTaskGroup(of: Void.self) { group in
                 for _ in 0..<callers {
                     group.addTask { await manager.disconnect() }
@@ -131,7 +99,7 @@ final class WebSocketManagerDisconnectTests: XCTestCase {
         defer { server.stop() }
         _ = delegate
 
-        await assertAsyncCompletes(within: 15, "connect/disconnect cycles") {
+        await assertCompletesAsync(within: 15, "connect/disconnect cycles") {
             for _ in 0..<3 {
                 await manager.disconnect()
                 try? await manager.connect()

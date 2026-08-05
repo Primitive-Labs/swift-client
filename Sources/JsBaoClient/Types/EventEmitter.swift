@@ -18,7 +18,10 @@ import Foundation
 public final class EventEmitter: @unchecked Sendable {
     private struct CallbackEntry {
         let id: UInt64
-        let handler: (Any) -> Void
+        /// Handed the payload and the delivery metadata captured for that emit.
+        /// Subscribers that do not want the metadata discard the second
+        /// argument, so there is one delivery path rather than two.
+        let handler: (Any, EventDelivery) -> Void
     }
 
     /// One `AsyncStream` consumer. `yield` forwards a matching payload into that
@@ -36,6 +39,11 @@ public final class EventEmitter: @unchecked Sendable {
     private var closureHandlers: [String: [CallbackEntry]] = [:]
     private var streamHandlers: [String: [StreamEntry]] = [:]
     private var nextHandlerId: UInt64 = 0
+    /// Emit counter behind ``EventDelivery/sequence``. Incremented once per
+    /// `dispatch`, inside the critical section that already snapshots the
+    /// handler lists — so the numbers are handed out in the order emits entered
+    /// that section, and no second lock acquisition is added to the emit path.
+    private var nextEmitSequence: UInt64 = 0
     /// Most recent value of each replayable event key, for
     /// `stream(for:replayingLatest: true)`. Bounded by
     /// `replayableEventKeys` — a handful of state-like events, never the
@@ -174,11 +182,25 @@ public final class EventEmitter: @unchecked Sendable {
         _ type: E.Type,
         handler: @escaping (E) -> Void
     ) -> EventSubscription {
+        subscribe(type, withDelivery: { payload, _ in handler(payload) })
+    }
+
+    /// The same registration, with the emit's ``EventDelivery`` alongside the
+    /// payload. Backs `JsBaoClient.observeOnMainActor(_:withDelivery:)`.
+    ///
+    /// Additive on purpose: `subscribe(_:handler:)` above keeps its signature,
+    /// so the client's own listeners that do not care about the metadata are
+    /// untouched, and both forms register the same kind of entry.
+    @discardableResult
+    func subscribe<E: JsBaoEventPayload>(
+        _ type: E.Type,
+        withDelivery handler: @escaping (E, EventDelivery) -> Void
+    ) -> EventSubscription {
         let key = E.eventKey.rawValue
         let id = allocateId()
-        addCallback(event: key, id: id) { value in
+        addCallback(event: key, id: id) { value, delivery in
             guard let typed = value as? E else { return }
-            handler(typed)
+            handler(typed, delivery)
         }
         return EventSubscription { [weak self] in
             self?.removeClosure(event: key, id: id)
@@ -325,7 +347,9 @@ public final class EventEmitter: @unchecked Sendable {
 
     private func onCallback<T>(_ event: JsBaoEvent, handler: @escaping (T) -> Void) -> EventSubscription {
         let id = allocateId()
-        addCallback(event: event.rawValue, id: id) { value in
+        // The deprecated callbacks get no delivery metadata — they are removed
+        // in the next major and their contract is unchanged.
+        addCallback(event: event.rawValue, id: id) { value, _ in
             if let typed = value as? T {
                 handler(typed)
                 return
@@ -345,7 +369,7 @@ public final class EventEmitter: @unchecked Sendable {
 
     private func onAnyCallback(_ event: JsBaoEvent, handler: @escaping (Any) -> Void) -> EventSubscription {
         let id = allocateId()
-        addCallback(event: event.rawValue, id: id) { value in
+        addCallback(event: event.rawValue, id: id) { value, _ in
             // `onAny` gives the handler no type annotation to bridge through, so
             // a converted event is delivered in its pre-conversion dictionary
             // form — byte-for-byte what this subscriber received before.
@@ -365,21 +389,28 @@ public final class EventEmitter: @unchecked Sendable {
     /// one final yield into an already-finished continuation, which
     /// `AsyncStream` discards.
     private func dispatch(key: String, payload: Any) {
-        let (callbacks, streams) = lock.withLock { () -> ([CallbackEntry], [StreamEntry]) in
+        let (callbacks, streams, delivery) = lock.withLock {
+            () -> ([CallbackEntry], [StreamEntry], EventDelivery) in
             if Self.replayableEventKeys.contains(key) {
                 latestByKey[key] = payload
             }
-            return (closureHandlers[key] ?? [], streamHandlers[key] ?? [])
+            // Captured here, not at handler-run time: a subscriber that is
+            // delivered a hop later must still be able to report when the
+            // client emitted. Taken inside the existing critical section so the
+            // sequence a payload carries matches the order emits were admitted.
+            nextEmitSequence += 1
+            let delivery = EventDelivery(emittedAt: Date(), sequence: nextEmitSequence)
+            return (closureHandlers[key] ?? [], streamHandlers[key] ?? [], delivery)
         }
         for entry in callbacks {
-            entry.handler(payload)
+            entry.handler(payload, delivery)
         }
         for entry in streams {
             entry.yield(payload)
         }
     }
 
-    private func addCallback(event: String, id: UInt64, handler: @escaping (Any) -> Void) {
+    private func addCallback(event: String, id: UInt64, handler: @escaping (Any, EventDelivery) -> Void) {
         lock.withLock {
             var list = closureHandlers[event] ?? []
             list.append(CallbackEntry(id: id, handler: handler))

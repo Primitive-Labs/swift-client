@@ -50,18 +50,20 @@ final class DocumentManagerRaceTests: XCTestCase {
         // `.network` so the open path goes through the full lifecycle
         // (sync protocol, persistence wiring, observer registration).
         let n = 10
+        // `YDocument` is not `Sendable`; it crosses the task-group boundary in
+        // the library's `ConfinedYDocument` holder.
         var instances: [YDocument] = []
-        try await withThrowingTaskGroup(of: YDocument.self) { group in
+        try await withThrowingTaskGroup(of: ConfinedYDocument.self) { group in
             for _ in 0..<n {
                 group.addTask {
-                    try await client.openDocument(
+                    ConfinedYDocument(try await client.openDocument(
                         docId,
                         options: OpenDocumentOptions(waitForLoad: .network)
-                    )
+                    ))
                 }
             }
             for try await doc in group {
-                instances.append(doc)
+                instances.append(doc.document)
             }
         }
 

@@ -248,10 +248,10 @@ public actor KvCache {
         let timeoutMs = options.serverTimeoutMs ?? 10000
         if timeoutMs > 0 {
             do {
-                return try await Self.withTimeout(ms: timeoutMs) {
+                return try await withTimeout(ms: timeoutMs) {
                     try await task.value
                 }
-            } catch is CacheTimeoutError {
+            } catch is AsyncTimeoutError {
                 if let stale = await self.get(key: key) { return stale }
                 throw JsBaoError(
                     code: .listTimeout,
@@ -355,27 +355,6 @@ public actor KvCache {
                 error: (error as? JsBaoError)?.message ?? "\(error)"
             )
         )
-    }
-
-    private struct CacheTimeoutError: Error {}
-
-    /// Race an async operation against a timeout, throwing `CacheTimeoutError`
-    /// if `ms` elapses first.
-    ///
-    /// `R: Sendable` because the result crosses the task-group boundary — the
-    /// constraint the Swift 6 language mode requires and the only thing that
-    /// was ever missing here. The sole caller passes `JSONValue`.
-    private static func withTimeout<R: Sendable>(ms: Int, _ op: @escaping @Sendable () async throws -> R) async throws -> R {
-        try await withThrowingTaskGroup(of: R.self) { group in
-            group.addTask { try await op() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-                throw CacheTimeoutError()
-            }
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else { throw CacheTimeoutError() }
-            return first
-        }
     }
 
     /// Set a value in both memory and persistent cache.

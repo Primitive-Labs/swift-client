@@ -96,7 +96,8 @@ public actor BlobManager {
     /// a millisecond timescale. They are `Int?` rather than defaulted to the
     /// `defaultBackoff*Ms` constants because those constants are `internal`, and
     /// a public default argument cannot reference an internal declaration.
-    public init(
+    // Internal: takes the module-internal `Logger` (#2363).
+    init(
         logger: Logger,
         uploadConcurrency: Int = 2,
         backoffBaseMs: Int? = nil,

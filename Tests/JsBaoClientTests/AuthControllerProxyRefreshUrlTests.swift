@@ -75,17 +75,25 @@ final class AuthControllerProxyRefreshUrlTests: XCTestCase {
 /// the refresh completes. Registered globally (the proxy refresh uses
 /// `URLSession.shared`).
 final class ProxyRefreshCaptureURLProtocol: URLProtocol {
-    private static let lock = NSLock()
-    private static var _capturedRefreshUrl: String?
-    static var refreshedToken = ""
+    /// One `LockedBox` for the whole stub: `URLSession` builds the protocol
+    /// instances, so the capture has to be static, and a `static var` is a hard
+    /// error under the Swift 6 language mode however carefully it is locked.
+    private struct Script {
+        var capturedRefreshUrl: String?
+        var refreshedToken = ""
+    }
 
-    static var capturedRefreshUrl: String? { lock.withLock { _capturedRefreshUrl } }
+    private static let script = LockedBox(Script())
+
+    static var capturedRefreshUrl: String? { script.value.capturedRefreshUrl }
+
+    static var refreshedToken: String {
+        get { script.value.refreshedToken }
+        set { script.withValue { $0.refreshedToken = newValue } }
+    }
 
     static func reset() {
-        lock.withLock {
-            _capturedRefreshUrl = nil
-            refreshedToken = ""
-        }
+        script.value = Script()
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -95,8 +103,8 @@ final class ProxyRefreshCaptureURLProtocol: URLProtocol {
 
     override func startLoading() {
         let url = request.url!
-        Self.lock.withLock { Self._capturedRefreshUrl = url.absoluteString }
-        let token = Self.lock.withLock { Self.refreshedToken }
+        Self.script.withValue { $0.capturedRefreshUrl = url.absoluteString }
+        let token = Self.script.value.refreshedToken
         let body = (try? JSONSerialization.data(withJSONObject: ["token": token])) ?? Data()
         let response = HTTPURLResponse(
             url: url,

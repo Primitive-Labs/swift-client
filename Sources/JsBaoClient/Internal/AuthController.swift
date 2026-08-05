@@ -168,7 +168,8 @@ public final class AuthController: @unchecked Sendable {
     // `await`.
     private var _transport: (any Transport)?
 
-    public init(
+    // Internal: takes the module-internal `Logger` (#2363).
+    init(
         appId: String,
         apiUrl: String,
         logger: Logger,

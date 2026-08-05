@@ -347,7 +347,7 @@ final class NetworkMonitoringTests: XCTestCase {
         for trial in 0..<40 {
             // Reset to a known connected baseline (bypasses the reachability
             // dedup, and recovers a trial that stranded the client offline).
-            client.forceReconnect()
+            await client.forceReconnectAsync()
             try await eventually(timeout: 5, description: "trial \(trial): baseline connected") {
                 client.isConnected
             }

@@ -155,6 +155,19 @@ DEFAULT_FILTER="${DEFAULT_FILTER}|ActorizedAnalyticsQueueTests"
 # run under TSan before, and no baseline entry involves `BlobManager` — nothing
 # is removed here, and nothing may be added.
 DEFAULT_FILTER="${DEFAULT_FILTER}|BlobBackoffTests|ActorizedBlobManagerTests"
+# #2171: `WebSocketManager` is an actor now and BOTH remaining baseline entries
+# were removed below. Same rule as `EventStreamTests` and
+# `AnalyticsQueueFlushTimerRaceTests`: a baseline entry may only be removed if
+# the gate actually runs the suites that hammer the race it covered.
+# `WebSocketManagerDisconnectTests` was already in the filter (it drives the
+# `disconnect()` side); `ActorizedWebSocketManagerTests` is the new ordering and
+# reconnect suite, which is what exercises `receiveLoopTask` and the task swap.
+# The `send(_:)` throughput measurement lives in its own suite
+# (`WebSocketSendThroughputTests`) precisely so it is NOT swept in here: a
+# 20,000-send loop under a 5-15x sanitizer is gate runtime with no coverage
+# return, because the ratio between its two arms survives instrumentation.
+# Don't add it (review of PR #2425).
+DEFAULT_FILTER="${DEFAULT_FILTER}|ActorizedWebSocketManagerTests|WebSocketManagerErrorTests"
 
 FILTER="${1:-${DEFAULT_FILTER}}"
 
@@ -166,9 +179,9 @@ FILTER="${1:-${DEFAULT_FILTER}}"
 # block that matches ANY of these is a KNOWN pre-existing race and does not fail
 # the gate; a block matching NONE is a NEW race and fails it.
 #
-# Granularity is deliberate. `WebSocketManager` IS a converted class, so only
-# its `disconnect` method is baseline; it is matched at METHOD level so a new
-# race in any other WebSocketManager method still fails the gate.
+# THE BASELINE IS EMPTY. Every race the gate sees is a NEW race and fails it.
+# Keep it that way: an entry added here is a race someone decided to tolerate,
+# and it needs the same justification the removed ones carried.
 #
 # The `EventSubscription` / `EventEmitter.swift` signatures were REMOVED once
 # #1994 Phase E2 fixed those two races (see the note above) — a race there now
@@ -181,14 +194,41 @@ FILTER="${1:-${DEFAULT_FILTER}}"
 # race anywhere in the file. Removed only after a clean TSan run over
 # `AnalyticsQueueFlushTimerRaceTests` (added to the default filter above)
 # confirmed the signature no longer appears.
-BASELINE_RACE_SIGNATURES=(
-  'WebSocketManager\.disconnect' # disconnect() receiveLoopTask race; METHOD-level
-  'receiveLoopTask'             # WebSocketManager field name, if TSan prints it
-)
+#
+# The last two — `WebSocketManager\.disconnect` and `receiveLoopTask`, the two
+# angles on the same `disconnect()`-versus-receive-loop race — were REMOVED by
+# #2171: `WebSocketManager` is an `actor` now, `receiveLoopTask` is isolated
+# state, and every URLSession callback enters through one ordered channel, so
+# the race the entries covered cannot occur. Removed only after a clean TSan run
+# over the default filter (with `ActorizedWebSocketManagerTests` and
+# `WebSocketManagerErrorTests` added to it above) reported 0 known / 0 new.
+#
+# That leaves the baseline EMPTY, which the two guards below exist to make safe:
+# an empty array is not an accident here, and it must not be able to turn the
+# race verdict into a permanent pass.
+BASELINE_RACE_SIGNATURES=()
 
 # Build a single alternation so a block is "known" if it matches any signature.
-KNOWN_RE="$(printf '%s|' "${BASELINE_RACE_SIGNATURES[@]}")"
-KNOWN_RE="${KNOWN_RE%|}"
+#
+# TWO empty-baseline hazards are handled here, both of which would otherwise
+# turn an emptied baseline into a silently broken gate (#2171 behavior 19):
+#
+#  1. macOS ships bash 3.2, where `"${arr[@]}"` on an EMPTY array aborts under
+#     `set -u` with `unbound variable`. Hence the `${arr[@]+...}` idiom, the
+#     same one `scripts/v6-sendable-gate.sh` already uses for `REQUIRE_ZERO`.
+#  2. An empty `KNOWN_RE` is an empty awk regex, and an empty regex matches
+#     EVERY string. Left unguarded, the classifier below would file every race —
+#     including a brand-new one — as KNOWN, and the race verdict would report OK
+#     forever. `HAVE_BASELINE` makes the classifier skip the known-match branch
+#     entirely when there is no baseline, so every race classifies as NEW.
+if [ "${#BASELINE_RACE_SIGNATURES[@]}" -gt 0 ]; then
+  HAVE_BASELINE=1
+  KNOWN_RE="$(printf '%s|' ${BASELINE_RACE_SIGNATURES[@]+"${BASELINE_RACE_SIGNATURES[@]}"})"
+  KNOWN_RE="${KNOWN_RE%|}"
+else
+  HAVE_BASELINE=0
+  KNOWN_RE=""
+fi
 
 # Collect every race in one run (don't abort on the first) so the diff sees the
 # full set. TSan defaults to halt_on_error=0, but set it explicitly.
@@ -239,7 +279,7 @@ set -e
 #   - Every other report type is counted as OTHER. None of them is in the
 #     documented baseline, so any occurrence fails the gate.
 CLASSIFY="$(
-  awk -v known_re="${KNOWN_RE}" '
+  awk -v known_re="${KNOWN_RE}" -v have_baseline="${HAVE_BASELINE}" '
     /WARNING: ThreadSanitizer:/ {
       in_block=1; block="";
       is_race = ($0 ~ /WARNING: ThreadSanitizer: data race/);
@@ -248,7 +288,10 @@ CLASSIFY="$(
     in_block && /SUMMARY: ThreadSanitizer:/ {
       in_block=0;
       if (!is_race) { other++; }
-      else if (block ~ known_re) { known++; }
+      # The known-match branch is skipped entirely when the baseline is empty:
+      # `block ~ ""` is true for every block, so testing it would classify
+      # every race as KNOWN and report a permanent pass.
+      else if (have_baseline == 1 && block ~ known_re) { known++; }
       else { new++; }
     }
     END { printf "%d %d %d\n", (known+0), (new+0), (other+0); }
@@ -284,6 +327,9 @@ if [ "${NEW_RACES}" -gt 0 ]; then
 elif [ "${KNOWN_RACES}" -gt 0 ]; then
   echo "Race verdict:  OK — only the ${KNOWN_RACES} documented pre-existing (baseline) race(s) fired; no new race."
   echo "               These are the #1910 sponsor-flagged pre-existing races, tolerated by the baseline-diff policy."
+elif [ "${HAVE_BASELINE}" -eq 0 ]; then
+  echo "Race verdict:  CLEAN — no data races at all, and the baseline is empty:"
+  echo "               every race is now a NEW race. Nothing is tolerated here any more."
 else
   echo "Race verdict:  CLEAN — no data races at all."
 fi

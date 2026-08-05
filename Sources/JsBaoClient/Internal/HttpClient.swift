@@ -9,7 +9,8 @@ public struct HttpClientConfig {
     public let getToken: () -> String?
     public let getConnectionId: () -> String?
     public let getGlobalAdminAppId: () -> String
-    public let logger: Logger
+    // Internal: `Logger` is module-internal (#2363).
+    let logger: Logger
 
     /// Single-flight token refresh. HttpClient calls this on a 401 (and when
     /// the current access token is within the expiry window) instead of
@@ -25,7 +26,8 @@ public struct HttpClientConfig {
     /// without a live server.
     public let sessionConfiguration: URLSessionConfiguration?
 
-    public init(
+    // Internal: takes the module-internal `Logger` (#2363).
+    init(
         apiUrl: String,
         appId: String,
         getToken: @escaping () -> String?,

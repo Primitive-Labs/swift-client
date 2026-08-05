@@ -35,23 +35,22 @@ final class EventEmitterTests: XCTestCase {
         // Subscriptions cancel on deinit, so retain them for the lifetime of
         // the test — otherwise the handler is removed the instant the returned
         // `EventSubscription` is discarded.
-        let subsLock = NSLock()
-        var subscriptions: [EventSubscription] = []
+        let subscriptions = LockedBox([EventSubscription]())
 
         assertCompletes(within: 5, "concurrent EventEmitter subscribe") {
             DispatchQueue.concurrentPerform(iterations: subscriberCount) { _ in
                 let sub = emitter.subscribe(CacheUpdatedEvent.self) { _ in counter.increment() }
-                subsLock.withLock { subscriptions.append(sub) }
+                subscriptions.withValue { $0.append(sub) }
             }
         }
 
-        XCTAssertEqual(subscriptions.count, subscriberCount)
+        XCTAssertEqual(subscriptions.value.count, subscriberCount)
 
         emitter.emit(Self.sampleEvent)
         XCTAssertEqual(counter.value, subscriberCount, "every concurrently-registered handler must fire exactly once")
 
         // Keep the subscriptions alive until here.
-        subsLock.withLock { subscriptions.removeAll() }
+        subscriptions.withValue { $0.removeAll() }
     }
 
     /// Race subscribe / emit / removeAll from many threads at once. The

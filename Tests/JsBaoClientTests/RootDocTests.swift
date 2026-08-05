@@ -22,19 +22,17 @@ final class RootDocTests: XCTestCase {
     }
 
     func testGetRootDocument() async throws {
-        // The root document may or may not exist depending on app config
-        do {
-            let result = try await client.documents.getRoot()
-            // If it exists, it should have a documentId
-            XCTAssertFalse(result.documentId.isEmpty)
-        } catch {
-            // Root doc not configured is acceptable
-            let msg = String(describing: error)
-            XCTAssertTrue(
-                msg.contains("404") || msg.contains("not found") || msg.contains("null"),
-                "Unexpected error: \(msg)"
-            )
+        // #2358: getRoot() must resolve the JWT's rootDocId locally and then
+        // fetch that document, matching js-bao (documentsApi.ts getRoot()).
+        // There is no `GET /documents/root` route on the server.
+        guard let rootDocId = client.getRootDocId() else {
+            return XCTFail("Test JWT should carry a rootDocId")
         }
+        let result = try await client.documents.getRoot()
+        XCTAssertEqual(
+            result.documentId, rootDocId,
+            "getRoot() must return the document identified by getRootDocId()"
+        )
     }
 
     func testGetRootDocIdViaClient() async throws {
@@ -68,7 +66,23 @@ final class RootDocTests: XCTestCase {
         // there's something to filter (mint-test-jwt + ensureRootDocAssigned
         // can race against the list's DynamoDB index — getRoot() forces
         // a server-side resolve that warms the permission row).
-        _ = try? await client.documents.getRoot()
+        let rootInfo = try await client.documents.getRoot()
+
+        // Warm the local metadata cache WITH the root row. After #2360 the
+        // default `waitForLoad` is local-first, so a warm cache is the branch
+        // that actually answers a default call — an empty cache would take the
+        // cold-cache network branch and never exercise the local filter.
+        var rootRow: [String: Any] = [
+            "documentId": rootInfo.documentId,
+            "title": rootInfo.title,
+            "permission": rootInfo.permission.rawValue,
+        ]
+        if let tags = rootInfo.tags { rootRow["tags"] = tags }
+        await client.documentManager.handleServerDocuments([rootRow])
+        XCTAssertNotNil(
+            client.documentManager.getMetadataIndex()[root],
+            "the local cache must hold the root row for this test to mean anything"
+        )
 
         let owned = try await client.me.ownedDocuments()
         XCTAssertFalse(
@@ -76,23 +90,23 @@ final class RootDocTests: XCTestCase {
             "root doc must be filtered from the default owned-documents listing"
         )
 
+        // Mirror direction: `includeRoot: true` surfaces the cached root
+        // rather than silently omitting it (js-bao parity, #2360).
+        let withRoot = try await client.me.ownedDocuments(
+            options: MeOwnedDocumentsOptions(includeRoot: true)
+        )
+        XCTAssertTrue(
+            withRoot.contains { $0.documentId == root },
+            "includeRoot: true must surface the root doc"
+        )
+
         // getRoot() resolves the root doc directly even though it's absent
-        // from the default listing. The root doc may not be materialized in
-        // every test app (see testGetRootDocument), so a 404 is acceptable —
-        // but when it does resolve, it must be the JWT's rootDocId.
-        do {
-            let resolvedRoot = try await client.documents.getRoot()
-            XCTAssertEqual(
-                resolvedRoot.documentId, root,
-                "getRoot() must resolve the JWT's rootDocId"
-            )
-        } catch {
-            let msg = String(describing: error)
-            XCTAssertTrue(
-                msg.contains("404") || msg.contains("not found") || msg.contains("null"),
-                "Unexpected getRoot() error: \(msg)"
-            )
-        }
+        // from the default listing, but getRoot() must still resolve it.
+        let resolvedRoot = try await client.documents.getRoot()
+        XCTAssertEqual(
+            resolvedRoot.documentId, root,
+            "getRoot() must resolve the JWT's rootDocId"
+        )
     }
 
     func testIsRootDocumentMatchesJwt() async throws {

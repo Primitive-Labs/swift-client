@@ -190,8 +190,8 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         let (docA, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
         let (docB, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
 
-        let counter = FireCounter()
-        let unsubscribe = CrossDocNote.subscribe { counter.bump() }
+        let counter = LockedBox(0)
+        let unsubscribe = CrossDocNote.subscribe { counter.add(1) }
         defer { unsubscribe() }
 
         try CrossDocNote(id: "a1", title: "alpha", done: false).save(in: docA)
@@ -1065,13 +1065,4 @@ extension CrossDocumentStaticQueryTests.IncPost {
         try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
         return self
     }
-}
-
-/// Thread-safe fire counter with only synchronous locked methods, safe to
-/// read from an async polling closure (Swift 6 forbids lock()/unlock() there).
-private final class FireCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    func bump() { lock.lock(); count += 1; lock.unlock() }
-    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
 }

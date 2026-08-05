@@ -69,6 +69,21 @@ enum ClientSourceText {
         return sources
     }
 
+    /// Every `.swift` file in the package — `Sources/` and `Tests/` both — as
+    /// paths relative to the package root, so each one can be read back with
+    /// `packageFile(_:)`. Sorted, so a failure names the same file every run.
+    static func packageSwiftFiles() throws -> [String] {
+        var found: [String] = []
+        for top in ["Sources", "Tests"] {
+            let root = packageRoot.appendingPathComponent(top)
+            guard let walker = FileManager.default.enumerator(atPath: root.path) else { continue }
+            for case let path as String in walker where path.hasSuffix(".swift") {
+                found.append("\(top)/\(path)")
+            }
+        }
+        return found.sorted()
+    }
+
     /// Drops `//` line comments. Block comments are not used in these files.
     static func stripComments(_ source: String) -> String {
         source
@@ -105,6 +120,35 @@ enum ClientSourceText {
             i -= 1
         }
         return block.reversed().joined(separator: "\n")
+    }
+
+    /// The attribute lines (`@available`, `@discardableResult`, …) attached to
+    /// `declaration` — the contiguous run of `@`-prefixed lines immediately
+    /// above it, looking past doc comments and blank lines. Returns `[]` when
+    /// the declaration isn't in the source at all.
+    ///
+    /// This is how the deprecation-window checks read an `@available` without
+    /// grepping the whole file: an attribute somewhere else in the file, or in
+    /// prose, must not decide whether a given member is deprecated. Shared by
+    /// `ActorizedBlobManagerTests` (#2172) and
+    /// `WebSocketManagerSyncSurfaceTests` (#2171).
+    static func attributes(before declaration: String, in source: String) -> [String] {
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let index = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces).hasPrefix(declaration)
+        }) else { return [] }
+        var collected: [String] = []
+        var i = index - 1
+        while i >= 0 {
+            let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("@") {
+                collected.append(trimmed)
+            } else if !trimmed.hasPrefix("///") && !trimmed.isEmpty {
+                break
+            }
+            i -= 1
+        }
+        return collected
     }
 
     /// Every `@unchecked Sendable` **declaration** line in a source file —

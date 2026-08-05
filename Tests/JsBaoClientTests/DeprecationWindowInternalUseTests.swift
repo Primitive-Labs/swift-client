@@ -217,14 +217,16 @@ final class DeprecationWindowInternalUseTests: XCTestCase {
     func testDeprecatedWaitForEventStillResolvesAndTimesOut() async throws {
         let emitter = EventEmitter()
 
-        let waiter = Task { try await waitForEvent(emitter: emitter, event: .documentClosed, timeout: 5) }
+        // The deprecated free function returns `Any`, which is not `Sendable`,
+        // so the task's success value is handed over in a `SendingBox`.
+        let waiter = Task { SendingBox(try await waitForEvent(emitter: emitter, event: .documentClosed, timeout: 5)) }
         // Let the wait register before emitting.
         while emitter.activeHandlerCount == 0 {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         emitter.emit(DocumentClosedEvent(documentId: "d1"))
 
-        let payload = try await waiter.value
+        let payload = try await waiter.value.value
         XCTAssertEqual((payload as? DocumentClosedEvent)?.documentId, "d1")
 
         do {

@@ -1,6 +1,33 @@
 import XCTest
 @testable import JsBaoClient
 
+/// Build the `{ status: <status obj>, run }` envelope the status endpoint
+/// returns, matching `resolveRunStatus` in workflows-controller.ts.
+///
+/// #2348: `status.status` is the server's single canonical, already-reconciled
+/// run status — one of `queued`, `running`, `apply_pending`, `apply_claimed`,
+/// `completed`, `failed`, `terminated`, `missing`. Raw Cloudflare spellings
+/// (`complete`, `errored`) are no longer produced, so tests use the canonical
+/// vocabulary here.
+private func statusEnvelope(
+    status: String,
+    output: Any? = nil,
+    error: String? = nil,
+    runId: String,
+    runStatus: String? = nil,
+    endedAt: String? = nil,
+    errorMessage: String? = nil
+) -> [String: Any] {
+    var statusObj: [String: Any] = ["status": status]
+    if let output { statusObj["output"] = output }
+    if let error { statusObj["error"] = error }
+    var run: [String: Any] = ["runId": runId, "runKey": "rk-\(runId)"]
+    if let runStatus { run["status"] = runStatus }
+    if let endedAt { run["endedAt"] = endedAt }
+    if let errorMessage { run["errorMessage"] = errorMessage }
+    return ["status": statusObj, "run": run]
+}
+
 /// Server-free tests for `workflows.waitFor` (#1975 / #1582 — port of JS #1443).
 ///
 /// The bug: the Swift client's only workflow-completion surface was the single,
@@ -29,19 +56,22 @@ final class WorkflowWaitForTests: XCTestCase {
         private var asyncResponder: (@Sendable (String, String, Any?, Int) async throws -> Any)?
         private var _callCount = 0
 
-        var callCount: Int { lock.lock(); defer { lock.unlock() }; return _callCount }
+        var callCount: Int { lock.withLock { _callCount } }
 
         func setResponder(_ r: @escaping @Sendable (String, String, Any?) throws -> Any) {
-            lock.lock(); responder = r; lock.unlock()
+            lock.withLock { responder = r }
         }
 
         func setAsyncResponder(_ r: @escaping @Sendable (String, String, Any?, Int) async throws -> Any) {
-            lock.lock(); asyncResponder = r; lock.unlock()
+            lock.withLock { asyncResponder = r }
         }
 
         @Sendable
         func make(_ method: String, _ path: String, _ body: Any?) async throws -> Any {
-            lock.lock(); _callCount += 1; let idx = _callCount; let ar = asyncResponder; let r = responder; lock.unlock()
+            let (idx, ar, r) = lock.withLock {
+                _callCount += 1
+                return (_callCount, asyncResponder, responder)
+            }
             if let ar { return try await ar(method, path, body, idx) }
             guard let r else { throw HttpError(status: 500, message: "no responder configured") }
             return try r(method, path, body)
@@ -53,39 +83,17 @@ final class WorkflowWaitForTests: XCTestCase {
     private final class Gate: @unchecked Sendable {
         private let lock = NSLock()
         private var isOpen = false
-        func unlock() { lock.lock(); isOpen = true; lock.unlock() }
+        func unlock() { lock.withLock { isOpen = true } }
         func open() async {
             while true {
-                lock.lock(); let o = isOpen; lock.unlock()
-                if o { return }
+                if lock.withLock({ isOpen }) { return }
                 try? await Task.sleep(nanoseconds: 5_000_000)
             }
         }
     }
 
-    /// Build the `{ status: <CF status obj>, run }` envelope the status endpoint
-    /// returns, matching `resolveRunStatus` in workflows-controller.ts.
-    private func statusEnvelope(
-        cfStatus: String,
-        output: Any? = nil,
-        error: String? = nil,
-        runId: String,
-        runStatus: String? = nil,
-        endedAt: String? = nil,
-        errorMessage: String? = nil
-    ) -> [String: Any] {
-        var statusObj: [String: Any] = ["status": cfStatus]
-        if let output { statusObj["output"] = output }
-        if let error { statusObj["error"] = error }
-        var run: [String: Any] = ["runId": runId, "runKey": "rk-\(runId)"]
-        if let runStatus { run["status"] = runStatus }
-        if let endedAt { run["endedAt"] = endedAt }
-        if let errorMessage { run["errorMessage"] = errorMessage }
-        return ["status": statusObj, "run": run]
-    }
-
     private func makeApi(_ stub: StubTransport, _ emitter: EventEmitter) -> WorkflowsAPI {
-        WorkflowsAPI(makeRequest: stub.make, getConnectionId: { "conn-test" }, logger: nil, events: emitter)
+        WorkflowsAPI(makeRequest: stub.make, getConnectionId: { "conn-test" }, events: emitter)
     }
 
     private func wfEvent(
@@ -120,7 +128,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let stub = StubTransport()
         // Not-yet-terminal at subscribe time, so the subscribe-time reconcile
         // keeps waiting and the frame is what resolves it.
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r1", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r1", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -145,7 +153,7 @@ final class WorkflowWaitForTests: XCTestCase {
     func testReconnectReconcileRecoversCompletionMissedWhileOffline() async throws {
         let stub = StubTransport()
         // While "offline" the run is still executing as far as the last fetch saw.
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r2", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r2", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -154,8 +162,8 @@ final class WorkflowWaitForTests: XCTestCase {
 
         // The run terminated during the outage; the terminal frame was never
         // replayed. Only a reconcile can recover it.
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "complete", output: ["done": true], runId: "r2", runStatus: "completed", endedAt: "2026-07-23T00:00:00Z")
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "completed", output: ["done": true], runId: "r2", runStatus: "completed", endedAt: "2026-07-23T00:00:00Z")
         }
         // Socket comes back.
         emitter.emit(StatusChangedEvent(status: .connected))
@@ -169,7 +177,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     func testTimeoutFiresWhenNeitherFrameNorReconcileCompletes() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r3", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r3", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -189,7 +197,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     func testNormalCompletionPathResolvesExactlyOnce() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r4", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r4", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -209,7 +217,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     func testFailedRunResolvesWithStatusAndError() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r5", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r5", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -225,7 +233,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     func testTerminatedRunResolves() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r6", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r6", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -239,7 +247,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     func testApplyRequiredFrameResolvesAsApplyPending() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r7", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r7", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -259,8 +267,8 @@ final class WorkflowWaitForTests: XCTestCase {
     func testResolvesFromSubscribeTimeReconcileWhenAlreadyTerminal() async throws {
         let stub = StubTransport()
         // Already terminal before waitFor even subscribes — no frame will come.
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "complete", output: ["x": "y"], runId: "r8", runStatus: "completed", endedAt: "2026-07-23T00:00:00Z")
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "completed", output: ["x": "y"], runId: "r8", runStatus: "completed", endedAt: "2026-07-23T00:00:00Z")
         }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
@@ -270,32 +278,65 @@ final class WorkflowWaitForTests: XCTestCase {
         XCTAssertEqual(result.output?["x"]?.stringValue, "y")
     }
 
-    // MARK: - endedAt-only terminal (#1388)
+    // MARK: - endedAt no longer implies terminal (was #1388, removed by #2348)
+    //
+    // The client used to treat `run.endedAt` as a terminal signal on its own and
+    // then guess WHICH terminal state it was from `run.errorMessage`. The server
+    // now reconciles the run before responding and never reports a terminal run
+    // as `running`, so both of those inferences are gone: a non-terminal status
+    // stays non-terminal no matter what the run row carries.
 
-    func testEndedAtSetWithNonTerminalStatusResolves() async throws {
+    func testEndedAtSetWithNonTerminalStatusDoesNotSettle() async throws {
         let stub = StubTransport()
-        // status is still "running" but endedAt is set — stale-status bug (#1388).
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", runId: "r9", runStatus: "running", endedAt: "2026-07-23T00:00:00Z")
+        // A non-terminal server status with endedAt set must NOT settle the wait
+        // — the endedAt fallback was removed. The wait runs to its timeout.
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "running", runId: "r9", runStatus: "running", endedAt: "2026-07-23T00:00:00Z")
         }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let result = try await api.waitFor(runId: "r9", options: WaitForWorkflowOptions(timeoutMs: 5_000))
-        // No errorMessage → completed.
-        XCTAssertEqual(result.status, "completed")
+        do {
+            _ = try await api.waitFor(runId: "r9", options: WaitForWorkflowOptions(timeoutMs: 300))
+            XCTFail("endedAt alone must not settle waitFor")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .workflowWaitTimeout)
+        }
     }
 
-    func testEndedAtSetWithErrorMessageResolvesFailed() async throws {
+    func testEndedAtWithErrorMessageDoesNotInferFailed() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", runId: "r10", runStatus: "running", endedAt: "2026-07-23T00:00:00Z", errorMessage: "kaboom")
+        // An errorMessage on the run row is not a terminal signal either — the
+        // status is what decides, and it says `running`.
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "running", runId: "r10", runStatus: "running", endedAt: "2026-07-23T00:00:00Z", errorMessage: "kaboom")
         }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let result = try await api.waitFor(runId: "r10", options: WaitForWorkflowOptions(timeoutMs: 5_000))
-        XCTAssertEqual(result.status, "failed")
+        do {
+            _ = try await api.waitFor(runId: "r10", options: WaitForWorkflowOptions(timeoutMs: 300))
+            XCTFail("an errorMessage must not be inferred as a terminal 'failed'")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .workflowWaitTimeout)
+        }
+    }
+
+    /// A server-declared `terminated` run settles as `terminated` — never
+    /// collapsed to `completed` by the removed errorMessage-based inference
+    /// (a terminated run carries no errorMessage).
+    func testTerminatedRunFromReconcileResolvesAsTerminated() async throws {
+        let stub = StubTransport()
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "terminated", runId: "r9b", runStatus: "terminated", endedAt: "2026-07-23T00:00:00Z")
+        }
+        let emitter = EventEmitter()
+        let api = makeApi(stub, emitter)
+
+        let result = try await api.waitFor(runId: "r9b", options: WaitForWorkflowOptions(timeoutMs: 5_000))
+        XCTAssertEqual(result.status, "terminated", "a terminated run must not resolve as completed")
+        XCTAssertTrue(result.isTerminal)
+        XCTAssertFalse(result.isFailure)
     }
 
     // MARK: - NOT_FOUND rejects immediately
@@ -332,7 +373,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     func testTwoWaitersForDifferentRunsSettleIndependently() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "any", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "any", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -356,7 +397,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     func testTypedOverloadDecodesOutput() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "r11", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "r11", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -371,99 +412,61 @@ final class WorkflowWaitForTests: XCTestCase {
         XCTAssertEqual(result.output, Payload(answer: 7))
     }
 
-    // MARK: - Shared status normalizer (used by getStatus + getStatusByRunId)
-
-    func testGetStatusNormalizesCompleteToCompleted() async throws {
-        let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "complete", runId: "n1", runStatus: "completed") }
-        let emitter = EventEmitter()
-        let api = makeApi(stub, emitter)
-
-        let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "completed", "raw Cloudflare 'complete' must normalize to 'completed'")
-    }
-
-    func testGetStatusNormalizesErroredToFailed() async throws {
-        let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "errored", error: "nope", runId: "n2", runStatus: "failed") }
-        let emitter = EventEmitter()
-        let api = makeApi(stub, emitter)
-
-        let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "failed")
-    }
-
-    // MARK: - Terminal run-row status (#2011)
+    // MARK: - Server status is passed through verbatim (#2348)
     //
-    // The server responds `{ status: <raw CF status obj>, run }` — `status`
-    // carries Cloudflare's spellings, `run.status` carries the mapped set
-    // (`completed`/`failed`/`terminated`, plus the apply-flow states and the
-    // legacy `error`). The `waitFor` port read the run row only for the
-    // apply-flow states, so a terminal run row whose `endedAt` is unset
-    // normalized to `running` and the wait ran to its timeout. Every test below
-    // holds the CF field non-terminal so the run row is the only terminal
-    // signal, and leaves `endedAt` unset so the #1388 endedAt path can't settle
-    // it either.
+    // The server now reconciles the run and returns ONE canonical status —
+    // `queued`, `running`, `apply_pending`, `apply_claimed`, `completed`,
+    // `failed`, `terminated`, `missing`. The client's own reconciliation is
+    // gone: no raw-spelling mapper, no run-row terminal fallback, no
+    // endedAt/errorMessage inference. `getStatus` and `getStatusByRunId` report
+    // exactly what the wire said.
 
-    func testGetStatusNormalizesTerminalRunRowFailedToFailed() async throws {
+    func testGetStatusPassesCanonicalStatusThroughVerbatim() async throws {
+        for canonical in [
+            "queued", "running", "apply_pending", "apply_claimed",
+            "completed", "failed", "terminated", "missing",
+        ] {
+            let stub = StubTransport()
+            stub.setResponder { _, _, _ in statusEnvelope(status: canonical, runId: "n1", runStatus: canonical) }
+            let emitter = EventEmitter()
+            let api = makeApi(stub, emitter)
+
+            let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
+            XCTAssertEqual(result.status, canonical, "getStatus must report the server's status verbatim")
+        }
+    }
+
+    /// The run row is no longer consulted at all: whatever `run.status` says, the
+    /// reported status is the server's top-level `status`. (The server keeps the
+    /// two in agreement; this pins that the client does not re-derive.)
+    func testGetStatusIgnoresRunRowStatus() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", error: "nope", runId: "n4", runStatus: "failed")
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "running", error: "nope", runId: "n4", runStatus: "failed")
         }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
         let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "failed", "a terminal run row must normalize to its terminal status")
+        XCTAssertEqual(result.status, "running", "the run row must not override the server's status")
     }
 
-    func testGetStatusNormalizesTerminalRunRowTerminatedToTerminated() async throws {
+    func testGetStatusReportsApplyPendingFromTheServer() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", runId: "n4b", runStatus: "terminated")
-        }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "apply_pending", runId: "n3", runStatus: "apply_pending") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
         let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "terminated")
+        XCTAssertEqual(result.status, "apply_pending")
     }
 
-    func testGetStatusNormalizesTerminalRunRowCompletedToCompleted() async throws {
+    /// The reconcile fetch settles on the server's terminal status with no
+    /// `endedAt` needed — the status alone is the terminal signal.
+    func testReconcileSettlesOnServerTerminalStatusWithoutEndedAt() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", runId: "n4c", runStatus: "completed")
-        }
-        let emitter = EventEmitter()
-        let api = makeApi(stub, emitter)
-
-        let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "completed")
-    }
-
-    // Legacy failure spelling: the removed `reconcileRun` had
-    // `case "failed", "terminated", "error":` on the RUN ROW, so `error` is
-    // tolerated on that field too.
-    func testGetStatusNormalizesLegacyErrorRunRowToFailed() async throws {
-        let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", error: "nope", runId: "n4d", runStatus: "error")
-        }
-        let emitter = EventEmitter()
-        let api = makeApi(stub, emitter)
-
-        let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "failed", "legacy 'error' spelling must normalize to 'failed'")
-    }
-
-    /// The hang #2011 describes, end to end: the reconcile fetch sees a terminal
-    /// run row with no `endedAt`, and the only thing that can settle the wait is
-    /// the normalizer reading `run.status`. Without the fix this runs the full
-    /// 5s timeout and settles as `timeout`.
-    func testReconcileSettlesOnTerminalRunRowWithoutEndedAt() async throws {
-        let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", error: "boom", runId: "n5", runStatus: "failed")
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "failed", error: "boom", runId: "n5", runStatus: "failed")
         }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
@@ -474,43 +477,25 @@ final class WorkflowWaitForTests: XCTestCase {
         XCTAssertEqual(result.error, "boom")
     }
 
-    func testReconcileSettlesOnLegacyErrorRunRowWithoutEndedAt() async throws {
+    /// `queued` is a canonical non-terminal status — it must leave the wait
+    /// pending rather than collapse to anything terminal.
+    func testQueuedStatusLeavesTheWaitPending() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "running", error: "boom", runId: "n5b", runStatus: "error")
-        }
-        let emitter = EventEmitter()
-        let api = makeApi(stub, emitter)
-
-        let result = try await api.waitFor(runId: "n5b", options: WaitForWorkflowOptions(timeoutMs: 5_000))
-        XCTAssertEqual(result.status, "failed")
-        XCTAssertTrue(result.isFailure)
-        XCTAssertEqual(result.error, "boom")
-    }
-
-    /// A non-terminal run row must still leave the wait pending — the run-row
-    /// fallback must not swallow the `running` case.
-    func testNonTerminalRunRowStillNormalizesToRunning() async throws {
-        let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in
-            statusEnvelope(cfStatus: "queued", runId: "n4e", runStatus: "running")
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "queued", runId: "n4e", runStatus: "queued")
         }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
         let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "running")
-    }
+        XCTAssertEqual(result.status, "queued")
 
-    func testNormalizerPrefersApplyFlowStatusOverCloudflareComplete() async throws {
-        let stub = StubTransport()
-        // CF says complete, but the DB run row is apply_pending — prefer the DB.
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "complete", runId: "n3", runStatus: "apply_pending") }
-        let emitter = EventEmitter()
-        let api = makeApi(stub, emitter)
-
-        let result = try await api.getStatus(workflowKey: "wf", runKey: "rk")
-        XCTAssertEqual(result.status, "apply_pending")
+        do {
+            _ = try await api.waitFor(runId: "n4e", options: WaitForWorkflowOptions(timeoutMs: 300))
+            XCTFail("a queued run must not settle waitFor")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .workflowWaitTimeout)
+        }
     }
 
     // MARK: - [P2] #1 regression: queued reconnect reconcile (overlap race)
@@ -526,16 +511,16 @@ final class WorkflowWaitForTests: XCTestCase {
     func testQueuedReconnectReconcileRunsAfterInFlightPreCompletionSnapshot() async throws {
         let stub = StubTransport()
         let gate = Gate()
-        stub.setAsyncResponder { [self] _, _, _, idx in
+        stub.setAsyncResponder { _, _, _, idx in
             if idx == 1 {
                 // Hold the subscribe-time reconcile in flight until the test has
                 // fired the reconnect, then return a pre-completion snapshot.
                 await gate.open()
-                return statusEnvelope(cfStatus: "running", runId: "rq", runStatus: "running")
+                return statusEnvelope(status: "running", runId: "rq", runStatus: "running")
             }
             // The queued reconnect reconcile sees the now-terminated run.
             return statusEnvelope(
-                cfStatus: "complete", output: ["done": true],
+                status: "completed", output: ["done": true],
                 runId: "rq", runStatus: "completed", endedAt: "2026-07-23T00:00:00Z"
             )
         }
@@ -570,7 +555,7 @@ final class WorkflowWaitForTests: XCTestCase {
     func testCancellationThrowsAndTearsDownWithNoTimeout() async throws {
         let stub = StubTransport()
         // Never terminal — only cancellation can settle this wait.
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "rc", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "rc", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -599,7 +584,7 @@ final class WorkflowWaitForTests: XCTestCase {
     /// registers nothing (the up-front `Task.isCancelled` check).
     func testCancellationBeforeSubscribeRegistersNothing() async throws {
         let stub = StubTransport()
-        stub.setResponder { [self] _, _, _ in statusEnvelope(cfStatus: "running", runId: "rc2", runStatus: "running") }
+        stub.setResponder { _, _, _ in statusEnvelope(status: "running", runId: "rc2", runStatus: "running") }
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
@@ -617,5 +602,168 @@ final class WorkflowWaitForTests: XCTestCase {
         }
         try? await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(emitter.activeHandlerCount, 0, "a cancelled-before-subscribe caller must leave no subscriptions")
+    }
+
+    // MARK: - (g) The finalization window (#2348)
+
+    /// The server reports the EXECUTION's status while a run whose row is
+    /// already terminal finishes finalizing, so a status read never carries
+    /// `completed` with a `nil` output. The terminal frame fires at the start of
+    /// that window and is never replayed — a caller that missed it and
+    /// reconciles inside the window has nothing left to wake it, and used to
+    /// wait out the whole timeout.
+    func testSettlesThroughTheFinalizationWindow() async throws {
+        let stub = StubTransport()
+        stub.setAsyncResponder { _, _, _, idx in
+            if idx == 1 {
+                // Inside the window: reported status is the execution's, while
+                // the run record already carries the terminal status.
+                return statusEnvelope(
+                    status: "running",
+                    runId: "fw1",
+                    runStatus: "completed",
+                    endedAt: "2026-08-05T00:00:00Z"
+                )
+            }
+            return statusEnvelope(
+                status: "completed",
+                output: ["done": true],
+                runId: "fw1",
+                runStatus: "completed",
+                endedAt: "2026-08-05T00:00:00Z"
+            )
+        }
+        let emitter = EventEmitter()
+        let api = makeApi(stub, emitter)
+
+        let result = try await api.waitFor(
+            runId: "fw1",
+            options: WaitForWorkflowOptions(timeoutMs: 20_000)
+        )
+        XCTAssertEqual(result.status, "completed")
+        // Settled with the real output, not an empty terminal read off the row.
+        XCTAssertEqual(result.output?["done"]?.boolValue, true)
+        XCTAssertGreaterThanOrEqual(stub.callCount, 2, "it took a re-check to get there")
+    }
+
+    /// A transient failure on a re-check inside the window must not abandon the
+    /// re-check. The caller swallows anything that isn't `.notFound` and leaves
+    /// its loop, and inside the window nothing else would wake the wait — so a
+    /// single failed GET used to re-open the full-timeout hang.
+    func testTransientFailureInsideTheWindowKeepsRechecking() async throws {
+        let stub = StubTransport()
+        stub.setAsyncResponder { _, _, _, idx in
+            if idx == 1 {
+                return statusEnvelope(
+                    status: "running",
+                    runId: "fw4",
+                    runStatus: "completed",
+                    endedAt: "2026-08-05T00:00:00Z"
+                )
+            }
+            if idx == 2 {
+                // The first re-check fails transiently.
+                throw HttpError(status: 503, message: "service unavailable")
+            }
+            return statusEnvelope(
+                status: "completed",
+                output: ["done": true],
+                runId: "fw4",
+                runStatus: "completed",
+                endedAt: "2026-08-05T00:00:00Z"
+            )
+        }
+        let emitter = EventEmitter()
+        let api = makeApi(stub, emitter)
+
+        let result = try await api.waitFor(
+            runId: "fw4",
+            options: WaitForWorkflowOptions(timeoutMs: 20_000)
+        )
+        XCTAssertEqual(result.status, "completed")
+        XCTAssertEqual(result.output?["done"]?.boolValue, true)
+        XCTAssertGreaterThanOrEqual(stub.callCount, 3, "the failed re-check must be retried")
+    }
+
+    /// A `.notFound` on a re-check still propagates — only transient errors are
+    /// retried inside the window.
+    func testNotFoundOnARecheckStillPropagates() async throws {
+        let stub = StubTransport()
+        stub.setAsyncResponder { _, _, _, idx in
+            if idx == 1 {
+                return statusEnvelope(
+                    status: "running",
+                    runId: "fw5",
+                    runStatus: "completed",
+                    endedAt: "2026-08-05T00:00:00Z"
+                )
+            }
+            throw HttpError(status: 404, message: "not found")
+        }
+        let emitter = EventEmitter()
+        let api = makeApi(stub, emitter)
+
+        do {
+            _ = try await api.waitFor(
+                runId: "fw5",
+                options: WaitForWorkflowOptions(timeoutMs: 20_000)
+            )
+            XCTFail("expected .notFound")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .notFound)
+        }
+    }
+
+    /// A contradictory row (in-flight record status with `endedAt` set) is NOT
+    /// the finalization window and must not settle the wait — that inference is
+    /// the #2119 guess this client no longer makes.
+    func testEndedAtAloneDoesNotSettleTheWait() async throws {
+        let stub = StubTransport()
+        stub.setResponder { _, _, _ in
+            statusEnvelope(
+                status: "running",
+                runId: "fw2",
+                runStatus: "running",
+                endedAt: "2026-08-05T00:00:00Z"
+            )
+        }
+        let emitter = EventEmitter()
+        let api = makeApi(stub, emitter)
+
+        do {
+            _ = try await api.waitFor(
+                runId: "fw2",
+                options: WaitForWorkflowOptions(timeoutMs: 400)
+            )
+            XCTFail("waitFor should have timed out")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .workflowWaitTimeout)
+        }
+    }
+
+    /// `missing` is a settled status the server answers 200 for. Waiting for it
+    /// to become terminal is waiting forever, so it throws `.notFound` — the way
+    /// those rows' 404 used to. The CLI stops on `missing` too.
+    func testMissingStatusThrowsNotFound() async throws {
+        let stub = StubTransport()
+        stub.setResponder { _, _, _ in
+            statusEnvelope(status: "missing", runId: "fw3", runStatus: "missing")
+        }
+        let emitter = EventEmitter()
+        let api = makeApi(stub, emitter)
+
+        let start = Date()
+        do {
+            _ = try await api.waitFor(
+                runId: "fw3",
+                options: WaitForWorkflowOptions(timeoutMs: 60_000)
+            )
+            XCTFail("expected .notFound")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .notFound)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5, "must not wait for the timeout")
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(emitter.activeHandlerCount, 0)
     }
 }

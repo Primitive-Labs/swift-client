@@ -92,43 +92,59 @@ ordinary test suites: each enforces a *budget* that only moves in one direction.
 
 ### `scripts/v6-sendable-gate.sh` — the Swift 6 `Sendable` regression gate
 
-The `JsBaoClient` target builds in the **Swift 6 language mode** (#1946), so
-strict concurrency checking is `complete`. The diagnostics the compiler grades
-as errors under that mode — the `Sendable` conformance failures the epic's
-851-error cascade was made of — now fail `swift build` in
-`Sources/JsBaoClient` on their own. The rest of the package —
-`SwiftBaoCodegen`, both test targets, `E2EMiniApp` — is still in Swift 5 mode,
-pinned by `swiftLanguageModes: [.v5]` at the package level.
+Every target in this package builds in the **Swift 6 language mode**, so strict
+concurrency checking is `complete`. The diagnostics the compiler grades as
+errors under that mode — the `Sendable` conformance failures the epic's
+851-error cascade was made of — now fail `swift build` on their own. #1946
+flipped `JsBaoClient` with a per-target setting; #2310 cleared the remaining
+targets (`JsBaoClientTests` needed 91 sites; `SwiftBaoCodegen`,
+`SwiftBaoCodegenTests` and `E2EMiniApp` were already clean) and moved the mode
+to the package-level `swiftLanguageModes: [.v6]` pin, so a target added later
+inherits it with no opt-in to remember.
 
 Not every strict-concurrency diagnostic is error-level, though, so "builds
-clean" is narrower than "no `Sendable` violations". As of Apple Swift 6.3.1 the
-target still emits 11 warning-level `#SendableClosureCaptures` diagnostics, all
-from one site (`Sources/JsBaoClient/Storage/SQLiteStorageProvider.swift`, the
-`work` parameter of `onQueue`). That group is warning-level in this compiler
-under `-swift-version 6` and under `-swift-version 5 -strict-concurrency=complete`
-alike, so the language mode is not what holds it down, and the gate below does
-not count it either — it greps `error:` lines, so its "0 sites" verdict is a
-statement about errors. Clearing that site needs `Sendable` constraints on the
-public `StorageProvider` generic methods, which is a public-API change; it is
-tracked in #2318.
+clean" is narrower than "no `Sendable` violations". The flip landed with 11
+warning-level `#SendableClosureCaptures` diagnostics still in the target, all
+from one site (`Storage/SQLiteStorageProvider.swift`, the `work` parameter of
+`onQueue`), behind a green build *and* a green gate — the gate counted `error:`
+lines only, so its "0 sites" verdict was a statement about errors. #2318 cleared
+the site (the closure now crosses the queue hop in a contained `QueueWork` box,
+with no change to the public `StorageProvider` protocol) and closed the blind
+spot that hid it: the gate counts warning-level strict-concurrency sites too,
+at budget **zero**.
 
-The gate adds three things `swift build` does not:
+The gate adds four things `swift build` does not:
 
-1. It confirms the mode is still committed, reading it out of
-   `swift package dump-package` rather than the source text. A revert to `.v5`
-   would compile clean and report zero sites, which is the one failure a build
-   cannot catch.
-2. It attributes errors per file, so a regression reads at a glance.
-3. It fails before the test build starts, with a gate-shaped message.
+1. It confirms the mode is still committed — the package pin reads `.v6` and no
+   target overrides it back, by a `swiftLanguageMode` setting or a
+   `-swift-version` unsafe flag — reading all of that out of `swift package
+   dump-package` rather than the source text. Every target is checked, not just
+   `JsBaoClient`: the gate's own build is `--target JsBaoClient`, so an override
+   on a test target would never be compiled here. A revert to `.v5` would
+   compile clean and report zero sites, which is the one failure a build cannot
+   catch.
+2. It counts warning-level strict-concurrency sites in `Sources/JsBaoClient`,
+   which a green build says nothing about. Deliberately wider than the one
+   group that produced #2318: a sibling group appearing after a toolchain bump
+   is the event this exists to surface. Scoped to the target's own sources, so
+   a dependency's warnings cannot fail our build.
+3. It attributes both counts per file, so a regression reads at a glance.
+4. It fails before the test build starts, with a gate-shaped message.
+
+It also touches the target's sources before building. An incremental build over
+an up-to-date module re-emits no warnings, so a warm `.build` would otherwise
+hand the warning counter an empty log and read as PASS. (Errors do not have
+that problem — a module with errors has no valid output to be up to date.)
 
 `run-tests.sh` invokes it in assertion mode before every full-suite run, with
-the budget in `V6_MAX_SITES` and the per-file list in `V6_ZERO_FILES`. Both are
-at **zero**. Set `SKIP_V6_SENDABLE_GATE=1` to skip it while iterating; never
-raise the budget to make a change pass.
+the error budget in `V6_MAX_SITES`, the warning budget in
+`V6_MAX_WARNING_SITES`, and the per-file list in `V6_ZERO_FILES`. All are at
+**zero**. Set `SKIP_V6_SENDABLE_GATE=1` to skip it while iterating; never raise
+a budget to make a change pass.
 
 ```bash
 scripts/v6-sendable-gate.sh                                  # measure only
-scripts/v6-sendable-gate.sh --max 0 --require-zero Internal/KvCache.swift
+scripts/v6-sendable-gate.sh --max 0 --max-warnings 0 --require-zero Internal/KvCache.swift
 ```
 
 Before #1946 the target compiled in `.v5` and this script installed `.v6`

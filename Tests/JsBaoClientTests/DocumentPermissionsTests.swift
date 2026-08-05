@@ -83,4 +83,59 @@ final class DocumentPermissionsTests: XCTestCase {
         }
         XCTAssertNotNil(newOwner, "User2 should be the new owner")
     }
+
+    // MARK: - Validate Access (#2358)
+
+    /// The owner of a document must get `hasAccess: true` with `owner`.
+    /// Exercises the live `POST /documents/:documentId/validate-access`
+    /// route — the only access-validation route the server registers.
+    func testValidateAccessAsOwner() async throws {
+        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await client.destroy() } }
+
+        let docId = try await ctx.createDocument(
+            appId: testApp.appId,
+            jwt: testApp.ownerJWT,
+            title: "Validate Access Owner"
+        )
+
+        let result = try await client.documents.validateAccess(documentId: docId)
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.hasAccess, "Owner must have access to their own document")
+        XCTAssertEqual(result.permission, .owner)
+    }
+
+    /// A member with an explicit grant sees that grant's level; a member
+    /// with no grant sees `hasAccess: false` rather than an error.
+    func testValidateAccessForGrantedAndUngrantedMember() async throws {
+        let ownerClient = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await ownerClient.destroy() } }
+
+        let docId = try await ctx.createDocument(
+            appId: testApp.appId,
+            jwt: testApp.ownerJWT,
+            title: "Validate Access Member"
+        )
+        let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member")
+        let user2Client = createTestClient(appId: testApp.appId, token: user2.jwt)
+        defer { Task { await user2Client.destroy() } }
+
+        // No grant yet — the call must succeed and report no access.
+        let before = try await user2Client.documents.validateAccess(documentId: docId)
+        XCTAssertTrue(before.success)
+        XCTAssertFalse(before.hasAccess, "Member without a grant must not have access")
+
+        try await ctx.grantPermission(
+            appId: testApp.appId,
+            documentId: docId,
+            userId: user2.userId,
+            permission: "read-write",
+            jwt: testApp.ownerJWT
+        )
+
+        let after = try await user2Client.documents.validateAccess(documentId: docId)
+        XCTAssertTrue(after.success)
+        XCTAssertTrue(after.hasAccess, "Member with a grant must have access")
+        XCTAssertEqual(after.permission, .readWrite)
+    }
 }

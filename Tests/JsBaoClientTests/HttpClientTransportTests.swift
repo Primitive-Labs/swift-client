@@ -145,14 +145,23 @@ final class HttpClientTransportTests: XCTestCase {
 ///   * everything else — 401 unless the request carries the refreshed bearer
 ///     token, in which case 200 `{"userId":"u1"}`.
 final class TransportStubURLProtocol: URLProtocol {
-    private static let lock = NSLock()
-    private static var _refreshCount = 0
-    private static var _sawAuthorizedRetry = false
-    private static var _lastRequestBody: Data?
-    private static var refreshedToken = ""
-    private static var binaryBody = Data()
-    private static var binaryContentType = "application/octet-stream"
-    private static var echoBody = false
+    /// The stub's whole mutable surface. `URLProtocol` instances are made by
+    /// URLSession on its own threads, so the script has to be shared statically
+    /// — and under the Swift 6 language mode a `static var` is a hard error
+    /// however carefully it is locked. Holding all of it in one `LockedBox`
+    /// keeps the state in a `static let` and preserves what the old NSLock did:
+    /// `configure` publishes every field in one atomic step.
+    private struct Script {
+        var refreshCount = 0
+        var sawAuthorizedRetry = false
+        var lastRequestBody: Data?
+        var refreshedToken = ""
+        var binaryBody = Data()
+        var binaryContentType = "application/octet-stream"
+        var echoBody = false
+    }
+
+    private static let script = LockedBox(Script())
 
     static func configure(
         refreshedToken: String,
@@ -160,24 +169,21 @@ final class TransportStubURLProtocol: URLProtocol {
         binaryContentType: String = "application/octet-stream",
         echoBody: Bool = false
     ) {
-        lock.withLock {
-            self.refreshedToken = refreshedToken
-            self.binaryBody = binaryBody
-            self.binaryContentType = binaryContentType
-            self.echoBody = echoBody
-            _refreshCount = 0
-            _sawAuthorizedRetry = false
-            _lastRequestBody = nil
-        }
+        script.value = Script(
+            refreshedToken: refreshedToken,
+            binaryBody: binaryBody,
+            binaryContentType: binaryContentType,
+            echoBody: echoBody
+        )
     }
 
     static func reset() {
         configure(refreshedToken: "")
     }
 
-    static var refreshCount: Int { lock.withLock { _refreshCount } }
-    static var sawAuthorizedRetryWithNewToken: Bool { lock.withLock { _sawAuthorizedRetry } }
-    static var lastRequestBody: Data? { lock.withLock { _lastRequestBody } }
+    static var refreshCount: Int { script.value.refreshCount }
+    static var sawAuthorizedRetryWithNewToken: Bool { script.value.sawAuthorizedRetry }
+    static var lastRequestBody: Data? { script.value.lastRequestBody }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -200,20 +206,20 @@ final class TransportStubURLProtocol: URLProtocol {
             return collected
         }
         if let body = body, !body.isEmpty {
-            Self.lock.withLock { Self._lastRequestBody = body }
+            Self.script.withValue { $0.lastRequestBody = body }
         }
 
         if path.hasSuffix("/auth/refresh") {
-            let token = Self.lock.withLock { () -> String in
-                Self._refreshCount += 1
-                return Self.refreshedToken
+            let token = Self.script.withValue { script -> String in
+                script.refreshCount += 1
+                return script.refreshedToken
             }
             respond(status: 200, body: Data(#"{"token":"\#(token)"}"#.utf8), contentType: "application/json")
             return
         }
 
         if path.hasSuffix("/blobs/raw") {
-            let (data, contentType) = Self.lock.withLock { (Self.binaryBody, Self.binaryContentType) }
+            let (data, contentType) = Self.script.withValue { ($0.binaryBody, $0.binaryContentType) }
             respond(status: 200, body: data, contentType: contentType)
             return
         }
@@ -224,9 +230,9 @@ final class TransportStubURLProtocol: URLProtocol {
         }
 
         let auth = request.value(forHTTPHeaderField: "Authorization")
-        let refreshed = Self.lock.withLock { Self.refreshedToken }
+        let refreshed = Self.script.value.refreshedToken
         if let auth = auth, auth == "Bearer \(refreshed)", !refreshed.isEmpty {
-            Self.lock.withLock { Self._sawAuthorizedRetry = true }
+            Self.script.withValue { $0.sawAuthorizedRetry = true }
             respond(status: 200, body: Data(#"{"userId":"u1"}"#.utf8), contentType: "application/json")
         } else {
             respond(status: 401, body: Data(#"{"error":"unauthorized"}"#.utf8), contentType: "application/json")

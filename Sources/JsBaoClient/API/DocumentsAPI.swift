@@ -118,10 +118,15 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// gradually) can reach without tripping the deprecation warning.
     /// Mirrors js-bao's `_internalListImpl` pattern from `documentsApi.ts`.
     ///
-    /// Threads the full `ListDocumentsOptions` surface
+    /// Threads the implemented `ListDocumentsOptions` fields
     /// (`limit`/`cursor`/`tag`/`forward`/`includeRoot`) into the query string
     /// and returns a `DocumentListPage`; the public `list` unwraps `.items`,
     /// `listPage` returns the page directly.
+    ///
+    /// This is always a blocking server fetch. The struct's local-first
+    /// fields (`refreshFromServer`, `localOnly`, `serverTimeoutMs`,
+    /// `waitForLoad`) are not implemented here and carry a deprecation warning
+    /// saying so — `client.me.ownedDocuments(...)` is where they work (#2360).
     public func _listImpl(
         options: ListDocumentsOptions? = nil,
         includeRoot includeRootArg: Bool = false
@@ -160,8 +165,10 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// Sentinel tag the server attaches to a root document. Mirrors
-    /// js-bao's `ROOT_DOCUMENT_TAG` in `documentsApi.ts`.
-    private static let rootDocumentTag = "__ROOT_TAG__"
+    /// js-bao's `ROOT_DOCUMENT_TAG` in `documentsApi.ts`. Defined once in
+    /// `LocalFirstListing` so this filter and `me.ownedDocuments`' local-path
+    /// filter test the same sentinel.
+    private static let rootDocumentTag = LocalFirstListing.rootDocumentTag
 
     /// Strip the app root document from a list response, matching js-bao's
     /// `_listImpl` filter exactly: drop any entry whose `documentId` equals
@@ -316,10 +323,18 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///   `_col-*` groups backing collection sharing) are included. They are
     ///   excluded by default. Mirrors js-bao's `{ includeSystem }` option
     ///   (#506).
+    ///
+    /// The flag is sent as `?includeSystem=true` because the server decides
+    /// what to return — it strips system rows unless asked (#2360; JS has sent
+    /// the param since #506). The client-side `_`-prefix filter runs only on
+    /// the default (`false`) branch, where it guards against a server
+    /// predating #506 that returns system rows unconditionally.
     public func listGroupPermissions(documentId: String, includeSystem: Bool = false) async throws -> [DocumentGroupPermissionEntry] {
+        var query = URLQuery()
+        if includeSystem { query.append("includeSystem", "true") }
         let all: [DocumentGroupPermissionEntry] = try await transport.request(
             method: .get,
-            path: "/documents/\(documentId)/group-permissions"
+            path: "/documents/\(documentId)/group-permissions\(query.queryString)"
         )
         return includeSystem ? all : all.filter { !$0.groupType.hasPrefix("_") }
     }
@@ -335,9 +350,14 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     // MARK: - Access
 
-    /// Validate the current user's access to a document.
+    /// Validate the current user's access to a document. Also accepts or
+    /// upgrades any pending invitation the caller has on the document.
+    ///
+    /// Sends `POST /documents/:documentId/validate-access` — the same route
+    /// js-bao uses (`documentsApi.ts` `validateAccess`). There is no
+    /// `/documents/:documentId/access` route on the server (#2358).
     public func validateAccess(documentId: String) async throws -> DocumentAccessResult {
-        try await transport.request(method: .get, path: "/documents/\(documentId)/access")
+        try await transport.request(method: .post, path: "/documents/\(documentId)/validate-access")
     }
 
     /// Accept a pending invitation to a document.
@@ -523,9 +543,27 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     // MARK: - Root Document
 
-    /// Get the root document for the app.
+    /// Get metadata for the app's root document.
+    ///
+    /// Resolves the root document id locally from the JWT
+    /// (`client.getRootDocId()`) and fetches that document, matching js-bao
+    /// (`documentsApi.ts` `getRoot`). The server has no `/documents/root`
+    /// alias — that path resolves as `GET /documents/:documentId` with the
+    /// literal id `"root"` and fails (#2358).
     public func getRoot() async throws -> DocumentInfo {
-        try await transport.request(method: .get, path: "/documents/root")
+        guard let client else {
+            throw JsBaoError(
+                code: .unavailable,
+                message: "DocumentsAPI.getRoot requires a wired JsBaoClient"
+            )
+        }
+        guard let docId = client.getRootDocId() else {
+            throw JsBaoError(
+                code: .notFound,
+                message: "Root document not available (no rootDocId in token)"
+            )
+        }
+        return try await get(documentId: docId)
     }
 
     // MARK: - Tags

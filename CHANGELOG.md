@@ -6,6 +6,396 @@ they bump the tag they pin.
 
 ## Unreleased
 
+### `me.ownedDocuments` is local-first by default; five `ListDocumentsOptions` fields are deprecated (#2360)
+
+**Freshness change — read this if you call `me.ownedDocuments(...)` /
+`me.ownedDocumentsPage(...)`.** `MeOwnedDocumentsOptions.waitForLoad` and
+`.serverTimeoutMs` were declared and never read: every online call blocked on
+the server. They now work, and the default `waitForLoad`
+(`.localIfAvailableElseNetwork`) means what it means in js-bao — **when the
+local metadata cache has owner rows, the call returns them immediately and
+refreshes from the server in the background** (one bounded fetch, merged into
+the cache, so the next call is fresh). A call with an empty local cache still
+blocks on the server.
+
+If a call site needs the old "always wait for the server" behavior, pass
+`waitForLoad: .network`:
+
+```swift
+let docs = try await client.me.ownedDocuments(
+    options: MeOwnedDocumentsOptions(waitForLoad: .network))
+```
+
+The rest of the resolution order:
+
+| Option | Behavior |
+| --- | --- |
+| `localOnly: true`, `refreshFromServer: false`, `waitForLoad: .local` | local cache rows only, no HTTP request, `cursor == nil` |
+| offline, `waitForLoad: .network` | throws `JsBaoError(code: .listUnavailableOffline)` |
+| offline, any other mode | local cache rows |
+| `serverTimeoutMs` (default 10000) | bounds every server fetch; exceeding it throws `JsBaoError(code: .listTimeout)`. `0` means unbounded |
+
+`limit` / `cursor` are ignored on local paths — the cache isn't paginated —
+and the returned `cursor` is `nil` there. Because of that,
+`ownedDocumentsPage(...)` is excluded from the local-first short-circuit: under
+the default `waitForLoad` the paged form always fetches from the server, so a
+paginating caller gets a real page and a real cursor instead of a `nil` cursor
+it would read as "no more pages" (js-bao gates the same branch on
+`!returnPage`). The cache-only modes still answer the paged form locally, with
+`cursor == nil`. A server-fetched page is also returned as-is rather than
+merged with the local-only rows, so a page never exceeds `limit` and a cursor
+walk doesn't see the same local rows repeated on every page (js-bao returns its
+page before the same merge). The flat `ownedDocuments(...)` keeps the merge.
+
+One deliberate divergence from js-bao: `waitForLoad: .local` returns local rows
+and does **not** fire a background refresh, where js-bao's `"local"` does. Only
+`localOnly` / `refreshFromServer: false` suppress the refresh in js-bao. This is
+what the approved plan for #2360 specifies — `.local` in Swift means "no network
+at all".
+
+**The app root document is filtered the same way on every path.** Local rows
+and server rows alike drop the root unless `includeRoot: true` is passed,
+matched by id (`getRootDocId()`) or the `__ROOT_TAG__` sentinel rather than by
+permission — the root's permission is `read-write`, never `owner`. And
+`includeRoot: true` against a local cache that doesn't hold the root falls
+through to the server rather than answering without it (js-bao parity).
+
+**Deprecations (still compile, still ignored).** `documents.list(...)` is a
+blocking server fetch and never implemented the local-first half of
+`ListDocumentsOptions`, so `refreshFromServer`, `localOnly`, `serverTimeoutMs`,
+`waitForLoad` and `returnPage` now carry a deprecation warning naming the
+replacement, as does `MeOwnedDocumentsOptions.returnPage` (use
+`ownedDocumentsPage(...)`). They are removed in the next major (#2367).
+
+**Fixed:** `documents.listGroupPermissions(documentId:includeSystem: true)` now
+sends `?includeSystem=true`. It previously filtered client-side only, and the
+server had already stripped the `_`-prefixed system groups — so the flag could
+not return a system group at any input.
+
+### Workflow run status comes from the server, unreconciled by the client (#2348)
+
+The server now returns one canonical, already-reconciled run status in
+`status.status`, from exactly this vocabulary:
+
+`queued` | `running` | `apply_pending` | `apply_claimed` | `completed` |
+`failed` | `terminated` | `missing`
+
+Raw Cloudflare spellings (`complete`, `errored`) no longer reach the wire, and a
+terminal run is never rolled back to `running`. The client's own reconciliation
+is therefore gone:
+
+- `workflows.getStatus` (and the runId-keyed status fetch behind `waitFor`)
+  report the server's `status` verbatim. They no longer map `complete` →
+  `completed` / `errored` → `failed`, and no longer fall back to `run.status`
+  when the top-level status looks non-terminal.
+- `workflows.waitFor` settles only on a server-declared terminal status
+  (`completed`, `failed`, `terminated`, `apply_pending`, `apply_claimed`). A run
+  row with `endedAt` set but a non-terminal status no longer settles the wait,
+  and a terminal state is no longer guessed from `run.errorMessage`.
+
+The `workflowStatus` WebSocket frame still maps `needsApply == true` to
+`apply_pending` — the frame is the one surface where the apply state is only
+recoverable from that flag.
+
+Apps talking to an up-to-date server see no behavior change. An app that pins a
+new client tag against an older server would see the raw statuses that server
+sends, since nothing rewrites them anymore.
+
+### `WebSocketManager` is an `actor`; `client.forceReconnect()` is deprecated (#2171)
+
+The WebSocket transport and its reconnect state machine no longer run behind an
+`NSLock`. `WebSocketManager` is a Swift `actor`, and every `URLSession` delegate
+callback plus the receive loop's failure path now enters through one unbounded,
+FIFO `AsyncStream` consumed by a single pump task — so the callback ordering a
+class got from `URLSession`'s serial delegate queue is preserved by
+construction rather than by convention.
+
+The manager, its delegate protocol and the client's conformance methods went
+module-internal in #2363, so almost all of this is invisible to apps. **Two
+public changes:**
+
+| Deprecated (still works) | Twin |
+| --- | --- |
+| `client.forceReconnect()` | `await client.forceReconnectAsync()` |
+
+The synchronous spelling can only *start* the reconnect and return, so an
+`isConnected` read immediately after it may still observe the old socket. The
+twin returns once the reconnect has been initiated. This rides the existing
+next-major window — see the policy section below; `forceReconnect` is class 1
+(caller-observable ordering).
+
+`WebSocketError` gains a `.transportFailure(message:code:)` case. It carries the
+`Sendable` reduction of the `URLSession` error across the delegate boundary, and
+its `errorDescription` returns the original `localizedDescription` **verbatim**,
+so `ConnectionErrorEvent.message` reads exactly as it did before. An exhaustive
+`switch` over `WebSocketError` needs a new case; a `catch`/`default` does not.
+
+**`try await client.connect()` now throws that reduction instead of the original
+`URLError`.** Before this release a transport failure resumed the connect call
+with the `URLError` `URLSession` reported; it now resumes with
+`WebSocketError.transportFailure(message:code:)`. Nothing about this is caught
+by the compiler and the text is unchanged (`localizedDescription` is verbatim,
+so logs read identically), so a `catch` that matched on the error's *type* stops
+matching silently:
+
+```swift
+// Before — no longer entered.
+do { try await client.connect() }
+catch let error as URLError where error.code == .notConnectedToInternet { … }
+
+// After — the URLError code rides along in the `code` payload.
+do { try await client.connect() }
+catch let error as WebSocketError {
+    if case .transportFailure(_, let code) = error,
+       code == URLError.notConnectedToInternet.rawValue { … }
+}
+```
+
+`(error as NSError).domain` / `.code` shift the same way.
+
+**Not changed:** `client.isConnected` and the manager's four synchronous reads
+(`isConnected`, `isConnecting`, `connectionStatus`, `isSocketOpen`) stay
+synchronous **permanently**, backed by a `nonisolated` snapshot box (sponsor
+decision, 2026-08-02). They keep their exact values and their SwiftUI-callable
+shape; undeprecated `…Async` twins sit beside them for callers that would rather
+take an actor hop for a strictly-current read. `isSocketOpen` still reads the
+socket's live `state`, not a cached boolean.
+
+### The whole package builds in the Swift 6 language mode (#2310)
+
+#1946 put the `JsBaoClient` target in the `.v6` language mode with a per-target
+setting and pinned the package default at `[.v5]` so nothing else moved. That
+pin is gone: the package now declares `swiftLanguageModes: [.v6]`, and
+`SwiftBaoCodegen`, `JsBaoCodegenPlugin`, `JsBaoClientTests`,
+`SwiftBaoCodegenTests` and `E2EMiniApp` build in Swift 6 mode with it. There is
+no per-target opt-in left in the manifest, so a target added later inherits the
+mode instead of silently landing in Swift 5.
+
+Measured before committing to the shape: `SwiftBaoCodegen`,
+`SwiftBaoCodegenTests` and `E2EMiniApp` were already clean at `.v6`;
+`JsBaoClientTests` had 91 error sites. Those were test-side fixes only — no
+library source and no public API changed:
+
+- raw `NSLock.lock()`/`unlock()` inside `async` helpers → scoped `withLock`;
+- `DispatchSemaphore.wait` / `Thread.sleep` inside a `Task` → an async wait and
+  `Task.sleep`;
+- locals mutated from a `@Sendable` callback, and `NSCountedSet` captured by
+  one, → the shared `LockedBox` / `FireCounter` containment boxes in
+  `Tests/JsBaoClientTests/Helpers/SendableBoxes.swift`;
+- lock-guarded `static var` in the `URLProtocol` test stubs → one `LockedBox`
+  per stub (a `static var` is global shared mutable state under `.v6` however
+  carefully it is locked);
+- `YDocument` crossing a `TaskGroup` boundary → the library's own
+  `ConfinedYDocument` holder — including the two GCD-based deadlock regression
+  markers and the shared watchdog in `Helpers/DeadlockWatchdog.swift`, which
+  were the last warning-level sites left in the test target.
+
+The app-layer packages moved with it (`swift-tools-version: 5.9` → `6.0` plus
+the same `swiftLanguageModes: [.v6]` pin): `packages/swift-primitive-app`, the
+iOS starter template, and the demo. `PrimitiveApp` measured 41 error sites, all
+in the DEBUG-only inspector: its HTTP server and response writer are now
+`Sendable` (their one mutable property each is lock-guarded, the shape
+`SSEChannel` already used), and every route serializes its payload on the main
+actor so the value crossing back to the request's `Task` is `Data` rather than
+a `[String: Any]`. **An app scaffolded from the template now compiles in the
+Swift 6 language mode by default, on both of its build paths** — the SPM pin in
+`Package.swift` and `SWIFT_VERSION: "6.0"` in `project.yml`, which is what the
+Xcode build (`./run-ios.sh`) reads. Change both if you would rather start in
+Swift 5 mode; changing one leaves Xcode and `swift build` disagreeing about the
+same source file. The docs example compile harness moved with them, so
+documented snippets are graded in the mode the template ships.
+
+`scripts/v6-sendable-gate.sh` moved with the pin: it now asserts the
+package-level mode is `[.v6]` and that no target overrides it back — checked
+across every target in the manifest, and covering the `-swift-version` unsafe
+flag as well as the `swiftLanguageMode` setting — instead of asserting the old
+target-scoped shape.
+
+One non-concurrency change to watch for if you flip your own package: under the
+Swift 6 language mode `#file` is the *concise* `<module>/<file>` form, not the
+full source path. Anything that builds a filesystem path out of `#file` starts
+resolving against the working directory instead of the source tree — use
+`#filePath` there. That is what it did to this package's cross-platform test
+harness locator, where the symptom was silent skips rather than a failure.
+
+**Your app still does not have to adopt the Swift 6 language mode** — the mode
+is per-target, so a Swift 5 package can depend on this one. The toolchain floor
+is unchanged from #1946 (`swift-tools-version: 6.0`).
+
+### Policy — when a synchronous public member gets an `async` twin (#2244)
+
+The rule the actorization epic (#1993, #1994) has been applying, written down
+so it stops being re-decided per phase. **Two classes, and every member falls in
+one of them:**
+
+1. **Deprecate + add an `async` twin** when a caller can observe the difference:
+   the member returns a result, or it is ordered against another call the caller
+   can make. The synchronous form keeps working for one release and is removed
+   in the next major. `client.flushAnalytics()`, `client.analytics.logEvent(_:)`,
+   `client.setBlobUploadConcurrency(_:)` and — new in this release —
+   `AnalyticsContext.logEvent(_:)` are all in this class.
+2. **Permanent, documented carve-out** when the member is a pure hand-off with
+   no caller-observable ordering **and** making it `async` would break a
+   correctness property. A carve-out names its reason here and in the type's
+   docstring; it carries no deprecation and gets no twin.
+
+The carve-outs, with their reasons:
+
+| Member | Why it stays synchronous |
+| --- | --- |
+| `WebSocketManagerDelegate`'s synchronous methods (`webSocketManagerOnStatusChange`, `webSocketManagerOnConnected`, `webSocketManagerShouldReconnect(code:reason:)`, …) | They are called from `URLSession`'s socket callbacks and their answers gate the very next step of the connection. An `async` delegate method would let the socket advance past a `shouldReconnect` decision that has not been made yet. |
+| `WebSocketManager`'s four transport reads (`isConnected`, `isConnecting`, `connectionStatus`, `isSocketOpen`) and the `client.isConnected` facade over them | Pure status reads with no result about a pending mutation. They serve from a `nonisolated` snapshot box written from inside the actor on every transition, so the values are identical to the lock version's — including the same snapshot-only caveat the class already documented. They are read from SwiftUI `body`, from `DebugInspector`, and through `DatabasesAPI`'s `isWebSocketOpen: () -> Bool` closure, none of which can `await`. Undeprecated `…Async` twins exist for callers that want a strictly-current read. |
+| `BlobManager.downloadUrl` | Reads only the API-URL and app-ID closures, so it is `nonisolated`. It is the blob member most likely to be called straight from a SwiftUI `body` (it feeds an `AsyncImage` URL), where `async` is not available. |
+| `AnalyticsQueue.prepared(_:)` | Lowering an event on the caller's thread is the *point*: it is where the `Any` graph stops and where the event's timestamp is taken. Hopping first would stamp the wrong instant. |
+| `EventEmitter` subscription and emit | Callbacks run inside `emit` by contract, and `observeOnMainActor`'s hop is enqueued synchronously inside it so cross-event order holds. `async` would replace that ordering with the scheduler's. |
+
+Twins carry a distinct name (`…Async`) rather than being `async` overloads:
+Swift prefers the `async` overload in an asynchronous context, so a same-name
+twin turns every existing un-`await`ed call inside an `async` function into a
+compile error — the source break the window exists to avoid.
+
+### `AnalyticsContext` gains `logEventAsync(_:)`; its synchronous `logEvent` is deprecated (#2244, consolidating #2272)
+
+The handle returned by `client.getLlmAnalyticsContext()` /
+`getGeminiAnalyticsContext()` was the last analytics entry point left out of the
+Phase D3 window (#1993): its `logEvent` handed the work to an unstructured task
+with no twin to await and no compiler nudge, while the same app's
+`client.analytics.logEvent` had both. It now matches the rest of the surface.
+
+| Deprecated (still works) | Twin |
+| --- | --- |
+| `context.logEvent(_:)` | `await context.logEventAsync(_:)` |
+
+The deprecation rides the existing Phase D/E next-major window — no new window,
+no separate migration note. What the twin adds is the same thing it adds
+elsewhere: it returns once the event has reached the analytics buffer, so it is
+ordered against a following flush.
+
+`AnalyticsContext.init` takes an optional `logEventAsync:` closure between the
+existing `logEvent:` and `isEnabled:` parameters. It is defaulted, so a
+hand-constructed context keeps compiling unchanged; such a context's
+`logEventAsync` falls back to the synchronous closure, calling it exactly once.
+
+Also fixed here, in the same family: the `logAnalytics` closures the client
+hands `LlmAPI` and `GeminiAPI` passed the event straight to the actor, so
+`ingest` stamped its `timestamp` whenever the unstructured task happened to run
+rather than when the call site logged it. They now lower the event with
+`prepared(_:)` on the caller's thread, the way `getLlmAnalyticsContext()`
+already did.
+
+### `observeOnMainActor(_:withDelivery:)` reports when the client emitted (#2244)
+
+New, additive. `observeOnMainActor(_:handler:)` delivers one main-actor hop
+after the emit, so a handler that takes its own `Date()` measures that hop along
+with the client's work. Anything building a timeline — a debug inspector, a
+latency report — wants the emit's own instant instead. It can have it now:
+
+```swift
+subscription = client.observeOnMainActor(DocumentLoadedEvent.self, withDelivery: { event, delivery in
+    rows.append(Row(at: delivery.emittedAt, order: delivery.sequence, id: event.documentId))
+})
+```
+
+`EventDelivery` carries two fields, both captured inside the emit before any
+handler or stream sees the payload:
+
+- `emittedAt` — the wall-clock instant of the emit. Wall clock, so it can be
+  compared with timestamps from outside the process, which also means it can
+  move backwards if the system clock is adjusted between two emits.
+- `sequence` — position in this emitter's **emit** order, from 1, increasing by
+  one per emit across all event keys. Emit order, never delivery order: a
+  handler that emits a second event synchronously gives that nested event a
+  *higher* sequence even though the nested delivery finishes first. Sort a
+  timeline on `sequence` and it cannot invert — including when the system clock
+  moves backwards between two emits, which `emittedAt` alone cannot survive.
+  The count is per emitter, so per client — two `JsBaoClient` instances in one
+  process count independently and their sequences must not be compared.
+
+Nothing changes for existing code. `observeOnMainActor(_:handler:)` keeps its
+signature and is now written as a wrapper over the metadata form, so the two
+share one delivery path — same main-actor isolation, same emit ordering, same
+cancellation. A distinct argument label rather than an overload of the same
+name, because two same-arity `observeOnMainActor` overloads would make a call
+site whose closure takes anonymous parameters ambiguous.
+
+`stream(for:)` gets no metadata in this pass. Delivering it there would first
+need an answer for `replayingLatest:` — whether a replayed value reports its
+original emit instant or the replay's — and there is no consumer waiting on it.
+
+Cost: one wall-clock read, one counter increment and one struct initialization
+per emit, inside the critical section the emit already entered. No new lock
+acquisition and nothing per subscriber. Measured at ~25 ns per emit on an
+Apple-silicon debug build.
+
+### The WebSocket plumbing and the logger are internal (#2363)
+
+`WebSocketManagerDelegate`, `WebSocketManager`, `Logger` and `createLogger` were
+`public` by accident — they live in `Internal/` and nothing outside the module
+implements or calls them. Because the delegate protocol was public,
+`JsBaoClient`'s conformance also put its 13 `webSocketManagerOn*` /
+`webSocketManagerBuild*` methods on the client's public API, where app code
+could read the bearer token out of
+`webSocketManagerBuildConnectionRequest(connectionId:)`'s `?token=` URL or call
+the `On*` methods to inject connection-lifecycle events the app's own observers
+treat as real. All of these are now `internal`.
+
+Two types that *are* public API kept their access and moved out of `Internal/`:
+`LogLevel` (now `Types/LogLevel.swift`) and `WebSocketError` (now in
+`Types/Errors.swift`, with the client's other public errors). Nothing about
+either declaration changed.
+
+**Migration.** Nothing to do unless your app referenced one of the internal
+symbols above, which it should not have. Two consequences worth naming:
+
+- `WorkflowsAPI`'s two public initializers no longer take `logger:` — the
+  parameter's type is now internal. Drop the argument; an internal overload
+  carries the logger inside the module. Set the client's log level with
+  `JsBaoClientOptions.logLevel` or `client.setLogLevel(_:)` as before.
+- The initializers of the `Internal/` helpers (`AnalyticsQueue`, `AuthController`,
+  `BlobManager`, `DocumentManager`, `HttpClientConfig`) are internal too, since
+  each takes the now-internal `Logger`. Those types were never meant to be
+  constructed from an app.
+
+Unrelated to the `?token=` handshake itself: the WS URL still carries the token
+as a query parameter for protocol compatibility with the JS client. Moving to an
+Authorization header needs a coordinated server change and is tracked separately.
+
+### Fixed — `databases.executeOperation(timing:)` now actually asks for timings (#2359)
+
+`timing` was encoded as a field in the request body. The server reads the flag
+from the `X-Timing` request header, so it never saw it and the response carried
+no `_timing` block — the option did nothing. It is sent as `X-Timing: true` now
+(and left out of the body, which is where the JS client has always put it), so
+`timing: true` returns the per-phase breakdown the docs describe.
+
+No source change is needed in your app: `ExecuteOperationOptions.timing` and
+the `timing:` argument on the typed `executeOperation<Params, Output>` overload
+keep the same shape. Only the wire changes — a request that used to carry a
+`timing` body field the server ignored now carries the header instead.
+
+One caveat if you are still on the deprecated closure init: `DatabasesAPI(makeRequest:)`
+cannot carry request headers, so `executeOperation` with `timing: true` now
+throws `CLIENT_LEGACY_TRANSPORT_UNSUPPORTED_OPTIONS` from the adapter instead of
+silently returning an untimed result. Move to `init(transport:)` (what
+`JsBaoClient` already does for you), or drop the `timing` flag. No other
+`executeOperation` call shape is affected, and instances built from a
+`JsBaoClient` never hit this path.
+
+### Fixed — `documents.validateAccess` and `documents.getRoot` called routes the server doesn't have (#2358)
+
+Both calls always failed with an HTTP 404:
+
+- `validateAccess(documentId:)` sent `GET /documents/{id}/access`. It now sends
+  `POST /documents/{id}/validate-access`, the route the server registers and the
+  one js-bao uses.
+- `getRoot()` sent `GET /documents/root`, which the server resolved as a document
+  whose id is the literal string `"root"`. It now resolves the root document id
+  from the JWT via `client.getRootDocId()` and fetches that document, matching
+  js-bao. When the token carries no `rootDocId` it throws
+  `JsBaoError(code: .notFound)` locally instead of issuing a doomed request, and
+  on a `DocumentsAPI` with no wired client it throws `JsBaoError(code: .unavailable)`
+  — the same guard `openRoot()` already had.
+
 ### Requires a Swift 6 toolchain — the package manifest is at tools-version 6.0 (#1946, Phase F)
 
 `Package.swift` moves from `swift-tools-version: 5.9` to `6.0`, and the
@@ -16,11 +406,10 @@ it is the only thing this change asks of a downstream app.
 
 The toolchain the package is actually built and tested against is **Swift 6.3
 (Xcode 26)**. Toolchains between 6.0 and 6.3 satisfy the manifest but are not
-part of our verification, and one caveat is worth knowing before you pin to
-one: the target still carries 11 warning-level `#SendableClosureCaptures`
-diagnostics in `SQLiteStorageProvider` (tracked in #2318). They are warnings in
-6.3; a 6.x that grades that diagnostic group as an error would fail the build.
-If you are on an older 6.x, build once before you commit to the bump.
+part of our verification. The target builds warning-free under 6.3 — the 11
+warning-level `#SendableClosureCaptures` diagnostics this entry used to caveat
+were cleared in #2318, so there is no diagnostic left for an older 6.x to grade
+as an error.
 
 No public API shape changes. The `Sendable` conformances the mode enforces were
 all added by the earlier phases of this epic (#1988, #1991, #1992, #1993,
@@ -29,9 +418,7 @@ becoming the compiler's job rather than a gate script's.
 
 **Your app does not have to adopt the Swift 6 language mode.** The language mode
 is per-target: a package in Swift 5 mode can depend on a target in Swift 6 mode.
-The rest of this package stays in Swift 5 mode too — the pin is
-`swiftLanguageModes: [.v5]`, and `SwiftBaoCodegen`, both test targets and the
-E2E mini-app are unchanged.
+(The rest of this package followed in #2310 — see the entry above.)
 
 ### Breaking — `BlobManager` is an actor; the synchronous blob-queue surface is deprecated or removed (#2172)
 

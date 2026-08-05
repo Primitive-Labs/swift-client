@@ -127,7 +127,7 @@ final class DisconnectReconnectTests: XCTestCase {
         try await waitForConnection(client: client)
 
         // Force reconnect
-        client.forceReconnect()
+        await client.forceReconnectAsync()
         try await delay(2)
 
         // Should be reconnected

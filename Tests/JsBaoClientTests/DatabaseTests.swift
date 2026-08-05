@@ -1,8 +1,11 @@
 import XCTest
 @testable import JsBaoClient
 
-/// Port of tests/client/js-bao-client-database-metadata.test.ts and js-bao-client-database-timing.test.ts
+/// Port of tests/client/js-bao-client-database-metadata.test.ts.
 /// Tests database CRUD and metadata operations.
+///
+/// The timing suite (js-bao-client-database-timing.test.ts) is ported in
+/// `DatabaseOperationTimingLiveTests.swift`, not here.
 final class DatabaseTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

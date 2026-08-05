@@ -139,37 +139,35 @@ final class HttpClientRefreshCoalescingTests: XCTestCase {
 ///     the refreshed bearer token, in which case 200 `{userId}`.
 ///
 /// State is static (the loading system instantiates a fresh protocol per
-/// request); a lock keeps the counters race-free under the concurrent burst.
+/// request) and shared across the concurrent burst, so it lives in one
+/// `LockedBox` — a `static var` is a hard error under the Swift 6 language
+/// mode however carefully it is locked, and the box keeps every read and write
+/// serialised exactly as the old NSLock did.
 final class RefreshStubURLProtocol: URLProtocol {
-    private static let lock = NSLock()
-    private static var _refreshCount = 0
-    private static var _sawAuthorizedRetry = false
-    private static var refreshedToken = ""
-    private static var refreshDelay: TimeInterval = 0
-    private static var refreshStatus = 200
+    private struct Script {
+        var refreshCount = 0
+        var sawAuthorizedRetry = false
+        var refreshedToken = ""
+        var refreshDelay: TimeInterval = 0
+        var refreshStatus = 200
+    }
+
+    private static let script = LockedBox(Script())
 
     static func configure(refreshedToken: String, refreshDelay: TimeInterval, refreshStatus: Int) {
-        lock.withLock {
-            self.refreshedToken = refreshedToken
-            self.refreshDelay = refreshDelay
-            self.refreshStatus = refreshStatus
-            _refreshCount = 0
-            _sawAuthorizedRetry = false
-        }
+        script.value = Script(
+            refreshedToken: refreshedToken,
+            refreshDelay: refreshDelay,
+            refreshStatus: refreshStatus
+        )
     }
 
     static func reset() {
-        lock.withLock {
-            _refreshCount = 0
-            _sawAuthorizedRetry = false
-            refreshedToken = ""
-            refreshDelay = 0
-            refreshStatus = 200
-        }
+        script.value = Script()
     }
 
-    static var refreshCount: Int { lock.withLock { _refreshCount } }
-    static var sawAuthorizedRetryWithNewToken: Bool { lock.withLock { _sawAuthorizedRetry } }
+    static var refreshCount: Int { script.value.refreshCount }
+    static var sawAuthorizedRetryWithNewToken: Bool { script.value.sawAuthorizedRetry }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -179,9 +177,9 @@ final class RefreshStubURLProtocol: URLProtocol {
         let path = url.path
 
         if path.hasSuffix("/auth/refresh") {
-            let (delay, status, token): (TimeInterval, Int, String) = Self.lock.withLock {
-                Self._refreshCount += 1
-                return (Self.refreshDelay, Self.refreshStatus, Self.refreshedToken)
+            let (delay, status, token): (TimeInterval, Int, String) = Self.script.withValue { script in
+                script.refreshCount += 1
+                return (script.refreshDelay, script.refreshStatus, script.refreshedToken)
             }
             if delay > 0 { Thread.sleep(forTimeInterval: delay) }
             if status == 200 {
@@ -195,9 +193,9 @@ final class RefreshStubURLProtocol: URLProtocol {
         // Any other request: authorize only when it presents the refreshed
         // bearer token (i.e. it is the retry after a successful refresh).
         let auth = request.value(forHTTPHeaderField: "Authorization")
-        let refreshed = Self.lock.withLock { Self.refreshedToken }
+        let refreshed = Self.script.value.refreshedToken
         if let auth = auth, auth == "Bearer \(refreshed)", !refreshed.isEmpty {
-            Self.lock.withLock { Self._sawAuthorizedRetry = true }
+            Self.script.withValue { $0.sawAuthorizedRetry = true }
             respond(status: 200, json: ["userId": "u1"])
         } else {
             respond(status: 401, json: ["error": "unauthorized"])

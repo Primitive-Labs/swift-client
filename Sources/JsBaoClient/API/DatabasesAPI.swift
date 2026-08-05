@@ -63,6 +63,13 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Deprecated: construct with a `Transport` instead. The legacy closure is
     /// wrapped in an adapter so existing call sites keep working for one major
     /// cycle.
+    ///
+    /// One call is conditional on this init: `executeOperation` with
+    /// `options.timing == true` sends the `X-Timing` request header (#2359),
+    /// and the legacy JSON closure cannot carry headers — so it surfaces
+    /// `CLIENT_LEGACY_TRANSPORT_UNSUPPORTED_OPTIONS` from the adapter instead
+    /// of returning an untimed result. Use `init(transport:)` if you need
+    /// timings, or leave the flag off.
     @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
     public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
         self.init(transport: ClosureTransport(makeRequest: makeRequest))
@@ -433,15 +440,30 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// pagination. The result shape depends on the operation (query rows,
     /// mutation acknowledgement, count, aggregate), so it is returned as an
     /// opaque `JSONValue` — JS returns `any` here.
+    ///
+    /// `options.timing` does not travel in the body: the server reads it from
+    /// the `X-Timing` request header, so it is sent as a header here and left
+    /// out of the encoded options (#2359). Same split the JS client makes.
+    ///
+    /// On an instance built with the deprecated `init(makeRequest:)`, a
+    /// `timing: true` throws `CLIENT_LEGACY_TRANSPORT_UNSUPPORTED_OPTIONS` —
+    /// the legacy JSON closure carries no request headers. Every other call
+    /// shape is unaffected; use `init(transport:)` to request timings.
     public func executeOperation(databaseId: String, name: String, options: ExecuteOperationOptions? = nil) async throws -> JSONValue {
         let encodedName = URLEncoding.encodeComponent(name)
+        // Only a `true` sends the header at all — a `false`/omitted flag sends
+        // nothing, matching the JS client's truthiness check.
+        let requestOptions = options?.timing == true
+            ? RequestOptions(customHeaders: ["X-Timing": "true"])
+            : nil
         // A `nil` options object sends `{}`, as the untyped body did — every
         // field on `ExecuteOperationOptions` is optional, so the default value
         // encodes to an empty JSON object.
         return try await transport.request(
             method: .post,
             path: "/databases/\(databaseId)/operations/\(encodedName)/execute",
-            body: options ?? ExecuteOperationOptions()
+            body: options ?? ExecuteOperationOptions(),
+            options: requestOptions
         )
     }
 

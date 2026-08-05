@@ -58,7 +58,7 @@ final class CodegenEdgeCaseTests: XCTestCase {
         try assertDateRoundTrip(raw)
     }
 
-    private func assertDateRoundTrip(_ raw: String, file: StaticString = #file, line: UInt = #line) throws {
+    private func assertDateRoundTrip(_ raw: String, file: StaticString = #filePath, line: UInt = #line) throws {
         let doc = YDocument()
         SchemaSync.clearCache()
         let model = TypedModel<TaskRecord>(doc: doc)
@@ -143,7 +143,7 @@ final class CodegenEdgeCaseTests: XCTestCase {
                      "encoder should return nil for -infinity; currently emits '-inf' which panics the Rust FFI")
     }
 
-    private func assertNumberRoundTrip(_ n: Double, file: StaticString = #file, line: UInt = #line) throws {
+    private func assertNumberRoundTrip(_ n: Double, file: StaticString = #filePath, line: UInt = #line) throws {
         let doc = YDocument()
         SchemaSync.clearCache()
         let model = TypedModel<TaskRecord>(doc: doc)

@@ -54,38 +54,18 @@ let package = Package(
                 .product(name: "TOMLKit", package: "TOMLKit"),
             ],
             path: "Sources/JsBaoClient",
-            // Swift 6 language mode, enabled on this target only (#1946,
-            // Phase F of the concurrency-modernization epic). Strict
-            // concurrency checking is `complete` here and the diagnostics
-            // are hard errors, so a `Sendable` regression in the library
-            // now fails the build instead of being counted by a script.
+            // No `swiftSettings:` here any more — the whole package is in the
+            // Swift 6 language mode via `swiftLanguageModes: [.v6]` at the
+            // bottom of this manifest (#2310). This target carried the only
+            // per-target opt-in between #1946 and #2310.
             //
-            // Getting here took the whole epic: #1910 removed the 231
-            // `unavailable from asynchronous contexts` sites (raw NSLock
-            // lock/unlock → scoped `withLock`), then #1988 (A, mechanical
-            // fixes), #1991 (B, typed transport spine), #1992 (C, honest
-            // model/schema/query `Sendable`), #1993 (D1-D3, actorized async
-            // managers) and #1994 (E, AsyncStream events) drove the
-            // remaining `Sendable` error sites from 67 to 0.
-            //
-            // The flip is deliberately target-scoped: the package pins
-            // `swiftLanguageModes: [.v5]` at the bottom of this manifest, so
-            // `SwiftBaoCodegen`, the two test targets and `E2EMiniApp` still
-            // compile in Swift 5 mode. Flipping those is separate work —
-            // the test targets in particular still carry strict-concurrency
-            // warnings.
-            //
-            // `scripts/v6-sendable-gate.sh` is still the regression gate,
-            // now running against this committed mode rather than a
-            // temporary rewrite of the manifest: it builds the target,
-            // reports any `Sendable` error site per file, and asserts a
-            // budget when given `--max` / `--require-zero`. `run-tests.sh`
-            // runs it that way before the suite. Its first check is that
-            // the `.swiftLanguageMode(.v6)` line below is still here — a
-            // silent revert would otherwise read as "zero sites".
-            swiftSettings: [
-                .swiftLanguageMode(.v6),
-            ],
+            // `scripts/v6-sendable-gate.sh` is still the regression gate for
+            // this target: it builds it, reports any `Sendable` error site per
+            // file, counts the warning-level strict-concurrency sites, and
+            // asserts a budget when given `--max` / `--max-warnings` /
+            // `--require-zero`. `run-tests.sh` runs it that way before the
+            // suite. Its first check is that the committed mode is still `.v6`
+            // — a silent revert would otherwise read as "zero sites".
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]
@@ -141,9 +121,23 @@ let package = Package(
             plugins: [.plugin(name: "JsBaoCodegenPlugin")]
         ),
     ],
-    // Package-wide default. Keeps the `.v6` flip scoped to the
-    // `JsBaoClient` target above (see the comment there): every other target
-    // in this package — `SwiftBaoCodegen`, `JsBaoClientTests`,
-    // `SwiftBaoCodegenTests`, `E2EMiniApp` — still compiles in Swift 5 mode.
-    swiftLanguageModes: [.v5]
+    // Package-wide: every target compiles in the Swift 6 language mode, so
+    // strict concurrency checking is `complete` and its diagnostics are hard
+    // errors everywhere in this package.
+    //
+    // Getting the library here took the whole concurrency-modernization epic:
+    // #1910 removed the 231 `unavailable from asynchronous contexts` sites (raw
+    // NSLock lock/unlock → scoped `withLock`), then #1988 (A, mechanical
+    // fixes), #1991 (B, typed transport spine), #1992 (C, honest
+    // model/schema/query `Sendable`), #1993 (D1-D3, actorized async managers)
+    // and #1994 (E, AsyncStream events) drove the remaining `Sendable` error
+    // sites from 67 to 0, and #1946 (F) flipped the `JsBaoClient` target on its
+    // own. #2310 finished the job: `JsBaoClientTests` needed 91 sites cleared
+    // (the same classes, plus lock-guarded `static var` test stubs, which are
+    // global mutable state under `.v6`), and `SwiftBaoCodegen`,
+    // `SwiftBaoCodegenTests` and `E2EMiniApp` were already clean.
+    //
+    // Because the mode is now the package default, a NEW target added below
+    // inherits it — there is no per-target opt-in to remember.
+    swiftLanguageModes: [.v6]
 )

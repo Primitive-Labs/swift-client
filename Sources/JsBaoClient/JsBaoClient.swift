@@ -153,6 +153,46 @@ public final class JsBaoClient: @unchecked Sendable {
     /// false with an unsent edit behind it (the Codex finding on PR #2104).
     private var outboundEnqueuesInProgress: [String: Int] = [:]
 
+    /// Ownership token of the flush currently draining each document's outbound
+    /// queue. Guarded by `lock`. Absent means no flush owns the document.
+    ///
+    /// One flush owns a document's drain at a time: the first to claim the id
+    /// owns it, a concurrent flush returns immediately, and the owner re-checks
+    /// the queue before it releases ownership, so anything queued meanwhile is
+    /// drained by that owner. Without this, two flushes could each hold an
+    /// unconfirmed batch and neither could see the other's (#2105).
+    ///
+    /// The value is a token rather than a bare `Set` membership because
+    /// ownership can be revoked underneath a running flush: `closeDocument` and
+    /// `destroy` drop the entry while a flush may be awaiting `sendLocalUpdate`.
+    /// If the document is then reopened and edited, a *new* flush legitimately
+    /// takes ownership — and when the old send finally returns, the old flush
+    /// must not touch the new owner's queue, remove its head, release its
+    /// ownership, or decide the flag. Comparing the token it acquired against
+    /// the current one tells it whether it is still the owner; if not, it exits
+    /// without touching any shared state (the Codex finding on PR #2396).
+    private var outboundFlushOwner: [String: UInt64] = [:]
+
+    /// Monotonic source of `outboundFlushOwner` tokens. Guarded by `lock`.
+    /// Never reused, so a revoked owner can never match a later one.
+    private var outboundFlushTokenSeq: UInt64 = 0
+
+    /// Documents whose drain was requested while another flush owned it.
+    /// Guarded by `lock`.
+    ///
+    /// A flush that finds the document already owned returns immediately, which
+    /// is only safe if the owner is guaranteed to carry the work the caller
+    /// wanted done. It isn't: the owner may be parked in a send that is about to
+    /// fail, and a failed send releases ownership without retrying. The request
+    /// would then be lost with the batch still queued, no owner, no debounce
+    /// timer armed — nothing left to flush it until the next local edit
+    /// (PR #2396 review). So a flush that can't claim the document records the
+    /// request here instead of dropping it, and the owner consumes the bit at
+    /// both of its release points and loops rather than releasing. Membership,
+    /// not a count: several requests collapse into one more drain pass, which is
+    /// all any of them wanted.
+    private var outboundReflushRequested: Set<String> = []
+
     /// Monotonic sequence handed out under `lock` to each unsynced-flag
     /// decision, so the decisions are *applied* in the order they were made.
     /// Guarded by `lock`.
@@ -182,7 +222,11 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Test-observability hook: invoked at the very end of
     /// `flushOutboundUpdates`, after the flag decision has been applied.
     /// Internal — the PR #2104 race test uses it to know the flush's clear
-    /// check has run. Never set in production code.
+    /// check has run. Fires only for the flush that *owns* the drain — on
+    /// every one of its exits: queue drained, send failed, or its ownership
+    /// revoked mid-send by `closeDocument`/`destroy`. It never fires for a
+    /// concurrent flush that returned without draining (#2105). Never set in
+    /// production code.
     var onOutboundFlushedForTest: ((String) -> Void)?
 
     // MARK: Storage-init completion signal (#1780)
@@ -501,9 +545,29 @@ public final class JsBaoClient: @unchecked Sendable {
         await wsManager.setDesiredConnection(shouldConnect: shouldConnect)
     }
 
-    /// Force reconnect the WebSocket
+    /// Force reconnect the WebSocket.
+    ///
+    /// Deprecated because `WebSocketManager` is an actor since #2171: this
+    /// spelling can only start the reconnect and return, so a following
+    /// `isConnected` read may still observe the old socket. Use
+    /// `forceReconnectAsync()`, which returns once the reconnect has actually
+    /// been initiated.
+    ///
+    /// The twin deliberately carries a distinct name rather than being a
+    /// same-name `async` overload: Swift prefers an `async` overload in an
+    /// asynchronous context, so a same-name twin turns every existing
+    /// un-`await`ed call into a compile error — the break this window exists to
+    /// avoid.
+    @available(*, deprecated, message: "Use forceReconnectAsync() — the synchronous version returns before the reconnect is initiated, so a following isConnected read may still observe the old socket. Removed in the next major release.")
     public func forceReconnect() {
-        wsManager.forceReconnect()
+        let wsManager = self.wsManager
+        Task { await wsManager.forceReconnect() }
+    }
+
+    /// Force reconnect the WebSocket, returning once the reconnect has been
+    /// initiated.
+    public func forceReconnectAsync() async {
+        await wsManager.forceReconnect()
     }
 
     /// Check if WebSocket is connected
@@ -1239,15 +1303,27 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// `AnalyticsContext.logEvent` is a synchronous app-facing shape, so it
     /// enqueues without waiting — the same contract the deprecated
-    /// `logAnalyticsEvent` has. It talks to the queue directly rather than
-    /// through that deprecated method (#1993, Phase D3), and captures the queue
-    /// strongly because the handle outlives the call and holding the queue does
-    /// not retain the client.
+    /// `logAnalyticsEvent` has, and deprecated for the same reason beside its
+    /// `logEventAsync` twin (#2244). Both talk to the queue directly rather
+    /// than through the deprecated client method (#1993, Phase D3), and both
+    /// capture the queue strongly because the handle outlives the call and
+    /// holding the queue does not retain the client.
+    ///
+    /// Both lower the event with `prepared(_:)` on the caller's thread: that is
+    /// where the `Any` graph stops, where the event's `timestamp` is taken, and
+    /// where a non-JSON-representable event is dropped *and logged* rather than
+    /// disappearing.
     private func makeAnalyticsContext() -> AnalyticsContext {
-        AnalyticsContext { [analyticsQueue] event in
-            guard let prepared = analyticsQueue.prepared(event) else { return }
-            Task { await analyticsQueue.logEvent(prepared) }
-        }
+        AnalyticsContext(
+            logEvent: { [analyticsQueue] event in
+                guard let prepared = analyticsQueue.prepared(event) else { return }
+                Task { await analyticsQueue.logEvent(prepared) }
+            },
+            logEventAsync: { [analyticsQueue] event in
+                guard let prepared = analyticsQueue.prepared(event) else { return }
+                await analyticsQueue.logEvent(prepared)
+            }
+        )
     }
 
     // MARK: - Top-level offline-metadata browsing (gap 14)
@@ -1686,7 +1762,7 @@ public final class JsBaoClient: @unchecked Sendable {
         if !wsManager.isSocketOpen {
             try? await connect()
         } else {
-            wsManager.forceReconnect()
+            await wsManager.forceReconnect()
         }
         return result
     }
@@ -1724,7 +1800,7 @@ public final class JsBaoClient: @unchecked Sendable {
         if !wsManager.isSocketOpen {
             try? await connect()
         } else {
-            wsManager.forceReconnect()
+            await wsManager.forceReconnect()
         }
         return result
     }
@@ -1934,16 +2010,57 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The result is deliberately not `@discardableResult`: dropping it cancels
     /// the subscription immediately, so the unused-result warning is the only
     /// mechanical protection against a handler that silently never fires.
+    ///
+    /// **Timing.** The handler runs one hop after the emit, so a `Date()` taken
+    /// inside it includes that hop. When the timestamp has to be the emit's own,
+    /// use ``observeOnMainActor(_:withDelivery:)`` and read
+    /// ``EventDelivery/emittedAt``.
     public func observeOnMainActor<E: JsBaoEventPayload>(
         _ type: E.Type,
         handler: @escaping @Sendable @MainActor (E) -> Void
+    ) -> EventSubscription {
+        // Wraps the metadata form and discards the metadata, so isolation,
+        // ordering and cancellation cannot drift apart between the two.
+        observeOnMainActor(type, withDelivery: { event, _ in handler(event) })
+    }
+
+    /// Observe one event on the main actor, with the emit's delivery metadata.
+    ///
+    /// Same subscription as ``observeOnMainActor(_:handler:)`` — same main-actor
+    /// isolation, same emit ordering, same cancellation — with an
+    /// ``EventDelivery`` describing *when the client emitted* rather than when
+    /// the handler got to run:
+    ///
+    /// ```swift
+    /// subscription = client.observeOnMainActor(DocumentLoadedEvent.self, withDelivery: { event, delivery in
+    ///     rows.append(Row(at: delivery.emittedAt, order: delivery.sequence, id: event.documentId))
+    /// })
+    /// ```
+    ///
+    /// Delivery is one hop onto the main actor, so a handler that stamps its own
+    /// `Date()` measures that hop as well as the client's work. Anything
+    /// building a timeline — a debug inspector, a latency report — should take
+    /// its timestamp from ``EventDelivery/emittedAt`` and sort on
+    /// ``EventDelivery/sequence``. Comparing the two is itself useful: the gap
+    /// is the cost of the hop, which is largest exactly when the main thread is
+    /// the thing being investigated.
+    ///
+    /// A distinct argument label rather than an overload of the same name:
+    /// two same-arity `observeOnMainActor` overloads would make a call site
+    /// whose closure takes anonymous parameters ambiguous.
+    ///
+    /// As with the no-metadata form, the result is deliberately not
+    /// `@discardableResult` — dropping it cancels the subscription.
+    public func observeOnMainActor<E: JsBaoEventPayload>(
+        _ type: E.Type,
+        withDelivery handler: @escaping @Sendable @MainActor (E, EventDelivery) -> Void
     ) -> EventSubscription {
         // The gate is what makes cancellation reach a hop that is already
         // enqueued: cancelling only removes the emitter callback, so without it
         // a handler could still mutate its owner's UI after that owner cancelled
         // or re-keyed the subscription.
         let gate = MainActorDeliveryGate()
-        let inner = eventEmitter.subscribe(type) { event in
+        let inner = eventEmitter.subscribe(type) { event, delivery in
             // `DispatchQueue.main.async`, not `Task { @MainActor in … }`. The
             // main queue is FIFO, so hops enqueued from inside successive emits
             // run in emit order. Separate unstructured `Task`s only get serial
@@ -1952,7 +2069,7 @@ public final class JsBaoClient: @unchecked Sendable {
             // priorities can run out of emit order.
             DispatchQueue.main.async {
                 guard !gate.isCancelled else { return }
-                MainActor.assumeIsolated { handler(event) }
+                MainActor.assumeIsolated { handler(event, delivery) }
             }
         }
         // Captured strongly: `inner` is the only reference to the emitter-side
@@ -2527,6 +2644,16 @@ public final class JsBaoClient: @unchecked Sendable {
             outboundDebounceTimers[documentId]?.cancel()
             outboundDebounceTimers.removeValue(forKey: documentId)
             pendingUpdates.removeValue(forKey: documentId)
+            // Drop the flush-ownership entry with the queue it guards (#2105).
+            // A retained entry would silently stop every future flush for this
+            // document if it were reopened. An owner still mid-send has had its
+            // token revoked, so it exits without touching the (possibly
+            // reopened) document's state when its send returns.
+            outboundFlushOwner.removeValue(forKey: documentId)
+            // Nothing is left to re-flush for a closed document, and a stale bit
+            // would make the first flush after a reopen take a pointless extra
+            // drain pass.
+            outboundReflushRequested.remove(documentId)
         }
 
         // Drop this document's flag-decision watermark alongside its queue state
@@ -3634,6 +3761,11 @@ public final class JsBaoClient: @unchecked Sendable {
             isDestroyed = true
             outboundDebounceTimers.values.forEach { $0.cancel() }
             outboundDebounceTimers.removeAll()
+            // Release every flush-ownership entry (#2105) so teardown can't
+            // leave a document wedged for a client that outlives it. Running
+            // flushes see their token revoked and exit on their next check.
+            outboundFlushOwner.removeAll()
+            outboundReflushRequested.removeAll()
             // Cancel any pending reachability apply so no reaction fires after
             // teardown (an already-enqueued one no-ops via the isDestroyed
             // guard in applyReachability).
@@ -3757,7 +3889,20 @@ public final class JsBaoClient: @unchecked Sendable {
             transport: httpClient,
             cache: cacheFacade,
             localMetadata: { [weak self] in self?.documentManager.getMetadataIndex() ?? [:] },
-            isOnline: { [weak self] in self?.networkingAllowed() ?? false }
+            isOnline: { [weak self] in self?.networkingAllowed() ?? false },
+            // Background refresh behind a local-first `ownedDocuments` writes
+            // the server rows into the same local metadata cache the
+            // local-first path reads, so the next call is fresh (#2360).
+            syncServerDocuments: { [weak self] docs in
+                guard let self = self else { return }
+                await self.documentManager.handleServerDocuments(
+                    docs.map { LocalFirstListing.serverDocumentPayload($0) }
+                )
+            },
+            // Lets the local-first paths apply the same root filter the
+            // server applies to `/me/owned-documents` (#848 / #2360).
+            rootDocId: { [weak self] in self?.getRootDocId() },
+            logger: logger
         )
         session = SessionAPI(transport: httpClient)
         auth = AuthAPI(
@@ -3871,13 +4016,24 @@ public final class JsBaoClient: @unchecked Sendable {
         authController.setClientNetworkMode = { [weak self] mode in
             self?.setNetworkMode(mode)
         }
+        // `prepared(_:)` runs on the calling thread — the same lowering
+        // `makeAnalyticsContext()` does — so the event's `timestamp` is the
+        // instant the LLM/Gemini call site logged it. Handing the raw event to
+        // the actor instead would have stamped it whenever the unstructured
+        // task happened to run (#2244).
         llm = LlmAPI(
             transport: httpClient,
-            logAnalytics: { [analyticsQueue] event in Task { await analyticsQueue.logEvent(event) } }
+            logAnalytics: { [analyticsQueue] event in
+                let prepared = analyticsQueue.prepared(event)
+                Task { await analyticsQueue.logEvent(prepared) }
+            }
         )
         gemini = GeminiAPI(
             transport: httpClient,
-            logAnalytics: { [analyticsQueue] event in Task { await analyticsQueue.logEvent(event) } }
+            logAnalytics: { [analyticsQueue] event in
+                let prepared = analyticsQueue.prepared(event)
+                Task { await analyticsQueue.logEvent(prepared) }
+            }
         )
         users = UsersAPI(transport: httpClient, cache: cacheFacade)
         groups = GroupsAPI(transport: httpClient)
@@ -4426,11 +4582,16 @@ public final class JsBaoClient: @unchecked Sendable {
     // directions, without adding a `lock` → `DocumentManager.lock` ordering
     // edge a future DocumentManager callback could deadlock against.
     //
-    // Scope: this covers the mark → append window only. A batch already
-    // removed from `pendingUpdates` by `flushOutboundUpdates` but not yet
-    // confirmed sent is invisible to both decision sites, so overlapping
-    // flushes can still clear the flag over an unsent edit — a pre-existing
-    // gap, tracked in #2105.
+    // The invariant both decision sites enforce (#2105): the flag is cleared
+    // for a document only at a moment when that document has no local update
+    // that is queued, mid-enqueue, or drained-but-unconfirmed. The third case
+    // used to be invisible — the flush removed the batch from `pendingUpdates`
+    // before awaiting the sends — so an overlapping flush could clear the flag
+    // over an unsent edit. `flushOutboundUpdates` now keeps each update in
+    // `pendingUpdates` until the socket has accepted it, and takes per-document
+    // ownership of the drain, so "drained" and "confirmed sent" are the same
+    // instant. Anything that later actorizes this path must carry that
+    // invariant rather than assume actor isolation subsumes it.
     //
     // Note the `lock` → `DocumentManager.lock` edge is avoided, not the
     // deadlock hazard in general: `unsyncedFlagApplyLock` *is* held across the
@@ -4457,6 +4618,59 @@ public final class JsBaoClient: @unchecked Sendable {
         return unsyncedFlagSeq
     }
 
+    /// Outcome of the shared clear guard: either a decision sequence to clear
+    /// the flag with, or the reason the clear was refused (logged by the
+    /// caller, outside `lock`).
+    private enum UnsyncedClearDecision {
+        case clear(seq: UInt64)
+        case blocked(reason: String)
+    }
+
+    /// What a flush owner's peek at its document's queue found.
+    private enum OutboundFlushPeek {
+        /// The next update to send.
+        case next([UInt8])
+        /// Nothing queued — try to release ownership and clear the flag.
+        case drained
+        /// This flush's ownership token was revoked (`closeDocument` /
+        /// `destroy`), so it must exit without touching any shared state.
+        case revoked
+    }
+
+    /// The one place that decides whether the outbound unsynced flag may be
+    /// cleared for a document. Both decision sites (`flushOutboundUpdates` and
+    /// `reconcileUnsyncedAfterSync`) route through it so their conditions
+    /// cannot drift apart. Caller must hold `lock`.
+    ///
+    /// The flag may clear only when the document has no local update that is
+    /// mid-enqueue (marked but not yet appended), queued (which now includes a
+    /// batch whose send hasn't been confirmed), or being drained by another
+    /// flush.
+    private func unsyncedClearDecisionLocked(_ documentId: String) -> UnsyncedClearDecision {
+        guard (outboundEnqueuesInProgress[documentId] ?? 0) == 0 else {
+            return .blocked(reason: "enqueueInProgress")
+        }
+        guard pendingUpdates[documentId]?.isEmpty ?? true else {
+            return .blocked(reason: "pendingQueued")
+        }
+        guard outboundFlushOwner[documentId] == nil else {
+            return .blocked(reason: "flushInProgress")
+        }
+        return .clear(seq: nextUnsyncedFlagSeqLocked())
+    }
+
+    /// Apply a clear decision taken under `lock`, logging a refusal at debug.
+    /// Called outside `lock` (the apply path takes `unsyncedFlagApplyLock`).
+    private func applyUnsyncedClearDecision(_ documentId: String, _ decision: UnsyncedClearDecision) {
+        switch decision {
+        case .clear(let seq):
+            applyUnsyncedFlag(documentId, false, seq: seq)
+        case .blocked(let reason):
+            // The line to grep when "evict says unsynced forever" is reported.
+            logger.debug("[outbound] unsynced flag clear suppressed", documentId, reason)
+        }
+    }
+
     /// Queue and debounce local document updates for sending
     func queueOutboundUpdate(documentId: String, update: [UInt8]) {
         // Mark the doc unsynced the moment an edit is queued — it holds local
@@ -4470,8 +4684,9 @@ public final class JsBaoClient: @unchecked Sendable {
         // would set the flag back with nothing pending left to ever clear it,
         // leaving `documents.evict` rejecting the doc indefinitely (#2004). It
         // also keeps the flag in place for this edit's own send: nothing between
-        // the mark and that send's completion clears it. (A *concurrent* flush
-        // of an earlier batch can still clear it mid-send — see #2105.)
+        // the mark and that send's completion clears it — a concurrent flush of
+        // an earlier batch can't clear it mid-send either, because that batch
+        // stays in `pendingUpdates` until the socket confirms it (#2105).
         //
         // Marking first opens the opposite window — the update isn't in
         // `pendingUpdates` yet, so an already-running flush's "everything
@@ -4514,57 +4729,178 @@ public final class JsBaoClient: @unchecked Sendable {
         onOutboundQueuedForTest?(documentId)
     }
 
+    /// Drain a document's queued updates to the socket (#2105).
+    ///
+    /// Two rules make the clear guard correct by construction:
+    ///
+    /// 1. **One owner per document.** The first flush to claim the id in
+    ///    `outboundFlushOwner` owns the drain; a concurrent flush records its
+    ///    request in `outboundReflushRequested` and returns. The owner re-checks
+    ///    the queue each iteration and consumes that request at both of its
+    ///    release points, so an edit queued mid-drain — or a drain requested
+    ///    while the owner sat in a send that then failed — is carried by the
+    ///    owner rather than lost. Ownership is a token, and `closeDocument` /
+    ///    `destroy` can revoke it while this flush is awaiting a send — so
+    ///    every step after an `await` re-checks the token and exits on a
+    ///    mismatch, rather than draining a reopened document's queue behind
+    ///    its rightful new owner.
+    /// 2. **Drain on confirmation, not on dequeue.** An update stays in
+    ///    `pendingUpdates` until `sendLocalUpdate` confirms the socket took it,
+    ///    so a batch in flight is visible to every clear guard as exactly what
+    ///    it is — an unsent local edit. On a failed send the batch stays queued
+    ///    and the flag stays set; the next flush (or the post-resync flush in
+    ///    `reconcileUnsyncedAfterSync`) carries it.
+    ///
+    /// Ownership is released in the *same* critical section that decides the
+    /// clear. Releasing first would let a new flush take ownership and start a
+    /// send while this one evaluated its guard — the original bug in a new form.
     private func flushOutboundUpdates(documentId: String) async {
-        let updates: [[UInt8]]? = lock.withLock {
-            // This removal is where the #2105 gap originates: the batch leaves
-            // `pendingUpdates` before it is confirmed sent (see the note on the
-            // clear guard below).
-            guard let pending = pendingUpdates.removeValue(forKey: documentId), !pending.isEmpty else {
+        let token: UInt64? = lock.withLock {
+            guard outboundFlushOwner[documentId] == nil else {
+                // Someone else owns the drain. Don't just return — record that a
+                // drain was asked for, so the owner makes another pass instead of
+                // releasing over the request. Without this, an owner whose send
+                // is about to fail drops the request along with its ownership and
+                // the queue is left with nothing to flush it.
+                outboundReflushRequested.insert(documentId)
                 return nil
             }
-            return pending
+            outboundFlushTokenSeq += 1
+            outboundFlushOwner[documentId] = outboundFlushTokenSeq
+            return outboundFlushTokenSeq
         }
-        guard let updates else { return }
+        guard let token else { return }
 
-        // Send each update, tracking whether every one reached the socket.
-        var allSent = true
-        for update in updates {
-            let sent = await documentManager.sendLocalUpdate(documentId: documentId, update: update)
-            if !sent { allSent = false }
-        }
-
-        // Clear the unsynced flag only if every update reached the socket AND
-        // nothing else is on its way out: no fresh edit queued while we were
-        // flushing, and no enqueue mid-flight between its mark and its insert
-        // into `pendingUpdates`. A send failure (socket down), a newly-queued
-        // edit, or an in-flight enqueue leaves the doc flagged unsynced, so the
-        // evict guard keeps protecting it — and every one of those cases has a
-        // flush of its own still to come that will clear the flag.
-        //
-        // Known gap (#2105, pre-existing): neither condition sees a batch that
-        // another flush has already removed from `pendingUpdates` but not yet
-        // confirmed sent, because the removal above happens before the awaits.
-        // Overlapping flushes can therefore clear the flag over an unsent edit
-        // if that other flush's send then fails.
-        if allSent {
-            let clearSeq: UInt64? = lock.withLock { () -> UInt64? in
-                guard (outboundEnqueuesInProgress[documentId] ?? 0) == 0 else { return nil }
-                guard pendingUpdates[documentId]?.isEmpty ?? true else { return nil }
-                return nextUnsyncedFlagSeqLocked()
+        while true {
+            // Peek only while still the owner. If `closeDocument`/`destroy`
+            // revoked the token (and a reopen may already have handed it to a
+            // new flush), stop here: the queue this reads is no longer ours,
+            // and nothing is left to release — the revoker took the entry.
+            let peek: OutboundFlushPeek = lock.withLock {
+                guard outboundFlushOwner[documentId] == token else { return .revoked }
+                guard let update = pendingUpdates[documentId]?.first else { return .drained }
+                return .next(update)
             }
-            if let clearSeq {
-                applyUnsyncedFlag(documentId, false, seq: clearSeq)
+            switch peek {
+            case .revoked:
+                onOutboundFlushedForTest?(documentId)
+                return
+
+            case .drained:
+                // The queue looks drained. Release ownership and decide the
+                // clear in the SAME critical section — releasing first would
+                // let a new flush take ownership and start a send while this
+                // one evaluated its guard, which is the original bug.
+                //
+                // Release only if the queue is still empty under that lock: an
+                // edit appended since the peek above has no flush of its own to
+                // fall back on (its flush task ran while we owned the drain and
+                // returned immediately), so the owner keeps ownership and
+                // drains it rather than leaving it queued with nothing pending.
+                //
+                // And release only our OWN token: it may have been revoked and
+                // re-handed to a new owner since the peek, in which case
+                // releasing would drop *their* ownership and let a third flush
+                // run alongside them.
+                let release = lock.withLock { () -> (revoked: Bool, decision: UnsyncedClearDecision?) in
+                    guard outboundFlushOwner[documentId] == token else { return (true, nil) }
+                    // Any drain requested while we owned the document is
+                    // satisfied by this pass: we are deciding under the same lock
+                    // whether anything is queued, and either drain it (below) or
+                    // establish there is nothing to drain.
+                    outboundReflushRequested.remove(documentId)
+                    guard pendingUpdates[documentId]?.isEmpty ?? true else { return (false, nil) }
+                    outboundFlushOwner.removeValue(forKey: documentId)
+                    return (false, unsyncedClearDecisionLocked(documentId))
+                }
+                if release.revoked {
+                    onOutboundFlushedForTest?(documentId)
+                    return
+                }
+                guard let decision = release.decision else { continue }
+                // Everything queued has reached the socket. The clear can still
+                // be refused — an enqueue mid-flight between its mark and its
+                // insert (#2004) has a flush of its own still to come.
+                applyUnsyncedClearDecision(documentId, decision)
+                onOutboundFlushedForTest?(documentId)
+                return
+
+            case .next(let update):
+                let sent = await documentManager.sendLocalUpdate(documentId: documentId, update: update)
+                guard sent else {
+                    // Leave the batch queued: `pendingUpdates` stays non-empty,
+                    // so the clear guard (here and in
+                    // `reconcileUnsyncedAfterSync`) keeps the document flagged
+                    // unsynced and `evict` keeps refusing it. The owner stops
+                    // rather than retrying on its own — there is no backoff
+                    // policy here, so the retained batch waits for the next local
+                    // edit's flush or for the post-resync flush in
+                    // `reconcileUnsyncedAfterSync`.
+                    //
+                    // Unless a drain was requested while this send was in flight:
+                    // that request arrived on a healthy socket (a resync had just
+                    // completed) and found the document owned, so it did nothing
+                    // but set the bit. Dropping ownership over it would strand
+                    // the batch with no owner, no timer, and no pending request —
+                    // the liveness hole this bit closes. Take another pass
+                    // instead. The bit is consumed here, so the retry count is
+                    // bounded by the number of requests actually made.
+                    let outcome = lock.withLock { () -> (retry: Bool, retained: Int) in
+                        let retained = pendingUpdates[documentId]?.count ?? 0
+                        // Only act on our own token — the send we just awaited is
+                        // exactly the window in which it can be revoked.
+                        guard outboundFlushOwner[documentId] == token else {
+                            return (false, retained)
+                        }
+                        if outboundReflushRequested.remove(documentId) != nil, retained > 0 {
+                            return (true, retained)
+                        }
+                        outboundFlushOwner.removeValue(forKey: documentId)
+                        return (false, retained)
+                    }
+                    if outcome.retry {
+                        logger.debug("[outbound] send failed, re-flush requested, retrying",
+                                     documentId, "\(outcome.retained)")
+                        continue
+                    }
+                    logger.debug("[outbound] send failed, retaining batch", documentId, "\(outcome.retained)")
+                    onOutboundFlushedForTest?(documentId)
+                    return
+                }
+
+                let stillOwner = lock.withLock { () -> Bool in
+                    // `closeDocument`/`destroy` can revoke ownership while the
+                    // send above is in flight, and a reopen can hand it to a new
+                    // flush. Removing the head then would consume an update that
+                    // belongs to the new owner's queue, so leave it alone.
+                    guard outboundFlushOwner[documentId] == token else { return false }
+                    // Only the owner removes from the head, but `closeDocument`
+                    // can drop the whole key mid-send and a later edit can append
+                    // a new head behind it. Remove the head only when it is still
+                    // the update we just confirmed, so a close-then-edit race
+                    // can't discard an update that never reached the socket.
+                    guard var queue = pendingUpdates[documentId], queue.first == update else { return true }
+                    queue.removeFirst()
+                    if queue.isEmpty {
+                        pendingUpdates.removeValue(forKey: documentId)
+                    } else {
+                        pendingUpdates[documentId] = queue
+                    }
+                    return true
+                }
+                guard stillOwner else {
+                    onOutboundFlushedForTest?(documentId)
+                    return
+                }
             }
         }
-
-        onOutboundFlushedForTest?(documentId)
     }
 
     /// Reconcile the outbound-unsynced flag after a (re)sync completes.
     ///
     /// The flush above leaves the flag set when a send fails (socket dropped
-    /// mid-flush): `pendingUpdates` was already removed but `allSent` is false,
-    /// so `markUnsyncedLocalChanges(_, false)` never runs. A later reconnect
+    /// mid-flush): the batch stays queued, so the clear guard refuses and
+    /// `markUnsyncedLocalChanges(_, false)` never runs. A later reconnect
     /// re-syncs the document through the normal `syncStep1`/`syncStep2`
     /// exchange — which re-delivers the local diff to the server — but that
     /// path never cleared the flag, so `documents.evict`/`evictAll` kept
@@ -4578,28 +4914,61 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `flushOutboundUpdates` clear it once that edit reaches the socket.
     ///
     /// Uses the same decide-under-`lock` / apply-by-sequence discipline as the
-    /// flush, and skips the clear while an enqueue is mid-flight, so it can't
-    /// clear a mark whose update hasn't reached `pendingUpdates` yet.
+    /// flush — literally the same guard, `unsyncedClearDecisionLocked` — so the
+    /// two decision sites can't drift apart.
+    ///
+    /// Then flushes anything still queued (#2105). Updates whose send failed
+    /// now stay in `pendingUpdates` instead of being dropped, so without this
+    /// trigger the queue would stay non-empty forever, the guard above would
+    /// never clear, and the flag would stick after a resync — the #1979 bug in
+    /// reverse. A resync completing is exactly the moment the socket is known
+    /// good, so retry there. One shot, no backoff; re-sending an update the
+    /// resync already carried is harmless (Yjs updates are idempotent).
+    ///
+    /// If a flush already owns the document, that spawned flush doesn't drain
+    /// itself — it records the request in `outboundReflushRequested` and the
+    /// owner makes another pass. The owner may be parked in the very send whose
+    /// failure this retry exists to repair, and a failed send releases ownership
+    /// without retrying, so a dropped request would strand the batch (PR #2396
+    /// review).
     func reconcileUnsyncedAfterSync(documentId: String) {
-        let clearSeq: UInt64? = lock.withLock { () -> UInt64? in
-            guard (outboundEnqueuesInProgress[documentId] ?? 0) == 0 else { return nil }
-            guard pendingUpdates[documentId]?.isEmpty ?? true else { return nil }
-            return nextUnsyncedFlagSeqLocked()
+        let decision: UnsyncedClearDecision = lock.withLock {
+            unsyncedClearDecisionLocked(documentId)
         }
-        if let clearSeq {
-            applyUnsyncedFlag(documentId, false, seq: clearSeq)
+        applyUnsyncedClearDecision(documentId, decision)
+
+        let hasQueuedUpdates = lock.withLock { !(pendingUpdates[documentId]?.isEmpty ?? true) }
+        guard hasQueuedUpdates else { return }
+        Task { [weak self] in
+            await self?.flushOutboundUpdates(documentId: documentId)
         }
+    }
+
+    // MARK: - Test observability (outbound queue state)
+
+    /// Number of updates still queued for send. Internal (visible only via
+    /// `@testable import`) — the #2105 tests assert that a failed send retains
+    /// its batch rather than dropping it. Never called from production code.
+    func pendingOutboundUpdateCountForTest(_ documentId: String) -> Int {
+        lock.withLock { pendingUpdates[documentId]?.count ?? 0 }
+    }
+
+    /// Whether a flush currently owns this document's drain. Internal — the
+    /// #2105 tests assert the ownership entry is always released, since a
+    /// leaked one would silently disable every future flush for the document.
+    func isOutboundFlushInProgressForTest(_ documentId: String) -> Bool {
+        lock.withLock { outboundFlushOwner[documentId] != nil }
     }
 }
 
 // MARK: - WebSocketManagerDelegate
 
 extension JsBaoClient: WebSocketManagerDelegate {
-    public func webSocketManagerHasAccessToken() -> Bool {
+    func webSocketManagerHasAccessToken() -> Bool {
         authController.getToken() != nil
     }
 
-    public func webSocketManagerBuildConnectionRequest(connectionId: String) -> (url: URL, headers: [String: String]) {
+    func webSocketManagerBuildConnectionRequest(connectionId: String) -> (url: URL, headers: [String: String]) {
         // The server expects the token as a query parameter, not an Authorization header.
         // This matches the JS client's buildWebSocketRequest() behavior.
         //
@@ -4627,7 +4996,7 @@ extension JsBaoClient: WebSocketManagerDelegate {
         return (url, headers)
     }
 
-    public func webSocketManagerOnStatusChange(_ status: ConnectionStatus) {
+    func webSocketManagerOnStatusChange(_ status: ConnectionStatus) {
         eventEmitter.emit(StatusChangedEvent(status: status))
         if status == .connected {
             lock.withLock {
@@ -4636,11 +5005,11 @@ extension JsBaoClient: WebSocketManagerDelegate {
         }
     }
 
-    public func webSocketManagerOnConnecting() {
+    func webSocketManagerOnConnecting() {
         logger.debug("WebSocket connecting...")
     }
 
-    public func webSocketManagerOnConnected() {
+    func webSocketManagerOnConnected() {
         logger.log("WebSocket connected")
         // Re-subscribe to all open documents
         let docIds = documentManager.listOpenDocuments()
@@ -4656,23 +5025,23 @@ extension JsBaoClient: WebSocketManagerDelegate {
         }
     }
 
-    public func webSocketManagerOnMessage(_ data: Data) async {
+    func webSocketManagerOnMessage(_ data: Data) async {
         if let text = String(data: data, encoding: .utf8) {
             await handleWebSocketMessage(text)
         }
     }
 
-    public func webSocketManagerOnMessage(_ text: String) async {
+    func webSocketManagerOnMessage(_ text: String) async {
         await handleWebSocketMessage(text)
     }
 
-    public func webSocketManagerOnClose(code: Int?, reason: String?) {
+    func webSocketManagerOnClose(code: Int?, reason: String?) {
         logger.log("WebSocket closed:", code ?? 0, reason ?? "")
         eventEmitter.emit(StatusChangedEvent(status: .disconnected))
         eventEmitter.emit(ConnectionCloseEvent(code: code, reason: reason))
     }
 
-    public func webSocketManagerOnError(_ error: Error) {
+    func webSocketManagerOnError(_ error: Error) {
         logger.warn("WebSocket error:", error.localizedDescription)
         eventEmitter.emit(ConnectionErrorEvent(message: error.localizedDescription))
         eventEmitter.emit(GenericErrorEvent(
@@ -4680,19 +5049,19 @@ extension JsBaoClient: WebSocketManagerDelegate {
         ))
     }
 
-    public func webSocketManagerOnReconnectScheduled(delayMs: Int) {
+    func webSocketManagerOnReconnectScheduled(delayMs: Int) {
         logger.debug("WebSocket reconnect in \(delayMs)ms")
     }
 
-    public func webSocketManagerOnDisconnectInitiated() {
+    func webSocketManagerOnDisconnectInitiated() {
         logger.debug("WebSocket disconnect initiated")
     }
 
-    public func webSocketManagerOnDisconnectResolved() {
+    func webSocketManagerOnDisconnectResolved() {
         logger.debug("WebSocket disconnect resolved")
     }
 
-    public func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool {
+    func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool {
         // Don't reconnect on auth failures
         if code == 4001 || code == 4003 { return false }
         return networkingAllowed()

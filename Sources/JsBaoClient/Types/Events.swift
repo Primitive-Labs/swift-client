@@ -1,5 +1,51 @@
 import Foundation
 
+// MARK: - Event delivery metadata
+
+/// When an event was emitted, and where it sits in the emitter's emit order.
+///
+/// Delivered alongside the payload by
+/// ``JsBaoClient/observeOnMainActor(_:withDelivery:)``. Both fields are captured
+/// inside the emit itself, before any handler or stream sees the payload, so a
+/// handler that runs a hop later — or several hops later, on a busy main
+/// thread — still reports the instant the client emitted rather than the instant
+/// it got around to handling. That difference is the whole point: a tool
+/// measuring client latency from the handler's own clock measures scheduler
+/// latency along with it.
+///
+/// ```swift
+/// subscription = client.observeOnMainActor(DocumentLoadedEvent.self, withDelivery: { event, delivery in
+///     let hop = Date().timeIntervalSince(delivery.emittedAt)
+///     timeline.append(row(event, at: delivery.emittedAt, order: delivery.sequence, hop: hop))
+/// })
+/// ```
+public struct EventDelivery: Sendable {
+    /// The wall-clock instant the event was emitted.
+    ///
+    /// Wall clock, so it can be compared against timestamps from outside the
+    /// process — which also means it can move backwards when the system clock
+    /// is adjusted between two emits. Sort on ``sequence`` when order has to
+    /// hold regardless.
+    public let emittedAt: Date
+
+    /// Position in this emitter's **emit** order, starting at 1 and increasing
+    /// by one per emit across all event keys.
+    ///
+    /// Emit order, never delivery order. A handler that emits a second event
+    /// synchronously gives that nested event a *higher* sequence even though
+    /// the nested delivery finishes first — the number records when the emit
+    /// was entered, not when any handler completed.
+    ///
+    /// Per emitter, so per client: two `JsBaoClient` instances in one process
+    /// count independently and their sequences must not be compared.
+    public let sequence: UInt64
+
+    public init(emittedAt: Date, sequence: UInt64) {
+        self.emittedAt = emittedAt
+        self.sequence = sequence
+    }
+}
+
 // MARK: - Connection Status
 
 public enum ConnectionStatus: String, Sendable {
@@ -954,17 +1000,54 @@ public struct CacheUpdateFailedEvent: Sendable {
 /// guard for callers that want to skip work when analytics is off.
 public final class AnalyticsContext: @unchecked Sendable {
     private let logger: @Sendable ([String: Any]) -> Void
+    private let asyncLogger: (@Sendable ([String: Any]) async -> Void)?
     private let enabledCheck: @Sendable (String?) -> Bool
 
+    /// - Parameters:
+    ///   - logEvent: The synchronous logger. Still required, and still what a
+    ///     context built without an async logger falls back to.
+    ///   - logEventAsync: The logger `logEventAsync(_:)` awaits. Defaulted, so
+    ///     a context constructed before this parameter existed keeps compiling
+    ///     and keeps its old behavior.
+    ///   - isEnabled: Phase gate — see ``isEnabled(_:)``.
     public init(
         logEvent: @escaping @Sendable ([String: Any]) -> Void,
+        logEventAsync: (@Sendable ([String: Any]) async -> Void)? = nil,
         isEnabled: @escaping @Sendable (String?) -> Bool = { _ in true }
     ) {
         self.logger = logEvent
+        self.asyncLogger = logEventAsync
         self.enabledCheck = isEnabled
     }
 
+    /// Log an event without waiting for it to reach the buffer.
+    ///
+    /// Deprecated for the reason every other synchronous analytics member is
+    /// (#1993, Phase D3): the work is handed to an unstructured task, so the
+    /// call is not ordered against anything that follows it — an event logged
+    /// immediately before a flush may miss that batch. The event's `timestamp`
+    /// is stamped when you call, either way.
+    @available(*, deprecated, message: "Use await logEventAsync(_:) — the synchronous version enqueues without waiting, so it is not ordered against a following flush. Removed in the next major release.")
     public func logEvent(_ event: [String: Any]) { logger(event) }
+
+    /// Log an event and return once it has reached the analytics buffer.
+    ///
+    /// The twin of `logEvent(_:)`, in the same shape as
+    /// `client.analytics.logEventAsync(_:)`. Use it when the event has to be
+    /// ordered against something that follows — a flush, a sign-out, a
+    /// teardown.
+    ///
+    /// A context constructed without a `logEventAsync:` closure falls back to
+    /// the synchronous one, calling it exactly once. That keeps a
+    /// hand-constructed context working; it just cannot promise the event has
+    /// landed, because its only logger does not report that either.
+    public func logEventAsync(_ event: [String: Any]) async {
+        if let asyncLogger {
+            await asyncLogger(event)
+            return
+        }
+        logger(event)
+    }
 
     /// Optional `phase` argument — `"start"`, `"success"`, `"failure"`,
     /// or `nil` for "any phase". Matches js-bao's signature so the call

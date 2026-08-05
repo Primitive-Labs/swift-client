@@ -195,7 +195,7 @@ final class NotificationsAPITests: XCTestCase {
         let lock = NSLock()
         var received: [NotificationEvent] = []
         let sub = client.eventEmitter.subscribe(NotificationEvent.self) { e in
-            lock.lock(); received.append(e); lock.unlock()
+            lock.withLock { received.append(e) }
         }
         defer { sub.cancel() }
 
@@ -207,7 +207,7 @@ final class NotificationsAPITests: XCTestCase {
         """
         await client.handleWebSocketMessage(frame)
 
-        lock.lock(); let events = received; lock.unlock()
+        let events = lock.withLock { received }
         XCTAssertEqual(events.count, 1, "Expected exactly one notification event")
         let e = try XCTUnwrap(events.first)
         XCTAssertEqual(e.notificationId, "ntf42")

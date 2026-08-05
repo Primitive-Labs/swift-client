@@ -274,7 +274,7 @@ final class ActorizedAsyncManagersTests: XCTestCase {
             // Only start once the handler is actually blocking. Bounded: if the
             // emit stops firing — the regression this test guards — an untimed
             // wait would hang the suite instead of failing with a message.
-            guard emitEntered.wait(timeout: .now() + 5) == .success else {
+            guard await emitEntered.waitAsync(timeout: .now() + 5) == .success else {
                 emitNeverFired.increment()
                 return nil
             }

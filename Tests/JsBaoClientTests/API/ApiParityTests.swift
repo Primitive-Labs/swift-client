@@ -623,11 +623,9 @@ final class ApiParityTests: XCTestCase {
 
     func test_workflows_start_forceRerunSerializes() async throws {
         let r = CallRecorder()
-        let logger = createLogger(level: .error, scope: "test")
         let api = WorkflowsAPI(
             makeRequest: r.make,
-            getConnectionId: { "conn-1" },
-            logger: logger
+            getConnectionId: { "conn-1" }
         )
         _ = try await api.start(
             workflowKey: "wf",
@@ -640,11 +638,9 @@ final class ApiParityTests: XCTestCase {
 
     func test_workflows_terminate_contextDocId_appendsQS() async throws {
         let r = CallRecorder()
-        let logger = createLogger(level: .error, scope: "test")
         let api = WorkflowsAPI(
             makeRequest: r.make,
-            getConnectionId: { "conn-1" },
-            logger: logger
+            getConnectionId: { "conn-1" }
         )
         _ = try await api.terminate(workflowKey: "wf", runKey: "rk", contextDocId: "doc-1")
         XCTAssertEqual(r.method, "POST")
@@ -653,11 +649,9 @@ final class ApiParityTests: XCTestCase {
 
     func test_workflows_listStepRuns_path() async throws {
         let r = CallRecorder()
-        let logger = createLogger(level: .error, scope: "test")
         let api = WorkflowsAPI(
             makeRequest: r.make,
-            getConnectionId: { "conn-1" },
-            logger: logger
+            getConnectionId: { "conn-1" }
         )
         _ = try await api.listStepRuns(runId: "run-1")
         XCTAssertEqual(r.method, "GET")
@@ -666,11 +660,9 @@ final class ApiParityTests: XCTestCase {
 
     func test_workflows_listRuns_forwardAndContextDocId() async throws {
         let r = CallRecorder()
-        let logger = createLogger(level: .error, scope: "test")
         let api = WorkflowsAPI(
             makeRequest: r.make,
-            getConnectionId: { "conn-1" },
-            logger: logger
+            getConnectionId: { "conn-1" }
         )
         _ = try await api.listRuns(options: ListWorkflowRunsOptions(
             forward: false,

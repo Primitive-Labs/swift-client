@@ -2,7 +2,24 @@ import Foundation
 
 // MARK: - Delegate Protocol
 
-public protocol WebSocketManagerDelegate: AnyObject {
+/// How `WebSocketManager` calls back into `JsBaoClient`.
+///
+/// Module-internal on purpose (#2363). While this was `public`, `JsBaoClient`'s
+/// conformance put all 13 `webSocketManagerOn*` / `webSocketManagerBuild*`
+/// methods on the client's public API: app code could read the bearer token out
+/// of `webSocketManagerBuildConnectionRequest(connectionId:)`'s `?token=` URL,
+/// and could call the `On*` methods to inject connection-lifecycle events the
+/// app's own observers would treat as real. Nothing outside the module
+/// implements or calls this, and tests reach it through `@testable import`.
+///
+/// Refined to `Sendable` by #2171: the manager is an `actor` now and calls the
+/// delegate from `nonisolated` context, so the reference genuinely crosses
+/// isolation domains. `JsBaoClient` — the only conformer — is already
+/// `@unchecked Sendable`, so it conforms for free. Every method keeps its
+/// signature, including the eleven synchronous ones: an `await` inside
+/// `connect()`'s decision region would reopen the double-connect race (#1993
+/// decision 2).
+protocol WebSocketManagerDelegate: AnyObject, Sendable {
     func webSocketManagerHasAccessToken() -> Bool
     func webSocketManagerBuildConnectionRequest(connectionId: String) -> (url: URL, headers: [String: String])
     func webSocketManagerOnStatusChange(_ status: ConnectionStatus)
@@ -20,84 +37,171 @@ public protocol WebSocketManagerDelegate: AnyObject {
 
 // MARK: - WebSocketManager
 
-public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWebSocketDelegate {
+/// The client's WebSocket transport and its reconnect state machine.
+///
+/// An `actor` since #2171. The `NSLock` it used to hold is gone; every piece of
+/// connection state below is actor-isolated. Two things that could not follow
+/// it into isolation are enumerated in `WebSocketTransportBoxes.swift`, each
+/// with its own written safety argument: the transport snapshot the synchronous
+/// reads serve from, and the weak delegate the client wires synchronously at
+/// construction.
+///
+/// **The ordered delegate-event channel.** `URLSession` delivers its callbacks
+/// on a serial delegate queue, so a class could rely on them arriving in order.
+/// An actor cannot: a `nonisolated` callback that hops onto the actor gets no
+/// ordering guarantee, and an `open` overtaking a `close` would leave the state
+/// machine believing a dead socket is live. Every lifecycle signal that
+/// originates outside isolation is therefore emitted into one unbounded
+/// `AsyncStream` and consumed by a single pump task, which restores FIFO order
+/// by construction rather than by convention.
+///
+/// Three consequences worth knowing:
+///
+/// - The callbacks emit **unconditionally**. They cannot read `task` (it is
+///   isolated), so they carry the task's `ObjectIdentifier` and the pump drops
+///   stale ones — in the same isolated step as the state it guards, which is
+///   stronger than the old identity check under a separate lock hold.
+/// - `handleConnectionClosed` has exactly **one** caller, `handle(_:)`. All
+///   three terminal paths (`didCloseWith`, `didCompleteWithError`, and the
+///   receive loop's catch) reach it only through the channel.
+/// - The receive loop's *message* path deliberately stays **off** the channel.
+///   Messages are not delegate callbacks, and `webSocketManagerOnMessage` is
+///   `async`; routing them through the pump would put an `await` inside the
+///   ordering region and serialize every inbound frame behind the actor.
+actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
-    // MARK: - Properties
+    // MARK: - Delegate events
 
-    private let logger: Logger
-    private var maxReconnectDelayMs: Int
-    internal weak var delegate: WebSocketManagerDelegate?
+    /// A lifecycle signal that originated **outside** actor isolation.
+    ///
+    /// `Sendable` by construction: it carries no `Error` and no
+    /// `URLSessionWebSocketTask`, only the task's `ObjectIdentifier` and a
+    /// failure already reduced to `WebSocketError`.
+    ///
+    /// Module-internal rather than private so the ordering suite can drive the
+    /// channel directly (`ActorizedWebSocketManagerTests`).
+    enum DelegateEvent: Sendable {
+        case opened(task: ObjectIdentifier)
+        case closed(task: ObjectIdentifier, code: Int, reason: String?)
+        case completed(task: ObjectIdentifier, failure: WebSocketError)
+        case receiveLoopFailed(task: ObjectIdentifier, code: Int?, failure: WebSocketError)
+    }
 
-    private let lock = NSLock()
+    // MARK: - Nonisolated state
 
-    private var session: URLSession?
-    private var task: URLSessionWebSocketTask?
-    private var _connected = false
-    private var _connecting = false
-    private var shouldConnect = true
-    private var manualReconnectPending = false
-    private var reconnectAttempts = 0
-    private var lastCloseInitiator: String?
-    private var reconnectWorkItem: DispatchWorkItem?
+    private nonisolated let logger: Logger
+
+    /// The transport state the synchronous reads serve from. See
+    /// `WebSocketTransportBoxes.swift` for the safety argument. Not `private`
+    /// so the ordering suite can observe the live task identity.
+    nonisolated let snapshot = WebSocketTransportSnapshot()
+
+    private nonisolated let delegateBox = WeakWebSocketManagerDelegateBox()
+
+    /// Set synchronously, with no window, from `JsBaoClient.setupDependencies()`.
+    nonisolated var delegate: (any WebSocketManagerDelegate)? {
+        get { delegateBox.value }
+        set { delegateBox.value = newValue }
+    }
+
+    /// The ordered delegate-event channel. `.unbounded`: a bounded policy that
+    /// discarded an `open` or a `close` would desynchronize the state machine
+    /// permanently, and the stream has exactly one producer pair (the delegate
+    /// queue and the receive loop) emitting once per connection-lifecycle
+    /// transition, never per message — so there is nothing here to meter, which
+    /// is why it does not borrow `EventEmitter`'s high-water accounting.
+    private nonisolated let events: AsyncStream<DelegateEvent>
+    private nonisolated let eventContinuation: AsyncStream<DelegateEvent>.Continuation
 
     /// Stable per-client connection id, minted once at construction. Must be
     /// a ULID, not a UUID: the JS client mints a ULID, and the server's auth
     /// middleware validates the `X-JB-Connection-Id` header against a ULID
     /// regex (`permission-middleware.ts`) — a UUID is silently dropped, which
     /// breaks the #737 `isOrigin` round-trip on `db.change` frames.
-    public let connectionId: String = ULID.generate()
+    nonisolated let connectionId: String = ULID.generate()
+
+    // MARK: - Isolated state
+
+    private var maxReconnectDelayMs: Int
+    private var session: URLSession?
+    private var shouldConnect = true
+    private var manualReconnectPending = false
+    private var reconnectAttempts = 0
+    private var lastCloseInitiator: String?
+    private var reconnectTask: Task<Void, Never>?
+
+    /// The single consumer of `events`. Captures `self` weakly — a strong
+    /// capture would retain the actor for as long as the stream is live, so
+    /// `deinit` would never run and the `URLSession` would never be
+    /// invalidated: a connection leak on every client teardown.
+    private var pump: Task<Void, Never>?
 
     // Connect continuation (the in-flight connect() call's own continuation)
     private var connectContinuation: CheckedContinuation<Void, Error>?
 
     // Additional callers that hit connect() while one is already in flight.
     // They are all resumed atomically when the in-flight attempt finishes —
-    // success resumes them with `()`, failure with the same error. Using an
-    // explicit list (instead of polling state) eliminates the race where the
-    // in-flight attempt completes in the gap between releasing the lock and
-    // a secondary caller starting to wait.
+    // success resumes them with `()`, failure with the same error.
     private var pendingConnectWaiters: [CheckedContinuation<Void, Error>] = []
 
     // Disconnect continuation (the in-flight disconnect() call's own continuation)
     private var disconnectContinuation: CheckedContinuation<Void, Never>?
     private var isDisconnecting = false
-    private var disconnectTimeoutWorkItem: DispatchWorkItem?
+    private var disconnectTimeoutTask: Task<Void, Never>?
 
     // Additional callers that hit disconnect() / setDesiredConnection() while a
-    // disconnect is already in flight. Same pattern as `pendingConnectWaiters`:
-    // they register atomically under the lock and are drained when the
-    // disconnect resolves (success path in handleConnectionClosed, fallback
-    // path in the disconnect() timeout work item, or the synchronous no-task
-    // path in disconnect()). Polling `isDisconnecting` from outside the lock
-    // is a data race even though Apple's memory model usually papers over it.
+    // disconnect is already in flight. Same pattern as `pendingConnectWaiters`.
     private var disconnectWaiters: [CheckedContinuation<Void, Never>] = []
 
     // Receive loop task
     private var receiveLoopTask: Task<Void, Never>?
 
-    // MARK: - Lock-decision helpers
+    /// Test seam (#2171): the pump reports every event it handled, in handling
+    /// order, so the ordering and no-drop behaviors can be observed. Mirrors
+    /// `onOutboundFlushedForTest` (#2105).
+    var onDelegateEventHandledForTest: (@Sendable (DelegateEvent) -> Void)?
 
-    /// Outcome of the connect() prologue, decided in a single `withLock` so the
-    /// checks and state mutations that must be atomic stay atomic. Everything
-    /// with side effects (delegate calls, awaiting a continuation) runs after
-    /// the lock is released.
+    // MARK: - Transport state, stored in the snapshot box
+
+    /// `connected` / `connecting` / `task` live in `snapshot` rather than in
+    /// three more isolated fields. One storage means the synchronous readers
+    /// and the actor can never drift apart, and every write below still happens
+    /// from inside isolation.
+    private var task: URLSessionWebSocketTask? {
+        get { snapshot.task }
+        set { snapshot.task = newValue }
+    }
+
+    private var _connected: Bool {
+        get { snapshot.connected }
+        set { snapshot.set(connected: newValue, connecting: snapshot.connecting) }
+    }
+
+    private var _connecting: Bool {
+        get { snapshot.connecting }
+        set { snapshot.set(connected: snapshot.connected, connecting: newValue) }
+    }
+
+    /// Writes both flags in one hold, for the transitions where a reader must
+    /// never catch the pair half-updated (`connecting` off and `connected` on
+    /// are the same instant).
+    private func setTransportState(connected: Bool, connecting: Bool) {
+        snapshot.set(connected: connected, connecting: connecting)
+    }
+
+    // MARK: - Decision types
+
+    /// Outcome of the connect() prologue, decided in one isolated step with no
+    /// suspension point in it, so the checks and the state mutations that must
+    /// be atomic stay atomic. Everything with side effects runs after.
     private enum ConnectDecision {
         case alreadyConnected
         case waitOnExisting
         case abort
-        case proceed(WebSocketManagerDelegate)
+        case proceed(any WebSocketManagerDelegate)
     }
 
-    /// How a secondary connect() caller — one that arrived while a connect was
-    /// already in flight — is resolved when it re-checks under the lock inside
-    /// its continuation prologue.
-    private enum ConnectWaiterResolution {
-        case registered
-        case succeeded
-        case failed
-    }
-
-    /// Outcome of the disconnect() prologue, decided in a single `withLock`.
+    /// Outcome of the disconnect() prologue, decided in one isolated step.
     private enum DisconnectDecision {
         case waitOnExisting
         case proceed(hadTask: Bool, currentTask: URLSessionWebSocketTask?)
@@ -105,126 +209,156 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     // MARK: - Init
 
-    public init(logger: Logger, maxReconnectDelayMs: Int, delegate: WebSocketManagerDelegate? = nil) {
+    init(logger: Logger, maxReconnectDelayMs: Int, delegate: (any WebSocketManagerDelegate)? = nil) {
         self.logger = logger
         self.maxReconnectDelayMs = maxReconnectDelayMs
-        self.delegate = delegate
+        var continuation: AsyncStream<DelegateEvent>.Continuation!
+        self.events = AsyncStream(DelegateEvent.self, bufferingPolicy: .unbounded) { continuation = $0 }
+        self.eventContinuation = continuation
         super.init()
+        self.delegateBox.value = delegate
+        // The pump is started from an isolated step rather than here: `self`
+        // has escaped by this point, so the initializer can no longer touch
+        // isolated state. Nothing is lost by the hop — the stream is unbounded,
+        // so any event emitted before the pump attaches is buffered, and the
+        // manager cannot be connected before `init` returns.
+        Task { await self.startPump() }
     }
 
-    deinit {
-        receiveLoopTask?.cancel()
-        task?.cancel(with: .goingAway, reason: nil)
-        session?.invalidateAndCancel()
-    }
-
-    // MARK: - Public Accessors
-
-    public var isConnected: Bool {
-        return lock.withLock { _connected }
-    }
-
-    public var isConnecting: Bool {
-        return lock.withLock { _connecting }
-    }
-
-    /// The transport state as a single `ConnectionStatus`, read under one lock
-    /// hold so `connected` and `connecting` can't be observed inconsistently
-    /// (reading `isConnected` then `isConnecting` separately is two lock hops
-    /// and can race). `.connected` wins over `.connecting`.
-    public var connectionStatus: ConnectionStatus {
-        return lock.withLock {
-            if _connected { return .connected }
-            if _connecting { return .connecting }
-            return .disconnected
+    private func startPump() {
+        guard pump == nil else { return }
+        let stream = events
+        pump = Task { [weak self] in
+            for await event in stream {
+                guard let self else { return }
+                await self.handle(event)
+            }
         }
     }
 
-    public func setMaxReconnectDelay(_ ms: Int) {
+    deinit {
+        pump?.cancel()
+        eventContinuation.finish()
+        receiveLoopTask?.cancel()
+        reconnectTask?.cancel()
+        disconnectTimeoutTask?.cancel()
+        // `snapshot.task`, not the isolated `task` accessor: `deinit` may touch
+        // isolated *stored* state, but not a computed property.
+        snapshot.task?.cancel(with: .goingAway, reason: nil)
+        session?.invalidateAndCancel()
+    }
+
+    // MARK: - Accessors
+
+    /// Synchronous **permanently** (sponsor, 2026-08-02, Fork 2 → Option B).
+    /// These four read the snapshot box, which is written from inside the actor
+    /// on every transition, so they keep the values and the caller-side shape
+    /// they had before the conversion.
+    nonisolated var isConnected: Bool { snapshot.connected }
+
+    nonisolated var isConnecting: Bool { snapshot.connecting }
+
+    /// The transport state as a single `ConnectionStatus`, read under one lock
+    /// hold so `connected` and `connecting` can't be observed inconsistently.
+    nonisolated var connectionStatus: ConnectionStatus { snapshot.status }
+
+    nonisolated var isSocketOpen: Bool { snapshot.socketIsOpen }
+
+    /// The strictly-current values, for callers that would rather take an actor
+    /// hop than a snapshot. Undeprecated — the synchronous forms above are not
+    /// going away.
+    var isConnectedAsync: Bool { _connected }
+
+    var isConnectingAsync: Bool { _connecting }
+
+    var connectionStatusAsync: ConnectionStatus { snapshot.status }
+
+    var isSocketOpenAsync: Bool { snapshot.socketIsOpen }
+
+    func setMaxReconnectDelay(_ ms: Int) {
         guard ms > 0 else { return }
-        lock.withLock { maxReconnectDelayMs = ms }
+        maxReconnectDelayMs = ms
+    }
+
+    func setEventHandledHookForTest(_ hook: (@Sendable (DelegateEvent) -> Void)?) {
+        onDelegateEventHandledForTest = hook
     }
 
     // MARK: - Connect
 
-    public func connect() async throws {
-        let decision: ConnectDecision = lock.withLock {
-            // Already connected
-            if task != nil && _connected {
-                logger.debug("[WSM][debug] connect aborted: already connected")
-                return .alreadyConnected
-            }
-
-            // Already connecting — resolve as a secondary waiter below.
-            if _connecting {
-                logger.debug("[WSM][debug] connect: waiting on existing connect attempt")
-                return .waitOnExisting
-            }
-
-            // Explicit connect() call implies the caller wants to connect,
-            // so reset shouldConnect (which disconnect() sets to false).
-            shouldConnect = true
-
-            guard let delegate = delegate else {
-                return .abort
-            }
-
-            if !delegate.webSocketManagerHasAccessToken() {
-                logger.debug("[CONNECT] Skipping connect: no access token present")
-                return .abort
-            }
-
-            // Clean up existing socket
-            if task != nil {
-                closeSocketLocked(initiator: "connect:cleanup")
-                task = nil
-            }
-
-            // Mark as connecting early to prevent concurrent connect() calls
-            // from racing past the _connecting check above.
-            _connecting = true
-
-            logger.debug("[WSM][debug] initiating connect", connectionId)
-            return .proceed(delegate)
-        }
-
-        let connectDelegate: WebSocketManagerDelegate
-        switch decision {
+    func connect() async throws {
+        switch connectDecision() {
         case .alreadyConnected, .abort:
             return
         case .waitOnExisting:
-            // Register atomically as a waiter. Because the decision above and
-            // this registration are two separate lock holds, the in-flight
-            // attempt may have finished in the gap — re-check under the lock
-            // and resolve directly if so, otherwise append to be drained when
-            // it finishes. (Matches the waitForAuthReady idiom.)
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let resolution: ConnectWaiterResolution = self.lock.withLock {
-                    if self._connecting {
-                        self.pendingConnectWaiters.append(continuation)
-                        return .registered
-                    }
-                    return self._connected ? .succeeded : .failed
-                }
-                switch resolution {
-                case .registered:
-                    break
-                case .succeeded:
-                    continuation.resume()
-                case .failed:
-                    continuation.resume(
-                        throwing: WebSocketError.connectionFailed("Connection attempt ended without success")
-                    )
-                }
-            }
-            return
-        case .proceed(let d):
-            connectDelegate = d
+            try await waitForInFlightConnect()
+        case .proceed(let delegate):
+            try await performConnect(with: delegate)
+        }
+    }
+
+    /// The connect decision region. It contains **no `await`** — actor
+    /// isolation is reentrant, so a suspension between the `_connecting` check
+    /// and the `_connecting = true` commit would let a second caller take the
+    /// same decision and open a second socket.
+    private func connectDecision() -> ConnectDecision {
+        // Already connected
+        if task != nil && _connected {
+            logger.debug("[WSM][debug] connect aborted: already connected")
+            return .alreadyConnected
         }
 
-        connectDelegate.webSocketManagerOnConnecting()
+        // Already connecting — resolve as a secondary waiter below.
+        if _connecting {
+            logger.debug("[WSM][debug] connect: waiting on existing connect attempt")
+            return .waitOnExisting
+        }
 
-        let (url, headers) = connectDelegate.webSocketManagerBuildConnectionRequest(connectionId: connectionId)
+        // Explicit connect() call implies the caller wants to connect,
+        // so reset shouldConnect (which disconnect() sets to false).
+        shouldConnect = true
+
+        guard let delegate = delegate else {
+            return .abort
+        }
+
+        if !delegate.webSocketManagerHasAccessToken() {
+            logger.debug("[CONNECT] Skipping connect: no access token present")
+            return .abort
+        }
+
+        // Clean up existing socket
+        if task != nil {
+            closeSocketNow(initiator: "connect:cleanup")
+            task = nil
+        }
+
+        // Mark as connecting early to prevent concurrent connect() calls
+        // from racing past the _connecting check above.
+        _connecting = true
+
+        logger.debug("[WSM][debug] initiating connect", connectionId)
+        return .proceed(delegate)
+    }
+
+    /// Park a secondary caller on the in-flight attempt.
+    ///
+    /// The class needed a `ConnectWaiterResolution` re-check here, because the
+    /// decision and the registration were two separate lock holds and the
+    /// attempt could finish in the gap. There is no gap now:
+    /// `withCheckedThrowingContinuation`'s body runs synchronously inside actor
+    /// isolation, so the registration lands in the same isolated step as the
+    /// `_connecting` check that chose this path (#2171 Fork 3).
+    private func waitForInFlightConnect() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.pendingConnectWaiters.append(continuation)
+        }
+    }
+
+    private func performConnect(with delegate: any WebSocketManagerDelegate) async throws {
+        delegate.webSocketManagerOnConnecting()
+
+        let (url, headers) = delegate.webSocketManagerBuildConnectionRequest(connectionId: connectionId)
 
         var request = URLRequest(url: url)
         for (key, value) in headers {
@@ -234,142 +368,172 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         // Create URLSession with self as delegate to get didOpenWithProtocol callback.
         // This is the equivalent of JavaScript's WebSocket 'onopen' event.
         let newSession = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        let oldSession = session
+        session = newSession
+        let newTask = newSession.webSocketTask(with: request)
+        task = newTask
+        _connecting = true
 
-        let (oldSession, newTask): (URLSession?, URLSessionWebSocketTask) = lock.withLock {
-            let oldSession = session
-            session = newSession
-            let newTask = newSession.webSocketTask(with: request)
-            task = newTask
-            _connecting = true
-            return (oldSession, newTask)
-        }
-
-        // Invalidate old session AFTER setting the new task, so any stale
-        // callbacks that sneak through are filtered by the task identity guards.
+        // Invalidate the old session AFTER setting the new task, so any stale
+        // callbacks that sneak through are filtered by the task identity guard
+        // in `handle(_:)`.
         oldSession?.invalidateAndCancel()
 
-        connectDelegate.webSocketManagerOnStatusChange(.connecting)
+        delegate.webSocketManagerOnStatusChange(.connecting)
 
         // Wait for the didOpenWithProtocol delegate callback to fire.
-        // IMPORTANT: Store the continuation BEFORE calling resume() to avoid
-        // a race where didOpenWithProtocol fires before the continuation is set.
+        // IMPORTANT: store the continuation BEFORE resuming the task, or the
+        // callback can land before there is anything to resume.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.lock.withLock {
-                self.connectContinuation = continuation
-            }
-
-            // Now start the connection
+            self.connectContinuation = continuation
             newTask.resume()
         }
     }
 
     // MARK: - URLSessionWebSocketDelegate
 
+    // These run outside actor isolation and cannot read `task`, so they filter
+    // nothing: they emit unconditionally and the pump drops stale events.
+
     /// Called when the WebSocket handshake completes — equivalent to JS's 'onopen'.
-    public func urlSession(
+    nonisolated func urlSession(
         _ session: URLSession,
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
-        let resumeSet: (connect: CheckedContinuation<Void, Error>?, waiters: [CheckedContinuation<Void, Error>])? =
-            lock.withLock {
-                // Ignore callbacks from stale sessions (e.g. after invalidateAndCancel)
-                guard webSocketTask === self.task else {
-                    logger.debug("[WSM][debug] ignoring didOpenWithProtocol from stale task")
-                    return nil
-                }
-                _connecting = false
-                _connected = true
-                reconnectAttempts = 0
-                logger.debug("[WSM][debug] socket open (didOpenWithProtocol)", connectionId)
-
-                let continuation = connectContinuation
-                connectContinuation = nil
-                let waiters = pendingConnectWaiters
-                pendingConnectWaiters.removeAll()
-                return (continuation, waiters)
-            }
-        guard let resumeSet = resumeSet else { return }
-
-        delegate?.webSocketManagerOnStatusChange(.connected)
-        delegate?.webSocketManagerOnConnected()
-        resumeSet.connect?.resume()
-        for waiter in resumeSet.waiters {
-            waiter.resume()
-        }
-
-        // Start the receive loop
-        startReceiveLoop(webSocketTask)
+        emit(.opened(task: ObjectIdentifier(webSocketTask)))
     }
 
     /// Called when the WebSocket closes.
-    public func urlSession(
+    nonisolated func urlSession(
         _ session: URLSession,
         webSocketTask: URLSessionWebSocketTask,
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
         reason: Data?
     ) {
-        guard lock.withLock({ webSocketTask === self.task }) else {
-            logger.debug("[WSM][debug] ignoring didCloseWith from stale task")
-            return
-        }
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) }
-        logger.debug("[WSM][debug] didCloseWith", closeCode.rawValue, reasonStr ?? "")
-        handleConnectionClosed(code: closeCode.rawValue, reason: reasonStr)
+        emit(.closed(task: ObjectIdentifier(webSocketTask), code: closeCode.rawValue, reason: reasonStr))
     }
 
     /// Called on task completion with error (connection failure).
-    public func urlSession(
+    nonisolated func urlSession(
         _ session: URLSession,
         task urlSessionTask: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
         guard let error = error else { return }
+        emit(.completed(task: ObjectIdentifier(urlSessionTask), failure: Self.transportFailure(from: error)))
+    }
 
-        let drained: (connect: CheckedContinuation<Void, Error>?, waiters: [CheckedContinuation<Void, Error>])? =
-            lock.withLock {
-                // Ignore callbacks from stale sessions (e.g. after invalidateAndCancel
-                // during reconnect). Without this guard, the stale session's error callback
-                // steals the new connection's continuation, causing a leak.
-                guard urlSessionTask === self.task else {
-                    logger.debug("[WSM][debug] ignoring didCompleteWithError from stale task:", error.localizedDescription)
-                    return nil
-                }
-                let continuation = connectContinuation
-                connectContinuation = nil
-                let waiters = pendingConnectWaiters
-                pendingConnectWaiters.removeAll()
-                _connecting = false
-                _connected = false
-                return (continuation, waiters)
-            }
-        guard let drained = drained else { return }
+    /// Reduce a non-`Sendable` `Error` to the `Sendable` value the channel
+    /// carries. The message is the original `localizedDescription` verbatim, so
+    /// `ConnectionErrorEvent.message` text is unchanged.
+    private nonisolated static func transportFailure(from error: Error) -> WebSocketError {
+        .transportFailure(message: error.localizedDescription, code: (error as? URLError)?.errorCode)
+    }
 
-        drained.connect?.resume(throwing: error)
-        for waiter in drained.waiters {
-            waiter.resume(throwing: error)
+    /// Yield onto the ordered channel. `nonisolated`, so every producer —
+    /// delegate queue or receive loop — reaches it without an actor hop.
+    nonisolated func emit(_ event: DelegateEvent) {
+        eventContinuation.yield(event)
+    }
+
+    // MARK: - The pump
+
+    /// The channel's only consumer and the **only** caller of
+    /// `handleConnectionClosed`.
+    ///
+    /// Deliberately not `async`: it is the decision region for every lifecycle
+    /// signal, and a suspension anywhere in it would let the next event
+    /// interleave and destroy the ordering the channel exists to provide. The
+    /// compiler enforces that here — a non-`async` function cannot `await`.
+    private func handle(_ event: DelegateEvent) {
+        // Reported on the way IN: a test that needs to stall the pump *before*
+        // an event is applied hooks here (behavior 13). Ordering the other way
+        // — "event N has been fully handled" — is available without a second
+        // hook, because the channel is FIFO and this method cannot suspend: a
+        // report for any later event proves every earlier one finished. The
+        // stale-event tests use a sentinel event for exactly that.
+        onDelegateEventHandledForTest?(event)
+
+        switch event {
+        case .opened(let taskId):
+            guard let current = currentTask(matching: taskId, "didOpenWithProtocol") else { return }
+            handleSocketOpened(current)
+
+        case .closed(let taskId, let code, let reason):
+            guard currentTask(matching: taskId, "didCloseWith") != nil else { return }
+            logger.debug("[WSM][debug] didCloseWith", code, reason ?? "")
+            handleConnectionClosed(code: code, reason: reason)
+
+        case .completed(let taskId, let failure):
+            guard currentTask(matching: taskId, "didCompleteWithError") != nil else { return }
+            // Transport-level failure. The pending connect continuation and its
+            // waiters take the transport error itself; the close that follows
+            // mirrors the JS client's 'error' + 'close' pair.
+            let pending = connectContinuation
+            connectContinuation = nil
+            let waiters = pendingConnectWaiters
+            pendingConnectWaiters.removeAll()
+            setTransportState(connected: false, connecting: false)
+            pending?.resume(throwing: failure)
+            for waiter in waiters { waiter.resume(throwing: failure) }
+            handleConnectionClosed(code: nil, reason: failure.localizedDescription, error: failure)
+
+        case .receiveLoopFailed(let taskId, let code, let failure):
+            guard currentTask(matching: taskId, "receive loop") != nil else { return }
+            handleConnectionClosed(code: code, reason: failure.localizedDescription, error: failure)
         }
-        // Transport-level failure. Route the error through handleConnectionClosed
-        // so its once-only `wasTask` guard emits `.connectionError` exactly once,
-        // whether the failure surfaces here (connect-time) or via the receive-loop
-        // catch (an already-established connection). handleConnectionClosed also
-        // emits the paired close, mirroring the JS client's 'error' + 'close' pair
-        // (`handleWebSocketError`).
-        handleConnectionClosed(code: nil, reason: error.localizedDescription, error: error)
+    }
+
+    /// The stale-event filter, run inside isolation — in the same step as the
+    /// state it guards, which the old `lock.withLock { webSocketTask === task }`
+    /// check could not be.
+    private func currentTask(matching taskId: ObjectIdentifier, _ what: String) -> URLSessionWebSocketTask? {
+        guard let current = task, ObjectIdentifier(current) == taskId else {
+            logger.debug("[WSM][debug] ignoring \(what) from stale task")
+            return nil
+        }
+        return current
+    }
+
+    private func handleSocketOpened(_ openedTask: URLSessionWebSocketTask) {
+        setTransportState(connected: true, connecting: false)
+        reconnectAttempts = 0
+        logger.debug("[WSM][debug] socket open (didOpenWithProtocol)", connectionId)
+
+        let continuation = connectContinuation
+        connectContinuation = nil
+        let waiters = pendingConnectWaiters
+        pendingConnectWaiters.removeAll()
+
+        delegate?.webSocketManagerOnStatusChange(.connected)
+        delegate?.webSocketManagerOnConnected()
+        continuation?.resume()
+        for waiter in waiters { waiter.resume() }
+
+        startReceiveLoop(openedTask)
     }
 
     // MARK: - Receive Loop
 
     private func startReceiveLoop(_ wsTask: URLSessionWebSocketTask) {
         receiveLoopTask?.cancel()
+        receiveLoopTask = makeReceiveLoop(wsTask)
+    }
 
-        receiveLoopTask = Task { [weak self] in
+    /// Built from a `nonisolated` factory so the loop body does not inherit
+    /// actor isolation: every inbound frame would otherwise be delivered from
+    /// the actor's executor.
+    private nonisolated func makeReceiveLoop(_ wsTask: URLSessionWebSocketTask) -> Task<Void, Never> {
+        Task { [weak self] in
             while !Task.isCancelled {
                 guard let self = self else { return }
 
-                let currentTask = self.lock.withLock { self.task }
-
-                guard currentTask === wsTask else { return }
+                // A snapshot read, not an actor hop: the box is written from
+                // inside the actor on every task change, so this is the same
+                // value an isolated read would give, at no per-message cost.
+                guard self.snapshot.task === wsTask else { return }
 
                 do {
                     let message = try await wsTask.receive()
@@ -384,22 +548,20 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
                     }
                 } catch {
                     guard !Task.isCancelled else { return }
-
-                    let stillCurrentTask = self.lock.withLock { self.task === wsTask }
-
-                    if stillCurrentTask {
-                        self.logger.log("Disconnected from WebSocket server. Error:", error.localizedDescription)
-                        // Established-connection transport failure: pass the error
-                        // so `.connectionError` fires (once, via the guard in
-                        // handleConnectionClosed). Deliberate closes cancel this
-                        // receive loop first, so `Task.isCancelled` short-circuits
-                        // above and never reaches here — no spurious error.
-                        self.handleConnectionClosed(
+                    self.logger.log("Disconnected from WebSocket server. Error:", error.localizedDescription)
+                    // Established-connection transport failure. It joins the
+                    // channel like every other terminal signal, so the pump's
+                    // once-only `wasTask` claim still fires `.connectionError`
+                    // exactly once whichever path surfaces the failure first.
+                    // Deliberate closes cancel this loop, so `Task.isCancelled`
+                    // short-circuits above and never reaches here.
+                    self.emit(
+                        .receiveLoopFailed(
+                            task: ObjectIdentifier(wsTask),
                             code: (error as? URLError)?.errorCode,
-                            reason: error.localizedDescription,
-                            error: error
+                            failure: Self.transportFailure(from: error)
                         )
-                    }
+                    )
                     return
                 }
             }
@@ -408,72 +570,53 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     // MARK: - Connection Closed Handler
 
+    /// Reached **only** from `handle(_:)` — every terminal path funnels through
+    /// the ordered channel first.
     private func handleConnectionClosed(code: Int?, reason: String?, error: Error? = nil) {
-        let snapshot: (
-            wasTask: URLSessionWebSocketTask?,
-            pendingConnect: CheckedContinuation<Void, Error>?,
-            drainedWaiters: [CheckedContinuation<Void, Error>],
-            pendingDisconnect: CheckedContinuation<Void, Never>?,
-            wasDisconnecting: Bool,
-            shouldReconnectNow: Bool,
-            manualPending: Bool,
-            drainedDisconnectWaiters: [CheckedContinuation<Void, Never>]
-        ) = lock.withLock {
-            if let initiator = lastCloseInitiator {
-                logger.warn("[WS-CLOSE] observed", initiator)
-            }
-
-            let wasTask = task
-            task = nil
-            _connected = false
-            _connecting = false
-
-            // Cancel receive loop
-            receiveLoopTask?.cancel()
-            receiveLoopTask = nil
-
-            // Reject pending connect continuation and any extra waiters
-            let pendingConnect = connectContinuation
-            connectContinuation = nil
-            let drainedWaiters = pendingConnectWaiters
-            pendingConnectWaiters.removeAll()
-
-            // Check for disconnect continuation + drain any extra disconnect waiters.
-            let pendingDisconnect = disconnectContinuation
-            let wasDisconnecting = isDisconnecting
-            let shouldReconnectNow = shouldConnect
-            let manualPending = manualReconnectPending
-            let drainedDisconnectWaiters = disconnectWaiters
-            disconnectWaiters.removeAll()
-
-            if pendingDisconnect != nil {
-                disconnectContinuation = nil
-                isDisconnecting = false
-                disconnectTimeoutWorkItem?.cancel()
-                disconnectTimeoutWorkItem = nil
-            }
-
-            if manualPending {
-                manualReconnectPending = false
-            }
-
-            lastCloseInitiator = nil
-
-            return (
-                wasTask, pendingConnect, drainedWaiters, pendingDisconnect,
-                wasDisconnecting, shouldReconnectNow, manualPending, drainedDisconnectWaiters
-            )
+        if let initiator = lastCloseInitiator {
+            logger.warn("[WS-CLOSE] observed", initiator)
         }
 
+        let wasTask = task
+        task = nil
+        setTransportState(connected: false, connecting: false)
+
+        receiveLoopTask?.cancel()
+        receiveLoopTask = nil
+
+        let pendingConnect = connectContinuation
+        connectContinuation = nil
+        let drainedWaiters = pendingConnectWaiters
+        pendingConnectWaiters.removeAll()
+
+        let pendingDisconnect = disconnectContinuation
+        let wasDisconnecting = isDisconnecting
+        let shouldReconnectNow = shouldConnect
+        let manualPending = manualReconnectPending
+        let drainedDisconnectWaiters = disconnectWaiters
+        disconnectWaiters.removeAll()
+
+        if pendingDisconnect != nil {
+            disconnectContinuation = nil
+            isDisconnecting = false
+            disconnectTimeoutTask?.cancel()
+            disconnectTimeoutTask = nil
+        }
+
+        if manualPending {
+            manualReconnectPending = false
+        }
+
+        lastCloseInitiator = nil
+
         // `.connectionError` fires here exactly once per transport failure. The
-        // atomic `wasTask` claim in the snapshot above is the once-only guard:
-        // whichever path (didCompleteWithError or the receive-loop catch) first
-        // enters with a live task nils it, so a second entry for the same failure
-        // sees `wasTask == nil` and does not re-emit. A graceful close
-        // (didCloseWith) passes `error: nil` and emits no error — mirroring the JS
-        // client emitting 'error' only on a transport error and 'close' on every
+        // `wasTask` claim above is the once-only guard: whichever terminal
+        // event the pump handles first nils the task, so a second event for the
+        // same failure is already dropped by the stale filter. A graceful close
+        // passes `error: nil` and emits no error — mirroring the JS client
+        // emitting 'error' only on a transport error and 'close' on every
         // close. Emitted before the close so subscribers see error-then-close.
-        if let error, snapshot.wasTask != nil {
+        if let error, wasTask != nil {
             delegate?.webSocketManagerOnError(error)
         }
 
@@ -483,94 +626,82 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         let closeError = WebSocketError.connectionFailed(
             "WebSocket closed before connected: code=\(code.map(String.init) ?? "nil")"
         )
-        snapshot.pendingConnect?.resume(throwing: closeError)
-        for waiter in snapshot.drainedWaiters {
+        pendingConnect?.resume(throwing: closeError)
+        for waiter in drainedWaiters {
             waiter.resume(throwing: closeError)
         }
 
-        // Clean up session. Capture-and-nil `session` atomically under the lock
-        // (it is written under the lock elsewhere, so reading it unlocked is a
-        // data race), then invalidate the captured reference outside the lock.
-        if snapshot.wasTask != nil {
-            let staleSession: URLSession? = lock.withLock {
-                let s = session
-                session = nil
-                return s
-            }
+        if wasTask != nil {
+            let staleSession = session
+            session = nil
             staleSession?.invalidateAndCancel()
         }
 
-        if snapshot.wasDisconnecting {
+        if wasDisconnecting {
             delegate?.webSocketManagerOnDisconnectResolved()
-            snapshot.pendingDisconnect?.resume()
-            // Drain any callers parked in disconnect()/setDesiredConnection()
-            // waiting for this disconnect to finish.
-            for waiter in snapshot.drainedDisconnectWaiters {
+            pendingDisconnect?.resume()
+            for waiter in drainedDisconnectWaiters {
                 waiter.resume()
             }
             return
         }
 
-        if snapshot.manualPending {
+        if manualPending {
             logger.debug("[WSM][debug] manual reconnect trigger fired")
-            Task {
-                try? await self.connect()
-            }
+            Task { try? await self.connect() }
             return
         }
 
-        if snapshot.shouldReconnectNow, delegate?.webSocketManagerShouldReconnect(code: code, reason: reason) == true {
+        if shouldReconnectNow, delegate?.webSocketManagerShouldReconnect(code: code, reason: reason) == true {
             let delay = calculateReconnectDelay()
             logger.debug("[WSM][debug] scheduling reconnect", delay)
             delegate?.webSocketManagerOnReconnectScheduled(delayMs: delay)
             scheduleReconnect(delayMs: delay)
         } else {
-            logger.debug("[WSM][debug] not scheduling reconnect, shouldConnect:", snapshot.shouldReconnectNow)
-            lock.withLock { reconnectAttempts = 0 }
+            logger.debug("[WSM][debug] not scheduling reconnect, shouldConnect:", shouldReconnectNow)
+            reconnectAttempts = 0
         }
     }
 
     // MARK: - Reconnect
 
+    /// A cancellable `Task.sleep`, replacing the `DispatchWorkItem` the class
+    /// used. Same pattern as `AnalyticsQueue.makeFlushTimer()`: the body is
+    /// built by a `nonisolated` factory so arming it needs no suspension.
     private func scheduleReconnect(delayMs: Int) {
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            let shouldGo = self.lock.withLock { self.shouldConnect }
+        reconnectTask?.cancel()
+        reconnectTask = makeReconnectTimer(delayMs: delayMs)
+    }
 
-            if shouldGo {
-                self.logger.debug("[WSM][debug] reconnect timer fired")
-                Task {
-                    try? await self.connect()
-                }
-            } else {
-                self.logger.debug("[WSM][debug] reconnect cancelled")
-            }
+    private nonisolated func makeReconnectTimer(delayMs: Int) -> Task<Void, Never> {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, delayMs)) * 1_000_000)
+            guard !Task.isCancelled, let self = self else { return }
+            await self.fireReconnect()
         }
+    }
 
-        lock.withLock {
-            reconnectWorkItem?.cancel()
-            reconnectWorkItem = workItem
+    private func fireReconnect() {
+        reconnectTask = nil
+        guard shouldConnect else {
+            logger.debug("[WSM][debug] reconnect cancelled")
+            return
         }
-
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .milliseconds(delayMs),
-            execute: workItem
-        )
+        logger.debug("[WSM][debug] reconnect timer fired")
+        Task { try? await self.connect() }
     }
 
     private func calculateReconnectDelay() -> Int {
-        return lock.withLock {
-            let delay = Self.reconnectDelayMs(
-                attempts: reconnectAttempts,
-                maxReconnectDelayMs: maxReconnectDelayMs
-            )
-            reconnectAttempts += 1
-            return delay
-        }
+        let delay = Self.reconnectDelayMs(
+            attempts: reconnectAttempts,
+            maxReconnectDelayMs: maxReconnectDelayMs
+        )
+        reconnectAttempts += 1
+        return delay
     }
 
     /// Pure exponential-backoff delay computation, split out so it can be unit
-    /// tested independently of the manager's locking and socket state.
+    /// tested independently of the manager's isolation and socket state.
     ///
     /// The cap is applied in the `Double` domain *before* converting to `Int`.
     /// Doing the `min` in `Int` (via `Int(pow(2.0, …))` first) traps once
@@ -579,7 +710,7 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
     /// `Double`, an overflowing `pow` simply yields `.infinity`, and
     /// `min(.infinity, Double(maxSeconds))` picks the finite cap, so the final
     /// `Int(...)` is always in range regardless of how high `attempts` climbs.
-    static func reconnectDelayMs(attempts: Int, maxReconnectDelayMs: Int) -> Int {
+    nonisolated static func reconnectDelayMs(attempts: Int, maxReconnectDelayMs: Int) -> Int {
         let baseDelayMs = 200
         let maxSeconds = max(1, maxReconnectDelayMs / 1000)
         let cappedSeconds = Int(min(pow(2.0, Double(attempts)), Double(maxSeconds)))
@@ -588,56 +719,12 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
 
     // MARK: - Disconnect
 
-    public func disconnect() async {
-        // Take a snapshot of any state we might pass to the delegate, then
-        // finish all internal mutations under the lock BEFORE releasing it and
-        // calling the delegate. This avoids any window where the delegate
-        // observes inconsistent state via the manager.
-        let decision: DisconnectDecision = lock.withLock {
-            // Already disconnecting — resolve as a waiter below.
-            if isDisconnecting {
-                return .waitOnExisting
-            }
-
-            shouldConnect = false
-            reconnectAttempts = 0
-            _connecting = false
-            reconnectWorkItem?.cancel()
-            reconnectWorkItem = nil
-
-            let hadTask = task != nil
-            let currentTask = task
-            if currentTask != nil {
-                isDisconnecting = true
-            } else {
-                _connected = false
-                isDisconnecting = false
-            }
-            return .proceed(hadTask: hadTask, currentTask: currentTask)
-        }
-
+    func disconnect() async {
         let hadTask: Bool
         let currentTask: URLSessionWebSocketTask?
-        switch decision {
+        switch disconnectDecision() {
         case .waitOnExisting:
-            // Register atomically as a waiter. The decision above and this
-            // registration are two separate lock holds, so the in-flight
-            // disconnect may have resolved in the gap — re-check under the
-            // lock and resume directly if so, otherwise append to be drained
-            // when it finishes. (Matches the waitForAuthReady idiom; the
-            // resume always happens outside the lock.)
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let resolvedInGap = self.lock.withLock { () -> Bool in
-                    if self.isDisconnecting {
-                        self.disconnectWaiters.append(continuation)
-                        return false
-                    }
-                    return true
-                }
-                if resolvedInGap {
-                    continuation.resume()
-                }
-            }
+            await waitForInFlightDisconnect()
             return
         case .proceed(let h, let t):
             hadTask = h
@@ -654,155 +741,156 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
         }
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            // Safety timeout: 500ms. Captures the pending disconnect
-            // continuation + any parked waiters OUT of the lock, then resumes
-            // them outside it. The `disconnectContinuation` nil-guard makes
-            // this mutually exclusive with handleConnectionClosed — whichever
-            // fires first nils it, and the other returns without resuming, so
-            // the continuation is resumed exactly once.
-            let timeoutWork = DispatchWorkItem { [weak self] in
-                guard let self = self else { return }
-                let drained: (
-                    continuation: CheckedContinuation<Void, Never>,
-                    waiters: [CheckedContinuation<Void, Never>]
-                )? = self.lock.withLock {
-                    guard let pendingContinuation = self.disconnectContinuation else {
-                        return nil
-                    }
-                    self.disconnectContinuation = nil
-                    self.isDisconnecting = false
-                    self.task = nil
-                    self._connected = false
-                    let drainedWaiters = self.disconnectWaiters
-                    self.disconnectWaiters.removeAll()
-                    return (pendingContinuation, drainedWaiters)
-                }
-                guard let drained = drained else { return }
+            self.disconnectContinuation = continuation
+            self.disconnectTimeoutTask = self.makeDisconnectTimeout()
 
-                self.delegate?.webSocketManagerOnDisconnectResolved()
-                drained.continuation.resume()
-                for waiter in drained.waiters {
-                    waiter.resume()
-                }
-            }
-
-            self.lock.withLock {
-                self.disconnectContinuation = continuation
-                self.disconnectTimeoutWorkItem = timeoutWork
-            }
-
-            DispatchQueue.global().asyncAfter(
-                deadline: .now() + .milliseconds(500),
-                execute: timeoutWork
-            )
-
-            // Cancel the receive loop first
+            // Cancel the receive loop first, then close the socket gracefully.
             self.receiveLoopTask?.cancel()
-
-            // Close the socket gracefully
             currentTask.cancel(with: .normalClosure, reason: nil)
+        }
+    }
+
+    /// The disconnect decision region. No `await` — see `connectDecision()`.
+    private func disconnectDecision() -> DisconnectDecision {
+        // Already disconnecting — resolve as a waiter below.
+        if isDisconnecting {
+            return .waitOnExisting
+        }
+
+        shouldConnect = false
+        reconnectAttempts = 0
+        _connecting = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+
+        let hadTask = task != nil
+        let currentTask = task
+        if currentTask != nil {
+            isDisconnecting = true
+        } else {
+            setTransportState(connected: false, connecting: false)
+            isDisconnecting = false
+        }
+        return .proceed(hadTask: hadTask, currentTask: currentTask)
+    }
+
+    /// Park on the in-flight disconnect. Registration is atomic with the
+    /// `isDisconnecting` check for the same reason `waitForInFlightConnect()`
+    /// is: the continuation body runs synchronously inside isolation.
+    private func waitForInFlightDisconnect() async {
+        guard isDisconnecting else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.disconnectWaiters.append(continuation)
+        }
+    }
+
+    /// The 500 ms safety timeout for a disconnect whose close callback never
+    /// arrives.
+    private nonisolated func makeDisconnectTimeout() -> Task<Void, Never> {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 500 * 1_000_000)
+            guard !Task.isCancelled, let self = self else { return }
+            await self.fireDisconnectTimeout()
+        }
+    }
+
+    /// Mutually exclusive with `handleConnectionClosed` by an atomic
+    /// check-and-nil of `disconnectContinuation`. Under the class this was
+    /// atomic only because both paths took the same `NSLock`; it is genuinely
+    /// atomic now — this method contains no suspension point.
+    private func fireDisconnectTimeout() {
+        guard let pendingContinuation = disconnectContinuation else { return }
+        disconnectContinuation = nil
+        isDisconnecting = false
+        disconnectTimeoutTask = nil
+        task = nil
+        _connected = false
+        let drainedWaiters = disconnectWaiters
+        disconnectWaiters.removeAll()
+
+        delegate?.webSocketManagerOnDisconnectResolved()
+        pendingContinuation.resume()
+        for waiter in drainedWaiters {
+            waiter.resume()
         }
     }
 
     // MARK: - setDesiredConnection
 
-    public func setDesiredConnection(shouldConnect: Bool) async {
-        logger.debug("[WSM][debug] setDesiredConnection", shouldConnect, "connected:", _connected, "connecting:", _connecting)
+    func setDesiredConnection(shouldConnect: Bool) async {
+        logger.debug(
+            "[WSM][debug] setDesiredConnection", shouldConnect,
+            "connected:", _connected, "connecting:", _connecting
+        )
 
         if shouldConnect {
-            // Wait for any pending disconnect to finish, registering as a
-            // waiter atomically under the lock instead of polling
-            // `isDisconnecting` from outside the lock (which is a data race).
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let resumeNow = self.lock.withLock { () -> Bool in
-                    if self.isDisconnecting {
-                        self.disconnectWaiters.append(continuation)
-                        return false
-                    }
-                    return true
-                }
-                if resumeNow {
-                    continuation.resume()
-                }
-            }
+            // Wait for any pending disconnect to finish before reconnecting.
+            await waitForInFlightDisconnect()
 
-            lock.withLock { self.shouldConnect = true }
+            self.shouldConnect = true
 
             // `connect()` is idempotent: it returns immediately if already
             // connected, registers on the `pendingConnectWaiters` list if a
-            // connect is already in flight, or starts a fresh connect. Calling
-            // it unconditionally replaces the old branch that hand-rolled a
-            // 50ms polling wait (`waitForConnection`) for the in-flight case.
+            // connect is already in flight, or starts a fresh connect.
             do {
                 try await connect()
             } catch {
                 logger.debug("[WSM][debug] connect failed in setDesiredConnection:", error.localizedDescription)
             }
         } else {
-            lock.withLock { self.shouldConnect = false }
+            self.shouldConnect = false
             await disconnect()
         }
     }
 
     // MARK: - Force Reconnect
 
-    public func forceReconnect() {
-        let needsConnect = lock.withLock { () -> Bool in
-            manualReconnectPending = true
-            shouldConnect = true
-            reconnectAttempts = 0
+    func forceReconnect() {
+        manualReconnectPending = true
+        shouldConnect = true
+        reconnectAttempts = 0
 
-            if task != nil {
-                closeSocketLocked(initiator: "forceReconnect")
-                // handleConnectionClosed will be triggered by the receive loop error
-                return false
-            }
-            return true
+        if task != nil {
+            closeSocketNow(initiator: "forceReconnect")
+            // The close lands as a channel event (`didCloseWith` /
+            // `didCompleteWithError`, or the receive loop's failure), and the
+            // pump takes it from there — `manualReconnectPending` is what tells
+            // `handleConnectionClosed` to reconnect immediately.
+            return
         }
 
-        if needsConnect {
-            Task {
-                try? await self.connect()
-            }
-        }
+        Task { try? await self.connect() }
     }
 
     // MARK: - Send
 
-    public func send(_ text: String) async throws {
-        let currentTask: URLSessionWebSocketTask? = lock.withLock {
-            guard let currentTask = task, _connected else { return nil }
-            return currentTask
-        }
-        guard let currentTask = currentTask else {
+    /// `nonisolated`: the task is read from the snapshot box and the frame goes
+    /// out off the actor, so concurrent sends stay concurrent and the
+    /// per-message path takes no actor hop.
+    nonisolated func send(_ text: String) async throws {
+        guard let currentTask = snapshot.sendableTask else {
             throw WebSocketError.notConnected
         }
-
         try await currentTask.send(.string(text))
     }
 
-    public func send(_ data: Data) async throws {
-        let currentTask: URLSessionWebSocketTask? = lock.withLock {
-            guard let currentTask = task, _connected else { return nil }
-            return currentTask
-        }
-        guard let currentTask = currentTask else {
+    nonisolated func send(_ data: Data) async throws {
+        guard let currentTask = snapshot.sendableTask else {
             throw WebSocketError.notConnected
         }
-
         try await currentTask.send(.data(data))
     }
 
     // MARK: - Close Socket
 
-    public func closeSocket(initiator: String) {
-        lock.withLock {
-            closeSocketLocked(initiator: initiator)
-        }
+    func closeSocket(initiator: String) {
+        closeSocketNow(initiator: initiator)
     }
 
-    /// Must be called with lock held.
-    private func closeSocketLocked(initiator: String) {
+    /// Isolated: it mutates the continuation state directly. (Under the class
+    /// this was `closeSocketLocked` and carried a "must be called with lock
+    /// held" contract; actor isolation makes the contract structural.)
+    private func closeSocketNow(initiator: String) {
         lastCloseInitiator = initiator
         receiveLoopTask?.cancel()
         task?.cancel(with: .goingAway, reason: initiator.data(using: .utf8))
@@ -824,30 +912,6 @@ public final class WebSocketManager: NSObject, @unchecked Sendable, URLSessionWe
             for waiter in waiters {
                 waiter.resume(throwing: err)
             }
-        }
-    }
-
-    // MARK: - Socket State
-
-    public var isSocketOpen: Bool {
-        return lock.withLock { task != nil && task?.state == .running && _connected }
-    }
-}
-
-// MARK: - WebSocketError
-
-public enum WebSocketError: Error, Sendable {
-    case notConnected
-    case connectionFailed(String)
-}
-
-extension WebSocketError: LocalizedError {
-    public var errorDescription: String? {
-        switch self {
-        case .notConnected:
-            return "WebSocket is not connected"
-        case .connectionFailed(let reason):
-            return "WebSocket connection failed: \(reason)"
         }
     }
 }

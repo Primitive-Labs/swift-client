@@ -307,16 +307,20 @@ final class ApiParityRound2Tests: XCTestCase {
 
     // MARK: - AnalyticsContext
 
+    /// Marked deprecated so the reference to the deprecated synchronous
+    /// `logEvent` (#2244) sits in a deprecated context and emits no warning —
+    /// the same convention as `DeprecationWindowInternalUseTests`.
+    @available(*, deprecated, message: "Deprecated context: exercises AnalyticsContext.logEvent during its deprecation window (#2244).")
     func test_analyticsContext_logsEventThroughClosure() {
-        var captured: [[String: Any]] = []
+        let captured = LockedBox([[String: Any]]())
         let ctx = AnalyticsContext(
             logEvent: { event in
-                captured.append(event)
+                captured.withValue { $0.append(event) }
             }
         )
         ctx.logEvent(["action": "click", "feature": "cta"])
-        XCTAssertEqual(captured.count, 1)
-        XCTAssertEqual(captured.first?["action"] as? String, "click")
+        XCTAssertEqual(captured.value.count, 1)
+        XCTAssertEqual(captured.value.first?["action"] as? String, "click")
         XCTAssertTrue(ctx.isEnabled())
     }
 

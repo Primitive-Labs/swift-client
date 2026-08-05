@@ -182,7 +182,10 @@ final class JsBaoEventPayloadTests: XCTestCase {
     ///
     /// This table is the record of what those nine `on`/`onAny` subscribers used
     /// to receive; the assertions below check both delivery shapes against it.
-    private static let legacyPayloads: [(payload: any JsBaoEventPayload, dictionary: [String: Any])] = [
+    /// Computed rather than stored: the element type is not `Sendable`, and a
+    /// stored `static` of a non-`Sendable` type is global shared mutable state
+    /// under the Swift 6 language mode.
+    private static var legacyPayloads: [(payload: any JsBaoEventPayload, dictionary: [String: Any])] { [
         // The pre-conversion emit was `events.emit(.meUpdated, json)` — the whole
         // WebSocket frame, not the me record — so this entry is built from a
         // frame and expects the frame back. Building it from the typed
@@ -202,7 +205,7 @@ final class JsBaoEventPayloadTests: XCTestCase {
         (OfflineAuthRenewedEvent(), [:]),
         (OfflineAuthRevokedEvent(wipeLocal: false), ["wipeLocal": false]),
         (BlobsQueueDrainedEvent(), [:]),
-    ]
+    ] }
 
     /// `legacyPayloads` must cover every payload that carries the bridge, the
     /// same way `testSamplePayloadsCoverEveryConformance` covers `samples`.

@@ -413,7 +413,7 @@ final class ActorizedBlobManagerTests: XCTestCase {
             // Only start once the handler is actually blocking. Bounded: if the
             // emit stops firing — the regression this test guards — an untimed
             // wait would hang the suite instead of failing with a message.
-            guard emitEntered.wait(timeout: .now() + 5) == .success else {
+            guard await emitEntered.waitAsync(timeout: .now() + 5) == .success else {
                 emitNeverFired.increment()
                 return nil
             }
@@ -756,22 +756,9 @@ final class ActorizedBlobManagerTests: XCTestCase {
     /// to a declaration, skipping the doc comment between them. Doc-comment
     /// prose can therefore never satisfy an attribute check.
     private static func attributes(before declaration: String, in source: String) -> [String] {
-        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard let index = lines.firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespaces).hasPrefix(declaration)
-        }) else { return [] }
-        var collected: [String] = []
-        var i = index - 1
-        while i >= 0 {
-            let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("@") {
-                collected.append(trimmed)
-            } else if !trimmed.hasPrefix("///") && !trimmed.isEmpty {
-                break
-            }
-            i -= 1
-        }
-        return collected
+        // Consolidated into Helpers/ClientSourceText.swift by #2171, which needs
+        // the same scan for the WebSocketManager deprecation window.
+        ClientSourceText.attributes(before: declaration, in: source)
     }
 
     /// The lines of a declaration's body, up to the first line that closes it at

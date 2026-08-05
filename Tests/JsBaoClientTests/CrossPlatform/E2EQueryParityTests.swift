@@ -55,12 +55,14 @@ final class E2EQueryParityTests: XCTestCase {
             // setUp can't throw XCTSkip from a static initializer;
             // record and let `runJsCli` surface the failure as the
             // test starts.
-            codegenError = error
+            codegenErrorBox.value = error
         }
     }()
-    // XCTest runs cases serially by default in this suite, so plain
-    // shared state is fine here without a lock.
-    private static var codegenError: Error?
+    // XCTest runs cases serially by default in this suite, so there is no real
+    // contention here — but a `static var` is a hard error under the Swift 6
+    // language mode, so the slot lives in a `LockedBox` held by a `static let`.
+    private static let codegenErrorBox = LockedBox<Error?>(nil)
+    private static var codegenError: Error? { codegenErrorBox.value }
 
     // MARK: - Harness preflight
 
@@ -1159,7 +1161,10 @@ final class E2EQueryParityTests: XCTestCase {
     ///   - id "a": priority 5, NOT completed, has 'urgent' tag
     ///   - id "b": priority 1, completed, has 'done' tag
     ///   - id "c": priority 3, NOT completed, has 'wip' tag
-    private static let fixtureRecords: [[String: Any]] = [
+    /// Computed rather than stored: `[[String: Any]]` is not `Sendable`, and a
+    /// stored `static` of a non-`Sendable` type is global shared mutable state
+    /// under the Swift 6 language mode. Each read builds its own copy.
+    private static var fixtureRecords: [[String: Any]] { [
         [
             "id": "a", "title": "Ship it",
             "priority": 5, "completed": false,
@@ -1178,7 +1183,7 @@ final class E2EQueryParityTests: XCTestCase {
             "tags": ["wip"],
             "createdAt": "2026-04-28T12:00:00Z",
         ],
-    ]
+    ] }
 
     /// Comprehensive `everything` fixture — one record exercising
     /// every field type with edge cases (Chinese, emoji, integer
@@ -1186,7 +1191,8 @@ final class E2EQueryParityTests: XCTestCase {
     /// Driven through dynamic mode on Swift (no codegen wrapper for
     /// `everything`) and runtime-loaded on JS. Each test does a
     /// per-field round-trip assertion.
-    private static let everythingFixture: [[String: Any]] = [
+    /// Computed for the same reason as `fixtureRecords` above.
+    private static var everythingFixture: [[String: Any]] { [
         [
             "id": "kitchen-sink",
             "label": "the one record",
@@ -1213,7 +1219,7 @@ final class E2EQueryParityTests: XCTestCase {
             // Stringset with mixed scripts.
             "tags": ["english", "中文", "🎉", "with space"],
         ],
-    ]
+    ] }
 
     private func idsFrom(_ records: [[String: Any]]) -> [String] {
         records.compactMap { $0["id"] as? String }

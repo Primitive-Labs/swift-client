@@ -154,9 +154,22 @@ public struct StartWorkflowResult: Decodable, Sendable, Equatable {
 
 /// Result of `getStatus` and `terminate`. Mirrors JS `WorkflowStatusResult`.
 ///
-/// `status` is the Cloudflare workflow status; `run` is the persisted DB
-/// record (its `status` carries the `apply_*` states).
+/// `status` is the server's single reconciled run status; `run` is the
+/// persisted DB record.
+///
+/// #2348 — the server returns exactly one canonical vocabulary on the wire, and
+/// the client uses it verbatim:
+///
+/// `queued` | `running` | `apply_pending` | `apply_claimed` | `completed` |
+/// `failed` | `terminated` | `missing`
+///
+/// Raw Cloudflare spellings (`complete`, `errored`) no longer reach the client,
+/// and a terminal run is never rolled back to `running`. It stays a plain
+/// `String` rather than a closed enum so a future server-added state can never
+/// turn a status read into a decode failure — same reasoning as every other
+/// Swift workflow status field.
 public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
+    /// The server's canonical run status. See the type doc for the vocabulary.
     public let status: String
     /// Final output of the run, when present. Opaque blob.
     public let output: JSONValue?
@@ -177,10 +190,10 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         let error: String?
     }
 
-    /// Memberwise init. Used by the shared status normalizer
-    /// (`WorkflowsAPI.normalizeWorkflowStatus`) to rebuild a result with the
-    /// canonical `status` derived from the raw Cloudflare status + the DB run's
-    /// apply-flow state.
+    /// Memberwise init, for constructing a result directly (tests, callers
+    /// assembling a status from parts). The `status` the server sends is used
+    /// verbatim by `getStatus` / `getStatusByRunId` — the client does not
+    /// re-derive it (#2348).
     public init(
         status: String,
         output: JSONValue?,
@@ -481,8 +494,8 @@ public struct RunSyncResult<Output: Decodable & Sendable>: Sendable {
 
 /// Typed result of the generic `workflows.getStatus`. Mirrors JS
 /// `WorkflowStatusResult<O>` — same fields as `WorkflowStatusResult` except
-/// `output`, which is decoded into `Output`. `status` is the Cloudflare
-/// workflow status; `run` is the persisted DB record.
+/// `output`, which is decoded into `Output`. `status` is the server's canonical
+/// run status (#2348); `run` is the persisted DB record.
 public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
     public let status: String
     /// Final output decoded into `Output` when present; `nil` otherwise.
