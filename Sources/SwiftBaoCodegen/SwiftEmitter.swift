@@ -190,11 +190,33 @@ struct SwiftEmitter {
         out += "    /// Persist this record to document `documentId` — inserts it if it\n"
         out += "    /// doesn't exist yet, updates it in place if it does. One call for\n"
         out += "    /// both, matching the JS client's `save()`. Throws if the doc isn't\n"
-        out += "    /// open. Returns `self` so you can `let saved = try note.save(in:)`.\n"
+        out += "    /// open.\n"
+        out += "    ///\n"
+        out += "    /// Updating writes only the fields assigned since this value was\n"
+        out += "    /// read (`_changedFields`), so two devices editing different fields\n"
+        out += "    /// of the same record merge instead of clobbering. Inserting writes\n"
+        out += "    /// every field.\n"
+        out += "    ///\n"
+        out += "    /// Returns the record AS SAVED, re-read from the document with no\n"
+        out += "    /// pending changes left — so a field this save didn't write carries\n"
+        out += "    /// whatever another device put there, and an insert's schema\n"
+        out += "    /// defaults and `auto_stamp` values are filled in. Assign it back\n"
+        out += "    /// (`task = try task.save(in: doc)`) when you keep using the value\n"
+        out += "    /// after the save; `self` itself still holds the values you had.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String) throws -> \(typeName) {\n"
-        out += "        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)\n"
-        out += "        return self\n"
+        out += "        let record = try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)\n"
+        out += "        guard var saved = \(typeName)(record: record) else {\n"
+        out += "            var fallback = self\n"
+        out += "            fallback.discardChanges()\n"
+        out += "            return fallback\n"
+        out += "        }\n"
+        out += "        // Carried over, not persisted: query-time includes and the\n"
+        out += "        // caller-pinned-id flag have no representation in the stored\n"
+        out += "        // record, and this path never changes the record's id.\n"
+        out += "        saved.related = related\n"
+        out += "        saved._explicitId = _explicitId\n"
+        out += "        return saved\n"
         out += "    }\n\n"
         out += "    /// Insert-or-update this record in `documentId`, matched by the\n"
         out += "    /// single-field unique constraint on `upsertOn` rather than `id` —\n"
@@ -210,10 +232,11 @@ struct SwiftEmitter {
         out += "    /// its fields reflect the merged state, NOT necessarily `self`.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String, upsertOn: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)\n"
+        out += "        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
+        out += "        copy.discardChanges()\n"
         out += "        return copy\n"
         out += "    }\n\n"
         out += "    /// Insert-or-update this record, matched by the NAMED unique\n"
@@ -238,10 +261,11 @@ struct SwiftEmitter {
         out += "    /// EXISTING record's id and its fields reflect the merged state.\n"
         out += "    @discardableResult\n"
         out += "    func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)\n"
+        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
+        out += "        copy.discardChanges()\n"
         out += "        return copy\n"
         out += "    }\n\n"
         out += "    /// `upsertByUnique` overload taking an EXPLICIT lookup value (one\n"
@@ -251,10 +275,11 @@ struct SwiftEmitter {
         out += "    /// when you want to make the lookup key explicit at the call site.\n"
         out += "    @discardableResult\n"
         out += "    func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue)\n"
+        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
+        out += "        copy.discardChanges()\n"
         out += "        return copy\n"
         out += "    }\n\n"
         out += "    /// Delete this record from document `documentId`. Throws if the doc isn't open.\n"
@@ -372,16 +397,24 @@ struct SwiftEmitter {
         let typeName = schema.swiftName
         // `Equatable`, `Hashable`, and `Codable` synthesis only fires
         // when the conformance lives in the SAME file as the type
-        // declaration. Adding the conformances here lets callers get
+        // declaration. Declaring the conformances here lets callers get
         // them for free — saves ~80 lines of hand-rolled boilerplate
         // per model. All generated stored-property types conform
         // (`String`, `Double`, `Bool`, `Set<String>`, plus their
-        // optional forms), so synthesis succeeds for every schema.
-        // CodingKeys synthesis also handles backtick-escaped property
-        // names automatically (Swift 5.1+), so reserved-keyword
-        // fields like `default` / `where` round-trip through
-        // `JSONEncoder` / `JSONDecoder` without needing a manual
-        // `CodingKeys` enum.
+        // optional forms), so the members below compile for every
+        // schema.
+        //
+        // Three of the four members are emitted rather than synthesized,
+        // because the struct carries non-schema bookkeeping the
+        // synthesized versions would pick up: `CodingKeys`, `==`, and
+        // `hash(into:)` list the real fields only (see
+        // `equatableHashableCodableConformance`), and `init(from:)` is
+        // emitted so a decoded record marks its fields changed (see
+        // `codableDecodeInit`). Only `encode(to:)` is synthesized — it
+        // follows the emitted `CodingKeys`, so `_explicitId` /
+        // `_changedFields` / `related` can't leak into the JSON.
+        // Backtick-escaped property names (`default`, `where`) round-trip
+        // fine: the emitted `CodingKeys` cases carry the same escapes.
         var out = "\(access) struct \(typeName): PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {\n"
         out += staticMembers(schema: schema)
         out += "\n"
@@ -393,6 +426,8 @@ struct SwiftEmitter {
         out += "\n"
         out += idProvenanceProperty(schema: schema)
         out += "\n"
+        out += changeTrackingMembers(schema: schema)
+        out += "\n"
         out += designatedInit(schema: schema)
         out += "\n"
         out += autoIdInit(schema: schema)
@@ -402,6 +437,8 @@ struct SwiftEmitter {
         out += rowInit(schema: schema)
         out += "\n"
         out += primitiveValuesFn(schema: schema)
+        out += "\n"
+        out += codableDecodeInit(schema: schema)
         out += "\n"
         out += equatableHashableCodableConformance(schema: schema)
         out += relationshipAccessors(schema: schema)
@@ -478,6 +515,7 @@ struct SwiftEmitter {
         }
         out += "        self.related = .empty\n"
         out += "        self._explicitId = false\n"
+        out += "        self._changedFields = Set(primitiveValues().keys)\n"
         out += "    }\n"
         return out
     }
@@ -923,13 +961,98 @@ struct SwiftEmitter {
 
     // MARK: - Stored properties
 
+    /// Emit one stored property per schema field, each carrying a `didSet`
+    /// that records the assignment in `_changedFields` (#2459).
+    ///
+    /// This is the Swift analogue of js-bao's `setValue` → `_localChanges`:
+    /// `save(in:)` writes only the fields the caller actually assigned, so
+    /// two devices editing different fields of the same record merge instead
+    /// of clobbering. Property observers do not fire for the initializers'
+    /// own assignments, which is exactly right — each init below sets
+    /// `_changedFields` explicitly to what that construction path means.
     private func storedProperties(schema: ParsedSchema) -> String {
         let access = options.accessLevel
         var out = ""
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
-            out += "    \(access) var \(propName(fname)): \(swiftStoredType(f, fieldName: fname))\n"
+            out += "    \(access) var \(propName(fname)): \(swiftStoredType(f, fieldName: fname)) {\n"
+            out += "        didSet { _changedFields.insert(\(quoted(fname))) }\n"
+            out += "    }\n"
         }
+        return out
+    }
+
+    // MARK: - Change tracking (#2459)
+
+    /// Emit the non-persisted `_changedFields` set plus `discardChanges()`.
+    /// Mirrors js-bao's `_localChanges` / `discardChanges()`: the write
+    /// facade passes the set to the runtime, which writes only those fields
+    /// when the record already exists.
+    private func changeTrackingMembers(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        var out = ""
+        out += "    /// Fields assigned since this value was constructed or read\n"
+        out += "    /// from the store — js-bao's `_localChanges`. `save(in:)` writes\n"
+        out += "    /// only these when the record already exists, so a save built\n"
+        out += "    /// from a stale read can't clobber another device's concurrent\n"
+        out += "    /// edit to a field you never touched. A record built through an\n"
+        out += "    /// initializer starts with every field it carries marked changed\n"
+        out += "    /// (it's new data); one read back out of the store starts clean.\n"
+        out += "    /// Inserting a record that doesn't exist yet always writes every\n"
+        out += "    /// field, whatever this holds.\n"
+        out += "    /// Not part of the record's persisted/equatable identity.\n"
+        out += "    \(access) private(set) var _changedFields: Set<String> = []\n\n"
+        out += "    /// Forget the pending field changes without writing them, so a\n"
+        out += "    /// later `save(in:)` treats this value as unmodified. Mirrors\n"
+        out += "    /// js-bao's `discardChanges()`. The field values themselves are\n"
+        out += "    /// left alone — re-read the record to get the stored ones back.\n"
+        out += "    \(access) mutating func discardChanges() {\n"
+        out += "        _changedFields = []\n"
+        out += "    }\n\n"
+        out += "    /// Mark every field this record carries as changed, so the next\n"
+        out += "    /// `save(in:)` writes all of them even if nothing was assigned.\n"
+        out += "    /// The counterpart to `discardChanges()`.\n"
+        out += "    ///\n"
+        out += "    /// Use it to force a whole-record write: saving a record you READ\n"
+        out += "    /// out of the store into another document that already holds it is\n"
+        out += "    /// an update with an empty change set, so it writes nothing. Call\n"
+        out += "    /// this first when you mean \"copy the whole record over\":\n"
+        out += "    ///\n"
+        out += "    ///     var copy = try Model.find(id)!\n"
+        out += "    ///     copy.markAllChanged()\n"
+        out += "    ///     try copy.save(in: otherDocId)\n"
+        out += "    ///\n"
+        out += "    /// Every field it writes wins last-writer-wins against a concurrent\n"
+        out += "    /// remote edit to that field, which is the cost of a full copy.\n"
+        out += "    \(access) mutating func markAllChanged() {\n"
+        out += "        _changedFields = Set(primitiveValues().keys)\n"
+        out += "    }\n"
+        return out
+    }
+
+    /// Emit an explicit `init(from:)` so a decoded value is treated like a
+    /// constructed one: every decoded field counts as a change. The
+    /// compiler's synthesized decode would leave `_changedFields` at its
+    /// empty default, and a decoded record would then silently save nothing
+    /// over an existing record (#2459). `encode(to:)` stays synthesized.
+    private func codableDecodeInit(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        var out = ""
+        out += "    /// Decode a record. A decoded value is treated like a\n"
+        out += "    /// constructed one — every decoded field is marked changed, so\n"
+        out += "    /// `save(in:)` writes all of them.\n"
+        out += "    \(access) init(from decoder: Decoder) throws {\n"
+        out += "        let container = try decoder.container(keyedBy: CodingKeys.self)\n"
+        for fname in displayFieldOrder(schema) {
+            guard let f = schema.fields[fname] else { continue }
+            let stored = swiftStoredType(f, fieldName: fname)
+            let base = stored.hasSuffix("?") ? String(stored.dropLast()) : stored
+            let call = stored.hasSuffix("?") ? "decodeIfPresent" : "decode"
+            out += "        self.\(propName(fname)) = try container.\(call)(\(base).self, forKey: .\(propName(fname)))\n"
+        }
+        out += "        self.related = .empty\n"
+        out += "        self._changedFields = Set(primitiveValues().keys)\n"
+        out += "    }\n"
         return out
     }
 
@@ -976,6 +1099,9 @@ struct SwiftEmitter {
             out += "        self.\(propName(fname)) = \(propName(fname))\n"
         }
         out += "        self.related = .empty\n"
+        // A constructed record is new data: every field it carries counts as
+        // a change, matching js-bao's `new Model({...})` (#2459).
+        out += "        self._changedFields = Set(primitiveValues().keys)\n"
         out += "    }\n"
         return out
     }
@@ -1019,6 +1145,9 @@ struct SwiftEmitter {
             }
         }
         out += "        self.related = .empty\n"
+        // Read back from the store: nothing is pending. A later `save(in:)`
+        // writes only what the caller assigns from here on (#2459).
+        out += "        self._changedFields = []\n"
         out += "    }\n"
         return out
     }
@@ -1069,6 +1198,8 @@ struct SwiftEmitter {
             }
         }
         out += "        self.related = RelatedRecords(raw: row[\"_related\"] as? [String: Any] ?? [:])\n"
+        // Read back from the store: nothing is pending (#2459).
+        out += "        self._changedFields = []\n"
         out += "    }\n"
         return out
     }

@@ -548,18 +548,24 @@ public final class DocumentManager: @unchecked Sendable {
     /// in `Internal/` and were never a supported entry point. Kept `internal` so
     /// that accidental public surface is not recreated.
     func handleRemoteUpdate(documentId: String, updateBase64: String) {
+        guard let updateData = Data(base64Encoded: updateBase64) else {
+            logger.warn("Invalid base64 in remote update for doc:", documentId)
+            return
+        }
+        handleRemoteUpdate(documentId: documentId, updateData: updateData)
+    }
+
+    /// Data-based twin of the base64 overload. `syncStep2`/`update` frames
+    /// whose payload exceeds the server's `MAX_UPDATE_SIZE` arrive as an
+    /// `updateUrl` pointing at R2; the router downloads those to raw bytes,
+    /// so the apply path must not require a base64 round-trip.
+    func handleRemoteUpdate(documentId: String, updateData: Data) {
         let doc: YDocument? = lock.withLock {
             guard let d = openDocs[documentId] else { return nil }
             applyingRemoteUpdate[documentId] = true
             return d
         }
         guard let doc else { return }
-
-        guard let updateData = Data(base64Encoded: updateBase64) else {
-            logger.warn("Invalid base64 in remote update for doc:", documentId)
-            lock.withLock { applyingRemoteUpdate[documentId] = false }
-            return
-        }
 
         let updateBytes = [UInt8](updateData)
         let applyStartMs = Self.nowMs()

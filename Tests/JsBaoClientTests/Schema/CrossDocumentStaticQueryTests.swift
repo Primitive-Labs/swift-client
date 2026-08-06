@@ -12,6 +12,15 @@ import YSwift
 /// `CrossDocNote` + its facade extension below are hand-written to match what
 /// `SwiftEmitter.crossDocumentFacade(schema:)` emits, so this exercises the
 /// real generated contract without invoking codegen.
+///
+/// They cover the READ/WRITE DELEGATION only. The hand-written models here
+/// deliberately leave out the emitter's change tracking (`_changedFields`,
+/// the per-field `didSet`, `discardChanges()` / `markAllChanged()`), so their
+/// writes take the untyped `changedFields: nil` path — which is what these
+/// tests want to assert against. The emitted shape is pinned elsewhere:
+/// `SwiftEmitterTests.testEmitsChangeTrackingMembers` and the committed
+/// goldens under `CodegenAcceptance/Generated/`. Don't read these structs as
+/// a current picture of generated code.
 final class CrossDocumentStaticQueryTests: XCTestCase {
 
     struct CrossDocNote: PrimitiveModel, Equatable {

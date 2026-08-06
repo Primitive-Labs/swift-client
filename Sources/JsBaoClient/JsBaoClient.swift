@@ -897,11 +897,29 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Create-or-update a record in document `docId` — insert if it doesn't
     /// exist yet, update in place if it does (one call, mirrors js-bao's
     /// `BaseModel.save`). Throws if the doc isn't open.
+    ///
+    /// - Parameter changedFields: the fields the caller actually assigned,
+    ///   js-bao's `_localChanges`. On an update only these are written, so a
+    ///   save built from a stale fetch doesn't re-write — and clobber — the
+    ///   fields another device changed concurrently (#2459). `nil` means "no
+    ///   tracking information": every supplied value counts as a change.
+    ///   Either way an update still drops values that already equal what's
+    ///   persisted — see `DynamicModel.save(id:values:changedFields:)`.
+    ///
+    /// Returns the live `PrimitiveRecord` handle for the saved row, so a
+    /// caller can read the record as it now stands in the document rather
+    /// than assuming its own values won: on an update the fields it didn't
+    /// write keep whatever another device put there, and on an insert the
+    /// schema defaults and `auto_stamp` values are filled in. The generated
+    /// `save(in:)` rebuilds its return value from this (#2459).
+    @discardableResult
     public func saveShared(
         _ schema: PrimitiveSchema, id: String,
-        values: [String: PrimitiveValue], in docId: String
-    ) throws {
-        _ = try requireMember(schema, in: docId).save(id: id, values: values)
+        values: [String: PrimitiveValue], in docId: String,
+        changedFields: Set<String>? = nil
+    ) throws -> PrimitiveRecord {
+        try requireMember(schema, in: docId)
+            .save(id: id, values: values, changedFields: changedFields)
     }
 
     /// First record matching a unique `constraint` and `value` across every
@@ -1107,14 +1125,21 @@ public final class JsBaoClient: @unchecked Sendable {
     ///   `DynamicModel.upsert` so an explicit id that collides with a
     ///   matched record throws `UpsertError.explicitIdConflict` —
     ///   mirroring js-bao's `_constructorProvidedId` upsertOn-conflict.
+    /// - Parameter changedFields: the fields the caller actually assigned
+    ///   (see `saveShared`). Applies to the merge path only; the insert path
+    ///   writes every supplied value.
     @discardableResult
     public func upsertShared(
         _ schema: PrimitiveSchema, id: String,
         values: [String: PrimitiveValue], on field: String, in docId: String,
-        explicitId: Bool = false
+        explicitId: Bool = false,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         try requireMember(schema, in: docId)
-            .upsert(values, on: field, id: id, explicitId: explicitId)
+            .upsert(
+                values, on: field, id: id, explicitId: explicitId,
+                changedFields: changedFields
+            )
     }
 
     /// Insert-or-update a record matched by the NAMED unique constraint
@@ -1138,13 +1163,17 @@ public final class JsBaoClient: @unchecked Sendable {
     /// - Parameter explicitId: `true` when the caller pinned `id`; an
     ///   explicit id colliding with a matched record throws
     ///   `UpsertError.explicitIdConflict`.
+    /// - Parameter changedFields: the fields the caller actually assigned
+    ///   (see `saveShared`). Applies to the merge path only; the insert path
+    ///   writes every supplied value.
     @discardableResult
     public func upsertByUniqueShared(
         _ schema: PrimitiveSchema, id: String,
         values: [String: PrimitiveValue], constraint: String,
         mode: UpsertMode = .either, in docId: String,
         explicitId: Bool = false,
-        uniqueLookupValue: [PrimitiveValue]? = nil
+        uniqueLookupValue: [PrimitiveValue]? = nil,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         // The cross-doc search needs the document open before it can be a
         // merge target; require it up front (also the insert target).
@@ -1152,7 +1181,8 @@ public final class JsBaoClient: @unchecked Sendable {
         return try sharedModel(for: schema).upsertByUnique(
             constraint: constraint, data: values, mode: mode, id: id,
             explicitId: explicitId, targetDocId: docId,
-            uniqueLookupValue: uniqueLookupValue
+            uniqueLookupValue: uniqueLookupValue,
+            changedFields: changedFields
         )
     }
 
@@ -2543,6 +2573,18 @@ public final class JsBaoClient: @unchecked Sendable {
             options: options
         )
 
+        // Sample "does this doc already hold data?" here — before anything
+        // else in this method can write into the ydoc. The sync decision
+        // below consumes it. `connectToSharedModels` inserts a `_meta_<model>`
+        // root per registered schema (SchemaSync.syncModelMeta), which is a
+        // real CRDT write: sampling after it would report a brand-new, empty
+        // doc as "has local data" for any app that registers its models
+        // before opening (the PrimitiveApp template pattern) and make
+        // `.localIfAvailableElseNetwork` return an empty document instead of
+        // waiting for server state (#2475). JS has the same ordering — it
+        // decides `hasLocal` first and connects the local query engine after.
+        let effectiveHasLocal = documentManager.ydocHasData(documentId)
+
         // Mirror the doc into every registered cross-document store so
         // `Model.query()` sees it. Covers `openDocumentByAlias` too (it
         // funnels through here).
@@ -2572,12 +2614,12 @@ public final class JsBaoClient: @unchecked Sendable {
             // YDocument immediately and callers raced the `.sync` event —
             // surfacing as "Story not found" flashes in StoryLens.
             //
-            // Read `ydocHasData` BEFORE kicking off sync, matching the JS
-            // evaluation order (`canResolveEarly` decides `hasLocal` first):
-            // `startNetworkSync` is an await suspension, and a fast server
-            // `syncComplete` landing in that window would flip the answer
-            // to "has data" and skip the wait.
-            let effectiveHasLocal = documentManager.ydocHasData(documentId)
+            // `effectiveHasLocal` was read at the top of this method, before
+            // any write into the ydoc — matching the JS evaluation order
+            // (`canResolveEarly` decides `hasLocal` first). It must not be
+            // re-read here: `startNetworkSync` is an await suspension, and a
+            // fast server `syncComplete` landing in that window would flip
+            // the answer to "has data" and skip the wait.
             await startNetworkSync(documentId: documentId)
             let needsNetworkWait =
                 options.waitForLoad == .network
@@ -4290,6 +4332,44 @@ public final class JsBaoClient: @unchecked Sendable {
         eventEmitter.emit(RemoteUpdateEvent(documentId: documentId))
     }
 
+    /// Download an oversized `syncStep2`/`update` payload the server parked in
+    /// R2 (`{type, updateUrl}` instead of inline `update` — sent whenever the
+    /// encoded diff exceeds `MAX_UPDATE_SIZE`). Mirrors the JS client's
+    /// `handleUpdate` updateUrl branch. Returns nil on any failure; callers
+    /// treat that like a dropped frame (a later syncStep1 retry or reconnect
+    /// re-requests the state).
+    private func downloadRemoteUpdate(from urlString: String, documentId: String) async -> Data? {
+        guard let url = URL(string: urlString) else {
+            logger.warn("Invalid updateUrl for doc:", documentId, urlString)
+            return nil
+        }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let http = response as? HTTPURLResponse else {
+                logger.warn("Non-HTTP response downloading update for doc:", documentId)
+                return nil
+            }
+            guard http.statusCode == 200 else {
+                logger.warn("Failed to download update for doc:", documentId, "status:", http.statusCode)
+                return nil
+            }
+            // The server stamps X-Compressed on /r2/ responses; it is
+            // hardcoded "false" today (compressData is an identity
+            // placeholder server-side), so compressed payloads are a
+            // protocol we don't speak yet — fail loudly instead of
+            // applying garbage bytes.
+            if (http.value(forHTTPHeaderField: "X-Compressed") ?? "false") == "true" {
+                logger.warn("Compressed update payloads are not supported; dropping update for doc:", documentId)
+                return nil
+            }
+            logger.debug("Downloaded remote update for doc:", documentId, "bytes:", data.count)
+            return data
+        } catch {
+            logger.warn("Failed to download update for doc:", documentId, error.localizedDescription)
+            return nil
+        }
+    }
+
     func handleWebSocketMessage(_ text: String) async {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -4324,8 +4404,23 @@ public final class JsBaoClient: @unchecked Sendable {
             }
 
         case "syncStep2":
-            guard let roomId = roomId, let update = json["update"] as? String else { return }
-            documentManager.handleRemoteUpdate(documentId: roomId, updateBase64: update)
+            guard let roomId = roomId else { return }
+            if let update = json["update"] as? String {
+                documentManager.handleRemoteUpdate(documentId: roomId, updateBase64: update)
+            } else if let updateUrl = json["updateUrl"] as? String {
+                // Payloads over the server's MAX_UPDATE_SIZE arrive as an R2
+                // URL instead of an inline update (JS parity: handleUpdate's
+                // updateUrl branch). Await the download here — the message
+                // pump processes frames sequentially, so the trailing
+                // syncComplete isn't handled until the full state is applied.
+                if let data = await downloadRemoteUpdate(from: updateUrl, documentId: roomId) {
+                    documentManager.handleRemoteUpdate(documentId: roomId, updateData: data)
+                }
+            } else {
+                // JS parity: "No update and no updateUrl — nothing reached
+                // the Y.Doc". Never drop this silently (#2474).
+                logger.warn("syncStep2 carried neither update nor updateUrl for doc:", roomId)
+            }
 
         case "syncComplete":
             guard let roomId = roomId else { return }
@@ -4345,8 +4440,21 @@ public final class JsBaoClient: @unchecked Sendable {
             )
 
         case "update":
-            guard let roomId = roomId, let update = json["update"] as? String else { return }
-            documentManager.handleRemoteUpdate(documentId: roomId, updateBase64: update)
+            guard let roomId = roomId else { return }
+            if let update = json["update"] as? String {
+                documentManager.handleRemoteUpdate(documentId: roomId, updateBase64: update)
+            } else if let updateUrl = json["updateUrl"] as? String {
+                // Large broadcast updates (a peer's >MAX_UPDATE_SIZE upload)
+                // are relayed as an R2 URL, same as oversized syncStep2.
+                if let data = await downloadRemoteUpdate(from: updateUrl, documentId: roomId) {
+                    documentManager.handleRemoteUpdate(documentId: roomId, updateData: data)
+                } else {
+                    return
+                }
+            } else {
+                logger.warn("update frame carried neither update nor updateUrl for doc:", roomId)
+                return
+            }
             // `.documentSyncStateChanged` (state "synced") is the supported,
             // non-deprecated replacement for `.remoteUpdate` (#1120): emit it
             // first so migrated subscribers fire.

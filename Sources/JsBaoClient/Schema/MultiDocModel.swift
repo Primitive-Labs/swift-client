@@ -304,6 +304,9 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     ///   - uniqueLookupValue: optional explicit lookup value(s) (one per
     ///     constraint field). Mirrors js-bao's separate
     ///     `uniqueLookupValue` argument; validated against `data`.
+    ///   - changedFields: the fields the caller actually assigned (see
+    ///     `DynamicModel.save(id:values:changedFields:)`). Applies to the
+    ///     merge path only; the insert path writes every supplied value.
     @discardableResult
     public func upsertByUnique(
         constraint name: String,
@@ -312,7 +315,8 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         id: String? = nil,
         explicitId: Bool = false,
         targetDocId: String,
-        uniqueLookupValue: [PrimitiveValue]? = nil
+        uniqueLookupValue: [PrimitiveValue]? = nil,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         let members = snapshotMembersInOrder()
         for (_, model) in members { model.awaitObserverDrain() }
@@ -372,7 +376,9 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
                              "(client.openDocument) before writing `\(schema.name)` records."
                 )
             }
-            _ = try target.save(id: matchRecordId, values: data)
+            _ = try target.save(
+                id: matchRecordId, values: data, changedFields: changedFields
+            )
             return UpsertResult(
                 record: PrimitiveRecord(
                     modelName: schema.name, id: matchRecordId, model: target

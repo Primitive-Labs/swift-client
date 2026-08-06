@@ -543,13 +543,35 @@ public final class DynamicModel: @unchecked Sendable {
     /// the same default-filling difference as `create` vs `update` — a new
     /// id fills unspecified fields from schema defaults; an existing id
     /// leaves omitted fields untouched.
+    ///
+    /// - Parameter changedFields: the fields the caller actually assigned,
+    ///   js-bao's `_localChanges`. On the **update** path only these are
+    ///   written, so a save built from a stale fetch doesn't re-write — and
+    ///   clobber — fields another device changed concurrently (#2459). `nil`
+    ///   means "no tracking information": every supplied value counts as a
+    ///   change, which is the contract for untyped callers that already pass
+    ///   just the fields they mean to write. The insert path ignores the set
+    ///   and writes every supplied value — a brand-new record needs all of
+    ///   its fields.
+    ///
+    ///   One thing `nil` does NOT opt out of: the second-stage value diff
+    ///   (js-bao's `_diffWithYjsData`) runs on every update. A supplied
+    ///   value that already equals the persisted one emits no op either
+    ///   way, so an unchanged field never gets a fresh last-writer-wins
+    ///   clock. Writing the same value again is not a way to win against a
+    ///   concurrent remote edit.
     @discardableResult
-    public func save(id: String, values: [String: PrimitiveValue]) throws -> PrimitiveRecord {
+    public func save(
+        id: String,
+        values: [String: PrimitiveValue],
+        changedFields: Set<String>? = nil
+    ) throws -> PrimitiveRecord {
         try withThrowingTx { [self] txn in
             let root = txn.transactionGetOrInsertMap(name: self.schema.name)
             let isUpdate = root.getMap(tx: txn, key: id) != nil
             try self.applyWriteInternal(
-                id: id, values: values, isUpdate: isUpdate, tx: txn
+                id: id, values: values, isUpdate: isUpdate,
+                changedFields: changedFields, tx: txn
             )
         }
         return PrimitiveRecord(modelName: schema.name, id: id, model: self)
@@ -691,12 +713,17 @@ public final class DynamicModel: @unchecked Sendable {
     ///   `_constructorProvidedId && this.id !== existingId` guard. A
     ///   non-explicit id is silently discarded on merge (JS auto-id
     ///   parity), which is the default.
+    /// - Parameter changedFields: the fields the caller actually assigned
+    ///   (see `save(id:values:changedFields:)`). Applies to the merge path
+    ///   only — the insert path writes every supplied value. The lookup key
+    ///   is always built from the full `values`, changed or not.
     @discardableResult
     public func upsert(
         _ values: [String: PrimitiveValue],
         on field: String,
         id: String? = nil,
-        explicitId: Bool = false
+        explicitId: Bool = false,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         // --- Validate the upsert-on input up-front (no tx yet) -------
         guard let fieldValue = values[field] else {
@@ -784,7 +811,10 @@ public final class DynamicModel: @unchecked Sendable {
         // defaults only on the insert path.
         var toWrite = values
         toWrite.removeValue(forKey: "id")
-        try applyWrite(id: outcome.id, values: toWrite, isUpdate: !outcome.wasCreated)
+        try applyWrite(
+            id: outcome.id, values: toWrite, isUpdate: !outcome.wasCreated,
+            changedFields: changedFields
+        )
 
         return UpsertResult(
             record: PrimitiveRecord(
@@ -1032,12 +1062,20 @@ public final class DynamicModel: @unchecked Sendable {
 
     /// Merge `data` into the existing record `existingId` in this doc.
     /// Shared by the single- and cross-doc merge paths.
+    ///
+    /// - Parameter changedFields: the caller-assigned fields (see
+    ///   `save(id:values:changedFields:)`); `nil` merges every supplied value.
     func mergeExisting(
-        existingId: String, data: [String: PrimitiveValue]
+        existingId: String,
+        data: [String: PrimitiveValue],
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         var values = data
         values.removeValue(forKey: "id")
-        try applyWrite(id: existingId, values: values, isUpdate: true)
+        try applyWrite(
+            id: existingId, values: values, isUpdate: true,
+            changedFields: changedFields
+        )
         return UpsertResult(
             record: PrimitiveRecord(
                 modelName: schema.name, id: existingId, model: self
@@ -1088,6 +1126,8 @@ public final class DynamicModel: @unchecked Sendable {
     ///   - uniqueLookupValue: optional explicit lookup value(s), one per
     ///     constraint field. Mirrors js-bao's separate `uniqueLookupValue`
     ///     argument; when nil the key is built from `data`.
+    ///   - changedFields: the fields the caller actually assigned (see
+    ///     `save(id:values:changedFields:)`). Applies to the merge path only.
     ///
     /// Single-doc scope: searches only this doc. Cross-doc search (every
     /// connected document, per js-bao) is `MultiDocModel.upsertByUnique`.
@@ -1097,7 +1137,8 @@ public final class DynamicModel: @unchecked Sendable {
         data: [String: PrimitiveValue],
         mode: UpsertMode = .either,
         id: String? = nil,
-        uniqueLookupValue: [PrimitiveValue]? = nil
+        uniqueLookupValue: [PrimitiveValue]? = nil,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         let (constraint, key) = try resolveUpsertConstraintKey(
             constraint: name, data: data, uniqueLookupValue: uniqueLookupValue
@@ -1121,7 +1162,9 @@ public final class DynamicModel: @unchecked Sendable {
         }
 
         if let existingId {
-            return try mergeExisting(existingId: existingId, data: data)
+            return try mergeExisting(
+                existingId: existingId, data: data, changedFields: changedFields
+            )
         }
         return try insertNew(id: id, data: data)
     }
@@ -1340,13 +1383,15 @@ public final class DynamicModel: @unchecked Sendable {
     private func applyWrite(
         id: String,
         values newValues: [String: PrimitiveValue],
-        isUpdate: Bool
+        isUpdate: Bool,
+        changedFields: Set<String>? = nil
     ) throws {
         try withThrowingTx { [self] txn in
             try self.applyWriteInternal(
                 id: id,
                 values: newValues,
                 isUpdate: isUpdate,
+                changedFields: changedFields,
                 tx: txn
             )
         }
@@ -1356,6 +1401,7 @@ public final class DynamicModel: @unchecked Sendable {
         id: String,
         values: [String: PrimitiveValue],
         isUpdate: Bool,
+        changedFields: Set<String>? = nil,
         tx txn: YrsTransaction
     ) throws {
         var newValues = values
@@ -1368,6 +1414,31 @@ public final class DynamicModel: @unchecked Sendable {
         let oldData: [String: PrimitiveValue] = existing.map {
             self.snapshotFromMap(rec: $0, tx: txn)
         } ?? [:]
+
+        // Stage 1 of js-bao's two-stage narrowing — `_localChanges` (#2459).
+        // Keep only the fields the caller actually assigned. `nil` means the
+        // caller supplied no tracking information, so every supplied value
+        // counts as a change (the untyped `DynamicModel` contract).
+        //
+        // Stage 2 below is NOT gated on `changedFields` — it runs on every
+        // update, so `nil` is "no narrowing by assignment", not "write
+        // everything unconditionally".
+        //
+        // UPDATE path only: an insert must write every field it was handed —
+        // that's what makes "read a record from doc A, save it into doc B"
+        // carry the whole record even though nothing was assigned.
+        //
+        // Why this matters: writing a Y.Map key is a real op with a fresh
+        // clock even when the value is identical, so it wins last-writer-wins
+        // against another device's concurrent edit to that key. A save built
+        // from a stale read would therefore silently revert fields the caller
+        // never touched. Everything downstream — the merged `dataToSave`
+        // view, validation, the dirty check, unique-index reconciliation, and
+        // the write itself — sees the narrowed set, so the record's post-write
+        // state is `persisted + real changes`.
+        if isUpdate, let changedFields {
+            newValues = newValues.filter { changedFields.contains($0.key) }
+        }
 
         // Apply schema-declared auto-timestamps BEFORE validation so a
         // `required: true` + `auto_stamp = "create"` field doesn't trip
@@ -1405,6 +1476,15 @@ public final class DynamicModel: @unchecked Sendable {
                 break  // always fire (caller didn't set it, per check above)
             }
             newValues[fname] = .number(nowMillis)
+        }
+
+        // Stage 2 of the narrowing — js-bao's `_diffWithYjsData` (#2459):
+        // drop any change whose value already equals what's persisted. Runs
+        // AFTER the stamp block so an explicitly-supplied auto_stamp value
+        // still counts as explicit (js-bao stamps off `_localChanges`, then
+        // diffs), and on the UPDATE path only for the same reason as stage 1.
+        if isUpdate {
+            newValues = newValues.filter { oldData[$0.key] != $0.value }
         }
 
         // Merge caller values on top of existing, and fill in

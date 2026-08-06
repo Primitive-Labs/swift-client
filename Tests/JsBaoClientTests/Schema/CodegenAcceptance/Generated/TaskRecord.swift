@@ -17,11 +17,21 @@ internal struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Ha
         ]
     )
 
-    internal var id: String
-    internal var title: String
-    internal var priority: Double?
-    internal var tags: Set<String>?
-    internal var createdAt: String?
+    internal var id: String {
+        didSet { _changedFields.insert("id") }
+    }
+    internal var title: String {
+        didSet { _changedFields.insert("title") }
+    }
+    internal var priority: Double? {
+        didSet { _changedFields.insert("priority") }
+    }
+    internal var tags: Set<String>? {
+        didSet { _changedFields.insert("tags") }
+    }
+    internal var createdAt: String? {
+        didSet { _changedFields.insert("createdAt") }
+    }
 
     internal var related: RelatedRecords = .empty
 
@@ -31,6 +41,45 @@ internal struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Ha
     /// `upsertByUnique` (js-bao `_constructorProvidedId` parity).
     /// Not part of the record's persisted/equatable identity.
     internal private(set) var _explicitId: Bool = true
+
+    /// Fields assigned since this value was constructed or read
+    /// from the store — js-bao's `_localChanges`. `save(in:)` writes
+    /// only these when the record already exists, so a save built
+    /// from a stale read can't clobber another device's concurrent
+    /// edit to a field you never touched. A record built through an
+    /// initializer starts with every field it carries marked changed
+    /// (it's new data); one read back out of the store starts clean.
+    /// Inserting a record that doesn't exist yet always writes every
+    /// field, whatever this holds.
+    /// Not part of the record's persisted/equatable identity.
+    internal private(set) var _changedFields: Set<String> = []
+
+    /// Forget the pending field changes without writing them, so a
+    /// later `save(in:)` treats this value as unmodified. Mirrors
+    /// js-bao's `discardChanges()`. The field values themselves are
+    /// left alone — re-read the record to get the stored ones back.
+    internal mutating func discardChanges() {
+        _changedFields = []
+    }
+
+    /// Mark every field this record carries as changed, so the next
+    /// `save(in:)` writes all of them even if nothing was assigned.
+    /// The counterpart to `discardChanges()`.
+    ///
+    /// Use it to force a whole-record write: saving a record you READ
+    /// out of the store into another document that already holds it is
+    /// an update with an empty change set, so it writes nothing. Call
+    /// this first when you mean "copy the whole record over":
+    ///
+    ///     var copy = try Model.find(id)!
+    ///     copy.markAllChanged()
+    ///     try copy.save(in: otherDocId)
+    ///
+    /// Every field it writes wins last-writer-wins against a concurrent
+    /// remote edit to that field, which is the cost of a full copy.
+    internal mutating func markAllChanged() {
+        _changedFields = Set(primitiveValues().keys)
+    }
 
     internal init(
         id: String,
@@ -45,6 +94,7 @@ internal struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Ha
         self.tags = tags
         self.createdAt = createdAt
         self.related = .empty
+        self._changedFields = Set(primitiveValues().keys)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -65,6 +115,7 @@ internal struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Ha
         self.createdAt = createdAt
         self.related = .empty
         self._explicitId = false
+        self._changedFields = Set(primitiveValues().keys)
     }
 
     internal init?(record: PrimitiveRecord) {
@@ -76,6 +127,7 @@ internal struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Ha
         self.tags = record["tags"]?.asStringSet
         self.createdAt = record["createdAt"]?.asDateString
         self.related = .empty
+        self._changedFields = []
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
@@ -89,6 +141,7 @@ internal struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Ha
         self.tags = (row["tags"] as? [String]).map(Set.init)
         self.createdAt = row["createdAt"] as? String
         self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
+        self._changedFields = []
     }
 
     internal func primitiveValues() -> [String: PrimitiveValue] {
@@ -99,6 +152,20 @@ internal struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Ha
         if let tags { values["tags"] = .stringset(tags) }
         if let createdAt { values["createdAt"] = .date(createdAt) }
         return values
+    }
+
+    /// Decode a record. A decoded value is treated like a
+    /// constructed one — every decoded field is marked changed, so
+    /// `save(in:)` writes all of them.
+    internal init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.title = try container.decode(String.self, forKey: .title)
+        self.priority = try container.decodeIfPresent(Double.self, forKey: .priority)
+        self.tags = try container.decodeIfPresent(Set<String>.self, forKey: .tags)
+        self.createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
+        self.related = .empty
+        self._changedFields = Set(primitiveValues().keys)
     }
 
     internal enum CodingKeys: String, CodingKey {
@@ -263,11 +330,33 @@ internal extension TaskRecord {
     /// Persist this record to document `documentId` — inserts it if it
     /// doesn't exist yet, updates it in place if it does. One call for
     /// both, matching the JS client's `save()`. Throws if the doc isn't
-    /// open. Returns `self` so you can `let saved = try note.save(in:)`.
+    /// open.
+    ///
+    /// Updating writes only the fields assigned since this value was
+    /// read (`_changedFields`), so two devices editing different fields
+    /// of the same record merge instead of clobbering. Inserting writes
+    /// every field.
+    ///
+    /// Returns the record AS SAVED, re-read from the document with no
+    /// pending changes left — so a field this save didn't write carries
+    /// whatever another device put there, and an insert's schema
+    /// defaults and `auto_stamp` values are filled in. Assign it back
+    /// (`task = try task.save(in: doc)`) when you keep using the value
+    /// after the save; `self` itself still holds the values you had.
     @discardableResult
     func save(in documentId: String) throws -> TaskRecord {
-        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
-        return self
+        let record = try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)
+        guard var saved = TaskRecord(record: record) else {
+            var fallback = self
+            fallback.discardChanges()
+            return fallback
+        }
+        // Carried over, not persisted: query-time includes and the
+        // caller-pinned-id flag have no representation in the stored
+        // record, and this path never changes the record's id.
+        saved.related = related
+        saved._explicitId = _explicitId
+        return saved
     }
 
     /// Insert-or-update this record in `documentId`, matched by the
@@ -284,10 +373,11 @@ internal extension TaskRecord {
     /// its fields reflect the merged state, NOT necessarily `self`.
     @discardableResult
     func save(in documentId: String, upsertOn: String) throws -> TaskRecord {
-        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)
+        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)
         if let resolved = TaskRecord(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
+        copy.discardChanges()
         return copy
     }
 
@@ -313,10 +403,11 @@ internal extension TaskRecord {
     /// EXISTING record's id and its fields reflect the merged state.
     @discardableResult
     func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> TaskRecord {
-        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)
+        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)
         if let resolved = TaskRecord(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
+        copy.discardChanges()
         return copy
     }
 
@@ -327,10 +418,11 @@ internal extension TaskRecord {
     /// when you want to make the lookup key explicit at the call site.
     @discardableResult
     func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> TaskRecord {
-        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue)
+        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue, changedFields: _changedFields)
         if let resolved = TaskRecord(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
+        copy.discardChanges()
         return copy
     }
 

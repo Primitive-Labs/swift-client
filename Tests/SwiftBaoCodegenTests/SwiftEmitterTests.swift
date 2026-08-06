@@ -106,10 +106,30 @@ final class SwiftEmitterTests: XCTestCase {
         // Writes (per-document instance methods — the save() API from #923)
         XCTAssertTrue(body.contains("func save(in documentId: String) throws -> NoteRecord"),
                       "instance save(in:) (create-or-update) must be emitted")
+        // The change-set hand-off on the PRIMARY write path (#2459). This is
+        // the call the whole change-tracking feature exists for; the goldens
+        // under CodegenAcceptance/ are hand-rolled and only compiled, never
+        // re-emitted and diffed, so without this assertion an emitter change
+        // that drops `changedFields:` here would ship green.
+        XCTAssertTrue(body.contains("let record = try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)"),
+                      "save(in:) must pass the tracked change set to saveShared (#2459)")
+        // save(in:) must hand back the record AS SAVED — rebuilt from the
+        // returned PrimitiveRecord the way the upsert paths already do, not a
+        // copy of `self`. A copy of `self` is stale for exactly the fields the
+        // narrowed write left to another device, which is the case this whole
+        // change exists for, and it misses insert-path defaults/auto-stamps.
+        XCTAssertTrue(body.contains("guard var saved = NoteRecord(record: record) else {"),
+                      "save(in:) must rebuild its return value from the saved record (#2459)")
+        XCTAssertTrue(body.contains("saved.related = related\n        saved._explicitId = _explicitId\n        return saved"),
+                      "save(in:) must carry the non-persisted caller-side state onto the rebuilt value (#2459)")
+        XCTAssertTrue(body.contains("var fallback = self\n            fallback.discardChanges()\n            return fallback"),
+                      "save(in:) needs a `self` fallback for an undecodable record, with changes cleared (#2459)")
+        XCTAssertFalse(body.contains("var saved = self\n        saved.discardChanges()\n        return saved"),
+                      "save(in:) must not return a stale copy of `self` (#2459)")
         // Upsert-by-unique-field write (JS parity: save({ upsertOn })).
         XCTAssertTrue(body.contains("func save(in documentId: String, upsertOn: String) throws -> NoteRecord"),
                       "instance save(in:upsertOn:) must be emitted")
-        XCTAssertTrue(body.contains("upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)"),
+        XCTAssertTrue(body.contains("upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)"),
                       "save(in:upsertOn:) should delegate to upsertShared, passing the record id + explicit-id provenance (#1122)")
         // The upsert paths must return the RESOLVED record, not `self` —
         // on the merge path the existing record's id wins (JS reassigns
@@ -122,7 +142,7 @@ final class SwiftEmitterTests: XCTestCase {
         // covers compound constraints — #1053).
         XCTAssertTrue(body.contains("func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> NoteRecord"),
                       "instance upsertByUnique(_:mode:in:) must be emitted")
-        XCTAssertTrue(body.contains("upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)"),
+        XCTAssertTrue(body.contains("upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)"),
                       "upsertByUnique should delegate to upsertByUniqueShared, passing the record id + explicit-id provenance (#1122)")
         // Explicit lookup-value overload (#1122 — js-bao's separate
         // `uniqueLookupValue` argument).
@@ -150,6 +170,63 @@ final class SwiftEmitterTests: XCTestCase {
                        "static create() was replaced by instance save(in:) (#923)")
         XCTAssertFalse(body.contains("static func update("),
                        "static update() was replaced by instance save(in:) (#923)")
+    }
+
+    /// Change tracking (#2459) — the emitted members that make
+    /// fetch–mutate–save a field-level write. Pinned here because the
+    /// committed goldens under `CodegenAcceptance/Generated/` are only
+    /// COMPILED by `CodegenAcceptanceTests`, never re-emitted and diffed:
+    /// an emitter change that dropped any of these would compile and pass
+    /// until someone happened to re-roll the goldens.
+    func testEmitsChangeTrackingMembers() throws {
+        let src = try emit("""
+        [models.note]
+        [models.note.fields.id]
+        type = "id"
+        [models.note.fields.title]
+        type = "string"
+        required = true
+        [models.note.fields.priority]
+        type = "number"
+        """)
+        let body = try XCTUnwrap(src["NoteRecord"])
+
+        // The set itself — `private(set)` so only the record's own
+        // mutators can rewrite it.
+        XCTAssertTrue(body.contains("private(set) var _changedFields: Set<String> = []"),
+                      "_changedFields must be emitted, publicly readable but not writable")
+
+        // Every stored property records its own assignment.
+        XCTAssertTrue(body.contains("var title: String {\n        didSet { _changedFields.insert(\"title\") }\n    }"),
+                      "each stored property needs a didSet recording the assignment")
+        XCTAssertTrue(body.contains("didSet { _changedFields.insert(\"priority\") }"),
+                      "optional fields track assignments too")
+        XCTAssertTrue(body.contains("didSet { _changedFields.insert(\"id\") }"),
+                      "the id field tracks assignments too")
+
+        // Seeding per construction path: constructed / decoded records are
+        // new data (everything changed); store reads start clean.
+        XCTAssertEqual(
+            body.components(separatedBy: "self._changedFields = Set(primitiveValues().keys)").count - 1, 3,
+            "designated init, auto-id init and init(from:) must each seed the full change set"
+        )
+        XCTAssertEqual(
+            body.components(separatedBy: "self._changedFields = []").count - 1, 2,
+            "init?(record:) and init?(row:) must each start clean"
+        )
+
+        // The explicit decode init — the synthesized one would leave the
+        // set empty and a decoded record would silently save nothing.
+        XCTAssertTrue(body.contains("init(from decoder: Decoder) throws {"),
+                      "init(from:) must be emitted, not synthesized (#2459)")
+        XCTAssertTrue(body.contains("let container = try decoder.container(keyedBy: CodingKeys.self)"),
+                      "the emitted decode init should decode through the emitted CodingKeys")
+
+        // Both mutators.
+        XCTAssertTrue(body.contains("mutating func discardChanges() {\n        _changedFields = []\n    }"),
+                      "discardChanges() must be emitted")
+        XCTAssertTrue(body.contains("mutating func markAllChanged() {\n        _changedFields = Set(primitiveValues().keys)\n    }"),
+                      "markAllChanged() must be emitted — the only way to re-arm a record read from the store (#2459)")
     }
 
     func testEmitsEnumAccessorForKeywordNamedField() throws {
@@ -341,7 +418,12 @@ final class SwiftEmitterTests: XCTestCase {
         guard let recordInitStart = body.range(of: "init?(record: PrimitiveRecord)") else {
             return XCTFail("no record init found")
         }
-        guard let rowInitStart = body.range(of: "init?(row:") else {
+        // Search for the row init AFTER the record init so a doc comment
+        // that happens to name `init?(row:` earlier in the file can't invert
+        // the range below.
+        guard let rowInitStart = body.range(
+            of: "init?(row:", range: recordInitStart.upperBound..<body.endIndex
+        ) else {
             return XCTFail("no row init found")
         }
         let recordInitBody = body[recordInitStart.upperBound..<rowInitStart.lowerBound]
@@ -391,7 +473,7 @@ final class SwiftEmitterTests: XCTestCase {
         required = true
         """)
         let body = try XCTUnwrap(src["TRecord"])
-        XCTAssertTrue(body.contains("var title: String\n"))
+        XCTAssertTrue(body.contains("var title: String {\n"))
     }
 
     func testPrimitiveValuesShape() throws {

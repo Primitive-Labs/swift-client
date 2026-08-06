@@ -513,6 +513,8 @@ runtime layer:
 | `init?(record:)` | "Read this CRDT-backed `PrimitiveRecord` into a typed value" — `nil` if a required field is missing. Used by `TypedModel.find` / `findAll`. |
 | `init?(row:)` | "Read this SQLite-mirror row dict into a typed value" — used by `dynamic.query(...)` for indexed-filter / pagination paths. Different from `init?(record:)` because the SQLite row is `[String: Any]`, not `PrimitiveRecord`. The two readers have separate cast rules — stringsets come back as `[String]` from SQLite, as `Set<String>` from PrimitiveRecord. |
 | `primitiveValues()` | Project the typed value back into a `[String: PrimitiveValue]` so the dynamic write path can encode it onto the doc. |
+| `_changedFields` + per-field `didSet` + `discardChanges()` / `markAllChanged()` | Track which fields the caller assigned — Swift's `_localChanges` (#2459). `save(in:)` passes the set to `DynamicModel`, which writes only those fields when the record already exists. See [Change tracking](#change-tracking-_changedfields) below. |
+| `init(from decoder:)` | Emitted rather than synthesized so a decoded record counts as constructed: every decoded field is marked changed. Synthesized decode would leave `_changedFields` empty and a decoded record would silently save nothing. `encode(to:)` stays synthesized. |
 
 **Could it ever get lighter?** Two paths, neither on this PR's
 runway:
@@ -810,11 +812,11 @@ double-compile the same struct.
 **Net effect**: `swift test` works (SPM plugin path), `./run-ios.sh` works
 (manual codegen path), and there's no path that builds the codegen-emitted
 types twice. The price of admission is the dual-step setup; both options above
-are covered in `primitive-app-template`'s
-[`run-ios.sh`](https://github.com/Primitive-Labs/swift-primitive-app-dev/blob/main/primitive-app-template/run-ios.sh)
+are covered in the Swift template's
+[`run-ios.sh`](../../templates/primitive-swift-template/run-ios.sh)
 (codegen invocation + xcodegen regenerate)
 and
-[`Package.swift`](https://github.com/Primitive-Labs/swift-primitive-app-dev/blob/main/primitive-app-template/Package.swift)
+[`Package.swift`](../../templates/primitive-swift-template/Package.swift)
 (the `exclude:` rule). Copy from there if you want a working reference.
 
 ## Naming
@@ -915,18 +917,81 @@ internal struct TaskRecord: PrimitiveModel, Equatable, Hashable, Codable {
         ]
     )
 
-    internal var id: String
-    internal var title: String
-    internal var priority: Double?
+    internal var id: String {
+        didSet { _changedFields.insert("id") }
+    }
+    internal var title: String {
+        didSet { _changedFields.insert("title") }
+    }
+    internal var priority: Double? {
+        didSet { _changedFields.insert("priority") }
+    }
     // ...
+
+    internal private(set) var _changedFields: Set<String> = []
+    internal mutating func discardChanges() { _changedFields = [] }
+    internal mutating func markAllChanged() { _changedFields = Set(primitiveValues().keys) }
 
     internal init(/* ... */) { /* ... */ }
     internal init?(record: PrimitiveRecord) { /* ... */ }
     internal init?(row: [String: Any]) { /* ... */ }
 
     internal func primitiveValues() -> [String: PrimitiveValue] { /* ... */ }
+    internal init(from decoder: Decoder) throws { /* ... */ }
 }
 ```
+
+### Change tracking (`_changedFields`)
+
+Every stored property carries a `didSet` that records the assignment in
+`_changedFields` — Swift's answer to js-bao's `_localChanges` (#2459).
+`save(in:)` passes the set to `JsBaoClient.saveShared` →
+`DynamicModel.save(id:values:changedFields:)`, which on the **update**
+path writes only those fields (and drops even those whose value already
+matches what's persisted, mirroring js-bao's `_diffWithYjsData`). Without
+this, `save(in:)` re-wrote every field from a possibly stale read, and
+yrs's per-key last-writer-wins silently reverted another device's
+concurrent edit.
+
+Where the set starts:
+
+| Construction path | `_changedFields` | Why |
+|---|---|---|
+| Designated / auto-id `init` | every field carrying a value | a constructed record is new data (js-bao's `new Model({...})`) |
+| `init(from decoder:)` | every decoded field | decoding is a construction, not a store read |
+| `init?(record:)` / `init?(row:)` | empty | read back from the store — nothing is pending |
+
+Property observers don't fire for an initializer's own assignments, so
+each init sets `_changedFields` explicitly to what that path means. The
+**insert** path ignores the set entirely and writes every supplied field,
+which is what keeps "read from doc A, `save(in: docB)`" whole.
+
+`save(in:)` returns the record AS SAVED, not the caller's own value: it
+rebuilds from the `PrimitiveRecord` `JsBaoClient.saveShared` hands back
+(the same thing the upsert paths do with `UpsertResult.record`), so a
+field the narrowed write left alone carries whatever another device put
+there, and an insert's schema defaults / `auto_stamp` values are filled
+in. Only the two pieces of caller-side state the store doesn't hold —
+`related` (query-time includes) and `_explicitId` — carry over from
+`self`; the returned record's change set is empty. `discardChanges()`
+drops pending edits without writing them (js-bao's `discardChanges()`).
+
+**The sharp edge, and how to get out of it.** A record read out of the
+store has an empty change set, so saving it into a document that ALREADY
+holds it is an update that writes nothing — no error, no ops. (js-bao
+behaves the same way: `BaseModel.save` bails when `_diffWithYjsData` comes
+back empty and the target doc already has the record.) That's right for
+fetch–mutate–save and wrong for "copy this record over that one", so
+`markAllChanged()` re-arms the set:
+
+```swift
+var copy = try TaskRecord.find(id)!
+copy.markAllChanged()
+try copy.save(in: otherDocId)   // writes every field it carries
+```
+
+A full copy wins last-writer-wins on every field it writes — that's the
+cost of asking for one.
 
 ### Field type mapping
 
@@ -942,10 +1007,11 @@ internal struct TaskRecord: PrimitiveModel, Equatable, Hashable, Codable {
 ### Conformances are auto-emitted
 
 Generated structs declare `: PrimitiveModel, Equatable, Hashable, Codable`
-on the struct itself. Swift's compiler synthesizes `==`, `hash(into:)`,
-and `init(from:)` / `encode(to:)` automatically *in the generated
-file* — synthesis only fires same-file. **You don't need to hand-roll
-any of these.**
+on the struct itself. `==`, `hash(into:)`, `CodingKeys`, and `init(from:)`
+are emitted in the generated file (they cover the real schema fields only,
+excluding `_explicitId` / `_changedFields`); `encode(to:)` is synthesized —
+synthesis only fires same-file. **You don't need to hand-roll any of
+these.**
 
 ```swift
 let a = TaskRecord(id: "x", title: "y")
