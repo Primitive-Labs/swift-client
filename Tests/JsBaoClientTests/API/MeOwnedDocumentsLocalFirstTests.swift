@@ -3,11 +3,11 @@ import XCTest
 
 /// `me.ownedDocuments` / `ownedDocumentsPage` local-first resolution (#2360).
 ///
-/// `waitForLoad` and `serverTimeoutMs` were declared on
+/// `waitForLoad` and `serverTimeout` were declared on
 /// `MeOwnedDocumentsOptions` and never read: every online call was a blocking
 /// server fetch. These tests pin the resolution order the sponsor chose —
 /// JS-parity local-first by default, with `.local` / `.network` as the
-/// explicit escapes and a bounded, always-throwing `serverTimeoutMs`.
+/// explicit escapes and a bounded, always-throwing `serverTimeout`.
 final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
 
     // MARK: - Fixtures
@@ -238,7 +238,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
         XCTAssertEqual(items.map { $0.documentId }, ["srv1"])
     }
 
-    // MARK: - Behavior 8: serverTimeoutMs
+    // MARK: - Behavior 8: serverTimeout
 
     func testNetworkModeTimesOutWithTypedError() async throws {
         let store = MetadataStore([Self.ownedEntry("local1")])
@@ -251,7 +251,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
         let started = Date()
         do {
             _ = try await api.ownedDocuments(
-                options: MeOwnedDocumentsOptions(serverTimeoutMs: 100, waitForLoad: .network)
+                options: MeOwnedDocumentsOptions(serverTimeout: 0.1, waitForLoad: .network)
             )
             XCTFail("a stalled fetch must throw .listTimeout, not hang")
         } catch let error as JsBaoError {
@@ -260,7 +260,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 1.0)
     }
 
-    /// `serverTimeoutMs: 0` is unbounded — the in-Swift `KvCache` reading of
+    /// `serverTimeout: 0` is unbounded — the in-Swift `KvCache` reading of
     /// the same option (`KvCache.swift`), documented on the field.
     func testZeroServerTimeoutIsUnbounded() async throws {
         let store = MetadataStore([Self.ownedEntry("local1")])
@@ -275,7 +275,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
         let api = makeAPI(store: store, transport: transport)
 
         let items = try await api.ownedDocuments(
-            options: MeOwnedDocumentsOptions(serverTimeoutMs: 0, waitForLoad: .network)
+            options: MeOwnedDocumentsOptions(serverTimeout: 0, waitForLoad: .network)
         )
 
         XCTAssertEqual(Set(items.map { $0.documentId }), ["local1", "srv1"])

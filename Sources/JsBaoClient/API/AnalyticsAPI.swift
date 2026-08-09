@@ -42,15 +42,6 @@ public final class AnalyticsAPI: Sendable {
 
     // MARK: - logEvent
 
-    /// Log a typed analytics event. The queue fills in `user_ulid`,
-    /// `timestamp`, and any plan / app-version overrides.
-    @available(*, deprecated, message: "Use logEventAsync(_:) — the synchronous version enqueues without waiting, so it is not ordered against a following flush. Removed in the next major release.")
-    public func logEvent(_ event: AnalyticsEventInput) {
-        let prepared = queue.prepared(event)
-        let queue = self.queue
-        Task { await queue.logEvent(prepared) }
-    }
-
     /// Log a typed analytics event, returning once it is buffered. The queue
     /// fills in `user_ulid`, `timestamp`, and any plan / app-version overrides.
     public func logEventAsync(_ event: AnalyticsEventInput) async {
@@ -58,18 +49,6 @@ public final class AnalyticsAPI: Sendable {
     }
 
     // MARK: - logSnapshot
-
-    /// Log a point-in-time state snapshot for the current user. No-ops
-    /// when there is no authenticated user (mirrors js-bao's
-    /// `analytics.logSnapshot`, which bails when `resolveAnalyticsUserUlid`
-    /// returns null). Emits `action: "_snapshot"`, `feature: "_state"`.
-    @available(*, deprecated, message: "Use logSnapshotAsync(context:) — the synchronous version enqueues without waiting. Removed in the next major release.")
-    public func logSnapshot(context: JSONValue? = nil) {
-        guard let event = snapshotEvent(context: context) else { return }
-        let prepared = queue.prepared(event)
-        let queue = self.queue
-        Task { await queue.logEvent(prepared) }
-    }
 
     /// Log a point-in-time state snapshot for the current user, returning once
     /// it is buffered. No-ops when there is no authenticated user.
@@ -90,13 +69,6 @@ public final class AnalyticsAPI: Sendable {
 
     // MARK: - flush
 
-    /// Flush pending analytics events immediately.
-    @available(*, deprecated, message: "Use flushAsync() — the synchronous version returns before the batch reaches the socket. Removed in the next major release.")
-    public func flush() {
-        let queue = self.queue
-        Task { await queue.flush() }
-    }
-
     /// Flush pending analytics events, returning once the batch has reached
     /// the socket (or, on a send failure, once it has been re-buffered and
     /// persisted).
@@ -106,24 +78,10 @@ public final class AnalyticsAPI: Sendable {
 
     // MARK: - Overrides
 
-    /// Override the plan field on all subsequent analytics events.
-    @available(*, deprecated, message: "Use setPlanOverrideAsync(_:) — the synchronous version applies the override without waiting, so an event logged right after it may not carry it. Removed in the next major release.")
-    public func setPlanOverride(_ plan: String?) {
-        let queue = self.queue
-        Task { await queue.setPlanOverride(plan) }
-    }
-
     /// Override the plan field on all subsequent analytics events, returning
     /// once the override is in effect.
     public func setPlanOverrideAsync(_ plan: String?) async {
         await queue.setPlanOverride(plan)
-    }
-
-    /// Override the app-version field on all subsequent analytics events.
-    @available(*, deprecated, message: "Use setAppVersionOverrideAsync(_:) — the synchronous version applies the override without waiting, so an event logged right after it may not carry it. Removed in the next major release.")
-    public func setAppVersionOverride(_ version: String?) {
-        let queue = self.queue
-        Task { await queue.setAppVersionOverride(version) }
     }
 
     /// Override the app-version field on all subsequent analytics events,

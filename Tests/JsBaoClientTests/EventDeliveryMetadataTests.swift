@@ -528,31 +528,27 @@ final class EventDeliveryMetadataTests: XCTestCase {
         )
     }
 
-    // MARK: - Edge case: the deprecated callbacks are untouched
+    // MARK: - Edge case: the deprecated callbacks are gone
 
-    /// `on` / `onAny` keep firing exactly as before — they get no delivery
-    /// metadata (they are removed in the next major) and the
-    /// `LegacyEventDictionary` bridge still applies.
-    @available(*, deprecated, message: "Deprecated context: exercises the deprecated on/onAny surface on purpose (#2244).")
-    func testDeprecatedCallbacksStillFireUnchanged() {
+    /// #2367 removed the untyped `on` / `onAny` shim and the
+    /// `LegacyEventDictionary` bridge with it. The typed `subscribe(_:handler:)`
+    /// registration is what remains, and it still delivers synchronously inside
+    /// `emit` — the delivery shape the removed shim had.
+    func testTheDeprecatedCallbackSurfaceWasRemoved() throws {
+        let emitterSource = try ClientSourceText.code("Types/EventEmitter.swift")
+        for gone in ["func on(", "func onAny("] {
+            XCTAssertFalse(emitterSource.contains(gone), "\(gone) must not survive #2367")
+        }
+
         let emitter = EventEmitter()
         let typed = ThreadSafeBox<[String]>([])
-        let untyped = ThreadSafeBox<[String]>([])
-
-        let onSubscription = emitter.on(.sync) { (event: SyncEvent) in
+        let subscription = emitter.subscribe(SyncEvent.self) { event in
             typed.mutate { $0.append(event.documentId) }
         }
-        let onAnySubscription = emitter.onAny(.sync) { value in
-            untyped.mutate { $0.append(((value as? SyncEvent)?.documentId) ?? "?") }
-        }
-        defer {
-            onSubscription.cancel()
-            onAnySubscription.cancel()
-        }
+        defer { subscription.cancel() }
 
-        emitter.emit(SyncEvent(documentId: "doc-legacy", synced: true))
+        emitter.emit(SyncEvent(documentId: "doc-typed", synced: true))
 
-        XCTAssertEqual(typed.value, ["doc-legacy"], "the deprecated typed callback still fires")
-        XCTAssertEqual(untyped.value, ["doc-legacy"], "the deprecated untyped callback still fires")
+        XCTAssertEqual(typed.value, ["doc-typed"], "the typed callback fires inside emit")
     }
 }

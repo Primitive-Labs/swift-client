@@ -248,7 +248,7 @@ extension JsBaoClient {
         let response = try await handleOAuthCallback(code: code, state: state)
 
         return GoogleSignInResult(
-            userId: getUserId(),
+            userId: userId,
             isNewUser: response.isNewUser ?? false
         )
     }

@@ -526,17 +526,16 @@ public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
 /// Options for `WorkflowsAPI.waitFor`. Mirrors JS `WaitForWorkflowOptions`.
 public struct WaitForWorkflowOptions: Sendable {
     /// Maximum time to wait for the run to reach a terminal state before
-    /// throwing a `.workflowWaitTimeout` `JsBaoError`. Defaults to 15 minutes
-    /// (900_000 ms).
+    /// throwing a `.workflowWaitTimeout` `JsBaoError`. Defaults to 15 minutes.
     ///
     /// Set to `0` (or any non-positive value) to disable the timeout entirely.
     /// WARNING: with no timeout the call (and its `workflowStatus`/`status`
     /// listeners) lives until the run terminates — only use this for runs you
     /// know will end.
-    public var timeoutMs: Int?
+    public var timeout: TimeInterval?
 
-    public init(timeoutMs: Int? = nil) {
-        self.timeoutMs = timeoutMs
+    public init(timeout: TimeInterval? = nil) {
+        self.timeout = timeout
     }
 }
 

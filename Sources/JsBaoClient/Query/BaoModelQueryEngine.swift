@@ -772,8 +772,6 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // an absent `options` becomes `QueryOptions()` whose `direction`
         // defaults to `.forward`, and a supplied `options` carries its own
         // `direction` through unchanged (`direction` is non-optional). It also
-        // carries `offsetForQuery` across without naming the deprecated
-        // `offset` accessor.
         var queryOptionsWithOverLimit = options ?? QueryOptions()
         queryOptionsWithOverLimit.limit = limit.map { $0 + 1 }
         // Scope the lock to just the base SELECT. Stringset population
@@ -959,11 +957,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         }
         sql += " ORDER BY \(orderParts.joined(separator: ", "))"
 
-        // Read the internal, non-deprecated `offsetForQuery` storage rather
-        // than the deprecated public `offset` accessor — honoring an
-        // offset-based query during the deprecation window must not trip the
-        // client's own `offset` deprecation.
-        sql += " \(QueryTranslator.buildLimitOffset(limit: options?.limit, offset: options?.offsetForQuery))"
+        // `QueryOptions.offset` was removed in #2367 — offset paging is
+        // unstable under concurrent inserts in CRDT-backed documents, so the
+        // engine emits LIMIT without OFFSET and callers page with
+        // `cursor` + `direction`.
+        sql += " \(QueryTranslator.buildLimitOffset(limit: options?.limit, offset: nil))"
         return (sql, params)
     }
 

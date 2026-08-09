@@ -8,10 +8,10 @@ import XCTest
 /// unusual for an actor conversion: the four synchronous **reads**
 /// (`isConnected`, `isConnecting`, `connectionStatus`, `isSocketOpen`) stay
 /// synchronous **permanently** behind the snapshot box, with undeprecated
-/// `…Async` twins beside them. Only one member gets the deprecation ceremony —
-/// the still-public `JsBaoClient.forceReconnect()` facade. The three
-/// `WebSocketManager` commands went internal in #2363, so a major-release
-/// window would protect nobody and they convert outright.
+/// `…Async` twins beside them. Only one member got the deprecation ceremony —
+/// the `JsBaoClient.forceReconnect()` facade, whose window #2367 closed by
+/// removing it. The three `WebSocketManager` commands went internal in #2363,
+/// so a major-release window would protect nobody and they convert outright.
 final class WebSocketManagerSyncSurfaceTests: XCTestCase {
 
     private static let managerFile = "Internal/WebSocketManager.swift"
@@ -336,32 +336,22 @@ final class WebSocketManagerSyncSurfaceTests: XCTestCase {
         await manager.disconnect()
     }
 
-    // MARK: - Behavior 14 — facade-only deprecation
+    // MARK: - Behavior 14 — the facade's deprecation window closed
 
-    /// The one member with a deprecation window: `JsBaoClient.forceReconnect()`
-    /// is still public, so app source compatibility is still at stake. It keeps
-    /// the shipped shape exactly — a distinctly-named `…Async` twin and an
-    /// `@available(*, deprecated, message:)` ending "Removed in the next major
-    /// release."
-    func testTheFacadeForceReconnectCarriesTheDeprecationWindow() throws {
+    /// The one member that had a deprecation window,
+    /// `JsBaoClient.forceReconnect()`, promised removal "in the next major
+    /// release". #2367 is that release, so the synchronous spelling is gone and
+    /// `forceReconnectAsync()` is the only facade left. A leftover deprecated
+    /// stub would mean the window never actually closed.
+    func testTheDeprecatedFacadeForceReconnectWasRemoved() throws {
         let source = try ClientSourceText.clientSource("JsBaoClient.swift")
         XCTAssertTrue(source.contains("public func forceReconnectAsync() async"),
-                      "the async twin must exist")
-        XCTAssertTrue(source.contains("public func forceReconnect() {"),
-                      "the synchronous spelling must survive the window")
-
-        let attributes = ClientSourceText.attributes(before: "public func forceReconnect() {", in: source)
-        let deprecation = try XCTUnwrap(
-            attributes.first { $0.hasPrefix("@available(*, deprecated") },
-            "forceReconnect() must be deprecated — attributes: \(attributes)"
-        )
-        XCTAssertTrue(
-            deprecation.contains("forceReconnectAsync()"),
-            "the message must name the twin: \(deprecation)"
-        )
-        XCTAssertTrue(
-            deprecation.contains("Removed in the next major release."),
-            "the message must end with the shipped removal wording: \(deprecation)"
+                      "the async twin is what survives")
+        XCTAssertFalse(source.contains("public func forceReconnect() {"),
+                       "the synchronous spelling was removed in #2367")
+        XCTAssertEqual(
+            ClientSourceText.attributes(before: "public func forceReconnectAsync() async", in: source), [],
+            "the surviving member takes no availability ceremony"
         )
     }
 
@@ -419,24 +409,17 @@ final class WebSocketManagerSyncSurfaceTests: XCTestCase {
         )
     }
 
-    // MARK: - Behavior 15 — the deprecated member still works
+    // MARK: - Behavior 15 — the surviving facade reconnects
 
-    /// The deprecated member is `JsBaoClient.forceReconnect()`, so this drives
-    /// **that** — the real public facade an app on the old spelling calls, not
-    /// the manager command underneath it. The facade's body is new code in this
-    /// PR (a `Task { await wsManager.forceReconnect() }` hand-off), and the
-    /// whole point of the one-release window is that the old spelling keeps
-    /// producing a reconnect; nothing else in the suite would notice if that
-    /// fire-and-forget `Task` stopped being spawned.
+    /// This drives `JsBaoClient.forceReconnectAsync()` — the real public facade
+    /// an app calls, not the manager command underneath it. The facade is a thin
+    /// hand-off to `wsManager.forceReconnect()`, and nothing else in the suite
+    /// would notice if that hand-off stopped happening.
     ///
     /// A fresh socket is observed from the **server** side (`acceptedCount`)
     /// because the client's `wsManager` is `private` — the server accepting a
     /// second connection is the observable form of "the reconnect happened".
-    /// The enclosing method is marked deprecated so the reference sits in a
-    /// deprecated context and the build stays warning-free (the convention
-    /// `DeprecationWindowInternalUseTests` set).
-    @available(*, deprecated, message: "Deprecated context: exercises the deprecated forceReconnect() on purpose (#2171).")
-    func testTheDeprecatedClientFacadeForceReconnectStillReconnects() async throws {
+    func testTheClientFacadeForceReconnectReconnects() async throws {
         let server = try LoopbackWebSocketServer()
         let url = try server.start()
         defer { server.stop() }
@@ -459,15 +442,14 @@ final class WebSocketManagerSyncSurfaceTests: XCTestCase {
         XCTAssertTrue(client.isConnected)
         let acceptedBefore = server.acceptedCount
 
-        // The deprecated spelling: synchronous, fire-and-forget.
-        client.forceReconnect()
+        await client.forceReconnectAsync()
 
         let reconnected = await eventuallyTrue(timeout: 10) {
             server.acceptedCount > acceptedBefore && client.isConnected
         }
         XCTAssertTrue(
             reconnected,
-            "the deprecated facade must still produce a fresh live socket "
+            "the facade must produce a fresh live socket "
                 + "(accepted \(server.acceptedCount), was \(acceptedBefore))"
         )
     }

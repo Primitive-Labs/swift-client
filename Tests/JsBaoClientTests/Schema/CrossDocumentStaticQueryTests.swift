@@ -404,7 +404,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
         // The row IS stored — the raw shared store can see it.
         XCTAssertNotNil(JsBaoClient.requireDefault()
-            .findShared(CrossDocNote.primitiveSchema, id: "drifted"),
+            .codegen.find(CrossDocNote.primitiveSchema, id: "drifted"),
             "precondition: the drifted row must exist in the shared store")
 
         // …but the typed find must throw a decode error, NOT return nil.
@@ -441,7 +441,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
         // With the drifted row gone, findAll succeeds again.
         try JsBaoClient.requireDefault()
-            .deleteShared(CrossDocNote.primitiveSchema, id: "drifted", in: docA)
+            .codegen.delete(CrossDocNote.primitiveSchema, id: "drifted", in: docA)
         let healthy = try CrossDocNote.findAll()
         XCTAssertEqual(healthy.map(\.id), ["ok"])
     }
@@ -550,12 +550,12 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         XCTAssertEqual(merged.id, "b1", "must resolve docB's existing record id")
         XCTAssertEqual(merged.body, "v2")
         let scopedToDocA = try JsBaoClient.requireDefault()
-            .queryShared(UniqueNote.primitiveSchema, options: QueryOptions(documents: [docA]))
+            .codegen.query(UniqueNote.primitiveSchema, options: QueryOptions(documents: [docA]))
             .compactMap { UniqueNote(row: $0) }
         XCTAssertTrue(scopedToDocA.contains { $0.id == "b1" && $0.body == "v2" },
                       "targetDocument parity writes the resolved id into docA")
         let scopedToDocB = try JsBaoClient.requireDefault()
-            .queryShared(UniqueNote.primitiveSchema, options: QueryOptions(documents: [docB]))
+            .codegen.query(UniqueNote.primitiveSchema, options: QueryOptions(documents: [docB]))
             .compactMap { UniqueNote(row: $0) }
         XCTAssertTrue(scopedToDocB.contains { $0.id == "b1" && $0.body == "v1" },
                       "JS parity keeps the original matching row in its source doc")
@@ -596,7 +596,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         ]
     )
 
-    /// `hasManyThroughShared` returns targets in **target `id ASC`** —
+    /// `client.codegen.hasManyThrough` returns targets in **target `id ASC`** —
     /// the declared join order picks which join rows, but the batched
     /// `id: { $in: [...] }` query re-sorts the output, matching js-bao.
     /// (#1201: previously it returned targets in join-row order.)
@@ -606,17 +606,17 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         client.registerModels([Self.throughTagSchema, Self.throughLinkSchema])
 
         let (doc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
-        try client.saveShared(Self.throughTagSchema, id: "t1", values: ["name": .string("red")], in: doc)
-        try client.saveShared(Self.throughTagSchema, id: "t2", values: ["name": .string("blue")], in: doc)
+        try client.codegen.save(Self.throughTagSchema, id: "t1", values: ["name": .string("red")], in: doc)
+        try client.codegen.save(Self.throughTagSchema, id: "t2", values: ["name": .string("blue")], in: doc)
         // Join rows inserted so join-row order ([t2, t1]) differs from
         // target id ASC; position ASC selects t1-then-t2.
-        try client.saveShared(Self.throughLinkSchema, id: "l1",
+        try client.codegen.save(Self.throughLinkSchema, id: "l1",
             values: ["postId": .string("p1"), "tagId": .string("t2"), "position": .number(1)], in: doc)
-        try client.saveShared(Self.throughLinkSchema, id: "l2",
+        try client.codegen.save(Self.throughLinkSchema, id: "l2",
             values: ["postId": .string("p1"), "tagId": .string("t1"), "position": .number(2)], in: doc)
 
         // Default (no declared join order) → target id ASC.
-        let defaultRows = try client.hasManyThroughShared(
+        let defaultRows = try client.codegen.hasManyThrough(
             target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
             sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId"
         )
@@ -624,7 +624,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
                        "no declared join order → defaults to target id ASC")
 
         // DESC join order still yields target id ASC (the $in re-sort wins).
-        let descRows = try client.hasManyThroughShared(
+        let descRows = try client.codegen.hasManyThrough(
             target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
             sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
             joinModelOrderByField: "position", joinModelOrderDirection: "DESC"
@@ -633,7 +633,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
                        "DESC join leg selects t2-then-t1 but output stays target id ASC")
     }
 
-    /// Paginated `hasManyThroughShared` (#1230, rerouted #1607) pages the
+    /// Paginated `client.codegen.hasManyThrough` (#1230, rerouted #1607) pages the
     /// join leg by `position` through the shared composite-cursor engine
     /// and `$in`-resolves each page. Seeds six tags/links so `limit: 2`
     /// produces three pages; walks forward via `nextCursor`, then steps
@@ -649,14 +649,14 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         // Position i points at tag t{i}, so position ASC and target id ASC
         // agree — each page's rows read as a clean id-ordered slice.
         for i in 1...6 {
-            try client.saveShared(Self.throughTagSchema, id: "t\(i)", values: ["name": .string("n\(i)")], in: doc)
-            try client.saveShared(Self.throughLinkSchema, id: "l\(i)",
+            try client.codegen.save(Self.throughTagSchema, id: "t\(i)", values: ["name": .string("n\(i)")], in: doc)
+            try client.codegen.save(Self.throughLinkSchema, id: "l\(i)",
                 values: ["postId": .string("p1"), "tagId": .string("t\(i)"), "position": .number(Double(i))], in: doc)
         }
 
         func page(after: String? = nil, before: String? = nil,
                   direction: CursorDirection = .forward) throws -> PagedQueryResult<PrimitiveRow> {
-            try client.hasManyThroughShared(
+            try client.codegen.hasManyThrough(
                 target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
                 sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
                 joinModelOrderByField: "position",
@@ -695,7 +695,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
                       "backward hasMore should track earlier rows remaining, not nextCursor")
 
         // limit larger than the set → whole set, no next page.
-        let all = try client.hasManyThroughShared(
+        let all = try client.codegen.hasManyThrough(
             target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
             sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
             joinModelOrderByField: "position", limit: 50
@@ -706,7 +706,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
         // Empty join set → empty page. Cursors copy the (empty) join
         // leg's envelope: no rows means no cursors either.
-        let empty = try client.hasManyThroughShared(
+        let empty = try client.codegen.hasManyThrough(
             target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
             sourceId: "no-such-post", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
             joinModelOrderByField: "position", limit: 2
@@ -731,8 +731,8 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         // positions 1,2,2,3,3,4 — ties straddle both limit-2 boundaries.
         let positions = [1, 2, 2, 3, 3, 4]
         for i in 1...6 {
-            try client.saveShared(Self.throughTagSchema, id: "t\(i)", values: ["name": .string("n\(i)")], in: doc)
-            try client.saveShared(Self.throughLinkSchema, id: "l\(i)",
+            try client.codegen.save(Self.throughTagSchema, id: "t\(i)", values: ["name": .string("n\(i)")], in: doc)
+            try client.codegen.save(Self.throughLinkSchema, id: "l\(i)",
                 values: ["postId": .string("p1"), "tagId": .string("t\(i)"),
                          "position": .number(Double(positions[i - 1]))], in: doc)
         }
@@ -741,7 +741,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         var cursor: String? = nil
         var guardCount = 0
         repeat {
-            let p = try client.hasManyThroughShared(
+            let p = try client.codegen.hasManyThrough(
                 target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
                 sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
                 joinModelOrderByField: "position",
@@ -769,12 +769,12 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         client.registerModels([Self.throughTagSchema, Self.throughLinkSchema])
 
         let (doc, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(localOnly: true))
-        try client.saveShared(Self.throughTagSchema, id: "t1", values: ["name": .string("n1")], in: doc)
-        try client.saveShared(Self.throughLinkSchema, id: "l1",
+        try client.codegen.save(Self.throughTagSchema, id: "t1", values: ["name": .string("n1")], in: doc)
+        try client.codegen.save(Self.throughLinkSchema, id: "l1",
             values: ["postId": .string("p1"), "tagId": .string("t1"),
                      "position": .number(1), "weight": .number(1)], in: doc)
 
-        let page = try client.hasManyThroughShared(
+        let page = try client.codegen.hasManyThrough(
             target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
             sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
             joinModelOrderByField: "weight", limit: 2
@@ -791,17 +791,17 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 extension CrossDocumentStaticQueryTests.CrossDocNote {
     static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [CrossDocumentStaticQueryTests.CrossDocNote] {
         try JsBaoClient.requireDefault()
-            .queryShared(primitiveSchema, filter: filter, options: options)
+            .codegen.query(primitiveSchema, filter: filter, options: options)
             .compactMap { CrossDocumentStaticQueryTests.CrossDocNote(row: $0) }
     }
 
     static func count(_ filter: DocumentFilter? = nil) throws -> Int {
-        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)
     }
 
     static func findAll() throws -> [CrossDocumentStaticQueryTests.CrossDocNote] {
         try JsBaoClient.requireDefault()
-            .queryShared(primitiveSchema, filter: nil, options: nil)
+            .codegen.query(primitiveSchema, filter: nil, options: nil)
             .map { row in
                 guard let decoded = CrossDocumentStaticQueryTests.CrossDocNote(row: row) else {
                     throw PrimitiveDecodeError(modelName: modelName, row: row)
@@ -811,7 +811,7 @@ extension CrossDocumentStaticQueryTests.CrossDocNote {
     }
 
     static func find(_ id: String) throws -> CrossDocumentStaticQueryTests.CrossDocNote? {
-        guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {
+        guard let row = JsBaoClient.requireDefault().codegen.find(primitiveSchema, id: id) else {
             return nil
         }
         guard let decoded = CrossDocumentStaticQueryTests.CrossDocNote(row: row) else {
@@ -822,23 +822,23 @@ extension CrossDocumentStaticQueryTests.CrossDocNote {
 
     static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> CrossDocumentStaticQueryTests.CrossDocNote? {
         try JsBaoClient.requireDefault()
-            .queryOneShared(primitiveSchema, filter: filter, options: options)
+            .codegen.queryOne(primitiveSchema, filter: filter, options: options)
             .flatMap { CrossDocumentStaticQueryTests.CrossDocNote(row: $0) }
     }
 
     @discardableResult
     static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
-        JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)
+        JsBaoClient.requireDefault().codegen.subscribe(primitiveSchema, callback)
     }
 
     @discardableResult
     func save(in documentId: String) throws -> CrossDocumentStaticQueryTests.CrossDocNote {
-        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
+        try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
         return self
     }
 
     func delete(in documentId: String) throws {
-        try JsBaoClient.requireDefault().deleteShared(Self.primitiveSchema, id: id, in: documentId)
+        try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)
     }
 }
 
@@ -905,25 +905,25 @@ extension CrossDocumentStaticQueryTests {
 
 extension CrossDocumentStaticQueryTests.UniqueNote {
     static func count(_ filter: DocumentFilter? = nil) throws -> Int {
-        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)
     }
 
     // Mirrors the emitter's sync-throws `find(_:)` (#1156); previously this
     // mirror diverged as a non-throwing accessor.
     static func find(_ id: String) throws -> CrossDocumentStaticQueryTests.UniqueNote? {
-        JsBaoClient.requireDefault().findShared(primitiveSchema, id: id)
+        JsBaoClient.requireDefault().codegen.find(primitiveSchema, id: id)
             .flatMap { CrossDocumentStaticQueryTests.UniqueNote(row: $0) }
     }
 
     static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> CrossDocumentStaticQueryTests.UniqueNote? {
         try JsBaoClient.requireDefault()
-            .findByUniqueShared(primitiveSchema, constraint: constraint, value: value)
+            .codegen.findByUnique(primitiveSchema, constraint: constraint, value: value)
             .flatMap { CrossDocumentStaticQueryTests.UniqueNote(row: $0) }
     }
 
     @discardableResult
     func save(in documentId: String, upsertOn: String) throws -> CrossDocumentStaticQueryTests.UniqueNote {
-        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)
+        let result = try JsBaoClient.requireDefault().codegen.upsert(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)
         if let resolved = CrossDocumentStaticQueryTests.UniqueNote(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
@@ -932,7 +932,7 @@ extension CrossDocumentStaticQueryTests.UniqueNote {
 
     @discardableResult
     func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> CrossDocumentStaticQueryTests.UniqueNote {
-        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)
+        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)
         if let resolved = CrossDocumentStaticQueryTests.UniqueNote(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
@@ -1035,7 +1035,7 @@ extension CrossDocumentStaticQueryTests {
 extension CrossDocumentStaticQueryTests.IncAuthor {
     @discardableResult
     func save(in documentId: String) throws -> CrossDocumentStaticQueryTests.IncAuthor {
-        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
+        try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
         return self
     }
 }
@@ -1043,13 +1043,13 @@ extension CrossDocumentStaticQueryTests.IncAuthor {
 extension CrossDocumentStaticQueryTests.IncPost {
     static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [CrossDocumentStaticQueryTests.IncPost] {
         try JsBaoClient.requireDefault()
-            .queryShared(primitiveSchema, filter: filter, options: options, include: include)
+            .codegen.query(primitiveSchema, filter: filter, options: options, include: include)
             .compactMap { CrossDocumentStaticQueryTests.IncPost(row: $0) }
     }
 
     static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> CrossDocumentStaticQueryTests.IncPost? {
         try JsBaoClient.requireDefault()
-            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)
+            .codegen.queryOne(primitiveSchema, filter: filter, options: options, include: include)
             .flatMap { CrossDocumentStaticQueryTests.IncPost(row: $0) }
     }
 
@@ -1063,7 +1063,7 @@ extension CrossDocumentStaticQueryTests.IncPost {
     static func includeAuthor(resultKey: String? = "author") -> Include {
         Include(
             type: .refersTo,
-            target: JsBaoClient.requireDefault().includeTarget(for: CrossDocumentStaticQueryTests.IncAuthor.primitiveSchema),
+            target: JsBaoClient.requireDefault().codegen.includeTarget(for: CrossDocumentStaticQueryTests.IncAuthor.primitiveSchema),
             sourceField: "authorId",
             resultKey: resultKey
         )
@@ -1071,7 +1071,7 @@ extension CrossDocumentStaticQueryTests.IncPost {
 
     @discardableResult
     func save(in documentId: String) throws -> CrossDocumentStaticQueryTests.IncPost {
-        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
+        try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)
         return self
     }
 }

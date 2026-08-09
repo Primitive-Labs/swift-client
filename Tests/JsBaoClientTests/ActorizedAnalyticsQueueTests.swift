@@ -416,7 +416,10 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
     /// The policy of record is "additive `async` twins + one-release
     /// deprecation". This asserts both halves for all nine members, so a future
     /// edit cannot quietly drop a twin or un-deprecate an original.
-    func testEveryDeprecatedAnalyticsMemberHasAnAsyncTwin() throws {
+    func testTheSynchronousAnalyticsMembersAreRemovedAndOnlyTheTwinsRemain() throws {
+        // The window closed in #2367: the synchronous half is gone and only the
+        // `Async` twin is left. Asserting the removal keeps the pair from
+        // growing a synchronous half back.
         let pairs: [(file: String, sync: String, twin: String)] = [
             ("JsBaoClient.swift", "func logAnalyticsEvent(", "func logAnalyticsEventAsync("),
             ("JsBaoClient.swift", "func flushAnalytics(", "func flushAnalyticsAsync("),
@@ -434,15 +437,12 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
                 source.contains(pair.twin),
                 "\(pair.file): missing the async twin `\(pair.twin)`"
             )
-            // The original survives the deprecation window, and is marked.
-            let declaration = try XCTUnwrap(
+            XCTAssertNil(
                 source.range(of: "public \(pair.sync)"),
-                "\(pair.file): the synchronous `\(pair.sync)` must survive the deprecation window"
-            )
-            let preceding = String(source[source.startIndex..<declaration.lowerBound].suffix(1200))
-            XCTAssertTrue(
-                preceding.contains("@available(*, deprecated"),
-                "\(pair.file): `\(pair.sync)` must be marked deprecated"
+                """
+                \(pair.file): the synchronous `\(pair.sync)` was removed by \
+                #2367 — do not reintroduce it beside its async twin
+                """
             )
         }
     }

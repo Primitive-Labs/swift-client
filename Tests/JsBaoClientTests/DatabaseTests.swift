@@ -155,17 +155,21 @@ final class DatabaseTests: XCTestCase {
     func testGrantAndRevokePermission() async throws {
         let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member")
 
-        let grantResult = try await client.databases.grantPermission(databaseId: databaseId, params: GrantPermissionParams(
-            userId: user2.userId,
-            permission: "manager"
-        ))
+        let grantResult = try await client.databases.addManager(
+            databaseId: databaseId,
+            params: AddManagerParams(userId: user2.userId)
+        )
         XCTAssertEqual(grantResult.userId, user2.userId)
+        XCTAssertEqual(grantResult.permission, "manager")
 
         let permissions = try await client.databases.listPermissions(databaseId: databaseId)
         let user2Perm = permissions.first { $0.userId == user2.userId }
         XCTAssertNotNil(user2Perm)
 
-        let revokeResult = try await client.databases.revokePermission(databaseId: databaseId, userId: user2.userId)
+        let revokeResult = try await client.databases.removeManager(
+            databaseId: databaseId,
+            userId: user2.userId
+        )
         XCTAssertTrue(revokeResult.success)
     }
 }

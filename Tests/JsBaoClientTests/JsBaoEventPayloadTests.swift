@@ -48,7 +48,6 @@ final class JsBaoEventPayloadTests: XCTestCase {
         AwarenessEvent(documentId: "d1", added: ["1"], updated: [], removed: []),
         PermissionEvent(documentId: "d1", permission: .owner),
         SchemaDiscoveredEvent(documentId: "d1", modelNames: ["Todo"]),
-        RemoteUpdateEvent(documentId: "d1"),
         ConnectionCloseEvent(code: 1000, reason: "bye"),
         ConnectionErrorEvent(message: "boom"),
         GenericErrorEvent(scope: "ws", message: "boom"),
@@ -92,8 +91,9 @@ final class JsBaoEventPayloadTests: XCTestCase {
     // MARK: - Behavior 1: every emitted key has exactly one payload type
 
     /// Every `JsBaoEvent` case declared in `Types/Events.swift` has exactly one
-    /// `JsBaoEventPayload` conformance, except the two deprecated cases that are
-    /// never emitted.
+    /// `JsBaoEventPayload` conformance, except any key listed in
+    /// `unpayloadedJsBaoEventKeys` (empty since #2367 removed the three
+    /// deprecated, never-emitted cases).
     ///
     /// The case list is read out of the source rather than from `CaseIterable`
     /// (which the compiler declines to synthesize for an enum with `@available`
@@ -151,158 +151,101 @@ final class JsBaoEventPayloadTests: XCTestCase {
     /// names a type, and nothing checks them against each other" arrangement: the
     /// key is derived from the type, and this asserts the derivation is the one
     /// subscribers see.
-    @available(*, deprecated, message: "Deprecated context: registers via onAny to observe the raw dispatch key on purpose (#1994).")
     func testTypedEmitLandsOnDeclaredKey() {
         for payload in Self.samples {
-            let emitter = EventEmitter()
-            let key = Swift.type(of: payload).eventKey
-            let hits = AtomicInt()
-            let sub = emitter.onAny(key) { _ in hits.increment() }
-            defer { sub.cancel() }
+            assertEmitLandsOnDeclaredKey(payload)
+        }
+    }
 
-            emitter.emitErased(payload)
-            XCTAssertEqual(
-                hits.value, 1,
-                "emit(\(Swift.type(of: payload))) must reach a subscriber on \(key.rawValue)"
+    /// One sample's check. Generic so the payload's concrete type is available
+    /// to `subscribe(_:)`; the existential elements of `samples` are opened
+    /// implicitly at the call site above. Registering by type rather than by a
+    /// raw key string is the only registration `EventEmitter` still offers
+    /// after #2367 removed the untyped shim.
+    private func assertEmitLandsOnDeclaredKey<E: JsBaoEventPayload>(
+        _ payload: E,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let emitter = EventEmitter()
+        let hits = AtomicInt()
+        let sub = emitter.subscribe(E.self) { _ in hits.increment() }
+        defer { sub.cancel() }
+
+        emitter.emitErased(payload)
+        XCTAssertEqual(
+            hits.value, 1,
+            "emit(\(E.self)) must reach a subscriber on \(E.eventKey.rawValue)",
+            file: file, line: line
+        )
+    }
+
+    /// `remoteUpdate` was a Swift-only event with no JS counterpart, kept alive
+    /// through a raw-key escape hatch. #2367 removed the case, its payload type
+    /// and the escape hatch, so the guard is now that none of them came back:
+    /// a re-added Swift-only key would otherwise slip past
+    /// `testConformanceSetMatchesTheJsEventMap`'s allowlist unnoticed.
+    func testTheRemoteUpdateEventWasRemoved() throws {
+        let declared = try declaredEventKeys()
+        XCTAssertFalse(
+            declared.contains("remoteUpdate"),
+            "the remoteUpdate case was removed in #2367"
+        )
+        XCTAssertFalse(
+            swiftOnlyJsBaoEventKeys.contains("remoteUpdate"),
+            "remoteUpdate must not be allowlisted as a Swift-only key any more"
+        )
+        for source in try ClientSourceText.allClientSources() {
+            XCTAssertFalse(source.contains("RemoteUpdateEvent"), "the payload type was removed")
+            XCTAssertFalse(source.contains("remoteUpdateRawKey"), "the raw-key escape hatch was removed")
+        }
+    }
+
+    // MARK: - The legacy dictionary bridge is gone
+
+    /// #2367 removed `LegacyEventDictionary` along with the `on` / `onAny` shim
+    /// that consumed it. Nine payload types carried the bridge so that a
+    /// handler still annotated `[String: Any]` kept receiving its
+    /// pre-conversion dictionary; with no untyped subscription left, there is
+    /// nothing for it to feed. The guard is that neither the protocol nor its
+    /// `legacyDictionary` witness came back.
+    func testTheLegacyDictionaryBridgeWasRemoved() throws {
+        for source in try ClientSourceText.allClientSources() {
+            XCTAssertFalse(
+                source.contains("LegacyEventDictionary"),
+                "the legacy dictionary bridge was removed in #2367"
+            )
+            XCTAssertFalse(
+                source.contains("legacyDictionary"),
+                "the bridge's witness was removed in #2367"
             )
         }
     }
 
-    /// `.remoteUpdate`'s payload resolves its key through the raw-key escape
-    /// hatch rather than naming the deprecated case, so the resolution has to be
-    /// asserted rather than assumed.
-    func testRemoteUpdateEventKeyResolvesThroughTheRawKey() {
-        XCTAssertEqual(RemoteUpdateEvent.eventKey.rawValue, "remoteUpdate")
-        XCTAssertEqual(RemoteUpdateEvent.eventKey.rawValue, JsBaoClient.remoteUpdateRawKey)
-    }
-
-    // MARK: - Behaviors 12 and 16: the legacy dictionary bridge
-
-    /// Every converted event's pre-conversion dictionary, key for key.
-    ///
-    /// This table is the record of what those nine `on`/`onAny` subscribers used
-    /// to receive; the assertions below check both delivery shapes against it.
-    /// Computed rather than stored: the element type is not `Sendable`, and a
-    /// stored `static` of a non-`Sendable` type is global shared mutable state
-    /// under the Swift 6 language mode.
-    private static var legacyPayloads: [(payload: any JsBaoEventPayload, dictionary: [String: Any])] { [
-        // The pre-conversion emit was `events.emit(.meUpdated, json)` — the whole
-        // WebSocket frame, not the me record — so this entry is built from a
-        // frame and expects the frame back. Building it from the typed
-        // initializer instead would have made this a round-trip of the shape the
-        // client never emits.
-        (MeUpdatedEvent(serverFrame: ["type": "meUpdated", "value": ["name": "Ada", "age": 36]]),
-         ["type": "meUpdated", "value": ["name": "Ada", "age": 36]]),
-        (PendingCreateFailedEvent(documentId: "d1", error: "boom"),
-         ["documentId": "d1", "error": "boom"]),
-        (AuthRefreshDeferredEvent(status: "backoff", cause: "network", nextAttemptMs: 2000),
-         ["status": "backoff", "cause": "network", "nextAttemptMs": 2000]),
-        (AuthRefreshDeferredEvent(status: "offline", cause: "cap-reached"),
-         ["status": "offline", "cause": "cap-reached"]),
-        (OfflineAuthEnabledEvent(method: "biometric"), ["method": "biometric"]),
-        (OfflineAuthUnlockedEvent(userId: "u1"), ["userId": "u1"]),
-        (OfflineAuthFailedEvent(reason: "expired"), ["reason": "expired"]),
-        (OfflineAuthRenewedEvent(), [:]),
-        (OfflineAuthRevokedEvent(wipeLocal: false), ["wipeLocal": false]),
-        (BlobsQueueDrainedEvent(), [:]),
-    ] }
-
-    /// `legacyPayloads` must cover every payload that carries the bridge, the
-    /// same way `testSamplePayloadsCoverEveryConformance` covers `samples`.
-    ///
-    /// Without this, adding a tenth converted event and forgetting the table
-    /// entry would leave its pre-conversion dictionary unasserted — exactly the
-    /// silent drift the bridge exists to prevent.
-    func testLegacyPayloadTableCoversEveryBridgedEvent() {
-        let bridged = Set(
-            allJsBaoEventPayloadTypes
-                .filter { $0 is any LegacyEventDictionary.Type }
-                .map { "\($0)" }
-        )
-        let covered = Set(Self.legacyPayloads.map { "\(Swift.type(of: $0.payload))" })
-        XCTAssertEqual(
-            bridged.subtracting(covered), [],
-            "add a legacyPayloads entry for these bridged payload types"
-        )
-        XCTAssertEqual(
-            covered.subtracting(bridged), [],
-            "these legacyPayloads entries name types that no longer carry the bridge"
-        )
-    }
-
-    /// Behavior 12 — a handler still annotated `[String: Any]` keeps firing with
-    /// the same keys and values it received before the conversion.
-    @available(*, deprecated, message: "Deprecated context: exercises the `on` shim on purpose (#1994).")
-    func testLegacyDictionaryHandlersStillFireWithTheSamePayload() {
-        for (payload, expected) in Self.legacyPayloads {
-            let emitter = EventEmitter()
-            let key = Swift.type(of: payload).eventKey
-            let received = ThreadSafeBox<[[String: Any]]>([])
-            let sub = emitter.on(key) { (dictionary: [String: Any]) in
-                received.mutate { $0.append(dictionary) }
-            }
-            defer { sub.cancel() }
-
-            emitter.emitErased(payload)
-
-            let got = received.value
-            XCTAssertEqual(got.count, 1, "on(.\(key.rawValue)) { (d: [String: Any]) in } must still fire")
-            assertSameDictionary(got.first ?? [:], expected, event: key.rawValue, shape: "on")
-        }
-    }
-
-    /// Behavior 16 — `onAny`, which has no annotation to bridge through, delivers
-    /// the pre-conversion dictionary verbatim. The comparison against the typed
-    /// emit is what stops the two representations drifting.
-    @available(*, deprecated, message: "Deprecated context: exercises the `onAny` shim on purpose (#1994).")
-    func testOnAnyDeliversThePreConversionDictionary() {
-        for (payload, expected) in Self.legacyPayloads {
-            let emitter = EventEmitter()
-            let key = Swift.type(of: payload).eventKey
-            let received = ThreadSafeBox<[Any]>([])
-            let sub = emitter.onAny(key) { value in
-                received.mutate { $0.append(value) }
-            }
-            defer { sub.cancel() }
-
-            emitter.emitErased(payload)
-
-            let got = received.value
-            XCTAssertEqual(got.count, 1, "onAny(.\(key.rawValue)) must still fire")
-            guard let dictionary = got.first as? [String: Any] else {
-                XCTFail("onAny(.\(key.rawValue)) must deliver a [String: Any], got \(String(describing: got.first))")
-                continue
-            }
-            assertSameDictionary(dictionary, expected, event: key.rawValue, shape: "onAny")
-        }
-    }
-
-    /// A missing optional stays missing rather than becoming `NSNull` — the
-    /// distinction the existing `AuthRefreshBackoffSchedulerTests` reads to mean
-    /// "no next attempt promised".
-    func testOptionalKeysAreOmittedNotNulled() {
-        let event = AuthRefreshDeferredEvent(status: "offline", cause: "cap-reached")
-        let dictionary = event.legacyDictionary
-        XCTAssertNil(dictionary["nextAttemptMs"], "an absent optional must not appear as a key at all")
-        XCTAssertNil(dictionary["error"])
-        XCTAssertEqual(dictionary["status"] as? String, "offline")
-        XCTAssertEqual(dictionary["cause"] as? String, "cap-reached")
-    }
-
-    /// A new consumer can still take the typed payload from the `on` shim — the
-    /// dictionary bridge is a fallback for the old annotation, not a replacement.
-    @available(*, deprecated, message: "Deprecated context: exercises the `on` shim on purpose (#1994).")
-    func testTypedAnnotationStillWorksOnTheShim() {
+    /// A subscriber takes the typed payload — the shape the bridge used to be a
+    /// fallback for, and now the only one.
+    func testTypedSubscriptionDeliversThePayload() {
         let emitter = EventEmitter()
         let received = ThreadSafeBox<[String]>([])
-        let sub = emitter.on(.offlineAuthEnabled) { (event: OfflineAuthEnabledEvent) in
+        let sub = emitter.subscribe(OfflineAuthEnabledEvent.self) { event in
             received.mutate { $0.append(event.method) }
         }
         defer { sub.cancel() }
 
         emitter.emit(OfflineAuthEnabledEvent(method: "signed"))
-        XCTAssertEqual(received.value, ["signed"],
-                       "the typed annotation must win over the legacy dictionary bridge")
+        XCTAssertEqual(received.value, ["signed"])
+    }
+
+    /// An unset optional stays `nil` rather than becoming a present-but-empty
+    /// value — the distinction `AuthRefreshBackoffSchedulerTests` reads to mean
+    /// "no next attempt promised". The dictionary bridge used to express this as
+    /// an absent KEY; the typed payload expresses it as a `nil` field.
+    func testUnsetOptionalFieldsStayNil() {
+        let event = AuthRefreshDeferredEvent(status: "offline", cause: "cap-reached")
+        XCTAssertNil(event.nextAttemptMs, "an unset optional must stay nil")
+        XCTAssertNil(event.error)
+        XCTAssertEqual(event.status, "offline")
+        XCTAssertEqual(event.cause, "cap-reached")
     }
 
     // MARK: - Behavior 15: parity with the JS `JsBaoEvents` map
@@ -444,45 +387,4 @@ final class JsBaoEventPayloadTests: XCTestCase {
         return keys
     }
 
-    // MARK: - Assertions
-
-    /// Compares two loosely-typed payload dictionaries. `NSNumber` bridging makes
-    /// `2000 as Int` and `2000 as NSNumber` compare equal, which is exactly the
-    /// tolerance a legacy `d["nextAttemptMs"] as? Int` call site has.
-    private func assertSameDictionary(
-        _ got: [String: Any],
-        _ expected: [String: Any],
-        event: String,
-        shape: String,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        XCTAssertEqual(
-            Set(got.keys), Set(expected.keys),
-            "\(shape)(.\(event)) delivered different keys than the pre-conversion payload",
-            file: file, line: line
-        )
-        for (key, expectedValue) in expected {
-            let gotValue = got[key]
-            XCTAssertTrue(
-                isEqualLoosely(gotValue, expectedValue),
-                "\(shape)(.\(event))[\(key)]: expected \(expectedValue), got \(String(describing: gotValue))",
-                file: file, line: line
-            )
-        }
-    }
-
-    private func isEqualLoosely(_ lhs: Any?, _ rhs: Any) -> Bool {
-        switch (lhs, rhs) {
-        case let (l as String, r as String): return l == r
-        case let (l as Bool, r as Bool): return l == r
-        case let (l as NSNumber, r as NSNumber): return l == r
-        case let (l as [String: Any], r as [String: Any]):
-            // Nested objects — the `meUpdated` frame's `value`. NSDictionary
-            // compares recursively and applies the same NSNumber bridging the
-            // scalar case above relies on.
-            return NSDictionary(dictionary: l).isEqual(to: r)
-        default: return false
-        }
-    }
 }

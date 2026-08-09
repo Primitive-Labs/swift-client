@@ -89,7 +89,7 @@ final class SendableModelLayerTests: XCTestCase {
 
     /// The untyped paginated surface is `Sendable` too — that is what the row
     /// bag buys: `PagedQueryResult<PrimitiveRow>` from `queryPaged` (and, in
-    /// the facade, from `queryPagedShared` / `hasManyThroughShared`) can be
+    /// the facade, from `codegen.queryPaged` / `codegen.hasManyThrough`) can be
     /// handed to another isolation domain.
     func testPagedRowsAreSendable() throws {
         let model = try seeded()

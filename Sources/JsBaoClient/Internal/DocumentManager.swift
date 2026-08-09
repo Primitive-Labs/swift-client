@@ -2,9 +2,9 @@ import Foundation
 import YSwift
 
 /// Tracks per-document awareness (presence) state for local and remote clients.
-public struct AwarenessEntry: @unchecked Sendable {
-    public var localState: [String: Any]?
-    public var remoteStates: [String: [String: Any]] = [:]
+public struct AwarenessEntry: Sendable {
+    public var localState: [String: JSONValue]?
+    public var remoteStates: [String: [String: JSONValue]] = [:]
 }
 
 /// Delta of awareness changes produced by applying a remote awareness frame.
@@ -734,14 +734,10 @@ public final class DocumentManager: @unchecked Sendable {
         lock.withLock { metadataIndex[documentId] = entry }
     }
 
-    /// Encode a `LocalMetadataEntry` to a `[String: Any]` for event
+    /// Encode a `LocalMetadataEntry` to a `[String: JSONValue]` for event
     /// payloads (the typed `DocumentMetadataChangedEvent.metadata` field).
-    private func metadataDictionary(_ entry: LocalMetadataEntry) -> [String: Any]? {
-        guard let data = try? JSONEncoder().encode(entry),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return obj
+    private func metadataDictionary(_ entry: LocalMetadataEntry) -> [String: JSONValue]? {
+        (try? JSONValue(encoding: entry))?.objectValue
     }
 
     public func handleServerDocuments(_ documents: [[String: Any]]) async {
@@ -992,8 +988,8 @@ public final class DocumentManager: @unchecked Sendable {
                 // shared between this task and the timer.
                 let cappedDelayMs = Int(
                     min(
-                        Double(backoff.maxMs),
-                        Double(backoff.baseMs) * pow(backoff.factor, Double(attempt))
+                        backoff.max * 1000,
+                        backoff.base * 1000 * pow(backoff.factor, Double(attempt))
                     )
                 )
                 let delayMs = backoff.jitter && cappedDelayMs > 0
@@ -1067,8 +1063,8 @@ public final class DocumentManager: @unchecked Sendable {
     @discardableResult
     public func setLocalAwarenessState(
         _ documentId: String,
-        state: [String: Any]
-    ) -> (previousState: [String: Any]?, exists: Bool) {
+        state: [String: JSONValue]
+    ) -> (previousState: [String: JSONValue]?, exists: Bool) {
         lock.withLock {
             guard var entry = docAwareness[documentId] else {
                 return (nil, false)
@@ -1109,14 +1105,18 @@ public final class DocumentManager: @unchecked Sendable {
                 if entry.remoteStates.removeValue(forKey: clientId) != nil {
                     delta.removed.append(clientId)
                 }
-            } else if let state = rawState as? [String: Any] {
+            } else if let rawDict = rawState as? [String: Any],
+                      let state = try? JSONValue.typedRow(from: rawDict, subject: "Awareness state") {
                 let previous = entry.remoteStates[clientId]
                 entry.remoteStates[clientId] = state
                 if previous == nil {
                     delta.added.append(clientId)
-                } else if !(previous! as NSDictionary).isEqual(to: state) {
+                } else if previous! != state {
                     // A re-sent identical state is a no-op, matching the
                     // JS awareness layer — don't report it in `updated`.
+                    // `JSONValue` is `Equatable` (#2367), so this is a plain
+                    // value comparison rather than the previous
+                    // `NSDictionary.isEqual(to:)` bridge.
                     delta.updated.append(clientId)
                 }
             }

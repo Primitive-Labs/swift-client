@@ -266,6 +266,58 @@ final class TransportSpineTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(transport.lastCall).body, exact)
     }
 
+    /// The workflow `meta` fidelity table in `swift-client/CHANGELOG.md` and
+    /// the migration guide is a claim about bytes, so it is asserted here
+    /// rather than only described there.
+    ///
+    /// A `meta` taken positionally reaches `JSONSerialization` without passing
+    /// through `JSONValue`, so an `Int64` past 2^53 survives.
+    /// `StartWorkflowOptions.meta` is `[String: JSONValue]`, whose single
+    /// `.number(Double)` case rounds it. #2367's re-review found the generic
+    /// `start` on the wrong side of that line: it declared `meta: [String:
+    /// Any]` like `origin/main` but built a `StartWorkflowOptions` internally,
+    /// so the value was rounded with no signature change to warn anyone. This
+    /// pins both halves — the exactness that was restored, and the one lossy
+    /// form the docs tell readers to avoid for large integer IDs.
+    func testWorkflowMetaFidelityMatchesTheDocumentedTable() async throws {
+        let exact = "9007199254740993"
+        let started = #"{"runId":"r","runKey":"k","status":"queued"}"#
+
+        let positional = ScriptedTransport(json: started)
+        _ = try await WorkflowsAPI(transport: positional).start(
+            workflowKey: "k",
+            input: ["a": 1] as [String: Int],
+            meta: ["id": Int64(9_007_199_254_740_993)]
+        )
+        let positionalBody = String(
+            decoding: try XCTUnwrap(XCTUnwrap(positional.lastCall).body), as: UTF8.self
+        )
+        XCTAssertTrue(
+            positionalBody.contains(exact),
+            "a positional `meta` must reach the wire exactly; got \(positionalBody)"
+        )
+
+        let viaOptions = ScriptedTransport(json: started)
+        _ = try await WorkflowsAPI(transport: viaOptions).start(
+            StartWorkflowOptions(
+                workflowKey: "k",
+                input: ["a": .number(1)],
+                meta: ["id": .number(9_007_199_254_740_993)]
+            )
+        )
+        let optionsBody = String(
+            decoding: try XCTUnwrap(XCTUnwrap(viaOptions.lastCall).body), as: UTF8.self
+        )
+        XCTAssertFalse(
+            optionsBody.contains(exact),
+            """
+            `StartWorkflowOptions.meta` is documented as the lossy form. If it \
+            is exact now, `JSONValue` gained an integer case — update the \
+            fidelity table in the CHANGELOG and the migration guide.
+            """
+        )
+    }
+
     // MARK: - Converted call sites (behavior 3 grep assertion)
 
     /// `swift-client`, derived from this file's path.
@@ -448,75 +500,89 @@ final class TransportSpineTests: XCTestCase {
             // dictionaries, so changing these is a public-signature break
             // deferred to a later phase.
             "API/AuthAPI.swift": (6, 0, 0),
-            // WebSocket subscription frames (not transport requests) plus the
-            // public `[String: Any]` params they are built from — Phase C/D.
-            "API/DatabasesAPI.swift": (2, 2, 0),
-            // Public `rootInput` / `meta` signatures. Changing them is a
-            // source break, deferred to the next major. The two
+            // The two WebSocket control frames (`db.subscribe` /
+            // `db.unsubscribe`) and the `JSONSerialization` that encodes them.
+            // #2367 typed the public `params` to `[String: JSONValue]`, so what
+            // is left is the wire-encoding boundary itself, not public surface.
+            // The review of this PR took it 2 -> 3: `sendSubscribeFrame`'s
+            // lowering is a `do`/`catch` that logs the encode failure rather
+            // than a `try?` that silently sent an empty `params` bag, which
+            // needs the declaration and the cast on separate lines.
+            "API/DatabasesAPI.swift": (3, 2, 0),
+            // Public `rootInput` / `meta` signatures. The two
             // `JSONSerialization` uses are deliberate: `start`/`runSync`
             // compose the opaque caller payload straight to request bytes,
             // because routing it through `JSONValue` would collapse an
-            // `Int64` to `Double` and lose exactness past 2^53.
+            // `Int64` to `Double` and lose exactness past 2^53. #2367
+            // deliberately left this one surface untyped for that reason and
+            // recorded it in the CHANGELOG as the batch's one known remaining
+            // break; it took the count 11 -> 10 by typing
+            // `StartWorkflowOptions`.
+            // The re-review of this PR took it 10 -> 11: the three public
+            // `start` forms now funnel through one private `startRequest` body
+            // composer, whose `input: [String: Any]` parameter is the added
+            // line. That is what lets the generic `start<Input: Encodable>`
+            // hand its declared-`[String: Any]` `meta` straight to
+            // `JSONSerialization` instead of raising it into
+            // `StartWorkflowOptions` and back — a round trip that rounded an
+            // `Int64` past 2^53 on a signature that had not changed. The file
+            // set is net zero on this commit: `JsBaoClient.swift` gave one back
+            // (22 -> 21) below.
             "API/WorkflowsAPI.swift": (11, 2, 0),
+            // The codegen-backing surface, moved off `JsBaoClient` into its own
+            // facade by #2367. These are the storage layer's row currency
+            // (`PrimitiveRow`'s shape). Retyping it was in #2367's scope and
+            // was split out: it reaches the emitter's row-decode expressions,
+            // so it re-rolls every generated model and every golden — in this
+            // package, in the template, in the demo and in the CLI's Swift
+            // fixtures. Not a correctness problem, a size one. The count here
+            // must not grow.
+            // The review of this PR took it 10 -> 11: making `client` `weak`
+            // (it is handed out by the public `client.codegen` property, so
+            // `unowned` could trap) needs a `DetachedIncludeTarget` whose
+            // `query` throws, and that conformance repeats `IncludeTarget`'s
+            // own `[[String: Any]]` return. Same row currency, one more line.
+            "API/CodegenAPI.swift": (11, 0, 0),
             // JWT payload parsing (the serialization boundary the design
             // sanctions). Every HTTP response `AuthController` reads is typed.
-            // Phase E (#1994) took it 12 → 4: the eight event payloads emitted
+            // Phase E (#1994) took it 12 -> 4: the eight event payloads emitted
             // as bare dictionaries — `auth-refresh-deferred` and the five
             // `offlineAuth:*` events — are typed `JsBaoEventPayload` structs
             // now, so what remains is JWT parsing only.
             "Internal/AuthController.swift": (4, 1, 0),
-            // Phase E (#1994) took it 3 → 0: the three `blobs:queue-drained`
+            // Phase E (#1994) took it 3 -> 0: the three `blobs:queue-drained`
             // emits (including the terminal-4xx exit added by #2056) now emit
             // `BlobsQueueDrainedEvent`. Nothing untyped is left — the blob HTTP
             // path was already `requestData`.
             "Internal/BlobManager.swift": (0, 0, 0),
-            // Deprecated migration machinery, removed in the next major
-            // release alongside the rest of the `Any` surface (#1994).
-            "Internal/ClosureTransport.swift": (0, 2, 2),
-            // The `legacyDictionary` bridge for the nine events Phase E
-            // (#1994) converted from bare dictionaries to typed payloads. It
-            // exists so an `events.on(.x) { (d: [String: Any]) in }` handler
-            // written against the old shape keeps firing for the deprecation
-            // window, and it goes away with the untyped event surface in the
-            // next major release — the same category as
-            // `Internal/ClosureTransport.swift` above. Budgeted explicitly
-            // rather than left to the out-of-scope ceiling so the bridge cannot
-            // grow past the nine events it was introduced for.
-            "Types/JsBaoEventPayload.swift": (12, 0, 0),
-            // The client's own untyped public surfaces — schema queries,
-            // awareness state, WS message payloads, analytics events,
-            // `getAuthConfig`, `getJwtPayload` — plus JWT/WS
-            // `JSONSerialization` parsing. None of them are HTTP response
-            // bodies: every HTTP call in this file is either typed or the one
-            // private `legacyJSONGraph` hop feeding a public `[String: Any]`
-            // signature (Phase C/D, #1992/#1993). B4 dropped the count by
-            // removing the last legacy closure and typing the alias-resolve
-            // call; the deprecated-closure count is 0, which is what proves
-            // the client no longer calls its own deprecated `makeRequest`.
-            // Phase C (#1992) took it 40 → 37: the three
-            // `PagedQueryResult<[String: Any]>` returns on `queryPagedShared`
-            // (×2) and the paginated `hasManyThroughShared` now carry the
-            // shared `Sendable` row bag, `PrimitiveRow`. The remaining 37 are
-            // the flat (unpaginated) `[[String: Any]]` query returns and the
-            // non-HTTP untyped surfaces listed above — they make no `Sendable`
-            // claim, so Phase C deliberately left them alone.
-            // Phase D3 (#1993) raised it 37 → 38 by exactly one: the deprecated
-            // `logAnalyticsEvent(_ event: [String: Any])` gained the
-            // `logAnalyticsEventAsync` twin with the same untyped parameter, so
-            // a caller's migration is mechanical (add `await`, add `Async`)
-            // rather than a retype. The typed alternative already exists on
-            // `client.analytics`, and the deprecation message names it.
-            "JsBaoClient.swift": (38, 5, 0),
+            // The client's own remaining untyped surfaces: the WS message
+            // payloads it parses, and the `Any` graphs it lowers typed values
+            // into at the wire boundary. #2367 took it 38 -> 21 by removing the
+            // whole deprecated surface, retyping the event/awareness/analytics
+            // payloads to `[String: JSONValue]`, and moving the 20
+            // codegen-backing `*Shared` methods to `API/CodegenAPI.swift`
+            // (budgeted above). The deprecated-closure count stays 0, which is
+            // what proves the client does not call a deprecated entry point of
+            // its own. The review of this PR took it 21 -> 22: `setAwareness`
+            // lowers its typed state in a `do`/`catch` that logs the encode
+            // failure rather than a `try?` that silently published an empty
+            // state, which needs the declaration and the cast on separate
+            // lines. The re-review took it back 22 -> 21: the two
+            // analytics-context closures each carried their own lowering cast,
+            // and both now call one `prepareAnalyticsEvent` helper that logs
+            // the encode failure instead of dropping it, so the two casts
+            // became one.
+            "JsBaoClient.swift": (21, 5, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP
             // response body is read here. Phase D1 (#1993) took the
-            // `JSONSerialization` count 6 → 5: the store's own persistence
+            // `JSONSerialization` count 6 -> 5: the store's own persistence
             // coding now goes through `JSONCoding` on `JSONValue` (the cache's
             // value type), which removed the two hand-rolled
             // serialize/deserialize hops in `saveToStorage`/`loadFromStorage`
             // and added one `isValidJSONObject` guard in `cacheValue(from:)`.
-            // Phase D3 took it 5 → 4: `cacheValue(from:)` is a one-line call to
+            // Phase D3 took it 5 -> 4: `cacheValue(from:)` is a one-line call to
             // the shared `JSONValue(jsonAny:subject:)` now (the analytics queue
             // needed the same lowering), and that initializer converts
             // containers structurally instead of round-tripping them through
@@ -595,7 +661,21 @@ final class TransportSpineTests: XCTestCase {
         // typing it would mean typing `handleServerDocuments`, which belongs
         // with the rest of the `Any` surface in the next major. Both sites go
         // away with it.
-        let outOfScopeUntypedDictionaryCeiling = 136
+        // Lowered 136 -> 103 by #2367, which is the "next major" every entry
+        // above was waiting for. The batch removed the whole deprecated
+        // surface, retyped the event / awareness / analytics-context payloads
+        // and `DatabaseSubscribeOptions.params` to `[String: JSONValue]`, and
+        // deleted `Internal/ClosureTransport.swift` and the
+        // `Types/JsBaoEventPayload.swift` legacy bridge outright — so those two
+        // budget entries are gone rather than zeroed. What is left under this
+        // ceiling is the storage / query row currency (`Schema/`, `Query/`,
+        // `Internal/DocumentManager`, `Internal/LocalFirstListing`) plus
+        // `PasskeyWire`. Retyping the row currency was in the batch's original
+        // scope and was split out into its own issue — it reaches the emitter's
+        // row-decode expressions, so it re-rolls every generated model and
+        // golden in this package, the template, the demo and the CLI's Swift
+        // fixtures.
+        let outOfScopeUntypedDictionaryCeiling = 103
         var outOfScopeUntypedDictionaries = 0
 
         for (relativePath, url) in try allSourceFiles() where budget[relativePath] == nil {
@@ -708,18 +788,16 @@ final class TransportSpineTests: XCTestCase {
         }
     }
 
-    /// Both legacy entry points are marked deprecated, so a consumer app is
-    /// told at compile time — this is what makes the removal in the next
-    /// major a documented step rather than a surprise.
-    func testLegacyEntryPointsAreMarkedDeprecated() throws {
+    /// Both legacy entry points are GONE. This used to assert they carried a
+    /// deprecation attribute during the window; #2367 is the removal that
+    /// window existed for, so the assertion inverts — they must not come back.
+    func testLegacyEntryPointsAreRemoved() throws {
         let source = try jsBaoClientSource
 
         for symbol in ["public func makeRequest(", "public func makeRawRequest("] {
-            let range = try XCTUnwrap(source.range(of: symbol), "\(symbol) not found")
-            let preceding = String(source[source.startIndex..<range.lowerBound]).suffix(600)
-            XCTAssertTrue(
-                preceding.contains("@available(*, deprecated"),
-                "\(symbol) must carry an @available(*, deprecated) attribute"
+            XCTAssertNil(
+                source.range(of: symbol),
+                "\(symbol) was removed by #2367 — do not reintroduce the untyped hatch"
             )
         }
     }
@@ -738,6 +816,52 @@ final class TransportSpineTests: XCTestCase {
             code.contains("private func legacyJSONGraph("),
             "the single internal untyped hop should still be the private legacyJSONGraph"
         )
+    }
+
+    /// `JsBaoNetworkError` (#2367) is only worth its name if `URLError` can no
+    /// longer escape, and that holds only while every `URLSession` data call
+    /// goes through the one `NetworkSession` helper. A new call site added
+    /// straight against `URLSession` would leak a raw `URLError` again — and
+    /// nothing else in the suite would notice, because the leak only shows up
+    /// against a network that is actually failing.
+    /// Keyed on the `URLSession` METHOD names rather than on a receiver
+    /// spelling: `session.data(for:` matched only the receiver the client
+    /// happens to use today, so `httpSession.data(for:)`, `dataTask(`,
+    /// `upload(for:)` and `download(for:)` all slipped past it. Each label
+    /// below is unique to `URLSession` (unlike a bare `.data(`, which
+    /// `String.data(using:)` also spells), so the scan is specific without
+    /// depending on what the receiver is called.
+    func testAllURLSessionDataCallsGoThroughTheOneHelper() throws {
+        // The helper itself is the one legitimate caller.
+        let helperFile = "Types/Errors.swift"
+        let spellings = [
+            ".data(for:", ".data(from:",
+            ".dataTask(", ".uploadTask(", ".downloadTask(",
+            ".upload(for:", ".upload(from:",
+            ".download(for:", ".download(from:",
+            ".bytes(for:", ".bytes(from:",
+        ]
+        // The one sanctioned receiver: `NetworkSession` IS the helper.
+        let sanctionedReceiver = "NetworkSession"
+
+        for (relativePath, url) in try allSourceFiles() where relativePath != helperFile {
+            let lines = try codeLines(of: url)
+            for spelling in spellings {
+                let offending = lines.filter { line in
+                    line.contains(spelling)
+                        && !line.contains(sanctionedReceiver + spelling)
+                }
+                XCTAssertTrue(
+                    offending.isEmpty,
+                    """
+                    \(relativePath) calls \(spelling) on something other than \
+                    NetworkSession — route it through NetworkSession so the \
+                    failure surfaces as JsBaoNetworkError rather than a raw \
+                    URLError. Offending line(s): \(offending)
+                    """
+                )
+            }
+        }
     }
 
     /// `CacheFacade` (B2) holds a `Transport`, not the legacy closure. Its

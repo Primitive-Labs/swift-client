@@ -36,7 +36,7 @@ final class LocksTests: XCTestCase {
     func testTryAcquireReturnsHandleOnFreeKeyAndNilWhenHeld() async throws {
         let key = uniqueKey("try")
 
-        let handle = try await client.locks.tryAcquire(key: key, ttlMs: 60_000)
+        let handle = try await client.locks.tryAcquire(key: key, ttl: 60)
         let acquired = try XCTUnwrap(handle, "A free key should be acquirable")
         XCTAssertEqual(acquired.key, key)
         XCTAssertFalse(acquired.handleId.isEmpty, "Acquire must return an opaque handleId")
@@ -45,7 +45,7 @@ final class LocksTests: XCTestCase {
         // Contention: a live lease blocks the next acquire — even for the same
         // caller, which the server answers with `acquired: false` rather than
         // re-entering the lock.
-        let second = try await client.locks.tryAcquire(key: key, ttlMs: 60_000)
+        let second = try await client.locks.tryAcquire(key: key, ttl: 60)
         XCTAssertNil(second, "A held key must not be re-acquired, not even by the holder")
 
         let released = try await client.locks.release(acquired)
@@ -56,7 +56,7 @@ final class LocksTests: XCTestCase {
 
     func testReleaseRequiresTheHoldingHandle() async throws {
         let key = uniqueKey("release-ownership")
-        let acquiredHandle = try await client.locks.tryAcquire(key: key, ttlMs: 60_000)
+        let acquiredHandle = try await client.locks.tryAcquire(key: key, ttl: 60)
         let handle = try XCTUnwrap(acquiredHandle)
 
         // A wrong/stale handleId does not free someone else's lock — and it is
@@ -87,9 +87,9 @@ final class LocksTests: XCTestCase {
 
     func testRenewExtendsTheLeaseAndStatusListReflectTheHeldLock() async throws {
         let key = uniqueKey("renew-status")
-        let handle = try await client.locks.acquire(key: key, ttlMs: 1_000, timeoutMs: 3_000)
+        let handle = try await client.locks.acquire(key: key, ttl: 1, timeout: 3)
 
-        let renewed = try await client.locks.renew(handle, ttlMs: 60_000)
+        let renewed = try await client.locks.renew(handle, ttl: 60)
         XCTAssertTrue(renewed.renewed)
         let before = try XCTUnwrap(isoDate(handle.leaseExpiresAt))
         let renewedExpiry = try XCTUnwrap(renewed.leaseExpiresAt)
@@ -114,11 +114,11 @@ final class LocksTests: XCTestCase {
 
     func testRenewOfALostLeaseReportsLeaseLost() async throws {
         let key = uniqueKey("renew-lost")
-        let acquiredHandle = try await client.locks.tryAcquire(key: key, ttlMs: 60_000)
+        let acquiredHandle = try await client.locks.tryAcquire(key: key, ttl: 60)
         let handle = try XCTUnwrap(acquiredHandle)
         _ = try await client.locks.release(handle)
 
-        let renewed = try await client.locks.renew(handle, ttlMs: 60_000)
+        let renewed = try await client.locks.renew(handle, ttl: 60)
         XCTAssertFalse(renewed.renewed, "A released handle can no longer renew")
         XCTAssertEqual(renewed.reason, "lease_lost")
     }
@@ -127,7 +127,7 @@ final class LocksTests: XCTestCase {
 
     func testBlockingAcquireResolvesOnceTheHolderReleases() async throws {
         let key = uniqueKey("block-release")
-        let heldHandle = try await client.locks.tryAcquire(key: key, ttlMs: 60_000)
+        let heldHandle = try await client.locks.tryAcquire(key: key, ttl: 60)
         let held = try XCTUnwrap(heldHandle)
 
         // Release from a detached task while the blocking acquire is polling.
@@ -138,7 +138,7 @@ final class LocksTests: XCTestCase {
         defer { releaser.cancel() }
 
         let start = Date()
-        let handle = try await client.locks.acquire(key: key, ttlMs: 60_000, timeoutMs: 15_000)
+        let handle = try await client.locks.acquire(key: key, ttl: 60, timeout: 15)
         let elapsed = Date().timeIntervalSince(start)
 
         XCTAssertEqual(handle.key, key)
@@ -153,11 +153,11 @@ final class LocksTests: XCTestCase {
 
     func testBlockingAcquireThrowsLockTimeoutWhenTheHolderNeverReleases() async throws {
         let key = uniqueKey("block-timeout")
-        let heldHandle = try await client.locks.tryAcquire(key: key, ttlMs: 60_000)
+        let heldHandle = try await client.locks.tryAcquire(key: key, ttl: 60)
         let held = try XCTUnwrap(heldHandle)
 
         do {
-            _ = try await client.locks.acquire(key: key, ttlMs: 60_000, timeoutMs: 900)
+            _ = try await client.locks.acquire(key: key, ttl: 60, timeout: 0.9)
             XCTFail("Blocking acquire on a permanently held key must time out")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .lockTimeout)
@@ -166,6 +166,38 @@ final class LocksTests: XCTestCase {
         }
 
         _ = try await client.locks.release(held)
+    }
+
+    /// `timeout` became a `TimeInterval` in #2367, so `.infinity` is
+    /// expressible for the first time and means "wait indefinitely". The poll
+    /// loop converts its remaining time to `Int` milliseconds on every
+    /// iteration, and it only reaches that conversion when the key is
+    /// contended — so this holds the key long enough to force at least one
+    /// poll, then releases. Before the fix this terminated the test process
+    /// (`Double value cannot be converted to Int because it is either infinite
+    /// or NaN`) rather than failing.
+    func testBlockingAcquireWithAnInfiniteTimeoutPollsInsteadOfTrapping() async throws {
+        let key = uniqueKey("block-infinite")
+        let heldHandle = try await client.locks.tryAcquire(key: key, ttl: 60)
+        let held = try XCTUnwrap(heldHandle)
+
+        let releaser = Task { [client] in
+            try? await Task.sleep(nanoseconds: 800 * 1_000_000)
+            _ = try? await client?.locks.release(held)
+        }
+        defer { releaser.cancel() }
+
+        let start = Date()
+        let handle = try await client.locks.acquire(key: key, ttl: 60, timeout: .infinity)
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertEqual(handle.key, key)
+        XCTAssertGreaterThanOrEqual(
+            elapsed, 0.7,
+            "an infinite timeout must keep polling through contention, not return early"
+        )
+
+        _ = try await client.locks.release(handle)
     }
 
     // MARK: - Helpers

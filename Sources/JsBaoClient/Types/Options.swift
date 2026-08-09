@@ -11,6 +11,12 @@ public struct JsBaoClientOptions: Sendable {
     /// use the auth controller (e.g., `client.auth.updateToken(...)`).
     public let token: String?
     public let offline: Bool
+    /// Ceiling on the WebSocket reconnect backoff, in seconds. Defaults to 300
+    /// (5 minutes), the same ceiling js-bao uses (`src/client/JsBaoClient.ts`,
+    /// `maxReconnectDelay` → `300_000` ms). Both clients compute the same
+    /// backoff, so a lower ceiling here just means retrying more often forever
+    /// against a server that is down (#2364). Pass a smaller value if your app
+    /// wants to reconnect sooner.
     public let maxReconnectDelay: TimeInterval
     public let globalAdminAppId: String
     public let wsHeaders: [String: String]
@@ -32,7 +38,7 @@ public struct JsBaoClientOptions: Sendable {
         appId: String,
         token: String? = nil,
         offline: Bool = true,
-        maxReconnectDelay: TimeInterval = 30,
+        maxReconnectDelay: TimeInterval = 300,
         globalAdminAppId: String = "global-admin-app",
         wsHeaders: [String: String] = [:],
         blobUploadConcurrency: Int = 2,
@@ -81,11 +87,11 @@ public struct AnalyticsAutoEventsConfig: Sendable {
     /// `user_active_daily` on the first successful auth of each calendar day.
     public var dailyAuth: Bool
     /// `user_returned` when the app returns to the foreground after at least
-    /// `minResumeMs` of inactivity.
+    /// `minResume` of inactivity.
     public var returnActive: Bool
-    /// Minimum gap (ms) between consecutive `returnActive` events.
+    /// Minimum gap between consecutive `returnActive` events.
     /// JS default: 5 minutes.
-    public var minResumeMs: Int
+    public var minResume: TimeInterval
     /// No-op in both JS and Swift today (fires before auth → no user). Kept
     /// for option-surface parity.
     public var boot: Bool
@@ -98,11 +104,11 @@ public struct AnalyticsAutoEventsConfig: Sendable {
     /// `offlineRecovery`: no-op in both JS and Swift today (removed as a rare,
     /// non-actionable edge case). Kept for option-surface parity.
     public var offlineRecoveryEnabled: Bool
-    public var offlineRecoveryMinIntervalMs: Int
+    public var offlineRecoveryMinInterval: TimeInterval
     /// `sync_error` (feature `sync`) when a sync/commit fails. Rate-limited to
-    /// one event per `syncErrorsMinIntervalMs`. JS default: 30s.
+    /// one event per `syncErrorsMinInterval`. JS default: 30s.
     public var syncErrorsEnabled: Bool
-    public var syncErrorsMinIntervalMs: Int
+    public var syncErrorsMinInterval: TimeInterval
     /// Blob upload lifecycle events (feature `blobs`): start / success /
     /// failure, each one-shot per upload.
     public var blobUploadsStart: Bool
@@ -119,14 +125,14 @@ public struct AnalyticsAutoEventsConfig: Sendable {
     public init(
         dailyAuth: Bool = true,
         returnActive: Bool = true,
-        minResumeMs: Int = 5 * 60 * 1000,
+        minResume: TimeInterval = 5 * 60,
         boot: Bool = true,
         firstDocOpen: Bool = true,
         firstDocEdit: Bool = true,
         offlineRecoveryEnabled: Bool = true,
-        offlineRecoveryMinIntervalMs: Int = 60 * 1000,
+        offlineRecoveryMinInterval: TimeInterval = 60,
         syncErrorsEnabled: Bool = true,
-        syncErrorsMinIntervalMs: Int = 30 * 1000,
+        syncErrorsMinInterval: TimeInterval = 30,
         blobUploadsStart: Bool = true,
         blobUploadsSuccess: Bool = true,
         blobUploadsFailure: Bool = true,
@@ -136,14 +142,14 @@ public struct AnalyticsAutoEventsConfig: Sendable {
     ) {
         self.dailyAuth = dailyAuth
         self.returnActive = returnActive
-        self.minResumeMs = minResumeMs
+        self.minResume = minResume
         self.boot = boot
         self.firstDocOpen = firstDocOpen
         self.firstDocEdit = firstDocEdit
         self.offlineRecoveryEnabled = offlineRecoveryEnabled
-        self.offlineRecoveryMinIntervalMs = offlineRecoveryMinIntervalMs
+        self.offlineRecoveryMinInterval = offlineRecoveryMinInterval
         self.syncErrorsEnabled = syncErrorsEnabled
-        self.syncErrorsMinIntervalMs = syncErrorsMinIntervalMs
+        self.syncErrorsMinInterval = syncErrorsMinInterval
         self.blobUploadsStart = blobUploadsStart
         self.blobUploadsSuccess = blobUploadsSuccess
         self.blobUploadsFailure = blobUploadsFailure
@@ -186,34 +192,38 @@ public struct RefreshProxyConfig: Sendable {
 // MARK: - Sync Config
 
 public struct SyncConfig: Sendable {
-    public var outboundDebounceMs: Int
-    public var handshakeTimeoutMs: Int
+    /// How long local edits are coalesced before the outbound update is sent.
+    public var outboundDebounce: TimeInterval
+    /// How long to wait for the sync handshake before giving up.
+    public var handshakeTimeout: TimeInterval
 
-    public init(outboundDebounceMs: Int = 50, handshakeTimeoutMs: Int = 10000) {
-        self.outboundDebounceMs = outboundDebounceMs
-        self.handshakeTimeoutMs = handshakeTimeoutMs
+    public init(outboundDebounce: TimeInterval = 0.05, handshakeTimeout: TimeInterval = 10) {
+        self.outboundDebounce = outboundDebounce
+        self.handshakeTimeout = handshakeTimeout
     }
 }
 
 // MARK: - Commit Retry Backoff
 
 public struct CommitRetryBackoff: Sendable {
-    public var baseMs: Int
+    /// Delay before the first retry.
+    public var base: TimeInterval
     public var factor: Double
-    public var maxMs: Int
+    /// Ceiling on the backed-off delay.
+    public var max: TimeInterval
     public var jitter: Bool
     public var maxAttempts: Int
 
     public init(
-        baseMs: Int = 1000,
+        base: TimeInterval = 1,
         factor: Double = 2.0,
-        maxMs: Int = 60000,
+        max: TimeInterval = 60,
         jitter: Bool = true,
         maxAttempts: Int = 10
     ) {
-        self.baseMs = baseMs
+        self.base = base
         self.factor = factor
-        self.maxMs = maxMs
+        self.max = max
         self.jitter = jitter
         self.maxAttempts = maxAttempts
     }
@@ -232,12 +242,11 @@ public struct OpenDocumentOptions: Sendable {
     public var waitForLoad: WaitForLoadMode
     public var enableNetworkSync: Bool
     public var retainLocal: Bool
-    /// Maximum time in milliseconds to wait for the document to become
-    /// available from the network before resolving with whatever local
-    /// (possibly empty) state exists. Mirrors JS
-    /// `open`/`openDocument`'s `availabilityWaitMs` (default 30000).
-    /// Clamped to `>= 0`.
-    public var availabilityWaitMs: Int
+    /// Maximum time to wait for the document to become available from the
+    /// network before resolving with whatever local (possibly empty) state
+    /// exists. Mirrors JS `open`/`openDocument`'s `availabilityWaitMs`
+    /// (default 30s). Clamped to `>= 0`.
+    public var availabilityWait: TimeInterval
     /// When `true`, open the document locally without starting server
     /// sync — sync begins only on an explicit `startNetworkSync(documentId:)`
     /// call. Mirrors JS `open`/`openDocument`'s `deferNetworkSync`.
@@ -252,14 +261,14 @@ public struct OpenDocumentOptions: Sendable {
         waitForLoad: WaitForLoadMode = .localIfAvailableElseNetwork,
         enableNetworkSync: Bool = true,
         retainLocal: Bool = true,
-        availabilityWaitMs: Int = 30_000,
+        availabilityWait: TimeInterval = 30,
         deferNetworkSync: Bool = false,
         requestSyncPerf: Bool = false
     ) {
         self.waitForLoad = waitForLoad
         self.enableNetworkSync = enableNetworkSync
         self.retainLocal = retainLocal
-        self.availabilityWaitMs = max(0, availabilityWaitMs)
+        self.availabilityWait = max(0, availabilityWait)
         self.deferNetworkSync = deferNetworkSync
         self.requestSyncPerf = requestSyncPerf
     }
@@ -427,8 +436,8 @@ public struct RetentionPolicy: Sendable {
     /// shape parity with js-bao; not yet consumed by enforcement
     /// (matches JS — same field is set but unused in enforcement).
     public var `default`: DefaultMode
-    /// Evict docs whose `lastOpenedAt` age exceeds this (ms).
-    public var ttlMs: Int?
+    /// Evict docs whose `lastOpenedAt` age exceeds this.
+    public var ttl: TimeInterval?
     /// Cap on local-doc count; oldest-first eviction when exceeded.
     public var maxDocs: Int?
     /// Cap on total `localBytes`; oldest-first eviction when exceeded.
@@ -438,13 +447,13 @@ public struct RetentionPolicy: Sendable {
 
     public init(
         default: DefaultMode = .persist,
-        ttlMs: Int? = nil,
+        ttl: TimeInterval? = nil,
         maxDocs: Int? = nil,
         maxBytes: Int? = nil,
         preserveOnSignOut: Bool? = nil
     ) {
         self.default = `default`
-        self.ttlMs = ttlMs
+        self.ttl = ttl
         self.maxDocs = maxDocs
         self.maxBytes = maxBytes
         self.preserveOnSignOut = preserveOnSignOut
@@ -473,7 +482,7 @@ public struct SyncMetadataOptions: Sendable {
     }
 }
 
-public struct StartWorkflowOptions: @unchecked Sendable {
+public struct StartWorkflowOptions: Sendable {
     /// The workflow key identifying which workflow to start. Carried here so
     /// the single-object `start(_:)` overload mirrors js-bao's
     /// `start({ workflowKey, input, ... })`. Defaults to `""` for the
@@ -483,20 +492,20 @@ public struct StartWorkflowOptions: @unchecked Sendable {
     /// Input data passed to the workflow (the server's opaque `rootInput`).
     /// Used by the single-object `start(_:)` overload; ignored by the
     /// positional form, which takes its own `input` parameter.
-    public var input: [String: Any]
+    public var input: [String: JSONValue]
     public var runKey: String?
     public var contextDocId: String?
-    public var meta: [String: Any]?
+    public var meta: [String: JSONValue]?
     /// When true, re-runs a workflow even if a prior run with the same
     /// `runKey` exists. Matches js-bao's `StartWorkflowOptions.forceRerun`.
     public var forceRerun: Bool?
 
     public init(
         workflowKey: String = "",
-        input: [String: Any] = [:],
+        input: [String: JSONValue] = [:],
         runKey: String? = nil,
         contextDocId: String? = nil,
-        meta: [String: Any]? = nil,
+        meta: [String: JSONValue]? = nil,
         forceRerun: Bool? = nil
     ) {
         self.workflowKey = workflowKey
@@ -677,21 +686,44 @@ public struct OfflineGrantStatus: Sendable {
 
 // MARK: - Cache Options
 
+/// Options for a cache-backed fetch.
+///
+/// A cached value is never held back waiting on the network: with
+/// `waitForLoad` at its default, a cache hit returns right away and any
+/// refresh the other options ask for runs in the background (#2364). Use
+/// `waitForLoad: .network` when the call must wait for fresh server data.
+///
+/// The one entry with nothing to serve is a cached "no such record" (an empty
+/// server response, stored as JSON `null`): when a refresh is due on such an
+/// entry the call awaits the fetch, exactly as a cache miss does.
 public struct FetchCachedOptions: Sendable {
+    /// Where the read comes from: `.local` (cache only), `.network` (always
+    /// fetch and wait for the server), or `.localIfAvailableElseNetwork` — the
+    /// default — which returns the cached value when there is one and fetches
+    /// only on a miss.
     public var waitForLoad: WaitForLoadMode?
+    /// Refresh from the server even when the cached value is fresh. The
+    /// refresh happens **behind** the returned cached value, so this makes the
+    /// *next* read current, not this one. To wait for fresh data, use
+    /// `waitForLoad: .network`.
     public var refreshNetwork: Bool?
-    public var refreshIfOlderThanMs: Int?
-    public var serverTimeoutMs: Int?
+    /// Refresh in the background when the cached entry is at least this many
+    /// seconds old. The cached value is still returned immediately.
+    public var refreshIfOlderThan: TimeInterval?
+    /// How long an awaited network fetch may take before it falls back to a
+    /// cached value or fails, in seconds. Defaults to 10; `0` disables the
+    /// bound.
+    public var serverTimeout: TimeInterval?
 
     public init(
         waitForLoad: WaitForLoadMode? = nil,
         refreshNetwork: Bool? = nil,
-        refreshIfOlderThanMs: Int? = nil,
-        serverTimeoutMs: Int? = nil
+        refreshIfOlderThan: TimeInterval? = nil,
+        serverTimeout: TimeInterval? = nil
     ) {
         self.waitForLoad = waitForLoad
         self.refreshNetwork = refreshNetwork
-        self.refreshIfOlderThanMs = refreshIfOlderThanMs
-        self.serverTimeoutMs = serverTimeoutMs
+        self.refreshIfOlderThan = refreshIfOlderThan
+        self.serverTimeout = serverTimeout
     }
 }

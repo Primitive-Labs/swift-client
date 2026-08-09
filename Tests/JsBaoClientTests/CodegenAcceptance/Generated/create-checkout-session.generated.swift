@@ -56,7 +56,7 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
-        timeoutMs: Int? = nil
+        timeout: TimeInterval? = nil
     ) async throws -> RunSyncResult<CreateCheckoutSessionOutput> {
         try await client.workflows.runSync(
             workflowKey: "create-checkout-session",
@@ -64,7 +64,7 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
             runKey: runKey,
             contextDocId: contextDocId,
             meta: meta,
-            timeoutMs: timeoutMs
+            timeout: timeout
         )
     }
 

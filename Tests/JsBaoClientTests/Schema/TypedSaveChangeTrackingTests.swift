@@ -9,7 +9,7 @@ import YSwift
 /// Runs against the committed `TaskRecord` golden
 /// (`CodegenAcceptance/Generated/TaskRecord.swift`) so it exercises the real
 /// emitted code, and against an offline in-memory client so `save(in:)` takes
-/// its real path through `JsBaoClient.saveShared`.
+/// its real path through `JsBaoClient.codegen.save`.
 final class TypedSaveChangeTrackingTests: XCTestCase {
 
     override func setUp() {
@@ -152,9 +152,7 @@ final class TypedSaveChangeTrackingTests: XCTestCase {
             createdAt: "2026-08-05T00:00:00Z"
         ).save(in: docId)
 
-        // Read through `query`, not `find`: `find` doesn't populate stringset
-        // fields (a separate, pre-existing gap in `MultiDocModel.find`).
-        let read = try XCTUnwrap(try TaskRecord.query(["id": "t1"]).first)
+        let read = try XCTUnwrap(try TaskRecord.find("t1"))
         XCTAssertEqual(read.title, "full")
         XCTAssertEqual(read.priority, 7)
         XCTAssertEqual(read.tags, ["x", "y"])
@@ -178,9 +176,7 @@ final class TypedSaveChangeTrackingTests: XCTestCase {
 
         try TaskRecord(id: "t1", title: "copy me", priority: 2, tags: ["z"]).save(in: docA)
 
-        // `query` rather than `find` so the stringset comes back populated
-        // (`MultiDocModel.find` doesn't populate stringset fields).
-        let loaded = try XCTUnwrap(try TaskRecord.query(["id": "t1"]).first)
+        let loaded = try XCTUnwrap(try TaskRecord.find("t1"))
         XCTAssertTrue(loaded._changedFields.isEmpty)
         try loaded.save(in: docB)
 

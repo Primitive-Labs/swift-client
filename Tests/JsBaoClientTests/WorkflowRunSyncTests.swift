@@ -134,8 +134,9 @@ final class WorkflowRunSyncTests: XCTestCase {
         XCTAssertEqual(second.existing, true)
     }
 
-    /// [JS CLIENT.timeoutMs] timeoutMs is forwarded and a fast workflow still
-    /// completes well inside it.
+    /// [JS CLIENT.timeoutMs] the timeout is forwarded and a fast workflow still
+    /// completes well inside it. Swift takes it as a `TimeInterval` in seconds
+    /// (#2367); the JS client's equivalent option is `timeoutMs`.
     func testRunSyncTimeoutMsForwarded() async throws {
         try await ctx.setupWorkflow(
             appId: testApp.appId,
@@ -149,7 +150,7 @@ final class WorkflowRunSyncTests: XCTestCase {
             workflowKey: "swift-runsync-timeout",
             runKey: "swift-timeout-run",
             contextDocId: contextDocId,
-            timeoutMs: 5000
+            timeout: 5
         )
         XCTAssertTrue(
             ["completed", "apply_pending"].contains(result.status),

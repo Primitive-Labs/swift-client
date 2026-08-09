@@ -96,7 +96,7 @@ final class LocksAPITests: XCTestCase {
         let r = CallRecorder()
         r.respond(with: ["acquired": true, "handle": handleJSON(key: "import:1")])
 
-        let handle = try await api(r).tryAcquire(key: "import:1", ttlMs: 60_000)
+        let handle = try await api(r).tryAcquire(key: "import:1", ttl: 60)
 
         XCTAssertEqual(r.last?.method, "POST")
         XCTAssertEqual(r.last?.path, "/locks/acquire")
@@ -117,7 +117,7 @@ final class LocksAPITests: XCTestCase {
             "retryAfterMs": 500,
         ])
 
-        let handle = try await api(r).tryAcquire(key: "k", ttlMs: 1_000)
+        let handle = try await api(r).tryAcquire(key: "k", ttl: 1)
         XCTAssertNil(handle)
     }
 
@@ -155,7 +155,7 @@ final class LocksAPITests: XCTestCase {
 
         let result = try await api(r).renew(
             LockHandle(key: "k", handleId: "h1", leaseExpiresAt: "2026-01-01T00:00:00.000Z"),
-            ttlMs: 30_000
+            ttl: 30
         )
 
         XCTAssertEqual(r.last?.method, "POST")
@@ -174,7 +174,7 @@ final class LocksAPITests: XCTestCase {
 
         let result = try await api(r).renew(
             LockHandle(key: "k", handleId: "h1", leaseExpiresAt: "2026-01-01T00:00:00.000Z"),
-            ttlMs: 30_000
+            ttl: 30
         )
         XCTAssertFalse(result.renewed)
         XCTAssertEqual(result.reason, "lease_lost")
@@ -250,7 +250,7 @@ final class LocksAPITests: XCTestCase {
             "retryAfterMs": 250,
         ])
 
-        let handle = try await api(r).tryAcquire(key: "k", ttlMs: 1_000)
+        let handle = try await api(r).tryAcquire(key: "k", ttl: 1)
         XCTAssertNil(handle)
     }
 
@@ -287,7 +287,7 @@ final class LocksAPITests: XCTestCase {
             .success(["acquired": true, "handle": handleJSON()]),
         ])
 
-        let handle = try await api(r).acquire(key: "k", ttlMs: 1_000, timeoutMs: 5_000)
+        let handle = try await api(r).acquire(key: "k", ttl: 1, timeout: 5)
         XCTAssertEqual(handle.handleId, "h1")
         XCTAssertEqual(r.callCount, 3, "It should keep polling until the key frees")
     }
@@ -297,7 +297,7 @@ final class LocksAPITests: XCTestCase {
         r.respond(with: ["acquired": false, "retryAfterMs": 10])
 
         do {
-            _ = try await api(r).acquire(key: "busy", ttlMs: 1_000, timeoutMs: 120)
+            _ = try await api(r).acquire(key: "busy", ttl: 1, timeout: 0.12)
             XCTFail("Expected a lock timeout")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .lockTimeout)
@@ -312,7 +312,7 @@ final class LocksAPITests: XCTestCase {
         r.respond(with: ["acquired": false, "retryAfterMs": 10_000])
 
         do {
-            _ = try await api(r).acquire(key: "k", ttlMs: 1_000, timeoutMs: 0)
+            _ = try await api(r).acquire(key: "k", ttl: 1, timeout: 0)
             XCTFail("Expected a lock timeout")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .lockTimeout)
@@ -331,7 +331,7 @@ final class LocksAPITests: XCTestCase {
             .success(["acquired": true, "handle": handleJSON()]),
         ])
 
-        let handle = try await api(r).acquire(key: "k", ttlMs: 1_000, timeoutMs: 5_000)
+        let handle = try await api(r).acquire(key: "k", ttl: 1, timeout: 5)
         XCTAssertEqual(handle.handleId, "h1")
         XCTAssertEqual(r.callCount, 2)
     }
@@ -343,7 +343,7 @@ final class LocksAPITests: XCTestCase {
         ])
 
         do {
-            _ = try await api(r).acquire(key: "k", ttlMs: 1_000, timeoutMs: 120)
+            _ = try await api(r).acquire(key: "k", ttl: 1, timeout: 0.12)
             XCTFail("Expected a lock timeout")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .lockTimeout, "A 429 must never surface from a blocking acquire")
@@ -355,7 +355,7 @@ final class LocksAPITests: XCTestCase {
         r.script([.failure(HttpError(status: 403, message: "HTTP 403", body: nil))])
 
         do {
-            _ = try await api(r).acquire(key: "k", ttlMs: 1_000, timeoutMs: 5_000)
+            _ = try await api(r).acquire(key: "k", ttl: 1, timeout: 5)
             XCTFail("Expected the 403 to propagate")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 403)
@@ -367,7 +367,7 @@ final class LocksAPITests: XCTestCase {
         r.script([.failure(HttpError(status: 429, message: "HTTP 429", body: nil))])
 
         do {
-            _ = try await api(r).tryAcquire(key: "k", ttlMs: 1_000)
+            _ = try await api(r).tryAcquire(key: "k", ttl: 1)
             XCTFail("tryAcquire must surface the rate limit to its caller")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 429)

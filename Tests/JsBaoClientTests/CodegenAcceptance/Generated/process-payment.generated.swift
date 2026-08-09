@@ -97,7 +97,7 @@ public struct ProcessPaymentWorkflow: Sendable {
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
-        timeoutMs: Int? = nil
+        timeout: TimeInterval? = nil
     ) async throws -> RunSyncResult<ProcessPaymentOutput> {
         try await client.workflows.runSync(
             workflowKey: "process-payment",
@@ -105,7 +105,7 @@ public struct ProcessPaymentWorkflow: Sendable {
             runKey: runKey,
             contextDocId: contextDocId,
             meta: meta,
-            timeoutMs: timeoutMs
+            timeout: timeout
         )
     }
 

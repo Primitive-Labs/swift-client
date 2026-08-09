@@ -707,12 +707,11 @@ final class EventStreamTests: XCTestCase {
                        "a stream opened after teardown must not register an entry")
     }
 
-    // MARK: - Edge case: re-entrant emit under the shim must not deadlock
+    // MARK: - Edge case: re-entrant emit from a callback must not deadlock
 
-    /// The registry lock is released before fan-out, so a legacy `on()` callback
-    /// that itself emits does not deadlock — and its nested emit still reaches a
-    /// stream consumer.
-    @available(*, deprecated, message: "Deprecated context: exercises the `on` shim on purpose (#1994).")
+    /// The registry lock is released before fan-out, so a callback that itself
+    /// emits does not deadlock — and its nested emit still reaches a stream
+    /// consumer.
     func testReentrantEmitFromCallbackDoesNotDeadlock() async throws {
         let emitter = EventEmitter()
         let nested = emitter.makeStream(
@@ -722,12 +721,12 @@ final class EventStreamTests: XCTestCase {
         )
         var iterator = nested.makeAsyncIterator()
 
-        let sub = emitter.on(.documentOpened) { (event: DocumentOpenedEvent) in
+        let sub = emitter.subscribe(DocumentOpenedEvent.self) { event in
             emitter.emit(DocumentClosedEvent(documentId: "nested-\(event.documentId)"))
         }
         defer { sub.cancel() }
 
-        assertCompletes(within: 5, "re-entrant emit from an on() callback") {
+        assertCompletes(within: 5, "re-entrant emit from a callback") {
             emitter.emit(DocumentOpenedEvent(documentId: "doc-1"))
         }
 

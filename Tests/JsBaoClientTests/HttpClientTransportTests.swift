@@ -67,6 +67,53 @@ final class HttpClientTransportTests: XCTestCase {
         XCTAssertTrue(TransportStubURLProtocol.sawAuthorizedRetryWithNewToken)
     }
 
+    // MARK: - A failed refresh is a network error, not a credential error
+
+    /// `JsBaoNetworkError` documents that the client raises it for any refresh
+    /// failure other than an HTTP 401/403 — 5xx responses and decode failures
+    /// included. The 401-retry path used to reduce those to
+    /// `HttpError(status: 401, message: "Refresh deferred due to network
+    /// failure")`, so an app could not tell a server outage from a revoked
+    /// session and would sign the user out. Matches the JS client, which
+    /// throws `JsBaoNetworkError` on the same branch.
+    func testRefreshFailingWithA5xxSurfacesAsANetworkErrorNotA401() async throws {
+        TransportStubURLProtocol.configure(refreshedToken: "", refreshStatus: 503)
+        let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1-stale"))
+
+        do {
+            let _: Payload = try await http.request(method: .get, path: "/me")
+            XCTFail("a request whose refresh 503s must throw")
+        } catch let error as JsBaoNetworkError {
+            XCTAssertTrue(
+                error.message.contains("503"),
+                "the underlying refresh failure must survive, got: \(error.message)"
+            )
+        } catch let error as HttpError {
+            XCTFail(
+                "a transient refresh outage surfaced as HttpError(\(error.status)) — "
+                    + "callers read that as invalid credentials"
+            )
+        }
+    }
+
+    /// The other half of the contract: a refresh the server answers with 401
+    /// really is a credential problem and must stay an `HttpError`, so this
+    /// fix does not reroute genuine sign-outs to the retry path.
+    func testRefreshRejectedWith401StillSurfacesAsAnHttpError() async throws {
+        TransportStubURLProtocol.configure(refreshedToken: "", refreshStatus: 401)
+        let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1-stale"))
+
+        do {
+            let _: Payload = try await http.request(method: .get, path: "/me")
+            XCTFail("a request whose refresh is rejected must throw")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.status, 401)
+            XCTAssertEqual(error.message, "Invalid credentials")
+        } catch let error as JsBaoNetworkError {
+            XCTFail("an invalid refresh token is not a network failure: \(error.message)")
+        }
+    }
+
     // MARK: - Behavior 8: raw bytes are never reconstructed from text
 
     func testRequestDataReturnsTheUntouchedResponseBytes() async throws {
@@ -159,6 +206,11 @@ final class TransportStubURLProtocol: URLProtocol {
         var binaryBody = Data()
         var binaryContentType = "application/octet-stream"
         var echoBody = false
+        /// Status the refresh endpoint answers with. `200` returns a token;
+        /// anything else exercises the refresh-failure branch (a 5xx is the
+        /// "server is down" case, a 401 the "credentials really are invalid"
+        /// case).
+        var refreshStatus = 200
     }
 
     private static let script = LockedBox(Script())
@@ -167,13 +219,15 @@ final class TransportStubURLProtocol: URLProtocol {
         refreshedToken: String,
         binaryBody: Data = Data(),
         binaryContentType: String = "application/octet-stream",
-        echoBody: Bool = false
+        echoBody: Bool = false,
+        refreshStatus: Int = 200
     ) {
         script.value = Script(
             refreshedToken: refreshedToken,
             binaryBody: binaryBody,
             binaryContentType: binaryContentType,
-            echoBody: echoBody
+            echoBody: echoBody,
+            refreshStatus: refreshStatus
         )
     }
 
@@ -210,9 +264,17 @@ final class TransportStubURLProtocol: URLProtocol {
         }
 
         if path.hasSuffix("/auth/refresh") {
-            let token = Self.script.withValue { script -> String in
+            let (token, status) = Self.script.withValue { script -> (String, Int) in
                 script.refreshCount += 1
-                return script.refreshedToken
+                return (script.refreshedToken, script.refreshStatus)
+            }
+            guard status == 200 else {
+                respond(
+                    status: status,
+                    body: Data(#"{"error":"refresh unavailable"}"#.utf8),
+                    contentType: "application/json"
+                )
+                return
             }
             respond(status: 200, body: Data(#"{"token":"\#(token)"}"#.utf8), contentType: "application/json")
             return

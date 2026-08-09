@@ -406,7 +406,7 @@ public actor BlobManager {
             request.setValue(adminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
         }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await NetworkSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -1048,6 +1048,14 @@ public actor BlobManager {
     /// - Everything else — network failures (`URLError`), transport errors,
     ///   any error carrying no HTTP status — is retryable, matching JS's
     ///   `isNetworkError` branch and its `return true` fallthrough.
+    ///
+    /// A refresh-time transport failure takes that last branch: no HTTP
+    /// response was received, so the error carries `status == 0` and never
+    /// reaches the terminal `status >= 400` case. It used to arrive here as a
+    /// synthetic `HttpError(status: 401)`, which is what dropped the upload
+    /// (#2366); the fix is at the throw site in `HttpClient.fetchWithRefresh`,
+    /// so no rule here needs to know how that failure is spelled.
+    /// `BlobRefreshOutageTests` pins the behavior end to end.
     static func shouldQueueError(_ error: Error) -> Bool {
         if let httpError = error as? HttpError {
             let status = httpError.status

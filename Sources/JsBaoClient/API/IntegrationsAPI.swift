@@ -18,16 +18,6 @@ public final class IntegrationsAPI: @unchecked Sendable {
         self.transport = transport
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRawRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRawRequest: @escaping (String, String, Any?) async throws -> HttpClientResponse
-    ) {
-        self.init(transport: ClosureTransport(responseRequest: makeRawRequest))
-    }
-
     /// Call a third-party integration through the server proxy.
     ///
     /// Mirrors the JS client's `client.integrations.call(request)`:

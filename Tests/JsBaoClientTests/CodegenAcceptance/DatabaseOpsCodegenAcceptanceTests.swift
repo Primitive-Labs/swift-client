@@ -23,27 +23,16 @@ import XCTest
 ///     envelope, decoded from a server-shaped payload;
 ///   - the generated `<Type>.Ops` factory binds `<Op>Params` in and `<Op>Result`
 ///     out over the additive generic `DatabasesAPI.executeOperation` overload,
-///     exercised live against a stub transport.
+///     exercised live against a recording transport.
 final class DatabaseOpsCodegenAcceptanceTests: XCTestCase {
 
     // MARK: - Stub transport
 
-    final class StubTransport: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        var response: Any = [String: Any]()
-
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
-        }
-    }
-
-    private func api(_ stub: StubTransport) -> DatabasesAPI {
-        DatabasesAPI(makeRequest: stub.make)
+    /// `RecordingTransport` scripts the response bytes and records the request
+    /// it was handed, which is what the factory tests below assert on. Hold the
+    /// transport so the recorded call can be read back after the `await`.
+    private func api(_ transport: RecordingTransport) -> DatabasesAPI {
+        DatabasesAPI(transport: transport)
     }
 
     // MARK: - Record + params round-trip
@@ -133,34 +122,34 @@ final class DatabaseOpsCodegenAcceptanceTests: XCTestCase {
     // MARK: - Generic executeOperation overload (published surface)
 
     func test_factory_queryOp_bindsTypedResult() async throws {
-        let stub = StubTransport()
-        stub.response = [
-            "data": [["id": "a1", "accountNumber": "0001"]],
-        ]
-        // Drive the generic overload directly against the stub transport (the
-        // generated factory delegates to exactly this call).
-        let result: Portfolio.ListAccountsResult = try await api(stub).executeOperation(
+        let transport = RecordingTransport(
+            json: #"{"data":[{"id":"a1","accountNumber":"0001"}]}"#
+        )
+        // Drive the generic overload directly against the recording transport
+        // (the generated factory delegates to exactly this call).
+        let result: Portfolio.ListAccountsResult = try await api(transport).executeOperation(
             databaseId: "db_1",
             name: "listAccounts",
             params: Portfolio.ListAccountsParams()
         )
-        XCTAssertEqual(stub.method, "POST")
-        XCTAssertEqual(stub.path, "/databases/db_1/operations/listAccounts/execute")
+        let call = try XCTUnwrap(transport.lastCall)
+        XCTAssertEqual(call.method, .post)
+        XCTAssertEqual(call.path, "/databases/db_1/operations/listAccounts/execute")
         XCTAssertEqual(result.data.first?.accountNumber, "0001")
     }
 
     func test_factory_mutationOp_encodesTypedParams() async throws {
-        let stub = StubTransport()
-        stub.response = ["results": [["op": "save", "success": true, "id": "acc_1"]]]
-        let result: Portfolio.SaveAccountResult = try await api(stub).executeOperation(
+        let transport = RecordingTransport(
+            json: #"{"results":[{"op":"save","success":true,"id":"acc_1"}]}"#
+        )
+        let result: Portfolio.SaveAccountResult = try await api(transport).executeOperation(
             databaseId: "db_1",
             name: "saveAccount",
             params: Portfolio.SaveAccountParams(accountNumber: "0001")
         )
         // Typed params were encoded into the request `params` object.
-        let body = stub.body as? [String: Any]
-        let params = body?["params"] as? [String: Any]
-        XCTAssertEqual(params?["accountNumber"] as? String, "0001")
+        let params = try XCTUnwrap(transport.lastCall?.jsonBody?["params"])
+        XCTAssertEqual(params["accountNumber"]?.stringValue, "0001")
         XCTAssertEqual(result.results.first?.id, "acc_1")
     }
 }

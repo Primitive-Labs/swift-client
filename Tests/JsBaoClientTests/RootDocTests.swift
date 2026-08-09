@@ -25,31 +25,30 @@ final class RootDocTests: XCTestCase {
         // #2358: getRoot() must resolve the JWT's rootDocId locally and then
         // fetch that document, matching js-bao (documentsApi.ts getRoot()).
         // There is no `GET /documents/root` route on the server.
-        guard let rootDocId = client.getRootDocId() else {
+        guard let rootDocId = client.rootDocId else {
             return XCTFail("Test JWT should carry a rootDocId")
         }
         let result = try await client.documents.getRoot()
         XCTAssertEqual(
             result.documentId, rootDocId,
-            "getRoot() must return the document identified by getRootDocId()"
+            "getRoot() must return the document identified by rootDocId"
         )
     }
 
     func testGetRootDocIdViaClient() async throws {
-        // After #849/#1109: getRootDocId is a synchronous cached read of
+        // After #849/#1109: rootDocId is a synchronous cached read of
         // the parsed JWT payload (JS `getRootDocId(): string | null` —
         // no HTTP call, no async, no throws). The test-mint endpoint
         // stuffs rootDocId into `payload.user.rootDocId`, so
-        // getRootDocId() must return that exact value.
-        let rootDocId = client.getRootDocId()
+        // rootDocId must return that exact value.
+        let rootDocId = client.rootDocId
         XCTAssertNotNil(rootDocId, "Test JWT should carry a rootDocId")
 
-        let payload = client.getJwtPayload()
-        let userClaims = payload?["user"] as? [String: Any]
-        let expected = userClaims?["rootDocId"] as? String
-            ?? payload?["rootDocId"] as? String
+        let payload = client.jwtPayload
+        let expected = payload?["user"]?["rootDocId"]?.stringValue
+            ?? payload?["rootDocId"]?.stringValue
         XCTAssertEqual(rootDocId, expected,
-                       "getRootDocId() must mirror the JWT payload's rootDocId")
+                       "rootDocId must mirror the JWT payload's rootDocId")
     }
 
     func testListFiltersRootByDefault() async throws {
@@ -59,7 +58,7 @@ final class RootDocTests: XCTestCase {
         // so we assert the faithful surviving contract: the root doc is
         // filtered out of the default listing, yet getRoot() resolves it
         // directly. (`includeRoot: true` would surface it, like JS.)
-        guard let root = client.getRootDocId() else {
+        guard let root = client.rootDocId else {
             return XCTFail("Test JWT must include rootDocId for this test")
         }
         // Make sure the root doc has been materialized server-side so
@@ -112,7 +111,7 @@ final class RootDocTests: XCTestCase {
     func testIsRootDocumentMatchesJwt() async throws {
         // isRootDocument should also resolve from the JWT payload, not
         // a separate HTTP-backed cache that has to warm up first.
-        guard let rootDocId = client.getRootDocId() else {
+        guard let rootDocId = client.rootDocId else {
             return XCTFail("Test JWT should carry a rootDocId")
         }
         XCTAssertTrue(client.isRootDocument(rootDocId))

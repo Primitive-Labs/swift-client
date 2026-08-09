@@ -41,11 +41,11 @@ public final class MeAPI: @unchecked Sendable {
     /// local-first call skips spawning a second concurrent fetch.
     private var refreshInFlight = false
 
-    private static let defaultRefreshIfOlderThanMs = 5 * 60 * 1000 // 5 minutes
+    private static let defaultRefreshIfOlderThan: TimeInterval = 5 * 60 // 5 minutes
 
     /// JS's `serverTimeoutMs` default for list calls
     /// (`documentsApi.ts`: `?? 10000`).
-    private static let defaultServerTimeoutMs = 10000
+    private static let defaultServerTimeout: TimeInterval = 10
 
     /// Public initializer — the typed transport spine. `Logger` is internal,
     /// so the logger-carrying designated initializer below is too; the SDK
@@ -88,22 +88,6 @@ public final class MeAPI: @unchecked Sendable {
         self.logger = logger
     }
 
-    @available(*, deprecated, message: "Use init(transport:cache:localMetadata:isOnline:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        cache: CacheFacade? = nil,
-        makeRawRequest: ((String, String, Data?, [String: String]) async throws -> (Data, Int))? = nil,
-        localMetadata: @escaping () -> [String: LocalMetadataEntry] = { [:] },
-        isOnline: @escaping () -> Bool = { true }
-    ) {
-        self.init(
-            transport: ClosureTransport(makeRequest: makeRequest, makeRawRequest: makeRawRequest),
-            cache: cache,
-            localMetadata: localMetadata,
-            isOnline: isOnline
-        )
-    }
-
     /// Retrieves the current user's profile, using the cache when available.
     /// Returns `nil` when there is no current user. Mirrors js-bao's
     /// `me.get(options)` → `UserProfile | null`. `FetchCachedOptions` maps
@@ -122,8 +106,8 @@ public final class MeAPI: @unchecked Sendable {
         let mergedOptions = FetchCachedOptions(
             waitForLoad: options?.waitForLoad,
             refreshNetwork: options?.refreshNetwork,
-            refreshIfOlderThanMs: options?.refreshIfOlderThanMs ?? Self.defaultRefreshIfOlderThanMs,
-            serverTimeoutMs: options?.serverTimeoutMs
+            refreshIfOlderThan: options?.refreshIfOlderThan ?? Self.defaultRefreshIfOlderThan,
+            serverTimeout: options?.serverTimeout
         )
 
         let value = try await cache.fetchCachedJSON(
@@ -394,7 +378,7 @@ public final class MeAPI: @unchecked Sendable {
         let localOnly = options?.localOnly == true
         let refreshFromServer = localOnly ? false : (options?.refreshFromServer != false)
         let waitForLoad = options?.waitForLoad ?? .localIfAvailableElseNetwork
-        let timeoutMs = options?.serverTimeoutMs ?? Self.defaultServerTimeoutMs
+        let timeoutMs = (options?.serverTimeout ?? Self.defaultServerTimeout).wholeMilliseconds
 
         // 1. Caller asked for the cache: no server call at all.
         if localOnly || !refreshFromServer || waitForLoad == .local {

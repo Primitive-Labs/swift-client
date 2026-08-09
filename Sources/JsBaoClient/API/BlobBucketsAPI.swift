@@ -19,21 +19,6 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         self.transport = transport
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closures
-    /// are wrapped in an adapter so existing call sites keep working for one
-    /// major cycle.
-    ///
-    /// When no `makeRawRequest` closure is supplied, `upload` / `download`
-    /// surface `CLIENT_LEGACY_TRANSPORT_UNSUPPORTED_OPTIONS` from the adapter
-    /// (the legacy JSON closure cannot carry raw bytes).
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        makeRawRequest: ((String, String, Data?, [String: String]) async throws -> (Data, Int))? = nil
-    ) {
-        self.init(transport: ClosureTransport(makeRequest: makeRequest, makeRawRequest: makeRawRequest))
-    }
-
     // MARK: - Bucket CRUD
 
     /// Create a new blob bucket (admin/owner only).

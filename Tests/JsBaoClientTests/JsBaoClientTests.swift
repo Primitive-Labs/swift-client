@@ -300,13 +300,13 @@ final class JsBaoClientTests: XCTestCase {
 
         // Default mode .auto: reporting-only isOnline() reflects transport, so
         // it is false while disconnected; the networking gate stays open.
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
         XCTAssertFalse(client.isOnline())
         XCTAssertTrue(client.networkingAllowed())
 
         await client.goOffline()
         XCTAssertFalse(client.isOnline())
-        XCTAssertEqual(client.getNetworkMode(), .offline)
+        XCTAssertEqual(client.networkMode, .offline)
 
         await client.goOnline()
         XCTAssertTrue(client.isOnline())

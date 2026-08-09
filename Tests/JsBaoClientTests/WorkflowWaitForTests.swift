@@ -37,17 +37,21 @@ private func statusEnvelope(
 /// occurred while the socket was down (iOS backgrounding) was lost permanently.
 ///
 /// These tests exercise the fix directly on `WorkflowsAPI`, driven through its
-/// injected `makeRequest` transport (the runId-keyed reconcile fetch) and a real
+/// injected `Transport` (the runId-keyed reconcile fetch) and a real
 /// `EventEmitter` (the `.workflowStatus` terminal frame and the `.status`
 /// reconnect event) — no dev server, no network. That is the same dependency
 /// injection `JsBaoClient` uses to construct `WorkflowsAPI`.
 final class WorkflowWaitForTests: XCTestCase {
 
     /// Controllable stand-in for the client's HTTP transport. Every
-    /// `getStatusByRunId` call routes through `make`; the test swaps `responder`
-    /// to model the run's server-side state changing over time (e.g. terminating
-    /// while the socket is down).
-    private final class StubTransport: @unchecked Sendable {
+    /// `getStatusByRunId` call routes through `execute`; the test swaps
+    /// `responder` to model the run's server-side state changing over time
+    /// (e.g. terminating while the socket is down).
+    ///
+    /// The responders still speak the loose `Any` JSON graph the test bodies
+    /// build; `execute` serializes that graph into the response bytes the
+    /// `Transport` protocol requires (#2367).
+    private final class StubTransport: Transport, @unchecked Sendable {
         private let lock = NSLock()
         private var responder: (@Sendable (String, String, Any?) throws -> Any)?
         // Async variant, given the 1-based call index. When set it takes
@@ -66,15 +70,50 @@ final class WorkflowWaitForTests: XCTestCase {
             lock.withLock { asyncResponder = r }
         }
 
-        @Sendable
-        func make(_ method: String, _ path: String, _ body: Any?) async throws -> Any {
+        func execute(
+            method: HTTPMethod,
+            path: String,
+            body: Data?,
+            options: RequestOptions?
+        ) async throws -> TransportResponse {
             let (idx, ar, r) = lock.withLock {
                 _callCount += 1
                 return (_callCount, asyncResponder, responder)
             }
-            if let ar { return try await ar(method, path, body, idx) }
-            guard let r else { throw HttpError(status: 500, message: "no responder configured") }
-            return try r(method, path, body)
+            let parsedBody = body.flatMap {
+                try? JSONSerialization.jsonObject(with: $0, options: .fragmentsAllowed)
+            }
+            do {
+                let value: Any
+                if let ar {
+                    value = try await ar(method.rawValue, path, parsedBody, idx)
+                } else if let r {
+                    value = try r(method.rawValue, path, parsedBody)
+                } else {
+                    throw HttpError(status: 500, message: "no responder configured")
+                }
+                return Self.jsonResponse(status: 200, value: value)
+            } catch let error as HttpError {
+                // `Transport.execute` reports a non-2xx status instead of
+                // throwing — the protocol extension is what turns it into an
+                // `HttpError`. Mapping a responder's `HttpError` back into a
+                // response keeps the real status-handling path under test.
+                return Self.jsonResponse(
+                    status: error.status,
+                    value: ["error": error.message]
+                )
+            }
+        }
+
+        private static func jsonResponse(status: Int, value: Any) -> TransportResponse {
+            let data =
+                (try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]))
+                ?? Data()
+            return TransportResponse(
+                status: status,
+                headers: ["Content-Type": "application/json"],
+                body: data
+            )
         }
     }
 
@@ -93,7 +132,7 @@ final class WorkflowWaitForTests: XCTestCase {
     }
 
     private func makeApi(_ stub: StubTransport, _ emitter: EventEmitter) -> WorkflowsAPI {
-        WorkflowsAPI(makeRequest: stub.make, getConnectionId: { "conn-test" }, events: emitter)
+        WorkflowsAPI(transport: stub, getConnectionId: { "conn-test" }, events: emitter)
     }
 
     private func wfEvent(
@@ -132,7 +171,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let task = Task { try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 5)) }
         await settle()
         emitter.emit(wfEvent(runId: "r1", status: "completed", output: ["answer": 42]))
 
@@ -157,7 +196,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "r2", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let task = Task { try await api.waitFor(runId: "r2", options: WaitForWorkflowOptions(timeout: 5)) }
         await settle()
 
         // The run terminated during the outage; the terminal frame was never
@@ -183,7 +222,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
         let start = Date()
         do {
-            _ = try await api.waitFor(runId: "r3", options: WaitForWorkflowOptions(timeoutMs: 250))
+            _ = try await api.waitFor(runId: "r3", options: WaitForWorkflowOptions(timeout: 0.25))
             XCTFail("waitFor should have timed out")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .workflowWaitTimeout)
@@ -201,7 +240,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "r4", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let task = Task { try await api.waitFor(runId: "r4", options: WaitForWorkflowOptions(timeout: 5)) }
         await settle()
         emitter.emit(wfEvent(runId: "r4", status: "completed", output: ["v": 1]))
         let result = try await task.value
@@ -221,7 +260,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "r5", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let task = Task { try await api.waitFor(runId: "r5", options: WaitForWorkflowOptions(timeout: 5)) }
         await settle()
         emitter.emit(wfEvent(runId: "r5", status: "failed", error: "boom"))
 
@@ -237,7 +276,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "r6", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let task = Task { try await api.waitFor(runId: "r6", options: WaitForWorkflowOptions(timeout: 5)) }
         await settle()
         emitter.emit(wfEvent(runId: "r6", status: "terminated"))
 
@@ -251,7 +290,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "r7", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let task = Task { try await api.waitFor(runId: "r7", options: WaitForWorkflowOptions(timeout: 5)) }
         await settle()
         // The server broadcasts status "completed" with needsApply true while the
         // run row is apply_pending.
@@ -273,7 +312,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let result = try await api.waitFor(runId: "r8", options: WaitForWorkflowOptions(timeoutMs: 5_000))
+        let result = try await api.waitFor(runId: "r8", options: WaitForWorkflowOptions(timeout: 5))
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(result.output?["x"]?.stringValue, "y")
     }
@@ -297,7 +336,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let api = makeApi(stub, emitter)
 
         do {
-            _ = try await api.waitFor(runId: "r9", options: WaitForWorkflowOptions(timeoutMs: 300))
+            _ = try await api.waitFor(runId: "r9", options: WaitForWorkflowOptions(timeout: 0.3))
             XCTFail("endedAt alone must not settle waitFor")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .workflowWaitTimeout)
@@ -315,7 +354,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let api = makeApi(stub, emitter)
 
         do {
-            _ = try await api.waitFor(runId: "r10", options: WaitForWorkflowOptions(timeoutMs: 300))
+            _ = try await api.waitFor(runId: "r10", options: WaitForWorkflowOptions(timeout: 0.3))
             XCTFail("an errorMessage must not be inferred as a terminal 'failed'")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .workflowWaitTimeout)
@@ -333,7 +372,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let result = try await api.waitFor(runId: "r9b", options: WaitForWorkflowOptions(timeoutMs: 5_000))
+        let result = try await api.waitFor(runId: "r9b", options: WaitForWorkflowOptions(timeout: 5))
         XCTAssertEqual(result.status, "terminated", "a terminated run must not resolve as completed")
         XCTAssertTrue(result.isTerminal)
         XCTAssertFalse(result.isFailure)
@@ -348,7 +387,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let api = makeApi(stub, emitter)
 
         do {
-            _ = try await api.waitFor(runId: "missing", options: WaitForWorkflowOptions(timeoutMs: 5_000))
+            _ = try await api.waitFor(runId: "missing", options: WaitForWorkflowOptions(timeout: 5))
             XCTFail("expected NOT_FOUND")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .notFound)
@@ -377,8 +416,8 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let taskA = Task { try await api.waitFor(runId: "A", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
-        let taskB = Task { try await api.waitFor(runId: "B", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let taskA = Task { try await api.waitFor(runId: "A", options: WaitForWorkflowOptions(timeout: 5)) }
+        let taskB = Task { try await api.waitFor(runId: "B", options: WaitForWorkflowOptions(timeout: 5)) }
         await settle()
 
         emitter.emit(wfEvent(runId: "A", status: "completed", output: ["who": "A"]))
@@ -402,7 +441,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let api = makeApi(stub, emitter)
 
         let task = Task {
-            try await api.waitFor(runId: "r11", as: Payload.self, options: WaitForWorkflowOptions(timeoutMs: 5_000))
+            try await api.waitFor(runId: "r11", as: Payload.self, options: WaitForWorkflowOptions(timeout: 5))
         }
         await settle()
         emitter.emit(wfEvent(runId: "r11", status: "completed", output: ["answer": 7]))
@@ -471,7 +510,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let result = try await api.waitFor(runId: "n5", options: WaitForWorkflowOptions(timeoutMs: 5_000))
+        let result = try await api.waitFor(runId: "n5", options: WaitForWorkflowOptions(timeout: 5))
         XCTAssertEqual(result.status, "failed")
         XCTAssertTrue(result.isFailure)
         XCTAssertEqual(result.error, "boom")
@@ -491,7 +530,7 @@ final class WorkflowWaitForTests: XCTestCase {
         XCTAssertEqual(result.status, "queued")
 
         do {
-            _ = try await api.waitFor(runId: "n4e", options: WaitForWorkflowOptions(timeoutMs: 300))
+            _ = try await api.waitFor(runId: "n4e", options: WaitForWorkflowOptions(timeout: 0.3))
             XCTFail("a queued run must not settle waitFor")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .workflowWaitTimeout)
@@ -527,7 +566,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "rq", options: WaitForWorkflowOptions(timeoutMs: 5_000)) }
+        let task = Task { try await api.waitFor(runId: "rq", options: WaitForWorkflowOptions(timeout: 5)) }
 
         // Wait until the subscribe-time reconcile fetch is in flight.
         while stub.callCount < 1 { try? await Task.sleep(nanoseconds: 5_000_000) }
@@ -550,7 +589,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
     /// A cancelled awaiting Task must settle the wait promptly (throwing
     /// `CancellationError`) and tear down both subscriptions — even when
-    /// `timeoutMs <= 0` disables the timer, which is the case that would
+    /// `timeout <= 0` disables the timer, which is the case that would
     /// otherwise leak the listeners indefinitely.
     func testCancellationThrowsAndTearsDownWithNoTimeout() async throws {
         let stub = StubTransport()
@@ -559,9 +598,9 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        // timeoutMs = 0 disables the timeout: without cancellation support the
+        // timeout = 0 disables the timeout: without cancellation support the
         // listeners would live forever.
-        let task = Task { try await api.waitFor(runId: "rc", options: WaitForWorkflowOptions(timeoutMs: 0)) }
+        let task = Task { try await api.waitFor(runId: "rc", options: WaitForWorkflowOptions(timeout: 0)) }
         await settle()
         // Both the .workflowStatus and .status listeners are registered.
         XCTAssertEqual(emitter.activeHandlerCount, 2, "waitFor should have two active subscriptions while waiting")
@@ -588,7 +627,7 @@ final class WorkflowWaitForTests: XCTestCase {
         let emitter = EventEmitter()
         let api = makeApi(stub, emitter)
 
-        let task = Task { try await api.waitFor(runId: "rc2", options: WaitForWorkflowOptions(timeoutMs: 0)) }
+        let task = Task { try await api.waitFor(runId: "rc2", options: WaitForWorkflowOptions(timeout: 0)) }
         task.cancel()
 
         do {
@@ -638,7 +677,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
         let result = try await api.waitFor(
             runId: "fw1",
-            options: WaitForWorkflowOptions(timeoutMs: 20_000)
+            options: WaitForWorkflowOptions(timeout: 20)
         )
         XCTAssertEqual(result.status, "completed")
         // Settled with the real output, not an empty terminal read off the row.
@@ -678,7 +717,7 @@ final class WorkflowWaitForTests: XCTestCase {
 
         let result = try await api.waitFor(
             runId: "fw4",
-            options: WaitForWorkflowOptions(timeoutMs: 20_000)
+            options: WaitForWorkflowOptions(timeout: 20)
         )
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(result.output?["done"]?.boolValue, true)
@@ -706,7 +745,7 @@ final class WorkflowWaitForTests: XCTestCase {
         do {
             _ = try await api.waitFor(
                 runId: "fw5",
-                options: WaitForWorkflowOptions(timeoutMs: 20_000)
+                options: WaitForWorkflowOptions(timeout: 20)
             )
             XCTFail("expected .notFound")
         } catch let error as JsBaoError {
@@ -733,7 +772,7 @@ final class WorkflowWaitForTests: XCTestCase {
         do {
             _ = try await api.waitFor(
                 runId: "fw2",
-                options: WaitForWorkflowOptions(timeoutMs: 400)
+                options: WaitForWorkflowOptions(timeout: 0.4)
             )
             XCTFail("waitFor should have timed out")
         } catch let error as JsBaoError {
@@ -756,7 +795,7 @@ final class WorkflowWaitForTests: XCTestCase {
         do {
             _ = try await api.waitFor(
                 runId: "fw3",
-                options: WaitForWorkflowOptions(timeoutMs: 60_000)
+                options: WaitForWorkflowOptions(timeout: 60)
             )
             XCTFail("expected .notFound")
         } catch let error as JsBaoError {

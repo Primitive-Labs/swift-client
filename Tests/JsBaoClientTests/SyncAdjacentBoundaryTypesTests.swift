@@ -171,7 +171,11 @@ final class SyncAdjacentBoundaryTypesTests: XCTestCase {
         ))
 
         let received = ThreadSafeBox<[DatabaseChangePayload]>([])
-        registry.register(databaseId: "db1", subscriptionKey: "k1", params: ["limit": 10]) { payload in
+        // `register` hands back the registration's identity, which `unregister`
+        // needs so a stale handle cannot remove a live registration.
+        let registration = registry.register(
+            databaseId: "db1", subscriptionKey: "k1", params: ["limit": 10]
+        ) { payload in
             received.mutate { $0.append(payload) }
         }
 
@@ -206,7 +210,10 @@ final class SyncAdjacentBoundaryTypesTests: XCTestCase {
 
         // Unregister is what `clear()` never got used for — it still works, and
         // it is the only removal path the client has.
-        registry.unregister(databaseId: "db1", subscriptionKey: "k1")
+        XCTAssertTrue(
+            registry.unregister(databaseId: "db1", subscriptionKey: "k1", id: registration),
+            "the live registration's own id must remove it"
+        )
         XCTAssertTrue(registry.list().isEmpty)
         registry.dispatch([
             "databaseId": "db1", "subscriptionKey": "k1", "changes": [],
@@ -223,12 +230,21 @@ final class SyncAdjacentBoundaryTypesTests: XCTestCase {
     func testDispatchDoesNotHoldTheLockWhileCallingBack() {
         let registry = DatabaseSubscriptionRegistry(logger: Logger(level: .none, scope: "db-sub"))
         let reentered = ThreadSafeBox<Bool>(false)
+        // The handler needs its own registration id to unregister itself, and
+        // that id only exists once `register` returns — so it is handed over
+        // through a box the handler reads at dispatch time.
+        let handle = ThreadSafeBox<DatabaseSubscriptionRegistry.RegistrationID?>(nil)
 
-        registry.register(databaseId: "db1", subscriptionKey: "k1", params: [:]) { [weak registry] _ in
+        let registration = registry.register(
+            databaseId: "db1", subscriptionKey: "k1", params: [:]
+        ) { [weak registry] _ in
             // Re-entering under a held non-recursive lock would deadlock here.
-            registry?.unregister(databaseId: "db1", subscriptionKey: "k1")
+            if let id = handle.value {
+                registry?.unregister(databaseId: "db1", subscriptionKey: "k1", id: id)
+            }
             reentered.mutate { $0 = true }
         }
+        handle.mutate { $0 = registration }
 
         registry.dispatch([
             "databaseId": "db1", "subscriptionKey": "k1", "changes": [],

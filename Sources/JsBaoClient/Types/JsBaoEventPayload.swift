@@ -18,10 +18,10 @@ import Foundation
 /// be observed under a key it is never delivered on — the mistake that made a
 /// mis-annotated `events.on` handler silently never fire.
 ///
-/// Every event the client emits has exactly one conforming payload type. The two
-/// deprecated cases that are never emitted — `JsBaoEvent.auth` and
-/// `JsBaoEvent.blobsUploadQueued` — deliberately have none, so there is nothing
-/// to subscribe to.
+/// Every event the client emits has exactly one conforming payload type. Since
+/// #2367 there are no exceptions — the never-emitted `auth` /
+/// `blobsUploadQueued` cases and the Swift-only `remoteUpdate` case were
+/// removed along with the rest of the deprecated surface.
 public protocol JsBaoEventPayload: Sendable {
     /// The event key this payload is always delivered under.
     static var eventKey: JsBaoEvent { get }
@@ -55,36 +55,6 @@ public extension JsBaoEventPayload {
     static var isReplayable: Bool { false }
 }
 
-/// Adapt an untyped `(JsBaoEvent, Any)` emit closure onto the typed one.
-///
-/// The one place the deprecated untyped emit closures are bridged. The key
-/// always comes from the payload's own type, so an adapted closure cannot pair
-/// a payload with a key nothing delivers it under.
-func adaptUntypedEmit(
-    _ emit: @escaping @Sendable (JsBaoEvent, Any) -> Void
-) -> @Sendable (any JsBaoEventPayload) -> Void {
-    { payload in emit(Swift.type(of: payload).eventKey, payload) }
-}
-
-// MARK: - Legacy dictionary bridge
-
-/// Internal bridge for the payload types that replaced a `[String: Any]` emit.
-///
-/// Nine events used to be emitted as bare dictionaries. Converting them to typed
-/// payloads would silently stop an existing
-/// `events.on(.offlineAuthEnabled) { (d: [String: Any]) in … }` handler from
-/// firing, which is exactly the class of failure the typed surface exists to
-/// remove. So for the whole deprecation window the callback shim converts back:
-/// `on` falls back to this representation when the handler's annotation is not
-/// the typed struct, and `onAny` delivers it verbatim.
-///
-/// The dictionary must reproduce the pre-conversion payload key-for-key,
-/// including omitting optional keys that were absent, and preserving the
-/// original Swift value types (an `Int` stays an `Int`, not a `Double`).
-protocol LegacyEventDictionary {
-    var legacyDictionary: [String: Any] { get }
-}
-
 // MARK: - New payload types (ported from the JS `JsBaoEvents` map)
 
 /// Payload for `.meUpdated`. Fires when the signed-in user's own record
@@ -109,45 +79,20 @@ public struct MeUpdatedEvent: JsBaoEventPayload {
     /// When the record was updated, when the frame carries it.
     public let updatedAt: String?
 
-    /// The whole server frame, retained only so the deprecated callback shim
-    /// can hand back byte-for-byte what it delivered before this event became
-    /// a typed struct.
-    private let frame: JSONValue
-
     public init(value: JSONValue, source: String? = nil, updatedAt: String? = nil) {
         self.value = value
         self.source = source
         self.updatedAt = updatedAt
-        var frame: [String: JSONValue] = [
-            "type": .string(Self.eventKey.rawValue),
-            "value": value,
-        ]
-        if let source { frame["source"] = .string(source) }
-        if let updatedAt { frame["updatedAt"] = .string(updatedAt) }
-        self.frame = .object(frame)
     }
 
     /// Build from the raw `meUpdated` WebSocket frame.
     ///
-    /// The pre-conversion emit handed subscribers this whole frame, so it is
-    /// kept verbatim for `legacyDictionary` while the typed fields are read out
-    /// of it. `source` is `"server"` for the same reason the JS client sets it
-    /// there: this initializer is only reached from a server push.
+    /// `source` is `"server"` for the same reason the JS client sets it there:
+    /// this initializer is only reached from a server push.
     init(serverFrame: JSONValue) {
-        self.frame = serverFrame
         self.value = serverFrame["value"] ?? .null
         self.source = serverFrame["source"]?.stringValue ?? "server"
         self.updatedAt = serverFrame["updatedAt"]?.stringValue
-    }
-}
-
-extension MeUpdatedEvent: LegacyEventDictionary {
-    /// The raw server frame this event used to be emitted as — `{"type":
-    /// "meUpdated", "value": …}`, not the me record. Rendered through
-    /// `JSONCoding`, so JSON numbers arrive as `NSNumber` and still bridge to
-    /// `Int` or `Double` at the call site.
-    var legacyDictionary: [String: Any] {
-        (try? JSONCoding.jsonObject(from: frame)) as? [String: Any] ?? [:]
     }
 }
 
@@ -164,12 +109,6 @@ public struct PendingCreateFailedEvent: JsBaoEventPayload {
     public init(documentId: String, error: String) {
         self.documentId = documentId
         self.error = error
-    }
-}
-
-extension PendingCreateFailedEvent: LegacyEventDictionary {
-    var legacyDictionary: [String: Any] {
-        ["documentId": documentId, "error": error]
     }
 }
 
@@ -202,19 +141,6 @@ public struct AuthRefreshDeferredEvent: JsBaoEventPayload {
     }
 }
 
-extension AuthRefreshDeferredEvent: LegacyEventDictionary {
-    /// Optional keys are omitted rather than set to `NSNull`, matching the
-    /// pre-conversion emit — callers distinguish "no next attempt promised"
-    /// by the key's absence.
-    var legacyDictionary: [String: Any] {
-        var details: [String: Any] = ["status": status]
-        if let cause { details["cause"] = cause }
-        if let nextAttemptMs { details["nextAttemptMs"] = nextAttemptMs }
-        if let error { details["error"] = error }
-        return details
-    }
-}
-
 /// Payload for `.offlineAuthEnabled`. Fires when an offline-auth grant is
 /// stored, so the app can sign in without the network. Mirrors the JS client's
 /// `OfflineAuthEnabledEvent`.
@@ -227,10 +153,6 @@ public struct OfflineAuthEnabledEvent: JsBaoEventPayload {
     public init(method: String) {
         self.method = method
     }
-}
-
-extension OfflineAuthEnabledEvent: LegacyEventDictionary {
-    var legacyDictionary: [String: Any] { ["method": method] }
 }
 
 /// Payload for `.offlineAuthUnlocked`. Fires when a stored offline-auth grant
@@ -246,10 +168,6 @@ public struct OfflineAuthUnlockedEvent: JsBaoEventPayload {
     }
 }
 
-extension OfflineAuthUnlockedEvent: LegacyEventDictionary {
-    var legacyDictionary: [String: Any] { ["userId": userId] }
-}
-
 /// Payload for `.offlineAuthFailed`. Fires when an offline-auth unlock could
 /// not complete. Mirrors the JS client's `OfflineAuthFailedEvent`.
 public struct OfflineAuthFailedEvent: JsBaoEventPayload {
@@ -263,10 +181,6 @@ public struct OfflineAuthFailedEvent: JsBaoEventPayload {
     }
 }
 
-extension OfflineAuthFailedEvent: LegacyEventDictionary {
-    var legacyDictionary: [String: Any] { ["reason": reason] }
-}
-
 /// Payload for `.offlineAuthRenewed`. Fires when a stored offline-auth grant's
 /// lifetime was extended. Carries no fields, matching the JS client's
 /// `OfflineAuthRenewedEvent`.
@@ -274,10 +188,6 @@ public struct OfflineAuthRenewedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .offlineAuthRenewed }
 
     public init() {}
-}
-
-extension OfflineAuthRenewedEvent: LegacyEventDictionary {
-    var legacyDictionary: [String: Any] { [:] }
 }
 
 /// Payload for `.offlineAuthRevoked`. Fires when a stored offline-auth grant
@@ -293,10 +203,6 @@ public struct OfflineAuthRevokedEvent: JsBaoEventPayload {
     }
 }
 
-extension OfflineAuthRevokedEvent: LegacyEventDictionary {
-    var legacyDictionary: [String: Any] { ["wipeLocal": wipeLocal] }
-}
-
 /// Payload for `.blobsQueueDrained`. Fires when the blob upload queue has no
 /// remaining work. Carries no fields.
 ///
@@ -308,10 +214,6 @@ public struct BlobsQueueDrainedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .blobsQueueDrained }
 
     public init() {}
-}
-
-extension BlobsQueueDrainedEvent: LegacyEventDictionary {
-    var legacyDictionary: [String: Any] { [:] }
 }
 
 // MARK: - Conformances for the existing payload types
@@ -409,21 +311,6 @@ extension SchemaDiscoveredEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .schemaDiscovered }
 }
 
-extension RemoteUpdateEvent: JsBaoEventPayload {
-    /// Resolved from `JsBaoClient.remoteUpdateRawKey` rather than naming the
-    /// deprecated `.remoteUpdate` case, the same escape hatch
-    /// `JsBaoClient.emitRemoteUpdate` uses so the client's own code does not
-    /// trip the case's deprecation during its window (#1120).
-    ///
-    /// The lookup always succeeds: the raw key is the case's own `rawValue`,
-    /// which `DeprecationWindowInternalUseTests` guards against drift, and
-    /// `JsBaoEventPayloadTests` asserts this key resolves to `"remoteUpdate"`.
-    /// The fallback only keeps this a total function, and points at the
-    /// documented migration target for `.remoteUpdate`.
-    public static var eventKey: JsBaoEvent {
-        JsBaoEvent(rawValue: JsBaoClient.remoteUpdateRawKey) ?? .documentSyncStateChanged
-    }
-}
 
 extension ConnectionCloseEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .connectionClose }
@@ -524,7 +411,6 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     AwarenessEvent.self,
     PermissionEvent.self,
     SchemaDiscoveredEvent.self,
-    RemoteUpdateEvent.self,
     ConnectionCloseEvent.self,
     ConnectionErrorEvent.self,
     GenericErrorEvent.self,
@@ -546,13 +432,11 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
 
 /// The event keys that have no payload type, and why.
 ///
-/// Both are deprecated Swift-only cases that nothing emits (#1120), so there is
-/// nothing for a payload to carry and no stream to open. Listed by raw value so
-/// naming them here does not trip their own deprecation.
-let unpayloadedJsBaoEventKeys: Set<String> = [
-    "auth",
-    "blobs:upload-queued",
-]
+/// Empty since #2367 removed the three deprecated cases that used to live here
+/// (`auth`, `blobs:upload-queued`, `remoteUpdate`). Kept as a declared, checked
+/// set so a future unpayloaded key has to be listed deliberately rather than
+/// silently skipping the payload-coverage guard.
+let unpayloadedJsBaoEventKeys: Set<String> = []
 
 /// Event keys the Swift client declares that the JS client's `JsBaoEvents` map
 /// does not.
@@ -562,12 +446,6 @@ let unpayloadedJsBaoEventKeys: Set<String> = [
 /// neither in the JS map nor listed here, so a new Swift-only event forces a
 /// decision. Listed by raw value.
 let swiftOnlyJsBaoEventKeys: Set<String> = [
-    // Swift-only and deprecated, never emitted (#1120). (`auth` is not listed:
-    // the JS map does carry an `auth` key as a legacy catch-all, it is just
-    // never emitted on either side.)
-    "blobs:upload-queued",
-    // Swift-only and deprecated, still emitted during its window (#1120).
-    "remoteUpdate",
     // `KvCache` lifecycle. Both clients emit these (JS from `kv-cache.ts`),
     // but the JS map covers only the client's own events, not the cache's.
     "cacheUpdated",

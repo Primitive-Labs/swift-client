@@ -18,62 +18,87 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// The client's event registry.
     ///
-    /// The client's own listeners go through this reference so they are not
-    /// affected by the public `events` property's deprecation.
-    let eventEmitter: EventEmitter
-
-    /// Event emitter for subscribing to client events.
-    ///
-    /// Replaced by the typed surface on the client itself:
+    /// Internal since #2367 removed the untyped public `events` surface.
+    /// Subscribe through the typed client members instead:
     /// ``stream(for:buffering:replayingLatest:)``,
     /// ``observeOnMainActor(_:handler:)`` and ``nextEvent(_:timeout:where:)``.
-    /// Those derive the event key from the payload type, so a mis-annotated
-    /// handler stops compiling instead of silently never firing.
-    @available(*, deprecated, message: "Use client.stream(for:) / observeOnMainActor(_:handler:) / nextEvent(_:) — the untyped event surface is removed in the next major release.")
-    public var events: EventEmitter { eventEmitter }
+    let eventEmitter: EventEmitter
 
-    /// Sub-APIs
-    public private(set) var documents: DocumentsAPI!
-    public private(set) var collections: CollectionsAPI!
-    public private(set) var databases: DatabasesAPI!
-    public private(set) var me: MeAPI!
-    public private(set) var session: SessionAPI!
-    public private(set) var auth: AuthAPI!
-    public private(set) var llm: LlmAPI!
-    public private(set) var gemini: GeminiAPI!
-    public private(set) var users: UsersAPI!
-    public private(set) var groups: GroupsAPI!
-    public private(set) var ruleSets: RuleSetsAPI!
-    public private(set) var groupTypeConfigs: GroupTypeConfigsAPI!
-    public private(set) var integrations: IntegrationsAPI!
-    public private(set) var prompts: PromptsAPI!
-    public private(set) var workflows: WorkflowsAPI!
-    public private(set) var invitations: InvitationsAPI!
+    // MARK: - Sub-APIs
+    //
+    // None of these is an implicitly-unwrapped optional any more (#2367). A
+    // `DocumentsAPI!` in the public surface was a crash-typed declaration
+    // leaking a two-phase-init workaround: every one of them is assigned
+    // during `init` and none is ever nil for a caller.
+    //
+    // The ones whose collaborators are all available as locals during phase 1
+    // are plain `let`s, built in `init` before `setupDependencies()`. The
+    // remaining six — `documents`, `me`, `auth`, `users`, `cache`, `codegen` —
+    // reach client-level logic that has no collaborator behind it
+    // (`networkingAllowed()`, `networkMode`, `rootDocId`, `logout(...)`, or
+    // `self` itself), so Swift's two-phase rule makes a `let` impossible for
+    // them. They keep private implicitly-unwrapped storage assigned in
+    // `setupSubApis()`, behind a non-optional public computed property.
+
+    public let collections: CollectionsAPI
+    public let databases: DatabasesAPI
+    public let session: SessionAPI
+    public let llm: LlmAPI
+    public let gemini: GeminiAPI
+    public let groups: GroupsAPI
+    public let ruleSets: RuleSetsAPI
+    public let groupTypeConfigs: GroupTypeConfigsAPI
+    public let integrations: IntegrationsAPI
+    public let prompts: PromptsAPI
+    public let workflows: WorkflowsAPI
+    public let invitations: InvitationsAPI
     /// Sub-API for the notification inbox and push-device registration
     /// (list / unreadCount / markRead / markAllRead / send / registerDevice /
     /// listDevices / unregisterDevice). Live in-app notifications arrive as
     /// the `.notification` event. Mirrors JS `client.notifications.*`.
-    public private(set) var notifications: NotificationsAPI!
+    public let notifications: NotificationsAPI
     /// Sub-API for the named lock service (tryAcquire / acquire / release /
     /// renew / status / list). Leases are mandatory-TTL and the opaque
     /// `handleId` proves holder identity. Mirrors JS `client.locks.*`.
-    public private(set) var locks: LocksAPI!
+    public let locks: LocksAPI
     /// Sub-API for typed resource metadata values (get / set / getBatch /
     /// list / delete). Category definitions are admin-scoped and are not
     /// exposed here. Mirrors JS `client.resourceMetadata.*`.
-    public private(set) var resourceMetadata: ResourceMetadataAPI!
-    public private(set) var blobBuckets: BlobBucketsAPI!
-    public private(set) var cronTriggers: CronTriggersAPI!
-    public private(set) var collectionTypeConfigs: CollectionTypeConfigsAPI!
-    public private(set) var databaseTypeConfigs: DatabaseTypeConfigsAPI!
-    public private(set) var analytics: AnalyticsAPI!
+    public let resourceMetadata: ResourceMetadataAPI
+    public let blobBuckets: BlobBucketsAPI
+    public let cronTriggers: CronTriggersAPI
+    public let collectionTypeConfigs: CollectionTypeConfigsAPI
+    public let databaseTypeConfigs: DatabaseTypeConfigsAPI
+    public let analytics: AnalyticsAPI
     /// Deep-link / universal-link routing (#931). Set
     /// `links.appBaseURL` to your app's public web base URL to enable
     /// the `shareURL(...)` builders.
-    public private(set) var links: LinksAPI!
+    public let links: LinksAPI
 
-    /// Cache facade for general-purpose caching
-    public private(set) var cache: CacheFacade!
+    // The five that cannot be `let`: private storage, non-optional accessor.
+
+    private var _documents: DocumentsAPI!
+    private var _me: MeAPI!
+    private var _auth: AuthAPI!
+    private var _users: UsersAPI!
+    private var _cache: CacheFacade!
+    private var _codegen: CodegenAPI!
+
+    /// Document sub-API. Wired during `init`; never nil for callers.
+    public var documents: DocumentsAPI { _documents }
+    /// Current-user sub-API. Wired during `init`; never nil for callers.
+    public var me: MeAPI { _me }
+    /// Authentication sub-API. Wired during `init`; never nil for callers.
+    public var auth: AuthAPI { _auth }
+    /// User-directory sub-API. Wired during `init`; never nil for callers.
+    public var users: UsersAPI { _users }
+    /// Cache facade for general-purpose caching. Wired during `init`; never
+    /// nil for callers.
+    public var cache: CacheFacade { _cache }
+    /// The surface generated models call into. **App code should use the
+    /// generated `Model.*` facade instead** — see ``CodegenAPI``. Wired during
+    /// `init`; never nil for callers.
+    public var codegen: CodegenAPI { _codegen }
 
     // MARK: - Internal Components
 
@@ -95,7 +120,7 @@ public final class JsBaoClient: @unchecked Sendable {
     private let kvCache: KvCache
 
     private let lock = NSLock()
-    private var networkMode: NetworkMode = .auto
+    private var networkModeStorage: NetworkMode = .auto
     /// System reachability, driven by the optional `ConnectivityMonitor`
     /// (Phase 2). Separate from `networkMode` (user intent): the monitor
     /// updates this bit and never mutates the mode. Defaults `true`, so with
@@ -103,7 +128,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// and gating behavior is unchanged. Guarded by `lock`.
     private var reachable = true
     /// Latest network-transition reason, surfaced via
-    /// `getNetworkStatus().reason` (was always `nil`). Set by
+    /// `networkStatus.reason` (was always `nil`). Set by
     /// `applyNetworkMode` and `applyReachability`. Guarded by `lock`.
     private var lastReason: String?
     private var lastOnlineAt: Date?
@@ -372,7 +397,7 @@ public final class JsBaoClient: @unchecked Sendable {
             // refresh implementation, JWT parsing, and proxy handling all live
             // in AuthController now (which owns `options.auth.refreshProxy`).
             refreshAccessToken: { [weak authController] in
-                await authController?.refreshAccessToken(cause: "http") ?? .network
+                await authController?.refreshAccessToken(cause: "http") ?? .network(nil)
             }
         ))
         self.httpClient = httpClient
@@ -407,7 +432,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // later. They are captured `weak` from the locals for the same reason
         // `KvCache`'s emitter is — an escaping closure cannot capture `self`
         // from an initializer before the instance is fully initialized.
-        self.analyticsQueue = AnalyticsQueue(
+        let analyticsQueue = AnalyticsQueue(
             logger: logger,
             appId: options.appId,
             offlineStore: offlineStore,
@@ -415,6 +440,7 @@ public final class JsBaoClient: @unchecked Sendable {
             getConnectionId: { [weak wsManager] in wsManager?.connectionId },
             getUserId: { [weak authController] in authController?.getUserId() }
         )
+        self.analyticsQueue = analyticsQueue
 
         // KV cache. The emitter is supplied here rather than injected by
         // `CacheFacade` later (#1993, Phase D2): `KvCache` is an actor, so
@@ -430,6 +456,86 @@ public final class JsBaoClient: @unchecked Sendable {
             // as a follow-up.)
             eventEmitter?.emitErased(payload)
         })
+
+        // Sub-APIs whose collaborators are all available as locals here. Built
+        // in phase 1 as `let`s (#2367) so the public surface carries no
+        // implicitly-unwrapped optional. Every closure captures a local
+        // weakly — never `self`, which is not usable yet.
+        self.collections = CollectionsAPI(transport: httpClient)
+        self.session = SessionAPI(transport: httpClient)
+        self.links = LinksAPI()
+        self.groups = GroupsAPI(transport: httpClient)
+        self.ruleSets = RuleSetsAPI(transport: httpClient)
+        self.groupTypeConfigs = GroupTypeConfigsAPI(transport: httpClient)
+        // IntegrationsAPI needs the full HttpClientResponse to surface
+        // upstream status / headers / typed error mapping (the proxy
+        // envelope puts the upstream status in the body and the proxy's
+        // OWN status in the response status), so it uses
+        // `Transport.requestRaw`, which does not throw on a non-2xx status.
+        self.integrations = IntegrationsAPI(transport: httpClient)
+        self.prompts = PromptsAPI(transport: httpClient)
+        self.invitations = InvitationsAPI(transport: httpClient)
+        self.notifications = NotificationsAPI(transport: httpClient)
+        self.locks = LocksAPI(transport: httpClient)
+        self.resourceMetadata = ResourceMetadataAPI(transport: httpClient)
+        // Blob upload/download go through `Transport.requestData`, which
+        // returns the untouched response bytes.
+        self.blobBuckets = BlobBucketsAPI(transport: httpClient)
+        self.cronTriggers = CronTriggersAPI(transport: httpClient)
+        self.collectionTypeConfigs = CollectionTypeConfigsAPI(transport: httpClient)
+        self.databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: httpClient)
+        // `prepared(_:)` runs on the calling thread — the same lowering
+        // `makeAnalyticsContext()` does — so the event's `timestamp` is the
+        // instant the LLM/Gemini call site logged it. Handing the raw event to
+        // the actor instead would have stamped it whenever the unstructured
+        // task happened to run (#2244).
+        self.llm = LlmAPI(
+            transport: httpClient,
+            logAnalytics: { [analyticsQueue] event in
+                let prepared = analyticsQueue.prepared(event)
+                Task { await analyticsQueue.logEvent(prepared) }
+            }
+        )
+        self.gemini = GeminiAPI(
+            transport: httpClient,
+            logAnalytics: { [analyticsQueue] event in
+                let prepared = analyticsQueue.prepared(event)
+                Task { await analyticsQueue.logEvent(prepared) }
+            }
+        )
+        self.workflows = WorkflowsAPI(
+            transport: httpClient,
+            getConnectionId: { [weak wsManager] in wsManager?.connectionId ?? "" },
+            logger: logger,
+            events: eventEmitter
+        )
+        // Analytics namespace — a thin facade over the shared
+        // `analyticsQueue`. All five methods fan out to the same queue.
+        self.analytics = AnalyticsAPI(
+            queue: analyticsQueue,
+            resolveUserUlid: { [weak authController] in authController?.getUserId() }
+        )
+        // Realtime DB subscriptions (`databases.subscribe`). The registry
+        // routes inbound `db.change` frames and is re-subscribed on reconnect.
+        let dbSubscriptionRegistry = DatabaseSubscriptionRegistry(logger: logger)
+        dbSubscriptionRegistry.setOriginContext(
+            DatabaseSubscriptionRegistry.OriginContext(
+                getConnectionId: { [weak wsManager] in wsManager?.connectionId },
+                getCurrentUserId: { [weak authController] in authController?.getUserId() }
+            )
+        )
+        self.databases = DatabasesAPI(
+            transport: httpClient,
+            subscriptionRegistry: dbSubscriptionRegistry,
+            sendWSMessage: { [weak wsManager] message in
+                Task { try? await wsManager?.send(message) }
+            },
+            isWebSocketOpen: { [weak wsManager] in wsManager?.isSocketOpen ?? false },
+            connectWebSocket: { [weak wsManager] in
+                Task { try? await wsManager?.connect() }
+            },
+            logger: logger
+        )
 
         // Wire up dependencies
         setupDependencies()
@@ -476,7 +582,7 @@ public final class JsBaoClient: @unchecked Sendable {
             URLQueryItem(name: "state", value: state),
         ]
         let url = components.url!
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await NetworkSession.data(from: url)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw AuthError(code: .unauthorized, message: "OAuth exchange failed: \(body)")
@@ -488,43 +594,19 @@ public final class JsBaoClient: @unchecked Sendable {
         return token
     }
 
-    // MARK: - Auth / OAuth config (gap P1)
+    // MARK: - Auth / OAuth config
 
-    /// Returns the raw `/oauth-config` envelope: `appId`, `name`, `mode`,
-    /// `waitlistEnabled`, `googleOAuthEnabled`, `googleClientId`,
-    /// `hasOAuth`, `redirectUris`, `passkeyEnabled`, `passkeyRpId`,
-    /// `passkeyRpName`, `hasPasskey`, `magicLinkEnabled`, `otpEnabled`.
-    /// Mirrors js-bao's `client.getAuthConfig()`.
-    public func getAuthConfig() async throws -> [String: Any] {
-        let result = try await legacyJSONGraph("GET", "/oauth-config", nil)
-        return result as? [String: Any] ?? [:]
-    }
-
-    /// App-level config bundle (`appId`, `name`, `mode`,
-    /// `waitlistEnabled`, `hasOAuth`, `hasPasskey`, `magicLinkEnabled`).
-    /// Subset of `getAuthConfig()` shaped for the app-launch UI.
-    /// Matches js-bao's `client.getAppConfig()`.
-    public func getAppConfig() async throws -> [String: Any] {
-        let cfg = try await getAuthConfig()
-        return [
-            "appId": cfg["appId"] ?? "",
-            "name": cfg["name"] ?? "",
-            "mode": cfg["mode"] ?? "public",
-            "waitlistEnabled": cfg["waitlistEnabled"] ?? false,
-            "hasOAuth": cfg["hasOAuth"] ?? false,
-            "hasPasskey": cfg["hasPasskey"] ?? false,
-            "magicLinkEnabled": cfg["magicLinkEnabled"] ?? false,
-        ]
-    }
+    // The untyped `getAuthConfig()` / `getAppConfig()` readers were removed in
+    // #2367: `client.auth.getAuthConfig()` and `client.auth.getAppConfig()`
+    // return the typed `AuthConfigInfo` / `AppConfigInfo` for the same
+    // endpoint.
 
     /// Boolean predicate: is OAuth set up + configured for this app?
-    /// Mirrors js-bao's `client.checkOAuthAvailable()` — wraps
-    /// `getAuthConfig` and checks `hasOAuth && googleClientId`.
+    /// Mirrors js-bao's `client.checkOAuthAvailable()` — reads
+    /// `client.auth.getAuthConfig()` and checks `hasOAuth && googleClientId`.
     public func checkOAuthAvailable() async -> Bool {
-        guard let cfg = try? await getAuthConfig() else { return false }
-        let hasOAuth = cfg["hasOAuth"] as? Bool ?? false
-        let googleClientId = cfg["googleClientId"] as? String
-        return hasOAuth && googleClientId?.isEmpty == false
+        guard let cfg = try? await auth.getAuthConfig() else { return false }
+        return cfg.hasOAuth && cfg.googleClientId?.isEmpty == false
     }
 
     // MARK: - Connection
@@ -543,25 +625,6 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Set whether the client should maintain a WebSocket connection
     public func setShouldConnect(_ shouldConnect: Bool) async {
         await wsManager.setDesiredConnection(shouldConnect: shouldConnect)
-    }
-
-    /// Force reconnect the WebSocket.
-    ///
-    /// Deprecated because `WebSocketManager` is an actor since #2171: this
-    /// spelling can only start the reconnect and return, so a following
-    /// `isConnected` read may still observe the old socket. Use
-    /// `forceReconnectAsync()`, which returns once the reconnect has actually
-    /// been initiated.
-    ///
-    /// The twin deliberately carries a distinct name rather than being a
-    /// same-name `async` overload: Swift prefers an `async` overload in an
-    /// asynchronous context, so a same-name twin turns every existing
-    /// un-`await`ed call into a compile error — the break this window exists to
-    /// avoid.
-    @available(*, deprecated, message: "Use forceReconnectAsync() — the synchronous version returns before the reconnect is initiated, so a following isConnected read may still observe the old socket. Removed in the next major release.")
-    public func forceReconnect() {
-        let wsManager = self.wsManager
-        Task { await wsManager.forceReconnect() }
     }
 
     /// Force reconnect the WebSocket, returning once the reconnect has been
@@ -628,7 +691,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Sync read of `rootDocId` from the parsed JWT payload, matching
     /// js-bao's `payload.user.rootDocId || payload.rootDocId` lookup.
     /// `nil` if no token is loaded or neither field is set. Internal
-    /// helper used by `getRootDocId()` and `isRootDocument`.
+    /// helper used by `rootDocId` and `isRootDocument`.
     private func rootDocIdFromJwt() -> String? {
         guard let payload = authController.getJwtPayload() else { return nil }
         if let user = payload["user"] as? [String: Any],
@@ -695,7 +758,7 @@ public final class JsBaoClient: @unchecked Sendable {
     // reads them automatically.
 
     private var modelToDocumentId: [String: String] = [:]
-    private var defaultDocumentId: String?
+    private var defaultDocumentIdStorage: String?
 
     /// Register `modelName → documentId` so a later
     /// `getDocumentModelMapping(modelName)` returns this doc. Throws
@@ -729,7 +792,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `getDocumentModelMapping`.
     public func getDocumentModelMapping(modelName: String) -> String? {
         return lock.withLock {
-            modelToDocumentId[modelName] ?? defaultDocumentId
+            modelToDocumentId[modelName] ?? defaultDocumentIdStorage
         }
     }
 
@@ -744,18 +807,19 @@ public final class JsBaoClient: @unchecked Sendable {
             )
         }
         lock.withLock {
-            defaultDocumentId = documentId
+            defaultDocumentIdStorage = documentId
         }
     }
 
     public func clearDefaultDocumentId() {
         lock.withLock {
-            defaultDocumentId = nil
+            defaultDocumentIdStorage = nil
         }
     }
 
-    public func getDefaultDocumentId() -> String? {
-        lock.withLock { defaultDocumentId }
+    /// The fallback document id used when a model does not name one.
+    public var defaultDocumentId: String? {
+        lock.withLock { defaultDocumentIdStorage }
     }
 
     // MARK: - Cross-document model store (parity with js-bao `initJsBao({ models })`)
@@ -808,389 +872,6 @@ public final class JsBaoClient: @unchecked Sendable {
         return lock.withLock { sharedModels[modelName] }
     }
 
-    /// Public include target for generated query-time include builders.
-    /// App code should normally use the generated `Model.includeRelation()`
-    /// helpers, which call this with the target model's schema.
-    public func includeTarget(for schema: PrimitiveSchema) -> any IncludeTarget {
-        sharedModel(for: schema)
-    }
-
-    // MARK: Shared-store CRUD (backs the codegen'd `Model.*` facade)
-    //
-    // Schema + dict shaped (no generics) so the generated per-type facade
-    // does the typed mapping (`Model(row:)`) and supplies `primitiveValues()`.
-    // Reads span every open doc by default; pass `options.documents` to scope.
-    // Writes target one document and throw if it isn't open.
-
-    /// Cross-document query → raw rows. The facade maps rows to the model type.
-    public func queryShared(
-        _ schema: PrimitiveSchema,
-        filter: DocumentFilter? = nil,
-        options: QueryOptions? = nil
-    ) throws -> [[String: Any]] {
-        try sharedModel(for: schema).query(filter, options: options)
-    }
-
-    /// Cross-document query with query-time relationship includes. Returns raw
-    /// rows with related records attached under `_related`, matching JS
-    /// `BaseModel.query(filter, { include })`.
-    public func queryShared(
-        _ schema: PrimitiveSchema,
-        filter: DocumentFilter? = nil,
-        options: QueryOptions? = nil,
-        include: [Include]
-    ) throws -> [[String: Any]] {
-        try sharedModel(for: schema).query(filter, options: options, include: include)
-    }
-
-    /// Cross-document paginated query → raw rows + cursors. The facade maps
-    /// rows to the model type while preserving `nextCursor`/`prevCursor`/
-    /// `hasMore` — so a caller passing `options.cursor`/`options.limit` can
-    /// actually obtain the next page. Mirrors js-bao's `BaseModel.query()`
-    /// return shape (#946); `queryShared` stays the flat-array convenience.
-    public func queryPagedShared(
-        _ schema: PrimitiveSchema,
-        filter: DocumentFilter? = nil,
-        options: QueryOptions? = nil
-    ) throws -> PagedQueryResult<PrimitiveRow> {
-        try sharedModel(for: schema).queryPaged(filter, options: options)
-    }
-
-    /// Cross-document paginated query with query-time relationship includes.
-    public func queryPagedShared(
-        _ schema: PrimitiveSchema,
-        filter: DocumentFilter? = nil,
-        options: QueryOptions? = nil,
-        include: [Include]
-    ) throws -> PagedQueryResult<PrimitiveRow> {
-        try sharedModel(for: schema).queryPaged(filter, options: options, include: include)
-    }
-
-    /// Cross-document count.
-    public func countShared(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil) throws -> Int {
-        try sharedModel(for: schema).count(filter)
-    }
-
-    /// First record with `id` across every open doc (raw row), or `nil`.
-    public func findShared(_ schema: PrimitiveSchema, id: String) -> [String: Any]? {
-        sharedModel(for: schema).find(id: id)?.row
-    }
-
-    /// Subscribe to any add/update/delete in any open doc's copy of the model.
-    ///
-    /// The callback is `@Sendable` (#1992): it runs on whichever thread
-    /// committed the change — a local writer's thread, or the observer-drain
-    /// queue — so state it captures must be safe to touch from either.
-    public func subscribeShared(
-        _ schema: PrimitiveSchema, _ callback: @escaping @Sendable () -> Void
-    ) -> @Sendable () -> Void {
-        sharedModel(for: schema).subscribe(callback)
-    }
-
-    /// Aggregate (group / count / sum / avg / …) across every open document.
-    public func aggregateShared(
-        _ schema: PrimitiveSchema, options: AggregateOptions
-    ) throws -> [[String: Any]] {
-        try sharedModel(for: schema).aggregate(options)
-    }
-
-    /// Create-or-update a record in document `docId` — insert if it doesn't
-    /// exist yet, update in place if it does (one call, mirrors js-bao's
-    /// `BaseModel.save`). Throws if the doc isn't open.
-    ///
-    /// - Parameter changedFields: the fields the caller actually assigned,
-    ///   js-bao's `_localChanges`. On an update only these are written, so a
-    ///   save built from a stale fetch doesn't re-write — and clobber — the
-    ///   fields another device changed concurrently (#2459). `nil` means "no
-    ///   tracking information": every supplied value counts as a change.
-    ///   Either way an update still drops values that already equal what's
-    ///   persisted — see `DynamicModel.save(id:values:changedFields:)`.
-    ///
-    /// Returns the live `PrimitiveRecord` handle for the saved row, so a
-    /// caller can read the record as it now stands in the document rather
-    /// than assuming its own values won: on an update the fields it didn't
-    /// write keep whatever another device put there, and on an insert the
-    /// schema defaults and `auto_stamp` values are filled in. The generated
-    /// `save(in:)` rebuilds its return value from this (#2459).
-    @discardableResult
-    public func saveShared(
-        _ schema: PrimitiveSchema, id: String,
-        values: [String: PrimitiveValue], in docId: String,
-        changedFields: Set<String>? = nil
-    ) throws -> PrimitiveRecord {
-        try requireMember(schema, in: docId)
-            .save(id: id, values: values, changedFields: changedFields)
-    }
-
-    /// First record matching a unique `constraint` and `value` across every
-    /// open doc (raw row), or `nil`. Mirrors js-bao's `BaseModel.findByUnique`.
-    public func findByUniqueShared(
-        _ schema: PrimitiveSchema, constraint: String, value: PrimitiveValue
-    ) throws -> [String: Any]? {
-        try sharedModel(for: schema).findByUnique(constraint: constraint, value: value)?.row
-    }
-
-    /// First record matching `filter` across every open doc (raw row), or
-    /// `nil` — `queryShared(...).first`. Mirrors js-bao's `BaseModel.queryOne`.
-    public func queryOneShared(
-        _ schema: PrimitiveSchema,
-        filter: DocumentFilter? = nil,
-        options: QueryOptions? = nil
-    ) throws -> [String: Any]? {
-        try sharedModel(for: schema).query(filter, options: options).first
-    }
-
-    /// First record matching `filter` across every open doc with query-time
-    /// relationship includes attached under `_related` (raw row), or `nil`.
-    /// Mirrors js-bao's `BaseModel.queryOne(filter, { include })`.
-    ///
-    /// Convention: this takes `.first` of the included query rather than
-    /// forwarding `limit: 1` the way js-bao's `queryOne` does. That matches the
-    /// existing no-include `queryOneShared` above, so the typed `queryOne`
-    /// overloads stay consistent with each other; the include resolver runs over
-    /// the full match set and the first row (with its `_related`) is returned. A
-    /// filter that matches nothing returns `nil` with no related decode.
-    public func queryOneShared(
-        _ schema: PrimitiveSchema,
-        filter: DocumentFilter? = nil,
-        options: QueryOptions? = nil,
-        include: [Include]
-    ) throws -> [String: Any]? {
-        try sharedModel(for: schema).query(filter, options: options, include: include).first
-    }
-
-    // MARK: - Cross-document relationship traversal (backs generated instance accessors)
-    //
-    // These mirror the JS client's generated relationship instance methods
-    // (`author.posts()`, `post.author()` — relationshipManager.ts), where the
-    // target model class is baked in at codegen and the accessor resolves the
-    // related record(s) by querying that target. On Swift the generated
-    // value-type struct has no per-document handle, so traversal runs against
-    // the cross-document shared store (same surface as `queryShared` /
-    // `findShared`): the emitter knows the target's `PrimitiveSchema` at
-    // codegen time and passes it in, so no global registry lookup is needed.
-    //
-    // Semantically equivalent to the per-record resolvers in
-    // `PrimitiveRecord.refersTo/hasMany/hasManyThrough` (RelationshipResolution.swift),
-    // but spanning every open document instead of one doc's `DynamicModel`.
-
-    /// Resolve a `refersTo` relationship: `sourceForeignKey` is this
-    /// record's foreign-key value pointing at a record in `target`.
-    /// Returns the target's raw row, or `nil` when the FK is unset or
-    /// points at a missing record. Mirrors JS `generateRefersToMethod`
-    /// (`targetModelClass.find(relatedId)`).
-    public func refersToShared(
-        target: PrimitiveSchema,
-        foreignKey sourceForeignKey: String?
-    ) -> [String: Any]? {
-        guard let fk = sourceForeignKey, !fk.isEmpty else { return nil }
-        return findShared(target, id: fk)
-    }
-
-    /// Resolve a `hasMany` relationship: records in `target` whose
-    /// `relatedIdField` equals `sourceId` (this record's id). Applies
-    /// optional `orderByField` / `orderDirection` sort. Returns raw rows.
-    /// Mirrors JS `generateHasManyMethod`
-    /// (`targetModelClass.query({ [relatedIdField]: this.id }, { sort })`).
-    public func hasManyShared(
-        target: PrimitiveSchema,
-        relatedIdField: String,
-        sourceId: String,
-        orderByField: String? = nil,
-        orderDirection: String? = nil
-    ) throws -> [[String: Any]] {
-        let descending = (orderDirection?.uppercased() == "DESC")
-        let options = orderByField.map { QueryOptions(sort: [$0: descending ? -1 : 1]) }
-        return try queryShared(target, filter: [relatedIdField: sourceId], options: options)
-    }
-
-    /// Resolve a `hasManyThrough` relationship via `joinModel`: find join
-    /// rows whose `joinModelLocalField` equals `sourceId` (ordered by the
-    /// declared `joinModelOrderByField` / `joinModelOrderDirection`, default
-    /// `id ASC`), collect their `joinModelRelatedField` values, and resolve
-    /// those ids in `target` with a single `id: { $in: [...] }` query. That
-    /// query's `id ASC` tiebreaker re-orders the output, so targets come back
-    /// in **target `id ASC`** — the declared join order governs which rows are
-    /// selected, not the final order. Mirrors JS `generateHasManyThroughMethod`
-    /// (sort join leg → `query({ id: { $in } })` → `id ASC` tiebreaker).
-    public func hasManyThroughShared(
-        target: PrimitiveSchema,
-        joinModel: PrimitiveSchema,
-        sourceId: String,
-        joinModelLocalField: String,
-        joinModelRelatedField: String,
-        joinModelOrderByField: String? = nil,
-        joinModelOrderDirection: String? = nil
-    ) throws -> [[String: Any]] {
-        let descending = (joinModelOrderDirection?.uppercased() == "DESC")
-        let joinOptions = joinModelOrderByField.map {
-            QueryOptions(sort: [$0: descending ? -1 : 1])
-        }
-        let joinRows = try queryShared(
-            joinModel, filter: [joinModelLocalField: sourceId], options: joinOptions
-        )
-        let targetIds = joinRows.compactMap { $0[joinModelRelatedField] as? String }
-        guard !targetIds.isEmpty else { return [] }
-        return try queryShared(target, filter: ["id": ["$in": targetIds]], options: nil)
-    }
-
-    /// Paginated `hasManyThrough` traversal — pages the JOIN leg through the
-    /// shared composite-cursor engine (`queryPagedShared`) by the declared
-    /// `joinModelOrderByField` / `joinModelOrderDirection` (defaulting to
-    /// **`id ASC`** when none is declared), then `$in`-resolves the page's
-    /// related ids against `target`. Mirrors JS `generateHasManyThroughMethod`,
-    /// which now delegates the page cut to `BaseModel.query`
-    /// (`relationshipManager.ts`).
-    ///
-    /// The cursor is the engine's **opaque** token (a `String?`), the same
-    /// composite `(field, id)` cursor `queryPaged` mints — so a cursor issued
-    /// here or by the JS client round-trips through the shared decoder. This
-    /// fixes the tie-straddle skip/duplicate defect (#1607) the old
-    /// hand-rolled raw-scalar cursor had. `limit` is required so a bare
-    /// `hasManyThroughShared(...)` call still binds to the unpaginated
-    /// overload above.
-    ///
-    /// Envelope contract: the returned `nextCursor` / `prevCursor` / `hasMore`
-    /// are COPIED verbatim from the join leg's paged result, and `data` is
-    /// REPLACED with the `$in`-resolved targets. Targets come back **target
-    /// `id ASC`** (the `$in` tiebreaker, #1201) — the join order governs which
-    /// rows are on the page, not the intra-page order. `hasMore` is the
-    /// engine's over-fetch signal: more rows remain in the CURRENT paging
-    /// direction (forward → later rows, backward → earlier rows) — it is NOT
-    /// "a prevCursor is present".
-    ///
-    /// A non-positive `limit` returns an empty page without querying.
-    public func hasManyThroughShared(
-        target: PrimitiveSchema,
-        joinModel: PrimitiveSchema,
-        sourceId: String,
-        joinModelLocalField: String,
-        joinModelRelatedField: String,
-        joinModelOrderByField: String? = nil,
-        joinModelOrderDirection: String? = nil,
-        limit: Int,
-        afterCursor: String? = nil,
-        beforeCursor: String? = nil,
-        direction: CursorDirection = .forward
-    ) throws -> PagedQueryResult<PrimitiveRow> {
-        guard limit > 0 else {
-            return PagedQueryResult(data: [], nextCursor: nil, prevCursor: nil, hasMore: false)
-        }
-        let orderByField = joinModelOrderByField ?? "id"
-        let descending = (joinModelOrderDirection?.uppercased() == "DESC")
-
-        // D7 / Fork B (#1607): warn on a nullable join order field.
-        RelationshipPaginationValidator.warnIfOrderFieldNullable(
-            schema: joinModel, orderByField: orderByField,
-            relationshipDescription:
-                "hasManyThrough(\(target.name) via \(joinModel.name))"
-        )
-
-        let cursor = direction == .forward ? afterCursor : beforeCursor
-        let joinOptions = QueryOptions(
-            sort: [orderByField: descending ? -1 : 1],
-            limit: limit,
-            cursor: cursor,
-            direction: direction,
-            projection: [joinModelRelatedField: 1, orderByField: 1]
-        )
-        let joinPage = try queryPagedShared(
-            joinModel, filter: [joinModelLocalField: sourceId], options: joinOptions
-        )
-        let relatedIds = joinPage.data.compactMap { $0[joinModelRelatedField] as? String }
-        guard !relatedIds.isEmpty else {
-            return PagedQueryResult(
-                data: [], nextCursor: joinPage.nextCursor,
-                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
-            )
-        }
-        let rows = try queryShared(target, filter: ["id": ["$in": relatedIds]], options: nil)
-        return PagedQueryResult(
-            data: rows.map(PrimitiveRow.init(raw:)), nextCursor: joinPage.nextCursor,
-            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
-        )
-    }
-
-    /// Insert-or-update a record in document `docId`, matched by the
-    /// single-field unique constraint on `field` — mirrors js-bao's
-    /// `save({ upsertOn: field })`. Throws if the doc isn't open.
-    ///
-    /// Returns the `UpsertResult` so callers can read the RESOLVED
-    /// record: on the merge path the existing record's id wins (JS
-    /// reassigns `this.id = existingId`), so `result.record.id` may
-    /// differ from the `id` passed in.
-    /// - Parameter explicitId: `true` when the caller pinned the `id`
-    ///   (the codegen's designated `init(id:…)`), `false` when it was
-    ///   auto-generated (the auto-id convenience init). Threaded to
-    ///   `DynamicModel.upsert` so an explicit id that collides with a
-    ///   matched record throws `UpsertError.explicitIdConflict` —
-    ///   mirroring js-bao's `_constructorProvidedId` upsertOn-conflict.
-    /// - Parameter changedFields: the fields the caller actually assigned
-    ///   (see `saveShared`). Applies to the merge path only; the insert path
-    ///   writes every supplied value.
-    @discardableResult
-    public func upsertShared(
-        _ schema: PrimitiveSchema, id: String,
-        values: [String: PrimitiveValue], on field: String, in docId: String,
-        explicitId: Bool = false,
-        changedFields: Set<String>? = nil
-    ) throws -> UpsertResult {
-        try requireMember(schema, in: docId)
-            .upsert(
-                values, on: field, id: id, explicitId: explicitId,
-                changedFields: changedFields
-            )
-    }
-
-    /// Insert-or-update a record matched by the NAMED unique constraint
-    /// (single-field or compound) — mirrors js-bao's
-    /// `BaseModel.upsertByUnique(constraintName, lookupValue, data,
-    /// options)`. `mode` maps JS's option flags: `.mustExist` ⇔
-    /// `objectMustExist`, `.mustNotExist` ⇔ `objectMustNotExist`,
-    /// `.either` ⇔ default. Throws if the constraint isn't declared, a
-    /// constraint field is missing from `values`, or (on insert) the
-    /// target doc isn't open.
-    ///
-    /// Scope: the existing-record search spans EVERY open document
-    /// (js-bao parity — `for (docId of connectedDocuments)`); a match in
-    /// any open doc merges into that doc, and a fresh insert lands in
-    /// `docId`.
-    ///
-    /// - Parameter uniqueLookupValue: optional explicit lookup value(s),
-    ///   one per constraint field — mirrors js-bao's separate
-    ///   `uniqueLookupValue` argument. When nil the key is built from
-    ///   `values`. Validated against `values` (arity + per-field).
-    /// - Parameter explicitId: `true` when the caller pinned `id`; an
-    ///   explicit id colliding with a matched record throws
-    ///   `UpsertError.explicitIdConflict`.
-    /// - Parameter changedFields: the fields the caller actually assigned
-    ///   (see `saveShared`). Applies to the merge path only; the insert path
-    ///   writes every supplied value.
-    @discardableResult
-    public func upsertByUniqueShared(
-        _ schema: PrimitiveSchema, id: String,
-        values: [String: PrimitiveValue], constraint: String,
-        mode: UpsertMode = .either, in docId: String,
-        explicitId: Bool = false,
-        uniqueLookupValue: [PrimitiveValue]? = nil,
-        changedFields: Set<String>? = nil
-    ) throws -> UpsertResult {
-        // The cross-doc search needs the document open before it can be a
-        // merge target; require it up front (also the insert target).
-        _ = try requireMember(schema, in: docId)
-        return try sharedModel(for: schema).upsertByUnique(
-            constraint: constraint, data: values, mode: mode, id: id,
-            explicitId: explicitId, targetDocId: docId,
-            uniqueLookupValue: uniqueLookupValue,
-            changedFields: changedFields
-        )
-    }
-
-    /// Delete a record from document `docId`. Throws if the doc isn't open.
-    public func deleteShared(_ schema: PrimitiveSchema, id: String, in docId: String) throws {
-        try requireMember(schema, in: docId).delete(id: id)
-    }
-
     /// Every connected `(model, document)` member of the shared store, for
     /// the debug inspector. Each entry is the per-doc writer for one model in
     /// one open document — so the inspector can surface cross-document data
@@ -1211,7 +892,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Resolve the per-doc writer for a model. The member only exists while
     /// the document is open (connected to the shared store), so a closed
     /// doc throws — opening is always an explicit step (matches js-bao).
-    private func requireMember(_ schema: PrimitiveSchema, in docId: String) throws -> DynamicModel {
+    func requireMember(_ schema: PrimitiveSchema, in docId: String) throws -> DynamicModel {
         guard let member = sharedModel(for: schema).member(docId: docId) else {
             throw JsBaoError(
                 code: .notFound,
@@ -1309,24 +990,24 @@ public final class JsBaoClient: @unchecked Sendable {
     // / Gemini call paths can log structured events. On Swift those
     // sites just delegate to `logAnalyticsEvent` directly today; the
     // bundles below are wrappers that match the JS shape so cross-
-    // platform code can call `client.getLlmAnalyticsContext()?.logEvent(...)`
+    // platform code can call `client.llmAnalyticsContext?.logEvent(...)`
     // identically.
 
     /// Returns a logger handle for LLM analytics, or `nil` when the
     /// auto-events config for `llm` is fully disabled. The handle has
     /// the same shape as js-bao's: `logEvent(event)` and
     /// `isEnabled(phase?)`.
-    public func getLlmAnalyticsContext() -> AnalyticsContext? {
+    public var llmAnalyticsContext: AnalyticsContext? {
         // Auto-events config isn't a typed option on Swift yet; if it
         // lands, swap this for the real flag-walk. For now always
         // return a context so cross-platform callers don't no-op.
-        return makeAnalyticsContext()
+        makeAnalyticsContext()
     }
 
     /// Returns a logger handle for Gemini analytics — same shape as
-    /// `getLlmAnalyticsContext()`.
-    public func getGeminiAnalyticsContext() -> AnalyticsContext? {
-        return makeAnalyticsContext()
+    /// `llmAnalyticsContext`.
+    public var geminiAnalyticsContext: AnalyticsContext? {
+        makeAnalyticsContext()
     }
 
     /// The handle both analytics-context accessors hand out.
@@ -1339,21 +1020,61 @@ public final class JsBaoClient: @unchecked Sendable {
     /// capture the queue strongly because the handle outlives the call and
     /// holding the queue does not retain the client.
     ///
-    /// Both lower the event with `prepared(_:)` on the caller's thread: that is
-    /// where the `Any` graph stops, where the event's `timestamp` is taken, and
-    /// where a non-JSON-representable event is dropped *and logged* rather than
-    /// disappearing.
+    /// Both lower the event through `prepareAnalyticsEvent` on the caller's
+    /// thread: that is where the `Any` graph stops, where the event's
+    /// `timestamp` is taken, and where a non-JSON-representable event is
+    /// dropped *and logged* rather than disappearing — on both of its two
+    /// rejection paths, the encoding and `prepared(_:)`.
     private func makeAnalyticsContext() -> AnalyticsContext {
+        // `AnalyticsContext`'s logger closures carry the typed `[String:
+        // JSONValue]` shape (#2367); `AnalyticsQueue.prepared(_:)` is still the
+        // untyped `[String: Any]` boundary (same precedent as
+        // `AnalyticsQueue.swift:148`'s doc comment describes), so lower back to
+        // `Any` here before handing the event to the queue.
         AnalyticsContext(
-            logEvent: { [analyticsQueue] event in
-                guard let prepared = analyticsQueue.prepared(event) else { return }
+            logEvent: { [analyticsQueue, logger] event in
+                guard let prepared = Self.prepareAnalyticsEvent(
+                    event, queue: analyticsQueue, logger: logger
+                ) else { return }
                 Task { await analyticsQueue.logEvent(prepared) }
             },
-            logEventAsync: { [analyticsQueue] event in
-                guard let prepared = analyticsQueue.prepared(event) else { return }
+            logEventAsync: { [analyticsQueue, logger] event in
+                guard let prepared = Self.prepareAnalyticsEvent(
+                    event, queue: analyticsQueue, logger: logger
+                ) else { return }
                 await analyticsQueue.logEvent(prepared)
             }
         )
+    }
+
+    /// Lower a typed analytics event to the queue's untyped shape and prepare
+    /// it, or return `nil` after saying why it could not ship.
+    ///
+    /// The lowering can fail — `JSONEncoder` rejects a non-finite
+    /// `JSONValue.number` by default — and a `try?` there would have dropped
+    /// the event without a word, contradicting the "dropped *and logged*"
+    /// contract the accessor's doc comment states. Now both rejection paths
+    /// (encoding here, `prepared(_:)` below) are equally visible.
+    ///
+    /// `static` so the closures keep capturing only the queue and the logger,
+    /// neither of which retains the client.
+    private static func prepareAnalyticsEvent(
+        _ event: [String: JSONValue],
+        queue: AnalyticsQueue,
+        logger: Logger
+    ) -> AnalyticsQueue.PreparedEvent? {
+        let lowered: Any
+        do {
+            lowered = try JSONCoding.jsonObject(from: event)
+        } catch {
+            logger.warn("[analytics] dropping event that failed to encode:", error.localizedDescription)
+            return nil
+        }
+        guard let eventAny = lowered as? [String: Any] else {
+            logger.warn("[analytics] dropping event that did not encode to a JSON object")
+            return nil
+        }
+        return queue.prepared(eventAny)
     }
 
     // MARK: - Top-level offline-metadata browsing (gap 14)
@@ -1374,7 +1095,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Storage for the active retention policy. Applied immediately
     /// when set; subsequent doc opens / persists update the
     /// `lastOpenedAt` and `localBytes` fields that enforcement reads.
-    private var retentionPolicy: RetentionPolicy = .init()
+    private var retentionPolicyStorage: RetentionPolicy = .init()
 
     /// Apply a retention policy that bounds the local document store.
     ///
@@ -1389,22 +1110,20 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Enforcement runs immediately and again as docs open/close
     /// (which is when `lastOpenedAt` / `localBytes` shift).
-    public func setRetentionPolicy(_ policy: RetentionPolicy) {
-        lock.withLock {
-            retentionPolicy = policy
+    public var retentionPolicy: RetentionPolicy {
+        get { lock.withLock { retentionPolicyStorage } }
+        set {
+            lock.withLock {
+                retentionPolicyStorage = newValue
+            }
+            Task { [newValue, weak self] in
+                await self?.documentManager.enforceRetentionPolicy(
+                    ttlMs: newValue.ttl.map(\.wholeMilliseconds),
+                    maxDocs: newValue.maxDocs,
+                    maxBytes: newValue.maxBytes
+                )
+            }
         }
-        Task { [policy, weak self] in
-            await self?.documentManager.enforceRetentionPolicy(
-                ttlMs: policy.ttlMs,
-                maxDocs: policy.maxDocs,
-                maxBytes: policy.maxBytes
-            )
-        }
-    }
-
-    /// Inspect the active retention policy.
-    public func getRetentionPolicy() -> RetentionPolicy {
-        lock.withLock { retentionPolicy }
     }
 
     /// Mark a doc as deleted locally — wipes the in-memory metadata
@@ -1434,29 +1153,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// completed for the doc). Throws `unavailable` on timeout.
     public func waitForInitialSync(
         documentId: String,
-        timeoutMs: Int = 10_000,
-        pollMs: Int = 200
+        timeout: TimeInterval = 10,
+        pollInterval: TimeInterval = 0.2
     ) async throws {
-        try await pollUntil(timeoutMs: timeoutMs, pollMs: pollMs) {
+        try await pollUntil(timeout: timeout, pollInterval: pollInterval) {
             self.documentManager.isSynced(documentId)
         }
-    }
-
-    /// One-shot sync gate: returns as soon as the doc reports its initial
-    /// sync complete. Alias for `waitForInitialSync` in this Swift surface,
-    /// matching js-bao, whose `waitForSync` also just forwards to
-    /// `waitForInitialSync`.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `waitForSync`.
-    @available(*, deprecated, message: "Use waitForInitialSync(documentId:timeoutMs:pollMs:) instead.")
-    public func waitForSync(
-        documentId: String,
-        timeoutMs: Int = 10_000,
-        pollMs: Int = 200
-    ) async throws {
-        try await waitForInitialSync(
-            documentId: documentId, timeoutMs: timeoutMs, pollMs: pollMs
-        )
     }
 
     /// Wait until the client and server hold identical document state.
@@ -1467,13 +1169,13 @@ public final class JsBaoClient: @unchecked Sendable {
     /// outbound debounce — `checkStateVector` reports `(false, false)` then.
     public func waitForInSync(
         documentId: String,
-        timeoutMs: Int = 10_000,
-        pollMs: Int = 200
+        timeout: TimeInterval = 10,
+        pollInterval: TimeInterval = 0.2
     ) async throws {
         try await awaitStateVector(
             documentId: documentId,
-            timeoutMs: timeoutMs,
-            pollMs: pollMs,
+            timeout: timeout,
+            pollInterval: pollInterval,
             operation: "waitForInSync"
         ) { $0.inSync }
     }
@@ -1487,47 +1189,47 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `checkStateVector` reports `(false, false)` then.
     public func waitForWriteConfirmation(
         documentId: String,
-        timeoutMs: Int = 10_000,
-        pollMs: Int = 200
+        timeout: TimeInterval = 10,
+        pollInterval: TimeInterval = 0.2
     ) async throws {
         try await awaitStateVector(
             documentId: documentId,
-            timeoutMs: timeoutMs,
-            pollMs: pollMs,
+            timeout: timeout,
+            pollInterval: pollInterval,
             operation: "waitForWriteConfirmation"
         ) { $0.includesWrites }
     }
 
     /// Poll the live `checkStateVector` round trip until `satisfied` reports
-    /// true or the caller's `timeoutMs` elapses, throwing `.unavailable` on
+    /// true or the caller's `timeout` elapses, throwing `.unavailable` on
     /// timeout. Each inner round trip is bounded by the caller's *remaining*
     /// time, not `checkStateVector`'s default 5s: when the socket is open but
     /// the server never answers a `stateVectorCheck`, an unbounded inner call
     /// would block for the full 5s before the outer deadline was re-checked,
-    /// so a short-timeout waiter (e.g. `waitForInSync(timeoutMs: 300)`) could
+    /// so a short-timeout waiter (e.g. `waitForInSync(timeout: 0.3)`) could
     /// block for ~5s instead of the requested 300ms (issue #1979).
     private func awaitStateVector(
         documentId: String,
-        timeoutMs: Int,
-        pollMs: Int,
+        timeout: TimeInterval,
+        pollInterval: TimeInterval,
         operation: String,
         satisfied: (_ verdict: (includesWrites: Bool, inSync: Bool)) -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        let deadline = Date().addingTimeInterval(timeout)
         while true {
-            let remainingMs = Int((deadline.timeIntervalSinceNow * 1000).rounded())
-            if remainingMs <= 0 { break }
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { break }
             // Bound the round trip by the time the caller still has, so a
-            // silent server can't stretch the wait past `timeoutMs`.
-            if satisfied(await checkStateVector(documentId: documentId, timeoutMs: remainingMs)) {
+            // silent server can't stretch the wait past `timeout`.
+            if satisfied(await checkStateVector(documentId: documentId, timeout: remaining)) {
                 return
             }
             // Sleep the poll interval, but never past the deadline.
-            let leftMs = Int((deadline.timeIntervalSinceNow * 1000).rounded())
-            if leftMs <= 0 { break }
-            let sleepMs = min(max(0, pollMs), leftMs)
-            if sleepMs > 0 {
-                try await Task.sleep(nanoseconds: UInt64(sleepMs) * 1_000_000)
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { break }
+            let sleep = min(max(0, pollInterval), left)
+            if sleep > 0 {
+                try await Task.sleep(nanoseconds: UInt64(sleep * 1_000_000_000))
             }
         }
         throw JsBaoError(
@@ -1560,7 +1262,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Mirrors js-bao's `checkStateVector(documentId, timeoutMs)`.
     public func checkStateVector(
         documentId: String,
-        timeoutMs: Int = 5_000
+        timeout: TimeInterval = 5
     ) async -> (includesWrites: Bool, inSync: Bool) {
         guard wsManager.isSocketOpen else { return (false, false) }
         guard let stateVector = documentManager.encodeStateVectorBase64(documentId) else {
@@ -1587,7 +1289,7 @@ public final class JsBaoClient: @unchecked Sendable {
             }
 
             // Resolve to a failure verdict if no response lands in time.
-            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(timeoutMs)) { [weak self] in
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
                 self?.resolveStateVectorWaiter(id: waiterId, documentId: documentId, result: (false, false))
             }
 
@@ -1649,7 +1351,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// online OR offline-with-grant.
     public func waitForAuthBootstrap(timeout: TimeInterval = 10) async throws {
         try await pollUntil(
-            timeoutMs: Int(timeout * 1000), pollMs: 100
+            timeout: timeout, pollInterval: 0.1
         ) {
             let state = self.authController.getAuthState()
             return state.authenticated || state.mode == .offline
@@ -1660,8 +1362,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `predicate()` first returns true. Throws `unavailable` if the
     /// timeout elapses first.
     private func pollUntil(
-        timeoutMs: Int,
-        pollMs: Int,
+        timeout: TimeInterval,
+        pollInterval: TimeInterval,
         // The predicate is invoked synchronously on this method's own
         // executor, once per poll iteration, and is never stored or sent
         // to another task — so it doesn't need to be `@Sendable`. Dropping
@@ -1670,24 +1372,24 @@ public final class JsBaoClient: @unchecked Sendable {
         // to concurrent execution).
         predicate: @escaping () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if predicate() { return }
-            try await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
+            try await Task.sleep(nanoseconds: UInt64(max(0, pollInterval) * 1_000_000_000))
         }
         throw JsBaoError(
             code: .unavailable,
-            message: "waitFor* timeout after \(timeoutMs)ms"
+            message: "waitFor* timeout after \(timeout)s"
         )
     }
 
-    /// Get current auth state
-    public func getAuthState() -> AuthState {
+    /// The current auth state.
+    public var authState: AuthState {
         authController.getAuthState()
     }
 
-    /// Get current user ID
-    public func getUserId() -> String? {
+    /// The current user's id, or `nil` when unauthenticated.
+    public var userId: String? {
         authController.getUserId()
     }
 
@@ -1696,14 +1398,16 @@ public final class JsBaoClient: @unchecked Sendable {
         authController.isAuthenticated()
     }
 
-    /// Get auth persistence info
-    public func getAuthPersistenceInfo() -> [String: Any] {
-        var info: [String: Any] = [:]
+    /// How the access token is persisted: `mode` is `"persisted"` or
+    /// `"memory"`, and a persisted token also reports its storage-key
+    /// `prefix`.
+    public var authPersistenceInfo: [String: JSONValue] {
+        var info: [String: JSONValue] = [:]
         if options.auth.persistJwtInStorage {
-            info["mode"] = "persisted"
-            info["prefix"] = options.auth.storageKeyPrefix ?? "default"
+            info["mode"] = .string("persisted")
+            info["prefix"] = .string(options.auth.storageKeyPrefix ?? "default")
         } else {
-            info["mode"] = "memory"
+            info["mode"] = .string("memory")
         }
         return info
     }
@@ -1884,9 +1588,15 @@ public final class JsBaoClient: @unchecked Sendable {
         authController.updateToken(token, cause: cause)
     }
 
-    /// Get the current JWT payload.
-    public func getJwtPayload() -> [String: Any]? {
-        authController.getJwtPayload()
+    /// The decoded claims of the current JWT, or `nil` when there is no
+    /// token (or it cannot be decoded).
+    public var jwtPayload: [String: JSONValue]? {
+        guard let claims = authController.getJwtPayload() else { return nil }
+        // The claims come straight out of `JSONSerialization` on the token's
+        // payload segment, so every value is already JSON-representable and
+        // the lowering cannot fail in practice. `try?` keeps the property
+        // non-throwing rather than promising something the type can't.
+        return try? JSONValue.typedRow(from: claims, subject: "JWT payload")
     }
 
     // MARK: - Network Mode
@@ -1899,7 +1609,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `networkingAllowed()` (mode-based), so a reporting change here never
     /// suppresses the reconnect loop.
     public func isOnline() -> Bool {
-        getNetworkStatus().isOnline
+        networkStatus.isOnline
     }
 
     /// Internal networking gate — "may networking be attempted right now?".
@@ -1908,10 +1618,10 @@ public final class JsBaoClient: @unchecked Sendable {
     /// monitoring off `reachable` stays `true`, so this equals the old
     /// `mode != .offline` and no gating behavior changes.
     internal func networkingAllowed() -> Bool {
-        lock.withLock { (networkMode == .online) || (networkMode == .auto && reachable) }
+        lock.withLock { (networkModeStorage == .online) || (networkModeStorage == .auto && reachable) }
     }
 
-    /// The single reporting formula shared by `getNetworkStatus().isOnline`
+    /// The single reporting formula shared by `networkStatus.isOnline`
     /// and the emitted `NetworkModeEvent.isOnline`, so the two always agree
     /// (JS-identical blend of mode + transport).
     internal func reportedOnline(mode: NetworkMode, transport: ConnectionStatus) -> Bool {
@@ -1923,7 +1633,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// separately (never nested) — snapshot-only, so a value emitted here may
     /// briefly precede an async transport change.
     private func computeReportedOnline() -> Bool {
-        let mode = lock.withLock { networkMode }
+        let mode = lock.withLock { networkModeStorage }
         return reportedOnline(mode: mode, transport: wsManager.connectionStatus)
     }
 
@@ -2139,15 +1849,22 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - Network
 
-    /// Get current network mode
-    public func getNetworkMode() -> NetworkMode {
-        lock.withLock { networkMode }
+    /// The current network mode. Setting it is equivalent to calling
+    /// ``setNetworkMode(_:options:)`` with default options.
+    public var networkMode: NetworkMode {
+        get { lock.withLock { networkModeStorage } }
+        set { setNetworkMode(newValue) }
     }
 
-    /// Get detailed network status
-    public func getNetworkStatus() -> NetworkStatus {
+    /// Detailed network status — mode, transport, reachability and the
+    /// reason for the last transition.
+    public var networkStatus: NetworkStatus {
+        // Reads the STORAGE, not the `networkMode` property: that property's
+        // getter takes `lock` itself, and `lock` is a non-recursive `NSLock`,
+        // so going through it here would deadlock. Before #2367 renamed it,
+        // `networkMode` *was* the storage and this read was direct.
         let (mode, lastOnline, reason) = lock.withLock {
-            (networkMode, lastOnlineAt, lastReason)
+            (networkModeStorage, lastOnlineAt, lastReason)
         }
         let transport = wsManager.connectionStatus
         return NetworkStatus(
@@ -2213,8 +1930,8 @@ public final class JsBaoClient: @unchecked Sendable {
     ) {
         let reason = options.reason ?? "user_set"
         let enteredAuto: Bool = lock.withLock {
-            let wasAuto = networkMode == .auto
-            networkMode = mode
+            let wasAuto = networkModeStorage == .auto
+            networkModeStorage = mode
             lastReason = reason
             return mode == .auto && !wasAuto
         }
@@ -2248,7 +1965,7 @@ public final class JsBaoClient: @unchecked Sendable {
         enum Action { case restore, pause }
         let action: Action? = lock.withLock {
             if isDestroyed { return nil }
-            guard networkMode == .auto else { return nil }
+            guard networkModeStorage == .auto else { return nil }
             return reachable ? .restore : .pause
         }
         guard let action else { return }
@@ -2353,10 +2070,10 @@ public final class JsBaoClient: @unchecked Sendable {
             if self.reachable == reachable { return nil } // dedup
             self.reachable = reachable
             self.lastReason = reason
-            let act: Action = (networkMode == .auto)
+            let act: Action = (networkModeStorage == .auto)
                 ? (reachable ? .restore : .pause)
                 : .noop
-            return (act, networkMode)
+            return (act, networkModeStorage)
         }
         guard let decision else { return }
 
@@ -2474,7 +2191,7 @@ public final class JsBaoClient: @unchecked Sendable {
                 // explicit `.online`. A reachability-driven restore runs in
                 // `.auto`, where we pause the socket (`setShouldConnect(false)`)
                 // WITHOUT mutating the mode — the monitor never writes mode.
-                if getNetworkMode() == .online {
+                if networkMode == .online {
                     applyNetworkMode(
                         .offline,
                         options: SetNetworkModeOptions(reason: "onlineAuthRequired")
@@ -2538,8 +2255,8 @@ public final class JsBaoClient: @unchecked Sendable {
         authController.isOfflineGrantAvailable()
     }
 
-    /// Get the status of the offline access grant.
-    public func getOfflineGrantStatus() -> OfflineGrantStatus {
+    /// The status of the offline access grant.
+    public var offlineGrantStatus: OfflineGrantStatus {
         authController.getOfflineGrantStatus()
     }
 
@@ -2556,8 +2273,8 @@ public final class JsBaoClient: @unchecked Sendable {
         }
     }
 
-    /// Get the offline identity (available after unlockOffline succeeds).
-    public func getOfflineIdentity() -> OfflineIdentity? {
+    /// The offline identity, available after `unlockOffline` succeeds.
+    public var offlineIdentity: OfflineIdentity? {
         authController.getOfflineIdentity()
     }
 
@@ -2663,13 +2380,13 @@ public final class JsBaoClient: @unchecked Sendable {
                         }
                     }
 
-                    // Bound the wait by `availabilityWaitMs` (JS parity):
+                    // Bound the wait by `availabilityWait` (JS parity):
                     // resolve with whatever local state exists once the
                     // network-availability budget is exhausted. A value of
                     // 0 means "don't wait for the network" — resolve at once.
-                    let waitMs = options.availabilityWaitMs
+                    let wait_ = options.availabilityWait
                     wait.set(timeoutTask: Task {
-                        try? await Task.sleep(nanoseconds: UInt64(waitMs) * 1_000_000)
+                        try? await Task.sleep(nanoseconds: UInt64(max(0, wait_) * 1_000_000_000))
                         if wait.claim() { cont.resume() }
                     })
                 }
@@ -2911,7 +2628,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Get root document ID from the parsed JWT payload. Matches
-    /// js-bao's `getRootDocId(): string | null` — a pure synchronous
+    /// js-bao's `rootDocId: string | null` — a pure synchronous
     /// cached read of `payload.user.rootDocId || payload.rootDocId`,
     /// with the offline identity as a final fallback (exactly the JS
     /// `authController.getRootDocId()` lookup). No HTTP call — the
@@ -2919,7 +2636,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// (OTP / OAuth / magic link / offline grant). The pre-#1109
     /// `async throws` + `refresh:` surface is gone: there is nothing
     /// to refetch.
-    public func getRootDocId() -> String? {
+    public var rootDocId: String? {
         if let root = rootDocIdFromJwt() { return root }
         return authController.getOfflineIdentity()?.rootDocId
     }
@@ -3021,7 +2738,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// under — JS `sendAwarenessState` does the same) and emits a local
     /// `.awareness` delta event (`added` on the first set, `updated`
     /// after), mirroring JS `setLocalAwarenessState` (#996).
-    public func setAwareness(_ documentId: String, state: [String: Any]) {
+    public func setAwareness(_ documentId: String, state: [String: JSONValue]) {
         let result = documentManager.setLocalAwarenessState(documentId, state: state)
         guard result.exists else { return }
 
@@ -3029,10 +2746,25 @@ public final class JsBaoClient: @unchecked Sendable {
         // (Previously Swift sent a bare `[state]`, which JS peers could not
         // destructure — #996.)
         let localKey = connectionId
+        // `state` is the typed `[String: JSONValue]` shape (#2367); lower it
+        // back to the `Any` graph `JSONSerialization` needs to encode the frame.
+        // This method cannot throw, and encoding only fails on a value
+        // `JSONEncoder` rejects (a non-finite `.number`) — but publishing an
+        // empty state to every peer is a visible behavior change, not a no-op,
+        // so it is logged rather than swallowed.
+        var stateAny: [String: Any] = [:]
+        do {
+            stateAny = try JSONCoding.jsonObject(from: state) as? [String: Any] ?? [:]
+        } catch {
+            logger.warn(
+                "[awareness] setAwareness(\(documentId)) state could not be encoded (\(error)); "
+                    + "publishing an empty state to peers"
+            )
+        }
         let message: [String: Any] = [
             "type": "awareness",
             "documentId": documentId,
-            "states": [[localKey, state]],
+            "states": [[localKey, stateAny]],
         ]
 
         if let jsonData = try? JSONSerialization.data(withJSONObject: message),
@@ -3091,7 +2823,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Get all awareness states for a document (local + remote).
     /// Returns a dictionary keyed by client ID.
-    public func getAwarenessStates(documentId: String) -> [String: [String: Any]] {
+    public func getAwarenessStates(documentId: String) -> [String: [String: JSONValue]] {
         guard let snapshot = documentManager.getAwarenessSnapshot(documentId) else { return [:] }
         var states = snapshot.remoteStates
         if let localState = snapshot.localState {
@@ -3105,10 +2837,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Call an endpoint the client does not wrap, decoding the response into
     /// your own `Decodable` type.
     ///
-    /// This is the supported replacement for `makeRequest`: same
-    /// authentication, token refresh, 401 retry, and error mapping, but the
-    /// response arrives as a real Swift type instead of an `Any` graph you
-    /// have to cast.
+    /// Same authentication, token refresh, 401 retry, and error mapping the
+    /// wrapped endpoints get, with the response decoded into a real Swift type.
     ///
     /// ```swift
     /// struct Health: Decodable { let ok: Bool }
@@ -3142,8 +2872,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Call an endpoint whose response shape you do not want to model, and
     /// get a `JSONValue` back rather than an `Any` graph.
     ///
-    /// The direct replacement for `makeRequest` when the response really is
-    /// dynamic: `JSONValue` carries the same information but is `Codable`,
+    /// Use this when the response really is dynamic: `JSONValue` carries the
+    /// same information an `Any` graph would but is `Codable`,
     /// `Sendable`, and `Equatable`, so it crosses concurrency boundaries and
     /// re-encodes losslessly. Returns `nil` for a 2xx response with an empty
     /// body or a JSON `null`; a malformed body throws.
@@ -3176,8 +2906,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Send and receive raw bytes — file uploads and downloads.
     ///
-    /// The supported replacement for `makeRawRequest`. Returns the response
-    /// bytes **untouched** with the status, and does not throw on a non-2xx
+    /// Returns the response bytes **untouched** with the status, and does not throw on a non-2xx
     /// status (inspect the returned status). Takes `RequestOptions`, so a
     /// timeout and custom headers are both available.
     public func requestData(
@@ -3191,92 +2920,46 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - HTTP API (deprecated `Any` surface)
 
-    /// Make an authenticated HTTP request.
-    ///
-    /// Returns `nil` for a 2xx response with an empty body (the honest
-    /// `Any?`); non-empty responses return the decoded JSON graph. Callers
-    /// narrow with `as?` / `try?` as before.
-    @available(*, deprecated, message: "Use request(method:path:body:) for a typed response, or requestJSON(method:path:) for a dynamic one. The untyped Any surface is removed in the next major release.")
-    public func makeRequest(_ method: String, _ path: String, _ data: Any? = nil) async throws -> Any? {
-        try await legacyJSONGraph(method, path, data)
-    }
-
-    /// Make a raw HTTP request.
-    @available(*, deprecated, message: "Use requestData(method:path:body:options:) — the untyped raw surface is removed in the next major release.")
-    public func makeRawRequest(_ method: String, _ path: String, _ data: Data? = nil, headers: [String: String]? = nil) async throws -> (Data, Int) {
-        // Goes through the same `executeRaw` spine `Transport.requestData`
-        // uses, so the response bytes come back untouched. The old
-        // implementation rebuilt them from `response.text` as UTF-8, which
-        // corrupted any non-UTF-8 download; the deprecated shim inherits that
-        // fix rather than keeping the bug alive for the deprecation window.
-        // `executeRaw` keeps the method as a `String`, so a verb outside
-        // `HTTPMethod` still reaches the server as itself.
-        let response = try await httpClient.executeRaw(
-            method: method,
-            path: path,
-            body: data,
-            options: RequestOptions(rawBody: true, customHeaders: headers ?? [:])
-        )
-        return (response.body, response.status)
-    }
-
     /// The last untyped hop inside `JsBaoClient` itself.
     ///
-    /// Three call sites still need the loosely-typed JSON graph because the
-    /// surface *they* feed is untyped: `getAuthConfig()` returns a public
-    /// `[String: Any]`, and `DocumentManager.handleServerDocuments` /
-    /// `createRemoteDocument` exchange `[String: Any]` documents. Typing
-    /// those is a public-signature change scheduled for a later phase
-    /// (#1992 / #1993), so they read the graph here rather than through the
-    /// deprecated public `makeRequest`, which would emit a deprecation
-    /// warning inside the client's own build.
+    /// A few call sites still need the loosely-typed JSON graph because the
+    /// surface *they* feed is untyped — `DocumentManager.handleServerDocuments`
+    /// / `createRemoteDocument` exchange `[String: Any]` documents. They read
+    /// the graph through this one private hop rather than a public untyped
+    /// entry point, which #2367 removed.
     private func legacyJSONGraph(_ method: String, _ path: String, _ data: Any? = nil) async throws -> Any? {
         try await httpClient.request(method: method, path: path, data: data)
     }
 
     // MARK: - Configuration
 
-    /// Get the API URL
-    public func getApiUrl() -> String { options.apiUrl }
+    /// The API base URL this client was configured with.
+    public var apiUrl: String { options.apiUrl }
 
-    /// Get the app ID
-    public func getAppId() -> String { options.appId }
+    /// The app id this client was configured with.
+    public var appId: String { options.appId }
 
-    /// Get the global admin app ID
-    public func getGlobalAdminAppId() -> String { options.globalAdminAppId }
+    /// The global-admin app id this client was configured with.
+    public var globalAdminAppId: String { options.globalAdminAppId }
 
     /// Set log level
     public func setLogLevel(_ level: LogLevel) {
         logger.setLevel(level)
     }
 
-    // `BlobManager` became an `actor` in #2172. The setter keeps a deprecated
-    // fire-and-forget form beside an `Async` twin (the D3 shape); the getter
-    // has no honest synchronous form — a snapshot would answer from a stale
-    // image — so it becomes an `unavailable, renamed:` stub that the compiler
-    // rewrites with a one-click fix-it. Both go away with the window.
-
-    /// Set blob upload concurrency
-    @available(*, deprecated, message: "Use setBlobUploadConcurrencyAsync(_:) — the synchronous version applies the setting without waiting, so a read right after it may still see the old value, and two calls are not ordered against each other: setBlobUploadConcurrency(1) then setBlobUploadConcurrency(5) can settle on 1. Removed in the next major release.")
-    public func setBlobUploadConcurrency(_ value: Int) {
-        let blobManager = self.blobManager
-        Task { await blobManager.setUploadConcurrency(value) }
-    }
+    // `BlobManager` is an actor (#2172), so reading and writing its upload
+    // concurrency are both effectful. The read is an `async` property rather
+    // than a synchronous one: a synchronous snapshot would answer from a
+    // stale image.
 
     /// Set blob upload concurrency, returning once the setting is in effect.
     public func setBlobUploadConcurrencyAsync(_ value: Int) async {
         await blobManager.setUploadConcurrency(value)
     }
 
-    /// Get blob upload concurrency
-    @available(*, unavailable, renamed: "getBlobUploadConcurrencyAsync()")
-    public func getBlobUploadConcurrency() -> Int {
-        fatalError("unavailable — use getBlobUploadConcurrencyAsync()")
-    }
-
-    /// Get blob upload concurrency
-    public func getBlobUploadConcurrencyAsync() async -> Int {
-        await blobManager.getUploadConcurrency()
+    /// The app-wide maximum number of concurrent blob uploads.
+    public var blobUploadConcurrency: Int {
+        get async { await blobManager.getUploadConcurrency() }
     }
 
     // MARK: - Offline Data
@@ -3345,25 +3028,10 @@ public final class JsBaoClient: @unchecked Sendable {
     // work on the caller's task. See `AnalyticsAPI` for why the twins carry a
     // distinct name instead of being same-name `async` overloads.
 
-    /// Log an analytics event.
-    @available(*, deprecated, message: "Use logAnalyticsEventAsync(_:), or the typed client.analytics namespace. The synchronous version enqueues without waiting, so it is not ordered against a following flush. Removed in the next major release.")
-    public func logAnalyticsEvent(_ event: [String: Any]) {
-        guard let prepared = analyticsQueue.prepared(event) else { return }
-        let queue = analyticsQueue
-        Task { await queue.logEvent(prepared) }
-    }
-
     /// Log an analytics event, returning once it is buffered.
     public func logAnalyticsEventAsync(_ event: [String: Any]) async {
         guard let prepared = analyticsQueue.prepared(event) else { return }
         await analyticsQueue.logEvent(prepared)
-    }
-
-    /// Flush pending analytics events immediately.
-    @available(*, deprecated, message: "Use flushAnalyticsAsync() — the synchronous version returns before the batch reaches the socket. Removed in the next major release.")
-    public func flushAnalytics() {
-        let queue = analyticsQueue
-        Task { await queue.flush() }
     }
 
     /// Flush pending analytics events, returning once the batch has reached the
@@ -3373,24 +3041,10 @@ public final class JsBaoClient: @unchecked Sendable {
         await analyticsQueue.flushAndWait()
     }
 
-    /// Override the plan field on all subsequent analytics events.
-    @available(*, deprecated, message: "Use setAnalyticsPlanOverrideAsync(_:) — the synchronous version applies the override without waiting, so an event logged right after it may not carry it. Removed in the next major release.")
-    public func setAnalyticsPlanOverride(_ plan: String?) {
-        let queue = analyticsQueue
-        Task { await queue.setPlanOverride(plan) }
-    }
-
     /// Override the plan field on all subsequent analytics events, returning
     /// once the override is in effect.
     public func setAnalyticsPlanOverrideAsync(_ plan: String?) async {
         await analyticsQueue.setPlanOverride(plan)
-    }
-
-    /// Override the app version field on all subsequent analytics events.
-    @available(*, deprecated, message: "Use setAnalyticsAppVersionOverrideAsync(_:) — the synchronous version applies the override without waiting, so an event logged right after it may not carry it. Removed in the next major release.")
-    public func setAnalyticsAppVersionOverride(_ version: String?) {
-        let queue = analyticsQueue
-        Task { await queue.setAppVersionOverride(version) }
     }
 
     /// Override the app version field on all subsequent analytics events,
@@ -3643,12 +3297,12 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// returnActive: emit `user_returned` (feature `session`) when the app
-    /// foregrounds after at least `minResumeMs` of inactivity. Mirrors
+    /// foregrounds after at least `minResume` of inactivity. Mirrors
     /// js-bao's `triggerReturnActiveEvent`.
     private func triggerReturnActiveEvent(trigger: String) {
         guard options.analyticsAutoEvents.returnActive else { return }
         guard let userId = resolveAnalyticsUserUlid() else { return }
-        let minResumeMs = options.analyticsAutoEvents.minResumeMs
+        let minResumeMs = options.analyticsAutoEvents.minResume.wholeMilliseconds
         Task { [weak self] in
             guard let self else { return }
             await self.ensureAnalyticsMetadataHydrated(userId: userId)
@@ -3679,11 +3333,11 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// syncErrors: emit `sync_error` (feature `sync`), rate-limited to one
-    /// event per `syncErrorsMinIntervalMs`. Mirrors js-bao's
+    /// event per `syncErrorsMinInterval`. Mirrors js-bao's
     /// `maybeLogSyncErrorEvent`.
     private func maybeLogSyncErrorEvent(documentId: String, reason: String) {
         guard options.analyticsAutoEvents.syncErrorsEnabled else { return }
-        let minIntervalMs = options.analyticsAutoEvents.syncErrorsMinIntervalMs
+        let minIntervalMs = options.analyticsAutoEvents.syncErrorsMinInterval.wholeMilliseconds
         let now = Date()
         let withinCooldown = lock.withLock { () -> Bool in
             if let last = lastSyncErrorEventAt {
@@ -3770,17 +3424,6 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     // MARK: - Blob Management
-
-    /// Get blob manager (for advanced usage)
-    ///
-    /// Deprecated in #2172 alongside the actor conversion. Note that the
-    /// deprecation is the smaller half of the change: `BlobManager` is an
-    /// `actor` now, so *every* call made through the returned instance is
-    /// `await`ed regardless of what this accessor is annotated with.
-    @available(*, deprecated, message: "Use client.documents for the app-wide upload-queue verbs and client.document(id).blobs() for the per-document ones — between them they cover everything this escape hatch reached. BlobManager is an actor now, so calls through it are async either way. Removed in the next major release.")
-    public func getBlobManager() -> BlobManager {
-        blobManager
-    }
 
     // MARK: - Document Context
 
@@ -3884,50 +3527,34 @@ public final class JsBaoClient: @unchecked Sendable {
         wsManager.delegate = self
     }
 
+    /// Builds the six sub-APIs that cannot be `let`s.
+    ///
+    /// Each one either takes `self` directly (`codegen`) or has closures that
+    /// reach client-level logic with no collaborator behind it —
+    /// `networkMode`, `networkingAllowed()`,
+    /// `rootDocId`, `logout(...)` — so they can only be built once
+    /// `self` is usable. They are assigned to private implicitly-unwrapped
+    /// storage read through non-optional public properties (#2367).
     private func setupSubApis() {
-        // Every sub-API is constructed with `transport: httpClient` — the
-        // legacy `(String, String, Any?) -> Any` closure that used to be
-        // built here is gone with the last converted call site (B3).
+        self._codegen = CodegenAPI(client: self)
+
         let cacheFacade = CacheFacade(
             kvCache: kvCache,
-            getNetworkMode: { [weak self] in self?.getNetworkMode() ?? .auto },
+            getNetworkMode: { [weak self] in self?.networkMode ?? .auto },
             transport: httpClient
         )
-        self.cache = cacheFacade
+        self._cache = cacheFacade
 
-        documents = DocumentsAPI(
+        self._documents = DocumentsAPI(
             transport: httpClient,
             blobManager: blobManager,
             documentManager: documentManager,
             client: self
         )
-        collections = CollectionsAPI(transport: httpClient)
-        links = LinksAPI()
-        // Realtime DB subscriptions (`databases.subscribe`). The registry
-        // routes inbound `db.change` frames and is re-subscribed on reconnect.
-        let dbSubscriptionRegistry = DatabaseSubscriptionRegistry(logger: logger)
-        dbSubscriptionRegistry.setOriginContext(
-            DatabaseSubscriptionRegistry.OriginContext(
-                getConnectionId: { [weak self] in self?.wsManager.connectionId },
-                getCurrentUserId: { [weak self] in self?.authController.getUserId() }
-            )
-        )
-        databases = DatabasesAPI(
-            transport: httpClient,
-            subscriptionRegistry: dbSubscriptionRegistry,
-            sendWSMessage: { [weak self] message in
-                Task { try? await self?.wsManager.send(message) }
-            },
-            isWebSocketOpen: { [weak self] in self?.wsManager.isSocketOpen ?? false },
-            connectWebSocket: { [weak self] in
-                Task { try? await self?.wsManager.connect() }
-            },
-            logger: logger
-        )
         // Avatar upload sends raw bytes with a custom Content-Type; it goes
         // through `Transport.requestData` like every other raw-bytes call
         // site now that `MeAPI` holds the transport.
-        me = MeAPI(
+        self._me = MeAPI(
             transport: httpClient,
             cache: cacheFacade,
             localMetadata: { [weak self] in self?.documentManager.getMetadataIndex() ?? [:] },
@@ -3943,11 +3570,11 @@ public final class JsBaoClient: @unchecked Sendable {
             },
             // Lets the local-first paths apply the same root filter the
             // server applies to `/me/owned-documents` (#848 / #2360).
-            rootDocId: { [weak self] in self?.getRootDocId() },
+            rootDocId: { [weak self] in self?.rootDocId },
             logger: logger
         )
-        session = SessionAPI(transport: httpClient)
-        auth = AuthAPI(
+        self._users = UsersAPI(transport: httpClient, cache: cacheFacade)
+        self._auth = AuthAPI(
             getUserId: { [weak self] in self?.authController.getUserId() },
             getToken: { [weak self] in self?.authController.getToken() },
             isAuthenticated: { [weak self] in self?.authController.isAuthenticated() ?? false },
@@ -4058,60 +3685,6 @@ public final class JsBaoClient: @unchecked Sendable {
         authController.setClientNetworkMode = { [weak self] mode in
             self?.setNetworkMode(mode)
         }
-        // `prepared(_:)` runs on the calling thread — the same lowering
-        // `makeAnalyticsContext()` does — so the event's `timestamp` is the
-        // instant the LLM/Gemini call site logged it. Handing the raw event to
-        // the actor instead would have stamped it whenever the unstructured
-        // task happened to run (#2244).
-        llm = LlmAPI(
-            transport: httpClient,
-            logAnalytics: { [analyticsQueue] event in
-                let prepared = analyticsQueue.prepared(event)
-                Task { await analyticsQueue.logEvent(prepared) }
-            }
-        )
-        gemini = GeminiAPI(
-            transport: httpClient,
-            logAnalytics: { [analyticsQueue] event in
-                let prepared = analyticsQueue.prepared(event)
-                Task { await analyticsQueue.logEvent(prepared) }
-            }
-        )
-        users = UsersAPI(transport: httpClient, cache: cacheFacade)
-        groups = GroupsAPI(transport: httpClient)
-        ruleSets = RuleSetsAPI(transport: httpClient)
-        groupTypeConfigs = GroupTypeConfigsAPI(transport: httpClient)
-        // IntegrationsAPI needs the full HttpClientResponse to surface
-        // upstream status / headers / typed error mapping (the proxy
-        // envelope puts the upstream status in the body and the proxy's
-        // OWN status in the response status), so it uses
-        // `Transport.requestRaw`, which does not throw on a non-2xx status.
-        integrations = IntegrationsAPI(transport: httpClient)
-        prompts = PromptsAPI(transport: httpClient)
-        workflows = WorkflowsAPI(
-            transport: httpClient,
-            getConnectionId: { [weak self] in self?.wsManager.connectionId ?? "" },
-            logger: logger,
-            events: eventEmitter
-        )
-        invitations = InvitationsAPI(transport: httpClient)
-        notifications = NotificationsAPI(transport: httpClient)
-        locks = LocksAPI(transport: httpClient)
-        resourceMetadata = ResourceMetadataAPI(transport: httpClient)
-        // Blob upload/download go through `Transport.requestData`, which
-        // returns the untouched response bytes.
-        blobBuckets = BlobBucketsAPI(transport: httpClient)
-        cronTriggers = CronTriggersAPI(transport: httpClient)
-        collectionTypeConfigs = CollectionTypeConfigsAPI(transport: httpClient)
-        databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: httpClient)
-        // Analytics namespace — a thin facade over the shared
-        // `analyticsQueue` (wired in setupDependencies). All five methods
-        // fan out to the same queue the top-level `logAnalyticsEvent` /
-        // `flushAnalytics` / `setAnalytics*Override` back-compat methods use.
-        analytics = AnalyticsAPI(
-            queue: analyticsQueue,
-            resolveUserUlid: { [weak self] in self?.authController.getUserId() }
-        )
     }
 
     private func setupStorage() {
@@ -4304,33 +3877,6 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - WebSocket Message Handling
 
-    /// Raw event key for the deprecated `.remoteUpdate` event (#1120).
-    ///
-    /// Emitting `.remoteUpdate` by naming the enum case trips its
-    /// `@available(deprecated)` at the emit site. Swift has no per-line or
-    /// per-file deprecation suppression: wrapping the emit in a deprecated
-    /// method only pushes the warning out to *that* method's caller — which is
-    /// exactly what the previous `emitRemoteUpdateDeprecated` shim did. Instead
-    /// the internal emit looks the case up by this raw string, which never
-    /// names the deprecated case, so no deprecation diagnostic fires.
-    ///
-    /// Drift guard: `DeprecationWindowInternalUseTests` asserts this equals
-    /// `JsBaoEvent.remoteUpdate.rawValue`, so the internal emit key and the
-    /// public subscription key can never diverge.
-    static let remoteUpdateRawKey = "remoteUpdate"
-
-    /// Emits the deprecated `.remoteUpdate` event (#1120) during its
-    /// deprecation window for existing subscribers (e.g. downstream
-    /// reload-on-remote-write loaders), without tripping the public deprecation
-    /// on the client's own emit. Migrated callers should use
-    /// `.documentSyncStateChanged` instead.
-    ///
-    /// The raw-key escape hatch now lives in `RemoteUpdateEvent.eventKey`, which
-    /// resolves the case from `remoteUpdateRawKey` — so the typed emit here
-    /// still never names `.remoteUpdate`.
-    private func emitRemoteUpdate(documentId: String) {
-        eventEmitter.emit(RemoteUpdateEvent(documentId: documentId))
-    }
 
     /// Download an oversized `syncStep2`/`update` payload the server parked in
     /// R2 (`{type, updateUrl}` instead of inline `update` — sent whenever the
@@ -4344,7 +3890,7 @@ public final class JsBaoClient: @unchecked Sendable {
             return nil
         }
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await NetworkSession.data(from: url)
             guard let http = response as? HTTPURLResponse else {
                 logger.warn("Non-HTTP response downloading update for doc:", documentId)
                 return nil
@@ -4455,16 +4001,10 @@ public final class JsBaoClient: @unchecked Sendable {
                 logger.warn("update frame carried neither update nor updateUrl for doc:", roomId)
                 return
             }
-            // `.documentSyncStateChanged` (state "synced") is the supported,
-            // non-deprecated replacement for `.remoteUpdate` (#1120): emit it
-            // first so migrated subscribers fire.
+            // `.documentSyncStateChanged` (state "synced") is what a
+            // reload-on-remote-write loader subscribes to. It replaced the
+            // Swift-only `.remoteUpdate` event, removed in #2367.
             eventEmitter.emit(DocumentSyncStateChangedEvent(documentId: roomId, state: "synced"))
-            // `.remoteUpdate` is deprecated (#1120) but still emitted during
-            // the deprecation window so existing subscribers keep working.
-            // Routed through `emitRemoteUpdate`, which resolves the event by
-            // its raw key instead of naming the deprecated case, so this emit
-            // site raises no self-inflicted deprecation warning.
-            emitRemoteUpdate(documentId: roomId)
 
         case "awareness":
             // Wire format: `states` is an array of `[clientId, state]`
@@ -4492,20 +4032,23 @@ public final class JsBaoClient: @unchecked Sendable {
             // is derived from the per-phase capture in DocumentManager
             // (`getSyncTimings`), mirroring JS's syncPerf handler.
             guard let roomId = roomId else { return }
-            let timings = json["timings"] as? [String: Any] ?? [:]
+            let timingsAny = json["timings"] as? [String: Any] ?? [:]
+            let timings = (try? JSONValue.typedRow(from: timingsAny, subject: "syncPerf timings")) ?? [:]
 
             // Assemble clientTimings exactly like JS: if syncComplete
             // hasn't yet stamped clientTotalMs (the already-in-sync case
             // where syncPerf can arrive first), compute it now from the
             // syncStep1 anchor, then strip the internal `syncStep1SentAt`
             // before emitting.
-            var clientTimings: [String: Any]? = nil
+            var clientTimings: [String: JSONValue]? = nil
             if var raw = documentManager.getSyncTimings(roomId) {
                 if let sentAt = raw["syncStep1SentAt"], raw["clientTotalMs"] == nil {
                     raw["clientTotalMs"] = Date().timeIntervalSince1970 * 1000.0 - sentAt
                 }
                 raw.removeValue(forKey: "syncStep1SentAt")
-                clientTimings = raw.mapValues { $0 as Any }
+                // `raw` is `[String: Double]`, so this is a direct wrap —
+                // no `JSONValue.typedRow` dynamic-cast chain needed.
+                clientTimings = raw.mapValues { JSONValue.number($0) }
             }
 
             eventEmitter.emit(SyncPerfEvent(
@@ -4541,7 +4084,7 @@ public final class JsBaoClient: @unchecked Sendable {
                 error: json["error"] as? String,
                 contextDocId: json["contextDocId"] as? String,
                 needsApply: json["needsApply"] as? Bool ?? false,
-                meta: json["meta"] as? [String: Any],
+                meta: (json["meta"] as? [String: Any]).flatMap { try? JSONValue.typedRow(from: $0, subject: "workflowStatus meta") },
                 startedByUserId: json["startedByUserId"] as? String
             )
             eventEmitter.emit(event)
@@ -4570,7 +4113,7 @@ public final class JsBaoClient: @unchecked Sendable {
                 runKey: json["runKey"] as? String,
                 instanceId: json["instanceId"] as? String,
                 contextDocId: json["contextDocId"] as? String,
-                meta: json["meta"] as? [String: Any]
+                meta: (json["meta"] as? [String: Any]).flatMap { try? JSONValue.typedRow(from: $0, subject: "workflowStarted meta") }
             )
             eventEmitter.emit(startedEvent)
 
@@ -4649,7 +4192,7 @@ public final class JsBaoClient: @unchecked Sendable {
             // `action == "deleted"` themselves.
             guard let docId = roomId else { return }
             let actionStr = json["action"] as? String ?? "updated"
-            let metadata = json["metadata"] as? [String: Any]
+            let metadata = (json["metadata"] as? [String: Any]).flatMap { try? JSONValue.typedRow(from: $0, subject: "docMetadata metadata") }
             let changedFields = json["changedFields"] as? [String]
             let event = DocumentMetadataChangedEvent(
                 documentId: docId,
@@ -4827,9 +4370,9 @@ public final class JsBaoClient: @unchecked Sendable {
             // Cancel existing timer
             outboundDebounceTimers[documentId]?.cancel()
 
-            let debounceMs = options.sync.outboundDebounceMs
+            let debounce = options.sync.outboundDebounce
             outboundDebounceTimers[documentId] = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(debounceMs) * 1_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(max(0, debounce) * 1_000_000_000))
                 await self?.flushOutboundUpdates(documentId: documentId)
             }
         }
@@ -5198,24 +4741,6 @@ public final class DocumentContext: @unchecked Sendable {
         self.transport = transport
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(documentId:client:blobManager:transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        documentId: String,
-        client: JsBaoClient,
-        blobManager: BlobManager,
-        makeRequest: @escaping (String, String, Any?) async throws -> Any
-    ) {
-        self.init(
-            documentId: documentId,
-            client: client,
-            blobManager: blobManager,
-            transport: ClosureTransport(makeRequest: makeRequest)
-        )
-    }
-
     public func open(options: OpenDocumentOptions = OpenDocumentOptions()) async throws -> YDocument {
         guard let client = client else { throw JsBaoError(code: .unavailable) }
         return try await client.openDocument(documentId, options: options)
@@ -5225,7 +4750,8 @@ public final class DocumentContext: @unchecked Sendable {
         await client?.closeDocument(documentId, options: options)
     }
 
-    public func getDoc() -> YDocument? {
+    /// The open `YDocument`, or `nil` when the document is not open.
+    public var doc: YDocument? {
         client?.getDoc(documentId)
     }
 

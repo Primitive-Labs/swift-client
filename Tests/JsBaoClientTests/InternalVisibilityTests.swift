@@ -165,9 +165,77 @@ final class InternalVisibilityTests: XCTestCase {
         )
 
         let errors = try ClientSourceText.clientSource("Types/Errors.swift")
+        let errorCode = ClientSourceText.stripComments(errors)
         XCTAssertTrue(
-            ClientSourceText.stripComments(errors).contains("public enum WebSocketError"),
+            errorCode.contains("public enum WebSocketError"),
             "WebSocketError is public API — apps catch it from the connect path"
+        )
+        XCTAssertTrue(
+            errorCode.contains("public struct JsBaoNetworkError"),
+            "JsBaoNetworkError is public API (#2367) — apps catch it instead of URLError"
+        )
+    }
+
+    // MARK: - The codegen-backing surface (#2367, decision D)
+
+    /// Every method the generated models call lives on `CodegenAPI`
+    /// (`client.codegen`), not on `JsBaoClient`.
+    ///
+    /// The sponsor chose a facade over `@_spi(Codegen)` because SPI is not
+    /// re-exported through `PrimitiveApp`'s `@_exported import JsBaoClient`.
+    /// The decision is encoded here rather than left in prose: if someone
+    /// moves one of these back onto the client — or reaches for `@_spi` — the
+    /// suite says so.
+    func testCodegenBackingMethodsAreNotOnTheClient() throws {
+        let client = ClientSourceText.stripComments(
+            try ClientSourceText.clientSource("JsBaoClient.swift")
+        )
+
+        // The old spelling, plus the bare names, so neither form comes back.
+        for symbol in [
+            "public func queryShared(", "public func queryPagedShared(",
+            "public func countShared(", "public func findShared(",
+            "public func findByUniqueShared(", "public func queryOneShared(",
+            "public func aggregateShared(", "public func subscribeShared(",
+            "public func saveShared(", "public func upsertShared(",
+            "public func upsertByUniqueShared(", "public func deleteShared(",
+            "public func refersToShared(", "public func hasManyShared(",
+            "public func hasManyThroughShared(", "public func includeTarget(",
+        ] {
+            XCTAssertFalse(
+                client.contains(symbol),
+                "\(symbol) belongs on CodegenAPI (client.codegen), not on JsBaoClient (#2367)"
+            )
+        }
+    }
+
+    /// `inspectableSharedMembers()` is the one member of that family that
+    /// stays on the client: it backs the debug inspector
+    /// (`PrimitiveAppState.swift`), not codegen. Moving it would break the
+    /// inspector for a reason that does not apply to it.
+    func testInspectableSharedMembersStaysOnTheClient() throws {
+        let client = ClientSourceText.stripComments(
+            try ClientSourceText.clientSource("JsBaoClient.swift")
+        )
+        XCTAssertTrue(
+            client.contains("public func inspectableSharedMembers("),
+            "inspectableSharedMembers() is the debug inspector's entry point, not codegen backing"
+        )
+    }
+
+    /// The facade is a plain namespace. `@_spi` was considered and rejected;
+    /// this fails if it is reintroduced here.
+    func testCodegenFacadeUsesNoSPI() throws {
+        let facade = ClientSourceText.stripComments(
+            try ClientSourceText.clientSource("API/CodegenAPI.swift")
+        )
+        XCTAssertFalse(
+            facade.contains("@_spi("),
+            """
+            CodegenAPI must stay a plain public namespace — @_spi is not \
+            re-exported through PrimitiveApp's @_exported import, so scaffolded \
+            apps would fail with "cannot find in scope" (#2367, decision D)
+            """
         )
     }
 }

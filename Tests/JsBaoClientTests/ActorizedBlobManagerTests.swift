@@ -530,7 +530,10 @@ final class ActorizedBlobManagerTests: XCTestCase {
     /// twin + one-release deprecation" (Fork 1 Option C, as D3 shipped it).
     /// Both halves, for all six members, so a later edit cannot quietly drop a
     /// twin or un-deprecate an original.
-    func testEveryDeprecatedBlobMutatorHasAnAsyncTwin() throws {
+    func testTheSynchronousBlobMutatorsAreRemovedAndOnlyTheTwinsRemain() throws {
+        // The window closed in #2367: the synchronous half is gone and only the
+        // `Async` twin is left. Asserting the removal keeps the pair from
+        // growing a synchronous half back.
         let pairs: [(file: String, sync: String, twin: String)] = [
             ("JsBaoClient.swift", "func setBlobUploadConcurrency(", "func setBlobUploadConcurrencyAsync("),
             ("API/DocumentsAPI.swift", "func pauseAllUploads(", "func pauseAllUploadsAsync("),
@@ -545,14 +548,12 @@ final class ActorizedBlobManagerTests: XCTestCase {
                 source.contains(pair.twin),
                 "\(pair.file): missing the async twin `\(pair.twin)`"
             )
-            XCTAssertNotNil(
+            XCTAssertNil(
                 source.range(of: "public \(pair.sync)"),
-                "\(pair.file): the synchronous `\(pair.sync)` must survive the deprecation window"
-            )
-            let attributes = Self.attributes(before: "public \(pair.sync)", in: source)
-            XCTAssertTrue(
-                attributes.contains { $0.hasPrefix("@available(*, deprecated") },
-                "\(pair.file): `\(pair.sync)` must be marked deprecated — attributes: \(attributes)"
+                """
+                \(pair.file): the synchronous `\(pair.sync)` was removed by \
+                #2367 — do not reintroduce it beside its async twin
+                """
             )
         }
     }
@@ -589,10 +590,13 @@ final class ActorizedBlobManagerTests: XCTestCase {
     /// Option B and Fork 1 → Option A). They stay in the source as
     /// `unavailable, renamed:` stubs so the compiler offers a one-click
     /// migration instead of "no such member", with no executable body.
-    func testTheRemovedSynchronousMembersAreGuidedStubs() throws {
+    func testTheGuidedStubsStillPointAtTheirReplacements() throws {
+        // These are `@available(*, unavailable, renamed:)` stubs for members
+        // already removed: they turn "cannot find in scope" into a rename hint.
+        // #2367 kept them deliberately — decision E allows exactly the
+        // annotations that point the compiler at a replacement during this
+        // migration, and a caller mid-migration is who they are for.
         let stubs: [(file: String, declaration: String, renamed: String)] = [
-            ("JsBaoClient.swift",
-             "public func getBlobUploadConcurrency()", "getBlobUploadConcurrencyAsync()"),
             ("API/DocumentsAPI.swift",
              "public func uploads(documentId: String? = nil)", "uploadsAsync(documentId:)"),
             ("API/DocumentsAPI.swift",
@@ -601,8 +605,6 @@ final class ActorizedBlobManagerTests: XCTestCase {
             ("API/DocumentsAPI.swift",
              "public func resumeUpload(blobId: String, documentId: String? = nil)",
              "resumeUploadAsync(blobId:documentId:)"),
-            ("API/DocumentsAPI.swift",
-             "public func getUploadConcurrency()", "getUploadConcurrencyAsync()"),
             ("API/DocumentsAPI.swift", "public func uploads()", "uploadsAsync()"),
             ("API/DocumentsAPI.swift", "public func pauseUpload(blobId: String)",
              "pauseUploadAsync(blobId:)"),
@@ -629,6 +631,32 @@ final class ActorizedBlobManagerTests: XCTestCase {
                 "\(stub.file): `\(stub.declaration)` must have no executable body"
             )
         }
+    }
+
+    /// The two concurrency readers are the exception: #2367 replaced their
+    /// `Async` twins with `{ get async }` properties, so the stubs pointing at
+    /// the old twin names went too — a `renamed:` hint naming a symbol that no
+    /// longer exists is worse than none.
+    func testTheConcurrencyReaderStubsWentWithTheirTwins() throws {
+        let client = try Self.clientSource("JsBaoClient.swift")
+        XCTAssertNil(
+            client.range(of: "public func getBlobUploadConcurrency()"),
+            "getBlobUploadConcurrency() and its stub were removed by #2367"
+        )
+        XCTAssertTrue(
+            client.contains("public var blobUploadConcurrency: Int {"),
+            "the async property that replaced it must be there"
+        )
+
+        let documents = try Self.clientSource("API/DocumentsAPI.swift")
+        XCTAssertNil(
+            documents.range(of: "public func getUploadConcurrency()"),
+            "getUploadConcurrency() and its stub were removed by #2367"
+        )
+        XCTAssertTrue(
+            documents.contains("public var uploadConcurrency: Int {"),
+            "the async property that replaced it must be there"
+        )
     }
 
     /// The twins are deliberately *not* same-name `async` overloads: Swift

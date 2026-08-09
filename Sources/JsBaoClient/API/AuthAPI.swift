@@ -129,10 +129,10 @@ public final class AuthAPI: @unchecked Sendable {
     // MARK: - Identity / token accessors
 
     /// The current user's id, or `nil` when unauthenticated.
-    public func getUserId() -> String? { _getUserId() }
+    public var userId: String? { _getUserId() }
 
     /// The current access token, or `nil` when unauthenticated.
-    public func getToken() -> String? { _getToken() }
+    public var token: String? { _getToken() }
 
     /// Whether the client currently holds an authenticated session.
     /// Mirrors JS `client.isAuthenticated()`.
@@ -140,17 +140,22 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Block until a user id is available (e.g. while a persisted session
     /// rehydrates or a refresh completes), or throw on timeout. Mirrors JS
-    /// `client.waitForUserId({ timeoutMs })` (default 5s). Returns immediately
-    /// if a user id is already present.
+    /// `client.waitForUserId({ timeoutMs })`. Returns immediately if a user id
+    /// is already present.
+    ///
+    /// `timeout` is a `TimeInterval` in **seconds** (renamed from `timeoutMs`
+    /// in #2367), and its default moved from 5s to **10s** in the same change
+    /// so it agrees with the client-level wait it sits beside. JS still
+    /// defaults to 5s.
     ///
     /// Implemented here by polling the injected `getUserId` accessor — the
     /// Swift `AuthController` exposes no event-driven waiter, so this matches
     /// the JS contract (resolve-with-id / throw-on-timeout) without one.
     @discardableResult
-    public func waitForUserId(timeoutMs: Int = 5000) async throws -> String {
+    public func waitForUserId(timeout: TimeInterval = 10) async throws -> String {
         if let uid = _getUserId() { return uid }
 
-        let deadline = Date().addingTimeInterval(Double(max(0, timeoutMs)) / 1000.0)
+        let deadline = Date().addingTimeInterval(Swift.max(0, timeout))
         let pollIntervalNs: UInt64 = 50_000_000 // 50ms
         while Date() < deadline {
             if let uid = _getUserId() { return uid }
@@ -289,7 +294,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Status of the stored offline grant (availability, expiry, method).
     /// Mirrors JS `auth.getOfflineGrantStatus()`.
-    public func getOfflineGrantStatus() -> OfflineGrantStatus {
+    public var offlineGrantStatus: OfflineGrantStatus {
         _getOfflineGrantStatus()
     }
 

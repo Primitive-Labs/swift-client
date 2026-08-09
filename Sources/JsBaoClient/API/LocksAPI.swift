@@ -7,8 +7,10 @@ import Foundation
 /// method-for-method.
 ///
 /// A caller acquires a lease on an app-scoped, caller-chosen key, does its
-/// exclusive work, then releases. `ttlMs` is mandatory, so a crashed holder
+/// exclusive work, then releases. `ttl` is mandatory, so a crashed holder
 /// never wedges the key — the lease expires and the next acquirer takes over.
+/// It is a `TimeInterval` in **seconds** (renamed from `ttlMs: Int` in #2367);
+/// the request body still carries a `ttlMs` JSON key.
 /// Blocking `acquire` is a client-side poll loop over the one-shot server
 /// endpoint.
 ///
@@ -16,7 +18,7 @@ import Foundation
 /// path — and `await` it, so the key is actually free when you return:
 ///
 /// ```swift
-/// guard let handle = try await client.locks.tryAcquire(key: "import:daily", ttlMs: 60_000) else {
+/// guard let handle = try await client.locks.tryAcquire(key: "import:daily", ttl: 60) else {
 ///     return  // someone else is already importing
 /// }
 /// do {
@@ -56,14 +58,6 @@ public final class LocksAPI: @unchecked Sendable {
         self.transport = transport
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.init(transport: ClosureTransport(makeRequest: makeRequest))
-    }
-
     // MARK: - Acquire
 
     /// One non-blocking attempt at the server endpoint. Returns the raw
@@ -83,25 +77,29 @@ public final class LocksAPI: @unchecked Sendable {
     ///
     /// Unlike the blocking `acquire`, a rate-limit 429 is **not** swallowed
     /// here — it surfaces to the caller as an `HttpError`.
-    public func tryAcquire(key: String, ttlMs: Int) async throws -> LockHandle? {
-        let res = try await acquireOnce(key: key, ttlMs: ttlMs)
+    public func tryAcquire(key: String, ttl: TimeInterval) async throws -> LockHandle? {
+        let res = try await acquireOnce(key: key, ttlMs: ttl.wholeMilliseconds)
         return res.acquired ? res.handle : nil
     }
 
-    /// Block until the lock is acquired or `timeoutMs` elapses.
+    /// Block until the lock is acquired or `timeout` elapses.
     ///
     /// Polls the acquire endpoint with jittered backoff (honoring the server's
     /// `retryAfterMs`), then throws `JsBaoError(code: .lockTimeout)` if it never
     /// wins the key within the window. The thrown error's `details` carry the
-    /// contended `key` and the `timeoutMs` that elapsed — the same payload as
+    /// contended `key` and the timeout that elapsed — the same payload as
     /// the JS client's `LockTimeoutError`.
     ///
     /// - Parameters:
     ///   - key: The caller-chosen lock key.
-    ///   - ttlMs: Lease duration in ms once acquired (capped server-side at 24h).
-    ///   - timeoutMs: How long to wait for the lock before throwing.
-    public func acquire(key: String, ttlMs: Int, timeoutMs: Int) async throws -> LockHandle {
-        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+    ///   - ttl: Lease duration once acquired (capped server-side at 24h).
+    ///   - timeout: How long to wait for the lock before throwing. Saturates
+    ///     at ``TimeInterval/maxWholeMilliseconds`` (~292 years), so
+    ///     `.infinity` means "wait indefinitely" rather than trapping.
+    public func acquire(key: String, ttl: TimeInterval, timeout: TimeInterval) async throws -> LockHandle {
+        let ttlMs = ttl.wholeMilliseconds
+        let timeoutMs = timeout.wholeMilliseconds
+        let deadline = Self.deadline(timeoutMs: timeoutMs)
         while true {
             var base = Self.defaultRetryAfterMs
             do {
@@ -154,14 +152,14 @@ public final class LocksAPI: @unchecked Sendable {
     /// Extend a held lease. Returns `renewed == false` (reason `"lease_lost"`)
     /// if the handle no longer holds the key.
     @discardableResult
-    public func renew(_ handle: LockHandle, ttlMs: Int) async throws -> LockRenewResult {
+    public func renew(_ handle: LockHandle, ttl: TimeInterval) async throws -> LockRenewResult {
         try await transport.request(
             method: .post,
             path: "/locks/renew",
             body: LockRenewRequest(
                 key: handle.key,
                 handle: LockHandleRef(handleId: handle.handleId),
-                ttlMs: ttlMs
+                ttlMs: ttl.wholeMilliseconds
             )
         )
     }
@@ -186,6 +184,25 @@ public final class LocksAPI: @unchecked Sendable {
     }
 
     // MARK: - Helpers
+
+    /// The instant a blocking `acquire` gives up, derived from the **clamped**
+    /// millisecond bound rather than the raw `TimeInterval` the caller passed.
+    ///
+    /// This is what keeps the poll loop's remaining-time arithmetic safe.
+    /// `Date().addingTimeInterval(timeout)` with `timeout: .infinity` yields a
+    /// deadline whose `timeIntervalSince(now)` is also infinite, and the loop
+    /// converts that remainder with `Int(_:)` — which traps on a non-finite or
+    /// out-of-range `Double`. `timeoutMs` has already been through
+    /// ``TimeInterval/wholeMilliseconds``, so it is finite and bounded by
+    /// ``TimeInterval/maxWholeMilliseconds``; a deadline built from it is
+    /// finite by construction and the remainder always fits in an `Int`.
+    ///
+    /// Before #2367 the parameter was `timeoutMs: Int` and could not express
+    /// an infinite wait, so the trap surface arrived with the `TimeInterval`
+    /// migration.
+    static func deadline(timeoutMs: Int, from now: Date = Date()) -> Date {
+        now.addingTimeInterval(Double(timeoutMs) / 1000)
+    }
 
     /// The `.lockTimeout` error a blocking `acquire` raises at its deadline.
     /// Mirrors the JS client's `LockTimeoutError` message and `details`.

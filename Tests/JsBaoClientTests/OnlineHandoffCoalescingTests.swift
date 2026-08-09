@@ -132,7 +132,7 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
             "the single coalesced handoff performs exactly one refresh round trip"
         )
         XCTAssertEqual(
-            client.getNetworkMode(), .offline,
+            client.networkMode, .offline,
             "the failed handoff reverts the client to offline mode"
         )
     }

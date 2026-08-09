@@ -2,8 +2,7 @@ import Foundation
 
 // MARK: - HTTPMethod
 
-/// The HTTP verbs the client speaks. Replaces the bare `String` method
-/// argument of the legacy `makeRequest(_:_:_:)` closure.
+/// The HTTP verbs the client speaks.
 public enum HTTPMethod: String, Sendable {
     case get = "GET"
     case head = "HEAD"
@@ -63,9 +62,7 @@ public struct TransportResponse: Sendable {
 /// empty-body, and non-2xx→`HttpError` policies are defined exactly once and
 /// a test fake cannot diverge from the real implementation's semantics.
 ///
-/// `HttpClient` is the production conformance; `ClosureTransport` adapts the
-/// deprecated `(String, String, Any?) async throws -> Any` closures during the
-/// migration window.
+/// `HttpClient` is the production conformance.
 public protocol Transport: Sendable {
     /// Perform one HTTP round trip.
     ///
@@ -337,9 +334,8 @@ public extension Transport {
 
     /// Raw bytes in, raw bytes out — blob upload/download.
     ///
-    /// Returns `execute`'s **untouched** bytes with the status, and (like the
-    /// legacy `makeRawRequest` it replaces) does not throw on a non-2xx
-    /// status. Takes `RequestOptions` rather than a bare header dictionary so
+    /// Returns `execute`'s **untouched** bytes with the status, and does not
+    /// throw on a non-2xx status. Takes `RequestOptions` rather than a bare header dictionary so
     /// callers can also set a timeout; `rawBody` is forced on because the
     /// body is already encoded bytes.
     func requestData(

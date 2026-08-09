@@ -47,7 +47,7 @@ final class AnalyticsContextAsyncTwinTests: XCTestCase {
         let box = EventBox()
         await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
-        let context = try XCTUnwrap(client.getLlmAnalyticsContext())
+        let context = try XCTUnwrap(client.llmAnalyticsContext)
         await context.logEventAsync(["action": "awaited", "feature": "llm"])
 
         XCTAssertEqual(
@@ -65,63 +65,73 @@ final class AnalyticsContextAsyncTwinTests: XCTestCase {
         let box = EventBox()
         await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
-        let context = try XCTUnwrap(client.getGeminiAnalyticsContext())
+        let context = try XCTUnwrap(client.geminiAnalyticsContext)
         await context.logEventAsync(["action": "gemini-awaited"])
 
         XCTAssertEqual(box.count, 1)
     }
 
     /// An event that is not JSON-representable is dropped by `prepared(_:)` on
-    /// the caller's thread — logged, not silent — and the await still returns.
+    /// the caller's thread — logged, not silent — rather than buffered.
+    ///
+    /// Since #2367 the context's own closures take `[String: JSONValue]`, so an
+    /// unrepresentable value cannot reach them at all. The untyped
+    /// `[String: Any]` boundary the drop path guards is
+    /// `AnalyticsQueue.prepared(_:)`, which the client's context closures still
+    /// call, so the check is made there.
     func testUnrepresentableEventIsDroppedRatherThanBuffered() async throws {
-        let client = makeClient()
-        defer { Task { await client.destroy() } }
+        let queue = AnalyticsQueue(logger: Logger(level: .none, scope: "2367-test"))
         let box = EventBox()
-        await client.analyticsQueue.setOnEventLogged { box.append($0) }
+        await queue.setOnEventLogged { box.append($0) }
 
-        let context = try XCTUnwrap(client.getLlmAnalyticsContext())
-        await context.logEventAsync(["action": "bad", "payload": OpaqueValue()])
-
-        XCTAssertEqual(box.count, 0, "a non-JSON-representable event is dropped by prepared(_:)")
+        XCTAssertNil(
+            queue.prepared(["action": "bad", "payload": OpaqueValue()]),
+            "a non-JSON-representable event is dropped by prepared(_:)"
+        )
+        XCTAssertEqual(box.count, 0, "a dropped event must never reach the buffer")
     }
 
-    // MARK: - Behavior 11: the synchronous member survives the window
+    // MARK: - Behavior 11: the deprecation window closed in #2367
 
-    /// The deprecated member still logs. It just does not say when — the
-    /// enqueue is an unstructured task, so the assertion polls.
-    @available(*, deprecated, message: "Deprecated context: exercises the deprecated AnalyticsContext.logEvent on purpose (#2244).")
-    func testDeprecatedSynchronousLogEventStillWorks() async throws {
-        let client = makeClient()
-        defer { Task { await client.destroy() } }
-        let box = EventBox()
-        await client.analyticsQueue.setOnEventLogged { box.append($0) }
-
-        let context = try XCTUnwrap(client.getLlmAnalyticsContext())
-        context.logEvent(["action": "sync-still-works"])
-
-        let deadline = Date().addingTimeInterval(5)
-        while box.count == 0, Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        XCTAssertEqual(box.all.first?["action"]?.stringValue, "sync-still-works")
+    /// The synchronous `AnalyticsContext.logEvent(_:)` method is gone: the
+    /// window opened in #2244 closed with the major. What remains is the
+    /// `logEventAsync(_:)` twin plus the `logEvent:` closure the initializer
+    /// still takes — a hand-built context keeps working, it just has no
+    /// synchronous method of its own.
+    func testTheSynchronousLogEventMethodWasRemoved() throws {
+        let source = try ClientSourceText.code("Types/Events.swift")
+        let region = try ClientSourceText.slice(
+            source,
+            from: "public final class AnalyticsContext",
+            to: "public struct AuthState"
+        )
+        XCTAssertFalse(
+            region.contains("public func logEvent("),
+            "the synchronous logEvent method was removed in #2367"
+        )
+        XCTAssertTrue(
+            region.contains("public func logEventAsync("),
+            "the twin is what survives the window"
+        )
+        XCTAssertTrue(
+            region.contains("logEvent: @escaping @Sendable ([String: JSONValue]) -> Void"),
+            "the initializer still takes the synchronous closure"
+        )
     }
 
-    /// The deprecation message points at the twin by name — that is the whole
-    /// migration instruction a caller gets from the compiler.
-    func testDeprecationMessageNamesTheTwin() throws {
+    /// Nothing on `AnalyticsContext` is deprecated any more — the removal is
+    /// the whole migration, so a leftover `@available(*, deprecated)` would be
+    /// pointing at a member that no longer exists.
+    func testNoDeprecationSurvivesOnAnalyticsContext() throws {
         let source = try ClientSourceText.clientSource("Types/Events.swift")
         let region = try ClientSourceText.slice(
             source,
             from: "public final class AnalyticsContext",
-            to: "public func logEventAsync"
+            to: "public struct AuthState"
         )
-        let deprecation = try XCTUnwrap(
+        XCTAssertNil(
             region.split(separator: "\n").first { $0.contains("@available(*, deprecated") },
-            "AnalyticsContext.logEvent must carry a deprecation"
-        )
-        XCTAssertTrue(
-            deprecation.contains("logEventAsync"),
-            "the deprecation must name the twin: \(deprecation)"
+            "AnalyticsContext carries no deprecation after #2367"
         )
     }
 

@@ -284,8 +284,8 @@ final class PersistenceTests: XCTestCase {
             auth: AuthConfig(persistJwtInStorage: true, storageKeyPrefix: "test")
         ))
 
-        let info = client1.getAuthPersistenceInfo()
-        XCTAssertEqual(info["mode"] as? String, "persisted")
+        let info = client1.authPersistenceInfo
+        XCTAssertEqual(info["mode"]?.stringValue, "persisted")
 
         await client1.destroy()
     }
@@ -310,8 +310,8 @@ final class PersistenceTests: XCTestCase {
         ))
 
         // Verify persistence mode is active
-        let info1 = client1.getAuthPersistenceInfo()
-        XCTAssertEqual(info1["mode"] as? String, "persisted")
+        let info1 = client1.authPersistenceInfo
+        XCTAssertEqual(info1["mode"]?.stringValue, "persisted")
 
         // Connect to ensure the token is stored
         try await client1.connect()

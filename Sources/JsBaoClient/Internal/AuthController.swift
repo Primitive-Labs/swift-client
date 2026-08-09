@@ -404,7 +404,7 @@ public final class AuthController: @unchecked Sendable {
                 return .existing(inFlight)
             }
             let task = Task<RefreshOutcome, Never> { [weak self] in
-                guard let self = self else { return .network }
+                guard let self = self else { return .network(nil) }
                 return await self._refreshAccessTokenImpl(cause: cause)
             }
             pendingRefresh = task
@@ -449,7 +449,9 @@ public final class AuthController: @unchecked Sendable {
         } catch {
             logger.warn("Token refresh network error:", error.localizedDescription)
             handleRefreshDeferred(cause: cause ?? "network_error", error: error)
-            return .network
+            // Carry the underlying failure so the 401 retry path can rethrow
+            // it as `JsBaoNetworkError` instead of inventing a 401.
+            return .network(JsBaoNetworkError(refreshFailure: error))
         }
     }
 
@@ -1624,7 +1626,7 @@ public final class AuthController: @unchecked Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await NetworkSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw JsBaoError(code: .unavailable, message: "Invalid response")
         }

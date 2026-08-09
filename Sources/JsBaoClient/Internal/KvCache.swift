@@ -98,17 +98,6 @@ public actor KvCache {
         self.emit = emit
     }
 
-    /// Deprecated: the untyped `(JsBaoEvent, Any)` emit closure. Adapted onto
-    /// the typed form so existing call sites keep working for one major cycle.
-    ///
-    /// Written as a second designated initializer rather than a `convenience`
-    /// one because an actor has no convenience initializers (a hard error in
-    /// the Swift 6 language mode, which Phase F flips this target to).
-    @available(*, deprecated, message: "Use init(emit:) with a `(any JsBaoEventPayload) -> Void` closure — the untyped event surface is removed in the next major release.")
-    public init(emit: @escaping @Sendable (JsBaoEvent, Any) -> Void) {
-        self.emit = adaptUntypedEmit(emit)
-    }
-
     #if DEBUG
     /// Test-only: push a payload through the injected emit closure without
     /// driving a whole network refresh. Used to assert the deprecated untyped
@@ -170,45 +159,97 @@ public actor KvCache {
     /// isolated steps with `await`s between them, exactly as before (#1910):
     /// each one used to be a `lock.withLock` hold, and merging them would span
     /// a suspension.
+    ///
+    /// ## A cache hit never awaits the network (#2364)
+    ///
+    /// When there is a cached record, this returns it **immediately** and, if
+    /// the record is due for a refresh, starts that refresh in the background.
+    /// That is what JS does (`src/client/kv-cache.ts`, the
+    /// `localIfAvailableElseNetwork` branch: `fetchNetwork().catch(() => {})`
+    /// then `return localVal`). Swift used to fall through to an awaited fetch
+    /// whenever the entry was older than `refreshIfOlderThanMs`, which turned
+    /// every expiry of the shared 5-minute `me.get()` TTL into a user-visible
+    /// stall on a slow link.
+    ///
+    /// A refresh is due when `refreshNetwork` is set, or when
+    /// `refreshIfOlderThanMs` is set and the record is at least that old —
+    /// the same two triggers JS folds into its `shouldRefresh` flag. So
+    /// `refreshNetwork` means "also refresh in the background", not "bypass
+    /// the cache and wait": bypassing is `waitForLoad: .network`, which
+    /// `CacheFacade` routes through `awaitNetwork` below.
+    ///
+    /// One exception: a cached JSON `null` is the "no such record" sentinel
+    /// (`CacheFacade.fetchCachedJSON`), so a record holding it has nothing to
+    /// serve. When such a record is due, this awaits the fetch instead —
+    /// matching JS, which excludes null/undefined from `localVal` and falls
+    /// through to `await fetchNetwork()`, and matching what Swift did on both
+    /// of these triggers before #2364. A record holding `null` that is **not**
+    /// due still short-circuits as a hit; that negative-caching difference from
+    /// JS predates #2364 and is deliberately unchanged.
+    ///
+    /// `awaitNetwork` is the internal forced-network path. `CacheFacade`
+    /// passes it for `waitForLoad: .network`, whose JS counterpart calls
+    /// `await fetchNetwork()` with no cache read at all. It is deliberately
+    /// not part of `FetchCachedOptions` — apps express the same thing with
+    /// `waitForLoad`.
     func fetchCachedValue(
         key: String,
         fetcher: @escaping @Sendable () async throws -> JSONValue,
-        options: FetchCachedOptions = FetchCachedOptions()
+        options: FetchCachedOptions = FetchCachedOptions(),
+        awaitNetwork: Bool = false
     ) async throws -> JSONValue {
         // Check in-memory cache
         let refreshNetwork = options.refreshNetwork ?? false
-        let refreshIfOlderThanMs = options.refreshIfOlderThanMs
+        let refreshIfOlderThanMs = options.refreshIfOlderThan.map(\.wholeMilliseconds)
 
-        if !refreshNetwork {
-            // Region 1: in-memory cache check. Reading `memCache[key]` and
-            // evaluating staleness happen with no suspension between them.
-            let cached = memCache[key]
-            if let cached = cached {
-                // Check staleness
-                if let maxAge = refreshIfOlderThanMs,
-                   let updatedAt = cached.updatedAtMs {
-                    let age = Date().timeIntervalSince1970 * 1000 - updatedAt
-                    if age < Double(maxAge) {
+        if !awaitNetwork {
+            // Region 1: in-memory cache check. Reading `memCache[key]`,
+            // evaluating staleness and registering the background refresh all
+            // happen with no suspension between them — the registration shares
+            // the dedup table with region 3, so it needs the same atomicity.
+            if let cached = memCache[key] {
+                if refreshNetwork || Self.isDueForRefresh(cached, maxAgeMs: refreshIfOlderThanMs) {
+                    // A cached JSON `null` is the "no such record" sentinel
+                    // (`CacheFacade.fetchCachedJSON`), so there is nothing to
+                    // serve: a due entry falls through to the awaited fetch in
+                    // region 3 instead of handing back `nil` and refreshing
+                    // behind it. JS excludes null/undefined from `localVal` for
+                    // the same reason (`src/client/kv-cache.ts`), and before
+                    // #2364 both of these triggers already fell through here.
+                    // A *fresh* `null` still short-circuits — Swift's negative
+                    // caching on that path predates this change and is left
+                    // alone.
+                    if !cached.value.isNull {
+                        startBackgroundRefresh(key: key, fetcher: fetcher)
                         return cached.value
                     }
                 } else {
                     return cached.value
                 }
-            }
-
-            // Region 2: persistent storage load (awaited with nothing held),
-            // then a separate isolated step to write the loaded record into
-            // memCache.
-            if let record = await loadFromStorage(key: key) {
-                if let maxAge = refreshIfOlderThanMs,
-                   let updatedAt = record.updatedAtMs {
-                    let age = Date().timeIntervalSince1970 * 1000 - updatedAt
-                    if age < Double(maxAge) {
-                        memCache[key] = record
+            } else if let loaded = await loadFromStorage(key: key) {
+                // Region 2: persistent storage load (awaited with nothing
+                // held), then a separate isolated step to write the loaded
+                // record into memCache and, when it is due, start the
+                // background refresh.
+                //
+                // `loadFromStorage` is a suspension point, so a fetch for this
+                // key can complete while it runs: `completeInflightFetch` →
+                // `set(key:value:)` writes the fresh record into `memCache`
+                // before persisting it. Whatever is in `memCache` now is
+                // therefore at least as new as what came off disk — prefer it,
+                // so a stale (or `null`) on-disk record can't overwrite a value
+                // that was fetched moments ago. The branch was only entered
+                // because `memCache[key]` was empty, so in the ordinary case
+                // this is exactly `memCache[key] = loaded`.
+                let record = memCache[key] ?? loaded
+                memCache[key] = record
+                if refreshNetwork || Self.isDueForRefresh(record, maxAgeMs: refreshIfOlderThanMs) {
+                    // Same `null` rule as region 1 above.
+                    if !record.value.isNull {
+                        startBackgroundRefresh(key: key, fetcher: fetcher)
                         return record.value
                     }
                 } else {
-                    memCache[key] = record
                     return record.value
                 }
             }
@@ -245,7 +286,7 @@ public actor KvCache {
         // timeout error instead of hanging (#994). Defaults to 10s to match JS
         // (`Math.max(0, options?.serverTimeoutMs ?? 10000)`); an explicit `0`
         // disables the bound (JS's `Math.max(0, …)` floor → falsy → no timer).
-        let timeoutMs = options.serverTimeoutMs ?? 10000
+        let timeoutMs = options.serverTimeout.map(\.wholeMilliseconds) ?? 10000
         if timeoutMs > 0 {
             do {
                 return try await withTimeout(ms: timeoutMs) {
@@ -261,6 +302,38 @@ public actor KvCache {
         }
 
         return try await task.value
+    }
+
+    /// Is `record` old enough that `refreshIfOlderThanMs` asks for a refresh?
+    ///
+    /// Mirrors the JS age test (`src/client/kv-cache.ts`): the age is clamped
+    /// at zero and compared with `>=`, so `refreshIfOlderThanMs: 0` makes every
+    /// record due. A record with no `updatedAtMs`, or a call with no
+    /// `refreshIfOlderThanMs`, is never due on age alone.
+    private static func isDueForRefresh(_ record: KvCacheRecord, maxAgeMs: Int?) -> Bool {
+        guard let maxAgeMs = maxAgeMs, let updatedAtMs = record.updatedAtMs else { return false }
+        let ageMs = max(0, Date().timeIntervalSince1970 * 1000 - updatedAtMs)
+        return ageMs >= Double(maxAgeMs)
+    }
+
+    /// Start a network refresh for `key` that nobody waits on, joining the
+    /// in-flight request when one is already running.
+    ///
+    /// This is JS's `fetchNetwork().catch(() => {})` — the returned task's
+    /// error is deliberately unobserved, because the caller has already been
+    /// handed the cached value and a failed background refresh must not
+    /// surface as a thrown error. `makeFetchTask` still emits
+    /// `cacheUpdateFailed`, so a subscriber sees the failure.
+    ///
+    /// Isolated and free of `await` for the same reason region 3 is: the
+    /// lookup and the registration both touch `inflightRequests` and must not
+    /// be split by a suspension, or two refreshes start for one key.
+    private func startBackgroundRefresh(
+        key: String,
+        fetcher: @escaping @Sendable () async throws -> JSONValue
+    ) {
+        guard inflightRequests[key] == nil else { return }
+        inflightRequests[key] = makeFetchTask(key: key, fetcher: fetcher)
     }
 
     /// Build (but do not register) the task that runs one network fetch for
@@ -624,22 +697,6 @@ public final class CacheFacade: @unchecked Sendable {
         self.transport = transport
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(kvCache:getNetworkMode:transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        kvCache: KvCache,
-        getNetworkMode: @escaping () -> NetworkMode,
-        makeRequest: @escaping (String, String, Any?) async throws -> Any
-    ) {
-        self.init(
-            kvCache: kvCache,
-            getNetworkMode: getNetworkMode,
-            transport: ClosureTransport(makeRequest: makeRequest)
-        )
-    }
-
     /// Build a deterministic cache key.
     ///
     /// Matches JS `buildCacheKey` (`src/client/kv-cache.ts`) byte-for-byte:
@@ -672,10 +729,11 @@ public final class CacheFacade: @unchecked Sendable {
     /// - `waitForLoad`:
     ///   - `.local` → return the cached value (if any) WITHOUT hitting the
     ///     network.
-    ///   - `.network` → force the network fetch, skipping the cache-hit
-    ///     short-circuit (via `refreshNetwork`).
-    ///   - `.localIfAvailableElseNetwork` (default) → return cached if present,
-    ///     otherwise fetch.
+    ///   - `.network` → force the network fetch and await it, skipping the
+    ///     cache read entirely (via the internal `awaitNetwork` flag).
+    ///   - `.localIfAvailableElseNetwork` (default) → return cached if present
+    ///     (refreshing in the background when `refreshNetwork` or
+    ///     `refreshIfOlderThanMs` says it is due), otherwise fetch.
     /// - Offline gating: when `getNetworkMode()` is `.offline`, never attempt
     ///   the network. Return the cached value if present; otherwise throw a
     ///   `.listUnavailableOffline` error.
@@ -726,9 +784,13 @@ public final class CacheFacade: @unchecked Sendable {
                     message: "Cache fetch unavailable offline (key: \(key))"
                 )
             }
-            var forced = options
-            forced.refreshNetwork = true
-            return try await kvCache.fetchCachedValue(key: key, fetcher: fetcher, options: forced)
+            // `awaitNetwork`, not `refreshNetwork`: since #2364 the latter
+            // means "serve the cached value and refresh behind it", which is
+            // the opposite of what `.network` promises. `awaitNetwork` is the
+            // internal flag for JS's `await fetchNetwork()`.
+            return try await kvCache.fetchCachedValue(
+                key: key, fetcher: fetcher, options: options, awaitNetwork: true
+            )
         }
 
         // `.localIfAvailableElseNetwork` (default).
@@ -742,8 +804,9 @@ public final class CacheFacade: @unchecked Sendable {
         }
 
         // Online/auto: defer to the low-level fetcher, which returns the
-        // cached value when present (honoring refreshNetwork /
-        // refreshIfOlderThanMs) and otherwise fetches.
+        // cached value when present — starting a background refresh if
+        // `refreshNetwork` / `refreshIfOlderThanMs` says one is due — and
+        // otherwise fetches.
         return try await kvCache.fetchCachedValue(key: key, fetcher: fetcher, options: options)
     }
 

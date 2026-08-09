@@ -246,55 +246,21 @@ public struct OpenDocumentResult: Sendable {
 // MARK: List inputs
 
 /// Options for the deprecated `documents.list(options:)`. Mirrors js-bao's
-/// `DocumentListOptions` field-for-field so the deprecated surface lines up
-/// across platforms.
+/// `DocumentListOptions` for the fields Swift implements, so the deprecated
+/// surface lines up across platforms.
 ///
 /// Deprecated alongside `documents.list` — migrate to
 /// `client.me.ownedDocuments(...)` / `client.me.sharedDocuments(...)`.
 ///
-/// Five of its fields are **not implemented in Swift** and carry a
-/// deprecation warning saying so (#2360): `documents.list` is a blocking
-/// server fetch, and the local-first behavior these fields describe lives on
-/// `client.me.ownedDocuments(...)`. They are backed by non-deprecated private
-/// storage so this file can keep round-tripping them without warning about
-/// itself; removal rides the batched Swift major (#2367).
+/// The five never-implemented fields (`refreshFromServer`, `localOnly`,
+/// `serverTimeoutMs`, `waitForLoad`, `returnPage`) were deprecated in #2360 and
+/// removed in #2367. `documents.list` is a blocking server fetch: the
+/// local-first behavior those fields described lives on
+/// `client.me.ownedDocuments(...)`, and the `{ items, cursor }` page shape lives
+/// on `documents.listPage(...)`.
 public struct ListDocumentsOptions: Sendable {
     /// Include the app's root document in results (excluded by default).
     public var includeRoot: Bool?
-
-    private var refreshFromServerStorage: Bool?
-    private var localOnlyStorage: Bool?
-    private var serverTimeoutMsStorage: Int?
-    private var waitForLoadStorage: String?
-    private var returnPageStorage: Bool?
-
-    /// Not implemented — `documents.list` always fetches from the server.
-    @available(*, deprecated, message: "Not implemented in Swift — documents.list always fetches from the server. Use client.me.ownedDocuments(options: MeOwnedDocumentsOptions(refreshFromServer:)) for the local-first list. Removed in the next major release (#2367).")
-    public var refreshFromServer: Bool? {
-        get { refreshFromServerStorage }
-        set { refreshFromServerStorage = newValue }
-    }
-
-    /// Not implemented — `documents.list` always fetches from the server.
-    @available(*, deprecated, message: "Not implemented in Swift — documents.list always fetches from the server. Use client.me.ownedDocuments(options: MeOwnedDocumentsOptions(localOnly:)) for the cache-only list. Removed in the next major release (#2367).")
-    public var localOnly: Bool? {
-        get { localOnlyStorage }
-        set { localOnlyStorage = newValue }
-    }
-
-    /// Not implemented — `documents.list` does not bound its fetch.
-    @available(*, deprecated, message: "Not implemented in Swift — documents.list does not bound its fetch. Use client.me.ownedDocuments(options: MeOwnedDocumentsOptions(serverTimeoutMs:)). Removed in the next major release (#2367).")
-    public var serverTimeoutMs: Int? {
-        get { serverTimeoutMsStorage }
-        set { serverTimeoutMsStorage = newValue }
-    }
-
-    /// Not implemented, and untyped where the replacement is typed.
-    @available(*, deprecated, message: "Not implemented in Swift — documents.list always waits for the server. Use client.me.ownedDocuments(options: MeOwnedDocumentsOptions(waitForLoad:)), which takes the typed WaitForLoadMode. Removed in the next major release (#2367).")
-    public var waitForLoad: String? {
-        get { waitForLoadStorage }
-        set { waitForLoadStorage = newValue }
-    }
 
     /// Maximum number of documents per page (enables server-side pagination).
     public var limit: Int?
@@ -305,38 +271,18 @@ public struct ListDocumentsOptions: Sendable {
     /// Sort chronologically (oldest first) instead of reverse-chronological.
     public var forward: Bool?
 
-    /// Not implemented — Swift can't switch a return type on a runtime flag.
-    @available(*, deprecated, message: "Not implemented in Swift — a runtime flag can't change a return type. Call documents.listPage(...) for the { items, cursor } page. Removed in the next major release (#2367).")
-    public var returnPage: Bool? {
-        get { returnPageStorage }
-        set { returnPageStorage = newValue }
-    }
-
-    /// The `refreshFromServer` / `localOnly` / `serverTimeoutMs` /
-    /// `waitForLoad` / `returnPage` parameters are accepted for source
-    /// compatibility and ignored — see the deprecated properties above.
     public init(
         includeRoot: Bool? = nil,
-        refreshFromServer: Bool? = nil,
-        localOnly: Bool? = nil,
-        serverTimeoutMs: Int? = nil,
-        waitForLoad: String? = nil,
         limit: Int? = nil,
         cursor: String? = nil,
         tag: String? = nil,
-        forward: Bool? = nil,
-        returnPage: Bool? = nil
+        forward: Bool? = nil
     ) {
         self.includeRoot = includeRoot
-        self.refreshFromServerStorage = refreshFromServer
-        self.localOnlyStorage = localOnly
-        self.serverTimeoutMsStorage = serverTimeoutMs
-        self.waitForLoadStorage = waitForLoad
         self.limit = limit
         self.cursor = cursor
         self.tag = tag
         self.forward = forward
-        self.returnPageStorage = returnPage
     }
 }
 

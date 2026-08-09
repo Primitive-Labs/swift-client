@@ -1,10 +1,186 @@
 # Changelog
 
-The Swift client is versioned by git tag (there is no `Package.swift` version
-field). Breaking changes are recorded here so downstream apps can migrate when
-they bump the tag they pin.
+## How this package is versioned
+
+**There are no version numbers and no tags.** The Swift client is published by
+branch, not by release: `scripts/publish-swift-packages.sh` pushes the built
+tree to a branch of the `Primitive-Labs/swift-client` mirror, and apps depend
+on that branch (`branch: "main"` for production, `branch: "alpha"` for the
+alpha channel — issue #1934). There is no `Package.swift` version field, no git
+tag, and therefore no older surface an app can pin to.
+
+The practical consequence: **a breaking change reaches every app on its next
+`swift package update`.** Breaking changes are recorded here so you can read
+what moved before you take the update, but reading this file is the whole
+mitigation — there is nothing to pin.
+
+(Earlier revisions of this file claimed the package "is versioned by git tag …
+so downstream apps can migrate when they bump the tag they pin". That was never
+true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
+
+### The batched breaking API cleanup (#2367)
+
+One deliberate source break covering everything that had been queued behind
+"the next major". Since there is no version to sit on (see above), the point of
+batching is to make the number of unavoidable breaks **exactly one**, not to
+let anyone migrate on their own schedule.
+
+A full symbol-by-symbol migration table is in the migration guide:
+<https://primitive-labs.github.io/primitive-docs-site/getting-started/swift-client-migration>.
+The headlines:
+
+- **Every symbol marked for removal in the next major was removed.** All 61
+  `next major` markers, and 76 of the 96 `@available(*, deprecated)`
+  declarations went with them: the untyped `EventEmitter` surface and
+  `client.events`, `makeRequest` / `makeRawRequest`, the sync/async twins, the
+  legacy closure-taking `init`s and `ClosureTransport`, `QueryOptions.offset`,
+  the never-emitted `.auth` / `.blobsUploadQueued` cases and the Swift-only
+  `.remoteUpdate` event, the six dead list-option fields from #2360 (five on
+  `ListDocumentsOptions`, plus `MeOwnedDocumentsOptions.returnPage`), the #619
+  per-document invitation verbs, the legacy `databases` permission /
+  import-bulk verbs, and `waitForSync`.
+
+  **20 deprecation warnings still exist**, and your build will still emit them.
+  18 describe **server-side** deprecations that were never queued behind this
+  batch (the metadata-category surface, the direct LLM/Gemini APIs) — those
+  still work. The other two are client-side and stay deprecated because their
+  replacement already shipped: `documents.list(...)` and `documents.listPage(...)`
+  point at `client.me.ownedDocuments(...)` / `client.me.sharedDocuments(...)`.
+- **No sub-API is an implicitly-unwrapped optional any more.** `client.documents`
+  and its 25 siblings used to be typed `DocumentsAPI!`. Reads are unchanged.
+- **`get*()` accessors became properties**, and the millisecond `Int` input
+  parameters became `TimeInterval` **in seconds** — `waitForInitialSync(timeoutMs: 10_000)`
+  is now `waitForInitialSync(timeout: 10)`. Response and telemetry `*Ms` fields
+  are untouched, and the request bodies keep their `ttlMs` / `timeoutMs` JSON
+  keys. `TimeInterval` can express values the old `Int` could not, so the
+  conversion saturates rather than trapping: negatives and `.nan` floor to `0`,
+  and `.infinity` (or anything above ~292 years) clamps to the maximum
+  representable millisecond count.
+- **The event / awareness / analytics payloads are `[String: JSONValue]`**, not
+  `[String: Any]`, which makes several `@unchecked Sendable` conformances real.
+- **`databases.subscribe` returns an `EventSubscription`**, not a discardable
+  closure. Hold the handle: releasing it unsubscribes.
+- **`JsBaoNetworkError` is public** and replaces the raw `URLError` that used to
+  escape the HTTP paths. It also replaces the `HttpError(status: 401)` a
+  *failed token refresh* used to raise: when a request's 401 triggers a refresh
+  and that refresh times out, returns 5xx, or fails to decode, the underlying
+  failure is now rethrown as a retryable `JsBaoNetworkError` instead of reading
+  as invalid credentials. A refresh the server rejects with 401/403 still
+  throws `HttpError(status: 401, message: "Invalid credentials")`.
+- **`RefreshOutcome` changed shape** to carry that failure. It is no longer a
+  `String`-raw-valued enum — `rawValue` and `init(rawValue:)` are gone — and
+  `.network` now has an associated value: `case network(JsBaoNetworkError?)`.
+  A comparison spelled `outcome == .network` no longer compiles; match it with
+  `if case .network = outcome` (or bind the error). The other cases are
+  unchanged and the enum is still `Equatable`.
+- **The codegen-backing `*Shared` methods moved to `client.codegen`** and
+  dropped the suffix.
+
+#### Two breaks this batch does NOT close
+
+**Workflow `input` / `meta` on the positional call forms.** The batch split
+this surface rather than moving all of it, so be precise about which call site
+you have:
+
+| Call site | Currency now |
+| --- | --- |
+| `workflows.start(workflowKey:input:options:)` — the `input` parameter | still `[String: Any]` |
+| `workflows.start(workflowKey:input:runKey:contextDocId:meta:forceRerun:)` — the generic `Encodable` form, `meta` | still `[String: Any]` |
+| `workflows.runSync(workflowKey:input:…:meta:…)` — both overloads | still `[String: Any]` |
+| `StartWorkflowOptions.input` / `.meta` | **now `[String: JSONValue]`** |
+
+The options struct moved because its `@unchecked Sendable` conformance was
+false while it held `[String: Any]`, and this batch was making those
+conformances real. The positional parameters did not, because `JSONValue` has a
+single `.number(Double)` case and retyping them would silently lose integer
+exactness past 2^53.
+
+The consequence is worth stating plainly: **the same logical field now has two
+fidelities depending on which form you call.** Every form that takes `meta`
+positionally — both `runSync` overloads and the generic `Encodable` `start` —
+serializes an `Int64` exactly, because those values reach `JSONSerialization`
+without passing through `JSONValue`. `start(StartWorkflowOptions(meta:))` does
+route through `JSONValue`, so an integer past 2^53 loses its low bits there.
+If you pass large integer IDs in `input` or `meta`, use one of the positional
+forms until `JSONValue` gains an integer case. Finishing the job — retyping the
+positional parameters too — is the **known future break** this migration does
+not cover.
+
+**The query/storage row currency** (`PrimitiveRow.raw`,
+`PrimitiveRowDecodable.init?(row:)`, `DocumentFilter`, `IncludeTarget`, the
+`DynamicModel` / `MultiDocModel` returns, and `DatabaseChangeEvent.data` /
+`.previousData`) also keeps `[String: Any]` / `Any?`, but for a different
+reason: size, not correctness. Retyping it reaches the codegen
+emitter's row-decode expressions, so it re-rolls every generated model and
+every golden — in the client, the template, the demo and the CLI's Swift
+fixtures. It was in this batch's original scope and was split into
+**issue #2546** rather than landed on top of a migration that already touches
+all of those. When it lands, regenerating your models is expected to be the
+whole of your side of it.
+### A refresh-time network outage is no longer reported as a 401 (#2366)
+
+When a request got a 401 and the token refresh that followed could not reach
+the server, the client threw `HttpError(status: 401, message: "Refresh
+deferred due to network failure")`. A transient outage was therefore
+indistinguishable from an expired session — and `BlobManager` treats a 401 as
+a permanent rejection, so an upload caught by a network blip had its retained
+bytes evicted and reported a terminal `willRetry: false` instead of being
+requeued. The blob was lost.
+
+That branch now throws the retryable `JsBaoNetworkError` (public since the
+#2367 batch above) instead of a synthetic 401, so blob uploads requeue and
+retry. This matches the JS client, which throws `JsBaoNetworkError` on the
+same branch.
+
+Migration: app code that inspects the status of a failed request and treats a
+401 as "signed out" no longer sees a 401 for this case — which is the point.
+A refresh the server actually *rejects* (401/403) is unchanged: it still
+throws `HttpError(status: 401, message: "Invalid credentials")`, and that is
+the case to sign out on.
+
+**No new public API beyond #2367's.** This fix originally shipped the failure
+under a module-internal representation so it would not add a public symbol
+outside #2367's single breaking batch; with that batch landed, the failure is
+spelled with #2367's public `JsBaoNetworkError` and the internal representation
+is gone.
+### Cached reads never wait on the network; the reconnect ceiling defaults to 5 minutes (#2364)
+
+Two behavior changes that bring the Swift client onto js-bao's defaults. This
+fix changes no signatures itself (the `refreshIfOlderThan` / `serverTimeout`
+spellings come from the #2367 batch above), so there is nothing to migrate —
+but both changes are observable at runtime.
+
+**A cache hit returns immediately, and any refresh runs behind it.** When a
+cached entry was older than `refreshIfOlderThan`, the Swift cache used to
+fall through to an *awaited* network fetch, so every expiry of the shared
+5-minute `me.get()` / `users.getBasic()` TTL blocked the caller on a round
+trip. It now returns the cached value straight away and refreshes in the
+background, so the *next* read is current — which is what js-bao has always
+done. `refreshNetwork: true` changed the same way: it forces the background
+refresh regardless of age rather than bypassing the cache and waiting.
+
+If a call site needs to wait for fresh server data, ask for it explicitly:
+
+```swift
+let profile = try await client.me.get(
+    options: FetchCachedOptions(waitForLoad: .network))
+```
+
+`waitForLoad: .network` is unchanged — it still skips the cache and awaits the
+server. A cache *miss* also still awaits, because there is nothing to serve —
+and so does a due entry that cached "no such record" (an empty 2xx body, stored
+as JSON `null`), for the same reason.
+
+**`maxReconnectDelay` now defaults to 300 seconds**, up from 30, matching
+js-bao's `300_000` ms. Both clients use the same backoff formula, so the old
+default made a Swift app retry roughly ten times as often — forever — against a
+server that is down. Apps that want a tighter ceiling can still pass one:
+
+```swift
+JsBaoClientOptions(apiUrl: …, wsUrl: …, appId: …, maxReconnectDelay: 30)
+```
 
 ### `me.ownedDocuments` is local-first by default; five `ListDocumentsOptions` fields are deprecated (#2360)
 
@@ -33,7 +209,7 @@ The rest of the resolution order:
 | `localOnly: true`, `refreshFromServer: false`, `waitForLoad: .local` | local cache rows only, no HTTP request, `cursor == nil` |
 | offline, `waitForLoad: .network` | throws `JsBaoError(code: .listUnavailableOffline)` |
 | offline, any other mode | local cache rows |
-| `serverTimeoutMs` (default 10000) | bounds every server fetch; exceeding it throws `JsBaoError(code: .listTimeout)`. `0` means unbounded |
+| `serverTimeout` (a `TimeInterval` in **seconds**, default 10 — renamed from `serverTimeoutMs` in #2367) | bounds every server fetch; exceeding it throws `JsBaoError(code: .listTimeout)`. `0` means unbounded |
 
 `limit` / `cursor` are ignored on local paths — the cache isn't paginated —
 and the returned `cursor` is `nil` there. Because of that,
@@ -60,12 +236,13 @@ permission — the root's permission is `read-write`, never `owner`. And
 `includeRoot: true` against a local cache that doesn't hold the root falls
 through to the server rather than answering without it (js-bao parity).
 
-**Deprecations (still compile, still ignored).** `documents.list(...)` is a
+**Deprecations (removed since — see #2367 above).** `documents.list(...)` is a
 blocking server fetch and never implemented the local-first half of
 `ListDocumentsOptions`, so `refreshFromServer`, `localOnly`, `serverTimeoutMs`,
-`waitForLoad` and `returnPage` now carry a deprecation warning naming the
-replacement, as does `MeOwnedDocumentsOptions.returnPage` (use
-`ownedDocumentsPage(...)`). They are removed in the next major (#2367).
+`waitForLoad` and `returnPage` carried a deprecation warning naming the
+replacement, as did `MeOwnedDocumentsOptions.returnPage` (use
+`ownedDocumentsPage(...)`). All six were **removed** in #2367; they no longer
+compile.
 
 **Fixed:** `documents.listGroupPermissions(documentId:includeSystem: true)` now
 sends `?includeSystem=true`. It previously filtered client-side only, and the

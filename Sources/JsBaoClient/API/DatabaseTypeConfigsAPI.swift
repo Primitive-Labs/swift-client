@@ -14,14 +14,6 @@ public final class DatabaseTypeConfigsAPI: @unchecked Sendable {
         self.transport = transport
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.init(transport: ClosureTransport(makeRequest: makeRequest))
-    }
-
     /// Lists all database type configurations for the current app.
     public func list() async throws -> [DatabaseTypeConfigInfo] {
         try await transport.request(method: .get, path: "/databases/types")

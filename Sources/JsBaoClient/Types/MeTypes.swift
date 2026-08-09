@@ -77,10 +77,11 @@ public enum AvatarContentType: String, Sendable, Equatable, CaseIterable {
 ///   cached metadata (defaults to `true`). `localOnly: true` forces this off.
 /// - `localOnly` — return only docs with local data on this device, ignoring
 ///   the server entirely.
-/// - `serverTimeoutMs` — bound on a server fetch, in milliseconds (default
-///   10000, JS parity). Exceeding it throws `JsBaoError(code: .listTimeout)`;
-///   `0` means unbounded, matching how the client's cache reads the same
-///   option.
+/// - `serverTimeout` — bound on a server fetch, a `TimeInterval` in
+///   **seconds** (default `10`; renamed from `serverTimeoutMs: Int` in #2367,
+///   which was 10000 milliseconds). Exceeding it throws
+///   `JsBaoError(code: .listTimeout)`; `0` means unbounded, matching how the
+///   client's cache reads the same option. The wire field is still `timeoutMs`.
 /// - `waitForLoad` — when the call resolves:
 ///   - `.local` — local cache rows only; never touches the network.
 ///   - `.network` — blocking server fetch, merged with local rows; throws
@@ -100,37 +101,31 @@ public struct MeOwnedDocumentsOptions: Sendable, Equatable {
     public var includeRoot: Bool?
     public var refreshFromServer: Bool?
     public var localOnly: Bool?
-    public var serverTimeoutMs: Int?
+    public var serverTimeout: TimeInterval?
     public var waitForLoad: WaitForLoadMode?
     public var forward: Bool?
 
-    private var returnPageStorage: Bool?
-
-    /// Not implemented — Swift can't switch a return type on a runtime flag.
-    @available(*, deprecated, message: "Not implemented in Swift — a runtime flag can't change a return type. Call me.ownedDocumentsPage(...) for the { items, cursor } page. Removed in the next major release (#2367).")
-    public var returnPage: Bool? {
-        get { returnPageStorage }
-        set { returnPageStorage = newValue }
-    }
-
-    /// The `returnPage` parameter is accepted for source compatibility and
-    /// ignored — call `ownedDocumentsPage(...)` instead.
+    /// `returnPage` was deprecated in #2360 and removed in #2367 — a runtime
+    /// flag can't change a return type in Swift. Call
+    /// `me.ownedDocumentsPage(...)` for the `{ items, cursor }` page.
+    ///
+    /// Note for anyone comparing option values: removing its private storage
+    /// changed the synthesized `Equatable` — two options differing only in
+    /// `returnPage` used to compare unequal and now compare equal.
     public init(
         includeRoot: Bool? = nil,
         refreshFromServer: Bool? = nil,
         localOnly: Bool? = nil,
-        serverTimeoutMs: Int? = nil,
+        serverTimeout: TimeInterval? = nil,
         waitForLoad: WaitForLoadMode? = nil,
-        forward: Bool? = nil,
-        returnPage: Bool? = nil
+        forward: Bool? = nil
     ) {
         self.includeRoot = includeRoot
         self.refreshFromServer = refreshFromServer
         self.localOnly = localOnly
-        self.serverTimeoutMs = serverTimeoutMs
+        self.serverTimeout = serverTimeout
         self.waitForLoad = waitForLoad
         self.forward = forward
-        self.returnPageStorage = returnPage
     }
 }
 

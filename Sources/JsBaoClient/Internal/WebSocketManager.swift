@@ -428,8 +428,13 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// Reduce a non-`Sendable` `Error` to the `Sendable` value the channel
     /// carries. The message is the original `localizedDescription` verbatim, so
     /// `ConnectionErrorEvent.message` text is unchanged.
+    ///
+    /// Built from `JsBaoNetworkError(transport:)` — the client's one
+    /// error-to-(message, code) mapping — so the WS and HTTP failure paths
+    /// cannot report the same underlying failure differently (#2367).
     private nonisolated static func transportFailure(from error: Error) -> WebSocketError {
-        .transportFailure(message: error.localizedDescription, code: (error as? URLError)?.errorCode)
+        let normalized = JsBaoNetworkError(transport: error)
+        return .transportFailure(message: normalized.message, code: normalized.urlErrorCode)
     }
 
     /// Yield onto the ordered channel. `nonisolated`, so every producer —

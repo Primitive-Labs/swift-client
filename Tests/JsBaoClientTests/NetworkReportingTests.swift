@@ -4,7 +4,7 @@ import Network
 
 /// Phase 1 (issue #1987): separation of the internal networking GATE
 /// (`networkingAllowed()`, mode-based) from the public connectivity REPORT
-/// (`isOnline()` / `getNetworkStatus()`, blended with transport), plus the new
+/// (`isOnline()` / `networkStatus`, blended with transport), plus the new
 /// `transport`/`reason` fields on `NetworkStatus`.
 ///
 /// Server-free: the connected-transport case drives a real socket via the
@@ -40,11 +40,11 @@ final class NetworkReportingTests: XCTestCase {
         let client = makeClient()
         defer { Task { await client.destroy() } }
 
-        XCTAssertEqual(client.getNetworkMode(), .auto)
-        XCTAssertEqual(client.getNetworkStatus().transport, .disconnected)
+        XCTAssertEqual(client.networkMode, .auto)
+        XCTAssertEqual(client.networkStatus.transport, .disconnected)
 
         // Reporting says offline (transport disconnected)…
-        XCTAssertFalse(client.getNetworkStatus().isOnline)
+        XCTAssertFalse(client.networkStatus.isOnline)
         XCTAssertFalse(client.isOnline())
 
         // …but the gate (the reconnect delegate) still says YES, so the
@@ -99,9 +99,9 @@ final class NetworkReportingTests: XCTestCase {
         XCTAssertFalse(client.isOnline())
     }
 
-    // MARK: - Behavior 4 — event isOnline agrees with getNetworkStatus()
+    // MARK: - Behavior 4 — event isOnline agrees with networkStatus
 
-    /// The emitted `NetworkModeEvent.isOnline` and `getNetworkStatus().isOnline`
+    /// The emitted `NetworkModeEvent.isOnline` and `networkStatus.isOnline`
     /// are routed through the same helper, so they always agree. `reason` is
     /// stored and surfaced.
     func testNetworkModeEventIsOnlineAgreesWithStatus() async throws {
@@ -119,14 +119,14 @@ final class NetworkReportingTests: XCTestCase {
             captured.value != nil
         }
 
-        XCTAssertEqual(captured.value, client.getNetworkStatus().isOnline)
+        XCTAssertEqual(captured.value, client.networkStatus.isOnline)
         XCTAssertEqual(captured.value, false)
-        XCTAssertEqual(client.getNetworkStatus().reason, "user_set")
+        XCTAssertEqual(client.networkStatus.reason, "user_set")
     }
 
     // MARK: - Behavior 2/4 — transport reflects a real connected socket
 
-    /// Against a real (loopback) socket, `getNetworkStatus().transport` becomes
+    /// Against a real (loopback) socket, `networkStatus.transport` becomes
     /// `.connected` and, in `.auto`, `isOnline()` reports `true`.
     func testTransportReflectsConnectedSocket() async throws {
         let server = try LoopbackWebSocketServer()
@@ -139,7 +139,7 @@ final class NetworkReportingTests: XCTestCase {
         try await client.connect()
         XCTAssertTrue(client.isConnected)
 
-        let status = client.getNetworkStatus()
+        let status = client.networkStatus
         XCTAssertEqual(status.transport, .connected)
         XCTAssertTrue(status.isOnline)   // .auto + connected → online
         XCTAssertTrue(client.isOnline())

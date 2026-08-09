@@ -18,29 +18,17 @@ import XCTest
 ///     the additive generic `WorkflowsAPI` overloads, `runSync` only for
 ///     `syncCallable` workflows. The compile of `Generated/` + `bindingsCompile`
 ///     below is the binding proof; the generic overloads are exercised live
-///     against a stub transport.
+///     against a recording transport.
 final class WorkflowCodegenAcceptanceTests: XCTestCase {
 
     // MARK: - Stub transport
 
-    /// Records the request and returns a canned response — the same pattern the
-    /// API-parity tests use to exercise a client method without a live server.
-    final class StubTransport: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        var response: Any = [String: Any]()
-
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
-        }
-    }
-
-    private func api(_ stub: StubTransport) -> WorkflowsAPI {
-        WorkflowsAPI(makeRequest: stub.make, getConnectionId: { "conn-1" })
+    /// `RecordingTransport` records the request and returns canned bytes — the
+    /// same pattern the API-parity tests use to exercise a client method
+    /// without a live server. Hold the transport so the recorded call can be
+    /// read back after the `await`.
+    private func api(_ transport: RecordingTransport) -> WorkflowsAPI {
+        WorkflowsAPI(transport: transport, getConnectionId: { "conn-1" })
     }
 
     // MARK: - Behavior 14: round-trip + server-shaped decode
@@ -110,39 +98,33 @@ final class WorkflowCodegenAcceptanceTests: XCTestCase {
     // MARK: - Behavior 15: generic WorkflowsAPI overloads (published surface)
 
     func test_genericRunSync_typedInputAndOutput() async throws {
-        let stub = StubTransport()
-        stub.response = [
-            "runId": "run_1",
-            "runKey": "rk_1",
-            "status": "completed",
-            "output": ["checkoutUrl": "https://pay.example/abc"],
-        ]
+        let transport = RecordingTransport(json: #"""
+        {"runId":"run_1","runKey":"rk_1","status":"completed",
+         "output":{"checkoutUrl":"https://pay.example/abc"}}
+        """#)
         let result: RunSyncResult<CreateCheckoutSessionOutput> =
-            try await api(stub).runSync(
+            try await api(transport).runSync(
                 workflowKey: "create-checkout-session",
                 input: CreateCheckoutSessionInput(priceId: "price_123")
             )
-        XCTAssertEqual(stub.method, "POST")
-        XCTAssertEqual(stub.path, "/workflows/create-checkout-session/run-sync")
+        let call = try XCTUnwrap(transport.lastCall)
+        XCTAssertEqual(call.method, .post)
+        XCTAssertEqual(call.path, "/workflows/create-checkout-session/run-sync")
         // Typed input was encoded into the opaque `rootInput` object.
-        let body = stub.body as? [String: Any]
-        let rootInput = body?["rootInput"] as? [String: Any]
-        XCTAssertEqual(rootInput?["priceId"] as? String, "price_123")
+        let rootInput = try XCTUnwrap(call.jsonBody?["rootInput"])
+        XCTAssertEqual(rootInput["priceId"]?.stringValue, "price_123")
         // Typed output decoded from the opaque `output` blob.
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(result.output?.checkoutUrl, "https://pay.example/abc")
     }
 
     func test_genericRunSync_oneOfOutput() async throws {
-        let stub = StubTransport()
-        stub.response = [
-            "runId": "run_2",
-            "runKey": "rk_2",
-            "status": "completed",
-            "output": ["kind": "bank", "accountId": "acct_9"],
-        ]
+        let transport = RecordingTransport(json: #"""
+        {"runId":"run_2","runKey":"rk_2","status":"completed",
+         "output":{"kind":"bank","accountId":"acct_9"}}
+        """#)
         let result: RunSyncResult<ProcessPaymentOutput> =
-            try await api(stub).runSync(
+            try await api(transport).runSync(
                 workflowKey: "process-payment",
                 input: ProcessPaymentInput(amount: 42)
             )
@@ -153,13 +135,12 @@ final class WorkflowCodegenAcceptanceTests: XCTestCase {
     }
 
     func test_genericGetStatus_typedOutput() async throws {
-        let stub = StubTransport()
-        stub.response = [
-            "status": ["status": "completed", "output": ["checkoutUrl": "https://x"]],
-            "run": ["runId": "r", "runKey": "k", "status": "completed"],
-        ]
+        let transport = RecordingTransport(json: #"""
+        {"status":{"status":"completed","output":{"checkoutUrl":"https://x"}},
+         "run":{"runId":"r","runKey":"k","status":"completed"}}
+        """#)
         let status: WorkflowStatus<CreateCheckoutSessionOutput> =
-            try await api(stub).getStatus(
+            try await api(transport).getStatus(
                 workflowKey: "create-checkout-session",
                 runKey: "rk_1"
             )
@@ -167,33 +148,30 @@ final class WorkflowCodegenAcceptanceTests: XCTestCase {
     }
 
     func test_genericStart_encodesTypedInput() async throws {
-        let stub = StubTransport()
-        stub.response = [
-            "runId": "run_3", "runKey": "rk_3", "status": "running",
-        ]
-        let started: StartWorkflowResult = try await api(stub).start(
+        let transport = RecordingTransport(
+            json: #"{"runId":"run_3","runKey":"rk_3","status":"running"}"#
+        )
+        let started: StartWorkflowResult = try await api(transport).start(
             workflowKey: "create-checkout-session",
             input: CreateCheckoutSessionInput(priceId: "p_1", quantity: 5)
         )
         XCTAssertEqual(started.runId, "run_3")
-        let body = stub.body as? [String: Any]
-        let rootInput = body?["rootInput"] as? [String: Any]
-        XCTAssertEqual(rootInput?["priceId"] as? String, "p_1")
-        XCTAssertEqual(rootInput?["quantity"] as? Int, 5)
+        let rootInput = try XCTUnwrap(transport.lastCall?.jsonBody?["rootInput"])
+        XCTAssertEqual(rootInput["priceId"]?.stringValue, "p_1")
+        XCTAssertEqual(rootInput["quantity"]?.numberValue, 5)
     }
 
     func test_genericStart_nilInputSendsEmptyObject() async throws {
-        let stub = StubTransport()
-        stub.response = ["runId": "r", "runKey": "k", "status": "running"]
+        let transport = RecordingTransport(
+            json: #"{"runId":"r","runKey":"k","status":"running"}"#
+        )
         // Optional-input workflow: passing nil sends `{}` (parity with JS).
-        let _: StartWorkflowResult = try await api(stub).start(
+        let _: StartWorkflowResult = try await api(transport).start(
             workflowKey: "import-csv",
             input: Optional<ImportCsvInput>.none
         )
-        let body = stub.body as? [String: Any]
-        let rootInput = body?["rootInput"] as? [String: Any]
-        XCTAssertNotNil(rootInput)
-        XCTAssertTrue(rootInput?.isEmpty ?? false)
+        let rootInput = try XCTUnwrap(transport.lastCall?.jsonBody?["rootInput"]?.objectValue)
+        XCTAssertTrue(rootInput.isEmpty)
     }
 }
 

@@ -28,14 +28,14 @@ final class AuthApiTests: XCTestCase {
     // MARK: - Identity accessors
 
     /// Happy path: with a valid token applied, the typed accessors mirror JS
-    /// `getUserId()/getToken()/isAuthenticated()` and `waitForUserId` resolves
+    /// `userId`/`token`/`isAuthenticated()` and `waitForUserId` resolves
     /// immediately with the JWT's user id.
     func testIdentityAccessorsReflectToken() async throws {
         XCTAssertTrue(client.auth.isAuthenticated())
-        XCTAssertEqual(client.auth.getToken(), testApp.ownerJWT)
-        XCTAssertEqual(client.auth.getUserId(), testApp.ownerUserId)
+        XCTAssertEqual(client.auth.token, testApp.ownerJWT)
+        XCTAssertEqual(client.auth.userId, testApp.ownerUserId)
 
-        let uid = try await client.auth.waitForUserId(timeoutMs: 2000)
+        let uid = try await client.auth.waitForUserId(timeout: 2)
         XCTAssertEqual(uid, testApp.ownerUserId)
     }
 
@@ -189,7 +189,7 @@ final class AuthApiTests: XCTestCase {
         XCTAssertTrue(loggedOut.auth.isAuthenticated())
         try await loggedOut.auth.logout()
         XCTAssertFalse(loggedOut.auth.isAuthenticated())
-        XCTAssertNil(loggedOut.auth.getToken())
-        XCTAssertNil(loggedOut.auth.getUserId())
+        XCTAssertNil(loggedOut.auth.token)
+        XCTAssertNil(loggedOut.auth.userId)
     }
 }

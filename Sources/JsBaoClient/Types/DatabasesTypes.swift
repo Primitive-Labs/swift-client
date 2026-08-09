@@ -185,19 +185,6 @@ public struct AddManagerParams: Encodable, Sendable {
     }
 }
 
-/// Parameters for the deprecated `grantPermission`. Only `"manager"` is
-/// accepted. Prefer `AddManagerParams` + `addManager`.
-public struct GrantPermissionParams: Encodable, Sendable {
-    public var userId: String
-    /// Only `"manager"` is accepted server-side.
-    public var permission: String
-
-    public init(userId: String, permission: String = "manager") {
-        self.userId = userId
-        self.permission = permission
-    }
-}
-
 /// Parameters for granting a group permission. Only `"manager"` is supported
 /// for groups.
 public struct GrantDatabaseGroupPermissionParams: Encodable, Sendable {
@@ -564,8 +551,16 @@ public struct DatabaseSuccessResult: Decodable, Sendable, Equatable {
 ///
 /// `changeType` is the server-derived filter transition (#740):
 /// `"enter"` / `"update"` / `"leave"`. Projection-using subscribers read
-/// `changeType`; CRDT-aware subscribers can keep reading `op`. `data` and
-/// `previousData` are opaque record blobs (`JSONValue`).
+/// `changeType`; CRDT-aware subscribers can keep reading `op`.
+///
+/// `data` and `previousData` are opaque record blobs, still typed `Any?` —
+/// which is why this type and its `DatabaseChangePayload` envelope are
+/// `@unchecked Sendable` rather than checked, even though
+/// `DatabasesAPI.subscribe`'s callback is now `@Sendable` (#2367). They are
+/// database rows, so they are part of the row currency deferred to **#2546**
+/// and get retyped to `JSONValue` there, with the generated models. Until
+/// then, convert one with `JSONValue.typedRow(from:)` before handing it across
+/// an actor boundary — the compiler will not do it for you.
 public struct DatabaseChangeEvent: @unchecked Sendable {
     /// `"enter" | "update" | "leave"` — absent on older server frames.
     public let changeType: String?
@@ -659,20 +654,17 @@ public struct DatabaseChangePayload: @unchecked Sendable {
 
 /// Options for `databases.subscribe(...)`. Mirrors JS
 /// `DatabaseSubscribeOptions`.
-public struct DatabaseSubscribeOptions: @unchecked Sendable {
+/// The change callback is a parameter of
+/// ``DatabasesAPI/subscribe(databaseId:subscriptionKey:options:onChange:)``
+/// rather than a field here, so a subscription always has exactly one handler
+/// and the options stay a plain value type.
+public struct DatabaseSubscribeOptions: Sendable {
     /// Bound params forwarded to the server; available in the
     /// subscription's filter CEL as `params.*`.
-    public let params: [String: Any]?
-    /// Called for every matching `db.change` frame until the returned
-    /// unsubscribe handle is invoked.
-    public let onChange: (DatabaseChangePayload) -> Void
+    public let params: [String: JSONValue]?
 
-    public init(
-        params: [String: Any]? = nil,
-        onChange: @escaping (DatabaseChangePayload) -> Void
-    ) {
+    public init(params: [String: JSONValue]? = nil) {
         self.params = params
-        self.onChange = onChange
     }
 }
 

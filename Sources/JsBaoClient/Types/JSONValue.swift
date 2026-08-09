@@ -258,23 +258,20 @@ public enum Updatable<Wrapped: Encodable & Sendable>: Encodable, Sendable {
 
 // MARK: - JSON bridging helpers
 
-/// Bridges between the JSON `Any` graph that `makeRequest` speaks (the
-/// output of `JSONSerialization`) and the typed `Codable` request/response
-/// models. This is the seam that lets the API layer hand back real Swift
+/// Bridges between the JSON `Any` graph `JSONSerialization` produces and the
+/// typed `Codable` request/response models. This is the seam that lets the API layer hand back real Swift
 /// types instead of `[String: Any]`.
 enum JSONCoding {
     static let decoder = JSONDecoder()
     static let encoder = JSONEncoder()
 
-    /// Decode a typed value from the loosely-typed JSON object a
-    /// `makeRequest` call returns.
+    /// Decode a typed value from a loosely-typed JSON object.
     static func decode<T: Decodable>(_ type: T.Type, from any: Any) throws -> T {
         let data = try JSONSerialization.data(withJSONObject: any, options: [.fragmentsAllowed])
         return try decoder.decode(T.self, from: data)
     }
 
-    /// Encode a typed request body back into the JSON `Any` graph
-    /// `makeRequest` expects as its body argument.
+    /// Encode a typed request body back into a JSON `Any` graph.
     static func jsonObject<T: Encodable>(from value: T) throws -> Any {
         let data = try encoder.encode(value)
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])

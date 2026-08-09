@@ -42,9 +42,9 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
     /// Thread-safe recorder for the `authRefreshDeferred` payloads.
     private final class DeferredRecorder: @unchecked Sendable {
         private let lock = NSLock()
-        private var _events: [[String: Any]] = []
-        func record(_ details: [String: Any]) { lock.withLock { _events.append(details) } }
-        var events: [[String: Any]] { lock.withLock { _events } }
+        private var _events: [AuthRefreshDeferredEvent] = []
+        func record(_ details: AuthRefreshDeferredEvent) { lock.withLock { _events.append(details) } }
+        var events: [AuthRefreshDeferredEvent] { lock.withLock { _events } }
     }
 
     /// A JWT whose payload decodes so `applyToken` parses a userId and the
@@ -79,26 +79,18 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
     /// Subscribe to `authRefreshDeferred` and keep the subscription alive for
     /// the caller (subscriptions cancel on deinit).
     ///
-    /// Deliberately goes through the deprecated `onAny` shim rather than the
-    /// typed `subscribe`. `.authRefreshDeferred` was one of the nine events
-    /// converted from a bare `[String: Any]` to a typed payload (#1994), and
-    /// this is the assertion set that proves the conversion did not change what
-    /// an existing dictionary subscriber sees: the tests below read
-    /// `details["nextAttemptMs"] as? Int` and rely on an absent optional being an
-    /// absent KEY. Marked `@available(*, deprecated)` so the reference to the
-    /// shim sits in a deprecated context. That annotation also makes this helper
-    /// deprecated, so every test method that calls it carries the same
-    /// annotation — otherwise the warning just moves up one level and fires once
-    /// per caller (same convention as `DeprecationWindowInternalUseTests`).
-    @available(*, deprecated, message: "Deprecated context: exercises the `onAny` dictionary shim on purpose (#1994).")
+    /// `.authRefreshDeferred` was one of the nine events converted from a bare
+    /// `[String: Any]` to a typed payload (#1994). #2367 removed the untyped
+    /// `onAny` shim these tests used to read it through, so the recorder now
+    /// holds `AuthRefreshDeferredEvent` values and the assertions read its
+    /// fields. `nextAttemptMs` is optional on the payload, so "no next attempt
+    /// promised" is still a nil check.
     private func recordDeferred(
         on emitter: EventEmitter,
         into recorder: DeferredRecorder
     ) -> EventSubscription {
-        emitter.onAny(.authRefreshDeferred) { payload in
-            if let details = payload as? [String: Any] {
-                recorder.record(details)
-            }
+        emitter.subscribe(AuthRefreshDeferredEvent.self) { event in
+            recorder.record(event)
         }
     }
 
@@ -132,7 +124,16 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         defer { controller.destroy() }
 
         let outcome = await controller.refreshAccessToken(cause: "test")
-        XCTAssertEqual(outcome, .network)
+        // `.network` carries the underlying failure so the 401 retry path can
+        // rethrow it as `JsBaoNetworkError` (#2367 review) — assert both the
+        // case and that the payload survived.
+        guard case .network(let underlying) = outcome else {
+            return XCTFail("expected .network, got \(outcome)")
+        }
+        XCTAssertEqual(
+            underlying?.urlErrorCode, URLError.Code.notConnectedToInternet.rawValue,
+            "the transport failure must reach the caller, not be reduced to a bare case"
+        )
         XCTAssertEqual(refreshCalls.value, 1, "the initial refresh ran once")
 
         let retried = await waitUntil(timeout: 5) { refreshCalls.value >= 2 }
@@ -145,7 +146,6 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
     /// The first deferral reports the BASE delay (JS starts `delayMs` at 0 and
     /// reports `nextDelay` before doubling); the next one reports the doubled
     /// delay.
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testBackoffDelayStartsAtBaseAndDoubles() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -164,16 +164,15 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         XCTAssertTrue(sawSecond, "the scheduled retry must fail again and emit a second deferral")
 
         let events = recorder.events
-        XCTAssertEqual(events[0]["status"] as? String, "scheduled")
-        XCTAssertEqual(events[0]["nextAttemptMs"] as? Int, 100, "first deferral reports the base delay")
-        XCTAssertEqual(events[1]["status"] as? String, "scheduled")
-        XCTAssertEqual(events[1]["nextAttemptMs"] as? Int, 200, "the delay doubles on the next deferral")
+        XCTAssertEqual(events[0].status, "scheduled")
+        XCTAssertEqual(events[0].nextAttemptMs, 100, "first deferral reports the base delay")
+        XCTAssertEqual(events[1].status, "scheduled")
+        XCTAssertEqual(events[1].nextAttemptMs, 200, "the delay doubles on the next deferral")
     }
 
     /// The "already scheduled" fast path: a second deferral while a retry is
     /// pending re-emits `scheduled` with the CURRENT delay and does not stack
     /// a second timer (which would double the retry rate).
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testSecondDeferralWhileScheduledDoesNotStackATimer() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -195,9 +194,9 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
 
         let events = recorder.events
         XCTAssertEqual(events.count, 2)
-        XCTAssertEqual(events[0]["nextAttemptMs"] as? Int, 30_000, "first deferral schedules the base delay")
+        XCTAssertEqual(events[0].nextAttemptMs, 30_000, "first deferral schedules the base delay")
         XCTAssertEqual(
-            events[1]["nextAttemptMs"] as? Int, 60_000,
+            events[1].nextAttemptMs, 60_000,
             "the already-scheduled fast path reports the current (doubled) delay"
         )
         XCTAssertEqual(
@@ -211,7 +210,6 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
     /// Once the accumulated backoff would reach the cap, the controller stops
     /// retrying: it resets the backoff, flips the client to offline mode, and
     /// emits `status: "offline"` carrying the error.
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testAccumulatedBackoffReachingCapGoesOffline() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -237,12 +235,12 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         _ = await controller.refreshAccessToken(cause: "first")
 
         let wentOffline = await waitUntil(timeout: 5) {
-            recorder.events.contains { $0["status"] as? String == "offline" }
+            recorder.events.contains { $0.status == "offline" }
         }
         XCTAssertTrue(wentOffline, "reaching the backoff cap must emit status: offline")
 
-        let offlineEvent = recorder.events.first { $0["status"] as? String == "offline" }
-        XCTAssertNotNil(offlineEvent?["error"], "the offline deferral carries the failure message")
+        let offlineEvent = recorder.events.first { $0.status == "offline" }
+        XCTAssertNotNil(offlineEvent?.error, "the offline deferral carries the failure message")
         XCTAssertEqual(
             requestedModes.value.first,
             NetworkMode.offline.rawValue,
@@ -259,7 +257,6 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
 
     /// A deferral while ALREADY offline emits `status: "offline"` and schedules
     /// nothing — retrying a refresh in offline mode is pointless.
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testDeferralWhileOfflineSchedulesNothing() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -279,8 +276,8 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         _ = await controller.refreshAccessToken(cause: "first")
 
         XCTAssertEqual(recorder.events.count, 1)
-        XCTAssertEqual(recorder.events[0]["status"] as? String, "offline")
-        XCTAssertNil(recorder.events[0]["nextAttemptMs"], "offline deferrals promise no next attempt")
+        XCTAssertEqual(recorder.events[0].status, "offline")
+        XCTAssertNil(recorder.events[0].nextAttemptMs, "offline deferrals promise no next attempt")
 
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(refreshCalls.value, 1, "no retry scheduled while offline")
@@ -290,7 +287,6 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
 
     /// A successful refresh clears the pending retry and the accumulated
     /// backoff, so the next failure starts again at the base delay.
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testSuccessfulRefreshResetsTimerAndBackoff() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -308,7 +304,7 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         defer { controller.destroy() }
 
         _ = await controller.refreshAccessToken(cause: "first")
-        XCTAssertEqual(recorder.events.first?["nextAttemptMs"] as? Int, 30_000)
+        XCTAssertEqual(recorder.events.first?.nextAttemptMs, 30_000)
 
         shouldFail.value = false
         let outcome = await controller.refreshAccessToken(cause: "recovered")
@@ -318,14 +314,13 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         shouldFail.value = true
         _ = await controller.refreshAccessToken(cause: "after-success")
         XCTAssertEqual(
-            recorder.events.last?["nextAttemptMs"] as? Int, 30_000,
+            recorder.events.last?.nextAttemptMs, 30_000,
             "a successful refresh resets the backoff to the base delay"
         )
     }
 
     /// An invalid (401/403) refresh also resets the timer and the backoff —
     /// backing off is only meaningful for connectivity failures.
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testInvalidRefreshResetsTimerAndBackoff() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -361,14 +356,13 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         invalid.value = false
         _ = await controller.refreshAccessToken(cause: "after-invalid")
         XCTAssertEqual(
-            recorder.events.last?["nextAttemptMs"] as? Int, 100,
+            recorder.events.last?.nextAttemptMs, 100,
             "the backoff restarts at the base delay after an invalid refresh"
         )
     }
 
     /// `bootstrapToken` / `updateToken` reset the scheduler — a token arriving
     /// from any path means the deferred refresh is moot.
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testTokenUpdateResetsTimerAndBackoff() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -396,7 +390,7 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
 
         _ = await controller.refreshAccessToken(cause: "after-update")
         XCTAssertEqual(
-            recorder.events.last?["nextAttemptMs"] as? Int, 100,
+            recorder.events.last?.nextAttemptMs, 100,
             "the backoff restarts at the base delay after a token update"
         )
     }
@@ -428,7 +422,6 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
     /// not enough on its own. A refresh that was ALREADY in flight when
     /// `destroy()` ran can fail with a network error afterwards, and must not
     /// schedule a replacement retry against the torn-down client.
-    @available(*, deprecated, message: "Deprecated context: calls `recordDeferred`, which exercises the `onAny` dictionary shim on purpose (#1994).")
     func testDestroyDuringInFlightRefreshDoesNotScheduleARetry() async throws {
         let emitter = EventEmitter()
         let recorder = DeferredRecorder()
@@ -461,7 +454,9 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         releaseRequest.value = true
 
         let outcome = await inFlight.value
-        XCTAssertEqual(outcome, .network)
+        guard case .network = outcome else {
+            return XCTFail("expected .network, got \(outcome)")
+        }
 
         try await Task.sleep(nanoseconds: 500_000_000)
         XCTAssertEqual(

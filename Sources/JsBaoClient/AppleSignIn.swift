@@ -221,7 +221,7 @@ extension JsBaoClient {
         }
 
         return AppleSignInResult(
-            userId: getUserId(),
+            userId: userId,
             isNewUser: response.isNewUser ?? false
         )
     }

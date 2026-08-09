@@ -66,23 +66,6 @@ public final class WorkflowsAPI: @unchecked Sendable {
         self.events = events
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        getConnectionId: @escaping () -> String = { "" },
-        events: EventEmitter? = nil
-    ) {
-        self.init(
-            transport: ClosureTransport(makeRequest: makeRequest),
-            getConnectionId: getConnectionId,
-            logger: nil,
-            events: events
-        )
-    }
-
     // MARK: - Workflow Execution
 
     /// Starts a workflow execution.
@@ -103,17 +86,58 @@ public final class WorkflowsAPI: @unchecked Sendable {
         input: [String: Any],
         options: StartWorkflowOptions? = nil
     ) async throws -> StartWorkflowResult {
+        // The `input` PARAMETER is opaque caller data the server does not
+        // introspect and the client cannot interpret, so it is serialized
+        // directly: `JSONSerialization` writes an `Int64` exactly, where
+        // `JSONValue`'s single `.number(Double)` case loses exactness past
+        // 2^53. That is why this parameter stayed `[String: Any]` in #2367.
+        //
+        // `StartWorkflowOptions.input` / `.meta` did NOT stay untyped — they
+        // are `[String: JSONValue]`, because the struct's `Sendable`
+        // conformance was unchecked while it held `[String: Any]`. So a `meta`
+        // that arrives through the options struct is already `JSONValue`-shaped
+        // and cannot be made exact here; a `meta` passed positionally (the
+        // generic `start` and both `runSync` overloads) never goes near
+        // `JSONValue`. Both the CHANGELOG and the migration guide record which
+        // form is which; closing the gap needs a `JSONValue` integer case.
+        //
+        // Lower the typed `meta` back to the `Any` graph the request body is
+        // built from. `try`, not `try?`: an unencodable value (a non-finite
+        // `.number`, which `JSONEncoder` rejects by default) must fail the
+        // start rather than silently start the workflow without its `meta`.
+        let loweredMeta = try options?.meta.map { try JSONCoding.jsonObject(from: $0) }
+        return try await startRequest(
+            workflowKey: workflowKey,
+            input: input,
+            runKey: options?.runKey,
+            contextDocId: options?.contextDocId,
+            meta: loweredMeta,
+            forceRerun: options?.forceRerun
+        )
+    }
+
+    /// The one place a start request body is composed.
+    ///
+    /// Every public `start` form funnels here with values that are already
+    /// untyped, so a caller who spelled `meta` untyped gets it on the wire
+    /// exactly as spelled — `meta` is `Any?` rather than `[String: JSONValue]`
+    /// precisely so nothing on this path can silently round an `Int64`. Only
+    /// `StartWorkflowOptions.meta` has been through `JSONValue` by the time it
+    /// reaches here, because that struct's field is typed.
+    private func startRequest(
+        workflowKey: String,
+        input: [String: Any],
+        runKey: String?,
+        contextDocId: String?,
+        meta: Any?,
+        forceRerun: Bool?
+    ) async throws -> StartWorkflowResult {
         let encodedKey = URLEncoding.encodeComponent(workflowKey)
-        // `input` and `meta` are opaque caller data the server does not
-        // introspect and the client cannot interpret — so they are serialized
-        // directly rather than routed through `JSONValue`, whose single
-        // `.number(Double)` case loses exactness past 2^53. `JSONSerialization`
-        // writes an `Int64` exactly, which is what the untyped body did.
         var payload: [String: Any] = ["rootInput": input]
-        if let runKey = options?.runKey { payload["runKey"] = runKey }
-        if let contextDocId = options?.contextDocId { payload["contextDocId"] = contextDocId }
-        if let meta = options?.meta { payload["meta"] = meta }
-        if options?.forceRerun == true { payload["forceRerun"] = true }
+        if let runKey { payload["runKey"] = runKey }
+        if let contextDocId { payload["contextDocId"] = contextDocId }
+        if let meta { payload["meta"] = meta }
+        if forceRerun == true { payload["forceRerun"] = true }
         let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
 
         // No local `workflowStarted` emit here (#1112): JS emits the event
@@ -133,9 +157,19 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// the options object rather than as separate positional parameters.
     @discardableResult
     public func start(_ options: StartWorkflowOptions) async throws -> StartWorkflowResult {
-        try await start(
+        // `options.input` is the typed `[String: JSONValue]` shape (#2367);
+        // lower it back to the `Any` graph the untyped `rootInput` body wants.
+        // `try`, not `try?` — an unencodable value used to start the workflow
+        // with `rootInput: {}` and report success.
+        guard let inputAny = try JSONCoding.jsonObject(from: options.input) as? [String: Any] else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "StartWorkflowOptions.input did not encode to a JSON object"
+            )
+        }
+        return try await start(
             workflowKey: options.workflowKey,
-            input: options.input,
+            input: inputAny,
             options: options
         )
     }
@@ -145,9 +179,10 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// terminal `status` (`completed`/`failed`/`terminated`/`timeout`/
     /// `apply_pending`); only transport/connectivity errors throw.
     ///
-    /// - Parameter timeoutMs: hard wall-clock ceiling (default server-side
-    ///   5000, capped at 30000). On exceed the run resolves with
-    ///   `status == "timeout"`.
+    /// - Parameter timeout: hard wall-clock ceiling in **seconds** (renamed
+    ///   from `timeoutMs` in #2367; the wire field is still `timeoutMs`).
+    ///   Defaults server-side to 5s, capped at 30s. On exceed the run resolves
+    ///   with `status == "timeout"`.
     ///
     /// (Swift omits the JS `AbortSignal` — the JS transport doesn't wire it
     /// through either; cancel via the surrounding `Task` and read final state
@@ -158,7 +193,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
-        timeoutMs: Int? = nil
+        timeout: TimeInterval? = nil
     ) async throws -> RunSyncWorkflowResult {
         let encodedKey = URLEncoding.encodeComponent(workflowKey)
         // Same reasoning as `start`: `input`/`meta` are opaque caller data, so
@@ -167,7 +202,11 @@ public final class WorkflowsAPI: @unchecked Sendable {
         if let runKey { payload["runKey"] = runKey }
         if let contextDocId { payload["contextDocId"] = contextDocId }
         if let meta { payload["meta"] = meta }
-        if let timeoutMs, timeoutMs > 0 { payload["timeoutMs"] = timeoutMs }
+        // The Swift parameter is a `TimeInterval` (#2367); the wire field
+        // stays `timeoutMs`, so convert here rather than renaming the key.
+        if let timeout, timeout > 0 {
+            payload["timeoutMs"] = timeout.wholeMilliseconds
+        }
         let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
         return try await transport.request(
             method: .post,
@@ -222,7 +261,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
-        timeoutMs: Int? = nil
+        timeout: TimeInterval? = nil
     ) async throws -> RunSyncResult<Output> {
         let encoded = try Self.encodeInputObject(input)
         let untyped = try await runSync(
@@ -231,7 +270,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
             runKey: runKey,
             contextDocId: contextDocId,
             meta: meta,
-            timeoutMs: timeoutMs
+            timeout: timeout
         )
         return RunSyncResult(
             runId: untyped.runId,
@@ -247,6 +286,10 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// Start a workflow with a typed `Codable` input. Mirrors the JS
     /// `start<I>` — the start result (`StartWorkflowResult`) is not output-typed
     /// on either client, so only the input is generic here.
+    ///
+    /// `meta` is `[String: Any]` and reaches the wire untouched, so an `Int64`
+    /// past 2^53 stays exact. Use this form (or `runSync`) rather than
+    /// `StartWorkflowOptions.meta` when you pass large integer IDs.
     @discardableResult
     public func start<Input: Encodable>(
         workflowKey: String,
@@ -257,18 +300,19 @@ public final class WorkflowsAPI: @unchecked Sendable {
         forceRerun: Bool? = nil
     ) async throws -> StartWorkflowResult {
         let encoded = try Self.encodeInputObject(input)
-        let options = StartWorkflowOptions(
+        // Straight to the body composer, not through `StartWorkflowOptions`
+        // (#2367). Routing via the options struct would have raised this
+        // `meta` into `[String: JSONValue]` and back, rounding an `Int64` past
+        // 2^53 — a silent change on a signature that did not change. The
+        // declared `[String: Any]` and the wire bytes agree again this way, and
+        // the input graph is no longer converted into a value nothing reads.
+        return try await startRequest(
             workflowKey: workflowKey,
             input: encoded,
             runKey: runKey,
             contextDocId: contextDocId,
             meta: meta,
             forceRerun: forceRerun
-        )
-        return try await start(
-            workflowKey: workflowKey,
-            input: encoded,
-            options: options
         )
     }
 
@@ -534,8 +578,8 @@ public final class WorkflowsAPI: @unchecked Sendable {
             throw JsBaoError(code: .unavailable, message: "workflows.waitFor requires the client event emitter")
         }
 
-        let defaultTimeoutMs = 15 * 60 * 1000  // 15 minutes
-        let timeoutMs = options?.timeoutMs ?? defaultTimeoutMs
+        let defaultTimeout: TimeInterval = 15 * 60  // 15 minutes
+        let timeoutMs = (options?.timeout ?? defaultTimeout).wholeMilliseconds
 
         // Honor a caller that was already cancelled before we set anything up —
         // return promptly instead of subscribing and leaking listeners.
@@ -803,12 +847,13 @@ public final class WorkflowsAPI: @unchecked Sendable {
         return try? JSONCoding.jsonObject(from: value)
     }
 
-    /// Bridge a typed `JSONValue` meta blob into the `[String: Any]?` the
-    /// untouchable event/context structs carry. Non-object metas map to
-    /// `nil` (the wire shape is always an object when present).
-    private static func metaToAny(_ value: JSONValue?) -> [String: Any]? {
-        guard let value, !value.isNull else { return nil }
-        return (try? JSONCoding.jsonObject(from: value)) as? [String: Any]
+    /// Narrow a typed `JSONValue` meta blob into the `[String: JSONValue]?`
+    /// the event/context structs carry (#2367 — both sides are `JSONValue`
+    /// now, so this is a plain `objectValue` read, not a conversion).
+    /// Non-object metas map to `nil` (the wire shape is always an object
+    /// when present).
+    private static func metaToObject(_ value: JSONValue?) -> [String: JSONValue]? {
+        value?.objectValue
     }
 
     /// Internal — invoked by `JsBaoClient` when a `workflowStatus` WS message
@@ -855,7 +900,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
                 contextDocId: event.contextDocId
             )
             let output = Self.outputToAny(statusResult.output)
-            let metaFromRun = Self.metaToAny(statusResult.run?.meta)
+            let metaFromRun = Self.metaToObject(statusResult.run?.meta)
 
             // 3. Run the user's handler.
             try await handler(WorkflowApplyContext(

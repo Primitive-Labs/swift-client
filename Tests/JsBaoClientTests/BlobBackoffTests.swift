@@ -470,6 +470,13 @@ final class BlobBackoffTests: XCTestCase {
         XCTAssertTrue(BlobManager.shouldQueueError(
             URLError(.notConnectedToInternet)))
         XCTAssertTrue(BlobManager.shouldQueueError(HttpError(status: 0, message: "x")))
+        // Whatever `HttpClient.fetchWithRefresh` throws for a refresh-time
+        // transport failure must be retryable (#2366). Since #2367 / PR #2549
+        // that failure is the public `JsBaoNetworkError` (rethrown from the
+        // refresh path, or built at the throw site when no underlying error
+        // was carried).
+        XCTAssertTrue(BlobManager.shouldQueueError(
+            JsBaoNetworkError(message: "Token refresh failed due to a network error")))
     }
 
     /// A permanent 4xx on the very first (immediate) attempt must never be

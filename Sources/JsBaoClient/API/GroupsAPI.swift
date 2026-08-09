@@ -10,14 +10,6 @@ public final class GroupsAPI: @unchecked Sendable {
         self.transport = transport
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.init(transport: ClosureTransport(makeRequest: makeRequest))
-    }
-
     // MARK: - Groups CRUD
 
     /// Creates a new group with the specified type, ID, and name.

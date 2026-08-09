@@ -86,27 +86,30 @@ public struct UserLookupResult: Decodable, Sendable, Equatable {
 /// Mirrors JS `GetUserOptions` field-for-field; this named type replaces
 /// the generic `FetchCachedOptions` on the users surface (parity row D1).
 public struct GetUserOptions: Sendable {
-    /// Re-fetches from the server if the cached entry is older than this
-    /// many milliseconds (default 5 minutes).
-    public var refreshIfOlderThanMs: Int?
+    /// Refreshes from the server in the background if the cached entry is
+    /// older than this many seconds (default 5 minutes). The cached value is
+    /// still returned immediately.
+    public var refreshIfOlderThan: TimeInterval?
     /// Where to read from: local cache, network, or local-first with
-    /// network fallback.
+    /// network fallback. Use `.network` when the call must wait for fresh
+    /// server data.
     public var waitForLoad: WaitForLoadMode?
-    /// When true, forces a network fetch even if cached data exists.
+    /// When true, refreshes from the server even if the cached entry is
+    /// fresh. The refresh runs behind the returned cached value, so it makes
+    /// the *next* read current, not this one.
     public var refreshNetwork: Bool?
-    /// Maximum time in milliseconds to wait for a server response before
-    /// falling back.
-    public var serverTimeoutMs: Int?
+    /// Maximum time to wait for a server response before falling back.
+    public var serverTimeout: TimeInterval?
 
     public init(
-        refreshIfOlderThanMs: Int? = nil,
+        refreshIfOlderThan: TimeInterval? = nil,
         waitForLoad: WaitForLoadMode? = nil,
         refreshNetwork: Bool? = nil,
-        serverTimeoutMs: Int? = nil
+        serverTimeout: TimeInterval? = nil
     ) {
-        self.refreshIfOlderThanMs = refreshIfOlderThanMs
+        self.refreshIfOlderThan = refreshIfOlderThan
         self.waitForLoad = waitForLoad
         self.refreshNetwork = refreshNetwork
-        self.serverTimeoutMs = serverTimeoutMs
+        self.serverTimeout = serverTimeout
     }
 }

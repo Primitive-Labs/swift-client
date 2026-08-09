@@ -214,7 +214,7 @@ final class DocumentLinkAccessTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let rootDocId = try XCTUnwrap(client.getRootDocId(), "test JWT should carry a rootDocId")
+        let rootDocId = try XCTUnwrap(client.rootDocId, "test JWT should carry a rootDocId")
         XCTAssertTrue(client.isRootDocument(rootDocId))
 
         do {

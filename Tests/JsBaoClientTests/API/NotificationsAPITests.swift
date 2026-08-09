@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import JsBaoClient
 
@@ -5,7 +6,7 @@ import XCTest
 /// WS event (parity with the JS client's `client.notifications.*` sub-API and
 /// `notification` event — #1601, mirroring #779 / PR #1602).
 ///
-/// The API tests instantiate the sub-API with a stub `makeRequest` closure
+/// The API tests instantiate the sub-API with a stub `Transport`
 /// that records the `(method, path, body)` triple, invokes each public method,
 /// and asserts the HTTP shape matches the js-bao counterpart
 /// (`src/client/api/notificationsApi.ts`). They don't hit the network.
@@ -18,20 +19,48 @@ final class NotificationsAPITests: XCTestCase {
 
     // MARK: - Recorder
 
-    /// Captures the most recent HTTP request the stub closure was asked to
+    /// Captures the most recent HTTP request the stub transport was asked to
     /// make and returns a canned response. Mirrors the recorder used in
-    /// `ApiParityTests`.
-    final class CallRecorder: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        var response: Any = [String: Any]()
+    /// `ApiParityTests`: the sub-API speaks bytes, the assertions are written
+    /// against the `JSONSerialization` graph, so the recorder converts both
+    /// ways.
+    final class CallRecorder: Transport, @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastMethod: HTTPMethod?
+        private var lastPath: String?
+        private var lastBody: Data?
+        private var cannedResponse: Any = [String: Any]()
 
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
+        var method: String? { lock.withLock { lastMethod?.rawValue } }
+        var path: String? { lock.withLock { lastPath } }
+        var body: Any? {
+            guard let data = lock.withLock({ lastBody }) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        }
+        var response: Any {
+            get { lock.withLock { cannedResponse } }
+            set { lock.withLock { cannedResponse = newValue } }
+        }
+
+        func execute(
+            method: HTTPMethod,
+            path: String,
+            body: Data?,
+            options: RequestOptions?
+        ) async throws -> TransportResponse {
+            lock.withLock {
+                lastMethod = method
+                lastPath = path
+                lastBody = body
+            }
+            let data = try JSONSerialization.data(
+                withJSONObject: response, options: [.fragmentsAllowed]
+            )
+            return TransportResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: data
+            )
         }
     }
 
@@ -56,7 +85,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_list_GET_noParams() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = ["items": [notificationJSON()], "unreadCount": 1]
         let result = try await api.list()
         XCTAssertEqual(r.method, "GET")
@@ -68,7 +97,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_list_buildsCursorAndLimitQS() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = ["items": [[String: Any]](), "unreadCount": 0]
         _ = try await api.list(limit: 25, cursor: "abc def")
         XCTAssertEqual(r.method, "GET")
@@ -77,7 +106,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_unreadCount_GET() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = ["unreadCount": 7]
         let result = try await api.unreadCount()
         XCTAssertEqual(r.method, "GET")
@@ -87,7 +116,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_markRead_PATCH_toReadPath() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = notificationJSON()
         let info = try await api.markRead(notificationId: "ntf1")
         XCTAssertEqual(r.method, "PATCH")
@@ -97,7 +126,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_markAllRead_POST() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = ["updated": 3]
         let result = try await api.markAllRead()
         XCTAssertEqual(r.method, "POST")
@@ -107,7 +136,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_send_POSTsParams_andDecodesResults() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = [
             "results": [
                 ["channel": "in-app", "status": "delivered", "notificationId": "ntf9"],
@@ -141,7 +170,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_registerDevice_POST_toPushTokens() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = deviceJSON()
         let params = RegisterPushDeviceParams(
             token: "abcdef",
@@ -164,7 +193,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_listDevices_GET_unwrapsItems() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = ["items": [deviceJSON()]]
         let result = try await api.listDevices()
         XCTAssertEqual(r.method, "GET")
@@ -175,7 +204,7 @@ final class NotificationsAPITests: XCTestCase {
 
     func test_unregisterDevice_DELETE_encodesToken() async throws {
         let r = CallRecorder()
-        let api = NotificationsAPI(makeRequest: r.make)
+        let api = NotificationsAPI(transport: r)
         r.response = ["deleted": true]
         let result = try await api.unregisterDevice(token: "tok with space")
         XCTAssertEqual(r.method, "DELETE")

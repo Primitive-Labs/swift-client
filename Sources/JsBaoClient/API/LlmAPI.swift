@@ -9,8 +9,8 @@ public final class LlmAPI: @unchecked Sendable {
     /// can fire `prompt_started` / `prompt_succeeded` / `prompt_failed`
     /// around each `chat` call without holding a reference to the client.
     /// Mirrors js-bao's `getLlmAnalyticsContext().logEvent(...)`
-    /// (`src/client/api/llmApi.ts`). Defaults to a no-op so existing
-    /// callers/tests that construct `LlmAPI(makeRequest:)` keep working.
+    /// (`src/client/api/llmApi.ts`). Defaults to a no-op so a caller that
+    /// constructs `LlmAPI(transport:)` without the client keeps working.
     private let logAnalytics: (AnalyticsEventInput) -> Void
 
     /// Designated initializer — the typed transport spine.
@@ -20,20 +20,6 @@ public final class LlmAPI: @unchecked Sendable {
     ) {
         self.transport = transport
         self.logAnalytics = logAnalytics
-    }
-
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        logAnalytics: @escaping (AnalyticsEventInput) -> Void = { _ in }
-    ) {
-        self.init(
-            transport: ClosureTransport(makeRequest: makeRequest),
-            logAnalytics: logAnalytics
-        )
     }
 
     /// Sends a chat completion request to the configured LLM provider.

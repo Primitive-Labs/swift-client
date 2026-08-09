@@ -55,9 +55,9 @@ final class RefreshTests: XCTestCase {
         // Wait for auth to initialize
         try await delay(1)
 
-        let state = client.getAuthState()
+        let state = client.authState
         XCTAssertTrue(state.authenticated)
-        XCTAssertNotNil(client.getUserId())
+        XCTAssertNotNil(client.userId)
     }
 
     func testIsAuthenticated() async throws {
@@ -202,13 +202,13 @@ final class RefreshTests: XCTestCase {
             client.isAuthenticated(),
             "Cold start with expired persisted JWT + live refresh cookie should refresh, not log the user out"
         )
-        XCTAssertEqual(client.getUserId(), testApp.ownerUserId)
+        XCTAssertEqual(client.userId, testApp.ownerUserId)
 
         // Token we end up with must be freshly issued, not the placeholder
         // we seeded. A nil payload or a stale exp would both indicate the
         // fix path didn't run.
-        guard let payload = client.getJwtPayload(),
-              let exp = payload["exp"] as? TimeInterval else {
+        guard let payload = client.jwtPayload,
+              let exp = payload["exp"]?.numberValue else {
             XCTFail("Expected a parseable JWT payload after cold-start refresh")
             return
         }

@@ -7,14 +7,14 @@ import Foundation
 /// - **`AsyncStream` consumers** — created through `JsBaoClient.stream(for:)`,
 ///   `observeOnMainActor(_:handler:)` and `nextEvent(_:)`. This is the supported
 ///   surface.
-/// - **Callback subscribers** — the deprecated `on` / `onAny` shim. They keep the
-///   delivery they have always had: synchronous, inside `emit`, in registration
-///   order. Wrapping them over a stream would have turned that into asynchronous
-///   delivery and changed the timing every existing consumer sees, so both shapes
+/// - **Callback subscribers** — the typed `subscribe(_:)` registrations behind
+///   `observeOnMainActor`. Delivery is synchronous, inside `emit`, in
+///   registration order. Wrapping them over a stream would have made that
+///   asynchronous and changed the timing every consumer sees, so both shapes
 ///   fan out from the same `emit` instead.
 ///
-/// The type itself is not deprecated — only the untyped members are — so code
-/// that merely names `EventEmitter` does not have to change.
+/// The untyped `on` / `onAny` shim this registry also used to serve was removed
+/// in #2367; only the typed shapes above remain.
 public final class EventEmitter: @unchecked Sendable {
     private struct CallbackEntry {
         let id: UInt64
@@ -77,37 +77,7 @@ public final class EventEmitter: @unchecked Sendable {
         self.logger = logger
     }
 
-    // MARK: - Callback subscription (deprecated shim)
-
-    /// Subscribe to an event with a typed handler. Returns a cancellable subscription.
-    ///
-    /// The event key and the handler's payload annotation are two independent
-    /// facts here, and nothing cross-checks them: annotate the wrong payload type
-    /// and the handler compiles but never fires.
-    @available(*, deprecated, message: "Use client.stream(for:) / observeOnMainActor(_:handler:) / nextEvent(_:) — the untyped event surface is removed in the next major release.")
-    @discardableResult
-    public func on<T>(_ event: JsBaoEvent, handler: @escaping (T) -> Void) -> EventSubscription {
-        onCallback(event, handler: handler)
-    }
-
-    /// Subscribe to an event, receiving the raw `Any` payload.
-    @available(*, deprecated, message: "Use client.stream(for:) / observeOnMainActor(_:handler:) / nextEvent(_:) — the untyped event surface is removed in the next major release.")
-    @discardableResult
-    public func onAny(_ event: JsBaoEvent, handler: @escaping (Any) -> Void) -> EventSubscription {
-        onAnyCallback(event, handler: handler)
-    }
-
-    /// Emit an event with a payload.
-    @available(*, deprecated, message: "Use the typed emit — `emit(_ payload:)` derives the key from the payload type. The untyped event surface is removed in the next major release.")
-    public func emit(_ event: JsBaoEvent, _ payload: Any) {
-        dispatch(key: event.rawValue, payload: payload)
-    }
-
-    /// Emit an event with no payload.
-    @available(*, deprecated, message: "Use the typed emit — `emit(_ payload:)` derives the key from the payload type. The untyped event surface is removed in the next major release.")
-    public func emit(_ event: JsBaoEvent) {
-        dispatch(key: event.rawValue, payload: () as Any)
-    }
+    // MARK: - Callback subscription
 
     /// Remove all callback handlers for an event.
     ///
@@ -115,14 +85,32 @@ public final class EventEmitter: @unchecked Sendable {
     /// subscription's lifetime through its `for await` loop, and ending someone
     /// else's loop from here would be a surprising reach across that boundary.
     /// To end every open stream — on client teardown — use `finishAllStreams()`.
+    ///
+    /// The removed entries are claimed under the lock and released after it is
+    /// dropped — see ``removeAll()`` for why.
     public func removeAll(for event: JsBaoEvent) {
-        lock.withLock { closureHandlers[event.rawValue] = nil }
+        let claimed = lock.withLock { closureHandlers.removeValue(forKey: event.rawValue) }
+        _ = claimed
     }
 
     /// Remove all callback handlers. Streams are untouched — see
     /// `removeAll(for:)`.
+    ///
+    /// The handler storage is claimed under the lock and released only after
+    /// the lock is dropped. Releasing a handler can run the `deinit` of a
+    /// consumer the closure was the last strong reference to, and a `deinit`
+    /// that cancels its subscriptions re-enters the emitter through
+    /// ``removeClosure(event:id:)`` — on the same thread, against the same
+    /// non-recursive `NSLock`. Doing that inside the critical section parks the
+    /// thread forever (issue #2574). This is the same discipline
+    /// `EventSubscription.cancel()` and `finishAllStreams()` already follow.
     public func removeAll() {
-        lock.withLock { closureHandlers.removeAll() }
+        let claimed = lock.withLock { () -> [String: [CallbackEntry]] in
+            let all = closureHandlers
+            closureHandlers.removeAll()
+            return all
+        }
+        _ = claimed
     }
 
     /// End every open stream and close the emitter.
@@ -345,41 +333,6 @@ public final class EventEmitter: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func onCallback<T>(_ event: JsBaoEvent, handler: @escaping (T) -> Void) -> EventSubscription {
-        let id = allocateId()
-        // The deprecated callbacks get no delivery metadata — they are removed
-        // in the next major and their contract is unchanged.
-        addCallback(event: event.rawValue, id: id) { value, _ in
-            if let typed = value as? T {
-                handler(typed)
-                return
-            }
-            // The nine events that used to be emitted as bare dictionaries are
-            // typed structs now. A handler still annotated `[String: Any]` gets
-            // the pre-conversion dictionary so it keeps firing for the whole
-            // deprecation window.
-            if let bridged = (value as? LegacyEventDictionary)?.legacyDictionary as? T {
-                handler(bridged)
-            }
-        }
-        return EventSubscription { [weak self] in
-            self?.removeClosure(event: event.rawValue, id: id)
-        }
-    }
-
-    private func onAnyCallback(_ event: JsBaoEvent, handler: @escaping (Any) -> Void) -> EventSubscription {
-        let id = allocateId()
-        addCallback(event: event.rawValue, id: id) { value, _ in
-            // `onAny` gives the handler no type annotation to bridge through, so
-            // a converted event is delivered in its pre-conversion dictionary
-            // form — byte-for-byte what this subscriber received before.
-            handler((value as? LegacyEventDictionary)?.legacyDictionary ?? value)
-        }
-        return EventSubscription { [weak self] in
-            self?.removeClosure(event: event.rawValue, id: id)
-        }
-    }
-
     /// Fan out one payload to both delivery shapes.
     ///
     /// The registry lock is held only to snapshot the entries (and retain the
@@ -425,13 +378,23 @@ public final class EventEmitter: @unchecked Sendable {
         }
     }
 
+    /// Cancelling one subscription. The removed entry is claimed under the lock
+    /// and released outside it, for the same reason ``removeAll()`` documents:
+    /// releasing a handler can run a consumer's `deinit`, which may cancel
+    /// another subscription and re-enter this non-recursive lock on this thread.
     private func removeClosure(event: String, id: UInt64) {
-        lock.withLock {
-            if var list = closureHandlers[event] {
-                list.removeAll { $0.id == id }
-                closureHandlers[event] = list
+        let claimed = lock.withLock { () -> [CallbackEntry] in
+            guard var list = closureHandlers[event] else { return [] }
+            var removed: [CallbackEntry] = []
+            list.removeAll { entry in
+                guard entry.id == id else { return false }
+                removed.append(entry)
+                return true
             }
+            closureHandlers[event] = list
+            return removed
         }
+        _ = claimed
     }
 
     private func removeStream(event: String, id: UInt64) {
@@ -687,21 +650,6 @@ final class CancellationBridge: @unchecked Sendable {
     }
 }
 
-/// Helper to wait for an event with a timeout.
-@available(*, deprecated, message: "Use client.nextEvent(_:timeout:where:) — it derives the event key from the payload type and returns it typed. The untyped event surface is removed in the next major release.")
-public func waitForEvent(
-    emitter: EventEmitter,
-    event: JsBaoEvent,
-    timeout: TimeInterval = 10,
-    predicate: ((Any) -> Bool)? = nil
-) async throws -> Any {
-    try await emitter.waitForNextUntypedEvent(
-        event: event,
-        timeout: timeout,
-        predicate: predicate
-    )
-}
-
 // MARK: - Resume-once waiting
 
 extension EventEmitter {
@@ -741,33 +689,6 @@ extension EventEmitter {
             }
         } onCancel: {
             cancellation.cancel()
-        }
-    }
-
-    /// The untyped form, kept for the deprecated free `waitForEvent`. Shares the
-    /// resume-once machinery above; only the subscription shape differs.
-    func waitForNextUntypedEvent(
-        event: JsBaoEvent,
-        timeout: TimeInterval,
-        predicate: ((Any) -> Bool)?
-    ) async throws -> Any {
-        let wait = SubscriptionHolder()
-        return try await withCheckedThrowingContinuation { continuation in
-            wait.set(onAnyCallback(event) { payload in
-                if let predicate, !predicate(payload) { return }
-                guard wait.claim() else { return }
-                // `payload` is `Any` (non-Sendable); the resume-once claim
-                // guarantees a single hand-off, so annotate the capture as
-                // reviewed-safe (same pattern as `unsafeDoc` in JsBaoClient).
-                nonisolated(unsafe) let capturedPayload = payload
-                continuation.resume(returning: capturedPayload)
-            })
-            wait.set(timeoutTask: timeoutTask(
-                wait: wait,
-                timeout: timeout,
-                eventKey: event.rawValue,
-                continuation: continuation
-            ))
         }
     }
 

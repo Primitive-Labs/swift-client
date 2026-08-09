@@ -4,9 +4,9 @@
 import Foundation
 import JsBaoClient
 
-internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
-    internal static let modelName = "crashTest"
-    internal static let primitiveSchema = PrimitiveSchema(
+public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+    public static let modelName = "crashTest"
+    public static let primitiveSchema = PrimitiveSchema(
         name: "crashTest",
         fields: [
             "id":           FieldDescriptor(type: .id),
@@ -24,42 +24,42 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
         ]
     )
 
-    internal var id: String {
+    public var id: String {
         didSet { _changedFields.insert("id") }
     }
-    internal var tags: Set<String>? {
+    public var tags: Set<String>? {
         didSet { _changedFields.insert("tags") }
     }
-    internal var requiredTags: Set<String> {
+    public var requiredTags: Set<String> {
         didSet { _changedFields.insert("requiredTags") }
     }
-    internal var email: String? {
+    public var email: String? {
         didSet { _changedFields.insert("email") }
     }
-    internal var boundedName: String? {
+    public var boundedName: String? {
         didSet { _changedFields.insert("boundedName") }
     }
-    internal var `default`: String? {
+    public var `default`: String? {
         didSet { _changedFields.insert("default") }
     }
-    internal var `where`: String? {
+    public var `where`: String? {
         didSet { _changedFields.insert("where") }
     }
-    internal var score: Double? {
+    public var score: Double? {
         didSet { _changedFields.insert("score") }
     }
-    internal var active: Bool? {
+    public var active: Bool? {
         didSet { _changedFields.insert("active") }
     }
 
-    internal var related: RelatedRecords = .empty
+    public var related: RelatedRecords = .empty
 
     /// `true` when the caller pinned `id` via the designated
     /// initializer; `false` when it was auto-generated. Drives the
     /// explicit-id-conflict check on `save(in:upsertOn:)` /
     /// `upsertByUnique` (js-bao `_constructorProvidedId` parity).
     /// Not part of the record's persisted/equatable identity.
-    internal private(set) var _explicitId: Bool = true
+    public private(set) var _explicitId: Bool = true
 
     /// Fields assigned since this value was constructed or read
     /// from the store — js-bao's `_localChanges`. `save(in:)` writes
@@ -71,13 +71,13 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
     /// Inserting a record that doesn't exist yet always writes every
     /// field, whatever this holds.
     /// Not part of the record's persisted/equatable identity.
-    internal private(set) var _changedFields: Set<String> = []
+    public private(set) var _changedFields: Set<String> = []
 
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
     /// js-bao's `discardChanges()`. The field values themselves are
     /// left alone — re-read the record to get the stored ones back.
-    internal mutating func discardChanges() {
+    public mutating func discardChanges() {
         _changedFields = []
     }
 
@@ -96,11 +96,11 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
     ///
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
-    internal mutating func markAllChanged() {
+    public mutating func markAllChanged() {
         _changedFields = Set(primitiveValues().keys)
     }
 
-    internal init(
+    public init(
         id: String,
         tags: Set<String>? = nil,
         requiredTags: Set<String>,
@@ -129,7 +129,7 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
     /// unique value merges into the existing record rather than
     /// throwing `UpsertError.explicitIdConflict`. Mirrors js-bao's
     /// id-less `new Model({...})` constructor.
-    internal init(
+    public init(
         tags: Set<String>? = nil,
         requiredTags: Set<String>,
         email: String? = nil,
@@ -153,7 +153,7 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
         self._changedFields = Set(primitiveValues().keys)
     }
 
-    internal init?(record: PrimitiveRecord) {
+    public init?(record: PrimitiveRecord) {
         guard let requiredTags = record["requiredTags"]?.asStringSet
         else { return nil }
         self.id = record.id
@@ -170,7 +170,7 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
-    internal init?(row: [String: Any]) {
+    public init?(row: [String: Any]) {
         guard let id = row["id"] as? String,
               let requiredTags = (row["requiredTags"] as? [String]).map(Set.init)
         else { return nil }
@@ -187,7 +187,7 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
         self._changedFields = []
     }
 
-    internal func primitiveValues() -> [String: PrimitiveValue] {
+    public func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [
             "requiredTags": .stringset(requiredTags),
         ]
@@ -204,7 +204,7 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
     /// Decode a record. A decoded value is treated like a
     /// constructed one — every decoded field is marked changed, so
     /// `save(in:)` writes all of them.
-    internal init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(String.self, forKey: .id)
         self.tags = try container.decodeIfPresent(Set<String>.self, forKey: .tags)
@@ -219,11 +219,11 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
         self._changedFields = Set(primitiveValues().keys)
     }
 
-    internal enum CodingKeys: String, CodingKey {
+    public enum CodingKeys: String, CodingKey {
         case id, tags, requiredTags, email, boundedName, `default`, `where`, score, active
     }
 
-    internal static func == (lhs: CrashTestRecord, rhs: CrashTestRecord) -> Bool {
+    public static func == (lhs: CrashTestRecord, rhs: CrashTestRecord) -> Bool {
         lhs.id == rhs.id &&
         lhs.tags == rhs.tags &&
         lhs.requiredTags == rhs.requiredTags &&
@@ -235,7 +235,7 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
         lhs.active == rhs.active
     }
 
-    internal func hash(into hasher: inout Hasher) {
+    public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
         hasher.combine(tags)
         hasher.combine(requiredTags)
@@ -253,14 +253,14 @@ internal struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatabl
 /// `options: QueryOptions(documents: [docId])`); `save(in:)` / `delete(in:)`
 /// target one document and throw if it isn't open. Backed by the configured
 /// default `JsBaoClient` (see `JsBaoClient.configureDefault`).
-internal extension CrashTestRecord {
+public extension CrashTestRecord {
     // MARK: Reads (cross-document by default)
 
     /// Query across all open documents. Rows that fail to decode (schema
     /// drift) are skipped. Scope to one/some docs via `options.documents`.
     static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [CrashTestRecord] {
         try JsBaoClient.requireDefault()
-            .queryShared(primitiveSchema, filter: filter, options: options)
+            .codegen.query(primitiveSchema, filter: filter, options: options)
             .compactMap { CrashTestRecord(row: $0) }
     }
 
@@ -269,7 +269,7 @@ internal extension CrashTestRecord {
     /// `BaseModel.query(filter, { include })`.
     static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [CrashTestRecord] {
         try JsBaoClient.requireDefault()
-            .queryShared(primitiveSchema, filter: filter, options: options, include: include)
+            .codegen.query(primitiveSchema, filter: filter, options: options, include: include)
             .compactMap { CrashTestRecord(row: $0) }
     }
 
@@ -279,7 +279,7 @@ internal extension CrashTestRecord {
     /// `BaseModel.query()`'s `{ data, nextCursor, hasMore }` shape.
     static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<CrashTestRecord> {
         let page = try JsBaoClient.requireDefault()
-            .queryPagedShared(primitiveSchema, filter: filter, options: options)
+            .codegen.queryPaged(primitiveSchema, filter: filter, options: options)
         return PagedQueryResult(
             data: page.data.compactMap { CrashTestRecord(row: $0) },
             nextCursor: page.nextCursor,
@@ -291,7 +291,7 @@ internal extension CrashTestRecord {
     /// Paginated query with query-time relationship includes.
     static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<CrashTestRecord> {
         let page = try JsBaoClient.requireDefault()
-            .queryPagedShared(primitiveSchema, filter: filter, options: options, include: include)
+            .codegen.queryPaged(primitiveSchema, filter: filter, options: options, include: include)
         return PagedQueryResult(
             data: page.data.compactMap { CrashTestRecord(row: $0) },
             nextCursor: page.nextCursor,
@@ -302,7 +302,7 @@ internal extension CrashTestRecord {
 
     /// Count across all open documents.
     static func count(_ filter: DocumentFilter? = nil) throws -> Int {
-        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)
+        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)
     }
 
     /// Every record across all open documents. Synchronous like the
@@ -313,7 +313,7 @@ internal extension CrashTestRecord {
     /// the result.
     static func findAll() throws -> [CrashTestRecord] {
         try JsBaoClient.requireDefault()
-            .queryShared(primitiveSchema, filter: nil, options: nil)
+            .codegen.query(primitiveSchema, filter: nil, options: nil)
             .map { row in
                 guard let decoded = CrashTestRecord(row: row) else {
                     throw PrimitiveDecodeError(modelName: modelName, row: row)
@@ -328,7 +328,7 @@ internal extension CrashTestRecord {
     /// `PrimitiveDecodeError` when the row exists but no longer decodes
     /// as `CrashTestRecord` — distinct from the `nil` not-found case.
     static func find(_ id: String) throws -> CrashTestRecord? {
-        guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {
+        guard let row = JsBaoClient.requireDefault().codegen.find(primitiveSchema, id: id) else {
             return nil
         }
         guard let decoded = CrashTestRecord(row: row) else {
@@ -344,7 +344,7 @@ internal extension CrashTestRecord {
     /// JS client's `Model.findByUnique(constraintName, value)`.
     static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> CrashTestRecord? {
         try JsBaoClient.requireDefault()
-            .findByUniqueShared(primitiveSchema, constraint: constraint, value: value)
+            .codegen.findByUnique(primitiveSchema, constraint: constraint, value: value)
             .flatMap { CrashTestRecord(row: $0) }
     }
 
@@ -353,7 +353,7 @@ internal extension CrashTestRecord {
     /// the JS client's `Model.queryOne(filter, options)`.
     static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> CrashTestRecord? {
         try JsBaoClient.requireDefault()
-            .queryOneShared(primitiveSchema, filter: filter, options: options)
+            .codegen.queryOne(primitiveSchema, filter: filter, options: options)
             .flatMap { CrashTestRecord(row: $0) }
     }
 
@@ -363,7 +363,7 @@ internal extension CrashTestRecord {
     /// `Model.queryOne(filter, { include })`.
     static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> CrashTestRecord? {
         try JsBaoClient.requireDefault()
-            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)
+            .codegen.queryOne(primitiveSchema, filter: filter, options: options, include: include)
             .flatMap { CrashTestRecord(row: $0) }
     }
 
@@ -376,12 +376,12 @@ internal extension CrashTestRecord {
     /// from either.
     @discardableResult
     static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
-        JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)
+        JsBaoClient.requireDefault().codegen.subscribe(primitiveSchema, callback)
     }
 
     /// Aggregate (group / count / sum / avg / …) across all open documents.
     static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
-        try JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)
+        try JsBaoClient.requireDefault().codegen.aggregate(primitiveSchema, options: options)
     }
 
     // MARK: Writes (target one document; throw if it isn't open)
@@ -404,7 +404,7 @@ internal extension CrashTestRecord {
     /// after the save; `self` itself still holds the values you had.
     @discardableResult
     func save(in documentId: String) throws -> CrashTestRecord {
-        let record = try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)
+        let record = try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)
         guard var saved = CrashTestRecord(record: record) else {
             var fallback = self
             fallback.discardChanges()
@@ -432,7 +432,7 @@ internal extension CrashTestRecord {
     /// its fields reflect the merged state, NOT necessarily `self`.
     @discardableResult
     func save(in documentId: String, upsertOn: String) throws -> CrashTestRecord {
-        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)
+        let result = try JsBaoClient.requireDefault().codegen.upsert(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)
         if let resolved = CrashTestRecord(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
@@ -462,7 +462,7 @@ internal extension CrashTestRecord {
     /// EXISTING record's id and its fields reflect the merged state.
     @discardableResult
     func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> CrashTestRecord {
-        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)
+        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)
         if let resolved = CrashTestRecord(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
@@ -477,7 +477,7 @@ internal extension CrashTestRecord {
     /// when you want to make the lookup key explicit at the call site.
     @discardableResult
     func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> CrashTestRecord {
-        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue, changedFields: _changedFields)
+        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue, changedFields: _changedFields)
         if let resolved = CrashTestRecord(record: result.record) { return resolved }
         var copy = self
         copy.id = result.record.id
@@ -487,6 +487,6 @@ internal extension CrashTestRecord {
 
     /// Delete this record from document `documentId`. Throws if the doc isn't open.
     func delete(in documentId: String) throws {
-        try JsBaoClient.requireDefault().deleteShared(Self.primitiveSchema, id: id, in: documentId)
+        try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)
     }
 }

@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import JsBaoClient
 
@@ -5,9 +6,9 @@ import XCTest
 /// strings by routing every value through `URLEncoding` / `URLQuery` instead of
 /// hand-escaping with `.urlQueryAllowed` / `.urlPathAllowed`.
 ///
-/// Each sub-API takes an injected `makeRequest` closure, so we capture the exact
-/// path each method hands to `HttpClient` without a live server. The stub returns
-/// an empty body and the call is wrapped in `try?` — the path is recorded before
+/// Each sub-API takes an injected `Transport`, so we capture the exact path
+/// each method hands to it without a live server. The stub returns an empty
+/// JSON object and the call is wrapped in `try?` — the path is recorded before
 /// the method decodes, so a decode failure does not hide the assertion.
 ///
 /// Two guarantees are pinned:
@@ -17,13 +18,27 @@ import XCTest
 ///    are now percent-encoded, matching the JS client's `URLSearchParams`.
 final class URLConstructionParityTests: XCTestCase {
 
-    /// Records the path passed to the sub-API's `makeRequest` and returns an
+    /// Records the path the sub-API asks the transport for and replies with an
     /// empty JSON object. Callers use `try?` so a decode mismatch on the empty
     /// body doesn't mask the captured path.
-    private func recorder(_ capture: @escaping (String) -> Void) -> (String, String, Any?) async throws -> Any {
-        { _, path, _ in
-            capture(path)
-            return [String: Any]()
+    private final class PathRecorder: Transport, @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastPath: String?
+
+        var path: String? { lock.withLock { lastPath } }
+
+        func execute(
+            method: HTTPMethod,
+            path: String,
+            body: Data?,
+            options: RequestOptions?
+        ) async throws -> TransportResponse {
+            lock.withLock { lastPath = path }
+            return TransportResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: Data("{}".utf8)
+            )
         }
     }
 
@@ -33,19 +48,19 @@ final class URLConstructionParityTests: XCTestCase {
     /// `.urlQueryAllowed` left `+` and `@` literal, so `?email=a+b@x.com`
     /// decoded to `a b@x.com` server-side and resolved the wrong user.
     func test_usersLookup_plusAddressedEmail_isEncoded() async throws {
-        var captured: String?
-        let users = UsersAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let users = UsersAPI(transport: recorder)
         _ = try? await users.lookup(email: "a+b@x.com")
-        XCTAssertEqual(captured, "/users/lookup?email=a%2Bb%40x.com")
+        XCTAssertEqual(recorder.path, "/users/lookup?email=a%2Bb%40x.com")
     }
 
     /// An ordinary email now encodes `@` to `%40` (JS `URLSearchParams` parity);
     /// the server decodes it back to the same address.
     func test_usersLookup_ordinaryEmail_matchesEncodeURIComponent() async throws {
-        var captured: String?
-        let users = UsersAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let users = UsersAPI(transport: recorder)
         _ = try? await users.lookup(email: "user@example.com")
-        XCTAssertEqual(captured, "/users/lookup?email=user%40example.com")
+        XCTAssertEqual(recorder.path, "/users/lookup?email=user%40example.com")
     }
 
     // MARK: - GroupsAPI.list — byte-identical + boolean convention preserved
@@ -53,20 +68,20 @@ final class URLConstructionParityTests: XCTestCase {
     /// A slug type filter and the `includeSystem=true`-only-when-true boolean
     /// convention are preserved byte-for-byte.
     func test_groupsList_slugAndBoolean_areByteIdentical() async throws {
-        var captured: String?
-        let groups = GroupsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let groups = GroupsAPI(transport: recorder)
         _ = try? await groups.list(options: ListGroupsOptions(
             type: "editors", limit: 25, cursor: "abc123", includeSystem: true
         ))
-        XCTAssertEqual(captured, "/groups?type=editors&limit=25&cursor=abc123&includeSystem=true")
+        XCTAssertEqual(recorder.path, "/groups?type=editors&limit=25&cursor=abc123&includeSystem=true")
     }
 
     /// `includeSystem` defaulting to nil/false appends nothing (unchanged).
     func test_groupsList_includeSystemFalse_isOmitted() async throws {
-        var captured: String?
-        let groups = GroupsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let groups = GroupsAPI(transport: recorder)
         _ = try? await groups.list(options: ListGroupsOptions(type: "editors"))
-        XCTAssertEqual(captured, "/groups?type=editors")
+        XCTAssertEqual(recorder.path, "/groups?type=editors")
     }
 
     // MARK: - GroupsAPI.listMembers — #2075 (cursor was not escaped at all)
@@ -75,30 +90,30 @@ final class URLConstructionParityTests: XCTestCase {
     /// interpolated it raw (`cursor=\(cursor)`), so a cursor containing a `+`
     /// or space produced a malformed query on page 2.
     func test_groupsListMembers_cursor_isEncoded() async throws {
-        var captured: String?
-        let groups = GroupsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let groups = GroupsAPI(transport: recorder)
         _ = try? await groups.listMembers(
             groupType: "editors",
             groupId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             options: PaginationOptions(limit: 50, cursor: "a+b c")
         )
         XCTAssertEqual(
-            captured,
+            recorder.path,
             "/groups/editors/01ARZ3NDEKTSV4RRFFQ69G5FAV/members?limit=50&cursor=a%2Bb%20c"
         )
     }
 
     /// A plain cursor stays byte-identical.
     func test_groupsListMembers_plainCursor_isByteIdentical() async throws {
-        var captured: String?
-        let groups = GroupsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let groups = GroupsAPI(transport: recorder)
         _ = try? await groups.listMembers(
             groupType: "editors",
             groupId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             options: PaginationOptions(cursor: "eyJrIjoxfQ")
         )
         XCTAssertEqual(
-            captured,
+            recorder.path,
             "/groups/editors/01ARZ3NDEKTSV4RRFFQ69G5FAV/members?cursor=eyJrIjoxfQ"
         )
     }
@@ -106,13 +121,13 @@ final class URLConstructionParityTests: XCTestCase {
     // MARK: - GroupsAPI.removeMemberByEmail — plus email in the query
 
     func test_groupsRemoveMemberByEmail_plusEmail_isEncoded() async throws {
-        var captured: String?
-        let groups = GroupsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let groups = GroupsAPI(transport: recorder)
         _ = try? await groups.removeMemberByEmail(
             groupType: "editors", groupId: "01ARZ3NDEKTSV4RRFFQ69G5FAV", email: "a+b@x.com"
         )
         XCTAssertEqual(
-            captured,
+            recorder.path,
             "/groups/editors/01ARZ3NDEKTSV4RRFFQ69G5FAV/members?email=a%2Bb%40x.com"
         )
     }
@@ -122,45 +137,45 @@ final class URLConstructionParityTests: XCTestCase {
     /// A value containing `/` is now escaped to `%2F` (the old `.urlPathAllowed`
     /// left it literal, letting a value split into extra path segments).
     func test_groupsDelete_slashInValue_isEscaped() async throws {
-        var captured: String?
-        let groups = GroupsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let groups = GroupsAPI(transport: recorder)
         _ = try? await groups.delete(groupType: "a/b", groupId: "01ARZ3NDEKTSV4RRFFQ69G5FAV")
-        XCTAssertEqual(captured, "/groups/a%2Fb/01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        XCTAssertEqual(recorder.path, "/groups/a%2Fb/01ARZ3NDEKTSV4RRFFQ69G5FAV")
     }
 
     // MARK: - CollectionsAPI.list — shared queryString helper
 
     func test_collectionsList_cursor_isEncoded() async throws {
-        var captured: String?
-        let collections = CollectionsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let collections = CollectionsAPI(transport: recorder)
         _ = try? await collections.list(options: PaginationOptions(limit: 10, cursor: "a+b"))
-        XCTAssertEqual(captured, "/collections?limit=10&cursor=a%2Bb")
+        XCTAssertEqual(recorder.path, "/collections?limit=10&cursor=a%2Bb")
     }
 
     // MARK: - InvitationsAPI.listDeferredGrants — email filter
 
     func test_invitationsListDeferredGrants_email_isEncoded() async throws {
-        var captured: String?
-        let invitations = InvitationsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let invitations = InvitationsAPI(transport: recorder)
         _ = try? await invitations.listDeferredGrants(email: "a+b@x.com")
-        XCTAssertEqual(captured, "/deferred-grants?email=a%2Bb%40x.com")
+        XCTAssertEqual(recorder.path, "/deferred-grants?email=a%2Bb%40x.com")
     }
 
     // MARK: - RuleSetsAPI.list — resourceType filter
 
     func test_ruleSetsList_resourceType_isEncoded() async throws {
-        var captured: String?
-        let ruleSets = RuleSetsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let ruleSets = RuleSetsAPI(transport: recorder)
         _ = try? await ruleSets.list(options: ListRuleSetsOptions(resourceType: "a b/c"))
-        XCTAssertEqual(captured, "/rule-sets?resourceType=a%20b%2Fc")
+        XCTAssertEqual(recorder.path, "/rule-sets?resourceType=a%20b%2Fc")
     }
 
     /// A plain resourceType slug stays byte-identical.
     func test_ruleSetsList_slug_isByteIdentical() async throws {
-        var captured: String?
-        let ruleSets = RuleSetsAPI(makeRequest: recorder { captured = $0 })
+        let recorder = PathRecorder()
+        let ruleSets = RuleSetsAPI(transport: recorder)
         _ = try? await ruleSets.list(options: ListRuleSetsOptions(resourceType: "document"))
-        XCTAssertEqual(captured, "/rule-sets?resourceType=document")
+        XCTAssertEqual(recorder.path, "/rule-sets?resourceType=document")
     }
 
     // MARK: - JsBaoClient.openDocumentByAlias — path segment

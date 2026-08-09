@@ -1,13 +1,14 @@
+import Foundation
 import XCTest
 @testable import JsBaoClient
 
 /// Wire-shape tests for the API-parity pass that filled in the
 /// gaps catalogued in the (since-retired) parity docs — see PR #790.
 ///
-/// Each test instantiates a sub-API with a stub `makeRequest` closure
-/// that records the `(method, path, body)` triple, then invokes the
-/// public method under test and asserts the HTTP shape matches the
-/// js-bao counterpart's wire format.
+/// Each test instantiates a sub-API with a stub `Transport` that records
+/// the `(method, path, body)` triple, then invokes the public method
+/// under test and asserts the HTTP shape matches the js-bao
+/// counterpart's wire format.
 ///
 /// These don't hit the network — they verify that every new method
 /// (a) compiles, (b) routes to the right endpoint with the right HTTP
@@ -22,24 +23,55 @@ final class ApiParityTests: XCTestCase {
 
     // MARK: - Recorder
 
-    /// Captures the most recent HTTP request the stub closure was
-    /// asked to make. `body` may be nil for GET/DELETE, a dict for
-    /// JSON requests, or `Data` for raw uploads (we don't wire the
-    /// raw closure in these tests — those paths are exercised at the
-    /// integration level).
-    final class CallRecorder: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        /// Optional canned response. Defaults to an empty dict so
-        /// methods that decode `[String: Any]` don't crash.
-        var response: Any = [String: Any]()
+    /// Captures the most recent HTTP request the stub transport was
+    /// asked to make. `body` is nil for GET/DELETE and the decoded JSON
+    /// graph for requests that carry one. Raw uploads aren't wired here —
+    /// those paths are exercised at the integration level.
+    ///
+    /// The sub-APIs take a `Transport` (which speaks bytes), while these
+    /// assertions are written against the `JSONSerialization` graph, so the
+    /// recorder converts in both directions: it decodes the recorded request
+    /// body and encodes `response` on each call.
+    final class CallRecorder: Transport, @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastMethod: HTTPMethod?
+        private var lastPath: String?
+        private var lastBody: Data?
+        private var cannedResponse: Any = [String: Any]()
 
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
+        var method: String? { lock.withLock { lastMethod?.rawValue } }
+        var path: String? { lock.withLock { lastPath } }
+        var body: Any? {
+            guard let data = lock.withLock({ lastBody }) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        }
+
+        /// Optional canned response. Defaults to an empty JSON object so
+        /// methods whose result type tolerates missing fields don't crash.
+        var response: Any {
+            get { lock.withLock { cannedResponse } }
+            set { lock.withLock { cannedResponse = newValue } }
+        }
+
+        func execute(
+            method: HTTPMethod,
+            path: String,
+            body: Data?,
+            options: RequestOptions?
+        ) async throws -> TransportResponse {
+            lock.withLock {
+                lastMethod = method
+                lastPath = path
+                lastBody = body
+            }
+            let data = try JSONSerialization.data(
+                withJSONObject: response, options: [.fragmentsAllowed]
+            )
+            return TransportResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: data
+            )
         }
     }
 
@@ -58,7 +90,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_collectionTypeConfigs_list_GET() async throws {
         let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(makeRequest: r.make)
+        let api = CollectionTypeConfigsAPI(transport: r)
         r.response = [[String: Any]]()
         _ = try await api.list()
         XCTAssertEqual(r.method, "GET")
@@ -67,7 +99,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_collectionTypeConfigs_get_escapesType() async throws {
         let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(makeRequest: r.make)
+        let api = CollectionTypeConfigsAPI(transport: r)
         r.response = [
             "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
             "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
@@ -83,7 +115,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_collectionTypeConfigs_create_POSTsParams() async throws {
         let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(makeRequest: r.make)
+        let api = CollectionTypeConfigsAPI(transport: r)
         r.response = [
             "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
             "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
@@ -99,7 +131,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_collectionTypeConfigs_update_PATCH() async throws {
         let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(makeRequest: r.make)
+        let api = CollectionTypeConfigsAPI(transport: r)
         r.response = [
             "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
             "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
@@ -112,7 +144,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_collectionTypeConfigs_delete_DELETE() async throws {
         let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(makeRequest: r.make)
+        let api = CollectionTypeConfigsAPI(transport: r)
         r.response = ["success": true]
         _ = try await api.delete(collectionType: "x")
         XCTAssertEqual(r.method, "DELETE")
@@ -123,7 +155,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databaseTypeConfigs_routes() async throws {
         let r = CallRecorder()
-        let api = DatabaseTypeConfigsAPI(makeRequest: r.make)
+        let api = DatabaseTypeConfigsAPI(transport: r)
         let configJSON: [String: Any] = [
             "appId": "app1", "databaseType": "userDB",
             "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
@@ -168,7 +200,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_cronTriggers_create_POST() async throws {
         let r = CallRecorder()
-        let api = CronTriggersAPI(makeRequest: r.make)
+        let api = CronTriggersAPI(transport: r)
         r.response = cronTriggerJSON()
         _ = try await api.create(params: CreateCronTriggerParams(triggerKey: "k", displayName: "d", cron: "* * * * *", workflowKey: "w"))
         XCTAssertEqual(r.method, "POST")
@@ -177,7 +209,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_cronTriggers_update_PUT() async throws {
         let r = CallRecorder()
-        let api = CronTriggersAPI(makeRequest: r.make)
+        let api = CronTriggersAPI(transport: r)
         r.response = cronTriggerJSON()
         _ = try await api.update(triggerId: "abc", params: UpdateCronTriggerParams(state: .paused))
         XCTAssertEqual(r.method, "PUT")
@@ -186,7 +218,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_cronTriggers_pause_resume_test_routes() async throws {
         let r = CallRecorder()
-        let api = CronTriggersAPI(makeRequest: r.make)
+        let api = CronTriggersAPI(transport: r)
 
         r.response = cronTriggerJSON()
         _ = try await api.pause(triggerId: "abc")
@@ -205,7 +237,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_invitations_quota_GET() async throws {
         let r = CallRecorder()
-        let api = InvitationsAPI(makeRequest: r.make)
+        let api = InvitationsAPI(transport: r)
         r.response = ["used": 1, "limit": 10, "remaining": 9, "unlimited": false]
         _ = try await api.quota()
         XCTAssertEqual(r.method, "GET")
@@ -214,7 +246,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_invitations_create_POSTsParams() async throws {
         let r = CallRecorder()
-        let api = InvitationsAPI(makeRequest: r.make)
+        let api = InvitationsAPI(transport: r)
         r.response = [
             "invitationId": "inv1", "email": "alice@example.com", "role": "member",
             "invitedBy": "owner", "invitedAt": "2024-01-01T00:00:00Z", "accepted": false,
@@ -228,7 +260,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_invitations_list_buildsCursorQS() async throws {
         let r = CallRecorder()
-        let api = InvitationsAPI(makeRequest: r.make)
+        let api = InvitationsAPI(transport: r)
         // Foundation's `.urlQueryAllowed` doesn't encode `=` (it's a
         // valid sub-delim inside query values, just not as a separator).
         // We assert the actual encoded form rather than the "looks safer"
@@ -240,7 +272,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_invitations_accept_POSTsToken() async throws {
         let r = CallRecorder()
-        let api = InvitationsAPI(makeRequest: r.make)
+        let api = InvitationsAPI(transport: r)
         r.response = [
             "status": "accepted", "invitationId": "inv1",
             "grantsResolved": ["groups": 0, "documents": 0],
@@ -253,7 +285,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_invitations_listDeferredGrants_path() async throws {
         let r = CallRecorder()
-        let api = InvitationsAPI(makeRequest: r.make)
+        let api = InvitationsAPI(transport: r)
 
         _ = try await api.listDeferredGrants(type: .document, email: nil, limit: nil)
         XCTAssertEqual(r.path, "/deferred-grants?type=document")
@@ -264,7 +296,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_invitations_revokeDeferredGrant_DELETE_withType() async throws {
         let r = CallRecorder()
-        let api = InvitationsAPI(makeRequest: r.make)
+        let api = InvitationsAPI(transport: r)
         r.response = ["status": "revoked", "deferredId": "abc"]
         _ = try await api.revokeDeferredGrant(deferredId: "abc", type: .group)
         XCTAssertEqual(r.method, "DELETE")
@@ -276,7 +308,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_blobBuckets_createBucket_POST() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = [
             "bucketId": "b1", "appId": "app1", "bucketKey": "k",
             "name": "n", "ttlTier": "permanent", "preset": "personal-uploads",
@@ -299,7 +331,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_blobBuckets_listBuckets_unwrapsItems() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         func bucketJSON(_ id: String) -> [String: Any] {
             [
                 "bucketId": id, "appId": "app1", "bucketKey": "k-\(id)",
@@ -317,7 +349,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_blobBuckets_updateBucket_PATCH() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = [
             "bucketId": "b1", "appId": "app1", "bucketKey": "k",
             "name": "Renamed", "description": NSNull(), "ttlTier": "permanent",
@@ -346,14 +378,14 @@ final class ApiParityTests: XCTestCase {
 
     func test_blobBuckets_list_buildsQS() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         _ = try await api.list(bucketIdOrKey: "k", cursor: "c", limit: 10)
         XCTAssertEqual(r.path, "/blob-buckets/k/blobs?cursor=c&limit=10")
     }
 
     func test_blobBuckets_getMetadata_path() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = [
             "blobId": "b1", "bucketId": "k", "numBytes": 12, "tags": [String](),
         ]
@@ -363,7 +395,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_blobBuckets_delete_DELETE() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = ["deleted": true]
         _ = try await api.delete(bucketIdOrKey: "k", blobId: "b1")
         XCTAssertEqual(r.method, "DELETE")
@@ -375,7 +407,7 @@ final class ApiParityTests: XCTestCase {
     // bucketId }`.
     func test_blobBuckets_deleteBatch_POST() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = [
             "deleted": 3,
             "blobIds": ["b1", "b2", "b3"],
@@ -399,7 +431,7 @@ final class ApiParityTests: XCTestCase {
     // path), matching how the single-blob and other bucket paths escape it.
     func test_blobBuckets_deleteBatch_encodesBucket() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = ["deleted": 1, "blobIds": ["b1"], "bucketId": "a b"]
         _ = try await api.delete(bucketIdOrKey: "a b", blobIds: ["b1"])
         XCTAssertEqual(r.path, "/blob-buckets/a%20b/blobs/delete")
@@ -409,7 +441,7 @@ final class ApiParityTests: XCTestCase {
     // 200 no-op returning `{ deleted: 0, blobIds: [] }`).
     func test_blobBuckets_deleteBatch_emptyArray() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = ["deleted": 0, "blobIds": [String](), "bucketId": "k"]
         let result = try await api.delete(bucketIdOrKey: "k", blobIds: [])
         XCTAssertEqual(r.method, "POST")
@@ -422,7 +454,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_blobBuckets_signedUrl_POSTwithExpires() async throws {
         let r = CallRecorder()
-        let api = BlobBucketsAPI(makeRequest: r.make)
+        let api = BlobBucketsAPI(transport: r)
         r.response = [
             "url": "https://example.com/signed", "token": "tok",
             "expiresAt": 1735689600, "expiresInSeconds": 60,
@@ -437,7 +469,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_users_getProfiles_POSTsIdsArray() async throws {
         let r = CallRecorder()
-        let api = UsersAPI(makeRequest: r.make)
+        let api = UsersAPI(transport: r)
         r.response = ["profiles": [["userId": "u1", "email": "u1@example.com"]]]
         let profiles = try await api.getProfiles(userIds: ["u1", "u2"])
         XCTAssertEqual(r.method, "POST")
@@ -448,7 +480,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_users_getProfiles_emptyArrayThrows() async {
         let r = CallRecorder()
-        let api = UsersAPI(makeRequest: r.make)
+        let api = UsersAPI(transport: r)
         do {
             _ = try await api.getProfiles(userIds: [])
             XCTFail("expected throw on empty array")
@@ -459,7 +491,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_users_lookup_buildsQS() async throws {
         let r = CallRecorder()
-        let api = UsersAPI(makeRequest: r.make)
+        let api = UsersAPI(transport: r)
         r.response = ["exists": false]
         _ = try await api.lookup(email: "alice@example.com")
         XCTAssertEqual(r.method, "GET")
@@ -476,7 +508,7 @@ final class ApiParityTests: XCTestCase {
         // documentManager isn't needed for the HTTP-only path; pass nil.
         // BlobManager has to be wired but we won't exercise it.
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -491,7 +523,7 @@ final class ApiParityTests: XCTestCase {
     func test_documents_requestAccess_POSTsParams() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -512,7 +544,7 @@ final class ApiParityTests: XCTestCase {
     func test_documents_approveAccessRequest_path() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -533,7 +565,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databases_getCelContext_GET() async throws {
         let r = CallRecorder()
-        let api = DatabasesAPI(makeRequest: r.make)
+        let api = DatabasesAPI(transport: r)
         r.response = ["databaseId": "db1", "celContext": ["tenantId": "t1"]]
         _ = try await api.getCelContext(databaseId: "db1")
         XCTAssertEqual(r.method, "GET")
@@ -542,7 +574,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databases_updateCelContext_PATCH() async throws {
         let r = CallRecorder()
-        let api = DatabasesAPI(makeRequest: r.make)
+        let api = DatabasesAPI(transport: r)
         r.response = [
             "databaseId": "db1", "title": "DB", "createdBy": "u1",
             "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
@@ -555,7 +587,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databases_addManager_PUTsPermission() async throws {
         let r = CallRecorder()
-        let api = DatabasesAPI(makeRequest: r.make)
+        let api = DatabasesAPI(transport: r)
         r.response = [
             "databaseId": "db1", "userId": "u1", "permission": "manager",
             "grantedAt": "2024-01-01T00:00:00Z", "grantedBy": "owner",
@@ -570,7 +602,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databases_removeManager_DELETE() async throws {
         let r = CallRecorder()
-        let api = DatabasesAPI(makeRequest: r.make)
+        let api = DatabasesAPI(transport: r)
         r.response = ["success": true]
         _ = try await api.removeManager(databaseId: "db1", userId: "u1")
         XCTAssertEqual(r.method, "DELETE")
@@ -579,7 +611,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databases_listGroupPermissions_includeSystem_buildsQS() async throws {
         let r = CallRecorder()
-        let api = DatabasesAPI(makeRequest: r.make)
+        let api = DatabasesAPI(transport: r)
         r.response = [[String: Any]]()
         _ = try await api.listGroupPermissions(databaseId: "db1", includeSystem: true)
         XCTAssertEqual(r.path, "/databases/db1/group-permissions?includeSystem=true")
@@ -590,7 +622,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databases_executeBatch_path() async throws {
         let r = CallRecorder()
-        let api = DatabasesAPI(makeRequest: r.make)
+        let api = DatabasesAPI(transport: r)
         r.response = ["imported": 1, "failed": 0]
         _ = try await api.executeBatch(
             databaseId: "db1", operationName: "save",
@@ -604,7 +636,7 @@ final class ApiParityTests: XCTestCase {
 
     func test_databases_importRows_batchesAndSumsResults() async throws {
         let r = CallRecorder()
-        let api = DatabasesAPI(makeRequest: r.make)
+        let api = DatabasesAPI(transport: r)
         r.response = ["imported": 1, "failed": 0]
         let rows: [[String: JSONValue]] = [
             ["id": .string("1")], ["id": .string("2")], ["id": .string("3")],
@@ -624,7 +656,7 @@ final class ApiParityTests: XCTestCase {
     func test_workflows_start_forceRerunSerializes() async throws {
         let r = CallRecorder()
         let api = WorkflowsAPI(
-            makeRequest: r.make,
+            transport: r,
             getConnectionId: { "conn-1" }
         )
         _ = try await api.start(
@@ -639,7 +671,7 @@ final class ApiParityTests: XCTestCase {
     func test_workflows_terminate_contextDocId_appendsQS() async throws {
         let r = CallRecorder()
         let api = WorkflowsAPI(
-            makeRequest: r.make,
+            transport: r,
             getConnectionId: { "conn-1" }
         )
         _ = try await api.terminate(workflowKey: "wf", runKey: "rk", contextDocId: "doc-1")
@@ -650,7 +682,7 @@ final class ApiParityTests: XCTestCase {
     func test_workflows_listStepRuns_path() async throws {
         let r = CallRecorder()
         let api = WorkflowsAPI(
-            makeRequest: r.make,
+            transport: r,
             getConnectionId: { "conn-1" }
         )
         _ = try await api.listStepRuns(runId: "run-1")
@@ -661,7 +693,7 @@ final class ApiParityTests: XCTestCase {
     func test_workflows_listRuns_forwardAndContextDocId() async throws {
         let r = CallRecorder()
         let api = WorkflowsAPI(
-            makeRequest: r.make,
+            transport: r,
             getConnectionId: { "conn-1" }
         )
         _ = try await api.listRuns(options: ListWorkflowRunsOptions(

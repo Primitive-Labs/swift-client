@@ -234,9 +234,14 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         // can't trigger the substring-op validator, so the now-throwing
         // `engine.query` is unreachable-error here — handle it locally
         // so `find` stays non-throwing.
+        // `stringsetFields` is what drives the post-query pass that pulls
+        // members out of the per-field junction tables. Without it the
+        // returned row simply has no stringset keys — `find` handed back a
+        // record `query` would have returned complete (#2485).
         let rows = (try? engine.query(
             modelName: schema.name,
-            filter: ["id": id]
+            filter: ["id": id],
+            stringsetFields: stringsetFieldNames
         )) ?? []
         guard !rows.isEmpty else { return nil }
         let connectOrder = snapshot.enumerated().reduce(
@@ -273,8 +278,14 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             let snap = rec.snapshot()
             for (fname, _) in schema.fields where fname != "id" {
                 if let v = snap[fname] {
-                    row[fname] = sqliteRepresentation(of: v)
+                    row[fname] = rowRepresentation(of: v)
                 }
+            }
+            // A record with no members has no snapshot entry at all, so give
+            // every stringset field the same `[]` the engine's population pass
+            // produces — one row shape whether the set is empty or not (#2485).
+            for fname in stringsetFieldNames where row[fname] == nil {
+                row[fname] = [String]()
             }
             row["_meta_doc_id"] = docId
             return Located(docId: docId, row: row)
@@ -617,15 +628,22 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         }
     }
 
-    /// `PrimitiveValue → SQLite-bind-friendly Any`.
-    private func sqliteRepresentation(of value: PrimitiveValue) -> Any {
+    /// `PrimitiveValue` → the value a query row carries for that field.
+    ///
+    /// Matches what `BaoModelQueryEngine` emits, so a row built here (only
+    /// `findByUnique` does) decodes through the same accessors as one that
+    /// came out of a SQL query. In particular a stringset is `[String]`, the
+    /// shape the engine's junction-table population pass writes and the
+    /// generated row decoder casts to — a comma-joined `String` would fail
+    /// that cast and silently drop the field (#2485).
+    private func rowRepresentation(of value: PrimitiveValue) -> Any {
         switch value {
         case let .string(s):    return s
         case let .number(n):    return n
         case let .boolean(b):   return b
         case let .id(s):        return s
         case let .date(s):      return s
-        case let .stringset(s): return Array(s).joined(separator: ",")
+        case let .stringset(s): return Array(s)
         case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
         }
     }

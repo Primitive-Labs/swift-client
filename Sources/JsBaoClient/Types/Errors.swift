@@ -278,3 +278,126 @@ extension WebSocketError: LocalizedError {
         }
     }
 }
+
+// MARK: - JsBaoNetworkError
+
+/// A transport or token-refresh failure: the request could not be completed
+/// against the server. Parity with the JS client's `JsBaoNetworkError`
+/// (`src/client/errors.ts`).
+///
+/// **This does not mean the request never reached the server.** The client
+/// raises it whenever the HTTP layer could not produce a usable response —
+/// DNS/TLS/connection failures, timeouts, and (via `AuthController`) any
+/// refresh failure other than an HTTP 401/403, which includes 5xx responses
+/// and decode failures. Treat it as *retryable*, not as proof of no side
+/// effect.
+///
+/// Before #2367 these surfaced as the raw `URLError` `URLSession` produced, so
+/// apps had to catch a Foundation type to handle them. They are now normalized
+/// through one internal helper, so `URLError` no longer escapes the client's
+/// HTTP paths.
+///
+/// A cancelled request is **not** reported here: `URLError.cancelled` is
+/// normalized to `CancellationError`, matching how the client already reports
+/// cancellation elsewhere.
+public struct JsBaoNetworkError: Error, Sendable, Equatable {
+    /// The underlying failure's `localizedDescription`, verbatim — except on
+    /// the refresh path, where a non-`LocalizedError` `HttpError` is spelled
+    /// out as `"Token refresh failed: HTTP <status> …"` (see
+    /// ``init(refreshFailure:)``).
+    public let message: String
+    /// The `URLError.Code` raw value when the failure came from `URLSession`,
+    /// `nil` otherwise.
+    public let urlErrorCode: Int?
+
+    public init(message: String, urlErrorCode: Int? = nil) {
+        self.message = message
+        self.urlErrorCode = urlErrorCode
+    }
+
+    /// Whether the failure was a timeout. Computed from ``urlErrorCode``
+    /// rather than stored, so it cannot contradict it.
+    public var isTimeout: Bool {
+        urlErrorCode == URLError.Code.timedOut.rawValue
+    }
+}
+
+extension JsBaoNetworkError: LocalizedError {
+    /// The underlying message verbatim — the client does not prefix it.
+    public var errorDescription: String? { message }
+}
+
+extension JsBaoNetworkError {
+    /// The client's ONE mapping from a transport `Error` to the message/code
+    /// pair every network-failure surface reports. `WebSocketError
+    /// .transportFailure` is built from this too, so the WS and HTTP paths
+    /// cannot drift apart.
+    init(transport error: Error) {
+        self.init(
+            message: error.localizedDescription,
+            urlErrorCode: (error as? URLError)?.errorCode
+        )
+    }
+
+    /// A failed token refresh, described in the same vocabulary.
+    ///
+    /// `HttpError` does not conform to `LocalizedError`, so its
+    /// `localizedDescription` is Foundation's generic "operation couldn't be
+    /// completed" text — useless for a 5xx refresh. Spell the status out
+    /// instead; every other failure goes through ``init(transport:)``.
+    init(refreshFailure error: Error) {
+        if let already = error as? JsBaoNetworkError {
+            self = already
+        } else if let http = error as? HttpError {
+            self.init(
+                message: "Token refresh failed: HTTP \(http.status) "
+                    + (http.serverMessage ?? http.message)
+            )
+        } else {
+            self.init(transport: error)
+        }
+    }
+
+    /// Normalize an error raised by a `URLSession` call into the client's own
+    /// vocabulary. Errors the client already owns pass through untouched.
+    ///
+    /// - `URLError.cancelled` becomes `CancellationError`, so a cancelled task
+    ///   is reported the same way everywhere in the client.
+    /// - Any other `URLError` becomes a `JsBaoNetworkError`.
+    /// - Anything else is returned as-is.
+    static func normalizing(_ error: Error) -> Error {
+        guard let urlError = error as? URLError else { return error }
+        if urlError.code == .cancelled { return CancellationError() }
+        return JsBaoNetworkError(transport: urlError)
+    }
+}
+
+/// The one place the client calls `URLSession`'s async data methods.
+///
+/// Every HTTP path in the client goes through here so `URLError` is normalized
+/// in exactly one place (#2367). Calling `URLSession.data(...)` directly
+/// anywhere else re-introduces the raw-`URLError` leak this exists to close —
+/// `TransportSpineTests` asserts that it doesn't happen.
+enum NetworkSession {
+    static func data(
+        for request: URLRequest,
+        using session: URLSession = .shared
+    ) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(for: request)
+        } catch {
+            throw JsBaoNetworkError.normalizing(error)
+        }
+    }
+
+    static func data(
+        from url: URL,
+        using session: URLSession = .shared
+    ) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(from: url)
+        } catch {
+            throw JsBaoNetworkError.normalizing(error)
+        }
+    }
+}

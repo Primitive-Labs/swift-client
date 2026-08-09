@@ -50,10 +50,20 @@ public struct HttpClientConfig {
 
 // MARK: - Types
 
-public enum RefreshOutcome: String, Sendable {
+public enum RefreshOutcome: Sendable, Equatable {
     case success
     case invalid
-    case network
+    /// The refresh failed for reasons that are not a credential problem — a
+    /// transport failure, a 5xx, or a body that would not decode.
+    ///
+    /// The payload is the underlying failure, normalized. It is carried rather
+    /// than discarded so `fetchWithRefresh` can rethrow it as the
+    /// `JsBaoNetworkError` the public contract promises; reducing it to a bare
+    /// case here is what made a transient outage surface to callers as
+    /// `HttpError(status: 401)` — i.e. as invalid credentials. `nil` only
+    /// where no error was raised (a refresh that lost its `AuthController` to
+    /// teardown).
+    case network(JsBaoNetworkError?)
 }
 
 /// Response from raw HTTP request.
@@ -469,7 +479,7 @@ public final class HttpClient: @unchecked Sendable {
         var urlRequest = try buildURLRequest(method: method, path: path, body: body, options: options)
         logger.debug("Making \(method) request to \(urlRequest.url?.absoluteString ?? "unknown")")
 
-        var (responseData, response) = try await session.data(for: urlRequest)
+        var (responseData, response) = try await NetworkSession.data(for: urlRequest, using: session)
         guard let httpResponse = response as? HTTPURLResponse else {
             return (responseData, response)
         }
@@ -484,11 +494,21 @@ public final class HttpClient: @unchecked Sendable {
             case .success:
                 // Rebuild request with the refreshed token
                 urlRequest = try buildURLRequest(method: method, path: path, body: body, options: options)
-                (responseData, response) = try await session.data(for: urlRequest)
+                (responseData, response) = try await NetworkSession.data(for: urlRequest, using: session)
             case .invalid:
                 throw HttpError(status: 401, message: "Invalid credentials")
-            case .network:
-                throw HttpError(status: 401, message: "Refresh deferred due to network failure")
+            case .network(let underlying):
+                // A refresh that failed for transport reasons is NOT a
+                // credential problem: rethrow it as the retryable
+                // `JsBaoNetworkError` the type's contract documents, matching
+                // the JS client's `JsBaoNetworkError` on the same path. The
+                // previous `HttpError(status: 401, ...)` made a transient
+                // outage indistinguishable from a revoked session — and made
+                // `BlobManager` evict the upload's retained bytes with a
+                // terminal `willRetry: false`, losing the blob (#2366).
+                throw underlying ?? JsBaoNetworkError(
+                    message: "Token refresh failed due to a network error"
+                )
             }
         }
 

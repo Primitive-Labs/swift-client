@@ -9,8 +9,8 @@ public final class GeminiAPI: @unchecked Sendable {
     /// can fire `prompt_started` / `prompt_succeeded` / `prompt_failed`
     /// around each call without holding a reference to the client. Mirrors
     /// js-bao's `getGeminiAnalyticsContext().logEvent(...)`
-    /// (`src/client/api/geminiApi.ts`). Defaults to a no-op so existing
-    /// callers/tests that construct `GeminiAPI(makeRequest:)` keep working.
+    /// (`src/client/api/geminiApi.ts`). Defaults to a no-op so a caller that
+    /// constructs `GeminiAPI(transport:)` without the client keeps working.
     private let logAnalytics: (AnalyticsEventInput) -> Void
 
     /// Designated initializer — the typed transport spine.
@@ -20,20 +20,6 @@ public final class GeminiAPI: @unchecked Sendable {
     ) {
         self.transport = transport
         self.logAnalytics = logAnalytics
-    }
-
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        logAnalytics: @escaping (AnalyticsEventInput) -> Void = { _ in }
-    ) {
-        self.init(
-            transport: ClosureTransport(makeRequest: makeRequest),
-            logAnalytics: logAnalytics
-        )
     }
 
     /// Operation label stamped into the `context_json.operation` field,

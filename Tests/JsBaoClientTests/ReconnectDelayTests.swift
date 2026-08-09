@@ -73,4 +73,36 @@ final class ReconnectDelayTests: XCTestCase {
             capped
         )
     }
+
+    /// The default reconnect ceiling is 300 seconds, matching js-bao's
+    /// `maxReconnectDelay` default of `300_000` ms
+    /// (`src/client/JsBaoClient.ts`). It used to be 30 here, and because both
+    /// clients compute the same backoff, that made Swift retry roughly ten
+    /// times as often — forever — against a server that is down (#2364).
+    func testDefaultReconnectCeilingMatchesTheJsFiveMinuteDefault() {
+        let options = JsBaoClientOptions(
+            apiUrl: "http://localhost:8787",
+            wsUrl: "ws://localhost:8787",
+            appId: "app-1"
+        )
+        XCTAssertEqual(options.maxReconnectDelay, 300, "default ceiling is 5 minutes, as in JS")
+
+        // The option is seconds; the manager takes milliseconds.
+        let defaultCeilingMs = Int(options.maxReconnectDelay * 1000)
+        XCTAssertEqual(defaultCeilingMs, 300_000)
+        XCTAssertEqual(
+            WebSocketManager.reconnectDelayMs(attempts: 100, maxReconnectDelayMs: defaultCeilingMs),
+            baseDelayMs + 300 * 1000,
+            "a client that cannot reach the server settles at one retry every ~5 minutes"
+        )
+
+        // An app that wants a tighter ceiling can still ask for one.
+        let tighter = JsBaoClientOptions(
+            apiUrl: "http://localhost:8787",
+            wsUrl: "ws://localhost:8787",
+            appId: "app-1",
+            maxReconnectDelay: 30
+        )
+        XCTAssertEqual(tighter.maxReconnectDelay, 30)
+    }
 }

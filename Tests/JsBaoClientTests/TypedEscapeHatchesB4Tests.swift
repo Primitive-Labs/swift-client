@@ -3,10 +3,10 @@ import XCTest
 
 /// #1991 Phase B4 — the public escape hatches on `JsBaoClient` (behavior 7).
 ///
-/// `makeRequest` / `makeRawRequest` stay for one deprecation cycle but are now
-/// marked `@available(*, deprecated)`, and the supported replacements —
-/// `request` (typed), `requestJSON` (dynamic), `requestData` (bytes) — are
-/// thin forwards onto the same `Transport` spine every wrapped API uses.
+/// `makeRequest` / `makeRawRequest` were removed by #2367 at the end of their
+/// deprecation cycle. The supported replacements — `request` (typed),
+/// `requestJSON` (dynamic), `requestData` (bytes) — are thin forwards onto the
+/// same `Transport` spine every wrapped API uses.
 ///
 /// Every test here runs against the local dev server (`setUp` creates an
 /// app). The server-free source assertions live in `TransportSpineTests`.
@@ -105,27 +105,11 @@ final class TypedEscapeHatchesB4Tests: XCTestCase {
         XCTAssertFalse(data.isEmpty, "the error body should reach the caller as bytes")
     }
 
-    // MARK: - The deprecated surface still works
-
-    /// The deprecation window is real: `makeRequest` keeps its old `Any?`
-    /// shape and behavior while routed through the typed spine.
-    ///
-    /// Marked `@available(*, deprecated)` so the deliberate reference to a
-    /// deprecated method sits in a deprecated context and does not warn —
-    /// the same technique `DeprecationWindowInternalUseTests` uses (#1913).
-    @available(*, deprecated, message: "Deprecated context: exercises the deprecated makeRequest on purpose (#1991).")
-    func testDeprecatedMakeRequestStillReturnsTheAnyGraph() async throws {
-        let result = try await client.makeRequest("GET", "/me", nil)
-        let dict = try XCTUnwrap(result as? [String: Any])
-        XCTAssertNotNil(dict["userId"] as? String)
-    }
-
-    /// `makeRawRequest` keeps returning `(Data, Int)` without throwing on a
-    /// non-2xx, and the bytes are now the untouched response bytes rather
-    /// than a UTF-8 reconstruction of the decoded text.
-    @available(*, deprecated, message: "Deprecated context: exercises the deprecated makeRawRequest on purpose (#1991).")
-    func testDeprecatedMakeRawRequestStillReturnsBytesAndStatus() async throws {
-        let (data, status) = try await client.makeRawRequest("GET", "/me", nil, headers: nil)
+    /// On a 2xx the bytes are the response body verbatim — the contract the
+    /// removed `makeRawRequest` had, minus its UTF-8 reconstruction. Kept from
+    /// that method's test, retargeted at its replacement.
+    func testRequestDataReturnsTheResponseBytesVerbatimOnSuccess() async throws {
+        let (data, status) = try await client.requestData(method: .get, path: "/me")
         XCTAssertEqual(status, 200)
         let json = try XCTUnwrap(
             try? JSONSerialization.jsonObject(with: data) as? [String: Any],

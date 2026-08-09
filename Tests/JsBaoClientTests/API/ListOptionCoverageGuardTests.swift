@@ -18,9 +18,13 @@ import XCTest
 /// read `@available` at runtime, so the inventory is what makes the
 /// requirement mechanical.
 ///
-/// Deprecated fields are stored under a `…Storage` name (the deprecation lives
-/// on a computed property over that storage), which is why the expected
-/// `Mirror` labels differ from the public field names.
+/// **Both deprecated inventories are empty since #2367**, which removed the
+/// six dead fields #2360 deprecated (`ListDocumentsOptions.refreshFromServer`
+/// / `.localOnly` / `.serverTimeoutMs` / `.waitForLoad` / `.returnPage` and
+/// `MeOwnedDocumentsOptions.returnPage`) rather than leaving them inert. They
+/// stay in the structure because the classification requirement outlives this
+/// particular clearing: a field added tomorrow still has to land in one bucket
+/// or the other.
 final class ListOptionCoverageGuardTests: XCTestCase {
 
     // MARK: - Inventories
@@ -28,18 +32,16 @@ final class ListOptionCoverageGuardTests: XCTestCase {
     /// `ListDocumentsOptions`: `documents.list` is a blocking server fetch, so
     /// only the query-string fields are implemented.
     private static let listDocumentsImplemented = ["includeRoot", "limit", "cursor", "tag", "forward"]
-    private static let listDocumentsDeprecated = [
-        "refreshFromServerStorage", "localOnlyStorage", "serverTimeoutMsStorage",
-        "waitForLoadStorage", "returnPageStorage",
-    ]
+    private static let listDocumentsDeprecated: [String] = []
 
-    /// `MeOwnedDocumentsOptions`: everything except `returnPage` is
-    /// implemented (#2360).
+    /// `MeOwnedDocumentsOptions`: every field is implemented since #2367
+    /// removed `returnPage`. `serverTimeoutMs` is now `serverTimeout`, in
+    /// seconds.
     private static let ownedDocumentsImplemented = [
-        "includeRoot", "refreshFromServer", "localOnly", "serverTimeoutMs",
+        "includeRoot", "refreshFromServer", "localOnly", "serverTimeout",
         "waitForLoad", "forward",
     ]
-    private static let ownedDocumentsDeprecated = ["returnPageStorage"]
+    private static let ownedDocumentsDeprecated: [String] = []
 
     func testInventoriesCoverEveryField() {
         let listFields = Mirror(reflecting: ListDocumentsOptions()).children.compactMap { $0.label }
@@ -91,39 +93,12 @@ final class ListOptionCoverageGuardTests: XCTestCase {
         }
     }
 
-    /// The deprecated fields are inert: setting them changes nothing on the
-    /// wire. (Their contract is the compiler warning, not behavior.)
-    func testDeprecatedListDocumentsFieldsAreInert() async throws {
-        let transport = RecordingTransport(json: #"{"items":[]}"#)
-        let api = DocumentsAPI(
-            transport: transport,
-            blobManager: BlobManager(
-                logger: createLogger(level: .error, scope: "test"),
-                uploadConcurrency: 1
-            )
-        )
-
-        _ = try await api._listImpl(options: ListDocumentsOptions())
-        let baseline = transport.lastCall?.path
-
-        _ = try await api._listImpl(options: ListDocumentsOptions(
-            refreshFromServer: false,
-            localOnly: true,
-            serverTimeoutMs: 1,
-            waitForLoad: "local",
-            returnPage: true
-        ))
-
-        XCTAssertEqual(transport.lastCall?.path, baseline)
-        XCTAssertEqual(transport.calls.count, 2, "the dead fields do not suppress the fetch either")
-    }
-
     // MARK: - Observable effects: MeOwnedDocumentsOptions
 
     /// `includeRoot` / `forward` reach the query string; the local-first
     /// fields' effects are asserted in `MeOwnedDocumentsLocalFirstTests`
     /// (suppressed request for `localOnly` / `refreshFromServer`, typed throws
-    /// for `waitForLoad` / `serverTimeoutMs`). This test pins the query half
+    /// for `waitForLoad` / `serverTimeout`). This test pins the query half
     /// and re-checks the suppression half so the guard stands alone.
     func testImplementedOwnedDocumentsFieldsHaveObservableEffects() async throws {
         let transport = RecordingTransport(json: #"{"items":[]}"#)
@@ -146,7 +121,7 @@ final class ListOptionCoverageGuardTests: XCTestCase {
             XCTAssertEqual(transport.calls.count, before, "\(options) must suppress the request")
         }
 
-        // serverTimeoutMs: bounded fetch that throws on expiry.
+        // serverTimeout: bounded fetch that throws on expiry.
         let stalled = RecordingTransport(responder: { _ in
             try await Task.sleep(nanoseconds: 5_000_000_000)
             return TransportResponse(status: 200, headers: [:], body: Data())
@@ -154,9 +129,9 @@ final class ListOptionCoverageGuardTests: XCTestCase {
         let stalledAPI = MeAPI(transport: stalled)
         do {
             _ = try await stalledAPI.ownedDocuments(
-                options: MeOwnedDocumentsOptions(serverTimeoutMs: 50, waitForLoad: .network)
+                options: MeOwnedDocumentsOptions(serverTimeout: 0.05, waitForLoad: .network)
             )
-            XCTFail("serverTimeoutMs must bound the fetch")
+            XCTFail("serverTimeout must bound the fetch")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .listTimeout)
         }

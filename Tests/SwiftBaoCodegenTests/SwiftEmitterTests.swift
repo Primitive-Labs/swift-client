@@ -65,7 +65,7 @@ final class SwiftEmitterTests: XCTestCase {
                       "query facade must throw (substring-op input errors surface, #1119)")
         XCTAssertTrue(body.contains("static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [NoteRecord]"),
                       "query-time include facade must be emitted")
-        XCTAssertTrue(body.contains(".queryShared(primitiveSchema, filter: filter, options: options, include: include)"),
+        XCTAssertTrue(body.contains(".codegen.query(primitiveSchema, filter: filter, options: options, include: include)"),
                       "include query should delegate to the shared include engine")
         // Paginated read — exposes nextCursor/hasMore so callers can page (#946).
         XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<NoteRecord>"))
@@ -91,18 +91,18 @@ final class SwiftEmitterTests: XCTestCase {
         // findByUnique / queryOne).
         XCTAssertTrue(body.contains("static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> NoteRecord?"),
                       "findByUnique facade must be emitted")
-        XCTAssertTrue(body.contains("findByUniqueShared(primitiveSchema, constraint: constraint, value: value)"),
-                      "findByUnique should delegate to findByUniqueShared")
+        XCTAssertTrue(body.contains("codegen.findByUnique(primitiveSchema, constraint: constraint, value: value)"),
+                      "findByUnique should delegate to codegen.findByUnique")
         XCTAssertTrue(body.contains("static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> NoteRecord?"),
                       "queryOne facade must be emitted")
-        XCTAssertTrue(body.contains("queryOneShared(primitiveSchema, filter: filter, options: options)"),
-                      "queryOne should delegate to queryOneShared")
+        XCTAssertTrue(body.contains("codegen.queryOne(primitiveSchema, filter: filter, options: options)"),
+                      "queryOne should delegate to codegen.queryOne")
         // queryOne with query-time relationship includes (#1216) — the typed
         // parity hole left after #1194 added include only to query/queryPaged.
         XCTAssertTrue(body.contains("static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> NoteRecord?"),
                       "queryOne include overload must be emitted")
-        XCTAssertTrue(body.contains("queryOneShared(primitiveSchema, filter: filter, options: options, include: include)"),
-                      "queryOne include overload should delegate to queryOneShared(...,include:)")
+        XCTAssertTrue(body.contains("codegen.queryOne(primitiveSchema, filter: filter, options: options, include: include)"),
+                      "queryOne include overload should delegate to codegen.queryOne(...,include:)")
         // Writes (per-document instance methods — the save() API from #923)
         XCTAssertTrue(body.contains("func save(in documentId: String) throws -> NoteRecord"),
                       "instance save(in:) (create-or-update) must be emitted")
@@ -111,8 +111,8 @@ final class SwiftEmitterTests: XCTestCase {
         // under CodegenAcceptance/ are hand-rolled and only compiled, never
         // re-emitted and diffed, so without this assertion an emitter change
         // that drops `changedFields:` here would ship green.
-        XCTAssertTrue(body.contains("let record = try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)"),
-                      "save(in:) must pass the tracked change set to saveShared (#2459)")
+        XCTAssertTrue(body.contains("let record = try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)"),
+                      "save(in:) must pass the tracked change set to codegen.save (#2459)")
         // save(in:) must hand back the record AS SAVED — rebuilt from the
         // returned PrimitiveRecord the way the upsert paths already do, not a
         // copy of `self`. A copy of `self` is stale for exactly the fields the
@@ -129,8 +129,8 @@ final class SwiftEmitterTests: XCTestCase {
         // Upsert-by-unique-field write (JS parity: save({ upsertOn })).
         XCTAssertTrue(body.contains("func save(in documentId: String, upsertOn: String) throws -> NoteRecord"),
                       "instance save(in:upsertOn:) must be emitted")
-        XCTAssertTrue(body.contains("upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)"),
-                      "save(in:upsertOn:) should delegate to upsertShared, passing the record id + explicit-id provenance (#1122)")
+        XCTAssertTrue(body.contains("codegen.upsert(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)"),
+                      "save(in:upsertOn:) should delegate to codegen.upsert, passing the record id + explicit-id provenance (#1122)")
         // The upsert paths must return the RESOLVED record, not `self` —
         // on the merge path the existing record's id wins (JS reassigns
         // `this.id = existingId`), so the facade re-decodes the result.
@@ -142,8 +142,8 @@ final class SwiftEmitterTests: XCTestCase {
         // covers compound constraints — #1053).
         XCTAssertTrue(body.contains("func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> NoteRecord"),
                       "instance upsertByUnique(_:mode:in:) must be emitted")
-        XCTAssertTrue(body.contains("upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)"),
-                      "upsertByUnique should delegate to upsertByUniqueShared, passing the record id + explicit-id provenance (#1122)")
+        XCTAssertTrue(body.contains("codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)"),
+                      "upsertByUnique should delegate to codegen.upsertByUnique, passing the record id + explicit-id provenance (#1122)")
         // Explicit lookup-value overload (#1122 — js-bao's separate
         // `uniqueLookupValue` argument).
         XCTAssertTrue(body.contains("func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> NoteRecord"),
@@ -757,7 +757,7 @@ final class SwiftEmitterTests: XCTestCase {
             "expected an instance accessor returning the target's optional typed record"
         )
         XCTAssertTrue(
-            posts.contains(#".refersToShared(target: UsersRecord.primitiveSchema, foreignKey: userId)"#),
+            posts.contains(#".codegen.refersTo(target: UsersRecord.primitiveSchema, foreignKey: userId)"#),
             "refersTo accessor should resolve via the default client, reading its own FK field"
         )
         XCTAssertTrue(
@@ -786,7 +786,7 @@ final class SwiftEmitterTests: XCTestCase {
             "hasMany accessor should be an instance method returning an array of the target's typed record"
         )
         XCTAssertTrue(
-            users.contains(#".hasManyShared("#)
+            users.contains(#".codegen.hasMany("#)
             && users.contains(#"target: PostsRecord.primitiveSchema"#)
             && users.contains(#"relatedIdField: "userId""#)
             && users.contains("sourceId: id"),
@@ -819,7 +819,7 @@ final class SwiftEmitterTests: XCTestCase {
             "hasManyThrough accessor should be an instance method returning the target array"
         )
         XCTAssertTrue(
-            posts.contains(#".hasManyThroughShared("#)
+            posts.contains(#".codegen.hasManyThrough("#)
             && posts.contains(#"target: TagsRecord.primitiveSchema"#)
             && posts.contains(#"joinModel: PostTagLinksRecord.primitiveSchema"#)
             && posts.contains(#"joinModelLocalField: "postId""#)
@@ -866,7 +866,7 @@ final class SwiftEmitterTests: XCTestCase {
             && posts.contains("afterCursor: afterCursor,")
             && posts.contains("beforeCursor: beforeCursor,")
             && posts.contains("direction: direction"),
-            "paginated accessor should forward its pagination args into hasManyThroughShared"
+            "paginated accessor should forward its pagination args into codegen.hasManyThrough"
         )
         XCTAssertTrue(
             posts.contains("nextCursor: page.nextCursor,")
@@ -893,7 +893,7 @@ final class SwiftEmitterTests: XCTestCase {
 
     /// A `hasManyThrough` with a declared `join_model_order_by_field` /
     /// `join_model_order_direction` must forward those into the generated
-    /// accessor's `hasManyThroughShared` call (mirrors how `hasMany`
+    /// accessor's `codegen.hasManyThrough` call (mirrors how `hasMany`
     /// forwards `order_by_field`). Previously these props were parsed but
     /// dropped (#1201).
     func testHasManyThroughAccessorForwardsDeclaredJoinOrder() throws {

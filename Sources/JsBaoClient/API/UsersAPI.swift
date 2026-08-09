@@ -6,7 +6,7 @@ public final class UsersAPI: @unchecked Sendable {
     private let transport: any Transport
     private let cache: CacheFacade?
 
-    private static let defaultRefreshIfOlderThanMs = 5 * 60 * 1000 // 5 minutes
+    private static let defaultRefreshIfOlderThan: TimeInterval = 5 * 60 // 5 minutes
 
     /// Designated initializer — the typed transport spine.
     public init(
@@ -15,17 +15,6 @@ public final class UsersAPI: @unchecked Sendable {
     ) {
         self.transport = transport
         self.cache = cache
-    }
-
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        cache: CacheFacade? = nil
-    ) {
-        self.init(transport: ClosureTransport(makeRequest: makeRequest), cache: cache)
     }
 
     /// Retrieves basic profile information for a user by their ID.
@@ -65,8 +54,8 @@ public final class UsersAPI: @unchecked Sendable {
         let mergedOptions = FetchCachedOptions(
             waitForLoad: options?.waitForLoad,
             refreshNetwork: options?.refreshNetwork,
-            refreshIfOlderThanMs: options?.refreshIfOlderThanMs ?? Self.defaultRefreshIfOlderThanMs,
-            serverTimeoutMs: options?.serverTimeoutMs
+            refreshIfOlderThan: options?.refreshIfOlderThan ?? Self.defaultRefreshIfOlderThan,
+            serverTimeout: options?.serverTimeout
         )
 
         let cacheKey = "user:\(userId)"

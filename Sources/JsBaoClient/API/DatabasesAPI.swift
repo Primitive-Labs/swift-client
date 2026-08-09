@@ -60,41 +60,6 @@ public final class DatabasesAPI: @unchecked Sendable {
         self.logger = logger
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    ///
-    /// One call is conditional on this init: `executeOperation` with
-    /// `options.timing == true` sends the `X-Timing` request header (#2359),
-    /// and the legacy JSON closure cannot carry headers — so it surfaces
-    /// `CLIENT_LEGACY_TRANSPORT_UNSUPPORTED_OPTIONS` from the adapter instead
-    /// of returning an untimed result. Use `init(transport:)` if you need
-    /// timings, or leave the flag off.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.init(transport: ClosureTransport(makeRequest: makeRequest))
-    }
-
-    /// Deprecated closure form of the full init used by `JsBaoClient`.
-    @available(*, deprecated, message: "Use init(transport:subscriptionRegistry:…) — the untyped makeRequest closure is removed in the next major release.")
-    convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        subscriptionRegistry: DatabaseSubscriptionRegistry,
-        sendWSMessage: @escaping (String) -> Void,
-        isWebSocketOpen: @escaping () -> Bool,
-        connectWebSocket: @escaping () -> Void,
-        logger: Logger? = nil
-    ) {
-        self.init(
-            transport: ClosureTransport(makeRequest: makeRequest),
-            subscriptionRegistry: subscriptionRegistry,
-            sendWSMessage: sendWSMessage,
-            isWebSocketOpen: isWebSocketOpen,
-            connectWebSocket: connectWebSocket,
-            logger: logger
-        )
-    }
-
     // MARK: - Realtime subscriptions
 
     /// Subscribe to real-time database changes for a server-registered
@@ -105,21 +70,26 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// `client.databases.subscribe(databaseId, subscriptionKey, { params, onChange })`.
     ///
     /// Sends `db.subscribe` over the active WebSocket; inbound `db.change`
-    /// frames are routed back to `options.onChange`. If the socket isn't
-    /// open yet, the registration is held and the reconnect pass re-issues
-    /// `db.subscribe` once it opens (matches the JS reconnect behavior).
+    /// frames are routed back to `onChange`. If the socket isn't open yet, the
+    /// registration is held and the reconnect pass re-issues `db.subscribe`
+    /// once it opens (matches the JS reconnect behavior).
     ///
-    /// - Returns: an unsubscribe handle — calling it removes the callback
-    ///   and sends `db.unsubscribe`. Safe to call multiple times.
+    /// `onChange` is `@Sendable` because it runs on whichever thread delivered
+    /// the frame — the WebSocket delivery thread, not the caller's.
+    ///
+    /// - Returns: the subscription handle. **Hold it for as long as you want
+    ///   changes**: the handle cancels itself when it is released, so dropping
+    ///   it unsubscribes rather than leaking a server-side subscription.
+    ///   `cancel()` is idempotent.
     /// - Throws: `JsBaoError(.invalidArgument, …)` if `databaseId` or
     ///   `subscriptionKey` is empty, matching the JS client's
     ///   `_subscribeDatabase` guards.
-    @discardableResult
     public func subscribe(
         databaseId: String,
         subscriptionKey: String,
-        options: DatabaseSubscribeOptions
-    ) throws -> () -> Void {
+        options: DatabaseSubscribeOptions = DatabaseSubscribeOptions(),
+        onChange: @escaping @Sendable (DatabaseChangePayload) -> Void
+    ) throws -> EventSubscription {
         guard !databaseId.isEmpty else {
             throw JsBaoError(
                 code: .invalidArgument,
@@ -134,15 +104,15 @@ public final class DatabasesAPI: @unchecked Sendable {
         }
         guard let registry = subscriptionRegistry else {
             logger?.warn("[db-sub] subscribe: realtime subscriptions are not wired (constructed without a WebSocket)")
-            return {}
+            return EventSubscription(cancel: {})
         }
 
         let params = options.params ?? [:]
-        registry.register(
+        let registrationID = registry.register(
             databaseId: databaseId,
             subscriptionKey: subscriptionKey,
             params: params,
-            onChange: options.onChange
+            onChange: onChange
         )
 
         // Send immediately if open; otherwise nudge a connect — the
@@ -153,8 +123,14 @@ public final class DatabasesAPI: @unchecked Sendable {
             connectWebSocket()
         }
 
-        return { [weak registry, weak self] in
-            registry?.unregister(databaseId: databaseId, subscriptionKey: subscriptionKey)
+        return EventSubscription { [weak registry, weak self] in
+            // Only the handle that owns the live registration may tear it
+            // down. A superseded handle removes nothing and sends nothing.
+            guard registry?.unregister(
+                databaseId: databaseId,
+                subscriptionKey: subscriptionKey,
+                id: registrationID
+            ) == true else { return }
             guard let self = self, self.isWebSocketOpen() else { return }
             self.encodeAndSend([
                 "type": "db.unsubscribe",
@@ -166,12 +142,31 @@ public final class DatabasesAPI: @unchecked Sendable {
 
     /// Send a single `db.subscribe` control frame. Shared by `subscribe`
     /// and the reconnect re-subscribe pass (`resubscribeAll`).
-    func sendSubscribeFrame(databaseId: String, subscriptionKey: String, params: [String: Any]) {
+    ///
+    /// Lowers the typed `params` to the `Any` graph `JSONSerialization` needs
+    /// at the wire boundary — the same boundary pattern as
+    /// `AnalyticsQueue.prepared(_:)`.
+    ///
+    /// Encoding can only fail on a value `JSONEncoder` rejects (a non-finite
+    /// `.number`). This frame is fire-and-forget, so it cannot throw — but an
+    /// empty `params` binds nothing in the server-side filter, which is a
+    /// silent behavior change rather than a no-op, so it is logged.
+    func sendSubscribeFrame(databaseId: String, subscriptionKey: String, params: [String: JSONValue]) {
+        var paramsAny: [String: Any] = [:]
+        do {
+            paramsAny = try JSONCoding.jsonObject(from: params) as? [String: Any] ?? [:]
+        } catch {
+            logger?.warn(
+                "[db-sub] subscribe: params for \(subscriptionKey) could not be encoded "
+                    + "(\(error)); sending an empty params bag, so the subscription filter "
+                    + "will bind nothing"
+            )
+        }
         encodeAndSend([
             "type": "db.subscribe",
             "databaseId": databaseId,
             "subscriptionKey": subscriptionKey,
-            "params": params,
+            "params": paramsAny,
         ])
     }
 
@@ -248,7 +243,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// lists every database in the app, and each row comes back with
     /// `permission == "owner"` — the field reports capability, not ownership.
     /// To pick out the databases the caller created, compare `createdBy`
-    /// against `client.getUserId()`.
+    /// against `client.userId`.
     public func list(
         databaseType: String? = nil,
         owner: String? = nil
@@ -357,31 +352,6 @@ public final class DatabasesAPI: @unchecked Sendable {
         try await transport.request(method: .get, path: "/databases/\(databaseId)/permissions")
     }
 
-    /// Grant a user permission to access a database.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.grantPermission`.
-    @available(*, deprecated, message: "Use databases.addManager(databaseId:params:) instead.")
-    public func grantPermission(databaseId: String, params: GrantPermissionParams) async throws -> DatabasePermissionEntry {
-        try await transport.request(
-            method: .put,
-            path: "/databases/\(databaseId)/permissions",
-            body: params
-        )
-    }
-
-    /// Revoke a user's permission to a database.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.revokePermission`.
-    @available(*, deprecated, message: "Use databases.removeManager(databaseId:userId:) instead.")
-    @discardableResult
-    public func revokePermission(databaseId: String, userId: String) async throws -> DatabaseSuccessResult {
-        let escapedId = URLEncoding.encodeComponent(userId)
-        return try await transport.request(
-            method: .delete,
-            path: "/databases/\(databaseId)/permissions/\(escapedId)"
-        )
-    }
-
     /// Transfer database ownership to another user.
     public func transferOwnership(databaseId: String, newOwnerId: String) async throws -> DatabaseOwnershipTransferResult {
         try await transport.request(
@@ -444,11 +414,6 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// `options.timing` does not travel in the body: the server reads it from
     /// the `X-Timing` request header, so it is sent as a header here and left
     /// out of the encoded options (#2359). Same split the JS client makes.
-    ///
-    /// On an instance built with the deprecated `init(makeRequest:)`, a
-    /// `timing: true` throws `CLIENT_LEGACY_TRANSPORT_UNSUPPORTED_OPTIONS` —
-    /// the legacy JSON closure carries no request headers. Every other call
-    /// shape is unaffected; use `init(transport:)` to request timings.
     public func executeOperation(databaseId: String, name: String, options: ExecuteOperationOptions? = nil) async throws -> JSONValue {
         let encodedName = URLEncoding.encodeComponent(name)
         // Only a `true` sends the header at all — a `false`/omitted flag sends
@@ -507,21 +472,6 @@ public final class DatabasesAPI: @unchecked Sendable {
         let raw = try await executeOperation(databaseId: databaseId, name: name, options: options)
         // Decode the opaque result blob into the typed `Output`.
         return try JSONCoding.decode(Output.self, from: JSONCoding.jsonObject(from: raw))
-    }
-
-    // MARK: - Bulk Import
-
-    /// Import a batch of records using a named mutation operation.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `databases.importBulk`.
-    @available(*, deprecated, message: "Use databases.executeBatch(databaseId:operationName:batch:) instead.")
-    public func importBulk(databaseId: String, operationName: String, batch: [DatabaseBatchOperation]) async throws -> DatabaseBatchResult {
-        let encodedName = URLEncoding.encodeComponent(operationName)
-        return try await transport.request(
-            method: .post,
-            path: "/databases/\(databaseId)/operations/\(encodedName)/import-bulk",
-            body: DatabaseBatchBody(batch: batch)
-        )
     }
 
     // MARK: - Schema

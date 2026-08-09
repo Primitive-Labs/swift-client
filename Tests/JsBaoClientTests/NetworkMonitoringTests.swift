@@ -85,9 +85,9 @@ final class NetworkMonitoringTests: XCTestCase {
             client.networkingAllowed() == false
         }
         // mode stays .auto; reconnect suppressed; reason recorded.
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
         XCTAssertFalse(client.webSocketManagerShouldReconnect(code: 1006, reason: "abnormal"))
-        XCTAssertEqual(client.getNetworkStatus().reason, "connectivityLost")
+        XCTAssertEqual(client.networkStatus.reason, "connectivityLost")
     }
 
     // MARK: - Behavior 8 — restore runs the handoff and connects (with token)
@@ -113,8 +113,8 @@ final class NetworkMonitoringTests: XCTestCase {
         try await eventually(timeout: 5, description: "restore reconnects") {
             client.isConnected
         }
-        XCTAssertEqual(client.getNetworkMode(), .auto)
-        XCTAssertEqual(client.getNetworkStatus().reason, "connectivityRestored")
+        XCTAssertEqual(client.networkMode, .auto)
+        XCTAssertEqual(client.networkStatus.reason, "connectivityRestored")
     }
 
     // MARK: - Behavior 9 — restore without a token: authOnlineRequired, no revert
@@ -140,7 +140,7 @@ final class NetworkMonitoringTests: XCTestCase {
             authRequired.value >= 1
         }
         // Mode stays .auto (NOT reverted to .offline); socket not connected.
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
         XCTAssertFalse(client.isConnected)
     }
 
@@ -173,7 +173,7 @@ final class NetworkMonitoringTests: XCTestCase {
         // Let any stray debounced work settle, then assert exactly one reaction.
         try await delay(0.5)
         XCTAssertEqual(connectivityEvents.value, 1)
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
     }
 
     // MARK: - Behavior 11 — explicit modes are user-pinned
@@ -187,17 +187,17 @@ final class NetworkMonitoringTests: XCTestCase {
 
         // Pin the mode explicitly.
         await client.goOffline()
-        XCTAssertEqual(client.getNetworkMode(), .offline)
+        XCTAssertEqual(client.networkMode, .offline)
 
         // A path loss records the reachability bit but must not drive the
         // socket or change the pinned mode.
         monitor.push(false)
         try await delay(0.4)
-        XCTAssertEqual(client.getNetworkMode(), .offline)
+        XCTAssertEqual(client.networkMode, .offline)
 
         // Returning to .auto then honors the current (lost) reachability.
         client.setNetworkMode(.auto)
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
         XCTAssertFalse(client.networkingAllowed())
     }
 
@@ -252,7 +252,7 @@ final class NetworkMonitoringTests: XCTestCase {
         try await eventually(timeout: 3, description: "offline disconnects") {
             client.isConnected == false
         }
-        XCTAssertEqual(client.getNetworkMode(), .offline)
+        XCTAssertEqual(client.networkMode, .offline)
 
         // A restore is recorded while pinned but drives no socket action.
         monitor.push(true)
@@ -265,7 +265,7 @@ final class NetworkMonitoringTests: XCTestCase {
         try await eventually(timeout: 5, description: "enter .auto reconnects") {
             client.isConnected
         }
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
     }
 
     /// The mirror case: a client connected while pinned `.online` that became
@@ -300,7 +300,7 @@ final class NetworkMonitoringTests: XCTestCase {
         try await eventually(timeout: 5, description: "enter .auto disconnects") {
             client.isConnected == false
         }
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
         XCTAssertFalse(client.networkingAllowed())
     }
 
@@ -342,7 +342,7 @@ final class NetworkMonitoringTests: XCTestCase {
         try await eventually(timeout: 5, description: "initially connected") {
             client.isConnected
         }
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
 
         for trial in 0..<40 {
             // Reset to a known connected baseline (bypasses the reachability
@@ -364,7 +364,7 @@ final class NetworkMonitoringTests: XCTestCase {
                 client.isConnected && client.networkingAllowed()
             }
         }
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
     }
 
     // MARK: - Behavior 15 — the first snapshot is not debounced (PR #2069 review)
@@ -411,7 +411,7 @@ final class NetworkMonitoringTests: XCTestCase {
         try await eventually(timeout: 5, description: "startup connects") {
             client.isConnected
         }
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
     }
 
     /// The correctness property the immediate-apply half protects: the first
@@ -454,8 +454,8 @@ final class NetworkMonitoringTests: XCTestCase {
         // No auto-connect happened, and the mode was not touched by the monitor.
         try await delay(0.5)
         XCTAssertFalse(client.isConnected)
-        XCTAssertEqual(client.getNetworkMode(), .auto)
-        XCTAssertEqual(client.getNetworkStatus().reason, "connectivityLost")
+        XCTAssertEqual(client.networkMode, .auto)
+        XCTAssertEqual(client.networkStatus.reason, "connectivityLost")
     }
 
     // MARK: - Behavior 16 — a stale deferred pause revalidates (#2078)
@@ -506,7 +506,7 @@ final class NetworkMonitoringTests: XCTestCase {
         )
         XCTAssertTrue(client.networkingAllowed())
         XCTAssertTrue(client.webSocketManagerShouldReconnect(code: 1006, reason: "abnormal"))
-        XCTAssertEqual(client.getNetworkMode(), .online)
+        XCTAssertEqual(client.networkMode, .online)
     }
 
     /// Same race, `.auto` variant: reachability is restored (and the restore
@@ -541,7 +541,7 @@ final class NetworkMonitoringTests: XCTestCase {
         )
         XCTAssertTrue(client.networkingAllowed())
         XCTAssertTrue(client.webSocketManagerShouldReconnect(code: 1006, reason: "abnormal"))
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
     }
 
     /// The guard must not defang the real pause: when the state the pause was
@@ -569,6 +569,6 @@ final class NetworkMonitoringTests: XCTestCase {
         }
         XCTAssertFalse(client.networkingAllowed())
         XCTAssertFalse(client.webSocketManagerShouldReconnect(code: 1006, reason: "abnormal"))
-        XCTAssertEqual(client.getNetworkMode(), .auto)
+        XCTAssertEqual(client.networkMode, .auto)
     }
 }

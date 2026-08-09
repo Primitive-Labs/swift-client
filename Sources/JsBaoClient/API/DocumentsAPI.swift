@@ -36,24 +36,6 @@ public final class DocumentsAPI: @unchecked Sendable {
         self.aliases = DocumentAliasesAPI(transport: transport)
     }
 
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        blobManager: BlobManager,
-        documentManager: DocumentManager? = nil,
-        client: JsBaoClient? = nil
-    ) {
-        self.init(
-            transport: ClosureTransport(makeRequest: makeRequest),
-            blobManager: blobManager,
-            documentManager: documentManager,
-            client: client
-        )
-    }
-
     // MARK: - CRUD
 
     /// Create a new document. **Local-first**, mirroring js-bao's
@@ -158,7 +140,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         // the requested tag should be returned (mirrors js-bao's `filterRoot`).
         if !includeRoot, options?.tag == nil {
             var rootDocId: String? = nil
-            if let client { rootDocId = client.getRootDocId() }
+            if let client { rootDocId = client.rootDocId }
             items = Self.filterOutRoot(items, rootDocId: rootDocId)
         }
         return DocumentListPage(items: items, cursor: cursor)
@@ -296,7 +278,7 @@ public final class DocumentsAPI: @unchecked Sendable {
             )
             // Self-removal: revoking your own access drops local sync — notify
             // and evict, matching js-bao (documentsApi.ts:1837-1862) (#961).
-            if userId == client?.getUserId() {
+            if userId == client?.userId {
                 client?.eventEmitter.emit(
                     DocumentMetadataChangedEvent(documentId: documentId, action: "deleted", source: "local")
                 )
@@ -360,17 +342,6 @@ public final class DocumentsAPI: @unchecked Sendable {
         try await transport.request(method: .post, path: "/documents/\(documentId)/validate-access")
     }
 
-    /// Accept a pending invitation to a document.
-    ///
-    /// Deprecated: the per-document accept concept has been removed.
-    /// Shares to existing app users auto-resolve at signup or write
-    /// time. Cross-identity shares use `client.invitations.accept(inviteToken:)`
-    /// with the token from the invitation email (issue #619).
-    @available(*, deprecated, message: "Per-doc accept removed. Email-matched shares auto-resolve; cross-identity uses client.invitations.accept(inviteToken:) (issue #619).")
-    public func acceptInvitation(documentId: String) async throws -> DocumentAccessResult {
-        try await transport.request(method: .post, path: "/documents/\(documentId)/validate-access")
-    }
-
     // MARK: - Invitations
 
     /// List pending deferred-grant invitations for a document. Returns
@@ -384,86 +355,6 @@ public final class DocumentsAPI: @unchecked Sendable {
             path: "/documents/\(documentId)/pending-invitations"
         )
         return response.items
-    }
-
-    /// List invitations for a document.
-    ///
-    /// Deprecated: reads the legacy `DocumentInvitation` model. New
-    /// shares go through `DeferredDocumentPermission` and are surfaced
-    /// by `listPendingInvitations`. Existing `DocumentInvitation` rows
-    /// remain visible here until they drain.
-    @available(*, deprecated, message: "Use documents.listPendingInvitations(documentId:) — reads new DeferredDocumentPermission rows (issue #619).")
-    public func listInvitations(documentId: String) async throws -> [DocumentInvitation] {
-        try await transport.request(method: .get, path: "/documents/\(documentId)/invitations")
-    }
-
-    /// Send an invitation to a document.
-    ///
-    /// Deprecated: use `updatePermissions(documentId:, params:)` with
-    /// `.email(...)`. The new API is idempotent and routes through the
-    /// unified deferred-grant flow.
-    @available(*, deprecated, message: "Use documents.updatePermissions(documentId:, params:) with .email(...) (issue #619).")
-    public func sendInvitation(documentId: String, email: String, permission: String, options: InvitationEmailOptions? = nil) async throws -> DocumentInvitationResponse {
-        try await transport.request(
-            method: .post,
-            path: "/documents/\(documentId)/invitations",
-            body: InvitationBody(email: email, permission: permission, options: options)
-        )
-    }
-
-    /// Get a specific invitation by email (client-side filter from list).
-    ///
-    /// Deprecated: use `client.invitations.get(invitationId:)` for the
-    /// app-level invitation, or `listPendingInvitations(documentId:)`
-    /// filtered by email for the doc-scoped deferred grant.
-    @available(*, deprecated, message: "Use client.invitations.get(invitationId:) or documents.listPendingInvitations(documentId:) filtered by email (issue #619).")
-    public func getInvitation(documentId: String, email: String) async throws -> DocumentInvitation? {
-        let list: [DocumentInvitation] = try await transport.request(
-            method: .get,
-            path: "/documents/\(documentId)/invitations"
-        )
-        return list.first { $0.email == email }
-    }
-
-    /// Update an invitation's permission (re-creates with same email).
-    ///
-    /// Deprecated: `updatePermissions(documentId:, params:)` is
-    /// idempotent — re-call it with the new permission to upsert.
-    @available(*, deprecated, message: "Use documents.updatePermissions(documentId:, params:) — it's idempotent (issue #619).")
-    public func updateInvitation(documentId: String, email: String, permission: String, options: InvitationEmailOptions? = nil) async throws -> DocumentInvitationResponse {
-        try await transport.request(
-            method: .post,
-            path: "/documents/\(documentId)/invitations",
-            body: InvitationBody(email: email, permission: permission, options: options)
-        )
-    }
-
-    /// Delete an invitation.
-    ///
-    /// Deprecated: use `removePermission(documentId:, email:)` (drops
-    /// both live and deferred rows for the email) or
-    /// `client.invitations.delete(invitationId:)` for app-level
-    /// invitations.
-    @available(*, deprecated, message: "Use documents.removePermission(documentId:, email:) or client.invitations.delete(invitationId:) (issue #619).")
-    public func deleteInvitation(documentId: String, invitationId: String) async throws -> MessageResult {
-        try await transport.request(
-            method: .delete,
-            path: "/documents/\(documentId)/invitations/\(invitationId)"
-        )
-    }
-
-    /// Decline an invitation (as the invitee).
-    ///
-    /// Deprecated: no invitee-side decline verb. Pending invitations
-    /// expire automatically. To remove yourself from an already-
-    /// accepted share, call `removePermission(documentId:, userId:)`
-    /// with your own user ID (issue #630, won't-fix).
-    @available(*, deprecated, message: "No invitee-side decline verb. Pending invitations expire automatically; self-remove via removePermission(documentId:, userId:) after acceptance (issue #619).")
-    public func declineInvitation(documentId: String, invitationId: String) async throws -> MessageResult {
-        try await transport.request(
-            method: .post,
-            path: "/documents/\(documentId)/invitations/\(invitationId)/decline"
-        )
     }
 
     /// Update document permissions for a user.
@@ -546,7 +437,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Get metadata for the app's root document.
     ///
     /// Resolves the root document id locally from the JWT
-    /// (`client.getRootDocId()`) and fetches that document, matching js-bao
+    /// (`client.rootDocId`) and fetches that document, matching js-bao
     /// (`documentsApi.ts` `getRoot`). The server has no `/documents/root`
     /// alias — that path resolves as `GET /documents/:documentId` with the
     /// literal id `"root"` and fails (#2358).
@@ -557,7 +448,7 @@ public final class DocumentsAPI: @unchecked Sendable {
                 message: "DocumentsAPI.getRoot requires a wired JsBaoClient"
             )
         }
-        guard let docId = client.getRootDocId() else {
+        guard let docId = client.rootDocId else {
             throw JsBaoError(
                 code: .notFound,
                 message: "Root document not available (no rootDocId in token)"
@@ -826,25 +717,23 @@ public final class DocumentsAPI: @unchecked Sendable {
     // already cross-document-capable `BlobManager` (`documentId: nil`).
 
     // `BlobManager` became an `actor` in #2172, so none of these can read or
-    // mutate the queue synchronously any more. Two shapes, per the sponsor's
-    // 2026-08-02 decisions:
+    // mutate the queue synchronously any more. Every one of them is an
+    // `…Async` form now: the deprecated fire-and-forget void twins
+    // (`pauseAllUploads`, `resumeAllUploads`, `setUploadConcurrency`) were
+    // removed in #2367 along with the rest of the deprecation window.
     //
-    //  * **Reads and result-returning mutators** (`uploads`, `pauseUpload`,
-    //    `resumeUpload`, `getUploadConcurrency`) have no honest synchronous
-    //    form — a snapshot would answer from a stale image, and a `Bool` from a
-    //    mutation that has not run yet would be a lie. They stay in the source
-    //    as `@available(*, unavailable, renamed:)` stubs so the compiler
-    //    rejects the call with a one-click rename fix-it instead of "no such
-    //    member", and they are deleted with the rest of the deprecation window.
-    //  * **Void-returning mutators** (`pauseAllUploads`, `resumeAllUploads`,
-    //    `setUploadConcurrency`) keep working, fire-and-forget, marked
-    //    `@available(*, deprecated)` beside an `Async` twin — the shape D3
-    //    shipped for the analytics surface.
+    // `uploads` / `pauseUpload` / `resumeUpload` keep an
+    // `@available(*, unavailable, renamed:)` stub so the compiler answers a
+    // migrating call with a one-click rename fix-it instead of "no such
+    // member". `getUploadConcurrency` has no stub because it did not merely
+    // gain an `Async` suffix — it became the `uploadConcurrency` async
+    // property, and `renamed:` cannot point a function at a property.
     //
     // The twins are deliberately **distinctly named** rather than same-name
     // `async` overloads: Swift prefers an `async` overload in an asynchronous
-    // context, so a same-name twin would turn every existing un-`await`ed call
-    // into a compile error — the break the window exists to avoid.
+    // context, so a same-name twin would have turned every existing
+    // un-`await`ed call into a compile error before the batch, which is the
+    // break the window existed to avoid.
 
     /// List tracked blob uploads, newest first. With `documentId == nil`
     /// (the default) returns uploads across **all** documents; pass a
@@ -900,15 +789,6 @@ public final class DocumentsAPI: @unchecked Sendable {
         return await blobManager.resumeUpload(blobId, documentId: documentId)
     }
 
-    /// Pause all in-progress uploads. With `documentId == nil` (the
-    /// default) pauses uploads across **all** documents; pass a
-    /// `documentId` to scope. Mirrors JS `documents.pauseAllUploads(documentId?)`.
-    @available(*, deprecated, message: "Use pauseAllUploadsAsync(documentId:) — the synchronous version schedules the pause without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a following resumeAllUploads() can apply FIRST, no-op, and leave every upload paused. Removed in the next major release.")
-    public func pauseAllUploads(documentId: String? = nil) {
-        let blobManager = self.blobManager
-        Task { await blobManager.pauseAll(documentId: documentId) }
-    }
-
     /// Pause all in-progress uploads, returning once every matching upload is
     /// paused. With `documentId == nil` (the default) pauses uploads across
     /// **all** documents; pass a `documentId` to scope.
@@ -916,28 +796,11 @@ public final class DocumentsAPI: @unchecked Sendable {
         await blobManager.pauseAll(documentId: documentId)
     }
 
-    /// Resume all paused uploads. With `documentId == nil` (the default)
-    /// resumes uploads across **all** documents; pass a `documentId` to
-    /// scope. Mirrors JS `documents.resumeAllUploads(documentId?)`.
-    @available(*, deprecated, message: "Use resumeAllUploadsAsync(documentId:) — the synchronous version schedules the resume without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a preceding pauseAllUploads() can apply AFTER it, leaving every upload paused. Removed in the next major release.")
-    public func resumeAllUploads(documentId: String? = nil) {
-        let blobManager = self.blobManager
-        Task { await blobManager.resumeAll(documentId: documentId) }
-    }
-
     /// Resume all paused uploads, returning once every matching upload is back
     /// in the retry rotation. With `documentId == nil` (the default) resumes
     /// uploads across **all** documents; pass a `documentId` to scope.
     public func resumeAllUploadsAsync(documentId: String? = nil) async {
         await blobManager.resumeAll(documentId: documentId)
-    }
-
-    /// Set the maximum number of concurrent blob uploads (app-wide).
-    /// Mirrors JS `documents.setUploadConcurrency(concurrency)`.
-    @available(*, deprecated, message: "Use setUploadConcurrencyAsync(_:) — the synchronous version applies the setting without waiting, so a read right after it may still see the old value, and two calls are not ordered against each other: setUploadConcurrency(1) then setUploadConcurrency(5) can settle on 1. Removed in the next major release.")
-    public func setUploadConcurrency(_ concurrency: Int) {
-        let blobManager = self.blobManager
-        Task { await blobManager.setUploadConcurrency(concurrency) }
     }
 
     /// Set the maximum number of concurrent blob uploads (app-wide),
@@ -948,15 +811,11 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// The current maximum number of concurrent blob uploads (app-wide).
     /// Mirrors JS `documents.getUploadConcurrency()`.
-    @available(*, unavailable, renamed: "getUploadConcurrencyAsync()")
-    public func getUploadConcurrency() -> Int {
-        fatalError("unavailable — use getUploadConcurrencyAsync()")
-    }
-
-    /// The current maximum number of concurrent blob uploads (app-wide).
-    /// Mirrors JS `documents.getUploadConcurrency()`.
-    public func getUploadConcurrencyAsync() async -> Int {
-        return await blobManager.getUploadConcurrency()
+    ///
+    /// `BlobManager` is an actor, so this is an `async` property: a
+    /// synchronous snapshot would answer from a stale image.
+    public var uploadConcurrency: Int {
+        get async { await blobManager.getUploadConcurrency() }
     }
 
     // MARK: - Get-or-create with alias (P1)
@@ -978,7 +837,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         }
         var userId = alias.userId
         if alias.scope == .user, userId == nil {
-            userId = client?.getUserId()
+            userId = client?.userId
         }
 
         let body = GetOrCreateWithAliasBody(
@@ -1039,7 +898,7 @@ public final class DocumentsAPI: @unchecked Sendable {
                 message: "DocumentsAPI.openRoot requires a wired JsBaoClient"
             )
         }
-        guard let docId = client.getRootDocId() else {
+        guard let docId = client.rootDocId else {
             throw JsBaoError(
                 code: .notFound,
                 message: "App has no root document"
@@ -1071,8 +930,8 @@ public final class DocumentsAPI: @unchecked Sendable {
         // stale-true flag. (#961)
         let confirmed = await waitForWriteConfirmation(
             documentId: documentId,
-            timeoutMs: 500,
-            pollMs: 100
+            timeout: 0.5,
+            pollInterval: 0.1
         )
         await client?.closeDocument(
             documentId,
@@ -1103,9 +962,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Async WebSocket state-vector round-trip (`stateVectorCheck`),
     /// mirroring js-bao's `documents.includesWrites(documentId, timeoutMs?)`.
     /// Resolves `false` when offline or the check times out.
-    public func includesWrites(documentId: String, timeoutMs: Int = 5_000) async -> Bool {
+    public func includesWrites(documentId: String, timeout: TimeInterval = 5) async -> Bool {
         guard let client else { return false }
-        return await client.checkStateVector(documentId: documentId, timeoutMs: timeoutMs).includesWrites
+        return await client.checkStateVector(documentId: documentId, timeout: timeout).includesWrites
     }
 
     /// Whether client and server hold identical document state. Async
@@ -1114,9 +973,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// `false` when offline or the check times out. (For a cheap
     /// synchronous read of the last-known local sync state, use
     /// `isSynced(documentId)`.)
-    public func inSync(documentId: String, timeoutMs: Int = 5_000) async -> Bool {
+    public func inSync(documentId: String, timeout: TimeInterval = 5) async -> Bool {
         guard let client else { return false }
-        return await client.checkStateVector(documentId: documentId, timeoutMs: timeoutMs).inSync
+        return await client.checkStateVector(documentId: documentId, timeout: timeout).inSync
     }
 
     // MARK: - waitFor* sub-API wrappers (P2)
@@ -1127,34 +986,38 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Wait until the server confirms it has all of this client's writes,
     /// returning `true` once confirmed and `false` on timeout. Polls the
     /// `stateVectorCheck` round-trip's `includesWrites`, mirroring js-bao's
-    /// `documents.waitForWriteConfirmation(documentId, timeoutMs?, pollMs?)`
+    /// `documents.waitForWriteConfirmation(documentId, timeoutMs?, pollMs?)` (ms on JS)
     /// — which resolves to a `boolean` rather than throwing on timeout.
     public func waitForWriteConfirmation(
         documentId: String,
-        timeoutMs: Int = 10_000,
-        pollMs: Int = 200
+        timeout: TimeInterval = 10,
+        pollInterval: TimeInterval = 0.2
     ) async -> Bool {
         guard let client else { return false }
-        let deadline = DispatchTime.now() + .milliseconds(timeoutMs)
+        // Monotonic, not wall-clock: a clock adjustment mid-wait must not cut
+        // the poll loop short or extend it. `DispatchTime + Double` takes the
+        // seconds directly, so the `timeoutMs: Int` → `TimeInterval` rename
+        // (#2367) did not need this to become a `Date`.
+        let deadline = DispatchTime.now() + timeout
         while DispatchTime.now() < deadline {
             if await client.checkStateVector(documentId: documentId).includesWrites {
                 return true
             }
-            try? await Task.sleep(nanoseconds: UInt64(max(0, pollMs)) * 1_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(max(0, pollInterval) * 1_000_000_000))
         }
         return false
     }
 
     public func waitForInSync(
         documentId: String,
-        timeoutMs: Int = 10_000,
-        pollMs: Int = 200
+        timeout: TimeInterval = 10,
+        pollInterval: TimeInterval = 0.2
     ) async throws {
         guard let client else {
             throw JsBaoError(code: .unavailable, message: "client unset")
         }
         try await client.waitForInSync(
-            documentId: documentId, timeoutMs: timeoutMs, pollMs: pollMs
+            documentId: documentId, timeout: timeout, pollInterval: pollInterval
         )
     }
 
@@ -1211,14 +1074,6 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
     /// Designated initializer — the typed transport spine.
     public init(transport: any Transport) {
         self.transport = transport
-    }
-
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(transport:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.init(transport: ClosureTransport(makeRequest: makeRequest))
     }
 
     /// Create or update a document alias.
@@ -1316,22 +1171,6 @@ public final class DocumentBlobContext: @unchecked Sendable {
         self.documentId = documentId
         self.transport = transport
         self.blobManager = blobManager
-    }
-
-    /// Deprecated: construct with a `Transport` instead. The legacy closure is
-    /// wrapped in an adapter so existing call sites keep working for one major
-    /// cycle.
-    @available(*, deprecated, message: "Use init(documentId:transport:blobManager:) — the untyped makeRequest closure is removed in the next major release.")
-    public convenience init(
-        documentId: String,
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
-        blobManager: BlobManager
-    ) {
-        self.init(
-            documentId: documentId,
-            transport: ClosureTransport(makeRequest: makeRequest),
-            blobManager: blobManager
-        )
     }
 
     /// Upload a blob to the document.
@@ -1517,26 +1356,10 @@ public final class DocumentBlobContext: @unchecked Sendable {
         return await blobManager.resumeUpload(blobId, documentId: documentId)
     }
 
-    /// Pause all in-progress uploads for this document. Mirrors JS `pauseAll`.
-    @available(*, deprecated, message: "Use pauseAllAsync() — the synchronous version schedules the pause without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a following resumeAll() can apply FIRST, no-op, and leave every upload paused. Removed in the next major release.")
-    public func pauseAll() {
-        let blobManager = self.blobManager
-        let documentId = self.documentId
-        Task { await blobManager.pauseAll(documentId: documentId) }
-    }
-
     /// Pause all in-progress uploads for this document, returning once they
     /// are paused. Mirrors JS `pauseAll`.
     public func pauseAllAsync() async {
         await blobManager.pauseAll(documentId: documentId)
-    }
-
-    /// Resume all paused uploads for this document. Mirrors JS `resumeAll`.
-    @available(*, deprecated, message: "Use resumeAllAsync() — the synchronous version schedules the resume without waiting, so it is ordered against nothing that follows: an uploadsAsync() read right after it may not reflect it yet, and a preceding pauseAll() can apply AFTER it, leaving every upload paused. Removed in the next major release.")
-    public func resumeAll() {
-        let blobManager = self.blobManager
-        let documentId = self.documentId
-        Task { await blobManager.resumeAll(documentId: documentId) }
     }
 
     /// Resume all paused uploads for this document, returning once they are
@@ -1547,26 +1370,6 @@ public final class DocumentBlobContext: @unchecked Sendable {
 }
 
 // MARK: - Request / response shims
-
-/// Body of `POST /documents/:id/invitations` — `{ email, permission }` plus
-/// the optional email-notification settings. Replaces the hand-merged untyped
-/// dictionary: `InvitationEmailOptions`' three fields are flattened in and
-/// omitted when `nil`, exactly as the merge did.
-private struct InvitationBody: Encodable, Sendable {
-    let email: String
-    let permission: String
-    let sendEmail: Bool?
-    let documentUrl: String?
-    let note: String?
-
-    init(email: String, permission: String, options: InvitationEmailOptions?) {
-        self.email = email
-        self.permission = permission
-        self.sendEmail = options?.sendEmail
-        self.documentUrl = options?.documentUrl
-        self.note = options?.note
-    }
-}
 
 /// Body of `POST /documents/get-or-create-with-alias`. `userId` / `title` /
 /// `tags` are omitted when `nil`, matching the conditional inserts the untyped

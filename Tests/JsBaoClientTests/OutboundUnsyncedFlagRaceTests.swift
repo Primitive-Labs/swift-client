@@ -5,7 +5,7 @@ import XCTest
 ///
 /// `JsBaoClient.queueOutboundUpdate` appended the update to `pendingUpdates` and
 /// scheduled the debounce `Task` under `lock`, then marked the document unsynced
-/// *after* the lock was released. With `SyncConfig(outboundDebounceMs: 0)` the
+/// *after* the lock was released. With `SyncConfig(outboundDebounce: 0)` the
 /// scheduled flush can run to completion inside that window: it removes the
 /// pending update, sends it, and clears the unsynced flag — and only then does
 /// the late `markUnsyncedLocalChanges(_, true)` run, setting the flag back with
@@ -30,7 +30,7 @@ final class OutboundUnsyncedFlagRaceTests: XCTestCase {
             offline: true,
             logLevel: .none,
             storageConfig: .memory,
-            sync: SyncConfig(outboundDebounceMs: 0),
+            sync: SyncConfig(outboundDebounce: 0),
             autoNetwork: false
         ))
     }
