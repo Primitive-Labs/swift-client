@@ -120,10 +120,14 @@ public struct AnalyticsEventInput: Encodable, Sendable {
 
 // MARK: - JSONValue → Any lowering
 
-extension JSONValue {
+public extension JSONValue {
     /// Lower a `JSONValue` into the loosely-typed `Any` graph that
-    /// `JSONSerialization` (and therefore the analytics queue's buffer)
-    /// speaks. `.null` becomes `NSNull` so it survives serialization.
+    /// `JSONSerialization` speaks — the inverse of ``JSONValue/init(jsonAny:subject:)``.
+    /// `.null` becomes `NSNull` so it survives serialization.
+    ///
+    /// Use this at a boundary that has to hand JSON to an API taking `Any`
+    /// (`JSONSerialization`, a debug/inspector payload). Inside the client,
+    /// prefer passing the `JSONValue` itself.
     func toAny() -> Any {
         switch self {
         case let .string(s): return s

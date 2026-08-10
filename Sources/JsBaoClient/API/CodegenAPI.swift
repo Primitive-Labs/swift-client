@@ -72,7 +72,7 @@ public final class CodegenAPI: @unchecked Sendable {
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         try requireClient("query").sharedModel(for: schema).query(filter, options: options)
     }
 
@@ -84,7 +84,7 @@ public final class CodegenAPI: @unchecked Sendable {
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         try requireClient("query").sharedModel(for: schema)
             .query(filter, options: options, include: include)
     }
@@ -122,7 +122,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// First record with `id` across every open doc (raw row), or `nil`.
     /// Answers `nil` once the owning client has been released — the same
     /// answer it gives for a record that isn't there.
-    public func find(_ schema: PrimitiveSchema, id: String) -> [String: Any]? {
+    public func find(_ schema: PrimitiveSchema, id: String) -> [String: JSONValue]? {
         client?.sharedModel(for: schema).find(id: id)?.row
     }
 
@@ -130,7 +130,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// open doc (raw row), or `nil`. Mirrors js-bao's `BaseModel.findByUnique`.
     public func findByUnique(
         _ schema: PrimitiveSchema, constraint: String, value: PrimitiveValue
-    ) throws -> [String: Any]? {
+    ) throws -> [String: JSONValue]? {
         try requireClient("findByUnique").sharedModel(for: schema)
             .findByUnique(constraint: constraint, value: value)?.row
     }
@@ -141,7 +141,7 @@ public final class CodegenAPI: @unchecked Sendable {
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> [String: Any]? {
+    ) throws -> [String: JSONValue]? {
         try requireClient("queryOne").sharedModel(for: schema).query(filter, options: options).first
     }
 
@@ -160,7 +160,7 @@ public final class CodegenAPI: @unchecked Sendable {
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> [String: Any]? {
+    ) throws -> [String: JSONValue]? {
         try requireClient("queryOne").sharedModel(for: schema)
             .query(filter, options: options, include: include).first
     }
@@ -168,7 +168,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Aggregate (group / count / sum / avg / …) across every open document.
     public func aggregate(
         _ schema: PrimitiveSchema, options: AggregateOptions
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         try requireClient("aggregate").sharedModel(for: schema).aggregate(options)
     }
 
@@ -321,7 +321,7 @@ public final class CodegenAPI: @unchecked Sendable {
     public func refersTo(
         target: PrimitiveSchema,
         foreignKey sourceForeignKey: String?
-    ) -> [String: Any]? {
+    ) -> [String: JSONValue]? {
         guard let fk = sourceForeignKey, !fk.isEmpty else { return nil }
         return find(target, id: fk)
     }
@@ -337,10 +337,10 @@ public final class CodegenAPI: @unchecked Sendable {
         sourceId: String,
         orderByField: String? = nil,
         orderDirection: String? = nil
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         let descending = (orderDirection?.uppercased() == "DESC")
         let options = orderByField.map { QueryOptions(sort: [$0: descending ? -1 : 1]) }
-        return try query(target, filter: [relatedIdField: sourceId], options: options)
+        return try query(target, filter: [relatedIdField: .string(sourceId)], options: options)
     }
 
     /// Resolve a `hasManyThrough` relationship via `joinModel`: find join
@@ -360,17 +360,21 @@ public final class CodegenAPI: @unchecked Sendable {
         joinModelRelatedField: String,
         joinModelOrderByField: String? = nil,
         joinModelOrderDirection: String? = nil
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         let descending = (joinModelOrderDirection?.uppercased() == "DESC")
         let joinOptions = joinModelOrderByField.map {
             QueryOptions(sort: [$0: descending ? -1 : 1])
         }
         let joinRows = try query(
-            joinModel, filter: [joinModelLocalField: sourceId], options: joinOptions
+            joinModel, filter: [joinModelLocalField: .string(sourceId)], options: joinOptions
         )
-        let targetIds = joinRows.compactMap { $0[joinModelRelatedField] as? String }
+        let targetIds = joinRows.compactMap { $0[joinModelRelatedField]?.stringValue }
         guard !targetIds.isEmpty else { return [] }
-        return try query(target, filter: ["id": ["$in": targetIds]], options: nil)
+        return try query(
+            target,
+            filter: ["id": ["$in": .array(targetIds.map { .string($0) })]],
+            options: nil
+        )
     }
 
     /// Paginated `hasManyThrough` traversal — pages the JOIN leg through the
@@ -434,16 +438,20 @@ public final class CodegenAPI: @unchecked Sendable {
             projection: [joinModelRelatedField: 1, orderByField: 1]
         )
         let joinPage = try queryPaged(
-            joinModel, filter: [joinModelLocalField: sourceId], options: joinOptions
+            joinModel, filter: [joinModelLocalField: .string(sourceId)], options: joinOptions
         )
-        let relatedIds = joinPage.data.compactMap { $0[joinModelRelatedField] as? String }
+        let relatedIds = joinPage.data.compactMap { $0[joinModelRelatedField]?.stringValue }
         guard !relatedIds.isEmpty else {
             return PagedQueryResult(
                 data: [], nextCursor: joinPage.nextCursor,
                 prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
             )
         }
-        let rows = try query(target, filter: ["id": ["$in": relatedIds]], options: nil)
+        let rows = try query(
+            target,
+            filter: ["id": ["$in": .array(relatedIds.map { .string($0) })]],
+            options: nil
+        )
         return PagedQueryResult(
             data: rows.map(PrimitiveRow.init(raw:)), nextCursor: joinPage.nextCursor,
             prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
@@ -463,7 +471,7 @@ private final class DetachedIncludeTarget: IncludeTarget {
         self.modelName = modelName
     }
 
-    func query(_ filter: DocumentFilter?, options: QueryOptions?) throws -> [[String: Any]] {
+    func query(_ filter: DocumentFilter?, options: QueryOptions?) throws -> [[String: JSONValue]] {
         throw JsBaoError(
             code: .unavailable,
             message: "An include targeting `\(modelName)` was built from a client.codegen "

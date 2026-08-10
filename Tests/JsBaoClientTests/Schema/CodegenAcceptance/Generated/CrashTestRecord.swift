@@ -170,20 +170,20 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
-    public init?(row: [String: Any]) {
-        guard let id = row["id"] as? String,
-              let requiredTags = (row["requiredTags"] as? [String]).map(Set.init)
+    public init?(row: [String: JSONValue]) {
+        guard let id = row["id"]?.stringValue,
+              let requiredTags = (row["requiredTags"]?.stringArrayValue).map(Set.init)
         else { return nil }
         self.id = id
-        self.tags = (row["tags"] as? [String]).map(Set.init)
+        self.tags = (row["tags"]?.stringArrayValue).map(Set.init)
         self.requiredTags = requiredTags
-        self.email = row["email"] as? String
-        self.boundedName = row["boundedName"] as? String
-        self.`default` = row["default"] as? String
-        self.`where` = row["where"] as? String
-        self.score = row["score"] as? Double
-        self.active = (row["active"] as? Bool) ?? (row["active"] as? Int).map({ $0 != 0 })
-        self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
+        self.email = row["email"]?.stringValue
+        self.boundedName = row["boundedName"]?.stringValue
+        self.`default` = row["default"]?.stringValue
+        self.`where` = row["where"]?.stringValue
+        self.score = row["score"]?.numberValue
+        self.active = row["active"]?.rowBoolValue
+        self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }
 
@@ -380,7 +380,7 @@ public extension CrashTestRecord {
     }
 
     /// Aggregate (group / count / sum / avg / …) across all open documents.
-    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+    static func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         try JsBaoClient.requireDefault().codegen.aggregate(primitiveSchema, options: options)
     }
 

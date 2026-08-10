@@ -12,8 +12,7 @@ import Foundation
 /// Refines `Sendable`: every codegen'd conformer is a value struct whose
 /// stored properties are all `Sendable` (scalars, `String`, `Set<String>`,
 /// nested value enums, and `RelatedRecords` — a spelling of the shared
-/// `PrimitiveRow` bag, which is `@unchecked Sendable` with a written safety
-/// argument),
+/// `PrimitiveRow` bag, whose `[String: JSONValue]` contents are `Sendable`),
 /// so the conformance is satisfied automatically. This makes the metatype
 /// `any PrimitiveModel.Type` `Sendable`, which lets it be stored on the
 /// `Sendable` `CsvImportOptions.model` field without an escape hatch.
@@ -36,72 +35,51 @@ public protocol PrimitiveModel: Sendable {
 /// The codegen'd facade uses this for query-time includes: the base row and
 /// any `_related` rows are all row dictionaries at the storage boundary.
 public protocol PrimitiveRowDecodable {
-    init?(row: [String: Any])
+    init?(row: [String: JSONValue])
 }
 
 public extension PrimitiveRowDecodable {
     /// Decode from the shared row bag. Same decode as `init?(row:)` — the bag
-    /// is a `Sendable` wrapper around exactly that dictionary — so generated
+    /// is a wrapper around exactly that dictionary — so generated
     /// `compactMap { Model(row: $0) }` call sites bind unchanged whether the
-    /// page hands them `[String: Any]` or a `PrimitiveRow` (#1992).
+    /// page hands them `[String: JSONValue]` or a `PrimitiveRow` (#1992).
     init?(row: PrimitiveRow) {
         self.init(row: row.raw)
     }
 }
 
-/// The one untyped row representation in the client: a `Sendable` bag of the
-/// `[String: Any]` a storage-layer row actually is, with typed accessors for
+/// The one schemaless row representation in the client: a bag of the
+/// `[String: JSONValue]` a storage-layer row is, with typed accessors for
 /// query-time includes.
 ///
 /// This is a generalization of what used to be `RelatedRecords` (the
 /// `_related` attachment on generated models), promoted to cover paginated
 /// query results as well. `RelatedRecords` remains as a spelling of the same
-/// type — deliberately ONE abstraction rather than two competing unchecked
-/// dictionary wrappers.
+/// type — deliberately ONE abstraction rather than two competing row
+/// wrappers.
 ///
-/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+/// ## Row values are `JSONValue`
 ///
-/// The bag's `Sendable` claim rests on the value domain being **recursively
-/// immutable value types**, not on any lock:
+/// Every leaf is a `JSONValue`, so the bag is `Sendable` by checked
+/// conformance rather than by argument (#2546). Read a column with the typed
+/// accessors — `row["title"]?.stringValue`, `row["priority"]?.numberValue`,
+/// `row["done"]?.rowBoolValue`, `row["tags"]?.stringArrayValue` — or reach
+/// `raw` for the dictionary itself.
 ///
-/// - `raw` is a `let`, set once at construction and never mutated afterwards.
-///   Include resolution mutates `[[String: Any]]` *before* the rows are
-///   wrapped (`IncludeResolver.resolve(rows:includes:depth:)` takes an
-///   `inout` array), never through the bag.
-/// - Every leaf value comes from one of two producers and both produce Swift
-///   value types only: `BaoModelQueryEngine.executeQuery` emits `Int`,
-///   `Double`, and `String` (SQL NULLs are omitted, not boxed), and the
-///   stringset population pass emits `[String]`.
-/// - The nested case is the point Codex raised on the design: after
-///   `IncludeResolver` runs, a row also carries `_related`, itself a
-///   `[String: Any]` whose values are a related row (`[String: Any]`) or an
-///   array of them (`[[String: Any]]`), nested up to the depth-3 cap. Those
-///   nested rows are produced by the same two producers, so the domain closes
-///   over itself: **the transitive contents are `Int` / `Double` / `String` /
-///   `[String]` / `[String: Any]` / `[[String: Any]]` and nothing else.**
-///   `Dictionary`, `Array`, and `String` are copy-on-write value types, so two
-///   threads reading the same bag either read distinct copies or an immutable
-///   shared buffer.
-/// - No reference type ever enters a row. In particular no `YDocument`, no
-///   `DynamicModel`, no `PrimitiveRecord`, and no mutable Foundation object
-///   (`NSMutableDictionary`/`NSMutableArray`) is ever written into one. An
-///   `NSNull` sentinel, if a caller puts one in, is an immutable singleton and
-///   does not weaken the argument.
-///
-/// The claim is therefore checkable by inspecting the row producers, which is
-/// the honesty bar this phase set. It would be broken by writing a mutable
-/// reference type into a row dictionary before wrapping it — don't.
-public struct PrimitiveRow: @unchecked Sendable, Codable, Equatable, Hashable {
+/// Numbers arrive as `.number(Double)`: SQLite INTEGER and REAL columns both
+/// land there, matching how the typed model layer already reads every numeric
+/// field as `Double`.
+public struct PrimitiveRow: Sendable, Codable, Equatable, Hashable {
     public static let empty = PrimitiveRow(raw: [:])
 
-    /// The underlying row. Treat as read-only — see the safety argument.
-    public let raw: [String: Any]
+    /// The underlying row. Treat as read-only.
+    public let raw: [String: JSONValue]
 
-    public init(raw: [String: Any] = [:]) {
+    public init(raw: [String: JSONValue] = [:]) {
         self.raw = raw
     }
 
-    public subscript(key: String) -> Any? {
+    public subscript(key: String) -> JSONValue? {
         raw[key]
     }
 
@@ -110,13 +88,13 @@ public struct PrimitiveRow: @unchecked Sendable, Codable, Equatable, Hashable {
     }
 
     public func one<T: PrimitiveRowDecodable>(_ key: String, as type: T.Type = T.self) -> T? {
-        guard let row = raw[key] as? [String: Any] else { return nil }
+        guard let row = raw[key]?.objectValue else { return nil }
         return T(row: row)
     }
 
     public func many<T: PrimitiveRowDecodable>(_ key: String, as type: T.Type = T.self) -> [T] {
-        guard let rows = raw[key] as? [[String: Any]] else { return [] }
-        return rows.compactMap { T(row: $0) }
+        guard let rows = raw[key]?.arrayValue else { return [] }
+        return rows.compactMap { $0.objectValue.flatMap { T(row: $0) } }
     }
 
     // MARK: - Codable / Equatable / Hashable are deliberately content-free
@@ -177,11 +155,11 @@ public struct PrimitiveDecodeError: Error, Sendable, Equatable {
 
     /// Build from a shared-store row dictionary (reads `id` and the
     /// `_meta_doc_id` routing column the cross-document store adds).
-    public init(modelName: String, row: [String: Any]) {
+    public init(modelName: String, row: [String: JSONValue]) {
         self.init(
             modelName: modelName,
-            recordId: row["id"] as? String ?? "",
-            documentId: row["_meta_doc_id"] as? String
+            recordId: row["id"]?.stringValue ?? "",
+            documentId: row["_meta_doc_id"]?.stringValue
         )
     }
 }

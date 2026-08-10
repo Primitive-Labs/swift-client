@@ -21,6 +21,12 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
     private(set) var port: UInt16 = 0
 
     private var _acceptedCount = 0
+    private var _receivedFrames: [String] = []
+
+    /// Every text frame the server has received, in arrival order. Lets a test
+    /// assert on what the client actually put on the wire (e.g. that no
+    /// syncStep1 went out) without reaching into the client's internals.
+    var receivedFrames: [String] { lock.withLock { _receivedFrames } }
 
     /// How many connections the listener has accepted since it started. It is
     /// the server-side view of "a fresh socket was built", which is what a test
@@ -80,8 +86,11 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
     /// `send` for good, which is what a sustained send loop hits (#2171
     /// behavior 23). Only an error — which a peer close produces — ends it.
     private func drain(_ connection: NWConnection) {
-        connection.receiveMessage { [weak self] _, _, _, error in
+        connection.receiveMessage { [weak self] data, _, _, error in
             guard let self = self else { return }
+            if let data, let text = String(data: data, encoding: .utf8) {
+                self.lock.withLock { self._receivedFrames.append(text) }
+            }
             if error != nil {
                 // Peer closed or errored — let the connection tear down.
                 connection.cancel()

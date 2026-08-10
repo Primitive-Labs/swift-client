@@ -41,6 +41,12 @@ public final class DocumentManager: @unchecked Sendable {
     /// coalescing guarantee above is unchanged (#1993, Phase D1).
     private var pendingOpens: [String: Task<ConfinedYDocument, Error>] = [:]
     private var docSyncStates: [String: Bool] = [:]
+    // In-flight syncStep1->syncComplete cycles, keyed by send time. Mirrors
+    // js-bao `documentManager.pendingSyncOperations`: while a cycle is in
+    // flight, `startNetworkSync` skips re-sending syncStep1. Without this the
+    // 350ms availability-retry loop floods the document DO with duplicate
+    // syncStep1 frames during a cold load (#2584).
+    private var pendingSyncOperations: [String: Date] = [:]
     private var docPermissions: [String: DocumentPermission] = [:]
     private var docOpenStartTime: [String: CFAbsoluteTime] = [:]
     private var docServerBytes: [String: Int] = [:]
@@ -62,6 +68,15 @@ public final class DocumentManager: @unchecked Sendable {
     // Docs that asked the server for sync-perf timings (JS
     // `syncPerfRequestedByDoc`). Consulted when building syncStep1.
     private var syncPerfRequestedDocs: Set<String> = []
+
+    // Per-document network-sync policy, mirroring js-bao's
+    // `startNetworkModeByDoc`. Recorded at open time and consulted by the
+    // post-commit path so a document the caller opened with
+    // `deferNetworkSync` / `enableNetworkSync: false` never gets an
+    // unrequested syncStep1 when its background create commits. JS has a
+    // third mode (`afterIndexedDb`); Swift's local store has no equivalent
+    // staged hand-off, so only `immediate` and `manual` exist here.
+    private var startNetworkModeByDoc: [String: StartNetworkMode] = [:]
 
     // Per-doc client-side sync timing capture (JS `clientSyncTimings`).
     // Keys mirror the JS field names emitted on `syncPerf.clientTimings`
@@ -115,6 +130,16 @@ public final class DocumentManager: @unchecked Sendable {
     var onLocalUpdate: ((String, [UInt8]) -> Void)?
     var fetchDocumentInfo: ((String) async throws -> DocumentInfo)?
     var createRemoteDocument: (([String: Any]) async throws -> [String: Any])?
+    /// Fires once a `pendingCreate` document exists server-side. The
+    /// syncStep1 sent before the commit landed gets no `syncComplete` back
+    /// (the server had no such document), so its in-flight claim is released
+    /// on commit and sync is re-triggered here. Mirrors js-bao's
+    /// `applyPostCommitPolicy`, which deletes the doc's `pendingSyncOperations`
+    /// entry and calls `startNetworkSync` on the same path.
+    ///
+    /// Fires only for documents in `immediate` mode — see
+    /// `applyPostCommitPolicy` below.
+    var onPendingCreateCommitted: ((String) -> Void)?
     var commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff()
     /// Online-state probe used to gate background-commit retries (mirrors
     /// js-bao's `ctx.isOnline()`). When nil, retries assume online.
@@ -150,6 +175,38 @@ public final class DocumentManager: @unchecked Sendable {
         documentId: String,
         options: OpenDocumentOptions
     ) async throws -> YDocument {
+        // Who drives this document's network sync (JS
+        // `startNetworkModeByDoc`). `deferNetworkSync` / `enableNetworkSync:
+        // false` means the caller does, so client-driven triggers — the
+        // connect sweep, the post-commit re-sync of a pending create — must
+        // leave it alone. `networkingAllowed()` is deliberately not part of
+        // the mode: that is a transient online check, not the caller's
+        // intent, and those paths check it separately.
+        //
+        // Recorded on every call that returns a document, including one that
+        // returns an already-open document (a locally-created document is
+        // already open by the time the caller opens it, which is exactly the
+        // deferred-sync case this exists for). JS `open` sets
+        // `startNetworkModeByDoc` the same way — the latest open's intent
+        // wins.
+        //
+        // Recorded in the same `lock.withLock` that claims `pendingOpens`,
+        // below — i.e. before `_openDocumentImpl` can put the document into
+        // `openDocs`. Writing it on the way *out* instead left a window that
+        // spans the storage provider, `loadDocument()`, `getMetadata` and
+        // `putMetadata`: for all of it the document is in
+        // `listOpenDocuments()` with no mode entry, and `startNetworkMode(_:)`
+        // defaults an absent entry to `.immediate`. A `connect()` overlapping
+        // the open of a `deferNetworkSync` document would then put an
+        // unrequested syncStep1 on the wire against a half-restored ydoc —
+        // the #2475 hazard the connect-sweep filter exists to close, on the
+        // common app-launch shape (open and connect concurrently, local
+        // restore of a large document taking hundreds of ms).
+        // `clearStartNetworkModeIfNotOpen` undoes the write on the throwing
+        // path, so an open that fails still leaves no entry behind.
+        let startMode: StartNetworkMode =
+            options.enableNetworkSync && !options.deferNetworkSync ? .immediate : .manual
+
         // Fast path / coalesce: decide under one lock hold. The check
         // for an already-open doc, the check for another caller's
         // in-flight open, and claiming the slot by registering our own
@@ -157,6 +214,10 @@ public final class DocumentManager: @unchecked Sendable {
         // could both miss `pendingOpens` and each start a duplicate
         // open. The `await` that follows always runs OUTSIDE the lock.
         let outcome: OpenOutcome = lock.withLock {
+            // Atomic with the document becoming visible: whichever branch we
+            // take below, any reader that can see this document from now on
+            // also sees the caller's start mode.
+            startNetworkModeByDoc[documentId] = startMode
             // Fast path: already fully open
             if let existing = openDocs[documentId] {
                 return .existing(existing)
@@ -190,12 +251,36 @@ public final class DocumentManager: @unchecked Sendable {
         case .existing(let existing):
             return existing
         case .awaitInFlight(let inFlight):
-            return try await inFlight.value.document
+            do {
+                return try await inFlight.value.document
+            } catch {
+                clearStartNetworkModeIfNotOpen(documentId)
+                throw error
+            }
         case .started(let task):
             defer {
                 lock.withLock { _ = pendingOpens.removeValue(forKey: documentId) }
             }
-            return try await task.value.document
+            do {
+                return try await task.value.document
+            } catch {
+                clearStartNetworkModeIfNotOpen(documentId)
+                throw error
+            }
+        }
+    }
+
+    /// Drop a start-mode entry written by an open that then threw — but only
+    /// while the document is genuinely not open. The guard matters because
+    /// concurrent opens share one entry: a failing open must not delete the
+    /// mode a successful one (or a `documents.create`) recorded for a
+    /// document that IS visible. The invariant it maintains is "an entry
+    /// exists exactly while the document is in `openDocs`".
+    private func clearStartNetworkModeIfNotOpen(_ documentId: String) {
+        lock.withLock {
+            if openDocs[documentId] == nil {
+                startNetworkModeByDoc.removeValue(forKey: documentId)
+            }
         }
     }
 
@@ -373,6 +458,7 @@ public final class DocumentManager: @unchecked Sendable {
         lock.withLock {
             _ = openDocs.removeValue(forKey: documentId)
             docSyncStates.removeValue(forKey: documentId)
+            pendingSyncOperations.removeValue(forKey: documentId)
             unconfirmedLocalWrites.remove(documentId)
             docOpenStartTime.removeValue(forKey: documentId)
             docServerBytes.removeValue(forKey: documentId)
@@ -381,6 +467,7 @@ public final class DocumentManager: @unchecked Sendable {
             docAwareness.removeValue(forKey: documentId)
             docPersistence.removeValue(forKey: documentId)
             syncPerfRequestedDocs.remove(documentId)
+            startNetworkModeByDoc.removeValue(forKey: documentId)
             clientSyncTimings.removeValue(forKey: documentId)
         }
 
@@ -410,6 +497,14 @@ public final class DocumentManager: @unchecked Sendable {
             "documentId": documentId,
             "stateVector": base64,
         ]
+        // Mirror JS `sendSyncStep1`'s `docHash` (SHA-256 hex over the full
+        // encoded state - the server's `calculateDocHash` algorithm). When it
+        // matches the server's hash, the server skips the diff/R2 cycle and
+        // answers with a bare syncComplete; Swift could never hit that
+        // fast path while it omitted the field (#2584).
+        if let contentHash = getContentDocHash(documentId: documentId) {
+            message["docHash"] = contentHash
+        }
         // Mirror JS `sendSyncStep1`: when the doc requested sync-perf
         // telemetry, ask the server to send a `syncPerf` frame.
         if isSyncPerfRequested(documentId) {
@@ -432,6 +527,43 @@ public final class DocumentManager: @unchecked Sendable {
         return jsonString
     }
 
+    // MARK: - Pending sync operations (JS parity, #2584)
+
+    /// Claim the in-flight sync slot for a document before sending
+    /// syncStep1. Returns `false` when a cycle is already in flight - the
+    /// caller must skip the send. Mirrors js-bao
+    /// `documentManager.beginPendingSyncOperation`, with a staleness escape
+    /// hatch standing in for the JS sync watchdog (10s, the JS
+    /// `syncWatchdogTimeoutMs` default): a pending entry older than
+    /// `staleAfter` is treated as lost and replaced, so a dropped
+    /// syncComplete cannot wedge the document's sync forever.
+    public func beginPendingSyncOperation(
+        _ documentId: String,
+        staleAfter: TimeInterval = 10
+    ) -> Bool {
+        lock.withLock {
+            if let startedAt = pendingSyncOperations[documentId],
+               Date().timeIntervalSince(startedAt) < staleAfter {
+                return false
+            }
+            pendingSyncOperations[documentId] = Date()
+            return true
+        }
+    }
+
+    /// Release the in-flight sync slot (cycle finished, send failed, or the
+    /// document closed). Mirrors JS `completePendingSyncOperation`.
+    public func completePendingSyncOperation(_ documentId: String) {
+        lock.withLock { _ = pendingSyncOperations.removeValue(forKey: documentId) }
+    }
+
+    /// Drop every in-flight sync claim - the transport died, so no
+    /// syncComplete is coming for any of them. Mirrors JS
+    /// `clearPendingSyncOperations` (ws-close path).
+    public func clearPendingSyncOperations() {
+        lock.withLock { pendingSyncOperations.removeAll() }
+    }
+
     /// Mark a document as wanting server sync-perf timings on its next
     /// sync round-trips. Mirrors JS `setSyncPerfRequested`.
     public func setSyncPerfRequested(_ documentId: String, _ value: Bool) {
@@ -447,6 +579,29 @@ public final class DocumentManager: @unchecked Sendable {
     /// Mirrors JS `isSyncPerfRequested`.
     public func isSyncPerfRequested(_ documentId: String) -> Bool {
         lock.withLock { syncPerfRequestedDocs.contains(documentId) }
+    }
+
+    /// Whether the client drives this document's network sync itself
+    /// (`immediate`) or the caller does (`manual` — the document was opened
+    /// with `deferNetworkSync` or `enableNetworkSync: false`). Mirrors
+    /// js-bao's `startNetworkModeByDoc` values.
+    public enum StartNetworkMode: Sendable {
+        case immediate
+        case manual
+    }
+
+    /// Record a document's network-sync policy. Called by `openDocument` and
+    /// by `startNetworkSync` (an explicit start promotes a `manual` document
+    /// to `immediate`, exactly as JS `startNetworkSync` does).
+    public func setStartNetworkMode(_ documentId: String, _ mode: StartNetworkMode) {
+        lock.withLock { startNetworkModeByDoc[documentId] = mode }
+    }
+
+    /// The recorded policy, defaulting to `immediate` for documents opened
+    /// through a path that records none — matching the pre-existing behavior
+    /// of every non-deferred open.
+    public func startNetworkMode(_ documentId: String) -> StartNetworkMode {
+        lock.withLock { startNetworkModeByDoc[documentId] ?? .immediate }
     }
 
     // MARK: - Client sync-perf instrumentation
@@ -595,6 +750,9 @@ public final class DocumentManager: @unchecked Sendable {
     public func handleSyncComplete(documentId: String) {
         let (startTime, bytes, syncStep1SentAt): (CFAbsoluteTime?, Int?, Double?) = lock.withLock {
             docSyncStates[documentId] = true
+            // The cycle this claim guarded is finished (JS parity: the
+            // syncComplete handler calls `completePendingSyncOperation`).
+            pendingSyncOperations.removeValue(forKey: documentId)
             return (
                 docOpenStartTime[documentId],
                 docServerBytes[documentId],
@@ -635,6 +793,28 @@ public final class DocumentManager: @unchecked Sendable {
                 }
                 try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: entry)
             }
+        }
+    }
+
+    /// Merge several encoded Yjs updates into one frame (JS parity:
+    /// `Y.mergeUpdates` in `flushLocalUpdates`) by applying them to a scratch
+    /// doc and encoding its state. One outbound frame per flush matters
+    /// server-side: a cold document room reconstructs the full document once
+    /// per concurrently-arriving message, so a burst of N tiny updates (the
+    /// fresh-open `_meta_*` registration writes) triggers N concurrent
+    /// multi-second reconstructions and starves the initial sync (#2584).
+    public func mergeUpdates(_ updates: [[UInt8]]) -> [UInt8] {
+        guard updates.count > 1 else { return updates.first ?? [] }
+        let scratch = YDocument()
+        scratch.transactSync { [logger] txn in
+            for u in updates {
+                do { try txn.transactionApplyUpdate(update: u) } catch {
+                    logger.warn("mergeUpdates: failed to apply queued update:", error.localizedDescription)
+                }
+            }
+        }
+        return scratch.transactSync { txn in
+            txn.transactionEncodeStateAsUpdate()
         }
     }
 
@@ -856,6 +1036,23 @@ public final class DocumentManager: @unchecked Sendable {
         return doc
     }
 
+    /// js-bao's `applyPostCommitPolicy`: run once a `pendingCreate` document
+    /// exists server-side.
+    ///
+    /// An `immediate` document releases the claim held by the syncStep1 that
+    /// went out before the commit (it can never be answered — the server had
+    /// no such document) and re-syncs, so the 350ms availability-retry loop
+    /// resumes at once instead of waiting out the 10s staleness window.
+    /// A `manual` document — opened with `deferNetworkSync` or
+    /// `enableNetworkSync: false` — is left untouched: the caller owns its
+    /// sync timing, and an unrequested syncStep1 here would pull server state
+    /// into a ydoc at a moment the caller did not choose (#2475).
+    private func applyPostCommitPolicy(_ documentId: String) {
+        guard startNetworkMode(documentId) == .immediate else { return }
+        lock.withLock { _ = pendingSyncOperations.removeValue(forKey: documentId) }
+        onPendingCreateCommitted?(documentId)
+    }
+
     /// Commit a pending create to the server
     public func commitOfflineCreate(
         documentId: String,
@@ -898,6 +1095,7 @@ public final class DocumentManager: @unchecked Sendable {
             if let metaToPersist {
                 try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
             }
+            applyPostCommitPolicy(documentId)
 
             return ["created": true]
         } catch let error as HttpError where error.status == 409 {
@@ -912,6 +1110,7 @@ public final class DocumentManager: @unchecked Sendable {
                 if let metaToPersist {
                     try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
                 }
+                applyPostCommitPolicy(documentId)
                 return ["linked": true]
             }
             return ["reason": "exists"]
@@ -1177,6 +1376,15 @@ public final class DocumentManager: @unchecked Sendable {
             docPersistence.removeAll()
             openDocs.removeAll()
             docSyncStates.removeAll()
+            pendingSyncOperations.removeAll()
+            // A mode entry exists exactly while its document is in `openDocs`
+            // (written under the `pendingOpens` claim in `openDocument`,
+            // removed in `closeDocument`). Clearing `openDocs` here without
+            // clearing this map would leave a stale `.manual` behind: a later
+            // `createLocalDocument` for the same id does not write the map, so
+            // `applyPostCommitPolicy` would read the dead entry and skip the
+            // post-commit re-sync.
+            startNetworkModeByDoc.removeAll()
             unconfirmedLocalWrites.removeAll()
             docPermissions.removeAll()
             pendingCreates.removeAll()
@@ -1293,6 +1501,19 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     // MARK: - Document Hash
+
+    /// SHA-256 hex digest over the document's full encoded state - the
+    /// server's `calculateDocHash` algorithm (`sha256(Y.encodeStateAsUpdate(doc))`,
+    /// lowercase hex), and what JS `getDocHash` sends in syncStep1. Distinct
+    /// from `getDocHash(documentId:)` below, which predates this and returns
+    /// the base64 state vector (kept for its existing public-API callers).
+    public func getContentDocHash(documentId: String) -> String? {
+        guard let doc = lock.withLock({ openDocs[documentId] }) else { return nil }
+        let update: [UInt8] = doc.transactSync { txn in
+            txn.transactionEncodeStateAsUpdate()
+        }
+        return hashSHA256(Data(update)).map { String(format: "%02x", $0) }.joined()
+    }
 
     public func getDocHash(documentId: String) -> String? {
         guard let doc = lock.withLock({ openDocs[documentId] }) else { return nil }

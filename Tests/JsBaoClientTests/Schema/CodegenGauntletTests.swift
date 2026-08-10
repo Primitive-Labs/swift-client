@@ -167,8 +167,9 @@ final class CodegenGauntletTests: XCTestCase {
     func testInitRowFromDynamicQuery_booleanRoundTrip() throws {
         // Booleans are stored as SQLite INTEGER and read back as
         // `Int` (0/1) by `BaoModelQueryEngine.executeQuery`, so a
-        // direct `as? Bool` cast in the codegen would silently drop
-        // every bool. The emitter falls back through `as? Int`.
+        // strict `.boolValue` read in the codegen would silently drop
+        // every bool. The emitter reads through `.rowBoolValue`, which
+        // accepts the `.number(0)` / `.number(1)` a row carries.
         let model = freshCrashTestModel()
         try model.create(CrashTestRecord(
             id: "boolT",
@@ -302,7 +303,7 @@ final class CodegenGauntletTests: XCTestCase {
             id: "low",  requiredTags: ["t"], email: "l@e.com", score: 10
         ))
         let rows = try model.dynamic.query(["score": ["$gte": 50]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertTrue(ids.contains("high"))
         XCTAssertFalse(ids.contains("low"))
     }
@@ -334,7 +335,7 @@ final class CodegenGauntletTests: XCTestCase {
                 ["score": ["$gte": 500]],
             ]
         ])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a", "c"])
     }
 
@@ -354,7 +355,7 @@ final class CodegenGauntletTests: XCTestCase {
             sortOrder: [("score", -1), ("id", 1)],
             limit: 1000
         ))
-        let topScore = sorted.first?["score"] as? Double
+        let topScore = sorted.first?["score"]?.numberValue
         XCTAssertEqual(topScore, 50)
     }
 
@@ -388,16 +389,9 @@ final class CodegenGauntletTests: XCTestCase {
         // depend on the storage encoding.
         var counts: [Bool: Int] = [:]
         for row in groups {
-            let active: Bool?
-            if let b = row["active"] as? Bool {
-                active = b
-            } else if let i = row["active"] as? Int {
-                active = (i != 0)
-            } else {
-                active = nil
-            }
-            if let active, let n = row["n"] as? Int {
-                counts[active] = n
+            let active = row["active"]?.rowBoolValue
+            if let active, let n = row["n"]?.numberValue {
+                counts[active] = Int(n)
             }
         }
         XCTAssertEqual(counts[true],  3)

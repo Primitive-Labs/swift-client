@@ -98,7 +98,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// `DynamicModel`.
     public struct Located {
         public let docId: String
-        public let row: [String: Any]
+        public let row: [String: JSONValue]
     }
 
     public init(
@@ -211,7 +211,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
 
     // MARK: - Reads
 
-    public func findAll() -> [[String: Any]] {
+    public func findAll() -> [[String: JSONValue]] {
         // `nil` filter never carries a substring operator, so the
         // now-throwing `query` can't actually throw here — handle the
         // unreachable error locally to keep `findAll` non-throwing
@@ -240,7 +240,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         // record `query` would have returned complete (#2485).
         let rows = (try? engine.query(
             modelName: schema.name,
-            filter: ["id": id],
+            filter: ["id": .string(id)],
             stringsetFields: stringsetFieldNames
         )) ?? []
         guard !rows.isEmpty else { return nil }
@@ -248,11 +248,11 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             into: [String: Int]()
         ) { $0[$1.element.docId] = $1.offset }
         let sorted = rows.sorted {
-            (connectOrder[$0["_meta_doc_id"] as? String ?? ""] ?? .max) <
-            (connectOrder[$1["_meta_doc_id"] as? String ?? ""] ?? .max)
+            (connectOrder[$0["_meta_doc_id"]?.stringValue ?? ""] ?? .max) <
+            (connectOrder[$1["_meta_doc_id"]?.stringValue ?? ""] ?? .max)
         }
         guard let first = sorted.first,
-              let docId = first["_meta_doc_id"] as? String else { return nil }
+              let docId = first["_meta_doc_id"]?.stringValue else { return nil }
         return Located(docId: docId, row: first)
     }
 
@@ -274,7 +274,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             guard let rec = try model.findByUnique(
                 constraint: name, values: values
             ) else { continue }
-            var row: [String: Any] = ["id": rec.id]
+            var row: [String: JSONValue] = ["id": .string(rec.id)]
             let snap = rec.snapshot()
             for (fname, _) in schema.fields where fname != "id" {
                 if let v = snap[fname] {
@@ -285,9 +285,9 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             // every stringset field the same `[]` the engine's population pass
             // produces — one row shape whether the set is empty or not (#2485).
             for fname in stringsetFieldNames where row[fname] == nil {
-                row[fname] = [String]()
+                row[fname] = .array([])
             }
-            row["_meta_doc_id"] = docId
+            row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
         return nil
@@ -415,7 +415,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     public func query(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         drainAllObservers()
         return try engine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -450,7 +450,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// Cross-doc aggregation. Runs one SQL query against the shared
     /// table. Group by `_meta_doc_id` to get per-doc rollups; omit
     /// grouping for a single global rollup.
-    public func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+    public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         drainAllObservers()
         return try engine.aggregate(
             modelName: schema.name, options: options,
@@ -563,7 +563,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         drainAllObservers()
         var rows = try engine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -636,15 +636,15 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// shape the engine's junction-table population pass writes and the
     /// generated row decoder casts to — a comma-joined `String` would fail
     /// that cast and silently drop the field (#2485).
-    private func rowRepresentation(of value: PrimitiveValue) -> Any {
+    private func rowRepresentation(of value: PrimitiveValue) -> JSONValue {
         switch value {
-        case let .string(s):    return s
-        case let .number(n):    return n
-        case let .boolean(b):   return b
-        case let .id(s):        return s
-        case let .date(s):      return s
-        case let .stringset(s): return Array(s)
-        case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
+        case let .string(s):    return .string(s)
+        case let .number(n):    return .number(n)
+        case let .boolean(b):   return .bool(b)
+        case let .id(s):        return .string(s)
+        case let .date(s):      return .string(s)
+        case let .stringset(s): return .array(Array(s).map { .string($0) })
+        case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
         }
     }
 }

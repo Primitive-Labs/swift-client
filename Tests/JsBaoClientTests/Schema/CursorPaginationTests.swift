@@ -86,7 +86,7 @@ final class CursorPaginationTests: XCTestCase {
             nil,
             options: QueryOptions(sort: ["id": 1], limit: 2)
         )
-        XCTAssertEqual(page.data.map { $0["id"] as? String }, ["p1", "p2"])
+        XCTAssertEqual(page.data.map { $0["id"]?.stringValue }, ["p1", "p2"])
         XCTAssertTrue(page.hasMore)
         XCTAssertNotNil(page.nextCursor)
         XCTAssertNil(page.prevCursor,
@@ -119,7 +119,7 @@ final class CursorPaginationTests: XCTestCase {
                     cursor: cursor, direction: .forward
                 )
             )
-            collected += page.data.compactMap { $0["id"] as? String }
+            collected += page.data.compactMap { $0["id"]?.stringValue }
             guard let next = page.nextCursor else { break }
             cursor = next
         }
@@ -152,7 +152,7 @@ final class CursorPaginationTests: XCTestCase {
         // its rows, then walk BACKWARD from its prevCursor. In
         // backward mode `nextCursor` advances further back; `prevCursor`
         // would rewind toward where we came from (not what we want).
-        var collected: [String] = lastPage.data.compactMap { $0["id"] as? String }
+        var collected: [String] = lastPage.data.compactMap { $0["id"]?.stringValue }
         var cursorBack = lastPage.prevCursor
         while let c = cursorBack {
             let page = try model.queryPaged(
@@ -167,7 +167,7 @@ final class CursorPaginationTests: XCTestCase {
             // returning). Prepend the page as-is so the accumulated list
             // stays ASC. (Before the fix, backward pages came back id-DESC
             // and this test reversed each page to compensate.)
-            collected = page.data.compactMap { $0["id"] as? String } + collected
+            collected = page.data.compactMap { $0["id"]?.stringValue } + collected
             cursorBack = page.nextCursor
         }
 
@@ -191,7 +191,7 @@ final class CursorPaginationTests: XCTestCase {
             nil,
             options: QueryOptions(sortOrder: order, limit: 2)
         )
-        XCTAssertEqual(page1.data.map { $0["id"] as? String }, ["p2", "p5"])
+        XCTAssertEqual(page1.data.map { $0["id"]?.stringValue }, ["p2", "p5"])
 
         let page2 = try model.queryPaged(
             nil,
@@ -200,7 +200,7 @@ final class CursorPaginationTests: XCTestCase {
                 cursor: page1.nextCursor, direction: .forward
             )
         )
-        XCTAssertEqual(page2.data.map { $0["id"] as? String }, ["p4", "p1"])
+        XCTAssertEqual(page2.data.map { $0["id"]?.stringValue }, ["p4", "p1"])
 
         let page3 = try model.queryPaged(
             nil,
@@ -209,7 +209,7 @@ final class CursorPaginationTests: XCTestCase {
                 cursor: page2.nextCursor, direction: .forward
             )
         )
-        XCTAssertEqual(page3.data.map { $0["id"] as? String }, ["p3"])
+        XCTAssertEqual(page3.data.map { $0["id"]?.stringValue }, ["p3"])
         XCTAssertFalse(page3.hasMore)
     }
 
@@ -223,7 +223,7 @@ final class CursorPaginationTests: XCTestCase {
             nil,
             options: QueryOptions(sortOrder: order, limit: 3)
         )
-        XCTAssertEqual(page1.data.map { $0["id"] as? String }, ["p1", "p3", "p4"])
+        XCTAssertEqual(page1.data.map { $0["id"]?.stringValue }, ["p1", "p3", "p4"])
 
         let page2 = try model.queryPaged(
             nil,
@@ -232,7 +232,7 @@ final class CursorPaginationTests: XCTestCase {
                 cursor: page1.nextCursor, direction: .forward
             )
         )
-        XCTAssertEqual(page2.data.map { $0["id"] as? String }, ["p2", "p5"])
+        XCTAssertEqual(page2.data.map { $0["id"]?.stringValue }, ["p2", "p5"])
     }
 
     // MARK: - With filter
@@ -244,7 +244,7 @@ final class CursorPaginationTests: XCTestCase {
             ["category": "a"],
             options: QueryOptions(sort: ["id": 1], limit: 2)
         )
-        XCTAssertEqual(page1.data.map { $0["id"] as? String }, ["p1", "p2"])
+        XCTAssertEqual(page1.data.map { $0["id"]?.stringValue }, ["p1", "p2"])
 
         let page2 = try model.queryPaged(
             ["category": "a"],
@@ -253,7 +253,7 @@ final class CursorPaginationTests: XCTestCase {
                 cursor: page1.nextCursor, direction: .forward
             )
         )
-        XCTAssertEqual(page2.data.map { $0["id"] as? String }, ["p4"])
+        XCTAssertEqual(page2.data.map { $0["id"]?.stringValue }, ["p4"])
         XCTAssertFalse(page2.hasMore)
     }
 
@@ -290,7 +290,7 @@ final class CursorPaginationTests: XCTestCase {
             nil,
             options: QueryOptions(limit: 3)
         )
-        XCTAssertEqual(page.data.map { $0["id"] as? String }, ["p1", "p2", "p3"])
+        XCTAssertEqual(page.data.map { $0["id"]?.stringValue }, ["p1", "p2", "p3"])
     }
 
     // MARK: - Implicit id tiebreaker
@@ -311,7 +311,7 @@ final class CursorPaginationTests: XCTestCase {
             nil,
             options: QueryOptions(sort: ["rank": 1], limit: 2)
         )
-        XCTAssertEqual(page1.data.map { $0["id"] as? String }, ["p2", "p5"])
+        XCTAssertEqual(page1.data.map { $0["id"]?.stringValue }, ["p2", "p5"])
 
         let page2 = try model.queryPaged(
             nil,
@@ -320,7 +320,7 @@ final class CursorPaginationTests: XCTestCase {
                 cursor: page1.nextCursor, direction: .forward
             )
         )
-        XCTAssertEqual(page2.data.map { $0["id"] as? String }, ["p4", "p1"])
+        XCTAssertEqual(page2.data.map { $0["id"]?.stringValue }, ["p4", "p1"])
 
         let page3 = try model.queryPaged(
             nil,
@@ -329,7 +329,7 @@ final class CursorPaginationTests: XCTestCase {
                 cursor: page2.nextCursor, direction: .forward
             )
         )
-        XCTAssertEqual(page3.data.map { $0["id"] as? String }, ["p3"])
+        XCTAssertEqual(page3.data.map { $0["id"]?.stringValue }, ["p3"])
     }
 
     /// The cursor generated from a single-field sort includes `id` in

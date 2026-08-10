@@ -53,8 +53,8 @@ final class ProjectionTests: XCTestCase {
             options: QueryOptions(projection: ["title": 1])
         )
         let row = rows.first ?? [:]
-        XCTAssertEqual(row["id"] as? String, "p1")
-        XCTAssertEqual(row["title"] as? String, "first")
+        XCTAssertEqual(row["id"]?.stringValue, "p1")
+        XCTAssertEqual(row["title"]?.stringValue, "first")
         XCTAssertNil(row["body"], "body should be excluded by projection")
         XCTAssertNil(row["score"], "score should be excluded by projection")
         XCTAssertNil(row["tags"], "stringset tags should be excluded by projection")
@@ -67,7 +67,7 @@ final class ProjectionTests: XCTestCase {
         let rows = try model.query(nil, options: QueryOptions(
             sortOrder: [("id", 1)], projection: ["title": 1]
         ))
-        XCTAssertEqual(rows.compactMap { $0["id"] as? String }, ["p1", "p2"])
+        XCTAssertEqual(rows.compactMap { $0["id"]?.stringValue }, ["p1", "p2"])
     }
 
     /// Include-mode projection that names a stringset field gets the
@@ -79,8 +79,8 @@ final class ProjectionTests: XCTestCase {
             options: QueryOptions(projection: ["tags": 1])
         )
         let row = rows.first ?? [:]
-        XCTAssertEqual(row["id"] as? String, "p1")
-        XCTAssertEqual(Set(row["tags"] as? [String] ?? []), ["red", "urgent"])
+        XCTAssertEqual(row["id"]?.stringValue, "p1")
+        XCTAssertEqual(Set(row["tags"]?.stringArrayValue ?? []), ["red", "urgent"])
         XCTAssertNil(row["title"])
     }
 
@@ -94,12 +94,12 @@ final class ProjectionTests: XCTestCase {
             options: QueryOptions(projection: ["body": 0])
         )
         let row = rows.first ?? [:]
-        XCTAssertEqual(row["id"] as? String, "p1")
-        XCTAssertEqual(row["title"] as? String, "first")
-        XCTAssertEqual(row["score"] as? Double, 10)
+        XCTAssertEqual(row["id"]?.stringValue, "p1")
+        XCTAssertEqual(row["title"]?.stringValue, "first")
+        XCTAssertEqual(row["score"]?.numberValue, 10)
         XCTAssertNil(row["body"])
         // Stringset still populated (not excluded).
-        XCTAssertEqual(Set(row["tags"] as? [String] ?? []), ["red", "urgent"])
+        XCTAssertEqual(Set(row["tags"]?.stringArrayValue ?? []), ["red", "urgent"])
     }
 
     /// Exclude-mode projection that names a stringset field omits it.
@@ -110,7 +110,7 @@ final class ProjectionTests: XCTestCase {
             options: QueryOptions(projection: ["tags": 0])
         )
         let row = rows.first ?? [:]
-        XCTAssertEqual(row["title"] as? String, "first")
+        XCTAssertEqual(row["title"]?.stringValue, "first")
         XCTAssertNil(row["tags"])
     }
 
@@ -150,10 +150,9 @@ final class ProjectionTests: XCTestCase {
                     projection: ["name": 1],
                     resultKey: "author")
         ])
-        let author = (rows[0]["_related"] as? [String: Any])?["author"]
-            as? [String: Any] ?? [:]
-        XCTAssertEqual(author["id"] as? String, "u1")
-        XCTAssertEqual(author["name"] as? String, "Alice")
+        let author = rows[0]["_related"]?.objectValue?["author"]?.objectValue ?? [:]
+        XCTAssertEqual(author["id"]?.stringValue, "u1")
+        XCTAssertEqual(author["name"]?.stringValue, "Alice")
         XCTAssertNil(author["role"],
                      "role should be excluded by include projection")
     }
@@ -174,8 +173,8 @@ final class ProjectionTests: XCTestCase {
         )
         XCTAssertEqual(page.data.count, 1)
         let row = page.data[0]
-        XCTAssertEqual(row["id"] as? String, "p1")
-        XCTAssertEqual(row["title"] as? String, "first")
+        XCTAssertEqual(row["id"]?.stringValue, "p1")
+        XCTAssertEqual(row["title"]?.stringValue, "first")
         XCTAssertNil(row["body"], "body should be excluded in paged result")
         XCTAssertNil(row["score"])
         XCTAssertNil(row["tags"])
@@ -191,9 +190,9 @@ final class ProjectionTests: XCTestCase {
             )
         )
         let row = page.data.first ?? PrimitiveRow.empty
-        XCTAssertEqual(row["title"] as? String, "first")
+        XCTAssertEqual(row["title"]?.stringValue, "first")
         XCTAssertNil(row["body"])
-        XCTAssertEqual(row["score"] as? Double, 10)
+        XCTAssertEqual(row["score"]?.numberValue, 10)
     }
 
     // MARK: - Mixed include/exclude projections (#1118)

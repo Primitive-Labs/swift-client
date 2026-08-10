@@ -286,7 +286,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     }
 
     /// Test-only helper for schema/index introspection.
-    public func rawQuery(_ sql: String, params: [Any] = []) -> [[String: Any]] {
+    public func rawQuery(_ sql: String, params: [Any] = []) -> [[String: JSONValue]] {
         lock.lock()
         defer { lock.unlock() }
         return executeQuery(sql, params: params)
@@ -296,7 +296,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
     /// Sync all records from a model into the SQLite table.
     /// Call this after opening a document or after batch mutations.
-    public func syncRecords(modelName: String, records: [[String: Any]]) {
+    public func syncRecords(modelName: String, records: [[String: JSONValue]]) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -343,7 +343,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     ///     untouched; pass an empty array to clear it.
     public func upsertRecord(
         modelName: String,
-        record: [String: Any],
+        record: [String: JSONValue],
         stringsets: [String: [String]] = [:]
     ) {
         lock.lock()
@@ -370,8 +370,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // we clear the parent's existing members before inserting the
         // new ones. Scoped by `_meta_doc_id` when the main row carries
         // one — otherwise scoped only by `parent_id`.
-        let parentId = record["id"] as? String ?? ""
-        let docId = record["_meta_doc_id"] as? String
+        let parentId = record["id"]?.stringValue ?? ""
+        let docId = record["_meta_doc_id"]?.stringValue
         for (fieldName, members) in stringsets {
             writeJunction(
                 modelName: modelName,
@@ -563,7 +563,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// asked us not to return (exclude-mode) or didn't ask for
     /// (include-mode).
     private func populateStringsets(
-        rows: inout [[String: Any]],
+        rows: inout [[String: JSONValue]],
         modelName: String,
         stringsetFields: Set<String>,
         projection: [String: Int]? = nil
@@ -600,7 +600,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     }
 
     private func populateStringsetsFiltered(
-        rows: inout [[String: Any]],
+        rows: inout [[String: JSONValue]],
         modelName: String,
         stringsetFields: Set<String>
     ) {
@@ -609,7 +609,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             // callers get a deterministic shape.
             for i in rows.indices {
                 for field in stringsetFields where rows[i][field] == nil {
-                    rows[i][field] = [String]()
+                    rows[i][field] = .array([])
                 }
             }
             return
@@ -626,7 +626,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// `(doc_id, parent_id)` since the same parent id can repeat
     /// across docs.
     private func populateOneStringsetField(
-        rows: inout [[String: Any]],
+        rows: inout [[String: JSONValue]],
         modelName: String,
         fieldName: String
     ) {
@@ -635,8 +635,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         struct Key: Hashable { let doc: String; let parent: String }
         var keys: Set<Key> = []
         for row in rows {
-            guard let parent = row["id"] as? String else { continue }
-            let doc = row["_meta_doc_id"] as? String ?? ""
+            guard let parent = row["id"]?.stringValue else { continue }
+            let doc = row["_meta_doc_id"]?.stringValue ?? ""
             keys.insert(Key(doc: doc, parent: parent))
         }
         guard !keys.isEmpty else { return }
@@ -664,17 +664,18 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             let sql = "SELECT \(selectList) FROM \"\(junction)\" WHERE \"parent_id\" IN (\(placeholders))"
             let resultRows = executeQuery(sql, params: chunk)
             for r in resultRows {
-                let doc = r["_meta_doc_id"] as? String ?? ""
-                guard let p = r["parent_id"] as? String,
-                      let v = r["value"] as? String else { continue }
+                let doc = r["_meta_doc_id"]?.stringValue ?? ""
+                guard let p = r["parent_id"]?.stringValue,
+                      let v = r["value"]?.stringValue else { continue }
                 grouped[Key(doc: doc, parent: p), default: []].append(v)
             }
         }
 
         for i in rows.indices {
-            let parent = rows[i]["id"] as? String ?? ""
-            let doc = rows[i]["_meta_doc_id"] as? String ?? ""
-            rows[i][fieldName] = grouped[Key(doc: doc, parent: parent)] ?? []
+            let parent = rows[i]["id"]?.stringValue ?? ""
+            let doc = rows[i]["_meta_doc_id"]?.stringValue ?? ""
+            let members = grouped[Key(doc: doc, parent: parent)] ?? []
+            rows[i][fieldName] = .array(members.map { .string($0) })
         }
     }
 
@@ -710,7 +711,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         options: QueryOptions? = nil,
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = []
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         // Take the lock only for the base SELECT so the post-query
         // stringset population (which re-enters the engine via
         // junction sub-queries) doesn't deadlock against a non-
@@ -722,7 +723,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // instead of being swallowed into `[]`, matching js-bao, which
         // throws on the same bad input.
         let tableName = sanitizedTableName(modelName)
-        var rows: [[String: Any]] = try {
+        var rows: [[String: JSONValue]] = try {
             lock.lock()
             defer { lock.unlock() }
             let (sql, params) = try buildSelectSQL(
@@ -747,12 +748,12 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// next/prev cursors for forward/backward navigation. Mirrors
     /// js-bao's `BaseModel.query` Promise<PaginatedResult>.
     ///
-    /// Rows come back as `PrimitiveRow`, the shared `Sendable` row bag, so the
-    /// page as a whole is `Sendable` and can cross an isolation boundary
-    /// (#1992). Read fields with the same `row["field"] as? T` subscript the
-    /// raw dictionary took, or reach `row.raw` for the dictionary itself. The
-    /// unpaginated `query` above still returns `[[String: Any]]` — it makes no
-    /// `Sendable` claim to keep honest.
+    /// Rows come back as `PrimitiveRow`, the shared row bag, so the page as a
+    /// whole is `Sendable` and can cross an isolation boundary (#1992). Read a
+    /// field with the same subscript the raw dictionary takes
+    /// (`row["field"]?.stringValue`), or reach `row.raw` for the dictionary
+    /// itself — the unpaginated `query` above returns those dictionaries
+    /// directly.
     public func queryPaged(
         modelName: String,
         filter: DocumentFilter? = nil,
@@ -776,7 +777,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         queryOptionsWithOverLimit.limit = limit.map { $0 + 1 }
         // Scope the lock to just the base SELECT. Stringset population
         // reacquires the lock (see `query()`).
-        var rows: [[String: Any]] = try {
+        var rows: [[String: JSONValue]] = try {
             lock.lock()
             defer { lock.unlock() }
             let (sql, params) = try buildSelectSQL(
@@ -1010,7 +1011,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         }
 
         let results = executeQuery(sql, params: params)
-        return results.first?["COUNT(*)"] as? Int ?? 0
+        return results.first?["COUNT(*)"]?.numberValue.map { Int($0) } ?? 0
     }
 
     /// Execute an aggregation query. `scopedToDocId` restricts the
@@ -1022,7 +1023,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         options: AggregateOptions,
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = []
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         lock.lock()
         defer { lock.unlock() }
 
@@ -1055,36 +1056,40 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         return stmt
     }
 
-    private func executeQuery(_ sql: String, params: [Any]) -> [[String: Any]] {
+    private func executeQuery(_ sql: String, params: [Any]) -> [[String: JSONValue]] {
         guard let stmt = prepare(sql) else { return [] }
 
         for (idx, param) in params.enumerated() {
             bindValue(stmt, index: Int32(idx + 1), value: param)
         }
 
-        var results: [[String: Any]] = []
+        var results: [[String: JSONValue]] = []
         let colCount = sqlite3_column_count(stmt)
 
         while sqlite3_step(stmt) == SQLITE_ROW {
-            var row: [String: Any] = [:]
+            var row: [String: JSONValue] = [:]
             for i in 0..<colCount {
                 let name = String(cString: sqlite3_column_name(stmt, i))
                 let type = sqlite3_column_type(stmt, i)
 
                 switch type {
                 case SQLITE_INTEGER:
-                    row[name] = Int(sqlite3_column_int64(stmt, i))
+                    // Every number in a row is a `.number(Double)` — the same
+                    // collapse the typed model layer already applies (it reads
+                    // every numeric field as `Double`), and the same one JS
+                    // does with its single `number` type.
+                    row[name] = .number(Double(sqlite3_column_int64(stmt, i)))
                 case SQLITE_FLOAT:
-                    row[name] = sqlite3_column_double(stmt, i)
+                    row[name] = .number(sqlite3_column_double(stmt, i))
                 case SQLITE_TEXT:
                     if let cStr = sqlite3_column_text(stmt, i) {
-                        row[name] = String(cString: cStr)
+                        row[name] = .string(String(cString: cStr))
                     }
                 case SQLITE_NULL:
                     break // omit nulls
                 default:
                     if let cStr = sqlite3_column_text(stmt, i) {
-                        row[name] = String(cString: cStr)
+                        row[name] = .string(String(cString: cStr))
                     }
                 }
             }
@@ -1102,6 +1107,22 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         }
 
         switch value {
+        case let v as JSONValue:
+            // Row values (the write path's `record`) are `JSONValue`; bind the
+            // scalar each case carries. A container has no column
+            // representation — stringsets go to their junction table via
+            // `stringsets:`, so one reaching here is a malformed record and
+            // binds as NULL rather than as its Swift description.
+            switch v {
+            case let .string(s):
+                sqlite3_bind_text(stmt, index, (s as NSString).utf8String, -1, nil)
+            case let .number(n):
+                sqlite3_bind_double(stmt, index, n)
+            case let .bool(b):
+                sqlite3_bind_int(stmt, index, b ? 1 : 0)
+            case .null, .array, .object:
+                sqlite3_bind_null(stmt, index)
+            }
         case let v as Int:
             sqlite3_bind_int64(stmt, index, Int64(v))
         case let v as Int64:

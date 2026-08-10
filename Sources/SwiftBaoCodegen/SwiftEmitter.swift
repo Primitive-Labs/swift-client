@@ -183,7 +183,7 @@ struct SwiftEmitter {
         out += "        JsBaoClient.requireDefault().codegen.subscribe(primitiveSchema, callback)\n"
         out += "    }\n\n"
         out += "    /// Aggregate (group / count / sum / avg / …) across all open documents.\n"
-        out += "    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {\n"
+        out += "    static func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {\n"
         out += "        try JsBaoClient.requireDefault().codegen.aggregate(primitiveSchema, options: options)\n"
         out += "    }\n\n"
         out += "    // MARK: Writes (target one document; throw if it isn't open)\n\n"
@@ -1172,9 +1172,9 @@ struct SwiftEmitter {
     private func rowInit(schema: ParsedSchema) -> String {
         let access = options.accessLevel
         var out = "    /// Build from a SQLite-backed query row (`dynamic.query(...)`).\n"
-        out += "    \(access) init?(row: [String: Any]) {\n"
+        out += "    \(access) init?(row: [String: JSONValue]) {\n"
         // Always require id from the row.
-        var guardClauses: [String] = ["let id = row[\"id\"] as? String"]
+        var guardClauses: [String] = ["let id = row[\"id\"]?.stringValue"]
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
@@ -1197,55 +1197,46 @@ struct SwiftEmitter {
                 out += "        self.\(propName(fname)) = \(rowReadExpression(f, key: quoted(fname)))\n"
             }
         }
-        out += "        self.related = RelatedRecords(raw: row[\"_related\"] as? [String: Any] ?? [:])\n"
+        out += "        self.related = RelatedRecords(raw: row[\"_related\"]?.objectValue ?? [:])\n"
         // Read back from the store: nothing is pending (#2459).
         out += "        self._changedFields = []\n"
         out += "    }\n"
         return out
     }
 
-    /// The expression that reads one field out of a SQLite-row dict.
+    /// The expression that reads one field out of a query row
+    /// (`[String: JSONValue]`).
     ///
-    /// Scalars (`string` / `number` / `boolean` / `id` / `date`) are
-    /// straight `as?` casts to their Swift type. Stringsets are special:
-    /// `BaoModelQueryEngine.populateStringsetsFiltered` writes stringset
-    /// columns back into the row dict as `[String]` (Swift array), not
-    /// as `Set<String>`, so a direct `as? Set<String>` cast always
-    /// fails and the row is silently dropped. Cast to `[String]` first
-    /// and convert.
+    /// Scalars (`string` / `number` / `id` / `date`) read through the matching
+    /// `JSONValue` accessor. Two field types need a row-specific one:
+    ///
+    /// - **stringset**: `BaoModelQueryEngine.populateStringsetsFiltered`
+    ///   writes the column back as an array of strings, so read it as
+    ///   `[String]` (`stringArrayValue`) and convert to the `Set<String>` the
+    ///   generated property stores.
+    /// - **boolean**: SQLite has no boolean type — a boolean field is stored
+    ///   as INTEGER, so the row carries `.number(0)` / `.number(1)`.
+    ///   `rowBoolValue` reads either that or a real `.bool`, so the field
+    ///   doesn't drop silently (optional) or abort the whole row (required).
     ///
     /// The expression returns an `Optional` of the field's storage
     /// type — caller wraps in `let prop = ...` to unwrap it.
     private func rowReadExpression(_ f: ParsedField, key: String) -> String {
         if f.type == .stringset {
-            return "(row[\(key)] as? [String]).map(Set.init)"
+            return "(row[\(key)]?.stringArrayValue).map(Set.init)"
         }
-        if f.type == .boolean {
-            // BaoModelQueryEngine.executeQuery returns SQLite INTEGER
-            // columns as `Int` — boolean fields are stored as INTEGER,
-            // so a direct `as? Bool` cast always fails and the row's
-            // bool either drops silently (optional) or aborts the
-            // whole row (required). Fall back through Int → Bool.
-            //
-            // Use a non-trailing closure on `.map` because the read
-            // expression sits inside a `guard let X = ..., let Y = ...
-            // else { return nil }` chain — a trailing closure there
-            // triggers the "trailing closure in this context is
-            // confusable with the body of the statement" warning.
-            return "(row[\(key)] as? Bool) ?? (row[\(key)] as? Int).map({ $0 != 0 })"
-        }
-        return "row[\(key)] as? \(swiftRowCastType(f))"
+        return "row[\(key)]?.\(rowAccessor(f))"
     }
 
-    /// The non-optional Swift type for a SQLite row-cast (`as? T`).
-    /// `.stringset` does not appear here — `rowReadExpression` handles
-    /// it via the `[String] → Set<String>` conversion path.
-    private func swiftRowCastType(_ f: ParsedField) -> String {
+    /// The `JSONValue` accessor a row read goes through for each field type.
+    /// `.stringset` does not appear here — `rowReadExpression` handles it via
+    /// the `[String] → Set<String>` conversion path.
+    private func rowAccessor(_ f: ParsedField) -> String {
         switch f.type {
-        case .string, .id, .date: return "String"
-        case .number:              return "Double"
-        case .boolean:             return "Bool"
-        case .stringset:           return "Set<String>"   // unused; handled in rowReadExpression
+        case .string, .id, .date: return "stringValue"
+        case .number:              return "numberValue"
+        case .boolean:             return "rowBoolValue"
+        case .stringset:           return "stringArrayValue"  // unused; see rowReadExpression
         }
     }
 

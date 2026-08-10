@@ -2292,14 +2292,17 @@ public final class JsBaoClient: @unchecked Sendable {
 
         // Sample "does this doc already hold data?" here — before anything
         // else in this method can write into the ydoc. The sync decision
-        // below consumes it. `connectToSharedModels` inserts a `_meta_<model>`
-        // root per registered schema (SchemaSync.syncModelMeta), which is a
-        // real CRDT write: sampling after it would report a brand-new, empty
-        // doc as "has local data" for any app that registers its models
-        // before opening (the PrimitiveApp template pattern) and make
+        // below consumes it.
+        //
+        // `connectToSharedModels` no longer writes anything: since #2587
+        // `_meta_<model>` is written on the save path, matching js-bao's
+        // `BaseModel.save`, so registering models before opening leaves the
+        // ydoc byte-empty. Keep the sample here anyway — the ordering is the
+        // invariant (JS decides `hasLocal` first and connects the local query
+        // engine after), and sampling after a connect that regains a write
+        // would report a brand-new empty doc as "has local data" and make
         // `.localIfAvailableElseNetwork` return an empty document instead of
-        // waiting for server state (#2475). JS has the same ordering — it
-        // decides `hasLocal` first and connects the local query engine after.
+        // waiting for server state (#2475).
         let effectiveHasLocal = documentManager.ydocHasData(documentId)
 
         // Mirror the doc into every registered cross-document store so
@@ -2318,6 +2321,11 @@ public final class JsBaoClient: @unchecked Sendable {
         // document locally without kicking off sync — the caller drives it
         // later via `startNetworkSync(documentId:)`. Mirrors JS `open`'s
         // `deferNetworkSync` short-circuit.
+        //
+        // The same condition was recorded per document by
+        // `DocumentManager.openDocument` (JS `startNetworkModeByDoc`), so
+        // later client-driven sync triggers — the post-commit re-sync for a
+        // pending create — honor the caller's choice too.
         if options.enableNetworkSync && !options.deferNetworkSync && networkingAllowed() {
             // Decide whether to block on the sync handshake before returning
             // (JS parity — JsBaoClient.ts `canResolveEarly`/`needsNetworkWait`):
@@ -2375,7 +2383,7 @@ public final class JsBaoClient: @unchecked Sendable {
                             if wait.isSettled { break }
                             guard let self else { break }
                             if self.networkingAllowed() {
-                                await self.startNetworkSync(documentId: syncDocId)
+                                await self.startNetworkSync(documentId: syncDocId, explicit: false)
                             }
                         }
                     }
@@ -2716,7 +2724,45 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Start network sync for a document
     public func startNetworkSync(documentId: String) async {
-        guard let message = documentManager.buildSyncStep1Message(documentId: documentId) else { return }
+        // A caller asking for sync explicitly hands the timing back to the
+        // client: a document opened with `deferNetworkSync` becomes
+        // `immediate` from here on, so its post-commit re-sync runs like any
+        // other document's. JS `startNetworkSync` sets the same mode on the
+        // same path. Client-driven callers below pass `explicit: false` —
+        // re-subscribing after a reconnect must not silently retag a document
+        // whose sync the caller still owns.
+        await startNetworkSync(documentId: documentId, explicit: true)
+    }
+
+    func startNetworkSync(documentId: String, explicit: Bool) async {
+        if explicit {
+            documentManager.setStartNetworkMode(documentId, .immediate)
+            // An explicit call is the caller taking over the timing, so it
+            // outranks a cycle the client itself started: release any
+            // outstanding claim before taking one below. JS does the same —
+            // `requestManualSync`'s `triggerSync` deletes the
+            // `pendingSyncOperations` entry immediately before sending
+            // (`documentManager.ts:2083`). Without this, a claim the client
+            // took (a connect sweep, or a syncStep1 whose answer was lost)
+            // silently swallows the caller's request for up to the 10s
+            // staleness window.
+            documentManager.completePendingSyncOperation(documentId)
+        }
+        // One syncStep1->syncComplete cycle in flight per document (JS
+        // parity: `sendSyncStep1` skips while `hasPendingSyncOperation`).
+        // Without this, the 350ms availability-retry loop floods the
+        // document DO with duplicate syncStep1 frames that starve the
+        // in-flight sync cycle (#2584). The claim is released by
+        // syncComplete, transport close, document close, a failed send
+        // below - or by aging out (the `staleAfter` watchdog stand-in).
+        guard documentManager.beginPendingSyncOperation(documentId) else {
+            logger.debug("startNetworkSync: sync already in progress for", documentId)
+            return
+        }
+        guard let message = documentManager.buildSyncStep1Message(documentId: documentId) else {
+            documentManager.completePendingSyncOperation(documentId)
+            return
+        }
 
         lock.withLock {
             _ = subscribedDocuments.insert(documentId)
@@ -2726,6 +2772,8 @@ public final class JsBaoClient: @unchecked Sendable {
             try await wsManager.send(message)
         } catch {
             logger.warn("Failed to send syncStep1 for", documentId, error.localizedDescription)
+            // No frame went out, so no syncComplete will release the claim.
+            documentManager.completePendingSyncOperation(documentId)
         }
     }
 
@@ -3516,6 +3564,21 @@ public final class JsBaoClient: @unchecked Sendable {
         documentManager.onLocalUpdate = { [weak self] documentId, update in
             self?.queueOutboundUpdate(documentId: documentId, update: update)
         }
+        // A `pendingCreate` doc doesn't exist server-side yet, so the
+        // syncStep1 sent at open time never gets a `syncComplete` back and its
+        // in-flight claim would refuse every retry until it aged out. The
+        // commit is the moment the server can answer: re-send then, exactly as
+        // js-bao's `applyPostCommitPolicy` does (#2587, keeping #852's
+        // availability-retry loop effective).
+        // Only fires for documents whose sync this client drives — the
+        // `deferNetworkSync` / `enableNetworkSync: false` opens are filtered
+        // out by `DocumentManager.applyPostCommitPolicy`.
+        documentManager.onPendingCreateCommitted = { [weak self] documentId in
+            Task { [weak self] in
+                guard let self, self.networkingAllowed() else { return }
+                await self.startNetworkSync(documentId: documentId, explicit: false)
+            }
+        }
         documentManager.commitRetryBackoff = options.commitRetryBackoff
         documentManager.isOnlineProvider = { [weak self] in self?.networkingAllowed() ?? false }
 
@@ -4277,10 +4340,46 @@ public final class JsBaoClient: @unchecked Sendable {
         case blocked(reason: String)
     }
 
+    /// Byte budget for ONE merged outbound frame — the server's default
+    /// `MAX_UPDATE_SIZE` (`JsBaoClient.ts:2406`).
+    ///
+    /// Merging the whole queue into one frame makes crossing that threshold
+    /// routine where a single transaction rarely would, and Swift's outbound
+    /// path has no R2 upload flow (JS `transmitLocalUpdate` switches to one
+    /// above the threshold — a pre-existing gap, tracked separately in
+    /// #2591). The server does not reject an oversize frame — `MAX_UPDATE_SIZE`
+    /// only routes storage, SQLite below it and R2 above
+    /// (`src/doc-worker/storage/update-io.ts:82`), and there is no inbound WS
+    /// size guard — but sending one anyway means every large batch takes the
+    /// server's R2 write path and travels as one all-or-nothing frame, and a
+    /// failed send leaves the batch queued so the next pass re-merges the same
+    /// oversize batch. Capping at the same threshold JS switches upload paths
+    /// at keeps the two clients' wire behavior comparable. So a flush merges
+    /// only the longest prefix of the queue that fits the budget; the
+    /// remainder follows on the next pass.
+    static let maxMergedUpdateBytes = 102_400
+
+    /// The prefix of `queued` to merge into this pass's frame. Always at least
+    /// one update: a single update already over the budget goes out on its own,
+    /// which is exactly what it did before batching existed.
+    static func mergeBudgetPrefix(_ queued: [[UInt8]]) -> [[UInt8]] {
+        var total = 0
+        var count = 0
+        for update in queued {
+            let next = total + update.count
+            if count > 0 && next > maxMergedUpdateBytes { break }
+            total = next
+            count += 1
+        }
+        return Array(queued.prefix(Swift.max(1, count)))
+    }
+
     /// What a flush owner's peek at its document's queue found.
     private enum OutboundFlushPeek {
-        /// The next update to send.
-        case next([UInt8])
+        /// The queued updates to send - merged into ONE wire frame (JS
+        /// parity: `flushLocalUpdates` sends `Y.mergeUpdates(queued)`; #2584),
+        /// capped at `maxMergedUpdateBytes` per pass.
+        case next([[UInt8]])
         /// Nothing queued — try to release ownership and clear the flag.
         case drained
         /// This flush's ownership token was revoked (`closeDocument` /
@@ -4429,8 +4528,8 @@ public final class JsBaoClient: @unchecked Sendable {
             // and nothing is left to release — the revoker took the entry.
             let peek: OutboundFlushPeek = lock.withLock {
                 guard outboundFlushOwner[documentId] == token else { return .revoked }
-                guard let update = pendingUpdates[documentId]?.first else { return .drained }
-                return .next(update)
+                guard let queued = pendingUpdates[documentId], !queued.isEmpty else { return .drained }
+                return .next(Self.mergeBudgetPrefix(queued))
             }
             switch peek {
             case .revoked:
@@ -4476,8 +4575,12 @@ public final class JsBaoClient: @unchecked Sendable {
                 onOutboundFlushedForTest?(documentId)
                 return
 
-            case .next(let update):
-                let sent = await documentManager.sendLocalUpdate(documentId: documentId, update: update)
+            case .next(let batch):
+                // One wire frame per flush pass, however many edits queued up
+                // (JS parity: `Y.mergeUpdates`; see `mergeUpdates` for why this
+                // matters to a cold server room - #2584).
+                let merged = documentManager.mergeUpdates(batch)
+                let sent = await documentManager.sendLocalUpdate(documentId: documentId, update: merged)
                 guard sent else {
                     // Leave the batch queued: `pendingUpdates` stays non-empty,
                     // so the clear guard (here and in
@@ -4527,11 +4630,13 @@ public final class JsBaoClient: @unchecked Sendable {
                     guard outboundFlushOwner[documentId] == token else { return false }
                     // Only the owner removes from the head, but `closeDocument`
                     // can drop the whole key mid-send and a later edit can append
-                    // a new head behind it. Remove the head only when it is still
-                    // the update we just confirmed, so a close-then-edit race
+                    // a new head behind it. Remove exactly the prefix we just
+                    // confirmed (the merged batch), so a close-then-edit race
                     // can't discard an update that never reached the socket.
-                    guard var queue = pendingUpdates[documentId], queue.first == update else { return true }
-                    queue.removeFirst()
+                    guard var queue = pendingUpdates[documentId],
+                          queue.count >= batch.count,
+                          queue.prefix(batch.count).elementsEqual(batch, by: ==) else { return true }
+                    queue.removeFirst(batch.count)
                     if queue.isEmpty {
                         pendingUpdates.removeValue(forKey: documentId)
                     } else {
@@ -4662,11 +4767,33 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnConnected() {
         logger.log("WebSocket connected")
-        // Re-subscribe to all open documents
-        let docIds = documentManager.listOpenDocuments()
+        // Re-subscribe to all open documents — except the ones JS's connect
+        // sweep skips too (`JsBaoClient.ts` `[CONNECT] Evaluating sync`):
+        //
+        //   - `.manual` documents. The caller took over this document's sync
+        //     timing (`deferNetworkSync` / `enableNetworkSync: false`), and a
+        //     connect it did not ask for must not put a syncStep1 on the wire
+        //     — that pulls server state into the ydoc at a moment the caller
+        //     did not choose (#2475). `explicit: false` only stops the mode
+        //     from being re-tagged; the send has to be skipped here.
+        //   - `pendingCreate` documents. The server does not have the document
+        //     yet, so a syncStep1 for it can never be answered — it would just
+        //     hold the pending-sync claim until it ages out. The open-time
+        //     availability retry loop and the post-commit hook drive those.
+        let docIds = documentManager.listOpenDocuments().filter { docId in
+            if documentManager.startNetworkMode(docId) == .manual {
+                logger.debug("Connect sweep: manual start mode, not syncing", docId)
+                return false
+            }
+            if documentManager.isPendingCreate(docId) {
+                logger.debug("Connect sweep: pending create, not syncing", docId)
+                return false
+            }
+            return true
+        }
         Task {
             for docId in docIds {
-                await startNetworkSync(documentId: docId)
+                await startNetworkSync(documentId: docId, explicit: false)
             }
             // Flush analytics
             await analyticsQueue.flush()
@@ -4688,6 +4815,11 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnClose(code: Int?, reason: String?) {
         logger.log("WebSocket closed:", code ?? 0, reason ?? "")
+        // No syncComplete is coming for any in-flight cycle on a dead
+        // transport; release every claim so the reconnect path's
+        // `startNetworkSync` sweep isn't refused (JS parity: ws-close calls
+        // `clearPendingSyncOperations`).
+        documentManager.clearPendingSyncOperations()
         eventEmitter.emit(StatusChangedEvent(status: .disconnected))
         eventEmitter.emit(ConnectionCloseEvent(code: code, reason: reason))
     }

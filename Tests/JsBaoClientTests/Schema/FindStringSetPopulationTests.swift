@@ -48,7 +48,7 @@ final class FindStringSetPopulationTests: XCTestCase {
 
         let located = try XCTUnwrap(multi.find(id: "d1"))
         let tags = try XCTUnwrap(
-            located.row["tags"] as? [String],
+            located.row["tags"]?.stringArrayValue,
             "find must return stringset members as [String], the same shape query returns"
         )
         XCTAssertEqual(Set(tags), ["a", "b"])
@@ -63,7 +63,7 @@ final class FindStringSetPopulationTests: XCTestCase {
         _ = try model.create(id: "d1", values: ["title": .string("no tags")])
 
         let located = try XCTUnwrap(multi.find(id: "d1"))
-        let tags = try XCTUnwrap(located.row["tags"] as? [String])
+        let tags = try XCTUnwrap(located.row["tags"]?.stringArrayValue)
         XCTAssertTrue(tags.isEmpty)
     }
 
@@ -80,10 +80,10 @@ final class FindStringSetPopulationTests: XCTestCase {
         let viaFind = try XCTUnwrap(multi.find(id: "d1")).row
         let viaQuery = try XCTUnwrap(try multi.query(["id": "d1"]).first)
         XCTAssertEqual(
-            Set(viaFind["tags"] as? [String] ?? []),
-            Set(viaQuery["tags"] as? [String] ?? [])
+            Set(viaFind["tags"]?.stringArrayValue ?? []),
+            Set(viaQuery["tags"]?.stringArrayValue ?? [])
         )
-        XCTAssertEqual(viaFind["title"] as? String, viaQuery["title"] as? String)
+        XCTAssertEqual(viaFind["title"]?.stringValue, viaQuery["title"]?.stringValue)
     }
 
     /// The junction tables are keyed by `(docId, parentId)`, so a record id
@@ -105,7 +105,7 @@ final class FindStringSetPopulationTests: XCTestCase {
 
         let located = try XCTUnwrap(multi.find(id: "shared"))
         XCTAssertEqual(located.docId, "docA", "first-match-wins in connect order")
-        XCTAssertEqual(Set(located.row["tags"] as? [String] ?? []), ["a-only"],
+        XCTAssertEqual(Set(located.row["tags"]?.stringArrayValue ?? []), ["a-only"],
                        "members must not merge across docs that share a record id")
     }
 
@@ -129,14 +129,14 @@ final class FindStringSetPopulationTests: XCTestCase {
 
         let located = try XCTUnwrap(multi.find(id: "shared"))
         XCTAssertEqual(located.docId, "docB")
-        XCTAssertEqual(Set(located.row["tags"] as? [String] ?? []), ["b-only"])
+        XCTAssertEqual(Set(located.row["tags"]?.stringArrayValue ?? []), ["b-only"])
     }
 
     // MARK: - findByUnique
 
     /// `findByUnique` builds its row from the record snapshot rather than the
     /// engine, and rendered the stringset as a comma-joined `String` — a shape
-    /// the generated row decoder (`as? [String]`) can't read, so the field
+    /// the generated row decoder (`.stringArrayValue`) can't read, so the field
     /// silently vanished there too.
     func testFindByUniquePopulatesStringsetMembers() throws {
         let multi = MultiDocModel(schema: schema)
@@ -151,7 +151,7 @@ final class FindStringSetPopulationTests: XCTestCase {
             constraint: "fss_docs_email_unique", value: .string("alice@example.com")
         ))
         let tags = try XCTUnwrap(
-            located.row["tags"] as? [String],
+            located.row["tags"]?.stringArrayValue,
             "findByUnique must return stringset members as [String], like query"
         )
         XCTAssertEqual(Set(tags), ["a", "b"])
@@ -168,7 +168,7 @@ final class FindStringSetPopulationTests: XCTestCase {
         let located = try XCTUnwrap(try multi.findByUnique(
             constraint: "fss_docs_email_unique", value: .string("bob@example.com")
         ))
-        let tags = try XCTUnwrap(located.row["tags"] as? [String])
+        let tags = try XCTUnwrap(located.row["tags"]?.stringArrayValue)
         XCTAssertTrue(tags.isEmpty)
     }
 

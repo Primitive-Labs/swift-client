@@ -86,7 +86,7 @@ final class SwiftEmitterTests: XCTestCase {
         XCTAssertTrue(body.contains("throw PrimitiveDecodeError(modelName: modelName, row: row)"),
                       "decode misses in find/findAll must throw, not return nil / drop rows")
         XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void"))
-        XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]]"))
+        XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]]"))
         // Cross-document unique lookup + single-result query (JS parity:
         // findByUnique / queryOne).
         XCTAssertTrue(body.contains("static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> NoteRecord?"),
@@ -157,7 +157,7 @@ final class SwiftEmitterTests: XCTestCase {
                       "explicit-id provenance flag must be emitted")
         XCTAssertTrue(body.contains("var related: RelatedRecords = .empty"),
                       "query-time include payload bag must be emitted")
-        XCTAssertTrue(body.contains("self.related = RelatedRecords(raw: row[\"_related\"] as? [String: Any] ?? [:])"),
+        XCTAssertTrue(body.contains("self.related = RelatedRecords(raw: row[\"_related\"]?.objectValue ?? [:])"),
                       "row init must preserve `_related` include payloads")
         XCTAssertTrue(body.contains("self.id = PrimitiveSchemaRegistry.newId()"),
                       "auto-id convenience init must be emitted")
@@ -335,12 +335,15 @@ final class SwiftEmitterTests: XCTestCase {
                       "expected `var values` when there's at least one optional field")
     }
 
-    func testBooleanRowReadUsesNonTrailingClosure() throws {
-        // `(row[..] as? Int).map { ... }` triggers the "trailing
-        // closure in this context is confusable with the body of the
-        // statement" warning when it sits inside a `guard let ... else
-        // { return nil }` chain. The emitter must use the
-        // non-trailing form `.map({ ... })`.
+    func testBooleanRowReadGoesThroughRowBoolValue() throws {
+        // SQLite has no boolean type — a boolean field is stored as INTEGER,
+        // so a row carries `.number(0)` / `.number(1)` and a strict
+        // `.boolValue` read would drop the field (optional) or the whole row
+        // (required). The emitter reads through `rowBoolValue`, which accepts
+        // a number as well as a real `.bool` (#2546). It must also stay a
+        // plain accessor: the read sits inside a `guard let ... else { return
+        // nil }` chain, where a trailing closure trips the "confusable with
+        // the body of the statement" warning.
         let src = try emit("""
         [models.t]
         [models.t.fields.id]
@@ -350,8 +353,8 @@ final class SwiftEmitterTests: XCTestCase {
         required = true
         """)
         let body = try XCTUnwrap(src["TRecord"])
-        XCTAssertTrue(body.contains(".map({ $0 != 0 })"),
-                      "boolean row-read should use non-trailing closure")
+        XCTAssertTrue(body.contains("row[\"done\"]?.rowBoolValue"),
+                      "boolean row-read should go through rowBoolValue")
         XCTAssertFalse(body.contains(".map { $0 != 0 }"),
                        "no trailing-closure form for boolean row-read")
     }

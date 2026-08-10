@@ -78,11 +78,11 @@ final class CrossDocQueryTests: XCTestCase {
         let multi = try seededTrio()
         let rows = try multi.query([
             "$or": [
-                ["rank": 1] as [String: Any],
-                ["rank": 7] as [String: Any],
+                ["rank": 1],
+                ["rank": 7],
             ]
         ])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a1", "c3"])
     }
 
@@ -91,25 +91,25 @@ final class CrossDocQueryTests: XCTestCase {
         // tag = red AND rank >= 4 → a2 (red,4) and c3 (red,7)
         let rows = try multi.query([
             "$and": [
-                ["tag": "red"] as [String: Any],
-                ["rank": ["$gte": 4]] as [String: Any],
+                ["tag": "red"],
+                ["rank": ["$gte": 4]],
             ]
         ])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a2", "c3"])
     }
 
     func testInOperatorAcrossDocs() throws {
         let multi = try seededTrio()
         let rows = try multi.query(["rank": ["$in": [2, 5, 6]]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["b1", "b2", "c2"])
     }
 
     func testContainsTextOperatorAcrossDocs() throws {
         let multi = try seededTrio()
         let rows = try multi.query(["title": ["$containsText": "alpha"]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a1", "a2", "b2", "c2"],
                        "All four items with 'alpha' in title, spanning docA/docB/docC")
     }
@@ -124,16 +124,16 @@ final class CrossDocQueryTests: XCTestCase {
         let rows = try multi.query([
             "$or": [
                 ["$and": [
-                    ["tag": "red"] as [String: Any],
-                    ["rank": ["$lte": 4]] as [String: Any],
-                ]] as [String: Any],
+                    ["tag": "red"],
+                    ["rank": ["$lte": 4]],
+                ]],
                 ["$and": [
-                    ["tag": "green"] as [String: Any],
-                    ["rank": ["$gte": 6]] as [String: Any],
-                ]] as [String: Any],
+                    ["tag": "green"],
+                    ["rank": ["$gte": 6]],
+                ]],
             ]
         ])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a1", "a2", "c2"])
     }
 
@@ -149,7 +149,7 @@ final class CrossDocQueryTests: XCTestCase {
         let page1 = try multi.queryPaged(nil, options: QueryOptions(
             sortOrder: [("rank", 1)], limit: 3
         ))
-        XCTAssertEqual(page1.data.map { $0["id"] as? String }, ["a1", "b1", "c1"])
+        XCTAssertEqual(page1.data.map { $0["id"]?.stringValue }, ["a1", "b1", "c1"])
         XCTAssertTrue(page1.hasMore)
         XCTAssertNotNil(page1.nextCursor)
 
@@ -157,14 +157,14 @@ final class CrossDocQueryTests: XCTestCase {
         let page2 = try multi.queryPaged(nil, options: QueryOptions(
             sortOrder: [("rank", 1)], limit: 3, cursor: page1.nextCursor
         ))
-        XCTAssertEqual(page2.data.map { $0["id"] as? String }, ["a2", "b2", "c2"])
+        XCTAssertEqual(page2.data.map { $0["id"]?.stringValue }, ["a2", "b2", "c2"])
         XCTAssertTrue(page2.hasMore)
 
         // Page 3 (tail)
         let page3 = try multi.queryPaged(nil, options: QueryOptions(
             sortOrder: [("rank", 1)], limit: 3, cursor: page2.nextCursor
         ))
-        XCTAssertEqual(page3.data.map { $0["id"] as? String }, ["c3"])
+        XCTAssertEqual(page3.data.map { $0["id"]?.stringValue }, ["c3"])
         XCTAssertFalse(page3.hasMore)
     }
 
@@ -190,7 +190,7 @@ final class CrossDocQueryTests: XCTestCase {
             direction: .backward
         ))
         XCTAssertEqual(
-            Set(back.data.compactMap { $0["id"] as? String }),
+            Set(back.data.compactMap { $0["id"]?.stringValue }),
             ["a1", "b1", "c1"],
             "Walking back from page 2 returns page 1's records"
         )
@@ -215,11 +215,10 @@ final class CrossDocQueryTests: XCTestCase {
             ]
         )
         // Rank-asc excluding tag=blue: a1(1), c1(3), a2(4), c2(6), c3(7).
-        XCTAssertEqual(page1.data.map { $0["id"] as? String }, ["a1", "c1"])
+        XCTAssertEqual(page1.data.map { $0["id"]?.stringValue }, ["a1", "c1"])
         for row in page1.data {
-            let selfRec = (row["_related"] as? [String: Any])?["self"]
-                          as? [String: Any]
-            XCTAssertEqual(selfRec?["id"] as? String, row["id"] as? String,
+            let selfRec = row["_related"]?.objectValue?["self"]?.objectValue
+            XCTAssertEqual(selfRec?["id"]?.stringValue, row["id"]?.stringValue,
                            "Self-include should echo the row")
         }
         XCTAssertTrue(page1.hasMore)
@@ -234,6 +233,6 @@ final class CrossDocQueryTests: XCTestCase {
                         sourceField: "id", resultKey: "self")
             ]
         )
-        XCTAssertEqual(page2.data.map { $0["id"] as? String }, ["a2", "c2"])
+        XCTAssertEqual(page2.data.map { $0["id"]?.stringValue }, ["a2", "c2"])
     }
 }

@@ -259,7 +259,7 @@ final class CodegenAcceptanceTests: XCTestCase {
     /// Query-time include through the generated typed facade (#1161):
     /// callers can build an include from the generated model, query typed
     /// rows, and read typed related payloads without dropping to
-    /// `DynamicModel` or `[[String: Any]]`.
+    /// `DynamicModel` or `[[String: JSONValue]]`.
     func testGeneratedQueryIncludeReturnsTypedRelatedRows() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)

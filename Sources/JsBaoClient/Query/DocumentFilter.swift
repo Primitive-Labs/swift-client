@@ -2,7 +2,8 @@ import Foundation
 
 /// MongoDB-style filter operators for querying BaoModel records.
 ///
-/// Usage:
+/// Values are `JSONValue`, so literals read the same as they do in JS:
+///
 /// ```swift
 /// // Simple equality
 /// let filter: DocumentFilter = ["completed": true]
@@ -16,7 +17,15 @@ import Foundation
 /// // Logical
 /// let filter: DocumentFilter = ["$or": [["status": "done"], ["priority": ["$gte": 5]]]]
 /// ```
-public typealias DocumentFilter = [String: Any]
+///
+/// A value held in a variable needs its `JSONValue` case spelled out, since
+/// only literals convert implicitly:
+///
+/// ```swift
+/// let filter: DocumentFilter = ["authorId": .string(authorId)]
+/// let filter: DocumentFilter = ["id": ["$in": .array(ids.map { .string($0) })]]
+/// ```
+public typealias DocumentFilter = [String: JSONValue]
 
 /// Options for query operations. Cursor-based pagination is opaque
 /// and works alongside arbitrary sort orders — mirrors js-bao's

@@ -54,7 +54,7 @@ internal struct TaskRecord: PrimitiveModel, Equatable, Hashable, Codable {
 
     internal init(...) { ... }
     internal init?(record: PrimitiveRecord) { ... }
-    internal init?(row: [String: Any]) { ... }
+    internal init?(row: [String: JSONValue]) { ... }
     internal func primitiveValues() -> [String: PrimitiveValue] { ... }
 }
 ```

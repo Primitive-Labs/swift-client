@@ -49,10 +49,10 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
             self.id = record.id; self.title = title; self.done = done
         }
 
-        init?(row: [String: Any]) {
-            guard let id = row["id"] as? String,
-                  let title = row["title"] as? String,
-                  let done = (row["done"] as? Bool) ?? (row["done"] as? Int).map({ $0 != 0 })
+        init?(row: [String: JSONValue]) {
+            guard let id = row["id"]?.stringValue,
+                  let title = row["title"]?.stringValue,
+                  let done = row["done"]?.rowBoolValue
             else { return nil }
             self.id = id; self.title = title; self.done = done
         }
@@ -620,7 +620,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
             target: Self.throughTagSchema, joinModel: Self.throughLinkSchema,
             sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId"
         )
-        XCTAssertEqual(defaultRows.compactMap { $0["id"] as? String }, ["t1", "t2"],
+        XCTAssertEqual(defaultRows.compactMap { $0["id"]?.stringValue }, ["t1", "t2"],
                        "no declared join order → defaults to target id ASC")
 
         // DESC join order still yields target id ASC (the $in re-sort wins).
@@ -629,7 +629,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
             sourceId: "p1", joinModelLocalField: "postId", joinModelRelatedField: "tagId",
             joinModelOrderByField: "position", joinModelOrderDirection: "DESC"
         )
-        XCTAssertEqual(descRows.compactMap { $0["id"] as? String }, ["t1", "t2"],
+        XCTAssertEqual(descRows.compactMap { $0["id"]?.stringValue }, ["t1", "t2"],
                        "DESC join leg selects t2-then-t1 but output stays target id ASC")
     }
 
@@ -663,7 +663,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
                 limit: 2, afterCursor: after, beforeCursor: before, direction: direction
             )
         }
-        func ids(_ p: PagedQueryResult<PrimitiveRow>) -> [String] { p.data.compactMap { $0["id"] as? String } }
+        func ids(_ p: PagedQueryResult<PrimitiveRow>) -> [String] { p.data.compactMap { $0["id"]?.stringValue } }
 
         // Page 1 — first page: prevCursor nil, nextCursor present.
         let p1 = try page()
@@ -747,7 +747,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
                 joinModelOrderByField: "position",
                 limit: 2, afterCursor: cursor
             )
-            seen.append(contentsOf: p.data.compactMap { $0["id"] as? String })
+            seen.append(contentsOf: p.data.compactMap { $0["id"]?.stringValue })
             cursor = p.hasMore ? p.nextCursor : nil
             guardCount += 1
             XCTAssertLessThan(guardCount, 10, "pagination should terminate")
@@ -780,7 +780,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
             joinModelOrderByField: "weight", limit: 2
         )
         XCTAssertEqual(
-            page.data.compactMap { $0["id"] as? String }, ["t1"],
+            page.data.compactMap { $0["id"]?.stringValue }, ["t1"],
             "paging the shared join leg by a nullable order field should succeed"
         )
     }
@@ -889,10 +889,10 @@ extension CrossDocumentStaticQueryTests {
             self.id = record.id; self.slug = slug; self.body = body
         }
 
-        init?(row: [String: Any]) {
-            guard let id = row["id"] as? String,
-                  let slug = row["slug"] as? String,
-                  let body = row["body"] as? String
+        init?(row: [String: JSONValue]) {
+            guard let id = row["id"]?.stringValue,
+                  let slug = row["slug"]?.stringValue,
+                  let body = row["body"]?.stringValue
             else { return nil }
             self.id = id; self.slug = slug; self.body = body
         }
@@ -967,8 +967,8 @@ extension CrossDocumentStaticQueryTests {
             self.id = record.id; self.name = name
         }
 
-        init?(row: [String: Any]) {
-            guard let id = row["id"] as? String, let name = row["name"] as? String
+        init?(row: [String: JSONValue]) {
+            guard let id = row["id"]?.stringValue, let name = row["name"]?.stringValue
             else { return nil }
             self.id = id; self.name = name
         }
@@ -1011,13 +1011,13 @@ extension CrossDocumentStaticQueryTests {
             self.related = .empty
         }
 
-        init?(row: [String: Any]) {
-            guard let id = row["id"] as? String,
-                  let authorId = row["authorId"] as? String,
-                  let title = row["title"] as? String
+        init?(row: [String: JSONValue]) {
+            guard let id = row["id"]?.stringValue,
+                  let authorId = row["authorId"]?.stringValue,
+                  let title = row["title"]?.stringValue
             else { return nil }
             self.id = id; self.authorId = authorId; self.title = title
-            self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
+            self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         }
 
         func primitiveValues() -> [String: PrimitiveValue] {

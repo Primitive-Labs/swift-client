@@ -8,7 +8,7 @@ import Foundation
 /// batched FK lookup.
 public protocol IncludeTarget: AnyObject {
     var modelName: String { get }
-    func query(_ filter: DocumentFilter?, options: QueryOptions?) throws -> [[String: Any]]
+    func query(_ filter: DocumentFilter?, options: QueryOptions?) throws -> [[String: JSONValue]]
 }
 
 extension DynamicModel: IncludeTarget {}
@@ -120,7 +120,7 @@ enum IncludeResolver {
     /// Top-level entry — mutate `rows` in place, attaching
     /// `_related[resultKey]` for each include.
     static func resolve(
-        rows: inout [[String: Any]],
+        rows: inout [[String: JSONValue]],
         includes: [Include],
         depth: Int
     ) throws {
@@ -132,7 +132,7 @@ enum IncludeResolver {
             // write into it.
             for i in rows.indices {
                 if rows[i]["_related"] == nil {
-                    rows[i]["_related"] = [String: Any]()
+                    rows[i]["_related"] = .object([:])
                 }
             }
             let key = spec.resultKey ?? spec.target.modelName
@@ -149,12 +149,12 @@ enum IncludeResolver {
             // Recurse. Collect the related records attached under
             // `key` across all rows, then recurse with depth+1.
             if let nested = spec.include, !nested.isEmpty {
-                var collected: [[String: Any]] = []
+                var collected: [[String: JSONValue]] = []
                 for row in rows {
-                    let related = row["_related"] as? [String: Any]
-                    if let arr = related?[key] as? [[String: Any]] {
-                        collected.append(contentsOf: arr)
-                    } else if let obj = related?[key] as? [String: Any] {
+                    let attached = row["_related"]?.objectValue?[key]
+                    if let arr = attached?.arrayValue {
+                        collected.append(contentsOf: arr.compactMap { $0.objectValue })
+                    } else if let obj = attached?.objectValue {
                         collected.append(obj)
                     }
                 }
@@ -173,23 +173,23 @@ enum IncludeResolver {
     // MARK: - refersTo
 
     private static func resolveRefersTo(
-        rows: inout [[String: Any]],
+        rows: inout [[String: JSONValue]],
         spec: Include,
         key: String
     ) throws {
         guard let fkField = spec.sourceField else { return }
 
         let fkValues: [String] = Array(Set(
-            rows.compactMap { $0[fkField] as? String }.filter { !$0.isEmpty }
+            rows.compactMap { $0[fkField]?.stringValue }.filter { !$0.isEmpty }
         ))
         if fkValues.isEmpty {
             for i in rows.indices {
-                setRelated(&rows[i], key: key, value: NSNull())
+                setRelated(&rows[i], key: key, value: .null)
             }
             return
         }
 
-        var filter: DocumentFilter = ["id": ["$in": fkValues]]
+        var filter: DocumentFilter = ["id": ["$in": .array(fkValues.map { .string($0) })]]
         if let extra = spec.filter {
             for (k, v) in extra { filter[k] = v }
         }
@@ -197,17 +197,17 @@ enum IncludeResolver {
             filter,
             options: spec.projection.map { QueryOptions(projection: $0) }
         )
-        var lookup: [String: [String: Any]] = [:]
+        var lookup: [String: [String: JSONValue]] = [:]
         for r in relatedRows {
-            if let id = r["id"] as? String { lookup[id] = r }
+            if let id = r["id"]?.stringValue { lookup[id] = r }
         }
 
         for i in rows.indices {
-            let fk = rows[i][fkField] as? String
+            let fk = rows[i][fkField]?.stringValue
             if let fk, let match = lookup[fk] {
-                setRelated(&rows[i], key: key, value: match)
+                setRelated(&rows[i], key: key, value: .object(match))
             } else {
-                setRelated(&rows[i], key: key, value: NSNull())
+                setRelated(&rows[i], key: key, value: .null)
             }
         }
     }
@@ -215,7 +215,7 @@ enum IncludeResolver {
     // MARK: - refersToMany
 
     private static func resolveRefersToMany(
-        rows: inout [[String: Any]],
+        rows: inout [[String: JSONValue]],
         spec: Include,
         key: String
     ) throws {
@@ -232,9 +232,9 @@ enum IncludeResolver {
         var allTargetIds = Set<String>()
         for (i, row) in rows.enumerated() {
             let ids: [String]
-            if let arr = row[fkField] as? [String] {
+            if let arr = row[fkField]?.stringArrayValue {
                 ids = arr
-            } else if let csv = row[fkField] as? String, !csv.isEmpty {
+            } else if let csv = row[fkField]?.stringValue, !csv.isEmpty {
                 ids = csv.split(separator: ",").map(String.init)
             } else {
                 ids = []
@@ -245,12 +245,14 @@ enum IncludeResolver {
 
         if allTargetIds.isEmpty {
             for i in rows.indices {
-                setRelated(&rows[i], key: key, value: [[String: Any]]())
+                setRelated(&rows[i], key: key, value: .array([]))
             }
             return
         }
 
-        var filter: DocumentFilter = ["id": ["$in": Array(allTargetIds)]]
+        var filter: DocumentFilter = [
+            "id": ["$in": .array(allTargetIds.map { .string($0) })],
+        ]
         if let extra = spec.filter {
             for (k, v) in extra { filter[k] = v }
         }
@@ -269,9 +271,9 @@ enum IncludeResolver {
 
         // Build both a lookup (for O(1) membership) and preserve the
         // sorted order by walking `targetRows` directly.
-        var lookup: [String: [String: Any]] = [:]
+        var lookup: [String: [String: JSONValue]] = [:]
         for r in targetRows {
-            if let id = r["id"] as? String { lookup[id] = r }
+            if let id = r["id"]?.stringValue { lookup[id] = r }
         }
 
         for (parentIdx, ids) in perParent {
@@ -280,9 +282,9 @@ enum IncludeResolver {
             // parent's members. If no spec.sort was set, the target
             // query's default is `id ASC` (via resolveSort), so the
             // order is at least deterministic.
-            var matched: [[String: Any]] = []
+            var matched: [[String: JSONValue]] = []
             for row in targetRows {
-                guard let rid = row["id"] as? String,
+                guard let rid = row["id"]?.stringValue,
                       idSet.contains(rid) else { continue }
                 matched.append(row)
                 if let limit = spec.limit, matched.count >= limit { break }
@@ -296,14 +298,14 @@ enum IncludeResolver {
                     matched = Array(matched.prefix(limit))
                 }
             }
-            setRelated(&rows[parentIdx], key: key, value: matched)
+            setRelated(&rows[parentIdx], key: key, value: .array(matched.map { .object($0) }))
         }
     }
 
     // MARK: - hasMany
 
     private static func resolveHasMany(
-        rows: inout [[String: Any]],
+        rows: inout [[String: JSONValue]],
         spec: Include,
         key: String
     ) throws {
@@ -311,16 +313,18 @@ enum IncludeResolver {
         let localField = spec.localField ?? "id"
 
         let parentValues: [String] = Array(Set(
-            rows.compactMap { $0[localField] as? String }.filter { !$0.isEmpty }
+            rows.compactMap { $0[localField]?.stringValue }.filter { !$0.isEmpty }
         ))
         if parentValues.isEmpty {
             for i in rows.indices {
-                setRelated(&rows[i], key: key, value: [[String: Any]]())
+                setRelated(&rows[i], key: key, value: .array([]))
             }
             return
         }
 
-        var filter: DocumentFilter = [fkField: ["$in": parentValues]]
+        var filter: DocumentFilter = [
+            fkField: ["$in": .array(parentValues.map { .string($0) })],
+        ]
         if let extra = spec.filter {
             for (k, v) in extra { filter[k] = v }
         }
@@ -335,21 +339,21 @@ enum IncludeResolver {
         let opts = QueryOptions(sort: spec.sort, projection: queryProjection)
         let allRelated = try spec.target.query(filter, options: opts)
 
-        var grouped: [String: [[String: Any]]] = [:]
+        var grouped: [String: [[String: JSONValue]]] = [:]
         for r in allRelated {
-            guard let fk = r[fkField] as? String else { continue }
+            guard let fk = r[fkField]?.stringValue else { continue }
             var emitted = r
             if stripFK { emitted.removeValue(forKey: fkField) }
             grouped[fk, default: []].append(emitted)
         }
 
         for i in rows.indices {
-            let parentKey = rows[i][localField] as? String ?? ""
+            let parentKey = rows[i][localField]?.stringValue ?? ""
             var list = grouped[parentKey] ?? []
             if let limit = spec.limit, list.count > limit {
                 list = Array(list.prefix(limit))
             }
-            setRelated(&rows[i], key: key, value: list)
+            setRelated(&rows[i], key: key, value: .array(list.map { .object($0) }))
         }
     }
 
@@ -389,43 +393,44 @@ enum IncludeResolver {
     // MARK: - Helpers
 
     private static func setRelated(
-        _ row: inout [String: Any],
+        _ row: inout [String: JSONValue],
         key: String,
-        value: Any
+        value: JSONValue
     ) {
-        var related = row["_related"] as? [String: Any] ?? [:]
+        var related = row["_related"]?.objectValue ?? [:]
         related[key] = value
-        row["_related"] = related
+        row["_related"] = .object(related)
     }
 
     /// After recursing on nested related records we mutated those
     /// copies (array/value-type semantics). Put the mutated versions
     /// back into the parent's `_related`.
     private static func reattachMutatedRelated(
-        parents: inout [[String: Any]],
+        parents: inout [[String: JSONValue]],
         key: String,
-        children: [[String: Any]]
+        children: [[String: JSONValue]]
     ) {
         // Map children back to their parent rows by id.
-        var byId: [String: [String: Any]] = [:]
+        var byId: [String: [String: JSONValue]] = [:]
         for c in children {
-            if let id = c["id"] as? String { byId[id] = c }
+            if let id = c["id"]?.stringValue { byId[id] = c }
         }
         for i in parents.indices {
-            var related = parents[i]["_related"] as? [String: Any] ?? [:]
-            if let arr = related[key] as? [[String: Any]] {
-                related[key] = arr.map { orig -> [String: Any] in
-                    if let id = orig["id"] as? String, let updated = byId[id] {
-                        return updated
+            var related = parents[i]["_related"]?.objectValue ?? [:]
+            if let arr = related[key]?.arrayValue {
+                related[key] = .array(arr.map { element -> JSONValue in
+                    guard let orig = element.objectValue else { return element }
+                    if let id = orig["id"]?.stringValue, let updated = byId[id] {
+                        return .object(updated)
                     }
-                    return orig
-                }
-            } else if let obj = related[key] as? [String: Any] {
-                if let id = obj["id"] as? String, let updated = byId[id] {
-                    related[key] = updated
+                    return element
+                })
+            } else if let obj = related[key]?.objectValue {
+                if let id = obj["id"]?.stringValue, let updated = byId[id] {
+                    related[key] = .object(updated)
                 }
             }
-            parents[i]["_related"] = related
+            parents[i]["_related"] = .object(related)
         }
     }
 }

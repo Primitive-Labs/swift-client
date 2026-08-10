@@ -51,21 +51,21 @@ public struct QueryTranslator {
         var params: [Any] = []
 
         for (key, value) in filter {
-            if key == "$and", let arr = value as? [DocumentFilter] {
+            if key == "$and", let arr = subFilters(value) {
                 let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " AND ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
-            } else if key == "$or", let arr = value as? [DocumentFilter] {
+            } else if key == "$or", let arr = subFilters(value) {
                 let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " OR ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
-            } else if let ops = value as? [String: Any] {
+            } else if let ops = value.objectValue {
                 // Operator expression: { "field": { "$gt": 5 } }.
                 //
                 // Validate "at most one substring op per field" BEFORE the
@@ -100,7 +100,7 @@ public struct QueryTranslator {
                 }
             } else {
                 // Simple equality: { "field": value }
-                if value is NSNull {
+                if value.isNull {
                     conditions.append("\(quoted(key)) IS NULL")
                 } else {
                     conditions.append("\(quoted(key)) = ?")
@@ -123,7 +123,7 @@ public struct QueryTranslator {
     private static func translateOperator(
         field: String,
         op: String,
-        value: Any,
+        value: JSONValue,
         stringsetFields: Set<String> = [],
         stringFields: Set<String>? = nil,
         fieldTypes: [String: String]? = nil,
@@ -153,7 +153,7 @@ public struct QueryTranslator {
                 )
             }
             // Value-type check (js-bao DocumentQueryTranslator.ts:316-323).
-            guard let raw = value as? String else {
+            guard let raw = value.stringValue else {
                 throw substringError(
                     "\(op) operator requires a string value for field \(field)",
                     field: field, op: op, fieldType: type
@@ -176,11 +176,11 @@ public struct QueryTranslator {
 
         switch op {
         case "$eq":
-            if value is NSNull { return ("\(col) IS NULL", []) }
+            if value.isNull { return ("\(col) IS NULL", []) }
             return ("\(col) = ?", [sqlValue(value)])
 
         case "$ne":
-            if value is NSNull { return ("\(col) IS NOT NULL", []) }
+            if value.isNull { return ("\(col) IS NOT NULL", []) }
             // Exclude NULL rows so the result set matches js-bao
             // (browser.ts `$ne` emits `col != ?`, which SQLite evaluates
             // as UNKNOWN for NULL → row excluded). The earlier OR-NULL
@@ -199,14 +199,14 @@ public struct QueryTranslator {
             return ("\(col) <= ?", [sqlValue(value)])
 
         case "$in":
-            if let arr = value as? [Any], !arr.isEmpty {
+            if let arr = value.arrayValue, !arr.isEmpty {
                 let placeholders = arr.map { _ in "?" }.joined(separator: ",")
                 return ("\(col) IN (\(placeholders))", arr.map { sqlValue($0) })
             }
             return ("0", []) // empty $in matches nothing
 
         case "$nin":
-            if let arr = value as? [Any], !arr.isEmpty {
+            if let arr = value.arrayValue, !arr.isEmpty {
                 let placeholders = arr.map { _ in "?" }.joined(separator: ",")
                 // Same NULL-handling alignment as `$ne` above — exclude
                 // missing values so result sets match js-bao.
@@ -215,7 +215,7 @@ public struct QueryTranslator {
             return ("1", []) // empty $nin matches everything
 
         case "$exists":
-            let exists = (value as? Bool) ?? true
+            let exists = value.boolValue ?? true
             return (exists ? "\(col) IS NOT NULL" : "\(col) IS NULL", [])
 
         case "$contains":
@@ -228,7 +228,7 @@ public struct QueryTranslator {
                 NSLog("[QueryTranslator] WARNING: $contains on non-stringset field '\(field)' — filter dropped")
                 return ("0", [])
             }
-            guard let member = value as? String, !member.isEmpty else {
+            guard let member = value.stringValue, !member.isEmpty else {
                 assertionFailure("QueryTranslator: $contains requires a non-empty string value (field '\(field)')")
                 return ("0", [])
             }
@@ -299,7 +299,7 @@ public struct QueryTranslator {
     ///     the junction on a specific value and group by a `true`/`false`
     ///     CASE on whether the member is present.
     ///
-    /// Output stays flat `[[String: Any]]` rows (Swift's idiom) rather
+    /// Output stays flat `[[String: JSONValue]]` rows (Swift's idiom) rather
     /// than js-bao's nested map. `scopedToDocId`, when set, scopes the
     /// query to one document — woven into the WHERE here (not spliced by
     /// the caller) so its bind param lands after any JOIN params.
@@ -332,7 +332,7 @@ public struct QueryTranslator {
         //     through to its "regular" branch, which DROPS the facet field;
         //   - two or more facet fields → js-bao rejects it (a *recoverable*
         //     400, "Multiple StringSet facet fields not supported").
-        // The whole aggregate surface is non-throwing (`-> [[String: Any]]` at
+        // The whole aggregate surface is non-throwing (`-> [[String: JSONValue]]` at
         // every layer), so we DEGRADE here rather than crash the host app: a
         // pure single facet runs; a pure multi-facet returns no rows; anything
         // mixed drops the facet and proceeds as regular aggregation.
@@ -691,8 +691,37 @@ public struct QueryTranslator {
             .replacingOccurrences(of: "_", with: "\\_")
     }
 
-    private static func sqlValue(_ value: Any) -> Any {
-        if let b = value as? Bool { return b ? 1 : 0 }
-        return value
+    /// The `$and` / `$or` operand: an array of sub-filters. Anything that
+    /// isn't an array of objects reads as "not a logical operator", which is
+    /// what the `as? [DocumentFilter]` cast expressed before the row currency
+    /// became `JSONValue` — a `$or` whose operand is a scalar falls through to
+    /// the equality branch exactly as it did.
+    private static func subFilters(_ value: JSONValue) -> [DocumentFilter]? {
+        guard let items = value.arrayValue else { return nil }
+        let objects = items.compactMap { $0.objectValue }
+        return objects.count == items.count ? objects : nil
+    }
+
+    /// One filter value as a SQLite bind parameter. Booleans bind as 0/1
+    /// (SQLite has no boolean type). An integral number binds as `Int64` and
+    /// anything else as `Double`: only `number` fields get a REAL column, so a
+    /// numeric operand compared against a `string`/`date`/`id`/`json` column
+    /// (all TEXT) is converted with that column's TEXT affinity, where
+    /// `CAST(5 AS TEXT)` is `'5'` but `CAST(5.0 AS TEXT)` is `'5.0'`. Binding
+    /// `5` as REAL would therefore stop matching a stored `"5"` — the JS
+    /// client binds an integral number as INTEGER for the same reason.
+    /// Containers can't be bound — they only reach here through a malformed
+    /// filter — so they bind as SQL NULL, which matches nothing rather than
+    /// matching by accident.
+    private static func sqlValue(_ value: JSONValue) -> Any {
+        switch value {
+        case let .string(s):        return s
+        case let .number(n):
+            if let integral = Int64(exactly: n) { return integral }
+            return n
+        case let .bool(b):          return b ? 1 : 0
+        case .null:                 return NSNull()
+        case .array, .object:       return NSNull()
+        }
     }
 }

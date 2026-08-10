@@ -45,14 +45,14 @@ final class QueryDocumentsFilterTests: XCTestCase {
     func testDocumentsSingleScopeReturnsOnlyThatDoc() throws {
         let multi = try seededTrio()
         let rows = try multi.query(nil, options: QueryOptions(documents: ["docA"]))
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a1"])
     }
 
     func testDocumentsMultipleScopeUnionsMatches() throws {
         let multi = try seededTrio()
         let rows = try multi.query(nil, options: QueryOptions(documents: ["docA", "docC"]))
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a1", "c1"])
     }
 
@@ -80,7 +80,7 @@ final class QueryDocumentsFilterTests: XCTestCase {
         )
         // rank >= 2 matches b1 (rank 2) and c1 (rank 3); documents
         // scope keeps only b1.
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["b1"])
     }
 
@@ -102,6 +102,6 @@ final class QueryDocumentsFilterTests: XCTestCase {
                 documents: ["docA", "docC"]
             )
         )
-        XCTAssertEqual(page.data.map { $0["id"] as? String }, ["a1", "c1"])
+        XCTAssertEqual(page.data.map { $0["id"]?.stringValue }, ["a1", "c1"])
     }
 }

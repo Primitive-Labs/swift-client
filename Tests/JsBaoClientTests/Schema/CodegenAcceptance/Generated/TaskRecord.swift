@@ -131,16 +131,16 @@ public struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
-    public init?(row: [String: Any]) {
-        guard let id = row["id"] as? String,
-              let title = row["title"] as? String
+    public init?(row: [String: JSONValue]) {
+        guard let id = row["id"]?.stringValue,
+              let title = row["title"]?.stringValue
         else { return nil }
         self.id = id
         self.title = title
-        self.priority = row["priority"] as? Double
-        self.tags = (row["tags"] as? [String]).map(Set.init)
-        self.createdAt = row["createdAt"] as? String
-        self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
+        self.priority = row["priority"]?.numberValue
+        self.tags = (row["tags"]?.stringArrayValue).map(Set.init)
+        self.createdAt = row["createdAt"]?.stringValue
+        self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }
 
@@ -321,7 +321,7 @@ public extension TaskRecord {
     }
 
     /// Aggregate (group / count / sum / avg / …) across all open documents.
-    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+    static func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         try JsBaoClient.requireDefault().codegen.aggregate(primitiveSchema, options: options)
     }
 

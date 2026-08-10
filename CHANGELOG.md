@@ -20,6 +20,36 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### The query row currency is `[String: JSONValue]` (#2546)
+
+The split-out remainder of the #2367 batch below. A query row was
+`[String: Any]`; it is now `[String: JSONValue]`, so `PrimitiveRow` is
+`Sendable` by checked conformance instead of by a written safety argument, and
+a row value is read by accessor rather than by cast.
+
+What moved: `PrimitiveRow.raw` and its `subscript` / `one` / `many`,
+`PrimitiveRowDecodable.init?(row:)`, `DocumentFilter`,
+`IncludeTarget.query(_:options:)`, and the `DynamicModel` / `MultiDocModel` /
+`client.codegen` row returns (`query`, `queryPaged`, `find`, `findByUnique`,
+`queryOne`, `aggregate`, the relationship traversals).
+
+**Regenerate your models first** — the emitter writes the row reads, so codegen
+output changes. For most apps that is the whole migration. After that:
+
+```swift
+let title = row["title"]?.stringValue        // was: row["title"] as? String
+let priority = row["priority"]?.numberValue  // was: as? Double
+let done = row["done"]?.rowBoolValue         // was: as? Bool
+let tags = row["tags"]?.stringArrayValue     // was: as? [String]
+```
+
+Every row number is a `.number(Double)`, including a SQLite INTEGER column;
+booleans are stored as INTEGER, which is why they read through `rowBoolValue`.
+Filter literals bind unchanged (`["priority": ["$gte": 4]]`); a filter value
+held in a variable needs its case spelled out
+(`["authorId": .string(authorId)]`). `JSONValue.toAny()` is public now for
+boundaries that still need the loose `Any` graph.
+
 ### The batched breaking API cleanup (#2367)
 
 One deliberate source break covering everything that had been queued behind
@@ -108,17 +138,12 @@ forms until `JSONValue` gains an integer case. Finishing the job — retyping th
 positional parameters too — is the **known future break** this migration does
 not cover.
 
-**The query/storage row currency** (`PrimitiveRow.raw`,
-`PrimitiveRowDecodable.init?(row:)`, `DocumentFilter`, `IncludeTarget`, the
-`DynamicModel` / `MultiDocModel` returns, and `DatabaseChangeEvent.data` /
-`.previousData`) also keeps `[String: Any]` / `Any?`, but for a different
-reason: size, not correctness. Retyping it reaches the codegen
-emitter's row-decode expressions, so it re-rolls every generated model and
-every golden — in the client, the template, the demo and the CLI's Swift
-fixtures. It was in this batch's original scope and was split into
-**issue #2546** rather than landed on top of a migration that already touches
-all of those. When it lands, regenerating your models is expected to be the
-whole of your side of it.
+**The query/storage row currency** was in this batch's original scope and was
+split into **issue #2546** rather than landed on top of a migration that
+already touches every generated artifact. It has since landed — see "The query
+row currency is `[String: JSONValue]`" below. `DatabaseChangeEvent.data` /
+`.previousData` stay `Any?`: they are the DoDb subscription payload, a separate
+surface, tracked in **#2579**.
 ### A refresh-time network outage is no longer reported as a 401 (#2366)
 
 When a request got a 401 and the token refresh that followed could not reach

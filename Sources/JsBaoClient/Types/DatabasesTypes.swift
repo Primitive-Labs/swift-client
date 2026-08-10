@@ -556,11 +556,12 @@ public struct DatabaseSuccessResult: Decodable, Sendable, Equatable {
 /// `data` and `previousData` are opaque record blobs, still typed `Any?` —
 /// which is why this type and its `DatabaseChangePayload` envelope are
 /// `@unchecked Sendable` rather than checked, even though
-/// `DatabasesAPI.subscribe`'s callback is now `@Sendable` (#2367). They are
-/// database rows, so they are part of the row currency deferred to **#2546**
-/// and get retyped to `JSONValue` there, with the generated models. Until
-/// then, convert one with `JSONValue.typedRow(from:)` before handing it across
-/// an actor boundary — the compiler will not do it for you.
+/// `DatabasesAPI.subscribe`'s callback is now `@Sendable` (#2367). #2546
+/// retyped the *document* query row currency and left these alone — they are
+/// the DoDb subscription payload, a separate surface — so retyping them is
+/// tracked in **#2579**. Until then, convert one with
+/// `JSONValue.typedRow(from:)` before handing it across an actor boundary —
+/// the compiler will not do it for you.
 public struct DatabaseChangeEvent: @unchecked Sendable {
     /// `"enter" | "update" | "leave"` — absent on older server frames.
     public let changeType: String?

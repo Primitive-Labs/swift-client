@@ -41,8 +41,9 @@ import Foundation
 /// Note the boundary: this says nothing about the `DatabaseChangePayload` the
 /// stored callback is *handed*. That type and its `DatabaseChangeEvent`
 /// elements are still `@unchecked Sendable` because `data` / `previousData`
-/// are `Any?` — row currency deferred to #2546. Annotating `onChange`
-/// `@Sendable` did not make its argument checked.
+/// are `Any?` — the DoDb subscription payload, tracked separately in #2579
+/// (#2546 retyped the document query row currency, not this one). Annotating
+/// `onChange` `@Sendable` did not make its argument checked.
 ///
 /// The argument that the registry itself is safe has three parts:
 ///

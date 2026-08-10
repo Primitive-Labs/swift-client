@@ -92,11 +92,11 @@ public struct BareBonesRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
-    public init?(row: [String: Any]) {
-        guard let id = row["id"] as? String
+    public init?(row: [String: JSONValue]) {
+        guard let id = row["id"]?.stringValue
         else { return nil }
         self.id = id
-        self.related = RelatedRecords(raw: row["_related"] as? [String: Any] ?? [:])
+        self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }
 
@@ -260,7 +260,7 @@ public extension BareBonesRecord {
     }
 
     /// Aggregate (group / count / sum / avg / …) across all open documents.
-    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+    static func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         try JsBaoClient.requireDefault().codegen.aggregate(primitiveSchema, options: options)
     }
 

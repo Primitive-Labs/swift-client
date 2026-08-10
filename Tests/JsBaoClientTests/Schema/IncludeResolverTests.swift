@@ -87,10 +87,9 @@ final class IncludeResolverTests: XCTestCase {
                     sourceField: "userId", resultKey: "author")
         ])
         XCTAssertEqual(rows.count, 3)
-        let firstAuthor = ((rows[0]["_related"] as? [String: Any])?["author"]
-            as? [String: Any])
-        XCTAssertEqual(firstAuthor?["id"] as? String, "u1")
-        XCTAssertEqual(firstAuthor?["name"] as? String, "Alice")
+        let firstAuthor = rows[0]["_related"]?.objectValue?["author"]?.objectValue
+        XCTAssertEqual(firstAuthor?["id"]?.stringValue, "u1")
+        XCTAssertEqual(firstAuthor?["name"]?.stringValue, "Alice")
     }
 
     /// A post with a missing FK gets `_related.author = nil`.
@@ -105,10 +104,10 @@ final class IncludeResolverTests: XCTestCase {
                         sourceField: "userId", resultKey: "author")
             ]
         )
-        let related = rows[0]["_related"] as? [String: Any]
+        let related = rows[0]["_related"]?.objectValue
         XCTAssertNotNil(related, "_related container must exist")
-        XCTAssertTrue(related?["author"] is NSNull || related?["author"] == nil,
-                      "Missing FK → nil author")
+        XCTAssertTrue(related?["author"]?.isNull ?? true,
+                      "Missing FK → null author")
     }
 
     /// Two parents sharing an FK hit ONE target record but attach it
@@ -125,9 +124,8 @@ final class IncludeResolverTests: XCTestCase {
         )
         XCTAssertEqual(rows.count, 2)
         for row in rows {
-            let author = ((row["_related"] as? [String: Any])?["author"]
-                as? [String: Any])
-            XCTAssertEqual(author?["id"] as? String, "u1",
+            let author = row["_related"]?.objectValue?["author"]?.objectValue
+            XCTAssertEqual(author?["id"]?.stringValue, "u1",
                            "Both posts share the same author record")
         }
     }
@@ -144,9 +142,9 @@ final class IncludeResolverTests: XCTestCase {
                         sourceField: "tagIds", resultKey: "tags")
             ]
         )
-        let related = rows[0]["_related"] as? [String: Any]
-        let tagRecords = related?["tags"] as? [[String: Any]] ?? []
-        let tagIds = Set(tagRecords.compactMap { $0["id"] as? String })
+        let related = rows[0]["_related"]?.objectValue
+        let tagRecords = related?["tags"]?.rowsValue ?? []
+        let tagIds = Set(tagRecords.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(tagIds, ["t1", "t2"])
     }
 
@@ -166,9 +164,8 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let related = (rows[0]["_related"] as? [String: Any])?["tags"]
-            as? [[String: Any]] ?? []
-        XCTAssertEqual(related.compactMap { $0["id"] as? String }, ["t1"])
+        let related = rows[0]["_related"]?.objectValue?["tags"]?.rowsValue ?? []
+        XCTAssertEqual(related.compactMap { $0["id"]?.stringValue }, ["t1"])
     }
 
     /// `refersToMany` with sort orders the resolved records.
@@ -186,10 +183,9 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let related = (rows[0]["_related"] as? [String: Any])?["tags"]
-            as? [[String: Any]] ?? []
+        let related = rows[0]["_related"]?.objectValue?["tags"]?.rowsValue ?? []
         XCTAssertEqual(
-            related.compactMap { $0["name"] as? String },
+            related.compactMap { $0["name"]?.stringValue },
             ["blue", "red"],
             "Sort ASC on name should emit blue before red"
         )
@@ -210,10 +206,9 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let related = (rows[0]["_related"] as? [String: Any])?["tags"]
-            as? [[String: Any]] ?? []
+        let related = rows[0]["_related"]?.objectValue?["tags"]?.rowsValue ?? []
         XCTAssertEqual(related.count, 1)
-        XCTAssertEqual(related[0]["name"] as? String, "blue",
+        XCTAssertEqual(related[0]["name"]?.stringValue, "blue",
                        "Sorted ASC then limited to 1 → blue")
     }
 
@@ -233,15 +228,13 @@ final class IncludeResolverTests: XCTestCase {
             ]
         )
         XCTAssertEqual(rows.count, 2)
-        let t2FromP1 = (rows[0]["_related"] as? [String: Any])?["tags"]
-            as? [[String: Any]]
-        let t2FromP2 = (rows[1]["_related"] as? [String: Any])?["tags"]
-            as? [[String: Any]]
-        let p1T2 = t2FromP1?.first(where: { $0["id"] as? String == "t2" })
-        let p2T2 = t2FromP2?.first(where: { $0["id"] as? String == "t2" })
+        let t2FromP1 = rows[0]["_related"]?.objectValue?["tags"]?.rowsValue
+        let t2FromP2 = rows[1]["_related"]?.objectValue?["tags"]?.rowsValue
+        let p1T2 = t2FromP1?.first(where: { $0["id"]?.stringValue == "t2" })
+        let p2T2 = t2FromP2?.first(where: { $0["id"]?.stringValue == "t2" })
         XCTAssertNotNil(p1T2)
         XCTAssertNotNil(p2T2)
-        XCTAssertEqual(p1T2?["name"] as? String, p2T2?["name"] as? String,
+        XCTAssertEqual(p1T2?["name"]?.stringValue, p2T2?["name"]?.stringValue,
                        "Same record via shared member must look identical on both parents")
     }
 
@@ -260,8 +253,7 @@ final class IncludeResolverTests: XCTestCase {
                         sourceField: "tagIds", resultKey: "tags")
             ]
         )
-        let tagRecords = (rows[0]["_related"] as? [String: Any])?["tags"]
-            as? [[String: Any]]
+        let tagRecords = rows[0]["_related"]?.objectValue?["tags"]?.rowsValue
         XCTAssertEqual(tagRecords?.count, 0)
     }
 
@@ -274,15 +266,13 @@ final class IncludeResolverTests: XCTestCase {
             Include(type: .hasMany, target: posts,
                     foreignKey: "userId", resultKey: "posts")
         ])
-        let u1 = rows.first(where: { $0["id"] as? String == "u1" })
-        let u1Posts = ((u1?["_related"]) as? [String: Any])?["posts"]
-            as? [[String: Any]]
-        XCTAssertEqual(Set(u1Posts?.compactMap { $0["id"] as? String } ?? []),
+        let u1 = rows.first(where: { $0["id"]?.stringValue == "u1" })
+        let u1Posts = u1?["_related"]?.objectValue?["posts"]?.rowsValue
+        XCTAssertEqual(Set(u1Posts?.compactMap { $0["id"]?.stringValue } ?? []),
                        ["p1", "p2"])
-        let u2 = rows.first(where: { $0["id"] as? String == "u2" })
-        let u2Posts = ((u2?["_related"]) as? [String: Any])?["posts"]
-            as? [[String: Any]]
-        XCTAssertEqual(Set(u2Posts?.compactMap { $0["id"] as? String } ?? []),
+        let u2 = rows.first(where: { $0["id"]?.stringValue == "u2" })
+        let u2Posts = u2?["_related"]?.objectValue?["posts"]?.rowsValue
+        XCTAssertEqual(Set(u2Posts?.compactMap { $0["id"]?.stringValue } ?? []),
                        ["p3"])
     }
 
@@ -303,9 +293,8 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let uPosts = (rows[0]["_related"] as? [String: Any])?["posts"]
-            as? [[String: Any]]
-        XCTAssertEqual(uPosts?.compactMap { $0["id"] as? String }, ["p2"])
+        let uPosts = rows[0]["_related"]?.objectValue?["posts"]?.rowsValue
+        XCTAssertEqual(uPosts?.compactMap { $0["id"]?.stringValue }, ["p2"])
     }
 
     /// `hasMany` with sort orders the included records.
@@ -323,9 +312,8 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let uPosts = (rows[0]["_related"] as? [String: Any])?["posts"]
-            as? [[String: Any]]
-        XCTAssertEqual(uPosts?.compactMap { $0["id"] as? String }, ["p2", "p1"],
+        let uPosts = rows[0]["_related"]?.objectValue?["posts"]?.rowsValue
+        XCTAssertEqual(uPosts?.compactMap { $0["id"]?.stringValue }, ["p2", "p1"],
                        "Sort by score DESC → p2 (20) before p1 (10)")
     }
 
@@ -346,10 +334,9 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let uPosts = (rows[0]["_related"] as? [String: Any])?["posts"]
-            as? [[String: Any]]
+        let uPosts = rows[0]["_related"]?.objectValue?["posts"]?.rowsValue
         XCTAssertEqual(uPosts?.count, 1)
-        XCTAssertEqual(uPosts?.first?["id"] as? String, "p1")
+        XCTAssertEqual(uPosts?.first?["id"]?.stringValue, "p1")
     }
 
     /// Include-mode projection that omits the foreign key must not
@@ -370,9 +357,8 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let uPosts = (rows[0]["_related"] as? [String: Any])?["posts"]
-            as? [[String: Any]] ?? []
-        XCTAssertEqual(Set(uPosts.compactMap { $0["id"] as? String }),
+        let uPosts = rows[0]["_related"]?.objectValue?["posts"]?.rowsValue ?? []
+        XCTAssertEqual(Set(uPosts.compactMap { $0["id"]?.stringValue }),
                        ["p1", "p2"],
                        "Related posts must not be dropped when projection omits FK")
         for p in uPosts {
@@ -399,9 +385,8 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let uPosts = (rows[0]["_related"] as? [String: Any])?["posts"]
-            as? [[String: Any]] ?? []
-        XCTAssertEqual(Set(uPosts.compactMap { $0["id"] as? String }),
+        let uPosts = rows[0]["_related"]?.objectValue?["posts"]?.rowsValue ?? []
+        XCTAssertEqual(Set(uPosts.compactMap { $0["id"]?.stringValue }),
                        ["p1", "p2"])
         for p in uPosts {
             XCTAssertNil(p["userId"])
@@ -430,11 +415,9 @@ final class IncludeResolverTests: XCTestCase {
                 )
             ]
         )
-        let author = (rows[0]["_related"] as? [String: Any])?["author"]
-            as? [String: Any]
-        let authorsPosts = (author?["_related"] as? [String: Any])?["allPosts"]
-            as? [[String: Any]]
-        XCTAssertEqual(Set(authorsPosts?.compactMap { $0["id"] as? String } ?? []),
+        let author = rows[0]["_related"]?.objectValue?["author"]?.objectValue
+        let authorsPosts = author?["_related"]?.objectValue?["allPosts"]?.rowsValue
+        XCTAssertEqual(Set(authorsPosts?.compactMap { $0["id"]?.stringValue } ?? []),
                        ["p1", "p2"])
     }
 
@@ -464,12 +447,10 @@ final class IncludeResolverTests: XCTestCase {
             ]
         )
         // Inspect the 4th level — should be absent (depth cut off).
-        let author = (rows[0]["_related"] as? [String: Any])?["author"]
-            as? [String: Any]
-        let lvl2posts = (author?["_related"] as? [String: Any])?["posts"]
-            as? [[String: Any]]
-        let lvl3author = (lvl2posts?.first?["_related"]
-            as? [String: Any])?["author"] as? [String: Any]
+        let author = rows[0]["_related"]?.objectValue?["author"]?.objectValue
+        let lvl2posts = author?["_related"]?.objectValue?["posts"]?.rowsValue
+        let lvl3author = lvl2posts?.first?["_related"]?
+            .objectValue?["author"]?.objectValue
         // Level 3 author exists. Level 4 posts should NOT (cut off).
         XCTAssertNotNil(lvl3author)
         XCTAssertNil(lvl3author?["_related"])
@@ -489,10 +470,10 @@ final class IncludeResolverTests: XCTestCase {
                         sourceField: "tagIds", resultKey: "tags"),
             ]
         )
-        let related = rows[0]["_related"] as? [String: Any]
-        let author = related?["author"] as? [String: Any]
-        let tagRecs = related?["tags"] as? [[String: Any]]
-        XCTAssertEqual(author?["id"] as? String, "u1")
+        let related = rows[0]["_related"]?.objectValue
+        let author = related?["author"]?.objectValue
+        let tagRecs = related?["tags"]?.rowsValue
+        XCTAssertEqual(author?["id"]?.stringValue, "u1")
         XCTAssertEqual(tagRecs?.count, 2)
     }
 
@@ -509,7 +490,7 @@ final class IncludeResolverTests: XCTestCase {
                         sourceField: "userId")  // no `as:`
             ]
         )
-        let related = rows[0]["_related"] as? [String: Any]
+        let related = rows[0]["_related"]?.objectValue
         XCTAssertNotNil(related?["inc_users"],
                         "Default result key should be target's modelName")
     }

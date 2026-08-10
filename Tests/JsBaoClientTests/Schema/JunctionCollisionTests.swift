@@ -74,7 +74,7 @@ final class JunctionCollisionTests: XCTestCase {
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%\\_\\_%' ESCAPE '\\'",
             params: []
         )
-        let names = Set(tables.compactMap { $0["name"] as? String })
+        let names = Set(tables.compactMap { $0["name"]?.stringValue })
         XCTAssertTrue(names.contains("users__posts_tags"),
                       "Expected junction users__posts_tags in \(names)")
         XCTAssertTrue(names.contains("users_posts__tags"),

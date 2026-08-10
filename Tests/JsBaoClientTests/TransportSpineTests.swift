@@ -529,20 +529,6 @@ final class TransportSpineTests: XCTestCase {
             // set is net zero on this commit: `JsBaoClient.swift` gave one back
             // (22 -> 21) below.
             "API/WorkflowsAPI.swift": (11, 2, 0),
-            // The codegen-backing surface, moved off `JsBaoClient` into its own
-            // facade by #2367. These are the storage layer's row currency
-            // (`PrimitiveRow`'s shape). Retyping it was in #2367's scope and
-            // was split out: it reaches the emitter's row-decode expressions,
-            // so it re-rolls every generated model and every golden — in this
-            // package, in the template, in the demo and in the CLI's Swift
-            // fixtures. Not a correctness problem, a size one. The count here
-            // must not grow.
-            // The review of this PR took it 10 -> 11: making `client` `weak`
-            // (it is handed out by the public `client.codegen` property, so
-            // `unowned` could trap) needs a `DetachedIncludeTarget` whose
-            // `query` throws, and that conformance repeats `IncludeTarget`'s
-            // own `[[String: Any]]` return. Same row currency, one more line.
-            "API/CodegenAPI.swift": (11, 0, 0),
             // JWT payload parsing (the serialization boundary the design
             // sanctions). Every HTTP response `AuthController` reads is typed.
             // Phase E (#1994) took it 12 -> 4: the eight event payloads emitted
@@ -667,15 +653,16 @@ final class TransportSpineTests: XCTestCase {
         // and `DatabaseSubscribeOptions.params` to `[String: JSONValue]`, and
         // deleted `Internal/ClosureTransport.swift` and the
         // `Types/JsBaoEventPayload.swift` legacy bridge outright — so those two
-        // budget entries are gone rather than zeroed. What is left under this
-        // ceiling is the storage / query row currency (`Schema/`, `Query/`,
-        // `Internal/DocumentManager`, `Internal/LocalFirstListing`) plus
-        // `PasskeyWire`. Retyping the row currency was in the batch's original
-        // scope and was split out into its own issue — it reaches the emitter's
-        // row-decode expressions, so it re-rolls every generated model and
-        // golden in this package, the template, the demo and the CLI's Swift
-        // fixtures.
-        let outOfScopeUntypedDictionaryCeiling = 103
+        // budget entries are gone rather than zeroed.
+        // Lowered 103 -> 41 by #2546, the split-out remainder of that batch:
+        // the query/storage row currency is `[String: JSONValue]` now, so
+        // `Schema/` and `Query/` are clear and `API/CodegenAPI.swift`'s budget
+        // entry is deleted rather than zeroed (it now passes the `API/` must-be-
+        // zero rule below like every other API file). What is left is
+        // `Internal/DocumentManager` + `Internal/LocalFirstListing` (the server
+        // document payload), `Utils/PasskeyWire`, and the scattered
+        // `JSONSerialization` shape checks.
+        let outOfScopeUntypedDictionaryCeiling = 41
         var outOfScopeUntypedDictionaries = 0
 
         for (relativePath, url) in try allSourceFiles() where budget[relativePath] == nil {

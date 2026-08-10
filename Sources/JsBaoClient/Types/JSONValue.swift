@@ -96,6 +96,31 @@ public enum JSONValue: Codable, Sendable, Equatable {
     /// Subscript into an object value; returns `nil` for non-objects or
     /// missing keys.
     public subscript(key: String) -> JSONValue? { objectValue?[key] }
+
+    // MARK: - Query-row accessors
+    //
+    // A query row (`[String: JSONValue]`) comes out of SQLite, where two
+    // column shapes don't line up with the strict accessors above. These two
+    // read them; generated `init?(row:)` uses both.
+
+    /// A row column read as a boolean. SQLite has no boolean type — a boolean
+    /// field is stored as INTEGER, so the row carries `.number(0)` /
+    /// `.number(1)`. A real `.bool` is accepted too; anything else is `nil`.
+    public var rowBoolValue: Bool? {
+        switch self {
+        case let .bool(b):   return b
+        case let .number(n): return n != 0
+        default:             return nil
+        }
+    }
+
+    /// A row column read as `[String]` — the shape a stringset field takes
+    /// after the engine's junction-table population pass (an `.array` of
+    /// `.string`). Non-string members are dropped; a non-array is `nil`.
+    public var stringArrayValue: [String]? {
+        guard case let .array(items) = self else { return nil }
+        return items.compactMap { $0.stringValue }
+    }
 }
 
 public extension JSONValue {

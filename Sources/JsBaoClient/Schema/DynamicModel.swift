@@ -425,7 +425,13 @@ public final class DynamicModel: @unchecked Sendable {
         )
         self.queryEngine = engine
 
-        SchemaSync.syncModelMeta(doc: doc, schema: schema)
+        // NOTE: _meta_* is NOT written here. js-bao parity (#2587): the JS
+        // client writes model metadata at save-time (`BaseModel.save` ->
+        // `syncModelMeta`), never at open/connect, so a client that only
+        // reads a document sends no pre-sync CRDT writes — a cold open's
+        // syncStep1 carries a genuinely empty state vector. See
+        // `applyWrite`/`save`, which call the in-transaction
+        // `SchemaSync.syncModelMeta(doc:schema:transaction:)`.
 
         // One-shot init transaction: install the root observer, then
         // iterate existing records and install per-record observers
@@ -573,6 +579,8 @@ public final class DynamicModel: @unchecked Sendable {
                 id: id, values: values, isUpdate: isUpdate,
                 changedFields: changedFields, tx: txn
             )
+            // JS parity: meta syncs at save-time (see applyWrite; #2587).
+            SchemaSync.syncModelMeta(doc: self.doc, schema: self.schema, transaction: txn)
         }
         return PrimitiveRecord(modelName: schema.name, id: id, model: self)
     }
@@ -852,7 +860,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// up-to-date; remote writes are picked up asynchronously via
     /// the root-map observer. We drain that queue before reading so
     /// callers always see the latest state.
-    public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [[String: Any]] {
+    public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [[String: JSONValue]] {
         awaitObserverDrain()
         return try queryEngine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -879,7 +887,7 @@ public final class DynamicModel: @unchecked Sendable {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         awaitObserverDrain()
         var rows = try queryEngine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -941,7 +949,7 @@ public final class DynamicModel: @unchecked Sendable {
         )
     }
 
-    public func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+    public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         awaitObserverDrain()
         return try queryEngine.aggregate(
             modelName: schema.name, options: options, scopedToDocId: docId,
@@ -956,15 +964,15 @@ public final class DynamicModel: @unchecked Sendable {
     /// on the main table's row dict. `upsertSqliteRow` pulls stringset
     /// values out separately and passes them to the engine via its
     /// `stringsets` parameter so they land in the junction tables.
-    private func sqliteRepresentation(of value: PrimitiveValue) -> Any? {
+    private func sqliteRepresentation(of value: PrimitiveValue) -> JSONValue? {
         switch value {
-        case let .string(s):    return s
-        case let .number(n):    return n
-        case let .boolean(b):   return b
-        case let .id(s):        return s
-        case let .date(s):      return s
+        case let .string(s):    return .string(s)
+        case let .number(n):    return .number(n)
+        case let .boolean(b):   return .bool(b)
+        case let .id(s):        return .string(s)
+        case let .date(s):      return .string(s)
         case .stringset:        return nil
-        case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
+        case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
         }
     }
 
@@ -1394,6 +1402,10 @@ public final class DynamicModel: @unchecked Sendable {
                 changedFields: changedFields,
                 tx: txn
             )
+            // After a successful write, mirror js-bao `BaseModel.save`:
+            // ensure the doc carries this model's `_meta_*` (op-free when
+            // it already matches; #2587).
+            SchemaSync.syncModelMeta(doc: self.doc, schema: self.schema, transaction: txn)
         }
     }
 
@@ -1913,7 +1925,7 @@ public final class DynamicModel: @unchecked Sendable {
         }
         // Main-row dict (scalars only). `_meta_doc_id` makes the row
         // addressable under the shared-engine compound PK.
-        var row: [String: Any] = ["id": id, "_meta_doc_id": docId]
+        var row: [String: JSONValue] = ["id": .string(id), "_meta_doc_id": .string(docId)]
         // Stringsets routed separately into junction tables.
         var stringsets: [String: [String]] = [:]
         let snap = snapshotFromMap(rec: rec, tx: tx)

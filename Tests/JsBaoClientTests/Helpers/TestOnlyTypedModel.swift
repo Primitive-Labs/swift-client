@@ -45,7 +45,7 @@ final class TypedModel<T: PrimitiveModel> {
 
     func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [T] {
         try dynamic.query(filter, options: options).compactMap { row in
-            guard let id = row["id"] as? String else { return nil }
+            guard let id = row["id"]?.stringValue else { return nil }
             return find(id: id)
         }
     }

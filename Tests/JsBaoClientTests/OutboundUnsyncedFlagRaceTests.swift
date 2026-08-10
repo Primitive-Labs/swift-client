@@ -1,5 +1,7 @@
 import XCTest
 @testable import JsBaoClient
+import YSwift
+import Yniffi
 
 /// Regression tests for issue #2004.
 ///
@@ -19,6 +21,15 @@ import XCTest
 /// Server-free: the client is built with unreachable URLs and never connects; the
 /// outbound send is intercepted by replacing `DocumentManager.sendWebSocketMessage`.
 final class OutboundUnsyncedFlagRaceTests: XCTestCase {
+
+    /// Collect update frames off a doc's observer (which fires on the writing
+    /// thread) without tripping Swift 6 concurrency checking.
+    private final class UpdateSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var frames: [[UInt8]] = []
+        func append(_ update: [UInt8]) { lock.withLock { frames.append(update) } }
+        var all: [[UInt8]] { lock.withLock { frames } }
+    }
 
     /// A client that never talks to a server: no `connect()`, in-memory storage,
     /// and zero outbound debounce so the flush races the queue call.
@@ -380,12 +391,40 @@ final class OutboundUnsyncedFlagRaceTests: XCTestCase {
         await client.destroy()
     }
 
-    /// Behavior 3. A failed send is retried by the next flush, ahead of the edit
-    /// that triggered it, and the flag clears only once both have landed.
+    /// Behavior 3. A failed send is retried by the next flush, together with the
+    /// edit that triggered it, and the flag clears only once both have landed.
+    ///
+    /// Since #2587 a flush sends the whole queue as ONE merged frame (JS parity:
+    /// `Y.mergeUpdates`), so the retry is not a second copy of the original
+    /// bytes — it is carried inside the merged frame. The assertion therefore
+    /// replays what went on the wire onto a replica and checks that BOTH edits
+    /// are there; a merge that dropped the retained edit is the lost-write this
+    /// test exists to catch, and a byte comparison could no longer see it.
     func testRetainedUpdateIsResentByTheNextFlushBeforeTheFlagClears() async throws {
         let client = makeZeroDebounceClient()
         let documentManager = client.documentManager
         let documentId = "unsynced-retained-resend-doc"
+
+        // Real Yjs update frames — merging only preserves ops for genuine
+        // updates, which is what the client always queues.
+        let source = YDocument()
+        let sink = UpdateSink()
+        let subscription = source.observeUpdate { sink.append($0) }
+        defer { _ = subscription }
+        source.transactSync { txn in
+            let root = txn.transactionGetOrInsertMap(name: "Todo")
+            let rec = root.getOrInsertMap(tx: txn, key: "rec1")
+            _ = rec.tryUpdate(tx: txn, key: "title", value: "\"first\"")
+        }
+        source.transactSync { txn in
+            let root = txn.transactionGetOrInsertMap(name: "Todo")
+            let rec = root.getOrInsertMap(tx: txn, key: "rec1")
+            _ = rec.tryUpdate(tx: txn, key: "note", value: "\"hello\"")
+        }
+        let frames = sink.all
+        XCTAssertEqual(frames.count, 2, "expected one update frame per transaction")
+        let firstUpdate = frames[0]
+        let secondUpdate = frames[1]
 
         struct SendFailure: Error {}
         let sends = ThreadSafeBox<[String]>([])
@@ -397,26 +436,43 @@ final class OutboundUnsyncedFlagRaceTests: XCTestCase {
         let flushFinished = DispatchSemaphore(value: 0)
         client.onOutboundFlushedForTest = { _ in flushFinished.signal() }
 
-        await queueOutboundUpdateOffPool(client: client, documentId: documentId, update: [1, 2, 3])
+        await queueOutboundUpdateOffPool(client: client, documentId: documentId, update: firstUpdate)
         XCTAssertEqual(flushFinished.wait(timeout: .now() + 5), .success,
                        "the flush never finished after the failed send")
         XCTAssertEqual(client.pendingOutboundUpdateCountForTest(documentId), 1,
                        "the failed send must leave its update queued")
         XCTAssertTrue(documentManager.hasUnsyncedLocalChanges(documentId))
 
-        // A later edit's flush carries both updates, oldest first.
-        await queueOutboundUpdateOffPool(client: client, documentId: documentId, update: [4, 5, 6])
+        // A later edit's flush carries both updates, in one merged frame.
+        await queueOutboundUpdateOffPool(client: client, documentId: documentId, update: secondUpdate)
         try await eventually(timeout: 5, description: "flag cleared after both updates were sent") {
             !documentManager.hasUnsyncedLocalChanges(documentId)
         }
 
-        let u1 = Data([1, 2, 3]).base64EncodedString()
-        let u2 = Data([4, 5, 6]).base64EncodedString()
+        let wire = sends.value
+        XCTAssertEqual(wire.count, 2, "expected the failed send plus one retry frame")
         XCTAssertEqual(
-            sends.value, [u1, u1, u2],
-            "the update whose send failed must be re-sent before the flag clears — clearing over "
-                + "a dropped edit is the lost-write this issue is about"
+            wire.first, Data(firstUpdate).base64EncodedString(),
+            "the first frame is the single queued update whose send failed"
         )
+
+        // The retry frame must carry the retained edit as well as the new one:
+        // clearing the flag over a dropped edit is the lost-write this is about.
+        let retryFrame = try XCTUnwrap(wire.last.flatMap { Data(base64Encoded: $0) })
+        let replica = YDocument()
+        replica.transactSync { txn in try? txn.transactionApplyUpdate(update: [UInt8](retryFrame)) }
+        let replayed: (String) -> String? = { key in
+            replica.transactSync { txn in
+                guard let root = txn.transactionGetMap(name: "Todo"),
+                      let rec = root.getMap(tx: txn, key: "rec1") else { return nil }
+                return try? rec.get(tx: txn, key: key)
+            }
+        }
+        XCTAssertEqual(replayed("title"), "\"first\"",
+                       "the retried frame lost the update whose send failed")
+        XCTAssertEqual(replayed("note"), "\"hello\"",
+                       "the retried frame lost the edit that triggered the retry")
+
         XCTAssertEqual(client.pendingOutboundUpdateCountForTest(documentId), 0)
 
         await client.destroy()

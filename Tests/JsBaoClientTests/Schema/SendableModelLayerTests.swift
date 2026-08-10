@@ -97,7 +97,7 @@ final class SendableModelLayerTests: XCTestCase {
         _ = requireSendable(page)
         _ = requireSendable(page.data)
         XCTAssertEqual(page.data.count, 2)
-        XCTAssertEqual(page.data.first?["id"] as? String, "s1")
+        XCTAssertEqual(page.data.first?["id"]?.stringValue, "s1")
     }
 
     /// `DynamicModel`, `MultiDocModel` and `BaoModelQueryEngine` are the
@@ -197,10 +197,10 @@ final class SendableModelLayerTests: XCTestCase {
         XCTAssertEqual(paged.data.count, unpaged.count)
         for (row, dict) in zip(paged.data, unpaged) {
             XCTAssertEqual(Set(row.raw.keys), Set(dict.keys))
-            XCTAssertEqual(row["id"] as? String, dict["id"] as? String)
-            XCTAssertEqual(row["title"] as? String, dict["title"] as? String)
-            XCTAssertEqual(row["score"] as? Double, dict["score"] as? Double)
-            XCTAssertEqual(row["tags"] as? [String], dict["tags"] as? [String])
+            XCTAssertEqual(row["id"]?.stringValue, dict["id"]?.stringValue)
+            XCTAssertEqual(row["title"]?.stringValue, dict["title"]?.stringValue)
+            XCTAssertEqual(row["score"]?.numberValue, dict["score"]?.numberValue)
+            XCTAssertEqual(row["tags"]?.stringArrayValue, dict["tags"]?.stringArrayValue)
         }
     }
 
@@ -210,7 +210,7 @@ final class SendableModelLayerTests: XCTestCase {
     func testRelatedRecordsIsTheSharedRowBag() {
         XCTAssertTrue(RelatedRecords.self == PrimitiveRow.self)
         let asRelated: RelatedRecords = PrimitiveRow(raw: ["a": 1])
-        XCTAssertEqual(asRelated["a"] as? Int, 1)
+        XCTAssertEqual(asRelated["a"]?.numberValue, 1)
         XCTAssertTrue(RelatedRecords.empty.raw.isEmpty)
     }
 
@@ -240,18 +240,18 @@ final class SendableModelLayerTests: XCTestCase {
             "authorId": .string("a1"), "title": .string("Notes"),
         ])
 
-        // refersTo → a nested [String: Any] under `_related`.
+        // refersTo → a nested row object under `_related`.
         let page = try books.queryPaged(
             nil, options: QueryOptions(sortOrder: [("id", 1)]),
             include: [Include(type: .refersTo, target: authors,
                               sourceField: "authorId", resultKey: "author")]
         )
         let row = try XCTUnwrap(page.data.first)
-        let related = try XCTUnwrap(row["_related"] as? [String: Any])
-        let author = try XCTUnwrap(related["author"] as? [String: Any])
-        XCTAssertEqual(author["name"] as? String, "Ada")
+        let related = try XCTUnwrap(row["_related"]?.objectValue)
+        let author = try XCTUnwrap(related["author"]?.objectValue)
+        XCTAssertEqual(author["name"]?.stringValue, "Ada")
 
-        // hasMany → a nested [[String: Any]], and it decodes through the
+        // hasMany → a nested array of rows, and it decodes through the
         // bag's typed accessors on the `_related` bag itself.
         let authorPage = try authors.queryPaged(
             nil, options: QueryOptions(sortOrder: [("id", 1)]),
@@ -259,7 +259,7 @@ final class SendableModelLayerTests: XCTestCase {
                               foreignKey: "authorId", resultKey: "books")]
         )
         let authorRow = try XCTUnwrap(authorPage.data.first)
-        let authorRelated = PrimitiveRow(raw: try XCTUnwrap(authorRow["_related"] as? [String: Any]))
+        let authorRelated = PrimitiveRow(raw: try XCTUnwrap(authorRow["_related"]?.objectValue))
         XCTAssertTrue(authorRelated.contains("books"))
         let decoded: [BagBook] = authorRelated.many("books")
         XCTAssertEqual(decoded.map(\.title), ["Notes"])
@@ -270,14 +270,15 @@ final class SendableModelLayerTests: XCTestCase {
         _ = requireSendable(authorPage)
     }
 
-    /// An `NSNull` sentinel a caller puts in a row reads back unchanged
-    /// through the wrapper. (The query engine omits SQL NULLs rather than
-    /// boxing them, so this is about callers, not the engine.)
+    /// A `.null` a caller puts in a row reads back unchanged through the
+    /// wrapper — present as a key, and distinguishable from an absent one.
+    /// (The query engine omits SQL NULLs rather than emitting `.null`, so
+    /// this is about callers, not the engine.)
     func testNullSentinelReadsBackThroughTheBag() {
-        let row = PrimitiveRow(raw: ["present": "x", "explicitNull": NSNull()])
-        XCTAssertEqual(row["present"] as? String, "x")
+        let row = PrimitiveRow(raw: ["present": "x", "explicitNull": .null])
+        XCTAssertEqual(row["present"]?.stringValue, "x")
         XCTAssertTrue(row.contains("explicitNull"))
-        XCTAssertTrue(row["explicitNull"] is NSNull)
+        XCTAssertEqual(row["explicitNull"]?.isNull, true)
         XCTAssertFalse(row.contains("absent"))
         XCTAssertNil(row["absent"])
     }
@@ -315,11 +316,6 @@ final class SendableModelLayerTests: XCTestCase {
                 "Types/DocumentTypes.swift",
                 "public struct ConfinedYDocument: @unchecked Sendable",
                 ["ffiLock", "NSRecursiveLock", "transactSync"]
-            ),
-            (
-                "Schema/PrimitiveModel.swift",
-                "public struct PrimitiveRow: @unchecked Sendable",
-                ["IncludeResolver", "_related", "copy-on-write"]
             ),
         ]
 
@@ -433,15 +429,27 @@ final class SendableModelLayerTests: XCTestCase {
         )
     }
 
-    /// The untyped rows are the ONE unchecked row representation. A second
-    /// `@unchecked Sendable` dictionary wrapper would be the competing
-    /// convention the sponsor ruled out.
-    func testOnlyOneUncheckedRowWrapperExists() throws {
+    /// `PrimitiveRow` is the ONE row representation, and since #2546 its
+    /// values are `JSONValue`, so its `Sendable` conformance is checked. An
+    /// `@unchecked` wrapper reappearing here would be both the competing
+    /// convention the sponsor ruled out and a return to unverifiable
+    /// `Sendable` debt.
+    func testTheRowBagConformanceIsChecked() throws {
         let source = try Self.clientSource("Schema/PrimitiveModel.swift")
-        let declarations = Self.uncheckedDeclarations(in: source)
-        XCTAssertEqual(declarations.count, 1,
-                       "expected exactly one unchecked row bag in PrimitiveModel.swift, found \(declarations)")
-        XCTAssertTrue(declarations.first?.contains("struct PrimitiveRow") == true)
+        XCTAssertTrue(
+            source.contains("public struct PrimitiveRow: Sendable, Codable, Equatable, Hashable"),
+            "PrimitiveRow's conformance is checked — an @unchecked here would be a regression"
+        )
+        XCTAssertTrue(
+            Self.uncheckedDeclarations(in: source).isEmpty,
+            "no unchecked wrapper belongs in PrimitiveModel.swift, found "
+            + "\(Self.uncheckedDeclarations(in: source))"
+        )
+        XCTAssertTrue(
+            source.contains("public let raw: [String: JSONValue]"),
+            "the row bag carries `[String: JSONValue]`, which is what makes the "
+            + "conformance checkable"
+        )
     }
 
     // MARK: - Helpers
@@ -470,8 +478,8 @@ private struct BagBook: PrimitiveRowDecodable, Equatable {
     let id: String
     let title: String
 
-    init?(row: [String: Any]) {
-        guard let id = row["id"] as? String, let title = row["title"] as? String else { return nil }
+    init?(row: [String: JSONValue]) {
+        guard let id = row["id"]?.stringValue, let title = row["title"]?.stringValue else { return nil }
         self.id = id
         self.title = title
     }

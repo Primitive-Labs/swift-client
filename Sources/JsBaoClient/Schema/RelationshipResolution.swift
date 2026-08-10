@@ -119,9 +119,9 @@ public extension PrimitiveRecord {
         let options = orderBy.map {
             QueryOptions(sort: [$0: descending ? -1 : 1])
         }
-        let rows = try target.query([fkField: self.id], options: options)
+        let rows = try target.query([fkField: .string(self.id)], options: options)
         return rows.compactMap { row in
-            (row["id"] as? String).map {
+            (row["id"]?.stringValue).map {
                 PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
             }
         }
@@ -180,16 +180,16 @@ public extension PrimitiveRecord {
         let joinOrderBy = rel.properties["joinModelOrderByField"] ?? "id"
         let descending = rel.properties["joinModelOrderDirection"]?.uppercased() == "DESC"
         let joinOptions = QueryOptions(sort: [joinOrderBy: descending ? -1 : 1])
-        let joinRows = try joinModel.query([localField: self.id], options: joinOptions)
-        let targetIds = joinRows.compactMap { $0[relatedField] as? String }
+        let joinRows = try joinModel.query([localField: .string(self.id)], options: joinOptions)
+        let targetIds = joinRows.compactMap { $0[relatedField]?.stringValue }
         guard !targetIds.isEmpty else { return [] }
         // Resolve the targets with one batched `id: { $in: [...] }` query.
         // Its `id ASC` tiebreaker re-orders the output to target `id ASC`,
         // matching JS and the generated `hasManyThroughShared` path — the
         // declared join order selects which rows, not the final order.
-        let rows = try target.query(["id": ["$in": targetIds]], options: nil)
+        let rows = try target.query(["id": ["$in": .array(targetIds.map { .string($0) })]], options: nil)
         return rows.compactMap { row in
-            (row["id"] as? String).map {
+            (row["id"]?.stringValue).map {
                 PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
             }
         }
@@ -258,17 +258,17 @@ public extension PrimitiveRecord {
             direction: direction,
             projection: [relatedField: 1, orderByField: 1]
         )
-        let joinPage = try joinModel.queryPaged([localField: self.id], options: options)
-        let relatedIds = joinPage.data.compactMap { $0[relatedField] as? String }
+        let joinPage = try joinModel.queryPaged([localField: .string(self.id)], options: options)
+        let relatedIds = joinPage.data.compactMap { $0[relatedField]?.stringValue }
         guard !relatedIds.isEmpty else {
             return PagedQueryResult(
                 data: [], nextCursor: joinPage.nextCursor,
                 prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
             )
         }
-        let rows = try target.query(["id": ["$in": relatedIds]], options: nil)
+        let rows = try target.query(["id": ["$in": .array(relatedIds.map { .string($0) })]], options: nil)
         let records: [PrimitiveRecord] = rows.compactMap { row in
-            (row["id"] as? String).map {
+            (row["id"]?.stringValue).map {
                 PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
             }
         }

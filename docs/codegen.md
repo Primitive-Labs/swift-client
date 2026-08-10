@@ -105,7 +105,7 @@ internal struct ContactRecord: PrimitiveModel, Equatable, Hashable, Codable {
         self.id = id; self.name = name; self.email = email
     }
     internal init?(record: PrimitiveRecord) { /* … */ }
-    internal init?(row: [String: Any]) { /* … */ }
+    internal init?(row: [String: JSONValue]) { /* … */ }
     internal func primitiveValues() -> [String: PrimitiveValue] { /* … */ }
 }
 ```
@@ -390,7 +390,7 @@ per use case) — not to flip the record itself to a class.
 ### Why does `query` route through untyped row dicts?
 
 > **Q: When I look at the implementation, `dynamic.query(...)`
-> returns `[[String: Any]]` — a list of untyped dicts — and the
+> returns `[[String: JSONValue]]` — a list of schemaless rows — and the
 > typed query path turns each row back into a `TaskRecord`. Why
 > the round trip? Why can't `model.query()` hand me typed records
 > directly?**
@@ -401,7 +401,7 @@ It does — *the user-facing API is typed*:
 let urgent: [TaskRecord] = model.query(["priority": ["$gte": 5]])
 ```
 
-You never touch a `[String: Any]` row in app code. The wrapper
+You never touch a raw row in app code. The wrapper
 returns `[TaskRecord]`. At the API level this is the same shape
 as TS's `Contact.query(...)` returning `Contact[]`.
 
@@ -411,15 +411,16 @@ Y.Map is a CRDT key-value tree; it doesn't support filter / sort /
 aggregate. To run something like `WHERE priority >= 5 ORDER BY
 createdAt DESC LIMIT 20` efficiently, the runtime keeps a
 synchronous SQLite mirror of every record. SQLite is what answers
-queries. SQLite hands rows back as `[String: Any]` — that's just
+queries. SQLite hands rows back as untyped columns — that's just
 the SQLite C API, there's no way to ask SQLite for a typed Swift
-value.
+value — so the engine lifts each column into a `JSONValue` and the
+row currency is `[String: JSONValue]` (#2546).
 
 So the pipeline:
 
 1. `model.query(filter)` (typed)
 2. → `dynamic.query(filter)` runs SQL on the SQLite mirror, gets
-   back `[[String: Any]]`
+   back `[[String: JSONValue]]`
 3. → for each row, the wrapper materializes a `TaskRecord` and
    the result is `[TaskRecord]` (typed)
 
@@ -511,7 +512,7 @@ runtime layer:
 |---|---|
 | Designated `init(...)` | Swift requires an explicit `init` for non-default-constructible structs; matches the demo's hand-written shape (id-first, optional fields default to `nil`). |
 | `init?(record:)` | "Read this CRDT-backed `PrimitiveRecord` into a typed value" — `nil` if a required field is missing. Used by `TypedModel.find` / `findAll`. |
-| `init?(row:)` | "Read this SQLite-mirror row dict into a typed value" — used by `dynamic.query(...)` for indexed-filter / pagination paths. Different from `init?(record:)` because the SQLite row is `[String: Any]`, not `PrimitiveRecord`. The two readers have separate cast rules — stringsets come back as `[String]` from SQLite, as `Set<String>` from PrimitiveRecord. |
+| `init?(row:)` | "Read this SQLite-mirror row dict into a typed value" — used by `dynamic.query(...)` for indexed-filter / pagination paths. Different from `init?(record:)` because the SQLite row is `[String: JSONValue]`, not `PrimitiveRecord`. The two readers have separate read rules — stringsets come back as an array of strings from SQLite (`stringArrayValue`), as `Set<String>` from PrimitiveRecord; and a boolean column is INTEGER in SQLite, so it reads through `rowBoolValue`. |
 | `primitiveValues()` | Project the typed value back into a `[String: PrimitiveValue]` so the dynamic write path can encode it onto the doc. |
 | `_changedFields` + per-field `didSet` + `discardChanges()` / `markAllChanged()` | Track which fields the caller assigned — Swift's `_localChanges` (#2459). `save(in:)` passes the set to `DynamicModel`, which writes only those fields when the record already exists. See [Change tracking](#change-tracking-_changedfields) below. |
 | `init(from decoder:)` | Emitted rather than synthesized so a decoded record counts as constructed: every decoded field is marked changed. Synthesized decode would leave `_changedFields` empty and a decoded record would silently save nothing. `encode(to:)` stays synthesized. |
@@ -934,7 +935,7 @@ internal struct TaskRecord: PrimitiveModel, Equatable, Hashable, Codable {
 
     internal init(/* ... */) { /* ... */ }
     internal init?(record: PrimitiveRecord) { /* ... */ }
-    internal init?(row: [String: Any]) { /* ... */ }
+    internal init?(row: [String: JSONValue]) { /* ... */ }
 
     internal func primitiveValues() -> [String: PrimitiveValue] { /* ... */ }
     internal init(from decoder: Decoder) throws { /* ... */ }
@@ -1380,11 +1381,11 @@ failable init.
 
 The path used by `dynamic.query` → `compactMap(T.init(row:))` and by
 real demo pages that drive `BaoDataLoader`. Rows come off SQLite as
-`[String: Any]`.
+`[String: JSONValue]`.
 
 | Test | Pins |
 |---|---|
-| `testInitRowFromDynamicQuery_includingStringset` | the spicy bit — `BaoModelQueryEngine.populateStringsetsFiltered` writes stringset columns back as `[String]`, so a naive `as? Set<String>` cast in the codegen would silently drop every row. The emitter now writes `(row[key] as? [String]).map(Set.init)`. **This test is what caught the original bug.** |
+| `testInitRowFromDynamicQuery_includingStringset` | the spicy bit — `BaoModelQueryEngine.populateStringsetsFiltered` writes stringset columns back as an array of strings, so a naive strict read in the codegen would silently drop every row. The emitter writes `(row[key]?.stringArrayValue).map(Set.init)`. **This test is what caught the original bug.** |
 
 #### Validation & uniqueness
 
