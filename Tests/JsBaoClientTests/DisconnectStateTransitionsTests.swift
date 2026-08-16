@@ -223,7 +223,7 @@ final class DisconnectStateTransitionsTests: XCTestCase {
         // The client still has a usable token, so an unguarded re-arm would
         // connect.
         client.eventEmitter.emit(AuthSuccessEvent(
-            token: "stale-token-that-is-not-current", previousToken: nil, cause: "google"
+            token: "stale-token-that-is-not-current", previousToken: nil, cause: "oauthCallback"
         ))
         try await delay(3)
 
@@ -328,7 +328,7 @@ final class DisconnectStateTransitionsTests: XCTestCase {
         XCTAssertFalse(client.isConnected)
 
         // A fresh interactive sign-in applies a token where there was none.
-        client.authController.applyToken(testApp.ownerJWT, previous: nil, cause: "google")
+        client.authController.applyToken(testApp.ownerJWT, previous: nil, cause: "oauthCallback")
 
         try await waitForConnection(client: client, timeout: 15)
         XCTAssertTrue(

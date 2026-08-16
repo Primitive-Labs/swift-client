@@ -93,8 +93,10 @@ public final class AuthController: @unchecked Sendable {
     /// Set true on `logout()`; blocks NON-interactive token applications
     /// (a `bootstrap`/`http_refresh`/`refresh`/`startup` that resolves
     /// after the user logged out) from silently re-authenticating or
-    /// re-persisting the JWT. Cleared by the next interactive login
-    /// (`google`/`oauth`/`apple`/`magic_link`/`otp`/`passkey`). Guarded by `lock`.
+    /// re-persisting the JWT. Cleared by the next explicit sign-in
+    /// (`oauthCallback`/`apple`/`magicLinkVerify`/`otpVerify`/`passkeyAuth`,
+    /// and `manual` — the app setting a token itself; see
+    /// `isInteractiveLogin`). Guarded by `lock`.
     private var blockNonInteractiveAuth = false
 
     // Refresh-retry backoff (#2022) — the port of the JS client's
@@ -228,6 +230,12 @@ public final class AuthController: @unchecked Sendable {
         lock.withLock { tokenAppliedHandler = handler }
     }
 
+    /// Drop the handler at client teardown, so a token applied afterwards
+    /// cannot reach a socket that is being (or has been) closed.
+    func clearTokenAppliedHandler() {
+        lock.withLock { tokenAppliedHandler = nil }
+    }
+
     #if DEBUG
     /// Test-only escape hatch from the one-shot rule: point an
     /// already-wired controller at a fake transport. `internal` and
@@ -274,31 +282,154 @@ public final class AuthController: @unchecked Sendable {
         return lock.withLock { jwtPayload }
     }
 
-    /// Bootstrap with an initial token (on startup)
+    /// Bootstrap with an initial token (on startup).
+    ///
+    /// Sets state ONLY — no `.authSuccess`, no `.authState`, no applied-token
+    /// notification. The constructor token is not a sign-in: the app supplied
+    /// it, so nothing changed from the app's point of view, and the client
+    /// opens its own socket during init. This mirrors JS
+    /// `authController.bootstrapToken`, which deliberately skips
+    /// `applyTokenEffects` (#2657, audit item A10).
+    ///
+    /// Silent on events, NOT on storage: the constructor token still has to
+    /// reach the JWT store, or the next session has nothing to restore
+    /// (`PersistenceTests.testJwtTokenPersistenceAcrossSessions`).
+    ///
+    /// Silent, but not blind: writing state directly skips `applyToken`'s
+    /// logout guard, so the write is refused when a `logout()` has since
+    /// blocked non-interactive auth, or when a different token is already
+    /// installed. Without that, a bootstrap that runs late (the client
+    /// re-bootstrapped after storage bound) could reinstate — and re-persist —
+    /// a token the user had just logged out of, with no event and no hook to
+    /// tell anyone.
     public func bootstrapToken(_ token: String?) {
         guard let token = token, !token.isEmpty else {
             markAuthReady()
             return
         }
-        applyToken(token, previous: nil, cause: "bootstrap")
+        let installed = lock.withLock { () -> Bool in
+            if blockNonInteractiveAuth { return false }
+            if let current = currentToken, current != token { return false }
+            currentToken = token
+            let payload = Self.parseJwtPayload(token: token)
+            jwtPayload = payload
+            currentUserId = Self.extractUserId(from: payload)
+            return true
+        }
+        guard installed else {
+            logger.debug("Ignoring bootstrap token — a newer session state won")
+            markAuthReady()
+            return
+        }
+        resetRefreshBackoff("bootstrap")
+        schedulePersist(token)
         markAuthReady()
     }
 
-    /// Update the current token
-    public func updateToken(_ token: String?, cause: String? = nil) {
-        let previous = getToken()
-        applyToken(token, previous: previous, cause: cause)
+    /// Persist the token the controller holds *now*.
+    ///
+    /// `JsBaoClient` calls this once its storage provider is bound: the
+    /// constructor token is applied synchronously during init, before there is
+    /// anywhere to write it. Deliberately not a second `bootstrapToken(...)` —
+    /// by the time storage binds the app may have logged out or signed in
+    /// again, and re-applying the constructor token would quietly undo that.
+    /// A no-op when no token is held.
+    ///
+    /// Reads the token and registers the write in ONE critical section, and
+    /// refuses once a `logout()` has blocked non-interactive auth. Reading
+    /// through `getToken()` and then queueing under a second lock acquisition
+    /// left a window in between: a `logout()` landing there clears the token,
+    /// drains the queue and deletes the record, and the write queued after it
+    /// resurrects the session the user just ended on the next launch. Inside
+    /// one critical section the two orders are both safe — queue first and
+    /// `awaitPendingPersistence()` drains it before the delete; lose the race
+    /// and there is no token left to write.
+    public func persistCurrentToken() {
+        lock.withLock {
+            guard !blockNonInteractiveAuth, let token = currentToken else { return }
+            schedulePersistLocked(token)
+        }
     }
 
-    /// Causes that represent an explicit, user-initiated sign-in (as
+    /// Update the current token.
+    ///
+    /// An unnamed cause is `"manual"` — the JS client's default for a direct
+    /// `setToken` (`JsBaoClient.setToken`), which is what this entry point is
+    /// (#2657, audit item A10).
+    ///
+    /// This is the app handing the client a token it obtained itself, so it is
+    /// an explicit sign-in whatever the caller names it: the cause travels on
+    /// the event, but the sign-in classification does not depend on it. Reading
+    /// the classification off the string alone meant the documented
+    /// `updateToken(jwt, cause: "external")` was dropped by the logout guard —
+    /// no token, no events, no socket — while the same call with the default
+    /// cause signed in. Internal, non-interactive applications (refresh,
+    /// restore, the server's `token_refresh` push) go through `applyToken` /
+    /// `applyServerPushedToken` and stay blocked.
+    public func updateToken(_ token: String?, cause: String? = nil) {
+        let previous = getToken()
+        applyToken(token, previous: previous, cause: cause ?? "manual", explicitSignIn: true)
+    }
+
+    /// Apply a token the server pushed over the live socket (`token_refresh`).
+    ///
+    /// Internal and NOT an explicit sign-in: it is the server rotating the
+    /// session, the very thing the logout guard exists to catch, so it stays
+    /// subject to it.
+    func applyServerPushedToken(_ token: String) {
+        applyToken(token, previous: getToken(), cause: "token_refresh")
+    }
+
+    /// Causes that represent an explicit, caller-initiated sign-in (as
     /// opposed to a background token refresh or persisted-session restore).
-    /// Also read by the client's connection re-arm (#2663): only a real
-    /// sign-in undoes the disconnect a `logout()` left behind.
+    /// The logout guard reads it: only a real sign-in lifts the block a
+    /// `logout()` left behind. (The client's connection re-arm used to read it
+    /// too; since #2657 the re-arm keys off "a token where there was none",
+    /// which is JS's own test, so it no longer needs the classification.)
+    ///
+    /// The vocabulary is the JS client's since #2657 (audit item A10):
+    /// `oauthCallback` / `magicLinkVerify` / `otpVerify` / `passkeyAuth`.
+    /// `apple` has no JS counterpart — native Sign in with Apple is a
+    /// Swift-only flow — so it keeps its own name.
+    ///
+    /// `manual` belongs here for the same reason the four flows do: it is the
+    /// unnamed public `updateToken`/`setToken`, an app handing the client a
+    /// token it obtained itself, which is a sign-in and not the in-flight
+    /// refresh the guard exists to catch. Leaving it out meant an app doing
+    /// its own auth could never sign back in after a `logout()` — JS, which
+    /// has no guard at all, just signs in (#2657, audit item A3). Internal
+    /// applications keep their own causes (`httpRefresh`,
+    /// `persisted-hydrate`, `token_refresh` for the server push), so they stay
+    /// blocked.
+    ///
+    /// A caller-named cause does NOT have to appear here to sign in: the public
+    /// `updateToken` passes `explicitSignIn` and is classified by the entry
+    /// point it came through, not by the string it chose (the documented
+    /// `cause: "external"` is a sign-in too). This list is what still resolves
+    /// the question for applications that carry only a cause.
     static func isInteractiveLogin(_ cause: String?) -> Bool {
         switch cause {
-        case "google", "oauth", "apple", "magic_link", "otp", "passkey": return true
-        default: return false
+        case "oauthCallback", "apple", "magicLinkVerify", "otpVerify", "passkeyAuth", "manual":
+            return true
+        default:
+            return false
         }
+    }
+
+    /// Derive the user id from a decoded JWT payload: the canonical nested
+    /// `user.userId` claim first, then the legacy top-level `userId`, then
+    /// `sub`. The first two steps and their order are the JS client's
+    /// (`authController.getUserId`); `sub` is the last resort JS keeps in
+    /// `extractUserIdFromPayload` and swift-client has always had. Reading only
+    /// the top level meant a token carrying just the canonical claim — what the
+    /// server issues — looked signed out (#2657, audit item A11).
+    static func extractUserId(from payload: [String: Any]?) -> String? {
+        guard let payload else { return nil }
+        let nested = (payload["user"] as? [String: Any])?["userId"] as? String
+        for candidate in [nested, payload["userId"] as? String, payload["sub"] as? String] {
+            if let candidate, !candidate.isEmpty { return candidate }
+        }
+        return nil
     }
 
     /// A precondition on the token held right now, evaluated inside
@@ -322,6 +453,9 @@ public final class AuthController: @unchecked Sendable {
     ///   complete `otpVerify` while that refresh is still in flight. Without
     ///   the guard an older `rt-{appId}` cookie — possibly a different user's —
     ///   would replace the session the user just signed into (#2656).
+    /// - Parameter explicitSignIn: the application came through the public
+    ///   token API, so it is a sign-in whatever its cause string says. Only
+    ///   `updateToken` passes it.
     /// - Parameter requiring: drop the application unless the token held now
     ///   still matches. Unlike `onlyWhenSignedOut` this also guards *clearing*
     ///   the token, which is what a rejected refresh does.
@@ -334,8 +468,10 @@ public final class AuthController: @unchecked Sendable {
         previous: String?,
         cause: String?,
         onlyWhenSignedOut: Bool = false,
+        explicitSignIn: Bool = false,
         requiring precondition: HeldTokenPrecondition = .none
     ) -> Bool {
+        let isSignIn = explicitSignIn || Self.isInteractiveLogin(cause)
         // Logout race guard: a refresh/restore that resolves AFTER the
         // user logged out must not silently sign them back in (or
         // re-persist the JWT). Drop non-interactive token applications
@@ -349,7 +485,7 @@ public final class AuthController: @unchecked Sendable {
         enum DropReason { case loggedOut, signedIn, superseded }
         var dropReason: DropReason = .loggedOut
         let applied: (newUserId: String?, newToken: String?)? = lock.withLock {
-            if token != nil, blockNonInteractiveAuth, !Self.isInteractiveLogin(cause) {
+            if token != nil, blockNonInteractiveAuth, !isSignIn {
                 return nil
             }
             if token != nil, onlyWhenSignedOut, currentToken != nil {
@@ -360,7 +496,7 @@ public final class AuthController: @unchecked Sendable {
                 dropReason = .superseded
                 return nil
             }
-            if token != nil, Self.isInteractiveLogin(cause) {
+            if token != nil, isSignIn {
                 blockNonInteractiveAuth = false
             }
             currentToken = token
@@ -368,7 +504,7 @@ public final class AuthController: @unchecked Sendable {
             if let token = token {
                 let payload = Self.parseJwtPayload(token: token)
                 jwtPayload = payload
-                currentUserId = payload?["userId"] as? String ?? payload?["sub"] as? String
+                currentUserId = Self.extractUserId(from: payload)
             } else {
                 jwtPayload = nil
                 currentUserId = nil
@@ -407,16 +543,23 @@ public final class AuthController: @unchecked Sendable {
 
         if let newToken = newToken {
             logger.debug("Token applied", "userId:", newUserId ?? "nil", "cause:", cause ?? "unknown")
-            emitter?.emit(AuthSuccessEvent(
-                token: newToken,
-                previousToken: previous,
-                cause: cause
-            ))
-            emitter?.emit(AuthStateEvent(
-                authenticated: true,
-                mode: getNetworkMode(),
-                userId: newUserId
-            ))
+            // A sign-in needs a user. JS gates both emissions on a derivable
+            // userId (`applyTokenEffects`), so a token the client cannot read a
+            // user out of is not reported as a successful sign-in (#2657, audit
+            // item A10) — the session is still installed, it is just not
+            // announced as somebody arriving.
+            if let newUserId {
+                emitter?.emit(AuthSuccessEvent(
+                    token: newToken,
+                    previousToken: previous,
+                    cause: cause
+                ))
+                emitter?.emit(AuthStateEvent(
+                    authenticated: true,
+                    mode: getNetworkMode(),
+                    userId: newUserId
+                ))
+            }
             // Re-authenticate an open WebSocket with the token that just
             // landed, rather than leaving the connection running on the
             // previous identity until it is closed and rebuilt (#2660). JS does
@@ -432,36 +575,50 @@ public final class AuthController: @unchecked Sendable {
             ))
         }
 
-        // Persist JWT if configured
-        if persistConfig.persistJwtInStorage, let token = newToken {
-            // Each write is chained onto the one before it rather than
-            // replacing the handle. `awaitPendingPersistence()` is the barrier
-            // the sign-out paths take before deleting the record (#2655), and a
-            // bare "latest task wins" handle would let an earlier, slower write
-            // finish AFTER that delete and resurrect the session the user just
-            // ended. Chaining also keeps two writes from reaching the store out
-            // of order. The read-modify-write of the chain tail happens in one
-            // critical section; `Task {}` only schedules, so nothing awaits
-            // under the lock.
-            lock.withLock {
-                let previousWrite = pendingPersistTask
-                pendingPersistTask = Task { [logger] in
-                    await previousWrite?.value
-                    do {
-                        try await persistJwt(token: token)
-                    } catch {
-                        // Don't swallow persistence errors silently — without
-                        // this log, a disk-full or SQLite-corruption issue would
-                        // leave the user appearing logged in until restart, with
-                        // no clue why they were unexpectedly logged out the next
-                        // session.
-                        logger.warn("Failed to persist JWT:", error.localizedDescription)
-                    }
-                }
-            }
-        }
+        schedulePersist(newToken)
 
         return true
+    }
+
+    /// Queue the configured JWT persistence for a token that has just been
+    /// installed. Every path that installs one calls this, `bootstrapToken`
+    /// included — that path emits nothing, but a constructor token never
+    /// written to storage leaves the next session with nothing to restore
+    /// (#2657).
+    private func schedulePersist(_ token: String?) {
+        guard let token else { return }
+        lock.withLock { schedulePersistLocked(token) }
+    }
+
+    /// The queueing half of `schedulePersist`, for callers that already hold
+    /// `lock` because the token they are writing has to be read in the same
+    /// critical section (`persistCurrentToken`).
+    ///
+    /// Each write is chained onto the one before it rather than replacing the
+    /// handle. `awaitPendingPersistence()` is the barrier the sign-out paths
+    /// take before deleting the record (#2655), and a bare "latest task wins"
+    /// handle would let an earlier, slower write finish AFTER that delete and
+    /// resurrect the session the user just ended. Chaining also keeps two
+    /// writes from reaching the store out of order. The read-modify-write of
+    /// the chain tail happens in one critical section; `Task {}` only
+    /// schedules, so nothing awaits under the lock.
+    ///
+    /// - Precondition: `lock` is held.
+    private func schedulePersistLocked(_ token: String) {
+        guard persistConfig.persistJwtInStorage else { return }
+        let previousWrite = pendingPersistTask
+        pendingPersistTask = Task { [logger] in
+            await previousWrite?.value
+            do {
+                try await persistJwt(token: token)
+            } catch {
+                // Don't swallow persistence errors silently — without this
+                // log, a disk-full or SQLite-corruption issue would leave
+                // the user appearing logged in until restart, with no clue
+                // why they were unexpectedly logged out the next session.
+                logger.warn("Failed to persist JWT:", error.localizedDescription)
+            }
+        }
     }
 
     /// Wait for every queued JWT persistence write to drain. Called from
@@ -608,7 +765,7 @@ public final class AuthController: @unchecked Sendable {
             applyToken(
                 newToken,
                 previous: previous,
-                cause: "refresh",
+                cause: "httpRefresh",
                 onlyWhenSignedOut: Self.isBootstrapCause(cause)
             )
             return .success
@@ -968,7 +1125,7 @@ public final class AuthController: @unchecked Sendable {
     /// `GET /oauth/callback?code=&state=` returns `{token, isNewUser}` plus
     /// the `rt-{appId}` HttpOnly refresh cookie (handled transparently by
     /// `URLSession`'s shared cookie storage). Applies the token with cause
-    /// `"google"`, which emits `.authSuccess` / `.authState` like every other
+    /// `"oauthCallback"`, which emits `.authSuccess` / `.authState` like every other
     /// interactive sign-in path. Returns the typed server response so callers
     /// can read `isNewUser`.
     @discardableResult
@@ -1008,7 +1165,7 @@ public final class AuthController: @unchecked Sendable {
         }
 
         let previous = getToken()
-        applyToken(result.token, previous: previous, cause: "google")
+        applyToken(result.token, previous: previous, cause: "oauthCallback")
         return result
     }
 
@@ -1289,7 +1446,7 @@ public final class AuthController: @unchecked Sendable {
             )
         }
         let envelope: MagicLinkVerifyEnvelope = try applyVerifiedToken(
-            MagicLinkVerifyEnvelope.self, from: raw, path: endpoint, cause: "magic_link"
+            MagicLinkVerifyEnvelope.self, from: raw, path: endpoint, cause: "magicLinkVerify"
         )
 
         return MagicLinkVerifyResult(
@@ -1340,7 +1497,7 @@ public final class AuthController: @unchecked Sendable {
             )
         }
         let envelope: OtpVerifyEnvelope = try applyVerifiedToken(
-            OtpVerifyEnvelope.self, from: raw, path: endpoint, cause: "otp"
+            OtpVerifyEnvelope.self, from: raw, path: endpoint, cause: "otpVerify"
         )
 
         return OtpVerifyResult(user: envelope.user, isNewUser: envelope.isNewUser)
@@ -1371,7 +1528,7 @@ public final class AuthController: @unchecked Sendable {
     }
 
     /// `POST /passkey/auth/finish` (no auth). On success applies the
-    /// returned access token (cause `"passkey"`) — the session lands exactly
+    /// returned access token (cause `"passkeyAuth"`) — the session lands exactly
     /// like the magic-link / OTP paths — and returns the typed result.
     public func passkeyAuthFinish(
         credential: JSONValue,
@@ -1391,7 +1548,7 @@ public final class AuthController: @unchecked Sendable {
             PasskeyAuthFinishEnvelope.self,
             from: raw,
             path: "/passkey/auth/finish",
-            cause: "passkey"
+            cause: "passkeyAuth"
         )
         return PasskeySignInResult(user: envelope.user, isNewUser: envelope.isNewUser)
     }
@@ -1697,7 +1854,7 @@ public final class AuthController: @unchecked Sendable {
         if persistConfig.persistJwtInStorage,
            let record = try? await offlineStore.loadPersistedJwt(appId: appId, namespace: namespace) {
             if Self.isPersistedTokenUsable(recordedExpiry: record.expiresAt, token: record.token) {
-                applyToken(record.token, previous: nil, cause: "bootstrap")
+                applyToken(record.token, previous: nil, cause: "persisted-hydrate")
                 return
             }
             // Aged out, inside the leeway, or carrying no usable expiry: drop

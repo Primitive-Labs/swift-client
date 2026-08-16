@@ -157,7 +157,15 @@ final class GoogleSignInUnitTests: XCTestCase {
         XCTAssertEqual(bare, "/oauth/callback?code=abc&state=c3RhdGU%3D")
     }
 
-    func testHandleOAuthCallbackEmitsGoogleAuthCause() async throws {
+    /// #2657 (audit item A10): the cause is the JS client's `oauthCallback`,
+    /// not the Swift-only `google`. The token is a real (decodable) JWT because
+    /// `.authSuccess` is now gated on a derivable userId — a token the client
+    /// cannot read a user out of is not reported as a sign-in.
+    func testHandleOAuthCallbackEmitsOauthCallbackCause() async throws {
+        // Minted once: `makeTestJwt` serializes a dictionary, so two calls with
+        // the same claims can order the keys differently and produce different
+        // strings.
+        let token = makeTestJwt(userId: "google-user")
         let emitter = EventEmitter()
         let controller = AuthController(
             appId: "test-app",
@@ -169,7 +177,7 @@ final class GoogleSignInUnitTests: XCTestCase {
             persistConfig: AuthConfig()
         )
         controller.setTransport(RecordingTransport(
-            json: #"{"token": "token-google", "isNewUser": false}"#
+            json: #"{"token": "\#(token)", "isNewUser": false}"#
         ))
 
         let events = try await collectEvents(from: emitter, event: AuthSuccessEvent.self) {
@@ -177,8 +185,8 @@ final class GoogleSignInUnitTests: XCTestCase {
         }
 
         let success = try XCTUnwrap(events.first)
-        XCTAssertEqual(success.token, "token-google")
-        XCTAssertEqual(success.cause, "google")
+        XCTAssertEqual(success.token, token)
+        XCTAssertEqual(success.cause, "oauthCallback")
     }
 
     func testStrictPercentEncodeLeavesUnreservedCharacters() throws {

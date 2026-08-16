@@ -344,7 +344,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// Complete passkey sign-in with an authenticator's
     /// `AuthenticationResponseJSON` (all binary fields base64url). Mirrors JS
     /// `passkeyAuthFinish(credential, challengeToken)`. On success the SDK
-    /// has already applied the returned access token (cause `"passkey"`).
+    /// has already applied the returned access token (cause `"passkeyAuth"`).
     public func passkeyAuthFinish(
         credential: [String: Any],
         challengeToken: String

@@ -165,8 +165,14 @@ public struct HttpError: Error, Sendable {
             let parsed = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
             let dict = parsed as? [String: Any]
         else { return (nil, nil) }
+        // #2652 — the per-resource access-rule surfaces answer with `errorCode`
+        // (`PROMPT_ACCESS_DENIED`, `WORKFLOW_ACCESS_DENIED`,
+        // `INTEGRATION_ACCESS_DENIED`) rather than `code`, so that spelling is
+        // lifted onto `serverCode` too, mirroring the JS client's
+        // `makeApiError`. `code` wins when a body carries both.
         let code = dict["code"] as? String
             ?? (dict["details"] as? [String: Any])?["code"] as? String
+            ?? dict["errorCode"] as? String
         let message = dict["error"] as? String
             ?? dict["message"] as? String
             ?? (dict["details"] as? [String: Any])?["error"] as? String

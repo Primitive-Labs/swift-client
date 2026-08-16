@@ -204,7 +204,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
 /// Result of a native OAuth code exchange — `handleOAuthCallback` (Google)
 /// and `handleAppleCallback` (Sign in with Apple). Mirrors the server's
 /// `{ token, isNewUser }` response. The SDK has already applied `token`
-/// (cause `"google"` / `"apple"`) by the time this is returned; callers read
+/// (cause `"oauthCallback"` / `"apple"`) by the time this is returned; callers read
 /// it for `isNewUser` to branch on first-time signup.
 public struct OAuthCallbackResult: Decodable, Sendable, Equatable {
     /// The access token the SDK applied.

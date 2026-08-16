@@ -37,7 +37,7 @@ extension AuthAPI {
     /// Sign in with a passkey using the system sheet (discoverable
     /// credential flow — the user picks from passkeys saved for the app's
     /// RP domain). On success the SDK has already applied the returned
-    /// access token (cause `"passkey"`), emitting `.authSuccess` /
+    /// access token (cause `"passkeyAuth"`), emitting `.authSuccess` /
     /// `.authState` like the other sign-in paths.
     ///
     /// - Parameters:

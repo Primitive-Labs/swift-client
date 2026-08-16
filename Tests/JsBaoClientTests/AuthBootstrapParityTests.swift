@@ -360,7 +360,7 @@ final class AuthBootstrapParityTests: XCTestCase {
 
         // Control: a full-lifetime token IS written.
         let healthy = makeTestJwt(userId: "u-2656", exp: Int(Date().timeIntervalSince1970) + 3600)
-        controller.applyToken(healthy, previous: nil, cause: "otp")
+        controller.applyToken(healthy, previous: nil, cause: "otpVerify")
         await controller.awaitPendingPersistence()
         let healthyRecord = try await store.loadPersistedJwt(appId: "test-app", namespace: "ns")
         XCTAssertEqual(healthyRecord?.token, healthy)
@@ -368,7 +368,7 @@ final class AuthBootstrapParityTests: XCTestCase {
         // A token with 60s of life left is refused, and the stale record it
         // would have replaced is cleared rather than left behind.
         let shortLived = makeTestJwt(userId: "u-2656", exp: Int(Date().timeIntervalSince1970) + 60)
-        controller.applyToken(shortLived, previous: healthy, cause: "otp")
+        controller.applyToken(shortLived, previous: healthy, cause: "otpVerify")
         await controller.awaitPendingPersistence()
         let shortRecord = try await store.loadPersistedJwt(appId: "test-app", namespace: "ns")
         XCTAssertNil(
@@ -391,7 +391,7 @@ final class AuthBootstrapParityTests: XCTestCase {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-        controller.applyToken("h.\(b64).s", previous: nil, cause: "otp")
+        controller.applyToken("h.\(b64).s", previous: nil, cause: "otpVerify")
         await controller.awaitPendingPersistence()
 
         let record = try await store.loadPersistedJwt(appId: "test-app", namespace: "ns")
@@ -459,7 +459,7 @@ final class AuthBootstrapParityTests: XCTestCase {
             userId: "signed-in-user",
             exp: Int(Date().timeIntervalSince1970) + 3600
         )
-        controller.applyToken(interactiveToken, previous: nil, cause: "otp")
+        controller.applyToken(interactiveToken, previous: nil, cause: "otpVerify")
 
         await restore.value
 

@@ -379,7 +379,7 @@ final class AuthRefreshBackoffSchedulerTests: XCTestCase {
         defer { controller.destroy() }
 
         _ = await controller.refreshAccessToken(cause: "first")
-        controller.updateToken(makeJwt(userId: "u1"), cause: "magic_link")
+        controller.updateToken(makeJwt(userId: "u1"), cause: "magicLinkVerify")
 
         let callsAfterUpdate = refreshCalls.value
         try await Task.sleep(nanoseconds: 400_000_000)

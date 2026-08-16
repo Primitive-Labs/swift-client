@@ -194,9 +194,9 @@ final class WsAuthFramesTests: XCTestCase {
             await deliver(["type": "auth_success"], to: client)
         }
 
-        // Counted rather than compared whole: the client's own bootstrap token
-        // application emits an `AuthSuccessEvent` of its own (cause
-        // `"bootstrap"`) and can land inside this window.
+        // Counted rather than compared whole: a startup refresh that resolves
+        // inside this window emits an `AuthSuccessEvent` of its own (cause
+        // `"httpRefresh"`). The constructor token itself is silent since #2657.
         XCTAssertEqual(events.filter { $0.cause == "websocket" }.count, 1)
     }
 

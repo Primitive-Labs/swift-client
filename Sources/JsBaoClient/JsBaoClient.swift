@@ -110,6 +110,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// tests can drive auth flows directly (e.g., concurrent-refresh
     /// coalescing tests). Not part of the public surface.
     internal let authController: AuthController
+    /// The socket work the most recent token application started, so the
+    /// sign-in entry points can await it (#2657). See `handleTokenApplied`.
+    private let pendingTokenConnect = PendingTokenConnectBox()
     let documentManager: DocumentManager
     private let blobManager: BlobManager
     private let offlineStore: OfflineStore
@@ -366,9 +369,6 @@ public final class JsBaoClient: @unchecked Sendable {
     /// when a token lands from any path (#2637). Cancelled on `destroy()` /
     /// `deinit`.
     private var wsAuthRecoverySubscription: EventSubscription?
-    /// Subscription for the no-token → token transition that re-arms the
-    /// connection (#2663). Cancelled on `destroy()` / `deinit`.
-    private var authReconnectSubscription: EventSubscription?
 
     /// One shared cross-document store per registered model, keyed by
     /// `modelName`. Mirrors js-bao's static `BaseModel.dbInstance` +
@@ -623,11 +623,11 @@ public final class JsBaoClient: @unchecked Sendable {
         registerLifecycleObservers()
         registerAnalyticsAutoEventObservers()
         registerWsAuthRecoveryObserver()
-        registerAuthReconnectObserver()
-        // Every token the controller applies re-authenticates the open socket
-        // in band (#2660).
+        // Connectivity follows the token: every token the controller applies
+        // re-authenticates an open socket in band (#2660), and one arriving
+        // where there was none opens the socket (#2657, audit item A3).
         authController.setTokenAppliedHandler { [weak self] token, previous in
-            self?.reauthenticateSocket(with: token, previous: previous)
+            self?.handleTokenApplied(token: token, previous: previous)
         }
     }
 
@@ -639,7 +639,6 @@ public final class JsBaoClient: @unchecked Sendable {
         removeLifecycleObservers()
         removeAnalyticsAutoEventObservers()
         removeWsAuthRecoveryObserver()
-        removeAuthReconnectObserver()
     }
 
     // MARK: - Static Methods
@@ -727,36 +726,99 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - Authentication
 
-    /// Wait for authentication to be ready. Mirrors js-bao's
-    /// `client.waitForAuthReady()` return shape: `(userId, mode)`.
-    /// The previous Void return matched neither the JS surface nor
-    /// the cross-platform code that switches on `mode`.
+    /// Wait until somebody is signed in, then report who and in which mode.
+    ///
+    /// Mirrors js-bao's `client.waitForAuthReady()` (#2657, audit item A12): it
+    /// resolves with a **non-optional** userId, and it THROWS when no user
+    /// arrives — on `authFailed`, or when the timeout expires. It used to
+    /// resolve at `markAuthReady()`, which made "nobody is signed in" a success
+    /// with a nil userId, so callers had to re-check the state themselves and
+    /// the ones that did not carried on as an anonymous client.
+    ///
+    /// To wait for session restore to settle WITHOUT requiring a signed-in user
+    /// — the cold-start "is there a session?" question — use
+    /// `waitForStorageReady(timeout:)`, which reports a Bool.
     @discardableResult
     public func waitForAuthReady(
         timeout: TimeInterval = 10
-    ) async throws -> (userId: String?, mode: NetworkMode) {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await self.authController.waitForAuthReady()
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                throw JsBaoError(code: .unavailable, message: "Auth ready timeout")
-            }
-            try await group.next()
-            group.cancelAll()
-        }
-        let state = authController.getAuthState()
-        return (userId: state.userId, mode: state.mode)
+    ) async throws -> (userId: String, mode: NetworkMode) {
+        let userId = try await awaitUserId(timeout: timeout, failOnAuthFailed: true)
+        return (userId: userId, mode: authController.getNetworkMode())
     }
 
-    /// Wait for user ID to be available
+    /// Wait for a user id, including one from a sign-in that starts AFTER this
+    /// call — the JS semantics (#2657, audit item A12). It used to throw the
+    /// moment auth-readiness landed, so awaiting it across an interactive
+    /// sign-in could never succeed.
     public func waitForUserId(timeout: TimeInterval = 10) async throws -> String {
-        try await waitForAuthReady(timeout: timeout)
-        guard let userId = authController.getUserId() else {
-            throw AuthError(code: .unauthorized, message: "Not authenticated")
+        // JS's `waitForUserId` waits out its timeout regardless of auth-failed;
+        // only `waitForAuthReady` races the failure event.
+        try await awaitUserId(timeout: timeout, failOnAuthFailed: false)
+    }
+
+    /// Poll for a derivable user id until `timeout`, optionally failing early
+    /// on an `authFailed` event.
+    ///
+    /// Polling rather than continuation plumbing: a userId can land from an
+    /// `.authSuccess`, an `.authState`, an offline unlock or a session restore
+    /// that finishes mid-wait, and every one of those already updates the
+    /// controller. Reading the controller covers them all without a
+    /// per-source subscription that could resume a continuation twice. It is
+    /// also what `AuthAPI.waitForUserId` has always done.
+    private func awaitUserId(
+        timeout: TimeInterval,
+        failOnAuthFailed: Bool
+    ) async throws -> String {
+        // Subscribe BEFORE reading the state, not after: an `authFailed`
+        // emitted in between would otherwise land on nobody, and the wait would
+        // run to its timeout instead of rejecting on the failure it exists to
+        // catch. The fast path (somebody is already signed in) pays one
+        // subscribe/cancel for it.
+        let failure = AuthFailureBox()
+        var subscription: EventSubscription?
+        if failOnAuthFailed {
+            subscription = eventEmitter.subscribe(AuthFailedEvent.self) { [authController] event in
+                // Order the failure against the sign-in the way JS's
+                // `Promise.race` does — whichever lands FIRST settles the wait
+                // for good. A poll reads state, not arrival order, so a failure
+                // followed within one poll interval by a token would otherwise
+                // resolve successfully, carrying the caller straight through
+                // the failure this wait exists to reject on. The controller's
+                // userId at the instant the failure arrives is the ordering
+                // witness: nil means the failure got here first, so record it;
+                // non-nil means somebody signed in first, so let them win.
+                guard authController.getUserId() == nil else { return }
+                failure.record(event)
+            }
         }
-        return userId
+        defer { subscription?.cancel() }
+
+        if let userId = authController.getUserId() { return userId }
+
+        // Failure before userId at every check, for the same first-settlement
+        // reason: a recorded failure is one that arrived while nobody was
+        // signed in, so it precedes any userId this poll can see.
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while true {
+            if let event = failure.value {
+                throw AuthError(
+                    code: .unauthorized,
+                    message: event.message ?? event.reason ?? "auth failed"
+                )
+            }
+            if let userId = authController.getUserId() { return userId }
+            if Date() >= deadline { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        if let event = failure.value {
+            throw AuthError(
+                code: .unauthorized,
+                message: event.message ?? event.reason ?? "auth failed"
+            )
+        }
+        if let userId = authController.getUserId() { return userId }
+        throw JsBaoError(code: .unavailable, message: "waitForUserId timeout")
     }
 
     // MARK: - Predicates + getters (P2)
@@ -1565,21 +1627,22 @@ public final class JsBaoClient: @unchecked Sendable {
     /// for a token and applies it (emitting `.authSuccess` / `.authState`).
     ///
     /// Mirrors JS `handleOAuthCallback` sequencing (src/client/JsBaoClient.ts):
-    /// after the exchange, connect the WebSocket if it isn't already open.
-    /// An open socket is handled by `reauthenticateSocket(with:previous:)`,
-    /// which applying the token above already ran (#2660): the same user's new
-    /// token goes out in band, and only a switch to a different user rebuilds
-    /// the connection. Signing in again as yourself no longer re-syncs every
-    /// open document.
+    /// after the exchange, the WebSocket is connected if it isn't already open.
+    /// That decision is no longer made here — since #2657 it belongs to
+    /// `handleTokenApplied`, which applies the same sequencing to EVERY sign-in
+    /// flow rather than to the two OAuth callbacks alone. This still awaits it,
+    /// so the call returns with the connection attempt finished, as before.
+    /// An open socket is re-authenticated instead of rebuilt (#2660): the same
+    /// user's new token goes out in band, and only a switch to a different user
+    /// rebuilds the connection, so signing in again as yourself does not
+    /// re-sync every open document.
     ///
     /// Returns the typed server response (`{token, isNewUser}`) so callers
     /// can read `isNewUser`.
     @discardableResult
     public func handleOAuthCallback(code: String, state: String) async throws -> OAuthCallbackResult {
         let result = try await authController.handleOAuthCallback(code: code, state: state)
-        if !wsManager.isSocketOpen {
-            try? await connect()
-        }
+        await awaitPendingTokenConnect()
         return result
     }
 
@@ -1587,8 +1650,9 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Exchange a native Sign in with Apple credential for a session token
     /// (`POST /auth/apple/callback`) and apply it (cause `"apple"`, emitting
-    /// `.authSuccess` / `.authState`), then re-authenticate the WebSocket —
-    /// the same post-exchange sequencing as `handleOAuthCallback`.
+    /// `.authSuccess` / `.authState`), then connect or re-authenticate the
+    /// WebSocket through `handleTokenApplied` — the same post-exchange
+    /// sequencing as `handleOAuthCallback`.
     ///
     /// Internal: the public entry point is the one-call
     /// `signInWithApple(presentationAnchor:)` (AppleSignIn.swift); unlike
@@ -1613,9 +1677,7 @@ public final class JsBaoClient: @unchecked Sendable {
             lastName: lastName,
             inviteToken: inviteToken
         )
-        if !wsManager.isSocketOpen {
-            try? await connect()
-        }
+        await awaitPendingTokenConnect()
         return result
     }
 
@@ -3965,60 +4027,104 @@ public final class JsBaoClient: @unchecked Sendable {
         }
     }
 
-    /// Re-arm the connection when a token arrives where there was none — a
-    /// sign-in after a `logout()`, which disconnects and so leaves
-    /// `shouldConnect` false. Since #2663 `connect()` no longer overrides that
-    /// flag, so without this hook a re-login would sign the user in and never
-    /// reconnect. JS does the same thing in its token-update hook ("Re-enable
-    /// WebSocket when transitioning from no-token to valid-token"). The flag
-    /// is re-armed for every client; the connect that follows is gated the same
-    /// way the init auto-connect is (`autoNetwork` + `networkingAllowed()`).
-    private func registerAuthReconnectObserver() {
-        let sub = eventEmitter.subscribe(AuthSuccessEvent.self) { [weak self] event in
-            // Only a real sign-in. A startup bootstrap or a persisted-session
-            // restore is also a no-token → token transition, but it is not a
-            // user asking to be connected — and it arrives before the initial
-            // reachability snapshot, so connecting on it would bypass the
-            // connectivity gate the init auto-connect waits for.
-            guard let self,
-                  event.previousToken == nil,
-                  AuthController.isInteractiveLogin(event.cause) else { return }
-            let token = event.token
-            Task { [weak self] in
-                await self?.rearmConnectionIfStillSignedIn(with: token)
+    /// Bring the connection in line with a token that was just applied — the
+    /// Swift equivalent of the JS client's `applyTokenEffects` tail.
+    ///
+    /// Two cases, split on whether a socket is open:
+    ///
+    ///  - **Open.** Re-authenticate it with the new token rather than tearing
+    ///    it down (`reauthenticateSocket`, #2660).
+    ///  - **Closed.** Connect. Every no-token→token transition connects in JS,
+    ///    whatever produced the token — magic link, OTP, passkey, OAuth, a
+    ///    manual `setToken`, a successful HTTP refresh. Before #2657 only the
+    ///    causes Swift classified as interactive sign-ins reconnected, so an
+    ///    app driving its own auth sat signed-in and offline.
+    ///
+    /// `bootstrapToken` deliberately does not come through here: the
+    /// constructor token is not a sign-in, and init runs its own auto-connect
+    /// behind the reachability gate.
+    private func handleTokenApplied(token: String, previous: String?) {
+        // The destroyed check lives inside the Task, not here: this runs inline
+        // on whatever thread applied the token, and taking the client's
+        // non-recursive lock on that thread is what the #2657 review flagged as
+        // a deadlock risk. The Task has no such constraint.
+        let task = Task { [weak self] in
+            guard let self, !self.lock.withLock({ self.isDestroyed }) else { return }
+            if await self.wsManager.isSocketOpenAsync {
+                await self.reauthenticateSocket(with: token, previous: previous)
+            } else {
+                await self.connectForAppliedToken(token: token, previous: previous)
             }
         }
-        lock.withLock { authReconnectSubscription = sub }
+        pendingTokenConnect.store(task)
     }
 
-    /// The re-arm itself, gated on the token that prompted it still being the
-    /// current one. The observer's work happens on a detached task, so a
-    /// `logout()` can land between the sign-in event and this body — re-arming
+    /// Wait for the socket work the last applied token started, if any.
+    ///
+    /// The hook itself is synchronous — it runs inside `applyToken` — so the
+    /// socket work is a `Task`. The sign-in entry points that used to
+    /// `await connect()` inline (`handleOAuthCallback`, `handleAppleCallback`)
+    /// await that Task instead, so they still return with the connection
+    /// attempt finished rather than merely scheduled; a caller that sends
+    /// immediately after signing in would otherwise race it.
+    private func awaitPendingTokenConnect() async {
+        await pendingTokenConnect.value?.value
+    }
+
+    /// Open the socket for a token that just landed on a disconnected client.
+    ///
+    /// Gated on a live client — a token arriving after `destroy()` (a late
+    /// refresh, or an app that kept the reference) must not reopen a socket
+    /// over closed storage — and the automatic connect is gated the same way
+    /// the init auto-connect is (`autoNetwork` + `networkingAllowed()`): an app
+    /// that opted out of automatic networking drives its own connect.
+    ///
+    /// A token where there was none also re-arms `shouldConnect`, which a
+    /// `logout()` (or an explicit `disconnect()`) left false; since #2663
+    /// `connect()` does not override that flag, so without the re-arm a
+    /// re-login would sign the user in and never reconnect. A token REPLACING
+    /// another does not re-arm — a refresh must not revive a connection the
+    /// app deliberately took down, which is also where JS stops (its
+    /// `shouldConnect = true` is likewise gated on `!hadToken`).
+    ///
+    /// The re-arm runs BEFORE the `autoNetwork` / `networkingAllowed()` gates,
+    /// as JS does (`applyTokenEffects` sets `shouldConnect = true`, then
+    /// computes `canConnect`). The flag is the app's standing intent, not this
+    /// connect attempt: gating the re-arm on automatic networking left an
+    /// `autoNetwork: false` client permanently down after a re-login, because
+    /// its own explicit `connect()` then aborts on `shouldConnect == false`.
+    /// The offline mode is the same story — the mode gates connecting, and
+    /// going back online restores the socket from the flag.
+    ///
+    /// The re-arm is bracketed by "is this still the current token?": this runs
+    /// on a detached task, so a `logout()` can land in between, and re-arming
     /// then would turn auto-reconnect back on against an explicit logout. The
     /// check is repeated after the flag is set, because the logout can also
     /// land during that hop; losing that race costs one flag write, which is
     /// then put back.
-    private func rearmConnectionIfStillSignedIn(with token: String) async {
+    private func connectForAppliedToken(token: String, previous: String?) async {
+        guard !lock.withLock({ isDestroyed }) else { return }
         guard authController.getToken() == token else { return }
-        await wsManager.setShouldConnectFlag(true)
-        guard authController.getToken() == token else {
-            await wsManager.setShouldConnectFlag(false)
-            return
-        }
-        // Connecting from here is gated exactly as the init auto-connect is:
-        // an app that opted out of automatic networking drives its own
-        // connect, and the re-armed flag is what makes that call work again.
-        guard options.autoNetwork, networkingAllowed(), !wsManager.isConnected else { return }
-        try? await wsManager.connect()
-    }
 
-    private func removeAuthReconnectObserver() {
-        let sub = lock.withLock { () -> EventSubscription? in
-            let current = authReconnectSubscription
-            authReconnectSubscription = nil
-            return current
+        if previous == nil {
+            await wsManager.setShouldConnectFlag(true)
+            guard authController.getToken() == token else {
+                await wsManager.setShouldConnectFlag(false)
+                return
+            }
         }
-        sub?.cancel()
+
+        guard options.autoNetwork, networkingAllowed() else { return }
+        guard !wsManager.isConnected else { return }
+
+        // A connect already in flight lands on its own — stacking a second one
+        // on it only races the first — but the callers that await this hook
+        // (`handleOAuthCallback`, `handleAppleCallback`) promise to return with
+        // the attempt FINISHED. `wsManager.connect()` resolves as a secondary
+        // waiter on the running attempt rather than opening a second socket, so
+        // calling it unconditionally keeps that promise without stacking
+        // anything.
+        try? await wsManager.connect()
     }
 
     private func removeAnalyticsAutoEventObservers() {
@@ -4288,6 +4394,11 @@ public final class JsBaoClient: @unchecked Sendable {
 
         // Idempotent; the monitor's own deinit also cancels as a safety net.
         connectivityMonitor?.cancel()
+        // Unhook the applied-token handler and cancel whatever socket work it
+        // has in flight: a token landing during or after teardown must not
+        // re-authenticate or reopen the connection behind `disconnect()` below.
+        authController.clearTokenAppliedHandler()
+        pendingTokenConnect.cancel()
         // Cancel a pending refresh-retry (#2022) first, so no background
         // refresh starts while the rest of the teardown runs.
         authController.destroy()
@@ -4299,7 +4410,6 @@ public final class JsBaoClient: @unchecked Sendable {
         removeLifecycleObservers()
         removeAnalyticsAutoEventObservers()
         removeWsAuthRecoveryObserver()
-        removeAuthReconnectObserver()
         await logSessionEndEvent(reason: "destroy")
         // Cancel the periodic flush timer and trigger a final flush
         // before closing storage. The flush is async (fires a Task),
@@ -4589,8 +4699,15 @@ public final class JsBaoClient: @unchecked Sendable {
             await kvCache.setStorageProvider(provider)
 
             // Bootstrap auth
-            if let token = options.token {
-                authController.bootstrapToken(token)
+            if options.token != nil {
+                // The constructor token was applied synchronously in `init`;
+                // this is the first moment it can reach storage, so persist
+                // whatever the controller holds NOW. Re-applying `options.token`
+                // here would race the app: a `logout()` or a sign-in landing
+                // between `init` and this line would be silently rolled back to
+                // the constructor token (and re-persisted), with no event and no
+                // applied-token hook to bring the socket back in line.
+                authController.persistCurrentToken()
             } else {
                 // Restore from persisted JWT — and, if it's aged out,
                 // attempt a cookie-based refresh before declaring the
@@ -5188,7 +5305,10 @@ public final class JsBaoClient: @unchecked Sendable {
                 logger.warn("Ignoring token_refresh frame with no token")
                 break
             }
-            authController.updateToken(pushed, cause: "token_refresh")
+            // Not `updateToken`: that entry point is the app signing itself in
+            // (and lifts the logout guard). A token the server pushed is the
+            // background rotation the guard exists to catch.
+            authController.applyServerPushedToken(pushed)
 
         case "db.subscribed", "db.unsubscribed":
             // Server-side ack. No client action — subscribe() returns a
@@ -5280,43 +5400,40 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// A no-op when no socket is open: the next connect carries the token in
     /// its handshake anyway, so there is nothing to queue.
-    private func reauthenticateSocket(with token: String, previous: String?) {
-        Task { [weak self] in
-            guard let self else { return }
-            guard await self.wsManager.isSocketOpenAsync else { return }
+    private func reauthenticateSocket(with token: String, previous: String?) async {
+        guard await wsManager.isSocketOpenAsync else { return }
 
-            // Both users have to be readable for this to be a *known* change of
-            // identity. An unreadable claim on either side falls through to the
-            // push, which the server accepts or refuses on its own terms.
-            if let previousUser = previous.flatMap(Self.userId(ofToken:)),
-               let newUser = Self.userId(ofToken: token),
-               previousUser != newUser {
-                self.logger.log("Signed-in user changed; rebuilding the WebSocket connection")
-                await self.wsManager.forceReconnect()
-                return
-            }
+        // Both users have to be readable for this to be a *known* change of
+        // identity. An unreadable claim on either side falls through to the
+        // push, which the server accepts or refuses on its own terms.
+        if let previousUser = previous.flatMap(Self.userId(ofToken:)),
+           let newUser = Self.userId(ofToken: token),
+           previousUser != newUser {
+            logger.log("Signed-in user changed; rebuilding the WebSocket connection")
+            await wsManager.forceReconnect()
+            return
+        }
 
-            let frame = ["type": "auth", "token": token]
-            guard let data = try? JSONSerialization.data(withJSONObject: frame),
-                  let text = String(data: data, encoding: .utf8) else { return }
-            do {
-                try await self.wsManager.send(text)
-                self.logger.debug("Pushed refreshed token to the server")
-            } catch {
-                // The socket died between the check and the send. The reconnect
-                // carries the new token in its handshake, so there is nothing
-                // to retry here.
-                self.logger.warn("Failed to push refreshed token:", error.localizedDescription)
-            }
+        let frame = ["type": "auth", "token": token]
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let text = String(data: data, encoding: .utf8) else { return }
+        do {
+            try await wsManager.send(text)
+            logger.debug("Pushed refreshed token to the server")
+        } catch {
+            // The socket died between the check and the send. The reconnect
+            // carries the new token in its handshake, so there is nothing
+            // to retry here.
+            logger.warn("Failed to push refreshed token:", error.localizedDescription)
         }
     }
 
     /// The user a token identifies, or nil when it carries no usable claim.
-    /// `userId` with `sub` as the fallback, the same pair `AuthController`
-    /// reads.
+    /// The derivation is `AuthController`'s, so "same user?" here answers the
+    /// same way `getUserId()` does — including the canonical nested
+    /// `payload.user.userId` claim the server issues (#2657, audit item A11).
     private static func userId(ofToken token: String) -> String? {
-        guard let payload = AuthController.parseJwtPayload(token: token) else { return nil }
-        return payload["userId"] as? String ?? payload["sub"] as? String
+        AuthController.extractUserId(from: AuthController.parseJwtPayload(token: token))
     }
 
     // MARK: - Outbound unsynced flag
@@ -6132,4 +6249,43 @@ public final class DocumentContext: @unchecked Sendable {
             blobManager: blobManager
         )
     }
+}
+
+/// The connect / re-authenticate Task the most recent token application
+/// started. Its own lock, not the client's: `handleTokenApplied` runs
+/// synchronously on whatever thread applied the token, and the client's `lock`
+/// is not recursive.
+final class PendingTokenConnectBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _task: Task<Void, Never>?
+
+    func store(_ task: Task<Void, Never>) { lock.withLock { _task = task } }
+
+    var value: Task<Void, Never>? { lock.withLock { _task } }
+
+    /// Drop and cancel the stored work — teardown, so nothing it would do to
+    /// the socket outlives the client.
+    func cancel() {
+        let task = lock.withLock { () -> Task<Void, Never>? in
+            let current = _task
+            _task = nil
+            return current
+        }
+        task?.cancel()
+    }
+}
+
+/// Holds the first `authFailed` seen while a `waitForAuthReady` is in flight,
+/// so the polling waiter can turn it into a throw. One writer (the event
+/// callback) and one reader (the waiting task) on different executors, hence
+/// the lock.
+final class AuthFailureBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _event: AuthFailedEvent?
+
+    func record(_ event: AuthFailedEvent) {
+        lock.withLock { if _event == nil { _event = event } }
+    }
+
+    var value: AuthFailedEvent? { lock.withLock { _event } }
 }

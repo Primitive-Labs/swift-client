@@ -154,6 +154,34 @@ final class TransportSpineTests: XCTestCase {
         XCTAssertEqual(error?.authCode, .invitationRequired)
     }
 
+    func testErrorCodeBodyFallsBackOntoServerCode() async throws {
+        // #2652 — the access-rule denials answer `{errorCode, message}` rather
+        // than `{code, error}`; the parser lifts that spelling onto
+        // `serverCode`, mirroring the JS client's `makeApiError` fallback.
+        let transport = ScriptedTransport(
+            status: 403,
+            json: #"{"errorCode":"PROMPT_ACCESS_DENIED","message":"Prompt access denied"}"#
+        )
+        let error = await httpError {
+            let _: Payload = try await transport.request(method: .get, path: "/prompts/x/execute")
+        }
+        XCTAssertEqual(error?.status, 403)
+        XCTAssertEqual(error?.serverCode, "PROMPT_ACCESS_DENIED")
+        XCTAssertEqual(error?.serverMessage, "Prompt access denied")
+    }
+
+    func testExplicitCodeStillWinsOverErrorCode() async throws {
+        // A body carrying both spellings keeps `code` — same precedence as JS.
+        let transport = ScriptedTransport(
+            status: 403,
+            json: #"{"code":"INVITATION_REQUIRED","errorCode":"PROMPT_ACCESS_DENIED","error":"nope"}"#
+        )
+        let error = await httpError {
+            let _: Payload = try await transport.request(method: .get, path: "/things")
+        }
+        XCTAssertEqual(error?.serverCode, "INVITATION_REQUIRED")
+    }
+
     func testSendThrowsOnNonSuccessStatus() async throws {
         let transport = ScriptedTransport(status: 404, json: #"{"error":"nope"}"#)
         let error = await httpError {
@@ -535,7 +563,12 @@ final class TransportSpineTests: XCTestCase {
             // as bare dictionaries — `auth-refresh-deferred` and the five
             // `offlineAuth:*` events — are typed `JsBaoEventPayload` structs
             // now, so what remains is JWT parsing only.
-            "Internal/AuthController.swift": (4, 1, 0),
+            // #2657 took it 4 -> 6: `extractUserId(from:)` reads the decoded
+            // JWT payload's nested `user` object, so the claim derivation adds
+            // one `[String: Any]?` parameter plus one `as? [String: Any]` cast
+            // of that same already-untyped payload. Still JWT parsing only —
+            // the sanctioned boundary — not new untyped surface.
+            "Internal/AuthController.swift": (6, 1, 0),
             // Phase E (#1994) took it 3 -> 0: the three `blobs:queue-drained`
             // emits (including the terminal-4xx exit added by #2056) now emit
             // `BlobsQueueDrainedEvent`. Nothing untyped is left — the blob HTTP
