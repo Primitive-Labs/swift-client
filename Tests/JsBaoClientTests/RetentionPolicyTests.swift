@@ -152,26 +152,54 @@ final class RetentionPolicyTests: XCTestCase {
         XCTAssertNotNil(after["newest-fresh"])
     }
 
-    // MARK: - Open / pending-create exemptions
+    // MARK: - Open / pending-create documents
 
-    func test_openDocsSkippedByEnforcement() async throws {
+    /// Inverted for #2668: enforcement used to skip open and pending-create
+    /// documents. JS `enforceRetentionPolicy` evicts with `force: true`
+    /// regardless of open state (`src/client/internal/documentManager.ts`), so a
+    /// long-lived open document could hold the local store over budget
+    /// indefinitely. This test now pins the JS behavior.
+    func test_openDocsAreEvictedByEnforcement() async throws {
         let mgr = try await setupManager(seed: [
-            meta("open-but-old", openedSecondsAgo: 7200, bytes: 100),
-            meta("closed-fresh", openedSecondsAgo: 10, bytes: 100),
+            meta("open-doc", openedSecondsAgo: 7200, bytes: 100),
         ])
 
-        // Open the stale doc so it's protected from eviction.
+        // Opening refreshes `lastOpenedAt` to now (as it does in JS), so let the
+        // document age past a short TTL rather than relying on the seeded value.
         _ = try await mgr.openDocument(
-            documentId: "open-but-old",
+            documentId: "open-doc",
             options: OpenDocumentOptions(
                 waitForLoad: .local, enableNetworkSync: false
             )
         )
+        try await Task.sleep(nanoseconds: 1_200_000_000)
 
-        await mgr.enforceRetentionPolicy(ttlMs: 60 * 1000) // 1 min TTL
+        await mgr.enforceRetentionPolicy(ttlMs: 1000)
 
-        let after = mgr.getMetadataIndex()
-        XCTAssertNotNil(after["open-but-old"], "open doc must survive TTL eviction")
-        XCTAssertNotNil(after["closed-fresh"])
+        XCTAssertNil(
+            mgr.getMetadataIndex()["open-doc"],
+            "an open document must not be exempt from TTL eviction (#2668 C24)"
+        )
+    }
+
+    /// The same for a document with an uncommitted local create: JS passes
+    /// `force: true` for every retention eviction, so `maxDocs` bounds the
+    /// store even when the oldest entries are pending creates (#2668 C24).
+    func test_pendingCreateDocsAreEvictedByEnforcement() async throws {
+        let mgr = try await setupManager(seed: [])
+
+        _ = try await mgr.createLocalDocument(
+            documentId: "pending-create", title: "pending", localOnly: false
+        )
+        XCTAssertTrue(mgr.isPendingCreate("pending-create"))
+
+        // "keep nothing locally" — the pending create is the only candidate, so
+        // the assertion does not depend on timestamp ordering.
+        await mgr.enforceRetentionPolicy(maxDocs: 0)
+
+        XCTAssertNil(
+            mgr.getMetadataIndex()["pending-create"],
+            "a pending-create document must not be exempt from maxDocs eviction (#2668 C24)"
+        )
     }
 }

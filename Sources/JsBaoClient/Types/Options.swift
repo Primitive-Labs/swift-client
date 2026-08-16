@@ -243,9 +243,16 @@ public struct OpenDocumentOptions: Sendable {
     public var enableNetworkSync: Bool
     public var retainLocal: Bool
     /// Maximum time to wait for the document to become available from the
-    /// network before resolving with whatever local (possibly empty) state
-    /// exists. Mirrors JS `open`/`openDocument`'s `availabilityWaitMs`
-    /// (default 30s). Clamped to `>= 0`.
+    /// network. When the open needs server state — `waitForLoad: .network`,
+    /// or `.localIfAvailableElseNetwork` with no local copy — and the budget
+    /// runs out, `openDocument` throws `JsBaoError(.networkTimeout)` rather
+    /// than returning a possibly-empty document; `0` means "don't wait for
+    /// the network", so it fails immediately. The same opens fast-fail with
+    /// `.documentUnavailableOffline`, `.noLocalAndNoNetwork`,
+    /// `.networkRequiresAutostart` or `.connectionDisabled` when the network
+    /// path cannot be satisfied at all. Mirrors JS
+    /// `open`/`openDocument`'s `availabilityWaitMs` (default 30s). Clamped to
+    /// `>= 0`.
     public var availabilityWait: TimeInterval
     /// When `true`, open the document locally without starting server
     /// sync — sync begins only on an explicit `startNetworkSync(documentId:)`
@@ -471,14 +478,29 @@ public struct SyncMetadataOptions: Sendable {
     public var payloadType: String?
     /// When true, the sync runs without blocking the caller.
     public var background: Bool?
+    /// Whether the server's listing replaces the local index rather than
+    /// merely merging into it: local documents absent from the response are
+    /// evicted and a `deleted` metadata event is emitted for each (pending
+    /// creates and local-only documents are exempt). This is how a document
+    /// whose access was revoked while this client was offline leaves the
+    /// device.
+    ///
+    /// Mirrors js-bao's `SyncMetadataOptions.authoritative`, **including its
+    /// default**: a full-listing sync is authoritative unless you set this to
+    /// `false`. A single-document sync (`documentId`) and an ids-only payload
+    /// (`payloadType: "ids"`) are never authoritative — neither carries enough
+    /// to prove a document is gone.
+    public var authoritative: Bool?
     public init(
         documentId: String? = nil,
         payloadType: String? = nil,
-        background: Bool? = nil
+        background: Bool? = nil,
+        authoritative: Bool? = nil
     ) {
         self.documentId = documentId
         self.payloadType = payloadType
         self.background = background
+        self.authoritative = authoritative
     }
 }
 

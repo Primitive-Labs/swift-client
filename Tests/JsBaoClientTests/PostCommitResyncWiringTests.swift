@@ -252,7 +252,14 @@ final class PostCommitResyncWiringTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let docId = newDocId()
-        client.documentManager.createRemoteDocument = { _ in ["documentId": docId] }
+        // The create must still be pending while the sweep runs, so its server
+        // call fails. Since #2664 the socket opening also re-drives pending
+        // creates, and a create that commits legitimately syncs afterwards
+        // through the post-commit path — which would end this test with a
+        // syncStep1 on the wire that the sweep never sent.
+        client.documentManager.createRemoteDocument = { _ in
+            throw JsBaoError(code: .unavailable)
+        }
         _ = try await client.documentManager.createLocalDocument(
             documentId: docId, title: "pending", localOnly: false
         )

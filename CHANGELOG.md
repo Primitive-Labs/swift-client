@@ -20,6 +20,66 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### `AuthFailedEvent.reason` on a rejected refresh matches the JS client (#2723)
+
+A refresh the server rejects used to deliver `reason: "invalid_token"` whatever
+drove it. The JS client — the reference — reports a different value per cause,
+and it always did; this client simply had its own vocabulary. An app that
+switches on `reason` needs to read the new values:
+
+| what drove the refresh                    | before          | now                          |
+|-------------------------------------------|-----------------|------------------------------|
+| the 401 retry on an authenticated request | `invalid_token` | `refresh_failed`, no message |
+| a manual or background refresh            | `invalid_token` | the refresh cause, e.g. `networkMode:online` |
+| the launch-time refresh                   | (no event)      | (no event, unchanged)        |
+
+`message` changes with it: the request-path event carries none, and the others
+carry `"Authentication refresh failed"` rather than the HTTP status text. The
+diagnostic detail moves to the log, where JS keeps it.
+
+Since the reason on that middle row IS the cause, the two entry points into the
+online-auth handoff no longer share one: the user pinning online
+(`goOnline()` / `setNetworkMode(.online)`) refreshes with cause
+`networkMode:online` as before, while an automatic restore — reachability
+returning, or re-entering `.auto` while reachable — now refreshes with
+`auto-network:online`, the name JS gives that path. An app that distinguishes
+"I asked to go online" from "the network came back" reads it off `reason`.
+
+Which events fire is unchanged — one per rejection, none at launch — so an app
+that only observes `authFailed` sees no difference. Sign-out is untouched: a
+rejected refresh still ends the session (#2655).
+
+### Disconnect now resets sync state and presence; `connect()` no longer overrides `disconnect()` (#2663)
+
+The client's disconnect handling now matches the JS client's, which is the
+reference. Four changes, all observable from an app:
+
+- **Open documents go unsynced on a disconnect.** On a transport `connecting`,
+  on a close, and at the initiation of a deliberate `disconnect()`, every open
+  document's sync state is set to `false` and a `SyncEvent(synced: false)` is
+  delivered for it; the reconnect delivers `synced: true` again. Previously
+  `isSynced(_:)` kept reporting `true` while offline and no event fired, so a
+  "synced" badge stayed lit with the network down.
+- **Remote presence is cleared on a close**, with an `AwarenessEvent` whose
+  `removed` lists the departed client IDs. Previously peer cursors stayed on
+  screen until the document was closed.
+- **One `.disconnected` status per close.** The client's close handler no
+  longer emits its own on top of the transport manager's, so subscribers see
+  one per close instead of two — plus one at the initiation of a deliberate
+  `disconnect()`, which previously reported nothing until the socket actually
+  closed (up to 500ms later).
+- **`connect()` returns without doing anything while `shouldConnect` is
+  false** — that is, after a `disconnect()` or a `logout()`. An explicit
+  disconnect means "stay down". Use `setShouldConnect(true)` (or
+  `forceReconnectAsync()`) to come back up; a sign-in after a logout re-arms
+  the connection on its own, as it does in JS.
+
+**What to change in your app:** if you reconnect with `try await
+client.connect()` after calling `disconnect()`, switch that call to `await
+client.setShouldConnect(true)`. Code that only ever calls `connect()` at
+startup is unaffected. If you drove a "synced" indicator off `isSynced(_:)` and
+worked around it sticking at `true`, you can drop the workaround.
+
 ### The query row currency is `[String: JSONValue]` (#2546)
 
 The split-out remainder of the #2367 batch below. A query row was

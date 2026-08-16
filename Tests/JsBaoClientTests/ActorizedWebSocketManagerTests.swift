@@ -37,9 +37,24 @@ final class ActorizedWebSocketManagerTests: XCTestCase {
         private var _requestsBuilt = 0
         private var _reconnectDelays: [Int] = []
 
-        init(url: URL, shouldReconnect: Bool = false) {
+        /// Fired from inside `webSocketManagerOnDisconnectInitiated()`, which
+        /// the manager calls from `disconnect()`'s isolated decision region —
+        /// after `isDisconnecting = true`, before the socket close is issued.
+        /// It is the only seam a test has for issuing a command that is
+        /// genuinely concurrent with an in-flight disconnect: the close
+        /// resolves locally in well under a millisecond, so any shape that
+        /// waits for the callback and *then* acts is acting on a disconnect
+        /// that has already finished (#2568).
+        private let onDisconnectInitiated: (@Sendable () -> Void)?
+
+        init(
+            url: URL,
+            shouldReconnect: Bool = false,
+            onDisconnectInitiated: (@Sendable () -> Void)? = nil
+        ) {
             self.url = url
             self.shouldReconnect = shouldReconnect
+            self.onDisconnectInitiated = onDisconnectInitiated
         }
 
         var calls: [String] { lock.withLock { _calls } }
@@ -66,7 +81,10 @@ final class ActorizedWebSocketManagerTests: XCTestCase {
         func webSocketManagerOnReconnectScheduled(delayMs: Int) {
             lock.withLock { _reconnectDelays.append(delayMs); _calls.append("reconnectScheduled") }
         }
-        func webSocketManagerOnDisconnectInitiated() { record("disconnectInitiated") }
+        func webSocketManagerOnDisconnectInitiated() {
+            record("disconnectInitiated")
+            onDisconnectInitiated?()
+        }
         func webSocketManagerOnDisconnectResolved() { record("disconnectResolved") }
         func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool { shouldReconnect }
     }

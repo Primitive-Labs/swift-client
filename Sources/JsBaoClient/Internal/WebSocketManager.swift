@@ -275,9 +275,27 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     var isSocketOpenAsync: Bool { snapshot.socketIsOpen }
 
+    /// Whether the manager is currently trying to hold a connection open — the
+    /// `shouldConnect` intent, not the live transport state. The WS auth
+    /// recovery reads it so it never revives a connection the caller
+    /// deliberately took down (#2637).
+    var desiredConnection: Bool { shouldConnect }
+
     func setMaxReconnectDelay(_ ms: Int) {
         guard ms > 0 else { return }
         maxReconnectDelayMs = ms
+    }
+
+    var shouldConnectFlag: Bool { shouldConnect }
+
+    /// Set the "should the manager hold a connection open" flag without
+    /// touching the socket — `setDesiredConnection` is the form that also
+    /// connects or disconnects. Mirrors JS `setShouldConnectFlag`. Its caller
+    /// is the auth transition: a token arriving where there was none re-arms a
+    /// connection an earlier logout took down (#2663).
+    func setShouldConnectFlag(_ value: Bool) {
+        logger.debug("[WSM][debug] setShouldConnectFlag", value)
+        shouldConnect = value
     }
 
     func setEventHandledHookForTest(_ hook: (@Sendable (DelegateEvent) -> Void)?) {
@@ -314,9 +332,16 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
             return .waitOnExisting
         }
 
-        // Explicit connect() call implies the caller wants to connect,
-        // so reset shouldConnect (which disconnect() sets to false).
-        shouldConnect = true
+        // An explicit disconnect means "stay down". `connect()` does not
+        // override it — JS returns immediately here
+        // (`webSocketManager.ts` `connect aborted: shouldConnect=false`), and
+        // before #2663 this line silently re-armed the reconnect loop after a
+        // `disconnect()` or a logout. `setDesiredConnection(true)` and
+        // `forceReconnect()` set the flag themselves and are the way back up.
+        if !shouldConnect {
+            logger.debug("[WSM][debug] connect aborted: shouldConnect=false")
+            return .abort
+        }
 
         guard let delegate = delegate else {
             return .abort
@@ -822,6 +847,34 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - setDesiredConnection
 
+    /// Set whether the manager should hold a connection open.
+    ///
+    /// `shouldConnect: true` parks on a disconnect that is already in flight
+    /// and then connects, so a connect issued while the socket is closing does
+    /// not race the close.
+    ///
+    /// **Last writer wins**, with one exception. That parking is the only
+    /// ordering guarantee: it applies to a disconnect already in flight, not
+    /// to one that arrives afterwards. Calls issued concurrently with no
+    /// ordering between them settle on whichever reaches the manager last, so
+    /// a `disconnect()` that lands after
+    /// `setDesiredConnection(shouldConnect: true)` leaves the manager
+    /// disconnected with auto-reconnect off — an explicit disconnect means
+    /// "stay down" and is not overridden by an earlier connect.
+    ///
+    /// The exception is a **coalesced** disconnect. A `disconnect()` that
+    /// arrives while another disconnect is still in flight takes
+    /// `disconnectDecision()`'s `.waitOnExisting` branch: it waits the
+    /// in-flight close out and returns, without re-running the decision region
+    /// and without cancelling a `setDesiredConnection(shouldConnect: true)`
+    /// already parked on that same close. So in the sequence `disconnect()` →
+    /// `setDesiredConnection(shouldConnect: true)` → `disconnect()`, the
+    /// parked connect resumes once the first close resolves and the manager
+    /// ends up **connected**, even though a disconnect was issued last.
+    ///
+    /// Callers that need a particular outcome must order the calls themselves
+    /// — await one before making the next. The JS client's `setShouldConnect`
+    /// follows the same rule, coalescing exception included (#2568).
     func setDesiredConnection(shouldConnect: Bool) async {
         logger.debug(
             "[WSM][debug] setDesiredConnection", shouldConnect,

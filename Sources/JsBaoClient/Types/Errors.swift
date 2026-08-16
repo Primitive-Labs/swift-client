@@ -29,6 +29,25 @@ public enum JsBaoErrorCode: String, Sendable {
     /// key. Mirrors the JS client's `LockTimeoutError` (`LOCK_TIMEOUT`); the
     /// error's `details` carry `key` and `timeoutMs`.
     case lockTimeout = "LOCK_TIMEOUT"
+    /// `openDocument` waited out its `availabilityWait` budget without the
+    /// document's sync completing — the server never answered. Mirrors JS
+    /// `waitForAvailability`'s `NETWORK_TIMEOUT` (#2667, parity C8).
+    case networkTimeout = "NETWORK_TIMEOUT"
+    /// `openDocument` needed the network, but the WebSocket is neither up nor
+    /// able to come up — no token, or `setShouldConnect(false)` (the state an
+    /// auth failure or a logout leaves behind). Mirrors JS
+    /// `waitForAvailability`'s `CONNECTION_DISABLED` (#2667, parity C8).
+    case connectionDisabled = "CONNECTION_DISABLED"
+    /// `openDocument` had no local copy of the document and no way to fetch
+    /// one — `waitForLoad: .localIfAvailableElseNetwork` with the document's
+    /// sync left to the caller (`enableNetworkSync: false`). Mirrors JS
+    /// `waitForAvailability`'s `NO_LOCAL_AND_NO_NETWORK` (#2667, parity C8).
+    case noLocalAndNoNetwork = "NO_LOCAL_AND_NO_NETWORK"
+    /// `openDocument` asked for the network path (`waitForLoad: .network`)
+    /// with `enableNetworkSync: false`, so nothing would ever start the sync
+    /// it is waiting for. Mirrors JS `waitForAvailability`'s
+    /// `NETWORK_REQUIRES_AUTOSTART` (#2667, parity C8).
+    case networkRequiresAutostart = "NETWORK_REQUIRES_AUTOSTART"
 }
 
 /// Main error type for the JsBao client library

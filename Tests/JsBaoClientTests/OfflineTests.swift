@@ -369,7 +369,15 @@ final class OfflineTests: XCTestCase {
         }
         XCTAssertTrue(committed, "Doc B should be auto-committed on reconnect and no longer pending")
         XCTAssertFalse(client.isPendingCreate(docIdB), "Doc B should no longer be pending after auto-commit")
-        XCTAssertTrue(client.hasLocalCopy(docIdB), "Doc B should remain a known local document after commit")
+        // Asserted through the metadata index since #2668: `hasLocalCopy` now
+        // requires a real local data signal (persistence, a pending create, a
+        // local-only document, an open document holding data, or localBytes),
+        // matching js-bao. Doc B is committed and still empty, so what survives
+        // the commit is its metadata entry, not a local copy.
+        XCTAssertNotNil(
+            client.listLocalDocuments()[docIdB],
+            "Doc B should remain a known local document after commit"
+        )
     }
 
     // MARK: - Data available immediately after network sync (evict + reopen)

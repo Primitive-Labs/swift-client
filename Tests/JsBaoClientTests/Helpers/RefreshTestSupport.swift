@@ -16,17 +16,23 @@ import Foundation
 /// - Parameters:
 ///   - initialToken: the access token the controller starts out holding.
 ///   - protocolClass: the `URLProtocol` subclass that answers every request.
+///   - refreshProxy: the refresh-proxy configuration, when the suite exercises
+///     the proxy routing.
+///   - emitter: the emitter the controller publishes to, for suites that assert
+///     on the events an app observes (#2723).
 func makeWiredClients(
     initialToken: String,
-    protocolClass: AnyClass = RefreshStubURLProtocol.self
+    protocolClass: AnyClass = RefreshStubURLProtocol.self,
+    refreshProxy: RefreshProxyConfig? = nil,
+    emitter: EventEmitter = EventEmitter()
 ) -> (auth: AuthController, http: HttpClient) {
     let auth = AuthController(
         appId: "test-app",
         apiUrl: "http://stub.local",
         logger: Logger(level: .error),
         offlineStore: OfflineStore(),
-        emitter: EventEmitter(),
-        refreshProxy: nil,
+        emitter: emitter,
+        refreshProxy: refreshProxy,
         persistConfig: AuthConfig()
     )
 
@@ -40,7 +46,9 @@ func makeWiredClients(
         getConnectionId: { nil },
         getGlobalAdminAppId: { "global-admin-app" },
         logger: Logger(level: .error),
-        refreshAccessToken: { await auth.refreshAccessToken(cause: "http") },
+        refreshAccessToken: {
+            await auth.refreshAccessToken(cause: AuthController.httpRequestCause)
+        },
         sessionConfiguration: stubConfig
     ))
 

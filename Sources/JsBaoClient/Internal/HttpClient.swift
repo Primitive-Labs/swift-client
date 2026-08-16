@@ -191,13 +191,10 @@ public final class HttpClient: @unchecked Sendable {
         body: Data?,
         options: RequestOptions?
     ) async throws -> TransportResponse {
-        // The direct token-refresh request must NOT run the refresh
-        // interceptor: pre-refreshing before it (or refreshing again on its
-        // 401) would re-enter AuthController's single-flight refresh while its
-        // Task is still running, and the Task would await itself — a deadlock.
-        // A 401 from `/auth/refresh` instead surfaces as an HttpError(401),
-        // which AuthController classifies as `.invalid`.
-        let skipRefresh = HttpClient.isRefreshRequest(path: path)
+        // The unauthenticated auth endpoints must NOT run the refresh
+        // interceptor (see `skipsRefreshInterceptor`). A 401 from one of them
+        // surfaces as an `HttpError` carrying the server's own error code.
+        let skipRefresh = HttpClient.skipsRefreshInterceptor(path: path)
 
         if !skipRefresh {
             await refreshIfExpiring()
@@ -244,13 +241,47 @@ public final class HttpClient: @unchecked Sendable {
         !["GET", "HEAD"].contains(method.uppercased())
     }
 
-    /// The direct token-refresh endpoint. A request to this path skips the
-    /// refresh interceptor (see `fetchWithRefresh`): it IS the refresh, so
-    /// pre-refreshing or refreshing again on its 401 would deadlock against
-    /// `AuthController`'s in-flight single-flight Task.
-    private static func isRefreshRequest(path: String) -> Bool {
+    /// The endpoints that skip the refresh interceptor — no expiry preflight
+    /// and no refresh-and-retry on a 401 (see `executeRaw` /
+    /// `fetchWithRefresh`).
+    ///
+    /// `/auth/refresh` is here because it IS the refresh: pre-refreshing or
+    /// refreshing again on its 401 would deadlock against `AuthController`'s
+    /// in-flight single-flight Task.
+    ///
+    /// The rest are the *unauthenticated* auth endpoints, which carry no
+    /// bearer token, so refreshing before or after them is pointless — and
+    /// harmful. The magic-link, OTP and passkey credentials are single-use: a
+    /// retry after a successful refresh re-POSTs a credential the server has
+    /// already consumed, and the 401 path replaces the server's own error code
+    /// (`INVITE_TOKEN_EXPIRED` and friends) with a flat
+    /// `HttpError(401, "Invalid credentials")`. The JS client issues all of
+    /// them with a raw `fetch` for exactly this reason
+    /// (`src/client/internal/authController.ts`); this set is the port of that
+    /// behavior (#2658).
+    ///
+    /// Authenticated passkey management (`/passkey/register/*`,
+    /// `/passkey/list`, `/passkey/{id}`) is deliberately absent: those requests
+    /// do carry a bearer token, so an expired one should still refresh.
+    private static let interceptorExemptPaths: Set<String> = [
+        "/auth/refresh",
+        "/auth/magic-link/request",
+        "/auth/magic-link/verify",
+        "/auth/otp/request",
+        "/auth/otp/verify",
+        "/passkey/auth/start",
+        "/passkey/auth/finish",
+        "/oauth-config",
+        "/oauth/callback",
+        "/auth/oauth/callback",
+    ]
+
+    /// Whether `path` is exempt from the refresh interceptor. The query string
+    /// is stripped first — `/oauth/callback?code=…&state=…` is the same
+    /// endpoint as `/oauth/callback`.
+    private static func skipsRefreshInterceptor(path: String) -> Bool {
         let purePath = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
-        return purePath == "/auth/refresh"
+        return interceptorExemptPaths.contains(purePath)
     }
 
     // MARK: - Private: Token Expiry

@@ -31,19 +31,58 @@ final class AvailabilityTests: XCTestCase {
         // Start offline
         await client.goOffline()
 
-        // Attempting to open with waitForLoad: .network while offline should fail
+        // Opening with waitForLoad: .network while offline fails with the
+        // typed code JS throws. Until #2667 the open resolved with a
+        // possibly-empty document instead, so this case tolerated either
+        // outcome; it now pins the error.
         do {
             _ = try await client.openDocument(docId, options: OpenDocumentOptions(
                 waitForLoad: .network,
                 enableNetworkSync: true
             ))
-            // If we get here without error, the client might handle this gracefully
-        } catch {
-            let msg = String(describing: error)
-            XCTAssertTrue(
-                msg.contains("OFFLINE") || msg.contains("UNAVAILABLE") || msg.contains("offline"),
-                "Expected offline error, got: \(msg)"
-            )
+            XCTFail("openDocument resolved while offline; expected DOCUMENT_UNAVAILABLE_OFFLINE")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .documentUnavailableOffline)
+        }
+    }
+
+    /// The `documents.open` twin surface forwards the same typed errors —
+    /// no wrapper swallows them (#2667, behavior 7). Uses the live server so
+    /// the sub-API is exercised the way callers reach it, against a document
+    /// that really exists.
+    func testDocumentsOpenTwinSurfaceThrowsTypedErrors() async throws {
+        let client = createTestClient(
+            appId: testApp.appId,
+            token: testApp.ownerJWT,
+            offline: true
+        )
+        defer { Task { await client.destroy() } }
+
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
+
+        await client.goOffline()
+        do {
+            _ = try await client.documents.open(docId, options: OpenDocumentOptions(
+                waitForLoad: .network,
+                enableNetworkSync: true
+            ))
+            XCTFail("documents.open resolved while offline; expected DOCUMENT_UNAVAILABLE_OFFLINE")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .documentUnavailableOffline)
+        }
+
+        // And the connection-disabled path, online but unable to connect.
+        await client.goOnline()
+        await client.setShouldConnect(false)
+        do {
+            _ = try await client.documents.open(docId, options: OpenDocumentOptions(
+                waitForLoad: .network,
+                enableNetworkSync: true,
+                availabilityWait: 1
+            ))
+            XCTFail("documents.open resolved with the connection disabled; expected CONNECTION_DISABLED")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .connectionDisabled)
         }
     }
 

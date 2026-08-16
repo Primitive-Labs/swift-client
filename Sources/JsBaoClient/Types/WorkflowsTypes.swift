@@ -49,6 +49,21 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
     /// Error message when `status == "failed"`, `null` otherwise. Mirrors JS
     /// `WorkflowRun.errorMessage`. Decoded when present.
     public let errorMessage: String?
+    /// #2636 — the platform's classification of this failure, from a closed
+    /// set it owns: `"LOCK_CONTENTION"` when the run lost a declarative-lock
+    /// race under `onContention: "fail"`, `"LOCK_TIMEOUT"` when it exhausted an
+    /// `onContention: "block"` budget. `nil` when the run did not fail, and for
+    /// a failure the platform did not classify. Branch on this rather than on
+    /// `errorMessage` text. Mirrors JS `WorkflowRun.errorCode`. Decoded when
+    /// present.
+    public let errorCode: String?
+    /// #2636 — why an elided run did not run: `"LOCK_CONTENTION"` when its
+    /// declarative lock was held and the definition declared
+    /// `onContention: "ignore"`. Only ever set on a run whose `status` is
+    /// `"skipped"`; such a run carries no `errorMessage` and produces no error
+    /// analytics — it is a visible record that the work was not done, not a
+    /// failure. Mirrors JS `WorkflowRun.skipReason`. Decoded when present.
+    public let skipReason: String?
     /// #2074 — normalized form of `errorMessage`, with ids, numbers, URLs and
     /// quoted literals replaced by placeholder tokens, so runs that failed for
     /// the same reason share one title you can group on. It is also the string
@@ -91,7 +106,7 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
         case runId, runKey, instanceId, workflowId, workflowKey
         case revisionId, contextDocId, status, createdAt, startedAt
         case executionStartedAt, queueDelayMs, createCallDurationMs, endedAt
-        case errorMessage, errorTitle
+        case errorMessage, errorTitle, errorCode, skipReason
         case failedStepId, failedStepKind, failedStepErrorTitle
         case meta
         case startedByUserId
@@ -115,6 +130,8 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
         endedAt = try c.decodeIfPresent(String.self, forKey: .endedAt)
         errorMessage = try c.decodeIfPresent(String.self, forKey: .errorMessage)
         errorTitle = try c.decodeIfPresent(String.self, forKey: .errorTitle)
+        errorCode = try c.decodeIfPresent(String.self, forKey: .errorCode)
+        skipReason = try c.decodeIfPresent(String.self, forKey: .skipReason)
         failedStepId = try c.decodeIfPresent(String.self, forKey: .failedStepId)
         failedStepKind = try c.decodeIfPresent(String.self, forKey: .failedStepKind)
         failedStepErrorTitle = try c.decodeIfPresent(
@@ -174,10 +191,13 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
     /// Final output of the run, when present. Opaque blob.
     public let output: JSONValue?
     public let error: String?
+    /// #2636 — why the run did not run, when `status == "skipped"`. The server
+    /// sends it next to the status and on the run record; either satisfies it.
+    public let skipReason: String?
     public let run: WorkflowRunInfo?
 
     private enum CodingKeys: String, CodingKey {
-        case status, output, error, run
+        case status, output, error, run, skipReason
     }
 
     /// The Cloudflare workflow status object the server nests under `status`:
@@ -188,6 +208,7 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         let status: String?
         let output: JSONValue?
         let error: String?
+        let skipReason: String?
     }
 
     /// Memberwise init, for constructing a result directly (tests, callers
@@ -198,12 +219,14 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         status: String,
         output: JSONValue?,
         error: String?,
-        run: WorkflowRunInfo?
+        run: WorkflowRunInfo?,
+        skipReason: String? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.run = run
+        self.skipReason = skipReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -215,16 +238,22 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         // We do the same. Defensive fallback: tolerate `status` arriving as a
         // bare string (direct construction / already-flattened payloads), and
         // top-level `output`/`error` for the same reason.
+        var nestedSkipReason: String? = nil
         if let cf = (try? c.decodeIfPresent(CFWorkflowStatus.self, forKey: .status)) ?? nil {
             status = cf.status ?? ""
             output = try cf.output ?? c.decodeIfPresent(JSONValue.self, forKey: .output)
             error = try cf.error ?? c.decodeIfPresent(String.self, forKey: .error)
+            nestedSkipReason = cf.skipReason
         } else {
             status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
             output = try c.decodeIfPresent(JSONValue.self, forKey: .output)
             error = try c.decodeIfPresent(String.self, forKey: .error)
         }
         run = try c.decodeIfPresent(WorkflowRunInfo.self, forKey: .run)
+        // #2636 — the reason rides next to the status and on the run record.
+        let topLevelSkipReason = try c.decodeIfPresent(
+            String.self, forKey: .skipReason)
+        skipReason = nestedSkipReason ?? topLevelSkipReason ?? run?.skipReason
     }
 }
 
@@ -432,12 +461,18 @@ public struct PendingApplyInfo: Decodable, Sendable, Equatable {
 public struct RunSyncWorkflowResult: Decodable, Sendable {
     public let runId: String
     public let runKey: String
-    /// `completed` | `failed` | `terminated` | `timeout` | `apply_pending`.
+    /// `completed` | `failed` | `terminated` | `timeout` | `apply_pending` |
+    /// `skipped`.
     public let status: String
     /// Final output when `status == "completed"`.
     public let output: JSONValue?
     /// Error message when `status == "failed"`.
     public let error: String?
+    /// #2636 — why the workflow did not run, when `status == "skipped"`: its
+    /// declarative lock was held and the definition declared
+    /// `onContention: "ignore"`. The envelope then carries neither `output` nor
+    /// `error`.
+    public let skipReason: String?
     /// Persisted run record (present on success).
     public let run: WorkflowRunInfo?
     /// `true` if `runKey` matched an existing run (no new execution occurred).
@@ -461,13 +496,20 @@ public struct RunSyncWorkflowResult: Decodable, Sendable {
 public struct RunSyncResult<Output: Decodable & Sendable>: Sendable {
     public let runId: String
     public let runKey: String
-    /// `completed` | `failed` | `terminated` | `timeout` | `apply_pending`.
+    /// `completed` | `failed` | `terminated` | `timeout` | `apply_pending` |
+    /// `skipped`.
     public let status: String
     /// Final output decoded into `Output` when `status == "completed"` (and the
     /// server returned a non-null output); `nil` otherwise.
     public let output: Output?
     /// Error message when `status == "failed"`.
     public let error: String?
+    /// #2636 — why the workflow did not run, when `status == "skipped"`: its
+    /// declarative lock was held and the definition declared
+    /// `onContention: "ignore"`. The result then carries neither `output` nor
+    /// `error`. Branch on this rather than on message text — the typed
+    /// envelope carries it for the same reason the untyped one does.
+    public let skipReason: String?
     /// Persisted run record (present on success).
     public let run: WorkflowRunInfo?
     /// `true` if `runKey` matched an existing run (no new execution occurred).
@@ -480,7 +522,10 @@ public struct RunSyncResult<Output: Decodable & Sendable>: Sendable {
         output: Output?,
         error: String?,
         run: WorkflowRunInfo?,
-        existing: Bool?
+        existing: Bool?,
+        // Trailing with a default so the pre-#2636 memberwise call still
+        // compiles for anyone constructing one of these directly.
+        skipReason: String? = nil
     ) {
         self.runId = runId
         self.runKey = runKey
@@ -489,6 +534,7 @@ public struct RunSyncResult<Output: Decodable & Sendable>: Sendable {
         self.error = error
         self.run = run
         self.existing = existing
+        self.skipReason = skipReason
     }
 }
 
@@ -501,18 +547,24 @@ public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
     /// Final output decoded into `Output` when present; `nil` otherwise.
     public let output: Output?
     public let error: String?
+    /// #2636 — why the run did not run, when `status == "skipped"`. Forwarded
+    /// from the untyped result, which reads it from wherever the server put it
+    /// (next to the status, or on the run record).
+    public let skipReason: String?
     public let run: WorkflowRunInfo?
 
     public init(
         status: String,
         output: Output?,
         error: String?,
-        run: WorkflowRunInfo?
+        run: WorkflowRunInfo?,
+        skipReason: String? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.run = run
+        self.skipReason = skipReason
     }
 }
 
@@ -545,8 +597,9 @@ public struct WaitForWorkflowOptions: Sendable {
 /// `status` is a plain `String` (not a closed enum) so a future server-added
 /// terminal-like state never turns "workflow finished" into a decode failure —
 /// matching every other Swift workflow status field. It is one of
-/// `completed` / `failed` / `terminated` / `apply_pending` / `apply_claimed`
-/// (never `running`). Use `isTerminal` / `isFailure` for common checks.
+/// `completed` / `failed` / `terminated` / `apply_pending` / `apply_claimed` /
+/// `skipped` (never `running`). Use `isTerminal` / `isFailure` for common
+/// checks.
 public struct WaitForWorkflowResult: Sendable {
     /// Terminal status of the run. Never `running`.
     public let status: String
@@ -554,11 +607,20 @@ public struct WaitForWorkflowResult: Sendable {
     public let output: JSONValue?
     /// Error message when `status == "failed"`.
     public let error: String?
+    /// #2636 — why the run did not run, when `status == "skipped"`
+    /// (`"LOCK_CONTENTION"`). `nil` for every other status.
+    public let skipReason: String?
 
-    public init(status: String, output: JSONValue?, error: String?) {
+    public init(
+        status: String,
+        output: JSONValue?,
+        error: String?,
+        skipReason: String? = nil
+    ) {
         self.status = status
         self.output = output
         self.error = error
+        self.skipReason = skipReason
     }
 
     /// `true` for any terminal-for-waiting status. Always `true` on a resolved
@@ -571,8 +633,13 @@ public struct WaitForWorkflowResult: Sendable {
     /// `catch`.
     public var isFailure: Bool { status == "failed" }
 
+    /// #2636 — `skipped` belongs here: an elided run (its declarative lock was
+    /// held and the definition declared `onContention: "ignore"`) is settled and
+    /// will never advance, so a set without it makes `waitFor` keep waiting
+    /// until its own timeout.
     static let terminalStatuses: Set<String> = [
         "completed", "failed", "terminated", "apply_pending", "apply_claimed",
+        "skipped",
     ]
 }
 
@@ -588,11 +655,19 @@ public struct WaitForResult<Output: Decodable & Sendable>: Sendable {
     public let output: Output?
     /// Error message when `status == "failed"`.
     public let error: String?
+    /// #2636 — why the run did not run, when `status == "skipped"`.
+    public let skipReason: String?
 
-    public init(status: String, output: Output?, error: String?) {
+    public init(
+        status: String,
+        output: Output?,
+        error: String?,
+        skipReason: String? = nil
+    ) {
         self.status = status
         self.output = output
         self.error = error
+        self.skipReason = skipReason
     }
 
     /// See `WaitForWorkflowResult.isTerminal`.

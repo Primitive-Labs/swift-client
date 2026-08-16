@@ -279,7 +279,11 @@ public final class WorkflowsAPI: @unchecked Sendable {
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
             run: untyped.run,
-            existing: untyped.existing
+            existing: untyped.existing,
+            // #2636 — the typed envelope mirrors every field of the untyped
+            // one, so an app on the generated invokers can branch on the reason
+            // an elided run did not run.
+            skipReason: untyped.skipReason
         )
     }
 
@@ -333,7 +337,9 @@ public final class WorkflowsAPI: @unchecked Sendable {
             status: untyped.status,
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
-            run: untyped.run
+            run: untyped.run,
+            // #2636 — same reason as the typed run-sync result above.
+            skipReason: untyped.skipReason
         )
     }
 
@@ -658,7 +664,11 @@ public final class WorkflowsAPI: @unchecked Sendable {
                     finish(.success(WaitForWorkflowResult(
                         status: status,
                         output: Self.jsonValueFromAny(event.output),
-                        error: event.error
+                        error: event.error,
+                        // #2636 — an elided run's frame carries the reason
+                        // instead of an error, so the event path reports the
+                        // same shape the reconcile path does.
+                        skipReason: event.skipReason
                     )))
                 }
 
@@ -714,7 +724,8 @@ public final class WorkflowsAPI: @unchecked Sendable {
         return WaitForResult(
             status: base.status,
             output: try Self.decodeTypedOutput(base.output),
-            error: base.error
+            error: base.error,
+            skipReason: base.skipReason
         )
     }
 
@@ -771,7 +782,8 @@ public final class WorkflowsAPI: @unchecked Sendable {
                 return WaitForWorkflowResult(
                     status: stored,
                     output: res.output,
-                    error: res.error
+                    error: res.error,
+                    skipReason: res.skipReason
                 )
             }
             attempts += 1
@@ -808,7 +820,8 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// run is not yet terminal.
     ///
     /// #2348: terminality is decided by the server-declared status alone — one
-    /// of `completed`, `failed`, `terminated`, `apply_pending`, `apply_claimed`.
+    /// of `completed`, `failed`, `terminated`, `apply_pending`, `apply_claimed`,
+    /// or `skipped` (#2636 — a run elided by its declarative lock).
     /// The client no longer infers a terminal state from `run.endedAt` or from
     /// the presence of `run.errorMessage`, and no longer maps raw Cloudflare
     /// spellings: the server reconciles the run before responding, so its
@@ -818,7 +831,8 @@ public final class WorkflowsAPI: @unchecked Sendable {
         return WaitForWorkflowResult(
             status: res.status,
             output: res.output,
-            error: res.error
+            error: res.error,
+            skipReason: res.skipReason
         )
     }
 

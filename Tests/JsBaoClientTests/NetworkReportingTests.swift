@@ -52,9 +52,15 @@ final class NetworkReportingTests: XCTestCase {
         XCTAssertTrue(client.webSocketManagerShouldReconnect(code: 1006, reason: "abnormal"))
         XCTAssertTrue(client.networkingAllowed())
 
-        // Auth-failure closes still suppress reconnect (unchanged).
-        XCTAssertFalse(client.webSocketManagerShouldReconnect(code: 4001, reason: "auth"))
-        XCTAssertFalse(client.webSocketManagerShouldReconnect(code: 4003, reason: "auth"))
+        // No close code suppresses reconnect any more (#2660). This used to
+        // assert that 4001 and 4003 did, which was the wrong pair: the server
+        // sends 4401 for an expired token, sends 4001 only alongside "Session
+        // expired. Please reconnect.", and never sends 4003. The gate now
+        // matches the JS client's `shouldReconnect`, which ignores the code, and
+        // a dead token is fixed by refreshing it rather than by abandoning the
+        // connection. Covered in full by `WsAuthFramesTests`.
+        XCTAssertTrue(client.webSocketManagerShouldReconnect(code: 4001, reason: "auth"))
+        XCTAssertTrue(client.webSocketManagerShouldReconnect(code: 4003, reason: "auth"))
     }
 
     // MARK: - Behaviors 2/3/4 — the reporting formula matrix

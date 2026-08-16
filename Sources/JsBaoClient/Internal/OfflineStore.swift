@@ -289,6 +289,47 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// `LocalMetadataEntry.docMetadata` (#673).
     public var docMetadata: JSONValue?
 
+    // The fields below mirror js-bao's `LocalMetadataEntry`
+    // (`src/client/internal/documentManager.ts`) so offline listings can
+    // report the same state the JS client reports (#2662, parity C26). All
+    // optional: rows written before the widening still decode.
+
+    /// The permission last known for this document, cached locally so an
+    /// offline listing can still report access level. Mirrors js-bao
+    /// `lastKnownPermission`. `permission` above stays as the raw
+    /// server-listing value; this one is written by the permission-apply path.
+    public var lastKnownPermission: String?
+    /// ISO-8601 timestamp of when `lastKnownPermission` was cached — the age
+    /// a caller needs to decide whether to trust it. Mirrors js-bao
+    /// `permissionCachedAt`.
+    public var permissionCachedAt: String?
+    /// ISO-8601 timestamp of the document's last known server-side
+    /// modification, tracked separately from `metadataSyncedAt` (which records
+    /// when *this client* last refreshed the metadata). Mirrors js-bao
+    /// `lastSyncedAt`.
+    public var lastSyncedAt: String?
+    /// Whether this document holds a local edit that has not reached the
+    /// server. Persisted so the flag survives a restart — the in-memory
+    /// `unconfirmedLocalWrites` set does not. Mirrors js-bao
+    /// `hasUnsyncedLocalChanges`.
+    public var hasUnsyncedLocalChanges: Bool?
+    /// Blob id of the document's thumbnail, for offline listings that render
+    /// one. Mirrors js-bao `thumbnailBlobId`.
+    public var thumbnailBlobId: String?
+    /// ISO-8601 timestamp of when access to this document was granted.
+    /// Mirrors js-bao `grantedAt`.
+    public var grantedAt: String?
+    /// ISO-8601 timestamp of when a pending create actually committed to the
+    /// server. Mirrors js-bao `createCommittedAt`, the #1953 GSI-lag bridge:
+    /// the owned-docs merge recency-gates on the later of this and
+    /// `createdAt`, so a slow-to-commit offline create is still bridged while
+    /// the server's `permissionsForUser` GSI catches up.
+    public var createCommittedAt: String?
+    /// Whether a local CRDT snapshot exists for this document. Named for
+    /// js-bao's `hasIndexedDbSnapshot`; Swift's local store is SQLite, and the
+    /// field keeps the JS name so cross-platform consumers read one vocabulary.
+    public var hasIndexedDbSnapshot: Bool?
+
     public init(
         documentId: String,
         title: String? = nil,
@@ -305,7 +346,15 @@ public struct LocalMetadataEntry: Codable, Sendable {
         localBytes: Int? = nil,
         commitRetryCount: Int? = nil,
         nextCommitAttemptAt: String? = nil,
-        docMetadata: JSONValue? = nil
+        docMetadata: JSONValue? = nil,
+        lastKnownPermission: String? = nil,
+        permissionCachedAt: String? = nil,
+        lastSyncedAt: String? = nil,
+        hasUnsyncedLocalChanges: Bool? = nil,
+        thumbnailBlobId: String? = nil,
+        grantedAt: String? = nil,
+        createCommittedAt: String? = nil,
+        hasIndexedDbSnapshot: Bool? = nil
     ) {
         self.documentId = documentId
         self.title = title
@@ -323,6 +372,14 @@ public struct LocalMetadataEntry: Codable, Sendable {
         self.commitRetryCount = commitRetryCount
         self.nextCommitAttemptAt = nextCommitAttemptAt
         self.docMetadata = docMetadata
+        self.lastKnownPermission = lastKnownPermission
+        self.permissionCachedAt = permissionCachedAt
+        self.lastSyncedAt = lastSyncedAt
+        self.hasUnsyncedLocalChanges = hasUnsyncedLocalChanges
+        self.thumbnailBlobId = thumbnailBlobId
+        self.grantedAt = grantedAt
+        self.createCommittedAt = createCommittedAt
+        self.hasIndexedDbSnapshot = hasIndexedDbSnapshot
     }
 }
 

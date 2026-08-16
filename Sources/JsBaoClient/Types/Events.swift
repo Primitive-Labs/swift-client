@@ -523,9 +523,17 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
     public let workflowId: String
     public let runKey: String
     public let runId: String
-    public let status: String   // "completed" | "failed" | "terminated"
+    public let status: String   // "completed" | "failed" | "terminated" | "skipped"
     public let output: Any?
     public let error: String?
+    /// #2636 — the platform's classification of a `"failed"` run
+    /// (`"LOCK_CONTENTION"` / `"LOCK_TIMEOUT"`); `nil` on any other status.
+    public let errorCode: String?
+    /// #2636 — why a `"skipped"` run did not run (`"LOCK_CONTENTION"`): its
+    /// declarative lock was held and the definition declared
+    /// `onContention: "ignore"`. `nil` on any other status; such a frame
+    /// carries no `error`.
+    public let skipReason: String?
     public let contextDocId: String?
     public let needsApply: Bool
     public let meta: [String: JSONValue]?
@@ -539,6 +547,8 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
         status: String,
         output: Any? = nil,
         error: String? = nil,
+        errorCode: String? = nil,
+        skipReason: String? = nil,
         contextDocId: String? = nil,
         needsApply: Bool = false,
         meta: [String: JSONValue]? = nil,
@@ -551,6 +561,8 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
         self.status = status
         self.output = output
         self.error = error
+        self.errorCode = errorCode
+        self.skipReason = skipReason
         self.contextDocId = contextDocId
         self.needsApply = needsApply
         self.meta = meta
@@ -756,7 +768,25 @@ public struct ConnectionCloseEvent: Sendable {
 
 public struct ConnectionErrorEvent: Sendable {
     public let message: String?
-    public init(message: String? = nil) { self.message = message }
+    /// Document the failed message was about, when the server's `error` frame
+    /// names one. Nil for transport-level failures, which are not per-document.
+    public let documentId: String?
+    /// The client message type the server rejected (e.g. `syncStep1`).
+    public let messageType: String?
+    /// Free-form server-supplied context for the failure.
+    public let detail: JSONValue?
+
+    public init(
+        message: String? = nil,
+        documentId: String? = nil,
+        messageType: String? = nil,
+        detail: JSONValue? = nil
+    ) {
+        self.message = message
+        self.documentId = documentId
+        self.messageType = messageType
+        self.detail = detail
+    }
 }
 
 public struct DocumentOpenedEvent: Sendable {

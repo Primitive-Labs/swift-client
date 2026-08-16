@@ -918,26 +918,13 @@ public final class DocumentsAPI: @unchecked Sendable {
         _ documentId: String,
         options: CloseDocumentOptions = CloseDocumentOptions()
     ) async -> CloseDocumentResult {
-        guard options.evictLocal else {
-            await client?.closeDocument(documentId, options: options)
-            return CloseDocumentResult(evicted: false)
-        }
-        // Verify the server actually holds our writes before evicting — an
-        // active state-vector round-trip with a 500ms/100ms poll, matching
-        // js-bao (JsBaoClient.ts:7346 `waitForWriteConfirmation(id, 500, 100)`).
-        // The cached `isSynced` flag would report `evicted: false` in the common
-        // just-flushed case (ack not yet processed) and could falsely evict on a
-        // stale-true flag. (#961)
-        let confirmed = await waitForWriteConfirmation(
-            documentId: documentId,
-            timeout: 0.5,
-            pollInterval: 0.1
-        )
-        await client?.closeDocument(
-            documentId,
-            options: CloseDocumentOptions(evictLocal: confirmed)
-        )
-        return CloseDocumentResult(evicted: confirmed)
+        // The write-confirmation guard lives in `client.closeDocument` since
+        // #2668 — it has to, because a document opened with `retainLocal: false`
+        // evicts at close without anyone passing `evictLocal`. Running the
+        // 500ms/100ms state-vector poll here as well would double the round trip
+        // on every eviction, so this forwards and reports what close decided.
+        guard let client else { return CloseDocumentResult(evicted: false) }
+        return await client.closeDocument(documentId, options: options)
     }
 
     /// Resolve an alias and open the document it points at, in one call.

@@ -30,6 +30,15 @@ final class RecordingTransport: Transport, @unchecked Sendable {
     var calls: [RecordedRequest] { lock.withLock { _calls } }
     var lastCall: RecordedRequest? { lock.withLock { _calls.last } }
 
+    /// The most recent call to one endpoint.
+    ///
+    /// Prefer this over `lastCall` in client-level tests: since #2656 a client
+    /// constructed without a token issues a startup `POST /auth/refresh`, which
+    /// can land after the call under test and take the `lastCall` slot.
+    func lastCall(to path: String) -> RecordedRequest? {
+        lock.withLock { _calls.last(where: { $0.path == path }) }
+    }
+
     init(responder: @escaping @Sendable (RecordedRequest) async throws -> TransportResponse) {
         self.responder = responder
     }

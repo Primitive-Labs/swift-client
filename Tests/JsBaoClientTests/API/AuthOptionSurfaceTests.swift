@@ -137,9 +137,12 @@ final class AuthOptionSurfaceTests: XCTestCase {
 
         _ = try await client.magicLinkVerify(token: "ml-token", inviteToken: "invite-tok-ml")
 
-        XCTAssertEqual(r.lastCall?.method, .post)
-        XCTAssertEqual(r.lastCall?.path, "/auth/magic-link/verify")
-        let body = r.lastCall?.jsonBody
+        // Select the verify call by path rather than taking the last one: a
+        // token-less client now issues a startup POST /auth/refresh (#2656),
+        // which can land after this call.
+        let call = r.lastCall(to: "/auth/magic-link/verify")
+        XCTAssertEqual(call?.method, .post)
+        let body = call?.jsonBody
         XCTAssertEqual(body?["token"]?.stringValue, "ml-token")
         XCTAssertEqual(body?["inviteToken"]?.stringValue, "invite-tok-ml")
     }
@@ -153,7 +156,7 @@ final class AuthOptionSurfaceTests: XCTestCase {
 
         _ = try await client.magicLinkVerify(token: "ml-token")
 
-        let body = r.lastCall?.jsonBody
+        let body = r.lastCall(to: "/auth/magic-link/verify")?.jsonBody
         XCTAssertNotNil(body)
         XCTAssertNil(body?["inviteToken"])
         XCTAssertEqual(body?["token"]?.stringValue, "ml-token")
@@ -166,7 +169,7 @@ final class AuthOptionSurfaceTests: XCTestCase {
 
         _ = try await client.magicLinkVerify(token: "ml-token", inviteToken: "   ")
 
-        let body = r.lastCall?.jsonBody
+        let body = r.lastCall(to: "/auth/magic-link/verify")?.jsonBody
         XCTAssertNil(body?["inviteToken"])
     }
 

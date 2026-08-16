@@ -446,7 +446,107 @@ final class WebSocketManagerGatesAndEdgeCasesTests: XCTestCase {
 
     /// `setDesiredConnection(true)` parks on the in-flight disconnect and only
     /// then connects, rather than racing it.
+    ///
+    /// The connect is issued from **inside** the disconnect, out of the
+    /// `disconnectInitiated` delegate callback. `disconnect()` makes that call
+    /// from the same non-suspending isolated region that set
+    /// `isDisconnecting = true`, and before it has issued the socket close at
+    /// all, so the disconnect is provably still in flight at the moment the
+    /// connect is enqueued on the actor. That is the precondition the test
+    /// claims to exercise, and there is no other seam that establishes it:
+    /// `URLSessionWebSocketTask.cancel(with:)` reports `didCloseWith` locally
+    /// within a fraction of a millisecond on the loopback server, so *any*
+    /// wait-then-act shape — including polling for `disconnectInitiated`, the
+    /// shape PR #2624 first used — issues its connect against a disconnect
+    /// that has already fully resolved. Measured, with
+    /// `waitForInFlightDisconnect()` stubbed out to return immediately: the
+    /// polling shape still passed 5 of 10 runs; this shape failed 20 of 20.
+    ///
+    /// The settle check below is a plain assertion rather than a poll, because
+    /// `setDesiredConnection` awaits `connect()`, and `connect()` publishes the
+    /// transport snapshot before it resumes its caller. The 10 s poll it
+    /// replaces was not a timeout worth keeping: waiting longer for a
+    /// condition that is already decided is what made the original test burn
+    /// its full window.
+    ///
+    /// Fired as two unordered `async let` children instead — the shape this
+    /// test had until #2568 — the connect reaches the actor first often enough
+    /// to matter under CPU load, finds no disconnect in flight, short-circuits
+    /// on `.alreadyConnected`, and lets the disconnect land last and settle
+    /// the manager disconnected. That is correct last-writer-wins behavior, so
+    /// the 10 s settle poll could never succeed and the test burned its full
+    /// window. The unordered case is covered by
+    /// `testConcurrentDisconnectAndSetDesiredConnectionSettleOnTheLastCommand`,
+    /// which asserts only invariants that hold in both interleavings.
     func testSetDesiredConnectionWaitsOutAnInFlightDisconnect() async throws {
+        let server = try LoopbackWebSocketServer()
+        let url = try server.start()
+        defer { server.stop() }
+
+        let managerBox = LockedBox<WebSocketManager?>(nil)
+        let reconnecting = LockedBox<Task<Void, Never>?>(nil)
+        let delegate = RecordingDelegate(url: url, onDisconnectInitiated: {
+            // Cleared before the teardown disconnect below, so this fires for
+            // exactly the one disconnect the test is ordering against.
+            guard let manager = managerBox.value else { return }
+            reconnecting.value = Task { await manager.setDesiredConnection(shouldConnect: true) }
+        })
+        let manager = makeManager(url: url, delegate: delegate)
+        managerBox.value = manager
+
+        try await manager.connect()
+        XCTAssertEqual(delegate.requestsBuilt, 1, "the opening connect builds exactly one request")
+
+        await assertCompletesAsync(within: 15, "setDesiredConnection(true) behind an in-flight disconnect") {
+            await manager.disconnect()
+            await reconnecting.value?.value
+        }
+
+        let calls = delegate.calls
+        XCTAssertEqual(
+            delegate.countOf("disconnectInitiated"), 1,
+            "disconnect() must report disconnectInitiated — the callback this test issues the connect from: \(calls)"
+        )
+
+        // The parking is what these two assert. Without it the connect runs
+        // while the socket is still open and `_connected` still true, takes
+        // `connectDecision()`'s `.alreadyConnected` branch, builds no second
+        // request, and leaves the disconnect to land last and settle the
+        // manager disconnected.
+        XCTAssertEqual(
+            delegate.requestsBuilt, 2,
+            "the connect must park on the close and then build a fresh request, not short-circuit on the open socket: \(calls)"
+        )
+        if let resolved = calls.firstIndex(of: "disconnectResolved"),
+           let reconnected = calls.lastIndex(of: "connecting") {
+            XCTAssertGreaterThan(
+                reconnected, resolved,
+                "the connect must start after the disconnect resolved, not alongside it: \(calls)"
+            )
+        } else {
+            XCTFail("expected both a resolved disconnect and a second connect: \(calls)")
+        }
+        XCTAssertTrue(
+            manager.isConnected,
+            "the connect must win the ordering and leave the manager connected: \(calls)"
+        )
+
+        managerBox.value = nil
+        await manager.disconnect()
+    }
+
+    /// The unordered variant: `disconnect()` and `setDesiredConnection(true)`
+    /// are fired with no ordering between them, and only the invariants that
+    /// hold in *both* interleavings are asserted (#2568).
+    ///
+    /// Which command reaches the actor last is the scheduler's choice, so the
+    /// terminal state is too — `setDesiredConnection` documents the rule as
+    /// last writer wins. The delegate call sequence names the interleaving: a
+    /// `connecting` after `disconnectInitiated` means the connect parked on
+    /// the in-flight disconnect and then re-drove a real connect, so it landed
+    /// last; no such call means the connect arrived first, short-circuited on
+    /// an already-open socket, and the disconnect landed last.
+    func testConcurrentDisconnectAndSetDesiredConnectionSettleOnTheLastCommand() async throws {
         let server = try LoopbackWebSocketServer()
         let url = try server.start()
         defer { server.stop() }
@@ -454,6 +554,7 @@ final class WebSocketManagerGatesAndEdgeCasesTests: XCTestCase {
         let manager = makeManager(url: url, delegate: delegate)
 
         try await manager.connect()
+        XCTAssertEqual(delegate.requestsBuilt, 1, "the opening connect builds exactly one request")
 
         await assertCompletesAsync(within: 15, "concurrent disconnect and setDesiredConnection(true)") {
             async let disconnecting: Void = manager.disconnect()
@@ -461,8 +562,31 @@ final class WebSocketManagerGatesAndEdgeCasesTests: XCTestCase {
             _ = await (disconnecting, reconnecting)
         }
 
-        let settled = await eventuallyTrue(timeout: 10) { manager.isConnected }
-        XCTAssertTrue(settled, "the connect must win the ordering and leave the manager connected")
+        let calls = delegate.calls
+        XCTAssertEqual(
+            delegate.countOf("disconnectInitiated"), 1,
+            "exactly one disconnect runs whichever order the pair lands in: \(calls)"
+        )
+        guard let initiated = calls.firstIndex(of: "disconnectInitiated") else { return }
+
+        if calls[initiated...].contains("connecting") {
+            XCTAssertEqual(
+                delegate.requestsBuilt, 2,
+                "the connect landed last, so it built exactly one further request: \(calls)"
+            )
+            let settled = await eventuallyTrue(timeout: 5) { manager.isConnected }
+            XCTAssertTrue(settled, "the connect landed last, so the manager must end connected: \(calls)")
+        } else {
+            XCTAssertEqual(
+                delegate.requestsBuilt, 1,
+                "the connect short-circuited on the open socket, so no second socket was opened: \(calls)"
+            )
+            XCTAssertFalse(
+                manager.isConnected,
+                "the disconnect landed last, so the manager must end disconnected: \(calls)"
+            )
+        }
+
         await manager.disconnect()
     }
 

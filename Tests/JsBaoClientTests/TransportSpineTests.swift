@@ -558,7 +558,12 @@ final class TransportSpineTests: XCTestCase {
             // and both now call one `prepareAnalyticsEvent` helper that logs
             // the encode failure instead of dropping it, so the two casts
             // became one.
-            "JsBaoClient.swift": (21, 5, 0),
+            // #2660 took the `JSONSerialization` count 5 -> 6: re-authenticating
+            // an open socket sends one more outbound frame,
+            // `{type:"auth", token}`, encoded the same way the other outbound
+            // frames in this file are. The dictionary it encodes is
+            // `[String: String]`, so the untyped-dictionary count is unchanged.
+            "JsBaoClient.swift": (21, 6, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP

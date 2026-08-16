@@ -41,7 +41,13 @@ final class EventTests: XCTestCase {
         let forDoc = loadedEvents.filter { $0.documentId == docId }
         XCTAssertGreaterThanOrEqual(forDoc.count, 1, "Expected at least one documentLoaded event")
 
-        let serverEvent = forDoc.first { $0.source == "server" }
+        // Exactly one server-source event per open cycle, matching JS
+        // (`tests/client/js-bao-client-events.test.ts`). This assertion used to
+        // be a tolerant `>= 1`, which is what let the every-resync re-emission
+        // go unnoticed (#2666).
+        let serverEvents = forDoc.filter { $0.source == "server" }
+        XCTAssertEqual(serverEvents.count, 1, "Expected exactly one server-source documentLoaded event")
+        let serverEvent = serverEvents.first
         XCTAssertNotNil(serverEvent, "Expected a server-source documentLoaded event")
         XCTAssertEqual(serverEvent?.documentId, docId)
         XCTAssertGreaterThanOrEqual(serverEvent?.elapsedMs ?? -1, 0)

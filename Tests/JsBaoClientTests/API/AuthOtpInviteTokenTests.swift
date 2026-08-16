@@ -132,10 +132,12 @@ final class AuthOtpInviteTokenTests: XCTestCase {
             inviteToken: "invite-tok-top"
         )
 
-        XCTAssertEqual(r.lastCall?.method, .post)
-        XCTAssertEqual(r.lastCall?.path, "/auth/otp/verify")
-        let body = r.lastCall?.jsonBody
-        XCTAssertEqual(body?["inviteToken"]?.stringValue, "invite-tok-top")
+        // Select the verify call by path rather than taking the last one: a
+        // token-less client now issues a startup POST /auth/refresh (#2656),
+        // which can land after this call.
+        let call = r.lastCall(to: "/auth/otp/verify")
+        XCTAssertEqual(call?.method, .post)
+        XCTAssertEqual(call?.jsonBody?["inviteToken"]?.stringValue, "invite-tok-top")
     }
 
     /// Source compatibility + JS parity: the two-arg call still works and
@@ -147,7 +149,7 @@ final class AuthOtpInviteTokenTests: XCTestCase {
 
         _ = try await client.otpVerify(email: "otp@example.com", code: "123456")
 
-        let body = r.lastCall?.jsonBody
+        let body = r.lastCall(to: "/auth/otp/verify")?.jsonBody
         XCTAssertNotNil(body)
         XCTAssertNil(body?["inviteToken"])
         XCTAssertEqual(body?.objectValue?.count, 2)

@@ -36,8 +36,9 @@ final class DisconnectReconnectTests: XCTestCase {
         try await delay(0.5)
         XCTAssertFalse(client.isConnected)
 
-        // Reconnect
-        try await client.connect()
+        // Reconnect. `connect()` is a no-op while shouldConnect is false
+        // (#2663); setShouldConnect(true) is how an explicit disconnect is undone.
+        await client.setShouldConnect(true)
         try await waitForConnection(client: client)
         XCTAssertTrue(client.isConnected)
     }
@@ -65,8 +66,8 @@ final class DisconnectReconnectTests: XCTestCase {
         await client.disconnect()
         try await delay(1)
 
-        // Reconnect
-        try await client.connect()
+        // Reconnect (see #2663: connect() no longer overrides shouldConnect)
+        await client.setShouldConnect(true)
         try await waitForConnection(client: client, timeout: 10)
 
         // Wait for re-sync
@@ -94,7 +95,7 @@ final class DisconnectReconnectTests: XCTestCase {
         for _ in 0..<3 {
             await client.disconnect()
             try await delay(0.3)
-            try await client.connect()
+            await client.setShouldConnect(true)
             try await delay(0.5)
         }
 
@@ -208,11 +209,10 @@ final class DisconnectReconnectTests: XCTestCase {
         await client.disconnect()
         try await delay(1)
 
-        // Note: disconnect() may not immediately reset sync state in all cases.
-        // The important behavior is that isSynced returns false after reconnect
-        // before the sync protocol completes again.
-        // XCTAssertFalse(client.isSynced(docId), "Sync state should reset after disconnect")
-        _ = client.isSynced(docId) // Just verify it doesn't crash
+        // Re-enabled by #2663: the disconnect now resets every open document's
+        // sync state, matching JS. The assertion was commented out while
+        // `docSyncStates` stuck at true through a disconnect.
+        XCTAssertFalse(client.isSynced(docId), "Sync state should reset after disconnect")
     }
 
     // MARK: - Queued updates sent after reconnect
@@ -268,8 +268,8 @@ final class DisconnectReconnectTests: XCTestCase {
             wMap.updateValue("offline_2", forKey: "offline_update_2", transaction: txn)
         }
 
-        // Reconnect
-        try await writer.connect()
+        // Reconnect (see #2663: connect() no longer overrides shouldConnect)
+        await writer.setShouldConnect(true)
         try await waitForConnection(client: writer, timeout: 10)
         try await waitForSync(client: writer, documentId: docId, timeout: 10)
 
@@ -348,16 +348,20 @@ final class DisconnectReconnectTests: XCTestCase {
         await client.disconnect()
         try await delay(1)
 
-        // Reconnect
-        try await client.connect()
+        // Reconnect. `connect()` is a no-op while shouldConnect is false
+        // (#2663), so an explicit disconnect is undone with setShouldConnect.
+        await client.setShouldConnect(true)
         try await waitForConnection(client: client, timeout: 10)
         try await delay(0.3)
 
-        // Should have seen connected, disconnected, connected (at minimum)
+        // Exact counts, tightened by #2663 from the tolerant >= form the
+        // duplicate-status bug forced. One connected per successful connect,
+        // and for the deliberate disconnect one status at initiation plus the
+        // one the transport manager emits for the close.
         let connectedCount = statusHistory.filter { $0 == .connected }.count
         let disconnectedCount = statusHistory.filter { $0 == .disconnected }.count
-        XCTAssertGreaterThanOrEqual(connectedCount, 2, "Expected at least 2 connected events, got \(connectedCount). History: \(statusHistory)")
-        XCTAssertGreaterThanOrEqual(disconnectedCount, 1, "Expected at least 1 disconnected event, got \(disconnectedCount). History: \(statusHistory)")
+        XCTAssertEqual(connectedCount, 2, "Expected exactly 2 connected events. History: \(statusHistory)")
+        XCTAssertEqual(disconnectedCount, 2, "Expected exactly 2 disconnected events (initiation + close). History: \(statusHistory)")
     }
 
     // MARK: - Awareness re-established after reconnect
@@ -414,12 +418,23 @@ final class DisconnectReconnectTests: XCTestCase {
         try await delay(1)
         receivedAwareness = false
 
-        // Reconnect client1
-        try await client1.connect()
+        // Reconnect client1 (see #2663: connect() no longer overrides shouldConnect)
+        await client1.setShouldConnect(true)
         try await waitForConnection(client: client1, timeout: 10)
         try await waitForSync(client: client1, documentId: docId, timeout: 10)
 
-        // Re-set awareness after reconnect
+        // Re-set awareness after reconnect.
+        //
+        // This stays a manual re-set even though the client now handles
+        // `refreshAwareness` (#2661). The server only asks a document's
+        // existing peers to republish when a connection *subscribes*
+        // (`connection-worker.ts` `requestExistingAwarenessStates`), and
+        // neither client sends a `subscribe` frame — the subscription is
+        // implied by `syncStep1`. A reconnected client therefore has no
+        // connection mapping for the document either, so nothing can be
+        // routed to it: no `refreshAwareness` reaches this client here,
+        // whatever it does with one. The handler itself is covered
+        // server-free in `ServerPushFramesTests`.
         client1.setAwareness(docId, state: ["user": ["name": "Client1-Reconnected"], "cursor": ["x": 30, "y": 40]])
 
         // Verify client2 receives updated awareness

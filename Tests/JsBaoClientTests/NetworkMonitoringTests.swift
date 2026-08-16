@@ -355,7 +355,9 @@ final class NetworkMonitoringTests: XCTestCase {
             // Fire the loss disconnect and the restore handoff concurrently so
             // they contend on the connect/disconnect serialization.
             async let loss: Void = client.setShouldConnect(false)
-            async let restore: Void = client.runOnlineAuthHandoff()
+            async let restore: Void = client.runOnlineAuthHandoff(
+                cause: JsBaoClient.OnlineHandoffCause.reachabilityRestore
+            )
             _ = await (loss, restore)
 
             // The restore must win — after both settle the client is connected

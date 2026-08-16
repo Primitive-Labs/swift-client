@@ -81,11 +81,27 @@ final class AuthRefreshCoalescingTests: XCTestCase {
             )
         }
 
-        // After the burst, the client must still hold a valid token.
-        XCTAssertTrue(
-            client.isAuthenticated(),
-            "Client must remain authenticated after a refresh burst. " +
-            "If false, the burst of refreshes ended with the access token cleared."
-        )
+        // After the burst, the auth state must agree with the shared outcome.
+        //
+        // Updated for #2655: this used to assert the client stayed
+        // authenticated unconditionally, which only held because a rejected
+        // refresh left the dead token in place. It now does what the JS client
+        // has always done — a refresh the server answers with 401 ends the
+        // session — so the expectation depends on the outcome all eight
+        // callers shared. Test sessions are built from a raw JWT with no
+        // refresh cookie, so `.invalid` is the usual path here; the assertion
+        // covers both so it keeps testing coalescing rather than the
+        // environment.
+        if firstOutcome == String(describing: RefreshOutcome.success) {
+            XCTAssertTrue(
+                client.isAuthenticated(),
+                "A successful refresh burst must leave the client authenticated."
+            )
+        } else {
+            XCTAssertFalse(
+                client.isAuthenticated(),
+                "A refresh burst the server rejected must end the session (#2655)."
+            )
+        }
     }
 }

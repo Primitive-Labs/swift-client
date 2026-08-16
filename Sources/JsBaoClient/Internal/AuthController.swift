@@ -207,6 +207,27 @@ public final class AuthController: @unchecked Sendable {
         }
     }
 
+    // MARK: - Applied-token notification
+
+    /// Called with every token the controller applies, from any path —
+    /// bootstrap, an interactive login, a background refresh, a token the
+    /// server pushed — together with the token it replaced. `JsBaoClient`
+    /// installs a handler that re-authenticates an open WebSocket (#2660); the
+    /// previous token is what lets it tell a rotation of the same identity,
+    /// which the socket can adopt in band, from a switch to a different user,
+    /// which it cannot.
+    ///
+    /// The controller has no transport reference and should not grow one, so
+    /// the socket side stays behind this closure. Stored under `lock` like
+    /// every other mutable field; the copy is taken under the lock and called
+    /// outside it, so a handler that reaches back into the controller cannot
+    /// deadlock.
+    private var tokenAppliedHandler: (@Sendable (String, String?) -> Void)?
+
+    func setTokenAppliedHandler(_ handler: @escaping @Sendable (String, String?) -> Void) {
+        lock.withLock { tokenAppliedHandler = handler }
+    }
+
     #if DEBUG
     /// Test-only escape hatch from the one-shot rule: point an
     /// already-wired controller at a fake transport. `internal` and
@@ -271,24 +292,72 @@ public final class AuthController: @unchecked Sendable {
 
     /// Causes that represent an explicit, user-initiated sign-in (as
     /// opposed to a background token refresh or persisted-session restore).
-    private static func isInteractiveLogin(_ cause: String?) -> Bool {
+    /// Also read by the client's connection re-arm (#2663): only a real
+    /// sign-in undoes the disconnect a `logout()` left behind.
+    static func isInteractiveLogin(_ cause: String?) -> Bool {
         switch cause {
         case "google", "oauth", "apple", "magic_link", "otp", "passkey": return true
         default: return false
         }
     }
 
-    /// Apply a new token, updating internal state and emitting events
-    func applyToken(_ token: String?, previous: String?, cause: String?) {
+    /// A precondition on the token held right now, evaluated inside
+    /// `applyToken`'s critical section so the check and the mutation it guards
+    /// cannot interleave.
+    enum HeldTokenPrecondition: Sendable {
+        /// Apply whatever is held.
+        case none
+        /// Apply only while the held token is still this one. The rejected
+        /// refresh passes it: the rejection belongs to the session that owned
+        /// the refresh, so a session established while it was in flight must
+        /// survive it (#2655 — the rejection-side mirror of `onlyWhenSignedOut`).
+        case unchangedFrom(String?)
+    }
+
+    /// Apply a new token, updating internal state and emitting events.
+    ///
+    /// - Parameter onlyWhenSignedOut: drop the application if a token is
+    ///   already held. The startup refresh passes this: it exists to fill an
+    ///   empty session, and an app that shows a login screen at launch can
+    ///   complete `otpVerify` while that refresh is still in flight. Without
+    ///   the guard an older `rt-{appId}` cookie — possibly a different user's —
+    ///   would replace the session the user just signed into (#2656).
+    /// - Parameter requiring: drop the application unless the token held now
+    ///   still matches. Unlike `onlyWhenSignedOut` this also guards *clearing*
+    ///   the token, which is what a rejected refresh does.
+    /// - Returns: `true` when the token was applied, `false` when a guard
+    ///   dropped it — callers with follow-up work (deleting the persisted JWT)
+    ///   must skip it in the latter case.
+    @discardableResult
+    func applyToken(
+        _ token: String?,
+        previous: String?,
+        cause: String?,
+        onlyWhenSignedOut: Bool = false,
+        requiring precondition: HeldTokenPrecondition = .none
+    ) -> Bool {
         // Logout race guard: a refresh/restore that resolves AFTER the
         // user logged out must not silently sign them back in (or
         // re-persist the JWT). Drop non-interactive token applications
         // until an explicit interactive login clears the flag.
         // The check-and-mutate stays atomic in one critical section; a
         // `nil` result signals the guard dropped the application so we
-        // log and return outside the lock exactly as before.
+        // log and return outside the lock exactly as before. The
+        // signed-out-only check rides in the same section for the same
+        // reason: read-then-apply outside the lock would reopen the race
+        // it is closing.
+        enum DropReason { case loggedOut, signedIn, superseded }
+        var dropReason: DropReason = .loggedOut
         let applied: (newUserId: String?, newToken: String?)? = lock.withLock {
             if token != nil, blockNonInteractiveAuth, !Self.isInteractiveLogin(cause) {
+                return nil
+            }
+            if token != nil, onlyWhenSignedOut, currentToken != nil {
+                dropReason = .signedIn
+                return nil
+            }
+            if case .unchangedFrom(let expected) = precondition, currentToken != expected {
+                dropReason = .superseded
                 return nil
             }
             if token != nil, Self.isInteractiveLogin(cause) {
@@ -308,8 +377,15 @@ public final class AuthController: @unchecked Sendable {
         }
 
         guard let (newUserId, newToken) = applied else {
-            logger.debug("Ignoring token application (cause:", cause ?? "unknown", ") — logged out, awaiting explicit login")
-            return
+            switch dropReason {
+            case .signedIn:
+                logger.debug("Ignoring token application (cause:", cause ?? "unknown", ") — a session was established while it was in flight")
+            case .superseded:
+                logger.debug("Ignoring token application (cause:", cause ?? "unknown", ") — it refers to a session that is no longer the current one")
+            case .loggedOut:
+                logger.debug("Ignoring token application (cause:", cause ?? "unknown", ") — logged out, awaiting explicit login")
+            }
+            return false
         }
 
         // A token landing from ANY path (bootstrap, interactive login, a
@@ -341,6 +417,13 @@ public final class AuthController: @unchecked Sendable {
                 mode: getNetworkMode(),
                 userId: newUserId
             ))
+            // Re-authenticate an open WebSocket with the token that just
+            // landed, rather than leaving the connection running on the
+            // previous identity until it is closed and rebuilt (#2660). JS does
+            // this from the same point in `applyTokenEffects`, after the auth
+            // events.
+            let notify = lock.withLock { tokenAppliedHandler }
+            notify?(newToken, previous)
         } else if previous != nil {
             emitter?.emit(AuthStateEvent(
                 authenticated: false,
@@ -351,25 +434,42 @@ public final class AuthController: @unchecked Sendable {
 
         // Persist JWT if configured
         if persistConfig.persistJwtInStorage, let token = newToken {
-            let task: Task<Void, Never> = Task { [logger] in
-                do {
-                    try await persistJwt(token: token)
-                } catch {
-                    // Don't swallow persistence errors silently — without this
-                    // log, a disk-full or SQLite-corruption issue would leave
-                    // the user appearing logged in until restart, with no clue
-                    // why they were unexpectedly logged out the next session.
-                    logger.warn("Failed to persist JWT:", error.localizedDescription)
+            // Each write is chained onto the one before it rather than
+            // replacing the handle. `awaitPendingPersistence()` is the barrier
+            // the sign-out paths take before deleting the record (#2655), and a
+            // bare "latest task wins" handle would let an earlier, slower write
+            // finish AFTER that delete and resurrect the session the user just
+            // ended. Chaining also keeps two writes from reaching the store out
+            // of order. The read-modify-write of the chain tail happens in one
+            // critical section; `Task {}` only schedules, so nothing awaits
+            // under the lock.
+            lock.withLock {
+                let previousWrite = pendingPersistTask
+                pendingPersistTask = Task { [logger] in
+                    await previousWrite?.value
+                    do {
+                        try await persistJwt(token: token)
+                    } catch {
+                        // Don't swallow persistence errors silently — without
+                        // this log, a disk-full or SQLite-corruption issue would
+                        // leave the user appearing logged in until restart, with
+                        // no clue why they were unexpectedly logged out the next
+                        // session.
+                        logger.warn("Failed to persist JWT:", error.localizedDescription)
+                    }
                 }
             }
-            lock.withLock { pendingPersistTask = task }
         }
+
+        return true
     }
 
-    /// Wait for any in-flight JWT persistence to drain. Called from
+    /// Wait for every queued JWT persistence write to drain. Called from
     /// `JsBaoClient.destroy()` so the storage layer doesn't close the
-    /// SQLite connection out from under a queued write. Safe to call
-    /// when no Task is in flight (no-op).
+    /// SQLite connection out from under a queued write, and by the sign-out
+    /// paths so a write cannot land after the record is deleted. Awaiting the
+    /// tail of the chain awaits all of it. Safe to call when no Task is in
+    /// flight (no-op).
     public func awaitPendingPersistence() async {
         let task = lock.withLock { pendingPersistTask }
         await task?.value
@@ -421,8 +521,73 @@ public final class AuthController: @unchecked Sendable {
         }
     }
 
+    /// Causes that identify the launch-time refresh — the one that runs before
+    /// the app has a session, rather than refreshing an existing one (#2656).
+    ///
+    /// Two consequences hang off it: its rejection is a silent signed-out start
+    /// (no `authFailed`, the port of JS's `shouldEmitAuthFailed` check in
+    /// `handleRefreshOutcome`), and its success only applies while the client
+    /// is still signed out (see `applyToken(onlyWhenSignedOut:)`).
+    ///
+    /// Not needed on the sign-out side: `handleRefreshFailure` guards every
+    /// cause the same way, by the session the refresh started from, which
+    /// subsumes the bootstrap case (that one starts from no session at all).
+    private static func isBootstrapCause(_ cause: String?) -> Bool {
+        switch cause {
+        case "startup", "bootstrap", "bootstrap:refresh": return true
+        default: return false
+        }
+    }
+
+    /// The cause the 401-retry (and pre-expiry) refresh on the request path
+    /// carries — `JsBaoClient` passes it when it wires `HttpClient`'s refresh
+    /// to this controller. Named because `authFailedEvent(cause:)` has to
+    /// recognise it.
+    static let httpRequestCause = "http"
+
+    /// The `authFailed` event a rejected refresh delivers to the app, or `nil`
+    /// when this cause delivers none. Port of the JS client's TWO emit sites,
+    /// which between them decide the whole table (#2723):
+    ///
+    ///   * `handleRefreshOutcome` (src/client/internal/authController.ts) emits
+    ///     for every cause EXCEPT `"http-request"` and `"bootstrap:refresh"`,
+    ///     reporting the cause itself as the `reason`.
+    ///   * `JsBaoClient`'s `onRefreshOutcome` wiring emits the bare
+    ///     `{ reason: "refresh_failed" }` for exactly the 401-retry cause the
+    ///     first site suppresses.
+    ///
+    /// So the launch refresh is silent, the request path's refresh reports
+    /// `refresh_failed`, and every other cause reports itself. This client has a
+    /// single emit site, so it makes the whole choice here rather than splitting
+    /// it. Before #2723 it reported `invalid_token` for all three, which is a
+    /// vocabulary no JS app ever sees.
+    ///
+    /// Pinned on both sides — `tests/client/js-bao-client-auth-failed-parity.test.ts`
+    /// and `AuthFailedRefreshParityHermeticTests`.
+    private static func authFailedEvent(cause: String?) -> AuthFailedEvent? {
+        // A signed-out start is not an auth failure (#2656).
+        if isBootstrapCause(cause) { return nil }
+        if cause == httpRequestCause {
+            // JS's payload at this site carries a reason and nothing else.
+            return AuthFailedEvent(message: nil, reason: "refresh_failed")
+        }
+        return AuthFailedEvent(
+            // JS derives the message from the rejection's error and falls back
+            // to this. A refresh the server *answered* — 401, or 2xx with no
+            // token — reaches its emit site with no error attached, so the
+            // fallback is the only message that path can produce there.
+            message: "Authentication refresh failed",
+            reason: cause ?? "refresh_invalid"
+        )
+    }
+
     private func _refreshAccessTokenImpl(cause: String? = nil) async -> RefreshOutcome {
         logger.debug("Refreshing access token", "cause:", cause ?? "unknown")
+
+        // The session this refresh belongs to. A rejection only ends *this*
+        // session: whatever else may be signed in by the time the answer comes
+        // back was not what the server rejected (see `handleRefreshFailure`).
+        let sessionAtStart = getToken()
 
         do {
             let newToken: String
@@ -436,15 +601,41 @@ public final class AuthController: @unchecked Sendable {
             resetRefreshBackoff("refresh-success")
 
             let previous = getToken()
-            applyToken(newToken, previous: previous, cause: "refresh")
+            // A startup refresh only ever fills an empty session: if anything
+            // signed the client in while it was in flight, that session wins
+            // (#2656). Every other cause is a refresh OF the current session,
+            // so it applies unconditionally.
+            applyToken(
+                newToken,
+                previous: previous,
+                cause: "refresh",
+                onlyWhenSignedOut: Self.isBootstrapCause(cause)
+            )
             return .success
-        } catch let error as HttpError where error.status == 401 || error.status == 403 {
+        } catch let error as HttpError where error.status == 401 {
+            // Only 401 means "this session is over" — 403 and 5xx are
+            // connectivity-class failures and fall through to the retryable
+            // path below, matching the JS `tryRefreshAccessToken`
+            // classification (src/client/internal/httpClient.ts). Issue #2655.
             logger.warn("Token refresh returned invalid:", error.status)
             resetRefreshBackoff("refresh-invalid")
-            emitter?.emit(AuthFailedEvent(
-                message: "Token refresh failed: \(error.message)",
-                reason: "invalid_token"
-            ))
+            await handleRefreshFailure(sessionAtStart: sessionAtStart)
+            if let event = Self.authFailedEvent(cause: cause) {
+                emitter?.emit(event)
+            }
+            return .invalid
+        } catch is RefreshTokenMissingError {
+            // A 2xx whose body carries no `token`: the server answered, so
+            // retrying on backoff would never recover. JS returns "invalid"
+            // here (`if (!newToken) return "invalid"`). Issue #2655.
+            logger.warn("Token refresh succeeded without a token; treating as invalid")
+            resetRefreshBackoff("refresh-invalid")
+            // Same sign-out and same `authFailed` table as the 401 path above —
+            // JS classifies both as `"invalid"` and hands them to one place.
+            await handleRefreshFailure(sessionAtStart: sessionAtStart)
+            if let event = Self.authFailedEvent(cause: cause) {
+                emitter?.emit(event)
+            }
             return .invalid
         } catch {
             logger.warn("Token refresh network error:", error.localizedDescription)
@@ -453,6 +644,54 @@ public final class AuthController: @unchecked Sendable {
             // it as `JsBaoNetworkError` instead of inventing a 401.
             return .network(JsBaoNetworkError(refreshFailure: error))
         }
+    }
+
+    /// End the session after a refresh the server rejected. Port of the JS
+    /// `handleRefreshFailure()` → `updateToken(null)` path
+    /// (src/client/internal/authController.ts): the dead access token is
+    /// dropped — which emits `authState{authenticated:false}` through
+    /// `applyToken` — and the persisted JWT record is deleted so the next
+    /// launch does not restore a session the server has already ended.
+    /// Issue #2655.
+    ///
+    /// `sessionAtStart` is the token the refresh set out to renew, and the
+    /// sign-out is a compare-and-clear against it. A refresh round trip is not
+    /// instantaneous, and anything can land while it is open: the startup
+    /// refresh runs with no session at all and an app that shows a login screen
+    /// at launch can complete `otpVerify` before the stale cookie is rejected;
+    /// a refresh of session A can be answered after B signed in. In both cases
+    /// the rejection refers to a session that is no longer current, and clearing
+    /// the token — or deleting the persisted record, which belongs to the new
+    /// session — would sign out a user the server never rejected. This is the
+    /// rejection-side mirror of the `applyToken(onlyWhenSignedOut:)` guard #2656
+    /// added on the success side; JS, single-threaded, cannot interleave here.
+    private func handleRefreshFailure(sessionAtStart: String?) async {
+        // Checked inside `applyToken`'s critical section: reading the current
+        // token here and clearing it afterwards would leave exactly the gap
+        // this guard exists to close.
+        let cleared = applyToken(
+            nil,
+            previous: sessionAtStart,
+            cause: "refreshFailed",
+            requiring: .unchangedFrom(sessionAtStart)
+        )
+        guard cleared else {
+            logger.debug("Rejected refresh did not end the session — a newer one was established while it was in flight")
+            return
+        }
+        // Deleted without consulting `persistJwtInStorage`, as in JS: a record
+        // written while persistence was enabled must not survive a later run
+        // with it off. Any queued persistence drains first so a write cannot
+        // land after the delete.
+        await awaitPendingPersistence()
+        // The drain is an `await`, so re-check: a sign-in during it owns
+        // whatever record is on disk now, and deleting that one would sign the
+        // new user out at the next launch.
+        guard getToken() == nil else {
+            logger.debug("Keeping the persisted JWT — a session was established while the sign-out drained")
+            return
+        }
+        try? await clearPersistedJwt()
     }
 
     // MARK: - Refresh Retry Backoff (#2022)
@@ -627,9 +866,16 @@ public final class AuthController: @unchecked Sendable {
         refreshRetryTask?.cancel()
     }
 
-    /// Handle a 401 challenge from the server
+    /// Refresh the access token in answer to a server auth challenge — an HTTP
+    /// 401, or an `auth_required` / `auth_failed` WebSocket frame (#2660).
+    ///
+    /// The cause is the fixed string `"ws-challenge"`, matching the JS client,
+    /// so an app watching `authRefreshDeferred` reads the same value on both
+    /// platforms. The frame's own reason is logged rather than folded into the
+    /// cause, which would make the string unpredictable.
     public func handleAuthChallenge(reason: String? = nil) async -> Bool {
-        let outcome = await refreshAccessToken(cause: reason ?? "auth_challenge")
+        logger.debug("Handling auth challenge", "reason:", reason ?? "unspecified")
+        let outcome = await refreshAccessToken(cause: "ws-challenge")
         return outcome == .success
     }
 
@@ -1021,25 +1267,27 @@ public final class AuthController: @unchecked Sendable {
         let trimmedInviteToken = inviteToken?.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedInviteToken = (trimmedInviteToken?.isEmpty == false) ? trimmedInviteToken : nil
 
-        let endpoint: String
-        var body: [String: JSONValue]
-
-        if let proxy = refreshProxy, proxy.enabled {
-            endpoint = "\(proxy.baseUrl)/auth/magic-link/verify"
-            body = ["token": .string(token), "appId": .string(appId)]
-        } else {
-            endpoint = "/auth/magic-link/verify"
-            body = ["token": .string(token)]
-        }
+        // The body is the same either way — JS sends no `appId` on the proxy
+        // request, and the proxy identifies the app from the `X-App-Id` header
+        // the same way the proxy refresh does.
+        var body: [String: JSONValue] = ["token": .string(token)]
         if let resolvedInviteToken = resolvedInviteToken {
             body["inviteToken"] = .string(resolvedInviteToken)
         }
 
-        let raw: JSONValue = try await transport.request(
-            method: .post,
-            path: endpoint,
-            body: body
-        )
+        let endpoint: String
+        let raw: JSONValue
+        if let proxy = refreshProxy, proxy.enabled {
+            endpoint = Self.proxyUrl(proxy: proxy, suffix: "auth/magic-link/verify")
+            raw = try await postToProxy(url: endpoint, proxy: proxy, body: body)
+        } else {
+            endpoint = "/auth/magic-link/verify"
+            raw = try await transport.request(
+                method: .post,
+                path: endpoint,
+                body: body
+            )
+        }
         let envelope: MagicLinkVerifyEnvelope = try applyVerifiedToken(
             MagicLinkVerifyEnvelope.self, from: raw, path: endpoint, cause: "magic_link"
         )
@@ -1079,17 +1327,18 @@ public final class AuthController: @unchecked Sendable {
         }
 
         let endpoint: String
+        let raw: JSONValue
         if let proxy = refreshProxy, proxy.enabled {
-            endpoint = "\(proxy.baseUrl)/auth/otp/verify"
+            endpoint = Self.proxyUrl(proxy: proxy, suffix: "auth/otp/verify")
+            raw = try await postToProxy(url: endpoint, proxy: proxy, body: body)
         } else {
             endpoint = "/auth/otp/verify"
+            raw = try await transport.request(
+                method: .post,
+                path: endpoint,
+                body: body
+            )
         }
-
-        let raw: JSONValue = try await transport.request(
-            method: .post,
-            path: endpoint,
-            body: body
-        )
         let envelope: OtpVerifyEnvelope = try applyVerifiedToken(
             OtpVerifyEnvelope.self, from: raw, path: endpoint, cause: "otp"
         )
@@ -1237,8 +1486,16 @@ public final class AuthController: @unchecked Sendable {
 
         // Block any in-flight refresh/restore from re-authenticating after
         // this logout (see `blockNonInteractiveAuth`). Set before clearing
-        // the token so a refresh resolving mid-logout is caught.
+        // the token so a refresh resolving mid-logout is caught — and before
+        // the server logout below, whose own 401 path can drive a refresh.
         lock.withLock { blockNonInteractiveAuth = true }
+
+        // JS parity (#2655): step 1 of the JS `logout()` is a best-effort
+        // `POST /auth/logout` that clears the server's refresh cookie. It runs
+        // before the token is dropped so the request still carries the bearer
+        // the server needs to identify the session.
+        await postServerLogout()
+
         let previous = getToken()
         applyToken(nil, previous: previous, cause: "logout")
 
@@ -1252,9 +1509,15 @@ public final class AuthController: @unchecked Sendable {
             // revokeOfflineGrant clears the stored grant (and the in-memory
             // identity) and, when wipeLocal is set, evicts local data.
             try? await revokeOfflineGrant(options: RevokeOfflineGrantOptions(wipeLocal: options.wipeLocal))
-        } else if options.wipeLocal {
-            try? await clearPersistedJwt()
         }
+
+        // JS parity (#2655): the persisted JWT goes on EVERY logout, not only
+        // under `wipeLocal`. In JS this falls out of `updateToken(null)`
+        // clearing the stored record; leaving it behind here meant a relaunch
+        // restored the session the user had just ended. Draining any queued
+        // persistence first keeps a write from landing after the delete.
+        await awaitPendingPersistence()
+        try? await clearPersistedJwt()
 
         if options.waitForDisconnect {
             await onLogoutDisconnect?()
@@ -1331,9 +1594,50 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - JWT Persistence (private)
 
+    /// A persisted access token is refused this close to its expiry, on both
+    /// the read and the write side. Port of the JS client's
+    /// `jwtPersistenceLeewayMs = 120_000` (#2656): a token about to expire is
+    /// worth less than the refresh it would suppress, and one already in
+    /// storage would only be handed to the network a moment before it lapses.
+    private static let jwtPersistenceLeewaySeconds: TimeInterval = 120
+
+    /// The expiry to judge a persisted record by: the recorded `expiresAt`
+    /// when it parses, otherwise the token's own `exp` claim. `nil` means
+    /// there is no usable expiry — which makes the token unusable rather than
+    /// eternal, matching JS's `isPersistedTokenUsable` (a token with no `exp`
+    /// returns false there).
+    private static func persistedExpiry(recordedExpiry: String?, token: String) -> Date? {
+        if let recordedExpiry = recordedExpiry,
+           let date = ISO8601DateFormatter().date(from: recordedExpiry) {
+            return date
+        }
+        if let exp = Self.parseJwtPayload(token: token)?["exp"] as? TimeInterval {
+            return Date(timeIntervalSince1970: exp)
+        }
+        return nil
+    }
+
+    /// Whether a persisted record still has enough life left to be used.
+    private static func isPersistedTokenUsable(recordedExpiry: String?, token: String) -> Bool {
+        guard let expiry = persistedExpiry(recordedExpiry: recordedExpiry, token: token) else {
+            return false
+        }
+        return expiry.timeIntervalSinceNow > jwtPersistenceLeewaySeconds
+    }
+
     private func persistJwt(token: String) async throws {
         let namespace = persistConfig.storageKeyPrefix ?? "default"
         let payload = Self.parseJwtPayload(token: token)
+
+        // Same leeway on the way in. A token that would be refused on the next
+        // read is not written at all, and whatever is already on disk is
+        // cleared rather than left as a stale record (JS `persistJwtInternal`).
+        guard Self.isPersistedTokenUsable(recordedExpiry: nil, token: token) else {
+            logger.debug("Not persisting JWT: no usable expiry, or inside the refresh leeway")
+            try await offlineStore.clearPersistedJwt(appId: appId, namespace: namespace)
+            return
+        }
+
         let record = PersistedJwtRecord(
             key: "session",
             token: token,
@@ -1357,58 +1661,71 @@ public final class AuthController: @unchecked Sendable {
         guard let record = try? await offlineStore.loadPersistedJwt(appId: appId, namespace: namespace) else {
             return nil
         }
-        // Check expiry
-        if let expiresAt = record.expiresAt,
-           let date = ISO8601DateFormatter().date(from: expiresAt),
-           date < Date() {
-            logger.debug("Persisted JWT expired")
+        guard Self.isPersistedTokenUsable(
+            recordedExpiry: record.expiresAt,
+            token: record.token
+        ) else {
+            logger.debug("Persisted JWT expired, inside the refresh leeway, or missing an expiry")
             return nil
         }
         return record.token
     }
 
     /// Restore an authenticated session on startup:
-    ///   1. Prefer a persisted access token that's still valid.
-    ///   2. If the persisted access token has aged out, attempt a cookie-based
-    ///      refresh — the `rt-{appId}` refresh cookie persists in
-    ///      `HTTPCookieStorage.shared` across app launches and lives up to 7d,
-    ///      so a user reopening the app after the 1h access-token TTL
-    ///      shouldn't be forced back through login.
+    ///   1. Prefer a persisted access token that's still usable (only possible
+    ///      when `persistJwtInStorage` is on).
+    ///   2. Otherwise attempt a cookie-based refresh — the `rt-{appId}` refresh
+    ///      cookie persists in `HTTPCookieStorage.shared` across app launches
+    ///      and lives up to 7d, so a user reopening the app after the 1h
+    ///      access-token TTL shouldn't be forced back through login.
     ///   3. Otherwise bootstrap as unauthenticated.
+    ///
+    /// Step 2 runs whenever there is no usable token — it is **not** gated on
+    /// `persistJwtInStorage` (off by default) and not on a persisted record
+    /// existing. That gate was #2656: with the default options every launch
+    /// started signed out even though the refresh cookie was sitting right
+    /// there, while the same app on the JS client resumed. JS's
+    /// `runAuthBootstrap` refreshes whenever `this.token` is empty, and this is
+    /// the port of that.
     ///
     /// Marks auth ready once the attempt completes, regardless of outcome.
     public func tryRestoreSession() async {
         defer { markAuthReady() }
 
-        guard persistConfig.persistJwtInStorage else { return }
-
         let namespace = persistConfig.storageKeyPrefix ?? "default"
-        guard let record = try? await offlineStore.loadPersistedJwt(appId: appId, namespace: namespace) else {
-            // No prior session on disk; don't waste a refresh round-trip on
-            // first install.
-            return
+
+        if persistConfig.persistJwtInStorage,
+           let record = try? await offlineStore.loadPersistedJwt(appId: appId, namespace: namespace) {
+            if Self.isPersistedTokenUsable(recordedExpiry: record.expiresAt, token: record.token) {
+                applyToken(record.token, previous: nil, cause: "bootstrap")
+                return
+            }
+            // Aged out, inside the leeway, or carrying no usable expiry: drop
+            // it so a later launch doesn't reconsider the same dead record,
+            // then fall through to the refresh.
+            logger.debug("Persisted JWT unusable; attempting cookie-based refresh")
+            try? await clearPersistedJwt()
         }
 
-        let expiredAt: Date? = record.expiresAt.flatMap { ISO8601DateFormatter().date(from: $0) }
-        let isExpired = expiredAt.map { $0 < Date() } ?? false
-
-        if !isExpired {
-            applyToken(record.token, previous: nil, cause: "bootstrap")
-            return
-        }
-
-        logger.debug("Persisted JWT expired; attempting cookie-based refresh")
         let outcome = await refreshAccessToken(cause: "startup")
         switch outcome {
         case .success:
             break // applyToken has already set the new token
         case .invalid:
-            // Refresh cookie is gone or the session was revoked. Clear the
-            // stale persisted record so we don't keep retrying.
-            try? await clearPersistedJwt()
+            // Refresh cookie is gone or the session was revoked. Nothing to
+            // keep — and nothing to report: a signed-out start is not an auth
+            // failure (see `isBootstrapCause`). Since #2655 the refresh path
+            // already clears the record; the idempotent delete stays as a
+            // local guarantee for the startup path regardless of how the
+            // refresh was routed. Skipped when a sign-in landed while the
+            // refresh was in flight — any record on disk is then the NEW
+            // session's, not the stale one this rejection refers to.
+            if getToken() == nil {
+                try? await clearPersistedJwt()
+            }
         case .network:
-            // Transient. Leave the stale record in place so the next launch
-            // (or an online-again trigger) can try again.
+            // Transient. Leave any record in place so the next launch (or an
+            // online-again trigger) can try again.
             break
         }
     }
@@ -1600,21 +1917,83 @@ public final class AuthController: @unchecked Sendable {
 
     private func refreshDirect() async throws -> String {
         let transport = try requireTransport()
-        let response: RefreshResponse = try await transport.request(
+        // `requestOptional` + an optional `token` put both "the server
+        // answered 2xx with nothing usable" shapes — an empty body (a proxy
+        // answering 204, say) and a body that simply omits `token` — on the
+        // `RefreshTokenMissingError` path (→ `.invalid`) rather than on a
+        // decode error (→ `.network`, retried forever). JS reads
+        // `text ? JSON.parse(text) : null` and treats both the same way. A
+        // body that is present but not decodable still throws from the
+        // transport and stays retryable, also matching JS. Issue #2655.
+        let response: RefreshResponse? = try await transport.requestOptional(
             method: .post,
             path: "/auth/refresh"
         )
-        return response.token
+        guard let token = response?.token, !token.isEmpty else {
+            throw RefreshTokenMissingError()
+        }
+        return token
+    }
+
+    /// Join a refresh-proxy base and an endpoint suffix into one absolute URL.
+    ///
+    /// Strips a single trailing slash off the base so a trailing-slash config
+    /// (`.../proxy/`) yields `.../proxy/auth/refresh` rather than a
+    /// double-slash `.../proxy//auth/refresh` that strict proxy routes 404
+    /// (#1983). Matches the JS client's `new URL(suffix, proxyBase)`.
+    static func proxyUrl(proxy: RefreshProxyConfig, suffix: String) -> String {
+        let base = proxy.baseUrl.hasSuffix("/") ? String(proxy.baseUrl.dropLast()) : proxy.baseUrl
+        return "\(base)/\(suffix)"
+    }
+
+    /// POST a JSON body straight to the refresh proxy, bypassing the transport.
+    ///
+    /// The proxy endpoints are absolute URLs, and the transport's `path` is
+    /// always resolved against `apiUrl + /app/{appId}/api` — passing one as a
+    /// path produced `https://api…/app/{id}/api/https://proxy…` and no verify
+    /// could ever succeed in proxy mode (#2658). These requests also carry no
+    /// bearer token, so they intentionally never run the refresh interceptor.
+    ///
+    /// Non-2xx surfaces as `HttpError` with the server's `{error, code}`
+    /// extracted, the same mapping `Transport.executeValidated` applies.
+    private func postToProxy(
+        url: String,
+        proxy: RefreshProxyConfig,
+        body: [String: JSONValue]
+    ) async throws -> JSONValue {
+        guard let parsed = URL(string: url) else {
+            throw HttpError(status: 0, message: "Failed to build URL for path: \(url)")
+        }
+        var request = URLRequest(url: parsed)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(appId, forHTTPHeaderField: "X-App-Id")
+        if let maxAge = proxy.cookieMaxAgeSeconds {
+            request.setValue(String(maxAge), forHTTPHeaderField: "X-Refresh-Cookie-Max-Age")
+        }
+        request.httpBody = try JSONCoding.encodeData(body)
+
+        let (data, response) = try await NetworkSession.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw JsBaoError(code: .unavailable, message: "Invalid response")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? ""
+            let parsedBody = HttpError.parseBody(text)
+            throw HttpError(
+                status: httpResponse.statusCode,
+                message: "HTTP \(httpResponse.statusCode)",
+                body: text,
+                serverCode: parsedBody.code,
+                serverMessage: parsedBody.message
+            )
+        }
+        return try JSONCoding.decodeData(JSONValue.self, from: data)
     }
 
     private func refreshViaProxy(proxy: RefreshProxyConfig) async throws -> String {
-        // Strip a single trailing slash off the proxy base so a trailing-slash
-        // config (`.../proxy/`) yields `.../proxy/auth/refresh` rather than a
-        // double-slash `.../proxy//auth/refresh` that strict proxy routes 404.
-        // This preserves the normalization the removed HttpClient refresh path
-        // applied before this refresh moved to AuthController (#1983).
-        let base = proxy.baseUrl.hasSuffix("/") ? String(proxy.baseUrl.dropLast()) : proxy.baseUrl
-        let url = "\(base)/auth/refresh"
+        let url = Self.proxyUrl(proxy: proxy, suffix: "auth/refresh")
         var request = URLRequest(url: URL(string: url)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1634,10 +2013,85 @@ public final class AuthController: @unchecked Sendable {
             throw HttpError(status: httpResponse.statusCode, message: "Refresh failed")
         }
 
-        guard let decoded = try? JSONCoding.decodeData(RefreshResponse.self, from: data) else {
+        return try Self.tokenFromRefreshBody(data)
+    }
+
+    /// Read the access token out of a 2xx refresh body, classifying the ways it
+    /// can carry none the way JS does. `tryRefreshAccessToken` reads
+    /// `const data = text ? JSON.parse(text) : null; const newToken =
+    /// data?.token; if (!newToken) return "invalid"`
+    /// (src/client/internal/httpClient.ts), so:
+    ///
+    /// - nothing to parse (a proxy answering 204, or 200 with no content),
+    ///   JSON `null`, or a document without a usable `token` all mean the
+    ///   session is over → `RefreshTokenMissingError` → `.invalid`. Retrying
+    ///   these on backoff would never recover, and would leave a dead bearer on
+    ///   every request in the meantime.
+    /// - a body that does not parse at all is a garbled response, not an answer
+    ///   about the session → `.network`, matching `JSON.parse` throwing into the
+    ///   outer `catch`.
+    ///
+    /// The direct (non-proxy) path gets the same classification from
+    /// `Transport.decodeOptional`, which also decodes into an Optional so a
+    /// bare `null` reads as "no document" rather than a decode failure.
+    /// Issue #2655.
+    static func tokenFromRefreshBody(_ data: Data) throws -> String {
+        // Zero bytes or nothing but JSON whitespace: no document at all, the
+        // `text ? … : null` arm. (`Transport.isEffectivelyEmpty` applies the
+        // same rule on the direct path; it is file-private to that extension.)
+        let isEmpty = data.allSatisfy { $0 == 0x20 || $0 == 0x09 || $0 == 0x0A || $0 == 0x0D }
+        guard !isEmpty else {
+            throw RefreshTokenMissingError()
+        }
+        let decoded: RefreshResponse?
+        do {
+            decoded = try JSONCoding.decodeData(RefreshResponse?.self, from: data)
+        } catch {
             throw JsBaoError(code: .unavailable, message: "Invalid refresh response")
         }
-        return decoded.token
+        guard let token = decoded?.token, !token.isEmpty else {
+            throw RefreshTokenMissingError()
+        }
+        return token
+    }
+
+    /// Best-effort `POST /auth/logout`, so the server drops the refresh
+    /// cookie and a later launch cannot mint a new access token from it.
+    /// Mirrors step 1 of the JS `JsBaoClient.logout()`; every failure is
+    /// swallowed, because a server that cannot be reached must not stop the
+    /// local sign-out. Issue #2655.
+    private func postServerLogout() async {
+        if let proxy = refreshProxy, proxy.enabled {
+            let base = proxy.baseUrl.hasSuffix("/") ? String(proxy.baseUrl.dropLast()) : proxy.baseUrl
+            guard let url = URL(string: "\(base)/auth/logout") else { return }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue(appId, forHTTPHeaderField: "X-App-Id")
+            if let maxAge = proxy.cookieMaxAgeSeconds {
+                request.setValue(String(maxAge), forHTTPHeaderField: "X-Refresh-Cookie-Max-Age")
+            }
+            if let token = getToken() {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+            do {
+                _ = try await NetworkSession.data(for: request)
+            } catch {
+                logger.debug("Best-effort server logout failed:", error.localizedDescription)
+            }
+            return
+        }
+
+        guard let transport = try? requireTransport() else { return }
+        do {
+            let _: SuccessResponse = try await transport.request(
+                method: .post,
+                path: "/auth/logout"
+            )
+        } catch {
+            logger.debug("Best-effort server logout failed:", error.localizedDescription)
+        }
     }
 }
 
@@ -1654,9 +2108,16 @@ struct SuccessResponse: Decodable, Sendable {
 }
 
 /// `{ token }` — `POST /auth/refresh` (direct and via the refresh proxy).
+/// `token` is optional so that a 2xx answer without one is classified as an
+/// ended session rather than a decode failure — see `refreshDirect`.
 struct RefreshResponse: Decodable, Sendable {
-    let token: String
+    let token: String?
 }
+
+/// A refresh that succeeded at the HTTP level but carried no usable token.
+/// Distinguishes the JS `"invalid"` case from the decode failures that stay
+/// retryable. Issue #2655.
+struct RefreshTokenMissingError: Error {}
 
 // The three verify envelopes below carry no `token` field: the token is read
 // off the raw response and applied by `applyVerifiedToken` *before* these

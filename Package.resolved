@@ -1,0 +1,33 @@
+{
+  "originHash" : "76e1a2de259c880f78941b84ddfe3fe1e0f3fb544e228d70b49671d62973e4e7",
+  "pins" : [
+    {
+      "identity" : "queue",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mattmassicotte/Queue",
+      "state" : {
+        "revision" : "38826d0b8838ce5edcdafa1ffb2f507693d5abcb",
+        "version" : "0.2.2"
+      }
+    },
+    {
+      "identity" : "tomlkit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/LebJe/TOMLKit.git",
+      "state" : {
+        "revision" : "ec6198d37d495efc6acd4dffbd262cdca7ff9b3f",
+        "version" : "0.6.0"
+      }
+    },
+    {
+      "identity" : "yswift-fork",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Primitive-Labs/yswift-fork.git",
+      "state" : {
+        "branch" : "alpha",
+        "revision" : "64dcdea7414daf21c06d9948015277e733d4c1a1"
+      }
+    }
+  ],
+  "version" : 3
+}
