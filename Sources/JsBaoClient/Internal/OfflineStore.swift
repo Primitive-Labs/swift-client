@@ -104,10 +104,25 @@ public actor OfflineStore {
     }
 
     public func getMetadata(appId: String, userId: String, documentId: String) async throws -> LocalMetadataEntry? {
+        try await readMetadata(appId: appId, userId: userId, documentId: documentId).entry
+    }
+
+    /// `getMetadata`, but reporting whether the store was actually read.
+    ///
+    /// `nil` means two different things on a cold start: "no row for this
+    /// document" and "no provider bound yet, so nothing could be read". The
+    /// local-only classification (#2691) has to tell them apart — the second is
+    /// *unknown*, not "ordinary", and a document whose classification is
+    /// unknown may not have its content put on the wire.
+    public func readMetadata(
+        appId: String,
+        userId: String,
+        documentId: String
+    ) async throws -> (entry: LocalMetadataEntry?, readable: Bool) {
         try await ensureMetadataDb(appId: appId, userId: userId)
-        guard let provider = storageProvider else { return nil }
+        guard let provider = storageProvider else { return (nil, false) }
         let record: StorageRecord<LocalMetadataEntry>? = try await provider.get(store: Self.storeMetaDocs, key: documentId)
-        return record?.value
+        return (record?.value, true)
     }
 
     /// Store-level purge of ALL locally persisted document data for this

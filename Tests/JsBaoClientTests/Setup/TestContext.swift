@@ -223,9 +223,9 @@ final class TestContext: @unchecked Sendable {
     /// `syncCallable` opts the workflow into `runSync` (mirrors the JS
     /// `createSyncWorkflow` helper in
     /// tests/client/js-bao-client-workflow-runSync.test.ts — which, like
-    /// this helper, does NOT call the legacy `/publish` endpoint: the
-    /// server now answers 409 WORKFLOW_CONFIG_MODEL for workflows that
-    /// already have an active configuration).
+    /// this helper, does not go near the legacy publish endpoint: it was
+    /// retired in #2768, and activation is the workflow's active
+    /// configuration).
     @discardableResult
     func setupWorkflow(
         appId: String,
@@ -240,6 +240,8 @@ final class TestContext: @unchecked Sendable {
                 "workflowKey": workflowKey,
                 "name": workflowKey,
                 "description": "Swift test workflow",
+                // #2652: caller workflows must state who may start them.
+                "accessRule": "true",
                 "steps": steps,
                 "syncCallable": syncCallable,
             ]

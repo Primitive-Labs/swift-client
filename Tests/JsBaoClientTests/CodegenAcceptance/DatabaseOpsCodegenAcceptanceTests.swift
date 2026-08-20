@@ -7,7 +7,7 @@ import XCTest
 /// The committed `.generated.swift` files under `GeneratedDatabases/` are the
 /// acceptance set: they are emitted by `primitive databases codegen --lang
 /// swift` from the fixture TOMLs in
-/// `cli/tests/fixtures/swift-db-acceptance/database-types/` and committed here
+/// `cli/tests/fixtures/swift-db-acceptance/database-type-configs/` and committed here
 /// so `swift build` and the full `swift test` validate that the generated Swift
 /// compiles against the real library and round-trips.
 ///

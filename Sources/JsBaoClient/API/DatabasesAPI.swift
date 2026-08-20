@@ -140,6 +140,44 @@ public final class DatabasesAPI: @unchecked Sendable {
         }
     }
 
+    /// Subscribe with the change payload decoded into a typed `Row` (#2805).
+    ///
+    /// The published SDK surface for the CLI-generated typed subscriptions
+    /// factory (`primitive databases codegen --lang swift`): the generated
+    /// `<Type>.Subscriptions` struct binds each registered subscription's row
+    /// type over THIS overload, the way `<Type>.Ops` binds its params/results
+    /// over the generic `executeOperation`. It is a thin wrapper over the
+    /// untyped `subscribe` above — same registration, same frames, same
+    /// reconnect behavior — that maps each delivered payload through
+    /// ``TypedDatabaseChangePayload/init(decoding:as:)``.
+    ///
+    /// `Row` must declare every field optional: a change frame carries only the
+    /// fields the write touched, narrowed further by the subscription's
+    /// `select`, so a blob that is missing a required field would decode to
+    /// `nil` and hand the caller nothing. The generated row types are emitted
+    /// that way for exactly this reason (#1772).
+    ///
+    /// - Parameter rowType: the type each change's `data` / `previousData`
+    ///   decodes into. Passed explicitly so this never competes with the
+    ///   untyped overload during overload resolution.
+    /// - Returns: the subscription handle. **Hold it for as long as you want
+    ///   changes** — releasing it unsubscribes.
+    public func subscribe<Row: Decodable & Sendable>(
+        databaseId: String,
+        subscriptionKey: String,
+        rowType: Row.Type,
+        options: DatabaseSubscribeOptions = DatabaseSubscribeOptions(),
+        onChange: @escaping @Sendable (TypedDatabaseChangePayload<Row>) -> Void
+    ) throws -> EventSubscription {
+        try subscribe(
+            databaseId: databaseId,
+            subscriptionKey: subscriptionKey,
+            options: options
+        ) { payload in
+            onChange(TypedDatabaseChangePayload(decoding: payload, as: Row.self))
+        }
+    }
+
     /// Send a single `db.subscribe` control frame. Shared by `subscribe`
     /// and the reconnect re-subscribe pass (`resubscribeAll`).
     ///

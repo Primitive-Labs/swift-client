@@ -595,11 +595,13 @@ public final class JsBaoClient: @unchecked Sendable {
             transport: httpClient,
             subscriptionRegistry: dbSubscriptionRegistry,
             sendWSMessage: { [weak wsManager] message in
-                Task { try? await wsManager?.send(message) }
+                guard let wsManager else { return }
+                Task { try? await wsManager.send(message) }
             },
             isWebSocketOpen: { [weak wsManager] in wsManager?.isSocketOpen ?? false },
             connectWebSocket: { [weak wsManager] in
-                Task { try? await wsManager?.connect() }
+                guard let wsManager else { return }
+                Task { try? await wsManager.connect() }
             },
             logger: logger
         )
@@ -3278,7 +3280,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // A new cycle: whatever the previous one delivered no longer counts
         // towards this one's "did the server send anything?" question
         // (#2664, C14 — JS clears `syncStep2ReceivedFor` on the same path).
-        lock.withLock { syncStep2ReceivedFor.remove(documentId) }
+        lock.withLock { _ = syncStep2ReceivedFor.remove(documentId) }
 
         // Arm the watchdog BEFORE the send, not after it returns: `send` is a
         // suspension point, and a fast server can answer while it is suspended.
@@ -4755,6 +4757,24 @@ public final class JsBaoClient: @unchecked Sendable {
             try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: userId)
             await documentManager.loadLocalMetadata()
         }
+        releaseHeldOutboundClassifications()
+    }
+
+    /// Release the outbound batches held while a document's local-only
+    /// classification was unknown (#2691).
+    ///
+    /// A document opened before the storage provider was bound has no answer to
+    /// `isLocalOnly` worth sending on, so its flush holds. This is the other
+    /// end: the stored metadata has now been read (or the bind has finished
+    /// without any to read), so every held document is classified — and the
+    /// flush either sends its batch or drops it as local-only.
+    func releaseHeldOutboundClassifications() {
+        let waiting = documentManager.resolveLocalOnlyClassifications()
+        for documentId in waiting {
+            let hasQueued = lock.withLock { !(pendingUpdates[documentId]?.isEmpty ?? true) }
+            guard hasQueued else { continue }
+            Task { [weak self] in await self?.flushOutboundUpdates(documentId: documentId) }
+        }
     }
 
     /// Re-scope the user-owned managers to the currently authenticated user,
@@ -4777,6 +4797,7 @@ public final class JsBaoClient: @unchecked Sendable {
             try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
             await documentManager.loadLocalMetadata()
         }
+        releaseHeldOutboundClassifications()
     }
 
     /// Wait until storage initialization has fully completed — token restored
@@ -5575,13 +5596,13 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Queue and debounce local document updates for sending
     func queueOutboundUpdate(documentId: String, update: [UInt8]) {
-        // Three classes of local update never go on the wire (JS parity:
-        // `updateHandler`, `src/client/JsBaoClient.ts:6228-6258`; #2665). This
-        // is the one funnel every local update reaches — the document
-        // observer, `transactAndSync`, and `transactAndSyncAsync` — so the
-        // filter sits here, exactly as JS's single update handler does.
+        // Four classes of local update never go on the wire (JS parity:
+        // `updateHandler`, `src/client/JsBaoClient.ts:6373-6414`; #2665,
+        // #2691). This is the one funnel every local update reaches — the
+        // document observer, `transactAndSync`, and `transactAndSyncAsync` —
+        // so the filter sits here, exactly as JS's single update handler does.
         //
-        // JS's fourth case, holding updates while IndexedDB replays into the
+        // JS's fifth case, holding updates while IndexedDB replays into the
         // Y.Doc, has no analogue here: `DocumentManager.openDocument` applies
         // the persisted state *before* it registers the update observer, so a
         // replay never reaches this method.
@@ -5595,6 +5616,17 @@ public final class JsBaoClient: @unchecked Sendable {
             // marking would set an unsynced flag that nothing can ever clear
             // for a document that never queues a send (#2004).
             logger.debug("[outbound] dropping update for read-only document", documentId)
+            return
+        }
+        if documentManager.isLocalOnly(documentId) {
+            // A local-only document is never committed to the server, so its
+            // content must never go on the wire (#2691). The pending-create
+            // hold below can't stand in for this: `createLocalDocument` leaves
+            // a local-only document out of `pendingCreates`, because there is
+            // no create to commit. Nothing is marked here, for the same reason
+            // as the read-only drop — no send means nothing could ever clear
+            // the flag.
+            logger.debug("[outbound] dropping update for local-only document", documentId)
             return
         }
         if documentManager.isPendingCreate(documentId) {
@@ -5761,6 +5793,43 @@ public final class JsBaoClient: @unchecked Sendable {
                 return
 
             case .next(let batch):
+                if documentManager.isLocalOnly(documentId) {
+                    // The classification can arrive after the enqueue: on a
+                    // cold start `openDocument` can run before the storage
+                    // provider is bound, read no metadata row, and only learn
+                    // the document is local-only when `loadLocalMetadata`
+                    // lands. The guard in `queueOutboundUpdate` cannot see
+                    // that, so the drop is repeated here — the last point
+                    // before the bytes reach the socket (#2691). Dropping the
+                    // queue leads the next pass to `.drained`, which releases
+                    // ownership and decides the unsynced clear.
+                    logger.debug("[outbound] dropping queued updates for local-only document", documentId)
+                    lock.withLock { _ = pendingUpdates.removeValue(forKey: documentId) }
+                    continue
+                }
+
+                if documentManager.isLocalOnlyClassificationPending(documentId) {
+                    // Nothing has been able to say what this document is yet —
+                    // it was opened before its stored metadata could be read.
+                    // `isLocalOnly` answers false for it out of ignorance, and
+                    // sending on that answer is exactly the leak this guard
+                    // exists to prevent, so hold the batch instead (#2691).
+                    //
+                    // Held, not dropped: an ordinary document's edit must still
+                    // reach the socket. The batch stays queued and the unsynced
+                    // flag stays set, as after a failed send, and
+                    // `resolveLocalOnlyClassifications` flushes it once the
+                    // classification lands — dropping it there if the answer is
+                    // local-only after all.
+                    logger.debug("[outbound] holding updates while local-only classification is unknown", documentId)
+                    lock.withLock {
+                        guard outboundFlushOwner[documentId] == token else { return }
+                        outboundFlushOwner.removeValue(forKey: documentId)
+                    }
+                    onOutboundFlushedForTest?(documentId)
+                    return
+                }
+
                 // One wire frame per flush pass, however many edits queued up
                 // (JS parity: `Y.mergeUpdates`; see `mergeUpdates` for why this
                 // matters to a cold server room - #2584).

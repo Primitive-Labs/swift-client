@@ -110,9 +110,15 @@ final class CloseEvictLifecycleTests: XCTestCase {
         try await client.connect()
 
         let documentId = "close-flush-\(UUID().uuidString.prefix(8))"
+        // An ordinary committed document: the only kind whose updates reach the
+        // outbound queue at all. A local-only document's edits are dropped
+        // before they can be queued (#2691) and a pending-create document's are
+        // held, so the create is confirmed here to leave a plain writable
+        // document with something to flush.
         _ = try await client.documentManager.createLocalDocument(
-            documentId: documentId, title: "flush-on-close", localOnly: true
+            documentId: documentId, title: "flush-on-close", localOnly: false
         )
+        client.documentManager.handlePendingCreateCommitted(documentId)
         _ = try await client.openDocument(
             documentId,
             options: OpenDocumentOptions(enableNetworkSync: false, deferNetworkSync: true)

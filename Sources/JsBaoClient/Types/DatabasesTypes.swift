@@ -669,6 +669,98 @@ public struct DatabaseSubscribeOptions: Sendable {
     }
 }
 
+// MARK: - Typed realtime subscriptions (#2805)
+//
+// The typed half of the surface above: the same wire frame, with the opaque
+// `data` / `previousData` blobs decoded into a caller-supplied `Row`. These
+// live in the SDK (not in each `<type>.generated.swift`) for the same reason
+// the `DBQueryResult<T>` family does — a Swift package compiles every generated
+// file into one module, so a per-file copy would redeclare.
+
+/// One change inside a typed `db.change` frame — the `Row`-decoded counterpart
+/// of ``DatabaseChangeEvent``.
+///
+/// `data` and `previousData` are **partial by construction**, which is why a
+/// generated `Row` declares every field optional. A change frame carries only
+/// what the write touched: `patch` / `increment` / `addToSet` / `removeFromSet`
+/// send just the delta, `save` merges onto the stored row, and a subscription's
+/// `select` narrows the payload further still. Typing them as the model's full
+/// record would claim fields the frame need not carry — the soundness bug
+/// tracked for the JS factory in #1772, which this surface deliberately does
+/// not reproduce.
+///
+/// A blob that does not decode into `Row` (a field whose wire type disagrees,
+/// say) yields `nil` rather than dropping the change: the frame is still
+/// delivered and ``raw`` carries the untouched event.
+public struct TypedDatabaseChangeEvent<Row: Decodable & Sendable>: Sendable {
+    /// `"enter" | "update" | "leave"` — absent on older server frames.
+    public let changeType: String?
+    /// `"save" | "patch" | "delete" | "increment" | "addToSet" | "removeFromSet"`.
+    public let op: String
+    public let modelName: String
+    public let id: String
+    /// The frame's `data`, decoded into `Row`. `nil` when the frame carried no
+    /// `data` (a `delete`) or when the blob is not a `Row`.
+    public let data: Row?
+    /// The frame's `previousData`, decoded into `Row`. `nil` when the server
+    /// sent none (no pre-read) or when the blob is not a `Row`.
+    public let previousData: Row?
+    /// The untyped event this was decoded from — the escape hatch for anything
+    /// `Row` cannot express, and the only place an undecodable blob survives.
+    public let raw: DatabaseChangeEvent
+
+    /// Decode one untyped event. Never throws: a blob that is not a `Row`
+    /// becomes `nil`, so one odd change cannot take the frame down.
+    public init(decoding event: DatabaseChangeEvent, as rowType: Row.Type = Row.self) {
+        self.changeType = event.changeType
+        self.op = event.op
+        self.modelName = event.modelName
+        self.id = event.id
+        self.data = Self.decodeRow(event.data)
+        self.previousData = Self.decodeRow(event.previousData)
+        self.raw = event
+    }
+
+    private static func decodeRow(_ blob: Any?) -> Row? {
+        guard let blob, !(blob is NSNull) else { return nil }
+        return try? JSONCoding.decode(Row.self, from: blob)
+    }
+}
+
+/// Envelope for a typed `db.change` frame — the `Row`-decoded counterpart of
+/// ``DatabaseChangePayload``. Every envelope field is threaded through
+/// unchanged, including the #737 origin attribution.
+public struct TypedDatabaseChangePayload<Row: Decodable & Sendable>: Sendable {
+    public let databaseId: String
+    public let subscriptionKey: String
+    public let changes: [TypedDatabaseChangeEvent<Row>]
+    public let timestamp: String
+    /// Connection id of the writer, or `nil` for server-side / unattributed writes.
+    public let originConnectionId: String?
+    /// User id of the writer, or `nil` for unattributed server-side writes.
+    public let originUserId: String?
+    /// `true` iff this exact WS connection produced the write.
+    public let isOrigin: Bool
+    /// `true` iff any tab/process signed in as this client's current user
+    /// produced the write.
+    public let isOriginUser: Bool
+
+    /// Decode an untyped payload. Never throws — see
+    /// ``TypedDatabaseChangeEvent/init(decoding:as:)``. Public so an app that
+    /// already holds an untyped payload (from `databases.subscribe`) can type it
+    /// after the fact.
+    public init(decoding payload: DatabaseChangePayload, as rowType: Row.Type = Row.self) {
+        self.databaseId = payload.databaseId
+        self.subscriptionKey = payload.subscriptionKey
+        self.changes = payload.changes.map { TypedDatabaseChangeEvent(decoding: $0, as: Row.self) }
+        self.timestamp = payload.timestamp
+        self.originConnectionId = payload.originConnectionId
+        self.originUserId = payload.originUserId
+        self.isOrigin = payload.isOrigin
+        self.isOriginUser = payload.isOriginUser
+    }
+}
+
 // MARK: Paginated decode envelope
 //
 // `GET /databases` returns `{ items, hasMore, nextCursor?, cursor? }` (#1958 —

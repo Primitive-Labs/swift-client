@@ -1,4 +1,4 @@
-// AUTO-GENERATED FROM database-types/catalog.toml — DO NOT EDIT.
+// AUTO-GENERATED FROM database-type-configs/catalog.toml — DO NOT EDIT.
 // Run `primitive databases codegen --lang swift` to regenerate.
 // fingerprint: 20ef8fc2fcd755ac
 

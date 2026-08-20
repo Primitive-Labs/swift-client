@@ -89,6 +89,12 @@ public final class DocumentManager: @unchecked Sendable {
     private var pendingCreates: Set<String> = []
     private var pendingCreateRetryTimers: [String: Task<Void, Never>] = [:]
     private var localOnlyDocs: Set<String> = []
+    /// Documents opened before their stored metadata could be read at all — a
+    /// cold start whose storage provider is not bound yet. For these,
+    /// local-only is *unknown*, not known-false, and an edit must be held
+    /// rather than sent until the classification lands (#2691). Emptied by
+    /// `resolveLocalOnlyClassifications()` once startup metadata has loaded.
+    private var localOnlyClassificationPending: Set<String> = []
 
     // Awareness state per document
     private var docAwareness: [String: AwarenessEntry] = [:]
@@ -483,9 +489,26 @@ public final class DocumentManager: @unchecked Sendable {
             )
         }
 
-        // Load metadata
-        if let metadata = try? await offlineStore?.getMetadata(appId: appId, userId: userId, documentId: documentId) {
-            lock.withLock { metadataIndex[documentId] = metadata }
+        // Load metadata — and note whether the store could answer at all. On a
+        // cold start the provider may not be bound yet, and then a missing row
+        // says nothing about the document: local-only is unknown, not false,
+        // and its edits are held until the classification lands (#2691).
+        if let offlineStore {
+            let read = try? await offlineStore.readMetadata(
+                appId: appId, userId: userId, documentId: documentId
+            )
+            lock.withLock {
+                if let entry = read?.entry { metadataIndex[documentId] = entry }
+                if read?.readable == true
+                    || metadataIndex[documentId] != nil
+                    || localOnlyDocs.contains(documentId) {
+                    // Either the store answered, or this session already knows
+                    // what the document is (it was created or listed here).
+                    localOnlyClassificationPending.remove(documentId)
+                } else {
+                    localOnlyClassificationPending.insert(documentId)
+                }
+            }
         }
 
         // Restore the cached permission from whichever metadata entry is now
@@ -506,6 +529,18 @@ public final class DocumentManager: @unchecked Sendable {
         // restore above so a cached reader grant is not overwritten by the
         // optimistic default (#2667, parity C19).
         bootstrapPermission(documentId: documentId)
+
+        // Pin local-only-ness for as long as this document stays open, whatever
+        // told us about it — the stored row just read, or one already in the
+        // index. Eviction deletes that row out from under an open document,
+        // which stays editable, and its edits must still never go on the wire
+        // (#2691). JS pins the same way, once its own open path has read the
+        // stored row (`_primeLocalOnlyFromLocalMetadata`).
+        lock.withLock {
+            if metadataIndex[documentId]?.localOnly == true {
+                localOnlyDocs.insert(documentId)
+            }
+        }
 
         // Decide the local-copy claim now: the stored metadata has been loaded
         // (a fresh session's metadata index is otherwise still empty, and the
@@ -690,6 +725,17 @@ public final class DocumentManager: @unchecked Sendable {
             // close (`documentManager.ts:1025`).
             serverLoadedEmitted.remove(documentId)
             localCopyClaimedAtOpen.remove(documentId)
+            // The marker outlives an evicted document's metadata row only
+            // because the document stays open and editable, and its edits must
+            // still stay off the wire (#2691). Closed, there is nothing left to
+            // filter — and a marker held past its row would go on claiming,
+            // through `hasLocalCopy`, a local copy eviction has deleted. A
+            // document whose row still says `localOnly` keeps its marker: the
+            // row is the classification, and it survives the close.
+            if metadataIndex[documentId]?.localOnly != true {
+                localOnlyDocs.remove(documentId)
+            }
+            localOnlyClassificationPending.remove(documentId)
         }
 
         if evictLocal {
@@ -960,7 +1006,7 @@ public final class DocumentManager: @unchecked Sendable {
     private func markSyncedLocally(_ documentId: String) {
         let alreadySynced = lock.withLock { docSyncStates[documentId] ?? false }
         guard !alreadySynced else {
-            lock.withLock { pendingSyncOperations.removeValue(forKey: documentId) }
+            lock.withLock { _ = pendingSyncOperations.removeValue(forKey: documentId) }
             emitter?.emit(SyncEvent(documentId: documentId, synced: true))
             return
         }
@@ -1533,8 +1579,45 @@ public final class DocumentManager: @unchecked Sendable {
         lock.withLock { pendingCreates.contains(documentId) }
     }
 
+    /// Local-only is a property of the document, not of the session that
+    /// created it: `localOnlyDocs` holds the ones created here, and the
+    /// metadata row carries the flag across a reload. `hasLocalCopy` reads both
+    /// for the same reason — a metadata row restored before
+    /// `loadLocalMetadata` refills the set (e.g. `setMetadata` from a listing
+    /// merge) would otherwise look like an ordinary document.
     public func isLocalOnly(_ documentId: String) -> Bool {
-        lock.withLock { localOnlyDocs.contains(documentId) }
+        lock.withLock {
+            localOnlyDocs.contains(documentId) || metadataIndex[documentId]?.localOnly == true
+        }
+    }
+
+    /// Whether this document was opened before anything could say what it is.
+    ///
+    /// `isLocalOnly` answers false for such a document, but only because
+    /// nothing has been read yet — so the outbound flush holds its batch
+    /// instead of sending it. Resolved (for every document at once) when
+    /// startup metadata has loaded, or when the storage bind has finished
+    /// without one.
+    public func isLocalOnlyClassificationPending(_ documentId: String) -> Bool {
+        lock.withLock { localOnlyClassificationPending.contains(documentId) }
+    }
+
+    /// Test seam for the state above: opening a document before the storage
+    /// provider binds is a startup race, and pinning the hold it produces is
+    /// worth more than reproducing the race.
+    func markLocalOnlyClassificationPendingForTest(_ documentId: String) {
+        lock.withLock { _ = localOnlyClassificationPending.insert(documentId) }
+    }
+
+    /// Declare every held classification resolved, returning the documents that
+    /// were waiting — their held batches are the ones to flush now.
+    @discardableResult
+    public func resolveLocalOnlyClassifications() -> [String] {
+        lock.withLock {
+            let waiting = Array(localOnlyClassificationPending)
+            localOnlyClassificationPending.removeAll()
+            return waiting
+        }
     }
 
     /// Create a document locally (offline or local-only). Pass
@@ -2134,7 +2217,14 @@ public final class DocumentManager: @unchecked Sendable {
             // reporting an evicted document (js-bao does the same on its evict
             // paths).
             pendingCreates.remove(documentId)
-            localOnlyDocs.remove(documentId)
+            // Eviction drops the metadata row the local-only flag also lives
+            // in, but an evicted document that is still open is still editable
+            // — and its edits must still stay off the wire (#2691). Keep the
+            // marker until it is closed; for a document that is not open there
+            // is nothing left to filter.
+            if openDocs[documentId] == nil {
+                localOnlyDocs.remove(documentId)
+            }
             pendingCreateRetryTimers.removeValue(forKey: documentId)?.cancel()
             // A document evicted while still open must not write itself back on
             // the next edit or at close. Cleared when it is reopened.
@@ -2171,6 +2261,10 @@ public final class DocumentManager: @unchecked Sendable {
 
     public func evictAllLocalData() async {
         lock.withLock {
+            // Every document the app may still be holding a `YDocument` for:
+            // one that is open, and one whose update observer is still
+            // attached. Read before `openDocs` is cleared below.
+            let stillHeld = Set(openDocs.keys).union(updateSubscriptions.keys)
             metadataIndex.removeAll()
             docPersistence.removeAll()
             openDocs.removeAll()
@@ -2192,7 +2286,15 @@ public final class DocumentManager: @unchecked Sendable {
             unconfirmedLocalWrites.removeAll()
             docPermissions.removeAll()
             pendingCreates.removeAll()
-            localOnlyDocs.removeAll()
+            // `openDocs` is cleared above, but nothing here closes the
+            // documents or cancels their update observers: a `YDocument` the
+            // app still holds keeps forwarding its edits to
+            // `queueOutboundUpdate`. Keep the local-only marker of every
+            // document that was still held — with the metadata index gone too,
+            // dropping it would turn a still-edited local-only document into
+            // an ordinary outbound one (#2691). Same rule as the per-document
+            // evict above.
+            localOnlyDocs.formIntersection(stillHeld)
             deletedMetadataIds.removeAll()
             pendingCreateRetryTimers.values.forEach { $0.cancel() }
             pendingCreateRetryTimers.removeAll()
@@ -2526,10 +2628,19 @@ public final class DocumentManager: @unchecked Sendable {
     /// caller reloads the new user's metadata via `loadLocalMetadata()` after.
     public func resetInMemoryUserState(userId newUserId: String) async {
         lock.withLock {
+            // Every document the app may still be holding a `YDocument` for:
+            // this reset closes nothing and cancels no update observer, so a
+            // retained local-only document keeps forwarding its edits to
+            // `queueOutboundUpdate` — and with the metadata index cleared below,
+            // dropping its marker would turn it into an ordinary outbound one
+            // over the newly authenticated socket (#2691). Same rule as the
+            // bulk evict, and as JS's identity-change handling
+            // (`clearLocalOnlyMarkers`).
+            let stillHeld = Set(openDocs.keys).union(updateSubscriptions.keys)
             metadataIndex.removeAll()
             pendingCreates.removeAll()
             unconfirmedLocalWrites.removeAll()
-            localOnlyDocs.removeAll()
+            localOnlyDocs.formIntersection(stillHeld)
             deletedMetadataIds.removeAll()
             userId = newUserId
         }

@@ -209,6 +209,15 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// Regression: `client.auth.logout(options:)` must route through the
     /// top-level client cleanup path, not directly to `AuthController`, so
     /// `wipeLocal` clears cached document data.
+    ///
+    /// A still-open local-only document is the deliberate #2691 exception:
+    /// the wipe purges both persisted stores, but it closes nothing — the app
+    /// still holds the live `YDocument` — so the local-only marker survives
+    /// (dropping it would turn the next edit into an ordinary outbound update
+    /// on a freshly authenticated socket) and `hasLocalCopy` truthfully stays
+    /// `true` for the in-memory copy. Same rule as JS `clearLocalOnlyMarkers`.
+    /// Once the document is closed, nothing is left anywhere and
+    /// `hasLocalCopy` goes `false`.
     func test_auth_logout_options_wipeLocal_clearsLocalDocuments() async throws {
         let r = makeRecorder()
         let client = makeClient(r)
@@ -221,8 +230,15 @@ final class AuthOptionSurfaceTests: XCTestCase {
 
         try await client.auth.logout(options: LogoutOptions(wipeLocal: true))
 
-        XCTAssertFalse(client.hasLocalCopy(docId))
         XCTAssertFalse(client.isAuthenticated())
+        // Held open across the wipe: the in-memory copy (and its off-the-wire
+        // marker) legitimately remains.
+        XCTAssertTrue(client.hasLocalCopy(docId))
+
+        // Closed, the marker is released (its metadata row is gone with the
+        // wipe) and no local copy remains anywhere.
+        _ = await client.closeDocument(docId)
+        XCTAssertFalse(client.hasLocalCopy(docId))
     }
 
     func test_logoutOptions_defaults_matchJS() {
