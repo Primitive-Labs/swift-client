@@ -20,6 +20,27 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// constructed in isolation (tests).
     private weak var client: JsBaoClient?
 
+    /// Suspends until the owning client has finished binding storage — token
+    /// restored, user-scoped managers bound, and the persisted `meta` rows read
+    /// back into `DocumentManager`'s index — reporting whether that happened
+    /// within the wait.
+    ///
+    /// The listing reconciliation needs it: it decides whether to walk the
+    /// scope by asking which cached documents the response failed to account
+    /// for, and before the load that index is empty, so a launch-time
+    /// `documents.list()` would find nothing to evict and the server-deleted
+    /// row would be restored from disk right after (#2827).
+    ///
+    /// Wired once by `JsBaoClient.setupSubApis`, before any call can reach the
+    /// API; `nil` when `DocumentsAPI` is constructed in isolation (tests),
+    /// where there is no such load to wait for.
+    private var storageReadyGate: (@Sendable () async -> Bool)?
+
+    /// Wire the storage-readiness gate. Called once during client setup.
+    func setStorageReadyGate(_ gate: @escaping @Sendable () async -> Bool) {
+        storageReadyGate = gate
+    }
+
     public let aliases: DocumentAliasesAPI
 
     /// Designated initializer — the typed transport spine.
@@ -92,7 +113,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         options: ListDocumentsOptions? = nil,
         includeRoot: Bool = false
     ) async throws -> DocumentListPage {
-        return try await _listImpl(options: options, includeRoot: includeRoot)
+        return try await _listImpl(options: options, includeRoot: includeRoot, returnPage: true)
     }
 
     /// Underscore-prefixed implementation that internal callers (e.g.
@@ -109,9 +130,14 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// fields (`refreshFromServer`, `localOnly`, `serverTimeoutMs`,
     /// `waitForLoad`) are not implemented here and carry a deprecation warning
     /// saying so — `client.me.ownedDocuments(...)` is where they work (#2360).
+    ///
+    /// `returnPage` says the caller asked for the page shape (`listPage`).
+    /// Only the reconciliation reads it: a page is a subset of the cached
+    /// scope, so it may not evict.
     public func _listImpl(
         options: ListDocumentsOptions? = nil,
-        includeRoot includeRootArg: Bool = false
+        includeRoot includeRootArg: Bool = false,
+        returnPage: Bool = false
     ) async throws -> DocumentListPage {
         // `includeRoot` may arrive either as the dedicated parameter (legacy
         // Swift call sites) or inside `options` (js-bao parity). Either enables it.
@@ -136,14 +162,340 @@ public final class DocumentsAPI: @unchecked Sendable {
         )
         var items = response.items
         let cursor = response.cursor
+        // Documents the server listed but the client-side root filter drops.
+        // They are still on the server, so the reconciliation must retain
+        // them rather than read their absence as a deletion.
+        var retainIds: Set<String> = []
         // Do not filter the root when filtering by tag — a root that carries
         // the requested tag should be returned (mirrors js-bao's `filterRoot`).
         if !includeRoot, options?.tag == nil {
             var rootDocId: String? = nil
             if let client { rootDocId = client.rootDocId }
             items = Self.filterOutRoot(items, rootDocId: rootDocId)
+            // js-bao retains the root by id (`syncMetadata({ includeRoot })`
+            // → `retainIds`); retaining every filtered row on top of that also
+            // covers a token whose payload carries no `rootDocId` claim.
+            if let rootDocId { retainIds.insert(rootDocId) }
+            let kept = Set(items.map { $0.documentId })
+            retainIds.formUnion(
+                response.items.map { $0.documentId }.filter { !kept.contains($0) }
+            )
+        }
+        // The caller's own response never evicts. An unpaged `GET /documents`
+        // is a bare array with no cursor and no `hasMore` (#858), and the
+        // controller silently truncates it at dynamo-bao's 100-row
+        // `defaultQueryLimit` — a truncated listing and a complete one are the
+        // same bytes. So merge what the caller got, then, only when the cache
+        // holds documents that response did not mention, walk the scope
+        // through the paged envelope and let *that* union do the evicting.
+        //
+        // Both halves run against the loaded metadata index: before the client
+        // has read the persisted `meta` rows back, the cache looks empty, so
+        // the merge would be undone by the load and the walk would find nothing
+        // to evict (#2827).
+        let metadataIsLoaded = await localMetadataIsLoaded()
+        await reconcileIntoLocalCache(items, authoritative: false, retainIds: retainIds)
+        if Self.listingScopeIsReconcilable(options: options, returnPage: returnPage),
+           metadataIsLoaded {
+            await reconcileByWalkingScope(
+                seenIds: Set(response.items.map { $0.documentId }),
+                retainIds: retainIds
+            )
         }
         return DocumentListPage(items: items, cursor: cursor)
+    }
+
+    /// Whether this request asked about the whole scope, and so may be
+    /// reconciled authoritatively (after the scope walk confirms what that
+    /// scope contains). Mirrors js-bao's `isPaged` rule (`documentsApi.ts`): a
+    /// limit, a cursor, a tag filter, `forward`, or the page-returning form
+    /// each make the request a question about a slice, and a slice's absences
+    /// prove nothing. `internal` for unit testing.
+    static func listingScopeIsReconcilable(
+        options: ListDocumentsOptions?,
+        returnPage: Bool
+    ) -> Bool {
+        if returnPage { return false }
+        guard let options else { return true }
+        if options.limit != nil { return false }
+        if !(options.cursor ?? "").isEmpty { return false }
+        if !(options.tag ?? "").isEmpty { return false }
+        if options.forward == true { return false }
+        return true
+    }
+
+    /// Write a listing response back into the local metadata cache. When the
+    /// listing is authoritative it is the server's whole view of the scope: a
+    /// cached document it omits is evicted (metadata row *and* `yjs_docs`
+    /// snapshot) and emits a `deleted` metadata event.
+    ///
+    /// This is js-bao's `reconcileFromResponse` →
+    /// `syncMetadata({ scope: "all", payload, authoritative })`
+    /// (`src/client/api/documentsApi.ts`). Swift kept the listing purely as a
+    /// return value, so a document deleted server-side stayed on the device
+    /// through every later launch (#2827).
+    private func reconcileIntoLocalCache(
+        _ items: [DocumentInfo],
+        authoritative: Bool,
+        retainIds: Set<String>,
+        evictOnly: [DocumentManager.EvictionCandidate]? = nil
+    ) async {
+        guard let documentManager else { return }
+        await documentManager.handleServerDocuments(
+            items.map { LocalFirstListing.serverDocumentPayload($0) },
+            authoritative: authoritative,
+            retainIds: retainIds,
+            evictOnly: evictOnly
+        )
+    }
+
+    /// Whether the persisted metadata rows have been read back into the local
+    /// index, so "which cached documents did this listing not account for?" has
+    /// a truthful answer. A gate that times out reports `false`, and the
+    /// listing then merges without ever evicting — the safe direction: the next
+    /// whole-scope listing reconciles instead.
+    private func localMetadataIsLoaded() async -> Bool {
+        guard let storageReadyGate else { return true }
+        return await storageReadyGate()
+    }
+
+    /// Page size for the scope walk. The server caps `limit` at 100
+    /// (`parseListLimitParam`), so asking for more buys nothing.
+    private static let scopeWalkPageSize = 100
+
+    /// Shortest gap between two whole-scope reconciliations. A walk costs one
+    /// request per 100 documents, so a client reconnecting through a flaky
+    /// network must not pay for it on every socket.
+    private static let scopeReconcileMinInterval: TimeInterval = 5 * 60
+
+    /// Guards the reconciliation's schedule: when the last walk finished
+    /// (completed or not) and the one currently running, so concurrent
+    /// connects share it rather than each walking the scope.
+    private let scopeReconcileLock = NSLock()
+    private var scopeReconcileLastRunAt: Date?
+    private var scopeReconcileInFlight: Task<Void, Never>?
+    /// Bumped whenever the schedule is re-armed. A walk carries the generation
+    /// it started under and does nothing once that is stale: neither applying
+    /// the scope it read nor writing back a schedule that now belongs to
+    /// somebody else. Mirrors js-bao's `scopeReconcileGeneration`.
+    private var scopeReconcileGeneration: UInt64 = 0
+    /// The user the current schedule was set for. A walk is about one user's
+    /// documents, so a different one signing in — including the sign-out /
+    /// sign-in pair, where no token-change handler sees both identities —
+    /// re-arms rather than inheriting the previous account's window.
+    private var scopeReconcileUserId: String?
+
+    /// How many pages the walk will follow before giving up. 100 pages × 100
+    /// rows bounds it at 10k documents; a scope larger than that (or a server
+    /// handing back an endless cursor) simply does not get reconciled, which
+    /// is the safe direction — nothing is deleted.
+    private static let scopeWalkMaxPages = 100
+
+    /// Read the caller's whole document scope and reconcile the union of it
+    /// authoritatively, evicting the cached documents the server no longer
+    /// lists.
+    ///
+    /// The walk exists because the caller's own response cannot carry the
+    /// signal this needs: the unpaged `GET /documents` returns a bare array
+    /// truncated at the server's default query limit, so it is indistinguishable
+    /// from a complete listing. The paged form returns the
+    /// `{ items, hasMore, nextCursor }` envelope, which is followed here to
+    /// exhaustion. Anything short of a completed walk — a request that failed,
+    /// a server that answers the paged request with a bare array (and so
+    /// ignores `limit` and says nothing about completeness), a cursor that
+    /// stops advancing, the page cap — evicts nothing at all.
+    ///
+    /// `seenIds` is what the caller's response already accounted for. When no
+    /// cached document is missing from it there is nothing an authoritative
+    /// pass could delete, and the walk is skipped: an app whose scope fits in
+    /// one unpaged response pays no extra request.
+    ///
+    /// Those same missing documents are also the *only* ones the walk may
+    /// evict, captured here with their metadata stamps and handed back to the
+    /// reconciliation: the walk spans several round trips, and a document
+    /// granted, created or re-confirmed while it runs can be genuinely absent
+    /// from the union — its page had already gone by — without having been
+    /// deleted server-side.
+    ///
+    /// `isCurrent` is asked, between round trips and again before anything is
+    /// applied, whether the scope being walked is still the one the client
+    /// cares about. The connect-time reconciliation passes an identity check
+    /// there: a user switch mid-walk would otherwise merge one account's
+    /// documents into the next account's cache — authoritatively, so the
+    /// documents the new user actually has would be the ones evicted.
+    private func reconcileByWalkingScope(
+        seenIds: Set<String>,
+        retainIds: Set<String>,
+        isCurrent: @Sendable () -> Bool = { true }
+    ) async {
+        guard let documentManager else { return }
+        let candidates = documentManager.evictionCandidateSnapshot(
+            seenIds: seenIds, retainIds: retainIds
+        )
+        guard !candidates.isEmpty else { return }
+
+        var union: [DocumentInfo] = []
+        var unionIds: Set<String> = []
+        var cursor: String? = nil
+
+        for _ in 0..<Self.scopeWalkMaxPages {
+            var query = URLQuery()
+            // The server returns the root whatever this says; asking for it
+            // keeps the union a superset of what the caller's response could
+            // have contained.
+            query.append("includeRoot", "true")
+            query.append("limit", Self.scopeWalkPageSize)
+            if let cursor, !cursor.isEmpty { query.append("cursor", cursor) }
+
+            guard isCurrent() else { return }
+            let page: DocumentListEnvelope
+            do {
+                page = try await transport.request(
+                    method: .get,
+                    path: "/documents\(query.queryString)"
+                )
+            } catch {
+                return
+            }
+            // A bare array in answer to `limit` means the server ignored it.
+            guard !page.isBareArray else { return }
+            // A body that never mentioned `items` (or legacy `documents`) is
+            // not a page of this scope — decoding it leaves an empty list, and
+            // an empty list read as the whole scope evicts everything.
+            guard page.listsItems else { return }
+
+            for item in page.items where unionIds.insert(item.documentId).inserted {
+                union.append(item)
+            }
+
+            guard let next = page.cursor, !next.isEmpty else {
+                // No continuation token. If the page nevertheless says more
+                // rows remain, the walk cannot ask for them and so never
+                // reached the end of the scope — an inconsistent envelope
+                // authorizes nothing.
+                guard !page.hasMore else { return }
+                // A scope walked as one user says nothing about the one signed
+                // in now.
+                guard isCurrent() else { return }
+                // The walk reached the end of the scope and the union is the
+                // server's whole view of it.
+                await reconcileIntoLocalCache(
+                    union,
+                    authoritative: true,
+                    retainIds: retainIds,
+                    evictOnly: candidates
+                )
+                return
+            }
+            if next == cursor { return }
+            cursor = next
+        }
+    }
+
+    /// Reconcile the local cache against the user's whole document scope,
+    /// evicting the documents the server no longer has (#2852).
+    ///
+    /// Eviction used to happen only inside `documents.list()`, whose response
+    /// is what gets reconciled. Both clients steer developers off that method
+    /// (#628) and onto `me.ownedDocuments` / `me.sharedDocuments`, which are
+    /// strict subsets of the cached scope and so merge only — correct for a
+    /// subset, but it left an app that never calls the deprecated method with
+    /// no eviction path at all: `meta` rows and multi-megabyte `yjs_docs`
+    /// snapshots of deleted documents accumulated for as long as it kept
+    /// launching.
+    ///
+    /// So this runs on its own schedule — from the connect handler
+    /// (`JsBaoClient.webSocketManagerOnConnected`), and at most once per
+    /// `scopeReconcileMinInterval` — rather than as a side effect of a listing
+    /// call, which would put a full scope walk behind every list. Concurrent
+    /// callers share the one walk.
+    ///
+    /// It is the same walk `documents.list()` uses, with nothing seen: every
+    /// cached document is a candidate, and only a walk followed to the end of
+    /// the scope evicts any of them. Mirrors js-bao's
+    /// `JsBaoClient.reconcileDocumentScope`.
+    func reconcileScopeAtConnect(force: Bool = false) async {
+        // Read outside the lock: it goes through `AuthController`'s own.
+        let currentUser = client?.userId
+        typealias Walk = Task<Void, Never>
+        let (stale, task): (Walk?, Walk?) = scopeReconcileLock.withLock {
+            var cancelled: Task<Void, Never>?
+            if scopeReconcileUserId != currentUser {
+                // The schedule belongs to another account. Whatever it holds —
+                // a spent window, a walk still fetching that account's pages —
+                // says nothing about this one's documents.
+                cancelled = rearmScopeReconcileLocked()
+                scopeReconcileUserId = currentUser
+            }
+            if let inFlight = scopeReconcileInFlight { return (cancelled, inFlight) }
+            if !force, let last = scopeReconcileLastRunAt,
+               Date().timeIntervalSince(last) < Self.scopeReconcileMinInterval {
+                return (cancelled, nil)
+            }
+            let generation = scopeReconcileGeneration
+            let task = Task<Void, Never> { [weak self] in
+                await self?.runScopeReconcile(generation: generation)
+            }
+            scopeReconcileInFlight = task
+            return (cancelled, task)
+        }
+        stale?.cancel()
+        await task?.value
+    }
+
+    /// Forget the staleness window, so the next connect reconciles rather than
+    /// skipping. Called when the signed-in user changes: the window was spent
+    /// on the previous user's scope and says nothing about this one's.
+    func resetScopeReconcileSchedule() {
+        let stale = scopeReconcileLock.withLock { rearmScopeReconcileLocked() }
+        stale?.cancel()
+    }
+
+    /// Re-arm the schedule, returning the walk that was running so the caller
+    /// can cancel it outside the lock.
+    ///
+    /// Bumping the generation is what actually detaches that walk: clearing
+    /// `scopeReconcileInFlight` alone would leave it free to apply the previous
+    /// account's scope and to stamp `scopeReconcileLastRunAt` on its way out,
+    /// skipping the new user's first reconciliation for the whole window.
+    /// Cancellation is the courtesy on top — it is cooperative, and the
+    /// generation check is what the correctness rests on.
+    private func rearmScopeReconcileLocked() -> Task<Void, Never>? {
+        scopeReconcileGeneration &+= 1
+        scopeReconcileLastRunAt = nil
+        let running = scopeReconcileInFlight
+        scopeReconcileInFlight = nil
+        return running
+    }
+
+    /// Whether a walk started under `generation` is still the current one.
+    private func scopeReconcileIsCurrent(_ generation: UInt64) -> Bool {
+        scopeReconcileLock.withLock { scopeReconcileGeneration == generation }
+    }
+
+    private func runScopeReconcile(generation: UInt64) async {
+        defer {
+            scopeReconcileLock.withLock {
+                // A walk the user signed out from under neither starts the next
+                // user's staleness window nor clears a walk started for them.
+                guard scopeReconcileGeneration == generation else { return }
+                scopeReconcileLastRunAt = Date()
+                scopeReconcileInFlight = nil
+            }
+        }
+        // Before the persisted `meta` rows are read back the index is empty, so
+        // the walk would find nothing to evict and the server-deleted row would
+        // come back off disk moments later (#2827).
+        guard await localMetadataIsLoaded() else { return }
+        var retainIds: Set<String> = []
+        // The walk asks for the root, so the union carries it — retaining it by
+        // id as well covers a token whose payload has no `rootDocId` claim.
+        if let rootDocId = client?.rootDocId { retainIds.insert(rootDocId) }
+        await reconcileByWalkingScope(
+            seenIds: [],
+            retainIds: retainIds,
+            isCurrent: { [weak self] in self?.scopeReconcileIsCurrent(generation) ?? false }
+        )
     }
 
     /// Sentinel tag the server attaches to a root document. Mirrors

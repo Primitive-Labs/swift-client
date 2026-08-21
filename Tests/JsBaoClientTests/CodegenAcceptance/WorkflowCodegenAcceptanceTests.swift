@@ -194,6 +194,35 @@ private func _acceptanceInvokerBindingsCompile(_ client: JsBaoClient) async thro
     let checkoutStart: StartWorkflowResult =
         try await checkout.start(input: CreateCheckoutSessionInput(priceId: "p"))
     _ = checkoutStart.runId
+    // #2806 — the JS factory's extras, on the capabilities the Swift client
+    // supports: a typed `terminate` bound to `<Key>Output`.
+    let checkoutEnded: WorkflowStatus<CreateCheckoutSessionOutput> =
+        try await checkout.terminate(runKey: "rk")
+    _ = checkoutEnded.output?.checkoutUrl
+    // Cron-trigger management with the workflow key pinned. An object-shaped
+    // input keeps `rootInput` open (the JS factory's `Partial<Input>`).
+    let created: CronTriggerInfo = try await checkout.cronTriggers.create(
+        triggerKey: "nightly-checkout",
+        displayName: "Nightly Checkout",
+        cron: "0 3 * * *",
+        rootInput: ["priceId": "price_123"]
+    )
+    _ = try await checkout.cronTriggers.update(
+        triggerId: created.triggerId,
+        cron: "0 4 * * *",
+        state: .paused
+    )
+    // An open `rootInput` clears the stored value with `.null` (the JS
+    // factory's `rootInput: null`).
+    _ = try await checkout.cronTriggers.update(
+        triggerId: created.triggerId,
+        rootInput: .null
+    )
+    // Apply-mode workflow → a key-pinned `define`. The Swift apply context has
+    // no output generic to bind, so `context.output` stays the client's `Any?`.
+    checkout.define { context in
+        _ = context.output
+    }
 
     let payment = processPayment(client)
     let paymentOut: RunSyncResult<ProcessPaymentOutput> =
@@ -208,4 +237,30 @@ private func _acceptanceInvokerBindingsCompile(_ client: JsBaoClient) async thro
 
     let profile = updateProfile(client)
     _ = try await profile.start(input: UpdateProfileInput(name: "n", nickname: nil))
+
+    // A non-object-shaped (scalar) input schema has nothing to partialize, so
+    // its cron `rootInput` is the full `<Key>Input` — the same rule the JS
+    // factory follows (#2806).
+    // `requiresClientApply = false` → no `define` member exists to call (the JS
+    // factory omits it too); everything else is unchanged.
+    let digest = sendDigest(client)
+    _ = try await digest.start(input: nil)
+    _ = try await digest.terminate(runKey: "rk")
+
+    let ticker = tick(client)
+    _ = try await ticker.cronTriggers.create(
+        triggerKey: "every-minute",
+        displayName: "Every Minute",
+        cron: "* * * * *",
+        rootInput: "beat"
+    )
+    // A bound `rootInput` is tri-state on `update`: omitted leaves the stored
+    // input alone, `.value` replaces it, `.clear` removes it — the three states
+    // the JS `rootInput?: I | null` param carries.
+    _ = try await ticker.cronTriggers.update(
+        triggerId: "trg_1",
+        rootInput: .value("beat")
+    )
+    _ = try await ticker.cronTriggers.update(triggerId: "trg_1", rootInput: .clear)
+    _ = try await ticker.cronTriggers.update(triggerId: "trg_1", cron: "*/2 * * * *")
 }

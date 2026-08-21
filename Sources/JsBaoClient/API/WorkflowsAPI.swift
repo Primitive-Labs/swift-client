@@ -343,6 +343,31 @@ public final class WorkflowsAPI: @unchecked Sendable {
         )
     }
 
+    /// Terminate a run with a typed `output` bound to `Output`. Mirrors the JS
+    /// `terminate<O>` — a terminated run can carry partial output, so the
+    /// generated per-workflow factory binds `<Key>Output` here exactly as it
+    /// does over `getStatus<O>` (#2806). Delegates to the untyped `terminate`
+    /// above, so the request is byte-identical; only the `output` blob is
+    /// decoded. An absent output decodes to `nil`.
+    public func terminate<Output: Decodable & Sendable>(
+        workflowKey: String,
+        runKey: String,
+        contextDocId: String? = nil
+    ) async throws -> WorkflowStatus<Output> {
+        let untyped = try await terminate(
+            workflowKey: workflowKey,
+            runKey: runKey,
+            contextDocId: contextDocId
+        )
+        return WorkflowStatus(
+            status: untyped.status,
+            output: try Self.decodeTypedOutput(untyped.output),
+            error: untyped.error,
+            run: untyped.run,
+            skipReason: untyped.skipReason
+        )
+    }
+
     /// Encode a typed `Codable` input into the `[String: Any]` object the
     /// server takes as `rootInput`. A `nil` input (optional-input workflow with
     /// no argument) sends `{}`; a non-object encoding also falls back to `{}`

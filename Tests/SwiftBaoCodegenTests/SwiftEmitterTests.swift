@@ -83,8 +83,9 @@ final class SwiftEmitterTests: XCTestCase {
         XCTAssertTrue(body.contains("static func find(_ id: String) throws -> NoteRecord?"))
         XCTAssertFalse(body.contains("static func find(_ id: String) async throws"),
                        "find must be synchronous throws, not async (#1156)")
-        XCTAssertTrue(body.contains("throw PrimitiveDecodeError(modelName: modelName, row: row)"),
-                      "decode misses in find/findAll must throw, not return nil / drop rows")
+        XCTAssertTrue(body.contains("throw PrimitiveDecodeError(modelName: modelName, row: row, schema: primitiveSchema)"),
+                      "decode misses in find/findAll must throw, not return nil / drop rows — "
+                          + "against the schema, so the error names the unreadable field (#2825)")
         XCTAssertTrue(body.contains("static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void"))
         XCTAssertTrue(body.contains("static func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]]"))
         // Cross-document unique lookup + single-result query (JS parity:

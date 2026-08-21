@@ -284,6 +284,9 @@ public struct OpenDocumentOptions: Sendable {
 public struct CreateDocumentOptions: Encodable, Sendable {
     public var title: String?
     public var tags: [String]?
+    /// If true, the document stays entirely on-device: it is never sent to
+    /// the server, in the creating session or any later one. Open it with
+    /// `OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: false)`.
     public var localOnly: Bool
     /// Opaque metadata blob to attach at creation (≤ 4 KB). The platform
     /// round-trips it verbatim — it does not introspect the value.

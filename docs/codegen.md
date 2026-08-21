@@ -517,6 +517,26 @@ runtime layer:
 | `_changedFields` + per-field `didSet` + `discardChanges()` / `markAllChanged()` | Track which fields the caller assigned — Swift's `_localChanges` (#2459). `save(in:)` passes the set to `DynamicModel`, which writes only those fields when the record already exists. See [Change tracking](#change-tracking-_changedfields) below. |
 | `init(from decoder:)` | Emitted rather than synthesized so a decoded record counts as constructed: every decoded field is marked changed. Synthesized decode would leave `_changedFields` empty and a decoded record would silently save nothing. `encode(to:)` stays synthesized. |
 
+#### A row that fails `init?(row:)` is reported, not dropped quietly
+
+`init?(row:)` returns `nil` when a required field is missing or holds
+something the declared type can't read, and the facade's multi-row reads
+(`query`, `queryPaged`) keep going — JS has no decode step, and one drifted
+row must not fail the whole read. What they no longer do is drop that row
+*quietly* (#2825): every skipped row goes through `PrimitiveRowDecoder`,
+which logs it at `.warn` with the model, the row id and the unreadable
+field(s), and hands the same `PrimitiveDecodeError` to an optional app hook:
+
+```swift
+PrimitiveRowDecoder.onDecodeFailure = { error in
+    // error.modelName, error.recordId, error.fields, error.documentId
+    Analytics.breadcrumb(error.localizedDescription)
+}
+```
+
+`queryOne` / `findByUnique` report the same way before answering `nil`;
+`find` / `findAll` stay louder still and `throw` the error.
+
 **Could it ever get lighter?** Two paths, neither on this PR's
 runway:
 

@@ -77,6 +77,18 @@ public final class DocumentManager: @unchecked Sendable {
     // Metadata
     private var metadataIndex: [String: LocalMetadataEntry] = [:]
 
+    /// Monotonic stamp of the last time each document's metadata was written
+    /// through `setMetadata` — i.e. the last time the server confirmed the
+    /// document exists (a listing merge or a `docMetadata` frame).
+    ///
+    /// Read only by the eviction-candidate snapshot: a scope walk runs over
+    /// several round trips, and a document the server confirms *while* the
+    /// walk is in flight may legitimately be missing from the walk's union
+    /// (its page had already gone by). Comparing the stamp tells the two apart
+    /// without holding the lock across the walk.
+    private var metadataTouches: [String: UInt64] = [:]
+    private var metadataTouchCounter: UInt64 = 0
+
     /// Documents for which a `deleted` metadata event has already been
     /// emitted. A revoke can reach this client twice — once as a
     /// `docMetadata` frame with `metadata: null`, once as an absence from the
@@ -1358,7 +1370,11 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     public func setMetadata(_ documentId: String, entry: LocalMetadataEntry) {
-        lock.withLock { metadataIndex[documentId] = entry }
+        lock.withLock {
+            metadataIndex[documentId] = entry
+            metadataTouchCounter &+= 1
+            metadataTouches[documentId] = metadataTouchCounter
+        }
     }
 
     /// Encode a `LocalMetadataEntry` to a `[String: JSONValue]` for event
@@ -1376,12 +1392,24 @@ public final class DocumentManager: @unchecked Sendable {
     /// device — the revoke `docMetadata` frame was never delivered, so the
     /// reconnect listing is the only signal. Pending creates and local-only
     /// documents are exempt: the server has never heard of them, so their
-    /// absence from the listing means nothing. Mirrors js-bao's
-    /// `upsertServerDocuments(..., { authoritative })`
+    /// absence from the listing means nothing. So is anything in `retainIds`:
+    /// a caller that filtered rows out of the listing before handing it over —
+    /// `documents.list` drops the app root — knows those documents are still on
+    /// the server. Mirrors js-bao's
+    /// `upsertServerDocuments(..., { authoritative, retainIds })`
     /// (`src/client/internal/documentManager.ts`).
+    ///
+    /// `evictOnly`, when given, is the candidate snapshot taken before the
+    /// caller went to the network: eviction is restricted to those documents,
+    /// still carrying the metadata stamp they had then. It is how an
+    /// authoritative listing assembled over several round trips avoids
+    /// deleting a document that entered — or was re-confirmed in — the cache
+    /// while the listing was being fetched.
     public func handleServerDocuments(
         _ documents: [[String: Any]],
-        authoritative: Bool = false
+        authoritative: Bool = false,
+        retainIds: Set<String> = [],
+        evictOnly: [EvictionCandidate]? = nil
     ) async {
         var seenIds: Set<String> = []
         let nowIso = ISO8601DateFormatter().string(from: Date())
@@ -1443,19 +1471,25 @@ public final class DocumentManager: @unchecked Sendable {
 
         guard authoritative else { return }
 
-        let candidates: [String] = lock.withLock {
-            metadataIndex.keys.filter { documentId in
-                if seenIds.contains(documentId) { return false }
-                if pendingCreates.contains(documentId) { return false }
-                if localOnlyDocs.contains(documentId) { return false }
-                if metadataIndex[documentId]?.localOnly == true { return false }
-                if metadataIndex[documentId]?.pendingCreate == true { return false }
-                return true
-            }
+        // The stamps the candidates were captured with, re-checked at the
+        // moment each document is evicted rather than only when the set was
+        // computed: evicting is asynchronous and runs document by document, so
+        // a confirmation can arrive for one still waiting its turn.
+        let expectedTouch: [String: UInt64?]? = evictOnly.map { candidates in
+            Dictionary(candidates.map { ($0.documentId, $0.metadataTouch) }) { first, _ in first }
         }
-
-        for documentId in candidates {
-            await evictLocalData(documentId: documentId)
+        for documentId in evictionCandidates(
+            seenIds: seenIds, retainIds: retainIds, evictOnly: evictOnly
+        ) {
+            let guardCandidate = expectedTouch.map {
+                EvictionCandidate(documentId: documentId, metadataTouch: $0[documentId] ?? nil)
+            }
+            let evicted = await evictLocalData(
+                documentId: documentId, ifUnconfirmedSince: guardCandidate
+            )
+            // The server confirmed it in the meantime; nothing was deleted and
+            // nothing may be announced as deleted.
+            guard evicted else { continue }
             let alreadyDeleted = lock.withLock { !deletedMetadataIds.insert(documentId).inserted }
             if alreadyDeleted { continue }
             emitter?.emit(DocumentMetadataChangedEvent(
@@ -1465,6 +1499,77 @@ public final class DocumentManager: @unchecked Sendable {
                 changedFields: ["deleted"],
                 source: "server"
             ))
+        }
+    }
+
+    /// The cached documents an authoritative listing of `seenIds` would evict:
+    /// everything in the metadata index the listing did not mention, minus
+    /// `retainIds` and minus the documents the server has never heard of
+    /// (pending creates, local-only).
+    ///
+    /// `DocumentsAPI` asks before paying for a full scope walk — an empty
+    /// answer means the listing it already has accounts for every cached
+    /// document, so there is nothing an authoritative pass could delete and
+    /// nothing to verify.
+    ///
+    /// `evictOnly` narrows the answer to a snapshot taken earlier (see
+    /// `evictionCandidateSnapshot`): a document outside it, or one whose
+    /// metadata has been written since the snapshot, is not a candidate.
+    func evictionCandidates(
+        seenIds: Set<String>,
+        retainIds: Set<String> = [],
+        evictOnly: [EvictionCandidate]? = nil
+    ) -> [String] {
+        let eligible = evictOnly.map { candidates in
+            Dictionary(candidates.map { ($0.documentId, $0.metadataTouch) }) { first, _ in first }
+        }
+        return lock.withLock {
+            metadataIndex.keys.filter { documentId in
+                if seenIds.contains(documentId) { return false }
+                if retainIds.contains(documentId) { return false }
+                if pendingCreates.contains(documentId) { return false }
+                if localOnlyDocs.contains(documentId) { return false }
+                if metadataIndex[documentId]?.localOnly == true { return false }
+                if metadataIndex[documentId]?.pendingCreate == true { return false }
+                if let eligible {
+                    // Not in the snapshot: it entered the cache after the
+                    // caller started fetching, so the fetch says nothing about
+                    // it. Stamp moved: the server confirmed it meanwhile.
+                    guard let touch = eligible[documentId] else { return false }
+                    guard metadataTouches[documentId] == touch else { return false }
+                }
+                return true
+            }
+        }
+    }
+
+    /// A cached document that an authoritative listing could evict, captured
+    /// with the metadata stamp it carried when the capture was taken.
+    public struct EvictionCandidate: Sendable, Hashable {
+        public let documentId: String
+        /// `nil` for a row restored from disk that no server confirmation has
+        /// touched since — which is exactly the state the document deleted
+        /// server-side is in at launch (#2827).
+        public let metadataTouch: UInt64?
+    }
+
+    /// The current eviction candidates, each paired with the metadata stamp it
+    /// carries right now, for a caller that is about to go to the network and
+    /// will reconcile authoritatively when it gets back.
+    ///
+    /// Handing the result back as `handleServerDocuments(evictOnly:)` bounds
+    /// that later eviction to what was cached — and unchanged — at this
+    /// moment, so a document granted, created or re-confirmed during the fetch
+    /// is never mistaken for one the server dropped.
+    func evictionCandidateSnapshot(
+        seenIds: Set<String>,
+        retainIds: Set<String> = []
+    ) -> [EvictionCandidate] {
+        let ids = evictionCandidates(seenIds: seenIds, retainIds: retainIds)
+        return lock.withLock {
+            ids.map {
+                EvictionCandidate(documentId: $0, metadataTouch: metadataTouches[$0])
+            }
         }
     }
 
@@ -2028,6 +2133,7 @@ public final class DocumentManager: @unchecked Sendable {
             pendingCreateRetryTimers.removeValue(forKey: documentId)
             let _ = openDocs.removeValue(forKey: documentId)
             _ = metadataIndex.removeValue(forKey: documentId)
+            metadataTouches.removeValue(forKey: documentId)
             // The document leaves `openDocs`, so its open cycle is over.
             serverLoadedEmitted.remove(documentId)
         }
@@ -2210,9 +2316,39 @@ public final class DocumentManager: @unchecked Sendable {
     /// its old content on the next open, and `maxBytes` enforcement reduced the
     /// accounted total without reclaiming any disk.
     public func evictLocalData(documentId: String) async {
+        await evictLocalData(documentId: documentId, ifUnconfirmedSince: nil)
+    }
+
+    /// `evictLocalData` for an authoritative listing, which decided who to
+    /// evict before it went to the network and may have been overtaken since.
+    ///
+    /// `ifUnconfirmedSince` carries the stamp the document had when it became a
+    /// candidate: the check happens in the same critical section that takes the
+    /// metadata row away, so a `docMetadata` frame or a listing merge landing
+    /// between the decision and this call abandons the eviction rather than
+    /// deleting what the server just confirmed. Reports whether it evicted, so
+    /// the caller knows not to announce a deletion that did not happen.
+    @discardableResult
+    func evictLocalData(
+        documentId: String,
+        ifUnconfirmedSince candidate: EvictionCandidate?
+    ) async -> Bool {
+        // Asked twice: here so a stale eviction has no side effects at all, and
+        // again below in the critical section that removes the row, which is
+        // what makes the answer binding.
+        if let candidate,
+           lock.withLock({ metadataTouches[documentId] != candidate.metadataTouch }) {
+            return false
+        }
         cancelPendingPersist(documentId: documentId)
-        let persistence: YjsSQLitePersistence? = lock.withLock {
+        let claim: (evicting: Bool, persistence: YjsSQLitePersistence?) = lock.withLock {
+            if let candidate, metadataTouches[documentId] != candidate.metadataTouch {
+                // The stamp moved: the server confirmed this document after it
+                // became a candidate, so the caller's decision is stale.
+                return (false, nil)
+            }
             metadataIndex.removeValue(forKey: documentId)
+            metadataTouches.removeValue(forKey: documentId)
             // Clear pending-create state too, so `hasLocalCopy` doesn't keep
             // reporting an evicted document (js-bao does the same on its evict
             // paths).
@@ -2231,13 +2367,14 @@ public final class DocumentManager: @unchecked Sendable {
             if openDocs[documentId] != nil {
                 persistenceSuspended.insert(documentId)
             }
-            return docPersistence.removeValue(forKey: documentId)
+            return (true, docPersistence.removeValue(forKey: documentId))
         }
+        guard claim.evicting else { return false }
 
         // A document that was never opened in this session has no
         // `docPersistence` entry — build one so the row is still deleted.
         let target: YjsSQLitePersistence?
-        if let persistence {
+        if let persistence = claim.persistence {
             target = persistence
         } else if let provider = await offlineStore?.getStorageProvider() {
             target = YjsSQLitePersistence(storageProvider: provider, documentId: documentId)
@@ -2257,6 +2394,7 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         try? await offlineStore?.deleteMetadata(appId: appId, userId: userId, documentId: documentId)
+        return true
     }
 
     public func evictAllLocalData() async {
@@ -2266,6 +2404,7 @@ public final class DocumentManager: @unchecked Sendable {
             // attached. Read before `openDocs` is cleared below.
             let stillHeld = Set(openDocs.keys).union(updateSubscriptions.keys)
             metadataIndex.removeAll()
+            metadataTouches.removeAll()
             docPersistence.removeAll()
             openDocs.removeAll()
             docSyncStates.removeAll()
@@ -2638,6 +2777,7 @@ public final class DocumentManager: @unchecked Sendable {
             // (`clearLocalOnlyMarkers`).
             let stillHeld = Set(openDocs.keys).union(updateSubscriptions.keys)
             metadataIndex.removeAll()
+            metadataTouches.removeAll()
             pendingCreates.removeAll()
             unconfirmedLocalWrites.removeAll()
             localOnlyDocs.formIntersection(stillHeld)

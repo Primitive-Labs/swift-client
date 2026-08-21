@@ -20,6 +20,127 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Connecting reconciles the whole document scope, so eviction no longer depends on `documents.list()` (#2852)
+
+The eviction #2827 added is reachable only by calling `documents.list()` — the
+method both clients are steering apps away from. `me.ownedDocuments(...)` and
+`me.sharedDocuments(...)` are strict subsets of the cached scope, so they merge
+only (a subset's absences prove nothing, and that stays true). An app built on
+those surfaces therefore had no eviction path at all: the `meta` rows and
+`yjs_docs` snapshots of documents deleted server-side accumulated for as long as
+it kept launching.
+
+The reconciliation now runs on its own schedule instead. Every socket connect
+walks the scope — the same walk `documents.list()` uses, with nothing seen, so
+every cached document is a candidate — and evicts what the walk did not find. No
+listing call is involved, so it costs nothing per list.
+
+The bounds are the walk's, unchanged: only a walk followed to the end of the
+scope through the paged `{ items, hasMore, nextCursor }` envelope evicts
+anything; only the documents cached, unchanged, before it started may be
+evicted; and it waits for the persisted `meta` rows to be read back first.
+
+What this means for an app:
+
+- **Local data can disappear shortly after connecting**, not only after a
+  `documents.list()` call. Subscribe to `DocumentMetadataChangedEvent` and tear
+  down a document you see `deleted` for.
+- **One walk per five minutes at most**, shared between concurrent connects, so
+  a reconnect storm does not pay for it repeatedly. Signing a different user in
+  re-arms it: the next connect walks that user's scope rather than skipping on
+  the window the previous session spent. That covers signing out and back in as
+  somebody else, and a walk the account switch overtakes is detached — it
+  neither merges the previous account's documents into this one's cache nor
+  starts this one's window.
+- **Nothing cached, no request.** A fresh install pays nothing.
+- The JS client does the same at its socket open (`JsBaoClient.ts`,
+  `reconcileDocumentScope`).
+
+### `documents.list()` reconciles the local cache, and can now evict (#2827)
+
+`documents.list()` used to hand back the server's rows and forget them. The
+local metadata cache was never compared against that listing, so a document
+deleted server-side (or one whose access was revoked) kept its `meta` row and
+its `yjs_docs` CRDT snapshot on the device forever — the reporting app carried a
+7.1 MB snapshot of a document deleted four days earlier.
+
+The listing is now written back into the local cache, and a call that asks about
+the whole scope (no `limit`, `cursor`, `tag`, `forward`, and not `listPage`) can
+evict: a cached document the server no longer has is removed — metadata row
+*and* CRDT snapshot — and delivers a `DocumentMetadataChangedEvent` with
+`action: "deleted"` and `metadata: nil`, so open state can be torn down.
+
+Eviction never runs against the response the caller got. The unpaged
+`GET /documents` is a bare array with no cursor, silently truncated at the
+server's 100-row default query limit, so a truncated listing and a complete one
+are the same bytes — deleting what it omits would wipe local data for anyone
+with more than 100 documents. Instead the client walks the scope itself through
+the paged `{ items, hasMore, nextCursor }` form, follows the cursor to
+exhaustion, and reconciles that union. A walk that cannot be finished — a failed
+request, a server that ignores `limit` and answers with a bare array, a cursor
+that stops advancing, a page that says more rows remain but hands back no
+cursor, a body that never mentions `items` at all — evicts nothing.
+
+Two further bounds keep the walk from deleting a document that is still there:
+
+- It may only evict the documents that were cached, unchanged, when it started.
+  The walk spans several round trips, and a document granted, created, or
+  re-confirmed by the server while it runs can be missing from the union simply
+  because its page had already gone by.
+- It waits for the client's storage init to finish first. Until the persisted
+  `meta` rows are read back, the local cache looks empty, so a `documents.list()`
+  issued at launch would find nothing to evict and the server-deleted row would
+  be restored from disk a moment later.
+
+(The JS client reconciles its first unpaged response directly
+(`src/client/api/documentsApi.ts`), which has the same truncation defect; the
+rule here is deliberately stricter rather than a faithful port. The same guard
+should land in `src/client` — tracked as separate work, not in this change.)
+
+What this means for an app:
+
+- **Local data can now disappear on a `documents.list()` call.** Subscribe to
+  `DocumentMetadataChangedEvent` and close/tear down a document you see
+  `deleted` for; reading a `YDocument` you still hold open after that gives you
+  an in-memory document with no local persistence behind it.
+- **A slice never evicts.** `limit`, `cursor`, `tag`, `forward`, and the
+  page-returning `listPage(...)` are subsets of the scope, so they merge only —
+  same rule the JS client applies (`isPaged`), and they never trigger a walk.
+- **The extra requests are only paid when something could be evicted.** When the
+  listing already accounts for every cached document — the usual case for an app
+  whose documents fit in one response — no walk is issued at all.
+- **The app root is safe.** The default listing filters the root out of its own
+  result; it is retained in the cache, not deleted.
+- `me.ownedDocuments(...)` is unchanged: it is owner-only, so its response is a
+  subset and stays merge-only (as in the JS client, issue #628).
+
+### A `boolean` field holding `0`/`1` no longer NULLs the field — or the row (#2825)
+
+`PrimitiveValue.decode(yrsString:as:)` accepted only the literal `"true"` /
+`"false"` for a `boolean` field. A CRDT value of the NUMBER `0`/`1` — which any
+workflow write can produce today (#2823, #2824) — decoded to `nil`, so the field
+never reached the SQLite mirror row, the generated `init?(row:)` required-field
+guard failed, and `Model.query()` dropped the whole record. Rows the engine
+still held simply weren't in the app, with no error and no log. The decode now
+reads a number the same way the row-side `rowBoolValue` always has: `0` is
+`false`, any other finite number is `true`. Non-numeric values (`"yes"`, a
+quoted `"false"`) are still undecodable.
+
+Dropping a row is also no longer silent. `query` / `queryPaged` / `queryOne` /
+`findByUnique` decode through the new `PrimitiveRowDecoder`, which logs each
+skipped row at `.warn` with the model, the row id and the unreadable field(s),
+and reports it to an optional app hook:
+
+```swift
+PrimitiveRowDecoder.onDecodeFailure = { error in
+    Analytics.breadcrumb(error.localizedDescription)
+}
+```
+
+`PrimitiveDecodeError` gained a `fields` array naming those fields, and the
+`find` / `findAll` errors carry it too. Additive: generated code is re-emitted
+on the next build, and no existing signature changed.
+
 ### `AuthFailedEvent.reason` on a rejected refresh matches the JS client (#2723)
 
 A refresh the server rejects used to deliver `reason: "invalid_token"` whatever

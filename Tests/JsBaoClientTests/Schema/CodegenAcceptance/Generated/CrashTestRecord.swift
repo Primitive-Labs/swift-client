@@ -257,20 +257,23 @@ public extension CrashTestRecord {
     // MARK: Reads (cross-document by default)
 
     /// Query across all open documents. Rows that fail to decode (schema
-    /// drift) are skipped. Scope to one/some docs via `options.documents`.
+    /// drift) are skipped — but never silently: each one is logged with
+    /// the row id and the unreadable field(s) and reported to
+    /// `PrimitiveRowDecoder.onDecodeFailure`. Scope to one/some docs via
+    /// `options.documents`.
     static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [CrashTestRecord] {
-        try JsBaoClient.requireDefault()
+        let rows = try JsBaoClient.requireDefault()
             .codegen.query(primitiveSchema, filter: filter, options: options)
-            .compactMap { CrashTestRecord(row: $0) }
+        return PrimitiveRowDecoder.decodeAll(rows, as: CrashTestRecord.self)
     }
 
     /// Query across all open documents and batch-prefetch related
     /// records into each row's `related` bag. Mirrors JS
     /// `BaseModel.query(filter, { include })`.
     static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [CrashTestRecord] {
-        try JsBaoClient.requireDefault()
+        let rows = try JsBaoClient.requireDefault()
             .codegen.query(primitiveSchema, filter: filter, options: options, include: include)
-            .compactMap { CrashTestRecord(row: $0) }
+        return PrimitiveRowDecoder.decodeAll(rows, as: CrashTestRecord.self)
     }
 
     /// Paginated query across all open documents. Returns the page's
@@ -281,7 +284,7 @@ public extension CrashTestRecord {
         let page = try JsBaoClient.requireDefault()
             .codegen.queryPaged(primitiveSchema, filter: filter, options: options)
         return PagedQueryResult(
-            data: page.data.compactMap { CrashTestRecord(row: $0) },
+            data: PrimitiveRowDecoder.decodeAll(page.data, as: CrashTestRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
             hasMore: page.hasMore
@@ -293,7 +296,7 @@ public extension CrashTestRecord {
         let page = try JsBaoClient.requireDefault()
             .codegen.queryPaged(primitiveSchema, filter: filter, options: options, include: include)
         return PagedQueryResult(
-            data: page.data.compactMap { CrashTestRecord(row: $0) },
+            data: PrimitiveRowDecoder.decodeAll(page.data, as: CrashTestRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
             hasMore: page.hasMore
@@ -316,7 +319,7 @@ public extension CrashTestRecord {
             .codegen.query(primitiveSchema, filter: nil, options: nil)
             .map { row in
                 guard let decoded = CrashTestRecord(row: row) else {
-                    throw PrimitiveDecodeError(modelName: modelName, row: row)
+                    throw PrimitiveDecodeError(modelName: modelName, row: row, schema: primitiveSchema)
                 }
                 return decoded
             }
@@ -332,7 +335,7 @@ public extension CrashTestRecord {
             return nil
         }
         guard let decoded = CrashTestRecord(row: row) else {
-            throw PrimitiveDecodeError(modelName: modelName, row: row)
+            throw PrimitiveDecodeError(modelName: modelName, row: row, schema: primitiveSchema)
         }
         return decoded
     }
@@ -343,18 +346,18 @@ public extension CrashTestRecord {
     /// same value may exist in more than one open doc). Mirrors the
     /// JS client's `Model.findByUnique(constraintName, value)`.
     static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> CrashTestRecord? {
-        try JsBaoClient.requireDefault()
+        let row = try JsBaoClient.requireDefault()
             .codegen.findByUnique(primitiveSchema, constraint: constraint, value: value)
-            .flatMap { CrashTestRecord(row: $0) }
+        return PrimitiveRowDecoder.decodeOne(row, as: CrashTestRecord.self)
     }
 
     /// The first record matching `filter` across all open documents,
     /// or `nil`. Equivalent to `query(filter, options).first` — mirrors
     /// the JS client's `Model.queryOne(filter, options)`.
     static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> CrashTestRecord? {
-        try JsBaoClient.requireDefault()
+        let row = try JsBaoClient.requireDefault()
             .codegen.queryOne(primitiveSchema, filter: filter, options: options)
-            .flatMap { CrashTestRecord(row: $0) }
+        return PrimitiveRowDecoder.decodeOne(row, as: CrashTestRecord.self)
     }
 
     /// The first record matching `filter` with query-time relationship
@@ -362,9 +365,9 @@ public extension CrashTestRecord {
     /// `query(filter, options, include:).first` — mirrors the JS client's
     /// `Model.queryOne(filter, { include })`.
     static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> CrashTestRecord? {
-        try JsBaoClient.requireDefault()
+        let row = try JsBaoClient.requireDefault()
             .codegen.queryOne(primitiveSchema, filter: filter, options: options, include: include)
-            .flatMap { CrashTestRecord(row: $0) }
+        return PrimitiveRowDecoder.decodeOne(row, as: CrashTestRecord.self)
     }
 
     /// Fire `callback` after any add/update/delete in any open document's

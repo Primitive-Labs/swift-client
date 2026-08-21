@@ -1,18 +1,26 @@
-// AUTO-GENERATED FROM workflows/import-csv.toml — DO NOT EDIT.
+// AUTO-GENERATED FROM workflows/tick.toml — DO NOT EDIT.
 // Run `primitive workflows codegen --lang swift` to regenerate.
-// fingerprint: b87d8a13f930f11e
+// fingerprint: 905ee7e0297479f7
 
 import Foundation
 import JsBaoClient
 
-public typealias ImportCsvInput = JSONValue
+public typealias TickInput = String
 
-public typealias ImportCsvOutput = JSONValue
+public struct TickOutput: Codable, Equatable, Sendable {
+    public var ticked: Bool
 
-/// Typed invoker for the `import-csv` workflow. Bind its `ImportCsvInput` /
-/// `ImportCsvOutput` over the generic `WorkflowsAPI` overloads. Obtain one
-/// with `importCsv(client)`.
-public struct ImportCsvWorkflow: Sendable {
+    public init(
+        ticked: Bool
+    ) {
+        self.ticked = ticked
+    }
+}
+
+/// Typed invoker for the `tick` workflow. Bind its `TickInput` /
+/// `TickOutput` over the generic `WorkflowsAPI` overloads. Obtain one
+/// with `tick(client)`.
+public struct TickWorkflow: Sendable {
     public let client: JsBaoClient
 
     public init(client: JsBaoClient) {
@@ -22,14 +30,14 @@ public struct ImportCsvWorkflow: Sendable {
     /// Start the workflow asynchronously; returns the run handle.
     @discardableResult
     public func start(
-        input: ImportCsvInput? = nil,
+        input: TickInput,
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
         forceRerun: Bool? = nil
     ) async throws -> StartWorkflowResult {
         try await client.workflows.start(
-            workflowKey: "import-csv",
+            workflowKey: "tick",
             input: input,
             runKey: runKey,
             contextDocId: contextDocId,
@@ -38,46 +46,46 @@ public struct ImportCsvWorkflow: Sendable {
         )
     }
 
-    /// Fetch a run's status with a typed `output` bound to `ImportCsvOutput`.
+    /// Fetch a run's status with a typed `output` bound to `TickOutput`.
     public func getStatus(
         runKey: String,
         contextDocId: String? = nil
-    ) async throws -> WorkflowStatus<ImportCsvOutput> {
+    ) async throws -> WorkflowStatus<TickOutput> {
         try await client.workflows.getStatus(
-            workflowKey: "import-csv",
+            workflowKey: "tick",
             runKey: runKey,
             contextDocId: contextDocId
         )
     }
 
-    /// Terminate a run; `output` is bound to `ImportCsvOutput` (a terminated
+    /// Terminate a run; `output` is bound to `TickOutput` (a terminated
     /// run can carry partial output).
     @discardableResult
     public func terminate(
         runKey: String,
         contextDocId: String? = nil
-    ) async throws -> WorkflowStatus<ImportCsvOutput> {
+    ) async throws -> WorkflowStatus<TickOutput> {
         try await client.workflows.terminate(
-            workflowKey: "import-csv",
+            workflowKey: "tick",
             runKey: runKey,
             contextDocId: contextDocId
         )
     }
 
     /// Register this workflow's apply handler. Emitted only because
-    /// `import-csv` is apply-mode (parity with JS). The context's `output`
+    /// `tick` is apply-mode (parity with JS). The context's `output`
     /// is the client's untyped `Any?`.
     public func define(onApply: @escaping WorkflowApplyHandler) {
-        client.workflows.define("import-csv", onApply: onApply)
+        client.workflows.define("tick", onApply: onApply)
     }
 
-    /// Cron triggers scoped to the `import-csv` workflow. The workflow key is
+    /// Cron triggers scoped to the `tick` workflow. The workflow key is
     /// pinned by the helpers below, so a trigger cannot be redirected.
     public var cronTriggers: CronTriggers {
         CronTriggers(client: client)
     }
 
-    /// Typed cron-trigger management for the `import-csv` workflow.
+    /// Typed cron-trigger management for the `tick` workflow.
     public struct CronTriggers: Sendable {
         public let client: JsBaoClient
 
@@ -94,7 +102,7 @@ public struct ImportCsvWorkflow: Sendable {
             timezone: String? = nil,
             description: String? = nil,
             overlapPolicy: CronOverlapPolicy? = nil,
-            rootInput: ImportCsvInput? = nil,
+            rootInput: TickInput? = nil,
             inputMapping: JSONValue? = nil
         ) async throws -> CronTriggerInfo {
             try await client.cronTriggers.create(
@@ -102,7 +110,7 @@ public struct ImportCsvWorkflow: Sendable {
                     triggerKey: triggerKey,
                     displayName: displayName,
                     cron: cron,
-                    workflowKey: "import-csv",
+                    workflowKey: "tick",
                     timezone: timezone,
                     description: description,
                     overlapPolicy: overlapPolicy,
@@ -123,12 +131,12 @@ public struct ImportCsvWorkflow: Sendable {
             cron: String? = nil,
             timezone: String? = nil,
             overlapPolicy: CronOverlapPolicy? = nil,
-            rootInput: Updatable<ImportCsvInput>? = nil,
+            rootInput: Updatable<TickInput>? = nil,
             inputMapping: JSONValue? = nil,
             state: UpdateCronTriggerState? = nil
         ) async throws -> CronTriggerInfo {
             let rootInputValue: JSONValue? = try rootInput.map {
-                (change: Updatable<ImportCsvInput>) throws -> JSONValue in
+                (change: Updatable<TickInput>) throws -> JSONValue in
                 switch change {
                 case .clear: return .null
                 case let .value(input): return try JSONValue(encoding: input)
@@ -141,7 +149,7 @@ public struct ImportCsvWorkflow: Sendable {
                     description: description,
                     cron: cron,
                     timezone: timezone,
-                    workflowKey: "import-csv",
+                    workflowKey: "tick",
                     overlapPolicy: overlapPolicy,
                     rootInput: rootInputValue,
                     inputMapping: inputMapping,
@@ -152,7 +160,7 @@ public struct ImportCsvWorkflow: Sendable {
     }
 }
 
-/// Typed invoker factory for the `import-csv` workflow.
-public func importCsv(_ client: JsBaoClient) -> ImportCsvWorkflow {
-    ImportCsvWorkflow(client: client)
+/// Typed invoker factory for the `tick` workflow.
+public func tick(_ client: JsBaoClient) -> TickWorkflow {
+    TickWorkflow(client: client)
 }

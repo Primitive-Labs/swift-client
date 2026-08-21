@@ -77,7 +77,10 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // The five that cannot be `let`: private storage, non-optional accessor.
 
-    private var _documents: DocumentsAPI!
+    /// `internal` rather than `private` so a hermetic test can put the sub-API
+    /// on a stand-in transport and exercise the client paths that drive it —
+    /// the connect-time scope reconciliation among them (#2852).
+    var _documents: DocumentsAPI!
     private var _me: MeAPI!
     private var _auth: AuthAPI!
     private var _users: UsersAPI!
@@ -4046,6 +4049,21 @@ public final class JsBaoClient: @unchecked Sendable {
     /// constructor token is not a sign-in, and init runs its own auto-connect
     /// behind the reachability gate.
     private func handleTokenApplied(token: String, previous: String?) {
+        // A different user is signing in. The whole-scope reconciliation's
+        // staleness window was spent walking the previous user's documents and
+        // says nothing about this one's, so the next connect must walk again
+        // rather than skip (#2852). Mirrors js-bao's `applyTokenEffects`, which
+        // re-arms it on the same user change.
+        //
+        // A missing previous user counts as a change: signing out and back in
+        // as somebody else arrives here as `previous == nil`, because the token
+        // was cleared in between, and that pair is the ordinary account switch.
+        // `DocumentsAPI` also checks the signed-in user against the one its
+        // schedule was set for, which covers the sign-out this handler is not
+        // told about at all.
+        if previous.flatMap(Self.userId(ofToken:)) != Self.userId(ofToken: token) {
+            _documents?.resetScopeReconcileSchedule()
+        }
         // The destroyed check lives inside the Task, not here: this runs inline
         // on whatever thread applied the token, and taking the client's
         // non-recursive lock on that thread is what the #2657 review flagged as
@@ -4514,6 +4532,14 @@ public final class JsBaoClient: @unchecked Sendable {
             documentManager: documentManager,
             client: self
         )
+        // The listing reconciliation reads the local metadata index to decide
+        // what a server-side deletion would evict, and `setupStorage()` fills
+        // that index asynchronously — a `documents.list()` issued at launch can
+        // otherwise run against an empty one and evict nothing (#2827).
+        self._documents.setStorageReadyGate { [weak self] in
+            guard let self else { return false }
+            return await self.waitForStorageReady()
+        }
         // Avatar upload sends raw bytes with a custom Content-Type; it goes
         // through `Transport.requestData` like every other raw-bytes call
         // site now that `MeAPI` holds the transport.
@@ -6091,6 +6117,11 @@ extension JsBaoClient: WebSocketManagerDelegate {
             for docId in docIds {
                 await startNetworkSync(documentId: docId, explicit: false)
             }
+            // Reconcile the whole document scope against the server, so a
+            // document deleted (or revoked) while this client was away leaves
+            // the device even for an app that only ever calls the subset
+            // listings (#2852). Rate-limited inside `DocumentsAPI`.
+            await documents.reconcileScopeAtConnect()
             // Flush analytics
             await analyticsQueue.flush()
             // Re-issue db.subscribe for every live database subscription —

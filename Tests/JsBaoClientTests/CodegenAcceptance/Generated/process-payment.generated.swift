@@ -139,6 +139,100 @@ public struct ProcessPaymentWorkflow: Sendable {
             contextDocId: contextDocId
         )
     }
+
+    /// Terminate a run; `output` is bound to `ProcessPaymentOutput` (a terminated
+    /// run can carry partial output).
+    @discardableResult
+    public func terminate(
+        runKey: String,
+        contextDocId: String? = nil
+    ) async throws -> WorkflowStatus<ProcessPaymentOutput> {
+        try await client.workflows.terminate(
+            workflowKey: "process-payment",
+            runKey: runKey,
+            contextDocId: contextDocId
+        )
+    }
+
+    /// Register this workflow's apply handler. Emitted only because
+    /// `process-payment` is apply-mode (parity with JS). The context's `output`
+    /// is the client's untyped `Any?`.
+    public func define(onApply: @escaping WorkflowApplyHandler) {
+        client.workflows.define("process-payment", onApply: onApply)
+    }
+
+    /// Cron triggers scoped to the `process-payment` workflow. The workflow key is
+    /// pinned by the helpers below, so a trigger cannot be redirected.
+    public var cronTriggers: CronTriggers {
+        CronTriggers(client: client)
+    }
+
+    /// Typed cron-trigger management for the `process-payment` workflow.
+    public struct CronTriggers: Sendable {
+        public let client: JsBaoClient
+
+        public init(client: JsBaoClient) {
+            self.client = client
+        }
+
+        /// Create a cron trigger that fires this workflow.
+        @discardableResult
+        public func create(
+            triggerKey: String,
+            displayName: String,
+            cron: String,
+            timezone: String? = nil,
+            description: String? = nil,
+            overlapPolicy: CronOverlapPolicy? = nil,
+            rootInput: JSONValue? = nil,
+            inputMapping: JSONValue? = nil
+        ) async throws -> CronTriggerInfo {
+            try await client.cronTriggers.create(
+                params: CreateCronTriggerParams(
+                    triggerKey: triggerKey,
+                    displayName: displayName,
+                    cron: cron,
+                    workflowKey: "process-payment",
+                    timezone: timezone,
+                    description: description,
+                    overlapPolicy: overlapPolicy,
+                    rootInput: rootInput,
+                    inputMapping: inputMapping
+                )
+            )
+        }
+
+        /// Update a cron trigger that fires this workflow. Omitted fields stay
+        /// unchanged; `description` removes the stored value with `.clear`
+        /// and `rootInput` with `.null`.
+        @discardableResult
+        public func update(
+            triggerId: String,
+            displayName: String? = nil,
+            description: Updatable<String>? = nil,
+            cron: String? = nil,
+            timezone: String? = nil,
+            overlapPolicy: CronOverlapPolicy? = nil,
+            rootInput: JSONValue? = nil,
+            inputMapping: JSONValue? = nil,
+            state: UpdateCronTriggerState? = nil
+        ) async throws -> CronTriggerInfo {
+            try await client.cronTriggers.update(
+                triggerId: triggerId,
+                params: UpdateCronTriggerParams(
+                    displayName: displayName,
+                    description: description,
+                    cron: cron,
+                    timezone: timezone,
+                    workflowKey: "process-payment",
+                    overlapPolicy: overlapPolicy,
+                    rootInput: rootInput,
+                    inputMapping: inputMapping,
+                    state: state
+                )
+            )
+        }
+    }
 }
 
 /// Typed invoker factory for the `process-payment` workflow.

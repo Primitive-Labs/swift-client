@@ -57,16 +57,49 @@ struct ModelFieldsEnvelope: Decodable, Sendable {
 struct DocumentListEnvelope: Decodable, Sendable {
     let items: [DocumentInfo]
     let cursor: String?
+    /// True when the body was the bare array rather than the keyed envelope.
+    ///
+    /// The two shapes are not equally informative: the envelope says whether
+    /// more rows remain, the array cannot. A caller that needs to know it has
+    /// the *whole* scope — `documents.list`'s reconciliation walk — must treat
+    /// a bare array as "completeness unknown", because the unpaged
+    /// `GET /documents` truncates at the server's default query limit and says
+    /// nothing about it (#2827).
+    let isBareArray: Bool
+    /// The envelope's own answer to "are there more rows after these?" —
+    /// `hasMore` when the body carried it, otherwise inferred from the presence
+    /// of a continuation cursor (`DocumentListPage`'s rule). Always `false` for
+    /// the bare array, which is why `isBareArray` has to be consulted too.
+    let hasMore: Bool
+    /// True when the keyed envelope actually carried an `items` (or legacy
+    /// `documents`) key.
+    ///
+    /// A JSON object without either decodes to an empty page, and an empty page
+    /// read as the whole scope evicts every cached document — so a body that
+    /// never mentioned the rows it is supposed to be listing must not be read
+    /// as one (#2827).
+    let listsItems: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case items, documents
+    }
 
     init(from decoder: Decoder) throws {
         if let array = try? [DocumentInfo](from: decoder) {
             items = array
             cursor = nil
+            isBareArray = true
+            hasMore = false
+            listsItems = true
             return
         }
         let page = try DocumentListPage(from: decoder)
         items = page.items
         cursor = page.cursor
+        isBareArray = false
+        hasMore = page.hasMore
+        let keys = try decoder.container(keyedBy: CodingKeys.self)
+        listsItems = keys.contains(.items) || keys.contains(.documents)
     }
 }
 
