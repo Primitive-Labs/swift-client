@@ -41,6 +41,17 @@ public final class DocumentsAPI: @unchecked Sendable {
         storageReadyGate = gate
     }
 
+    /// Where the reconciliation says what it decided. Defaults to the library
+    /// default level, so an isolated construction (tests) logs nothing below
+    /// `info`; `JsBaoClient.setupSubApis` replaces it with the client's own,
+    /// which follows the app's configured `logLevel`.
+    private var logger = createLogger(level: .info, scope: "documents")
+
+    /// Wire the client's logger. Called once during client setup.
+    func setLogger(_ logger: Logger) {
+        self.logger = logger.forScope(scope: "documents")
+    }
+
     public let aliases: DocumentAliasesAPI
 
     /// Designated initializer — the typed transport spine.
@@ -303,7 +314,10 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// exhaustion. Anything short of a completed walk — a request that failed,
     /// a server that answers the paged request with a bare array (and so
     /// ignores `limit` and says nothing about completeness), a cursor that
-    /// stops advancing, the page cap — evicts nothing at all.
+    /// stops advancing, the page cap — evicts nothing at all. Nor does a
+    /// completed walk whose union is empty: the walk asks `includeRoot=true`,
+    /// so zero rows is an anomalous answer rather than a user with no
+    /// documents (#2859).
     ///
     /// `seenIds` is what the caller's response already accounted for. When no
     /// cached document is missing from it there is nothing an authoritative
@@ -377,6 +391,20 @@ public final class DocumentsAPI: @unchecked Sendable {
                 // A scope walked as one user says nothing about the one signed
                 // in now.
                 guard isCurrent() else { return }
+                // A completed walk that found nothing at all. The request asks
+                // `includeRoot=true`, so the server's answer to it always
+                // carries at least the caller's root: zero rows is an anomalous
+                // answer, not a user with no documents, and reading it as the
+                // whole scope evicts every cached document on the device
+                // (#2859). One row — the root, and nothing else — is the user
+                // whose documents really were all deleted, and that page still
+                // evicts the rest of the cache.
+                guard !union.isEmpty else {
+                    logger.debug(
+                        "[documents] scope reconcile declined: the walk found no documents"
+                    )
+                    return
+                }
                 // The walk reached the end of the scope and the union is the
                 // server's whole view of it.
                 await reconcileIntoLocalCache(

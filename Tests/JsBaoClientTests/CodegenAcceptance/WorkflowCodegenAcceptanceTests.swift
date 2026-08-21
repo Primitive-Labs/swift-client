@@ -209,9 +209,12 @@ private func _acceptanceInvokerBindingsCompile(_ client: JsBaoClient) async thro
     )
     _ = try await checkout.cronTriggers.update(
         triggerId: created.triggerId,
-        cron: "0 4 * * *",
-        state: .paused
+        cron: "0 4 * * *"
     )
+    // #2803 — availability is not one of the fields this helper updates. It is
+    // the client's own verb pair, which takes the trigger id and nothing else.
+    _ = try await client.cronTriggers.disable(triggerId: created.triggerId)
+    _ = try await client.cronTriggers.enable(triggerId: created.triggerId)
     // An open `rootInput` clears the stored value with `.null` (the JS
     // factory's `rootInput: null`).
     _ = try await checkout.cronTriggers.update(

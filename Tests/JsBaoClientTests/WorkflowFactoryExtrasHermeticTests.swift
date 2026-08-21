@@ -69,7 +69,7 @@ final class WorkflowFactoryExtrasHermeticTests: XCTestCase {
         {"triggerId":"trg_1","triggerKey":"k","displayName":"d","description":null,
          "cron":"* * * * *","timezone":"UTC","workflowKey":"tick",
          "overlapPolicy":"skip","rootInput":null,"inputMapping":null,
-         "state":"active","lastError":null,"lastTriggeredAt":null,
+         "status":"active","lastError":null,"lastTriggeredAt":null,
          "lastTriggeredRunId":null,"nextFireAt":null,"skippedCount":0,
          "firedCount":0,"createdBy":"u1","createdAt":"2024-01-01T00:00:00Z",
          "modifiedAt":"2024-01-01T00:00:00Z"}

@@ -223,6 +223,73 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
         XCTAssertEqual(transport.calls.count, 0)
     }
 
+    // MARK: - A completed walk that found nothing at all evicts nothing
+
+    /// The one response shape that is well-formed and still means "delete
+    /// everything": a completed walk whose union is empty (#2859). The walk
+    /// asks `includeRoot=true`, so a correct answer carries at least the
+    /// caller's root — zero rows is anomalous, not a user with no documents,
+    /// and local data that never synced is not re-downloadable.
+    func test_aCompletedWalkThatReturnedZeroDocumentsEvictsNothing() async throws {
+        let fixture = try await makeFixture()
+        await fixture.manager.handleServerDocuments([
+            serverDoc("doc-cached", "Cached before the walk"),
+        ])
+        try await seedYjsRow(fixture.storage, documentId: "doc-cached")
+
+        let sink = EventSink()
+        let sub = emitter.subscribe(DocumentMetadataChangedEvent.self) { sink.record($0) }
+        defer { sub.cancel() }
+
+        let transport = Self.walkServer(pages: ["": #"{"items":[],"hasMore":false}"#])
+        let api = makeAPI(fixture, transport: transport)
+
+        await api.reconcileScopeAtConnect()
+
+        XCTAssertNotNil(
+            fixture.manager.getLocalMetadata("doc-cached"),
+            "a zero-row page is not the server saying the whole scope is gone"
+        )
+        let persisted = try await fixture.offline.getMetadata(
+            appId: "test-app", userId: "test-user", documentId: "doc-cached"
+        )
+        XCTAssertNotNil(persisted, "the `meta` row stays on the device")
+        let snapshot = try await yjsRow(fixture.storage, documentId: "doc-cached")
+        XCTAssertNotNil(
+            snapshot,
+            "and so does the CRDT snapshot, which may hold unsynced offline edits"
+        )
+        XCTAssertNil(
+            sink.all.first { $0.documentId == "doc-cached" && $0.action == "deleted" },
+            "and the app must not be told a document it still has was deleted"
+        )
+    }
+
+    /// Zero rows and an empty scope are different cases. A user whose documents
+    /// really were all deleted server-side still has a root, so their walk comes
+    /// back with exactly one item — and that page is authoritative about the
+    /// rest of the cache.
+    func test_aRootOnlyPageStillEvictsEveryOtherCachedDocument() async throws {
+        let fixture = try await makeFixture()
+        await fixture.manager.handleServerDocuments([
+            serverDoc("doc-root", "Root"),
+            serverDoc("doc-deleted", "Deleted server-side"),
+        ])
+
+        let transport = Self.walkServer(pages: ["": """
+        {"items":[{"documentId":"doc-root","title":"Root","permission":"owner"}],"hasMore":false}
+        """])
+        let api = makeAPI(fixture, transport: transport)
+
+        await api.reconcileScopeAtConnect()
+
+        XCTAssertNotNil(fixture.manager.getLocalMetadata("doc-root"))
+        XCTAssertNil(
+            fixture.manager.getLocalMetadata("doc-deleted"),
+            "a root-only page means the user's documents really are all gone"
+        )
+    }
+
     // MARK: - A walk it could not finish evicts nothing
 
     /// Each of these is a scope the client could not read to the end, so its

@@ -132,8 +132,7 @@ public struct TickWorkflow: Sendable {
             timezone: String? = nil,
             overlapPolicy: CronOverlapPolicy? = nil,
             rootInput: Updatable<TickInput>? = nil,
-            inputMapping: JSONValue? = nil,
-            state: UpdateCronTriggerState? = nil
+            inputMapping: JSONValue? = nil
         ) async throws -> CronTriggerInfo {
             let rootInputValue: JSONValue? = try rootInput.map {
                 (change: Updatable<TickInput>) throws -> JSONValue in
@@ -152,8 +151,7 @@ public struct TickWorkflow: Sendable {
                     workflowKey: "tick",
                     overlapPolicy: overlapPolicy,
                     rootInput: rootInputValue,
-                    inputMapping: inputMapping,
-                    state: state
+                    inputMapping: inputMapping
                 )
             )
         }

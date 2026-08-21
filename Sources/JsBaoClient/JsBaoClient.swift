@@ -4540,6 +4540,7 @@ public final class JsBaoClient: @unchecked Sendable {
             guard let self else { return false }
             return await self.waitForStorageReady()
         }
+        self._documents.setLogger(logger)
         // Avatar upload sends raw bytes with a custom Content-Type; it goes
         // through `Transport.requestData` like every other raw-bytes call
         // site now that `MeAPI` holds the transport.

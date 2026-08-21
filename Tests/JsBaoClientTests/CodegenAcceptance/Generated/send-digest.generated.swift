@@ -125,8 +125,7 @@ public struct SendDigestWorkflow: Sendable {
             timezone: String? = nil,
             overlapPolicy: CronOverlapPolicy? = nil,
             rootInput: Updatable<SendDigestInput>? = nil,
-            inputMapping: JSONValue? = nil,
-            state: UpdateCronTriggerState? = nil
+            inputMapping: JSONValue? = nil
         ) async throws -> CronTriggerInfo {
             let rootInputValue: JSONValue? = try rootInput.map {
                 (change: Updatable<SendDigestInput>) throws -> JSONValue in
@@ -145,8 +144,7 @@ public struct SendDigestWorkflow: Sendable {
                     workflowKey: "send-digest",
                     overlapPolicy: overlapPolicy,
                     rootInput: rootInputValue,
-                    inputMapping: inputMapping,
-                    state: state
+                    inputMapping: inputMapping
                 )
             )
         }

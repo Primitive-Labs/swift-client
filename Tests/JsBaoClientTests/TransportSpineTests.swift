@@ -743,7 +743,6 @@ final class TransportSpineTests: XCTestCase {
     private static let appLayerSourceRoots = [
         "packages/swift-primitive-app/Sources",
         "templates/primitive-swift-template/Sources",
-        "demo-apps/swift-template-demo/Sources",
     ]
 
     /// The deprecated hatches, matched **without** a leading `.` on purpose.

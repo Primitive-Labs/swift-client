@@ -124,8 +124,7 @@ public struct ImportCsvWorkflow: Sendable {
             timezone: String? = nil,
             overlapPolicy: CronOverlapPolicy? = nil,
             rootInput: Updatable<ImportCsvInput>? = nil,
-            inputMapping: JSONValue? = nil,
-            state: UpdateCronTriggerState? = nil
+            inputMapping: JSONValue? = nil
         ) async throws -> CronTriggerInfo {
             let rootInputValue: JSONValue? = try rootInput.map {
                 (change: Updatable<ImportCsvInput>) throws -> JSONValue in
@@ -144,8 +143,7 @@ public struct ImportCsvWorkflow: Sendable {
                     workflowKey: "import-csv",
                     overlapPolicy: overlapPolicy,
                     rootInput: rootInputValue,
-                    inputMapping: inputMapping,
-                    state: state
+                    inputMapping: inputMapping
                 )
             )
         }

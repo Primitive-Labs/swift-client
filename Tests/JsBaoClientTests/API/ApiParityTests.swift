@@ -191,7 +191,7 @@ final class ApiParityTests: XCTestCase {
         [
             "triggerId": "abc", "triggerKey": "k", "displayName": "d",
             "cron": "* * * * *", "timezone": "UTC", "workflowKey": "w",
-            "overlapPolicy": "skip", "state": "active",
+            "overlapPolicy": "skip", "status": "active",
             "skippedCount": 0, "firedCount": 0,
             "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
             "modifiedAt": "2024-01-01T00:00:00Z",
@@ -211,22 +211,23 @@ final class ApiParityTests: XCTestCase {
         let r = CallRecorder()
         let api = CronTriggersAPI(transport: r)
         r.response = cronTriggerJSON()
-        _ = try await api.update(triggerId: "abc", params: UpdateCronTriggerParams(state: .paused))
+        _ = try await api.update(triggerId: "abc", params: UpdateCronTriggerParams(displayName: "renamed"))
         XCTAssertEqual(r.method, "PUT")
         XCTAssertEqual(r.path, "/cron-triggers/abc")
     }
 
-    func test_cronTriggers_pause_resume_test_routes() async throws {
+    func test_cronTriggers_disable_enable_test_routes() async throws {
         let r = CallRecorder()
         let api = CronTriggersAPI(transport: r)
 
+        // #2803 — the uniform operational verb pair, replacing pause/resume.
         r.response = cronTriggerJSON()
-        _ = try await api.pause(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/pause")
+        _ = try await api.disable(triggerId: "abc")
+        XCTAssertEqual(r.path, "/cron-triggers/abc/disable")
         XCTAssertEqual(r.method, "POST")
 
-        _ = try await api.resume(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/resume")
+        _ = try await api.enable(triggerId: "abc")
+        XCTAssertEqual(r.path, "/cron-triggers/abc/enable")
 
         r.response = ["started": true]
         _ = try await api.test(triggerId: "abc")

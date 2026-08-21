@@ -20,6 +20,46 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Cron triggers report one `status`; `CronTriggerState`, `pause` and `resume` are gone (#2803)
+
+A cron trigger used to answer "is this running?" in two places: `state`
+(`active | paused | error_paused | archived`), which mixed availability with
+delete lifecycle, and a separate server-owned flag the API set when you paused
+one. The platform now has a single server-owned availability field on every
+object that exposes an endpoint or fires on its own, and cron triggers decode
+it like everything else.
+
+**This breaks decoding.** `CronTriggerInfo` is `Decodable` with no defaults, so
+a build that expects `state` fails on the first cron response it reads — a
+`list` or a `get`, not just a write. There is nothing to pin: take the update
+and change the three names below.
+
+| before | now |
+|---|---|
+| `CronTriggerInfo.state: CronTriggerState` | `CronTriggerInfo.status: ObjectStatus` |
+| `CronTriggerState.paused` / `.errorPaused` | `ObjectStatus.inactive` (read `lastError` for why) |
+| `CronTriggerState.active` / `.archived` | `ObjectStatus.active` / `.archived` |
+| `cronTriggers.pause(triggerId:)` | `cronTriggers.disable(triggerId:)` |
+| `cronTriggers.resume(triggerId:)` | `cronTriggers.enable(triggerId:)` |
+| `UpdateCronTriggerParams.state` | removed — availability is not a configuration edit |
+
+`ObjectStatus` is shared, not cron-specific: the same three cases describe
+every object the platform can take out of service, and `archived` appears only
+where a delete writes a tombstone.
+
+Two behavior changes ride along. A trigger the platform stopped after a failed
+fire is `.inactive` with `lastError` set, where it used to be `.errorPaused`;
+`enable` clears both and reschedules it. And `update` no longer accepts
+availability in any spelling — it returns `400` naming the verb pair — so an
+app that paused a trigger by writing `state` calls `disable(triggerId:)`
+instead.
+
+The generated typed workflow helpers follow the same removal: the
+`<workflow>.cronTriggers.update(...)` a `primitive workflows codegen --lang
+swift` run emits no longer takes a `state:` argument, so regenerate the files
+alongside the update and call `client.cronTriggers.disable(triggerId:)` /
+`.enable(triggerId:)` for availability.
+
 ### Connecting reconciles the whole document scope, so eviction no longer depends on `documents.list()` (#2852)
 
 The eviction #2827 added is reachable only by calling `documents.list()` — the

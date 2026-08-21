@@ -41,7 +41,8 @@ public final class CronTriggersAPI: @unchecked Sendable {
     }
 
     /// Update one or more fields. Schedule-relevant changes (`cron`,
-    /// `timezone`, `state`) propagate to the Durable Object.
+    /// `timezone`) propagate to the Durable Object. Availability is not
+    /// settable here — use `disable` / `enable`.
     public func update(
         triggerId: String,
         params: UpdateCronTriggerParams
@@ -58,16 +59,16 @@ public final class CronTriggersAPI: @unchecked Sendable {
         try await transport.request(method: .delete, path: "/cron-triggers/\(triggerId)")
     }
 
-    /// Pause a trigger. The scheduled alarm is cancelled and no further
-    /// runs are started until the trigger is resumed.
-    public func pause(triggerId: String) async throws -> CronTriggerInfo {
-        try await transport.request(method: .post, path: "/cron-triggers/\(triggerId)/pause")
+    /// Take a trigger out of service. The scheduled alarm is cancelled and no
+    /// further runs start until `enable`.
+    public func disable(triggerId: String) async throws -> CronTriggerInfo {
+        try await transport.request(method: .post, path: "/cron-triggers/\(triggerId)/disable")
     }
 
-    /// Resume a paused or `error_paused` trigger. Clears `lastError` and
-    /// reschedules the next fire.
-    public func resume(triggerId: String) async throws -> CronTriggerInfo {
-        try await transport.request(method: .post, path: "/cron-triggers/\(triggerId)/resume")
+    /// Put a trigger back in service. Clears `lastError` and reschedules the
+    /// next fire. Refuses an archived trigger — that is a delete, not a pause.
+    public func enable(triggerId: String) async throws -> CronTriggerInfo {
+        try await transport.request(method: .post, path: "/cron-triggers/\(triggerId)/enable")
     }
 
     /// Fire the associated workflow immediately without affecting the

@@ -173,8 +173,7 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
             timezone: String? = nil,
             overlapPolicy: CronOverlapPolicy? = nil,
             rootInput: JSONValue? = nil,
-            inputMapping: JSONValue? = nil,
-            state: UpdateCronTriggerState? = nil
+            inputMapping: JSONValue? = nil
         ) async throws -> CronTriggerInfo {
             try await client.cronTriggers.update(
                 triggerId: triggerId,
@@ -186,8 +185,7 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
                     workflowKey: "create-checkout-session",
                     overlapPolicy: overlapPolicy,
                     rootInput: rootInput,
-                    inputMapping: inputMapping,
-                    state: state
+                    inputMapping: inputMapping
                 )
             )
         }

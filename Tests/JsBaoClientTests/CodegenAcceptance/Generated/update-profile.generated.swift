@@ -183,8 +183,7 @@ public struct UpdateProfileWorkflow: Sendable {
             timezone: String? = nil,
             overlapPolicy: CronOverlapPolicy? = nil,
             rootInput: JSONValue? = nil,
-            inputMapping: JSONValue? = nil,
-            state: UpdateCronTriggerState? = nil
+            inputMapping: JSONValue? = nil
         ) async throws -> CronTriggerInfo {
             try await client.cronTriggers.update(
                 triggerId: triggerId,
@@ -196,8 +195,7 @@ public struct UpdateProfileWorkflow: Sendable {
                     workflowKey: "update-profile",
                     overlapPolicy: overlapPolicy,
                     rootInput: rootInput,
-                    inputMapping: inputMapping,
-                    state: state
+                    inputMapping: inputMapping
                 )
             )
         }
