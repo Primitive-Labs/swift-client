@@ -702,6 +702,36 @@ public final class DynamicModel: @unchecked Sendable {
         }
     }
 
+    /// Reject an empty primary key the CALLER supplied to an upsert,
+    /// before any match resolution runs.
+    ///
+    /// `applyWriteInternal`'s guard sees only the *resolved* id, and on an
+    /// upsert merge that's the matched record's id — the caller's invalid
+    /// one is discarded on the way there (JS auto-id parity), so the guard
+    /// never fires and the write lands on the matched record. js-bao draws
+    /// the line earlier: `save()` runs its falsy-id check (`if (!this.id)
+    /// throw "Cannot save item without an id."`) BEFORE the deferred
+    /// `upsertOn` lookup, and `upsertByUnique` assigns `dataToUpsert` onto
+    /// the matched record so an empty `id` there trips that same check on
+    /// the merge path. So an empty key is rejected whether or not the
+    /// unique value already names a record (#2885).
+    ///
+    /// "Supplied" follows the same precedence the insert paths use to
+    /// resolve the id: the explicit `id:` argument first, then an `id`
+    /// carried in the caller's values. `nil` means the caller supplied no
+    /// key at all — that's the auto-generate path, not an empty one.
+    internal static func requireNonEmptySuppliedId(
+        _ id: String?,
+        data: [String: PrimitiveValue],
+        modelName: String
+    ) throws {
+        let supplied = id ?? data["id"].flatMap { $0.asId ?? $0.asString }
+        guard let supplied, supplied.isEmpty else { return }
+        throw FieldValidationError.requiredFieldMissing(
+            field: "id", modelName: modelName
+        )
+    }
+
     /// Insert-or-update by a single-field unique value. Mirrors
     /// js-bao's `save({ upsertOn: field })`.
     ///
@@ -755,6 +785,14 @@ public final class DynamicModel: @unchecked Sendable {
         guard let key = UniqueIndex.buildKey(fields: [field], values: values) else {
             throw UpsertError.nullOrEmptyField(field: field)
         }
+
+        // The caller's key is checked here, not just after resolution —
+        // the merge path below would otherwise substitute the matched
+        // record's id for it. js-bao's guard sits in the same place: after
+        // the `upsertOn` validation, before the deferred lookup.
+        try Self.requireNonEmptySuppliedId(
+            id, data: values, modelName: schema.name
+        )
 
         // --- Resolve inside a single transaction to avoid TOCTOU ----
         var resolved: Result<(id: String, wasCreated: Bool), Error> =
@@ -1152,6 +1190,12 @@ public final class DynamicModel: @unchecked Sendable {
             constraint: name, data: data, uniqueLookupValue: uniqueLookupValue
         )
 
+        // Before the lookup: a match would otherwise supply the id the
+        // caller failed to (see `requireNonEmptySuppliedId`).
+        try Self.requireNonEmptySuppliedId(
+            id, data: data, modelName: schema.name
+        )
+
         let existingId = existingRecordId(constraintName: name, key: key)
 
         switch mode {
@@ -1416,6 +1460,23 @@ public final class DynamicModel: @unchecked Sendable {
         changedFields: Set<String>? = nil,
         tx txn: YrsTransaction
     ) throws {
+        // Every write funnels through here — `create`, `update`, `save`,
+        // both upsert forms — so this is where the primary key's presence
+        // is enforced, once, for all of them. Mirrors js-bao's `save()`
+        // guard (`if (!this.id) throw new Error("Cannot save item without
+        // an id. Ensure id is set.")`, BaseModel.ts), which likewise runs
+        // before `validateBeforeSave` and is falsy-based: `""` is not an
+        // id. Swift's non-optional `String` covers the null half already,
+        // so emptiness is all that's left to check (#2885).
+        //
+        // It runs before anything is read or materialized, so a rejected
+        // write leaves no record and no root map behind.
+        guard !id.isEmpty else {
+            throw FieldValidationError.requiredFieldMissing(
+                field: "id", modelName: self.schema.name
+            )
+        }
+
         var newValues = values
         let root = txn.transactionGetOrInsertMap(name: self.schema.name)
 
@@ -1524,8 +1585,26 @@ public final class DynamicModel: @unchecked Sendable {
         // Presence check only — matches js-bao's `null || undefined`
         // guard (BaseModel.ts line 844). Empty strings are
         // considered present and pass.
+        //
+        // `id` is the one field read off the write itself rather than out of
+        // the merged data (#2885). The primary key never travels in `values`
+        // — the generated `primitiveValues()` omits it and every write path
+        // resolves it into the separate `id:` argument (caller-supplied, or
+        // auto-assigned from the id field's generator) before getting here.
+        // So on an insert `dataToSave["id"]` is empty for a value the runtime
+        // has already guaranteed, and `required = true` on `id` — a shape the
+        // codegen accepts, and `auto_assign` gives no `default` for the
+        // materialization loop above to fill — used to fail every insert.
+        // js-bao's `validateBeforeSave` reads the same field the same way
+        // (`fieldKey === "id" ? this.id : this.getValue(fieldKey)`, #613), so
+        // one `models.toml` now behaves identically from both clients. It is
+        // a different *source* for the value, not an exemption: an id that
+        // isn't there still fails — the guard at the top of this method has
+        // already rejected it, exactly as js-bao's `save()` does before its
+        // validator runs.
         for (fname, desc) in self.schema.fields where desc.required {
-            guard dataToSave[fname] != nil else {
+            let present = fname == "id" ? !id.isEmpty : dataToSave[fname] != nil
+            guard present else {
                 throw FieldValidationError.requiredFieldMissing(
                     field: fname, modelName: self.schema.name
                 )

@@ -311,19 +311,27 @@ final class GoogleSignInLiveTests: XCTestCase {
     }
 
     func testStartOAuthFlowBuildsAuthorizeUrlFromServerConfig() async throws {
-        // NOTE: the admin API currently only allow-lists https/localhost
-        // redirect URIs, so a custom-scheme URI (the native
-        // `com.googleusercontent.apps.*:/oauth2redirect/google` shape) can't
-        // be registered against today's server. Use an https URI here — the
-        // client-side flow under test is identical either way.
-        // `googleClientSecret` is deliberately not set: it is reference-only
-        // (#2256), so a literal is rejected with 400, and the authorize URL this
-        // test builds is derived from `googleClientId` alone.
+        // The configuration is the `ios` ENTRY of the Google client map
+        // (#2891), because that is the entry a Swift app reads: Google
+        // registers a client per platform, and a `web` entry would leave this
+        // client correctly reporting Google unavailable. No `clientSecret` —
+        // Google issues none for the iOS client type and the server rejects one
+        // outright; PKCE is what proves possession.
+        //
+        // An https redirect URI rather than the native
+        // `com.googleusercontent.apps.*:/oauth2redirect/google` shape only
+        // because the client-side flow under test is identical either way.
         let redirectUri = "https://example.com/oauth/callback"
         _ = try await ctx.updateTestApp(appId: testApp.appId, fields: [
-            "googleClientId": "test-123.apps.googleusercontent.com",
             "googleOAuthEnabled": true,
-            "redirectUris": [redirectUri],
+            "googleClients": [
+                "clients": [
+                    "ios": [
+                        "clientId": "test-123.apps.googleusercontent.com",
+                        "redirectUris": [redirectUri],
+                    ],
+                ],
+            ],
         ])
 
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
@@ -353,8 +361,8 @@ final class GoogleSignInLiveTests: XCTestCase {
     }
 
     func testStartOAuthFlowThrowsWhenOAuthNotConfigured() async throws {
-        // Fresh app has no googleClientId — mirrors the JS client throwing
-        // "OAuth not configured".
+        // A fresh app has no Google client map at all, so its `ios` entry is
+        // absent — mirrors the JS client throwing "OAuth not configured".
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 

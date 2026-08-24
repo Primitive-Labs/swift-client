@@ -20,6 +20,30 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### The codegen plugin can read a schema outside the target: `bao-codegen.json` (#2889)
+
+`JsBaoCodegenPlugin` used to find its input only by scanning the target's own
+source files for `*schema.toml` / `models.toml`, so an app with a web client
+and a Swift client in sibling directories could not share the one `models.toml`
+they must share — the wire field names live in its keys — except through a
+symlink, which doesn't survive a checkout on a filesystem without symlinks.
+
+Additive: nothing changes for a target without the file. To name a schema
+anywhere, add `bao-codegen.json` at the root of the target's source directory:
+
+```json
+{ "input": "../../models/models.toml" }
+```
+
+Relative paths resolve against the target directory (absolute paths are used
+as-is), the config replaces the scan when present, and exactly one `input` is
+supported — every schema in a target shares one `GeneratedModels` directory,
+whose barrel and stale-file sweep cannot host two. A config that is malformed,
+names no usable `input`, or resolves to a path that is not a file fails the
+build naming the file and the value; it never falls back to the scan. Add
+`exclude: ["bao-codegen.json"]` to the target to silence SwiftPM's
+unhandled-file warning. See `docs/codegen.md`.
+
 ### Cron triggers report one `status`; `CronTriggerState`, `pause` and `resume` are gone (#2803)
 
 A cron trigger used to answer "is this running?" in two places: `state`

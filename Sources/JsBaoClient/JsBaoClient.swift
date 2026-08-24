@@ -681,12 +681,15 @@ public final class JsBaoClient: @unchecked Sendable {
     // return the typed `AuthConfigInfo` / `AppConfigInfo` for the same
     // endpoint.
 
-    /// Boolean predicate: is OAuth set up + configured for this app?
-    /// Mirrors js-bao's `client.checkOAuthAvailable()` — reads
-    /// `client.auth.getAuthConfig()` and checks `hasOAuth && googleClientId`.
+    /// Boolean predicate: can THIS (native) client start Google sign-in?
+    ///
+    /// Mirrors js-bao's `client.checkOAuthAvailable()`, against the client map
+    /// (#2891): the provider enabled AND the `ios` entry usable. Google
+    /// registers a client per platform, so a web-only app answers `false` here
+    /// — the PKCE exchange this client runs would fail at Google.
     public func checkOAuthAvailable() async -> Bool {
         guard let cfg = try? await auth.getAuthConfig() else { return false }
-        return cfg.hasOAuth && cfg.googleClientId?.isEmpty == false
+        return cfg.googleSignInAvailable
     }
 
     // MARK: - Connection
@@ -1585,12 +1588,95 @@ public final class JsBaoClient: @unchecked Sendable {
     /// native analog — apps drive their own navigation after logout, so it is
     /// intentionally not modeled on `LogoutOptions`.)
     public func logout(options: LogoutOptions) async throws {
+        // The local teardown (close sweep, user-scoped reset, and the
+        // `wipeLocal` purge) lives in `runLogoutCleanup`, which the auth
+        // controller awaits inside `logout` — before `AuthLogoutCompleteEvent`
+        // and before any `waitForDisconnect` teardown (#2874).
         try await authController.logout(options: options)
+        await disconnect()
+    }
+
+    /// Every document the logout has to close (#2874): the ones the document
+    /// manager still holds (open, or open-then-evicted with their update
+    /// observer intact) plus every document still connected to a shared
+    /// cross-document store.
+    ///
+    /// The second set is not redundant. `evictAllLocalData()` clears
+    /// `openDocs` while closing nothing, and a document created but never
+    /// reopened has no update observer at all — so after an app-level
+    /// `evictAllLocal()` the shared stores are the only remaining record that
+    /// the signed-out user's rows are still there to read.
+    private func logoutSweepDocumentIds() -> [String] {
+        let models = lock.withLock { Array(sharedModels.values) }
+        var ids = Set(documentManager.retainedDocumentIdsForLogout())
+        for model in models { ids.formUnion(model.connectedDocIds) }
+        return Array(ids)
+    }
+
+    /// Everything the client tears down for a logout, awaited by
+    /// `AuthController.logout` through `onLogoutCleanup` (#2874). Mirrors the
+    /// JS client's `handleLogoutCleanup`.
+    private func runLogoutCleanup(options: LogoutOptions) async {
+        // Close every document the app may still be holding. `closeDocument`
+        // is the client-level close, so each document also leaves every shared
+        // cross-document store (`disconnectFromSharedModels`), loses its
+        // update observer, clears its sync watchdog and outbound queue state,
+        // and sends a best-effort `unsubscribe` while the socket is still up.
+        //
+        // The sweep runs over `logoutSweepDocumentIds()`, not over the
+        // open-document map alone: an app-level `evictAllLocal()` before the
+        // logout clears `openDocs` without closing anything, leaving those
+        // documents connected to the shared stores (and, once opened, still
+        // observed) — which is precisely the state whose rows would otherwise
+        // stay readable afterwards.
+        //
+        // Drained in a loop rather than from one snapshot: an `openDocument`
+        // racing this sweep can commit after the snapshot was taken. JS takes
+        // a single pass (`listOpenDocIds()`), so the loop is a Swift addition
+        // and must fail loudly rather than silently — a non-empty snapshot
+        // after the last pass means documents are still open and the
+        // signed-out user's rows are still readable.
+        var drained = false
+        for _ in 0..<3 {
+            let documentIds = logoutSweepDocumentIds()
+            if documentIds.isEmpty {
+                drained = true
+                break
+            }
+            for documentId in documentIds {
+                _ = await closeDocument(
+                    documentId,
+                    options: CloseDocumentOptions(evictLocal: false)
+                )
+            }
+        }
+        if !drained {
+            let stillOpen = logoutSweepDocumentIds().count
+            if stillOpen > 0 {
+                logger.warn(
+                    "[logout] close sweep did not drain:", stillOpen,
+                    "document(s) still open after 3 passes; the signed-out user's",
+                    "rows may remain readable (#2874)"
+                )
+            }
+        }
+
+        // On every logout, wipe or not: a signed-out user's failed create may
+        // not retry under the next session's transport.
+        documentManager.resetUserScopedStateForLogout()
+
+        // The wipe runs AFTER the sweep, and the order is required — this is
+        // the one deliberate departure from JS, which wipes first.
+        // `evictAllLocalData()` clears `openDocs` and `docPersistence`, so
+        // wiping first would leave the sweep nothing to iterate: no document
+        // closed, no update observer cancelled, nothing disconnected from the
+        // shared stores — the whole fix a no-op for `logout(wipeLocal: true)`.
+        // (JS gets away with its order because `evictLocalDocument` drops the
+        // persistence handle, not the open-doc entry.)
         if options.wipeLocal {
             await documentManager.evictAllLocalData()
             await kvCache.clearAll()
         }
-        await disconnect()
     }
 
     // MARK: - OAuth
@@ -3051,14 +3137,12 @@ public final class JsBaoClient: @unchecked Sendable {
             )
         }
 
-        // `YDocument` isn't `Sendable`, but every access below runs under
-        // the doc's exclusive FFI lock (`withExclusiveAccess`), which
-        // serializes it against observer registration on other threads
-        // (#1126) — a guarantee the compiler can't see. Alias it as
-        // `nonisolated(unsafe)` so the cross-thread capture into the
-        // `DispatchQueue.global` closure is allowed while keeping the lock
-        // discipline that actually makes it safe.
-        nonisolated(unsafe) let unsafeDoc = doc
+        // `YDocument` is `Sendable` since the Swift 6 strict-concurrency
+        // repair (#2847), so the capture below needs no `nonisolated(unsafe)`
+        // escape hatch — but raw access still must run under the doc's
+        // exclusive FFI lock (`withExclusiveAccess`), which serializes it
+        // against observer registration on other threads (#1126).
+        let unsafeDoc = doc
         let result: (T, [UInt8]) = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 // Use raw YrsDoc to bypass syncQueue entirely. Raw access
@@ -4669,6 +4753,15 @@ public final class JsBaoClient: @unchecked Sendable {
         )
         // logout(waitForDisconnect:) tears down networking via this hook.
         authController.onLogoutDisconnect = { [weak self] in await self?.disconnect() }
+        // Every logout — wipe or not — closes the signed-out user's documents
+        // before the controller signals completion (#2874, JS parity with
+        // `deps.onLogoutCleanup`). Without it the shared cross-document store
+        // kept the previous user's members connected, and the next user's
+        // unscoped `Model.query()` read their rows.
+        authController.onLogoutCleanup = { [weak self] options in
+            guard let self else { return }
+            await self.runLogoutCleanup(options: options)
+        }
         // The refresh-retry backoff hitting its cap gives up on reconnecting
         // and takes the whole client offline (#2022), the same way the JS
         // client's auth controller calls `deps.setNetworkMode("offline")`.
@@ -4805,8 +4898,9 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Re-scope the user-owned managers to the currently authenticated user,
-    /// clearing the previously-bound user's in-memory metadata first. A no-op
-    /// when the user is unchanged.
+    /// clearing the previously-bound user's in-memory metadata first. When the
+    /// user is unchanged this only reloads local metadata a logout dropped
+    /// (#2874), and is otherwise a no-op.
     ///
     /// `setupStorage()` binds document/metadata storage to whoever init
     /// restored. A later sign-in (`otpVerify`) updates only `AuthController`,
@@ -4817,7 +4911,18 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `waitForStorageReady()` confirms the initial bind has finished.
     public func rebindUserScopedStorage() async {
         let newUserId = authController.getUserId() ?? ""
-        if documentManager.userId == newUserId { return }
+        if documentManager.userId == newUserId {
+            // Same user, but a logout in this process dropped in-memory
+            // user-scoped state the store still holds (#2874): reload it here,
+            // or their pending creates would stay uncommitted until the app
+            // relaunched. `loadLocalMetadata()` is additive and idempotent, so
+            // re-running it for an unchanged user is safe.
+            if documentManager.needsLocalMetadataReload {
+                await documentManager.loadLocalMetadata()
+                releaseHeldOutboundClassifications()
+            }
+            return
+        }
         await documentManager.resetInMemoryUserState(userId: newUserId)
         await kvCache.setUserId(authController.getUserId())
         if !newUserId.isEmpty {

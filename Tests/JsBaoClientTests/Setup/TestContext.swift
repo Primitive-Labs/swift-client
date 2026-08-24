@@ -251,11 +251,12 @@ final class TestContext: @unchecked Sendable {
             throw TestSetupError("Failed to create workflow: \(createRes)")
         }
 
+        // No status here: it is server-owned (#2803) and creation already
+        // yields an active workflow — the endpoint rejects a status key.
         _ = try await adminRequest(
             method: "PATCH",
             path: "/admin/api/apps/\(appId)/workflows/\(workflowId)",
             body: [
-                "status": "active",
                 "requiresClientApply": requiresClientApply,
             ]
         )
@@ -327,8 +328,10 @@ final class TestContext: @unchecked Sendable {
     }
 
     /// Update writable app fields via `PUT /admin/api/apps/{appId}` (e.g.
-    /// `googleClientId` / `googleClientSecret` / `redirectUris` for the
-    /// OAuth flow tests). Returns the canonical admin-API app shape.
+    /// `googleClients` — the per-platform client map — for the OAuth flow
+    /// tests, or `emailRedirectUris` for magic link). Returns the canonical
+    /// admin-API app shape. The retired scalars (`googleClientId`,
+    /// `googleClientSecret`, `redirectUris`) are rejected by the server (#2891).
     @discardableResult
     func updateTestApp(appId: String, fields: [String: Any]) async throws -> [String: Any] {
         try await adminRequest(method: "PUT", path: "/admin/api/apps/\(appId)", body: fields)

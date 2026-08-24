@@ -235,7 +235,7 @@ public final class AuthAPI: @unchecked Sendable {
     }
 
     /// Fetch the app-launch config subset (`appId`, `name`, `mode`,
-    /// `waitlistEnabled`, `hasOAuth`, `hasPasskey`, `magicLinkEnabled`).
+    /// `waitlistEnabled`, `googleAvailable`, `hasPasskey`, `magicLinkEnabled`).
     /// Mirrors JS `client.getAppConfig()` — the 7-field projection of the
     /// `/oauth-config` envelope used to decide what login UI to show before a
     /// session exists. Decodes the same `/oauth-config` payload as
@@ -246,16 +246,10 @@ public final class AuthAPI: @unchecked Sendable {
         }
         // Unwired: project the 7 launch-UI fields out of the full
         // `/oauth-config` envelope (the same payload, extra fields ignored).
-        let config = try await _getAuthConfig()
-        return AppConfigInfo(
-            appId: config.appId,
-            name: config.name,
-            mode: config.mode,
-            waitlistEnabled: config.waitlistEnabled,
-            hasOAuth: config.hasOAuth,
-            hasPasskey: config.hasPasskey,
-            magicLinkEnabled: config.magicLinkEnabled
-        )
+        // Projected by `AppConfigInfo`'s own initializer, not restated here:
+        // the launch UI and the flow must not be able to disagree about
+        // whether Google sign-in is available (#2891).
+        return AppConfigInfo(from: try await _getAuthConfig())
     }
 
     // MARK: - Logout

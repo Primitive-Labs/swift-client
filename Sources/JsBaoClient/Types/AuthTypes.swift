@@ -87,6 +87,64 @@ public struct OtpVerifyResult: Decodable, Sendable, Equatable {
 
 // MARK: Auth config
 
+/// One Google client, as `/oauth-config` publishes it (#2891).
+///
+/// A projection of the stored entry, not the entry itself: no `clientSecret`
+/// is ever published, and `usable` is the server's SHAPE verdict — a client id,
+/// at least one redirect URI, and a client secret exactly when that client type
+/// takes one. A consumer's availability predicate is that AND
+/// `googleOAuthEnabled`, which is what `googleSignInAvailable` computes.
+public struct GoogleClientConfig: Decodable, Sendable, Equatable {
+    public let clientId: String
+    public let redirectUris: [String]
+    public let usable: Bool
+
+    public init(clientId: String, redirectUris: [String], usable: Bool) {
+        self.clientId = clientId
+        self.redirectUris = redirectUris
+        self.usable = usable
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        clientId = try c.decodeIfPresent(String.self, forKey: .clientId) ?? ""
+        redirectUris = try c.decodeIfPresent([String].self, forKey: .redirectUris) ?? []
+        usable = try c.decodeIfPresent(Bool.self, forKey: .usable) ?? false
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case clientId, redirectUris, usable
+    }
+}
+
+/// The Google client map, keyed by client type (#2891).
+///
+/// Google registers a client PER PLATFORM — `web`, `ios`, `android`,
+/// `desktop`, `chrome-extension` — so there is no single "is Google available"
+/// flag to read: a native app reads its own `ios` entry, and a browser reads
+/// `web`. Kept as a dictionary rather than an enum-keyed struct so a client
+/// type added server-side decodes rather than throwing.
+public struct GoogleClientsConfig: Decodable, Sendable, Equatable {
+    public let clients: [String: GoogleClientConfig]
+
+    public init(clients: [String: GoogleClientConfig]) {
+        self.clients = clients
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        clients =
+            try c.decodeIfPresent([String: GoogleClientConfig].self, forKey: .clients) ?? [:]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case clients
+    }
+}
+
+/// The client type a Swift app signs in through.
+let nativeGoogleClientType = "ios"
+
 /// The app's auth configuration, returned by `auth.getAuthConfig()`. Mirrors
 /// the object JS `AuthController.getAuthConfig()` resolves to (the
 /// `GET /oauth-config` envelope). The passkey fields pair with the native
@@ -99,12 +157,10 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     public let mode: String
     public let waitlistEnabled: Bool
     public let googleOAuthEnabled: Bool
-    public let googleClientId: String?
-    public let hasOAuth: Bool
-    public let redirectUris: [String]?
+    /// The typed client map (#2891). `nil` only against a server that predates
+    /// it — which reports unavailable, the documented client-version floor.
+    public let googleClients: GoogleClientsConfig?
     public let passkeyEnabled: Bool
-    public let passkeyRpId: String?
-    public let passkeyRpName: String?
     /// Opaque per-RP config map (`{ [rpId]: { name } }`) — kept as `JSONValue`
     /// because the shape is configuration data the SDK never introspects.
     public let passkeyRpConfig: JSONValue?
@@ -124,12 +180,8 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
         mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? ""
         waitlistEnabled = try c.decodeIfPresent(Bool.self, forKey: .waitlistEnabled) ?? false
         googleOAuthEnabled = try c.decodeIfPresent(Bool.self, forKey: .googleOAuthEnabled) ?? false
-        googleClientId = try c.decodeIfPresent(String.self, forKey: .googleClientId)
-        hasOAuth = try c.decodeIfPresent(Bool.self, forKey: .hasOAuth) ?? false
-        redirectUris = try c.decodeIfPresent([String].self, forKey: .redirectUris)
+        googleClients = try c.decodeIfPresent(GoogleClientsConfig.self, forKey: .googleClients)
         passkeyEnabled = try c.decodeIfPresent(Bool.self, forKey: .passkeyEnabled) ?? false
-        passkeyRpId = try c.decodeIfPresent(String.self, forKey: .passkeyRpId)
-        passkeyRpName = try c.decodeIfPresent(String.self, forKey: .passkeyRpName)
         passkeyRpConfig = try c.decodeIfPresent(JSONValue.self, forKey: .passkeyRpConfig)
         hasPasskey = try c.decodeIfPresent(Bool.self, forKey: .hasPasskey) ?? false
         appleSignInEnabled = try c.decodeIfPresent(Bool.self, forKey: .appleSignInEnabled) ?? false
@@ -139,10 +191,29 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case appId, name, mode, waitlistEnabled, googleOAuthEnabled, googleClientId
-        case hasOAuth, redirectUris, passkeyEnabled, passkeyRpId, passkeyRpName
+        case appId, name, mode, waitlistEnabled, googleOAuthEnabled, googleClients
+        case passkeyEnabled
         case passkeyRpConfig, hasPasskey, appleSignInEnabled, hasApple
         case magicLinkEnabled, otpEnabled
+    }
+}
+
+extension AuthConfigInfo {
+    /// The `ios` entry, or `nil` when this app has no native Google client.
+    public var nativeGoogleClient: GoogleClientConfig? {
+        googleClients?.clients[nativeGoogleClientType]
+    }
+
+    /// Can THIS (native) client start Google sign-in right now?
+    ///
+    /// The enable flag AND the `ios` entry's shape, together (DSO-2891-001).
+    /// One property so a login view's button and its action cannot disagree —
+    /// which is exactly what the removed `hasOAuth` let them do: it was
+    /// clientId-only, so a web-only app rendered a button whose PKCE exchange
+    /// failed at Google.
+    public var googleSignInAvailable: Bool {
+        guard googleOAuthEnabled, let entry = nativeGoogleClient else { return false }
+        return entry.usable && !entry.clientId.isEmpty
     }
 }
 
@@ -161,7 +232,11 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
     /// `AuthConfigInfo.mode` is modeled).
     public let mode: String
     public let waitlistEnabled: Bool
-    public let hasOAuth: Bool
+    /// Whether THIS (native) client can start Google sign-in — the provider
+    /// enabled and the `ios` entry usable (#2891). It replaced the server's
+    /// `hasOAuth`, which could not tell a web-configured app from a
+    /// native-configured one and so was wrong in one direction or the other.
+    public let googleAvailable: Bool
     public let hasPasskey: Bool
     public let magicLinkEnabled: Bool
 
@@ -170,7 +245,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
         name: String,
         mode: String,
         waitlistEnabled: Bool,
-        hasOAuth: Bool,
+        googleAvailable: Bool,
         hasPasskey: Bool,
         magicLinkEnabled: Bool
     ) {
@@ -178,24 +253,32 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
         self.name = name
         self.mode = mode
         self.waitlistEnabled = waitlistEnabled
-        self.hasOAuth = hasOAuth
+        self.googleAvailable = googleAvailable
         self.hasPasskey = hasPasskey
         self.magicLinkEnabled = magicLinkEnabled
     }
 
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        appId = try c.decodeIfPresent(String.self, forKey: .appId) ?? ""
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
-        mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? "public"
-        waitlistEnabled = try c.decodeIfPresent(Bool.self, forKey: .waitlistEnabled) ?? false
-        hasOAuth = try c.decodeIfPresent(Bool.self, forKey: .hasOAuth) ?? false
-        hasPasskey = try c.decodeIfPresent(Bool.self, forKey: .hasPasskey) ?? false
-        magicLinkEnabled = try c.decodeIfPresent(Bool.self, forKey: .magicLinkEnabled) ?? false
+    /// Project the launch-UI subset out of the full envelope.
+    ///
+    /// Derived rather than decoded, so the two views of the same response
+    /// cannot disagree about whether to offer the Google button.
+    public init(from config: AuthConfigInfo) {
+        self.init(
+            appId: config.appId,
+            name: config.name,
+            mode: config.mode.isEmpty ? "public" : config.mode,
+            waitlistEnabled: config.waitlistEnabled,
+            googleAvailable: config.googleSignInAvailable,
+            hasPasskey: config.hasPasskey,
+            magicLinkEnabled: config.magicLinkEnabled
+        )
     }
 
-    private enum CodingKeys: String, CodingKey {
-        case appId, name, mode, waitlistEnabled, hasOAuth, hasPasskey, magicLinkEnabled
+    public init(from decoder: Decoder) throws {
+        // The `/oauth-config` envelope carries no `googleAvailable` key — it is
+        // a client-side predicate over the map — so decoding goes through the
+        // full type and projects, rather than restating the rule here.
+        self.init(from: try AuthConfigInfo(from: decoder))
     }
 }
 

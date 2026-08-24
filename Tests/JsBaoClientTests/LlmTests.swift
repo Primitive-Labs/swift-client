@@ -12,6 +12,13 @@ final class LlmTests: XCTestCase {
         ctx = TestContext()
         try await ctx.initialize()
         testApp = try await ctx.createTestApp(name: "swift-llm")
+        // #2687 — the direct LLM proxy is fail-closed per app; without this
+        // opt-in every llm.chat() answers 403 DIRECT_LLM_DISABLED before
+        // input validation runs.
+        try await ctx.updateAppSettings(
+            appId: testApp.appId,
+            settings: ["directLlmEnabled": true]
+        )
         client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
     }
 

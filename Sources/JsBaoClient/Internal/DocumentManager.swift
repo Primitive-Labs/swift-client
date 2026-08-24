@@ -100,6 +100,10 @@ public final class DocumentManager: @unchecked Sendable {
     // Pending creates
     private var pendingCreates: Set<String> = []
     private var pendingCreateRetryTimers: [String: Task<Void, Never>] = [:]
+    /// Set when a logout dropped in-memory user-scoped state whose persisted
+    /// records survived, so the next sign-in must reload metadata even for an
+    /// unchanged user (#2874). Read through `needsLocalMetadataReload`.
+    private var localMetadataReloadPending = false
     private var localOnlyDocs: Set<String> = []
     /// Documents opened before their stored metadata could be read at all — a
     /// cold start whose storage provider is not bound yet. For these,
@@ -1253,6 +1257,24 @@ public final class DocumentManager: @unchecked Sendable {
     /// model's shared cross-document store the moment it's registered.
     public func openDocumentsSnapshot() -> [(documentId: String, doc: YDocument)] {
         lock.withLock { openDocs.map { (documentId: $0.key, doc: $0.value) } }
+    }
+
+    /// Every document id this manager still holds for the logout sweep
+    /// (#2874): the open ones **plus** every document whose update observer is
+    /// still installed.
+    ///
+    /// The two sets differ after `evictAllLocalData()`, which clears
+    /// `openDocs` without closing anything — its own comment says so: the
+    /// observer stays attached, so an opened document survives the purge here
+    /// even though it is no longer "open". A sweep driven by
+    /// `openDocumentsSnapshot()` alone would skip it and leave a `YDocument`
+    /// the app still holds forwarding the signed-out user's edits.
+    ///
+    /// Not the whole answer on its own: a document created but never reopened
+    /// has no observer, so the client unions this with the shared stores'
+    /// membership (`JsBaoClient.logoutSweepDocumentIds`).
+    public func retainedDocumentIdsForLogout() -> [String] {
+        lock.withLock { Array(Set(openDocs.keys).union(updateSubscriptions.keys)) }
     }
 
     public func isSynced(_ documentId: String) -> Bool {
@@ -2759,6 +2781,38 @@ public final class DocumentManager: @unchecked Sendable {
         try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
     }
 
+    /// Drop the retry state a logout leaves behind (#2874). JS parity with
+    /// `resetUserScopedState` (`documentManager.ts`), run on EVERY logout:
+    /// cancel the pending-create retry timers and clear the in-memory
+    /// pending-create set, so a signed-out user's failed create cannot commit
+    /// under a later session's transport. The persisted `pendingCreate`
+    /// records are untouched — they rehydrate for the same user through
+    /// `loadLocalMetadata()` on the next sign-in.
+    ///
+    /// Separate from `resetInMemoryUserState(userId:)`, which re-points the
+    /// manager at a new user and leaves the timers running.
+    public func resetUserScopedStateForLogout() {
+        lock.withLock {
+            pendingCreateRetryTimers.values.forEach { $0.cancel() }
+            pendingCreateRetryTimers.removeAll()
+            pendingCreates.removeAll()
+            // The persisted records outlive this reset, so the in-memory set
+            // is now behind what is on disk. Nothing else re-reads it for an
+            // unchanged user (`rebindUserScopedStorage` short-circuits on a
+            // matching id), which would strand those creates until the process
+            // restarted — so say out loud that a reload is owed.
+            localMetadataReloadPending = true
+        }
+    }
+
+    /// Whether a logout dropped in-memory user-scoped state that the persisted
+    /// metadata still holds (#2874). The sign-in rebind reads this so the same
+    /// user signing back in — same process, no relaunch — rehydrates their
+    /// pending creates instead of leaving them silently uncommitted.
+    public var needsLocalMetadataReload: Bool {
+        lock.withLock { localMetadataReloadPending }
+    }
+
     /// Reset in-memory, user-scoped state and re-point at `newUserId` WITHOUT
     /// deleting the previous user's persisted metadata (unlike
     /// `evictAllLocalData`, which purges disk). Used when the signed-in user
@@ -2801,6 +2855,8 @@ public final class DocumentManager: @unchecked Sendable {
                     localOnlyDocs.insert(entry.documentId)
                 }
             }
+            // In-memory state is level with the store again (#2874).
+            localMetadataReloadPending = false
         }
     }
 

@@ -130,7 +130,10 @@ final class AuthApiTests: XCTestCase {
             appId: testApp.appId,
             settings: [
                 "magicLinkEnabled": true,
-                "redirectUris": ["https://example.com/callback"],
+                // The magic-link allow-list is its own key as of #2891, and it
+                // is fail-closed: with none of these set the server rejects
+                // every request rather than allowing any redirect.
+                "emailRedirectUris": ["https://example.com/callback"],
             ]
         )
 
@@ -158,7 +161,10 @@ final class AuthApiTests: XCTestCase {
             appId: testApp.appId,
             settings: [
                 "magicLinkEnabled": true,
-                "redirectUris": ["https://example.com/callback"],
+                // The magic-link allow-list is its own key as of #2891, and it
+                // is fail-closed: with none of these set the server rejects
+                // every request rather than allowing any redirect.
+                "emailRedirectUris": ["https://example.com/callback"],
             ]
         )
 

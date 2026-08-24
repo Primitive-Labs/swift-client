@@ -346,6 +346,13 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             constraint: name, data: data, uniqueLookupValue: uniqueLookupValue
         )
 
+        // Before the search: a match in any doc would otherwise supply the
+        // id the caller failed to (see
+        // `DynamicModel.requireNonEmptySuppliedId`).
+        try DynamicModel.requireNonEmptySuppliedId(
+            id, data: data, modelName: schema.name
+        )
+
         // Cross-doc search: first connected doc that holds the key wins.
         var matchRecordId: String?
         for (_, model) in members {

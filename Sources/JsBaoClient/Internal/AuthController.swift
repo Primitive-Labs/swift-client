@@ -1072,8 +1072,8 @@ public final class AuthController: @unchecked Sendable {
 
     /// Start the OAuth flow. Mirrors JS `authController.startOAuthFlow`
     /// (src/client/internal/authController.ts): fetch the app's auth config
-    /// (`GET /oauth-config`), require a `googleClientId`, and build the Google
-    /// authorize URL client-side with the base64-JSON state bag
+    /// (`GET /oauth-config`), require a usable `ios` client entry, and build
+    /// the Google authorize URL client-side with the base64-JSON state bag
     /// `{nonce, redirectUri, continueUrl?}`. Where the JS client redirects the
     /// browser, this returns the URL for the caller to open (e.g. via
     /// `ASWebAuthenticationSession` — see `JsBaoClient.signInWithGoogle`).
@@ -1089,7 +1089,13 @@ public final class AuthController: @unchecked Sendable {
             method: .get,
             path: "/oauth-config"
         )
-        guard let googleClientId = config.googleClientId, !googleClientId.isEmpty else {
+        // The same predicate the button gates on, re-checked here so a caller
+        // that skipped `checkOAuthAvailable()` cannot start a flow that can
+        // only fail — including on an app whose provider is switched off, which
+        // the server now rejects at the callback too (#2891).
+        guard config.googleSignInAvailable,
+              let googleClientId = config.nativeGoogleClient?.clientId
+        else {
             throw JsBaoError(code: .unavailable, message: "OAuth not configured")
         }
 
@@ -1676,6 +1682,15 @@ public final class AuthController: @unchecked Sendable {
         await awaitPendingPersistence()
         try? await clearPersistedJwt()
 
+        // JS parity (#2874): the web client's `authController.logout` awaits
+        // `deps.onLogoutCleanup({ wipeLocal })` on EVERY logout before it
+        // signals completion. Placed here, ahead of the `waitForDisconnect`
+        // teardown, the sweep's per-document `unsubscribe` frames still reach
+        // a live socket — a Swift improvement over JS, which disconnects
+        // before calling `auth.logout` — and no completion subscriber can
+        // observe the signed-out user's documents or rows.
+        await onLogoutCleanup?(options)
+
         if options.waitForDisconnect {
             await onLogoutDisconnect?()
         }
@@ -1695,9 +1710,16 @@ public final class AuthController: @unchecked Sendable {
     /// Optional hook invoked when `logout(waitForDisconnect: true)` is
     /// requested, awaited so callers can block until the socket is torn down.
     /// Wired by `JsBaoClient` (which owns the WebSocket lifecycle); `nil` when
-    /// the controller is used standalone. Mirrors the JS `onLogoutCleanup`
-    /// dependency the web client injects.
+    /// the controller is used standalone.
     var onLogoutDisconnect: (@Sendable () async -> Void)?
+
+    /// Client-owned logout cleanup, awaited on EVERY logout before
+    /// `onLogoutDisconnect` and before `AuthLogoutCompleteEvent` (#2874).
+    /// Mirrors the JS `onLogoutCleanup` dependency: close every open
+    /// document, reset user-scoped document state, and — under `wipeLocal` —
+    /// purge the local stores. Wired by `JsBaoClient` the same way
+    /// `onLogoutDisconnect` is; `nil` when the controller is used standalone.
+    var onLogoutCleanup: (@Sendable (LogoutOptions) async -> Void)?
 
     // MARK: - Network Mode
 
