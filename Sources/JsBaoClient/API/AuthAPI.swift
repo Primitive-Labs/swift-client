@@ -22,7 +22,12 @@ public final class AuthAPI: @unchecked Sendable {
     private let _getToken: () -> String?
     private let _isAuthenticated: () -> Bool
 
-    // Non-native sign-in flows
+    // Non-native sign-in flows.
+    //
+    // `_emailSignInRequest` (#2884) is the one email entry point; it is
+    // optional only so an instance wired before the unified flow existed
+    // still compiles (it throws when called unwired).
+    private let _emailSignInRequest: ((_ email: String, _ redirectUri: String?) async throws -> Bool)?
     private let _magicLinkRequest: (_ email: String, _ redirectUri: String) async throws -> Bool
     private let _magicLinkVerify: (_ token: String) async throws -> MagicLinkVerifyResult
     // Carries the optional #466 invite token through verify. When unwired,
@@ -74,6 +79,7 @@ public final class AuthAPI: @unchecked Sendable {
         getUserId: @escaping () -> String?,
         getToken: @escaping () -> String?,
         isAuthenticated: @escaping () -> Bool,
+        emailSignInRequest: ((_ email: String, _ redirectUri: String?) async throws -> Bool)? = nil,
         magicLinkRequest: @escaping (_ email: String, _ redirectUri: String) async throws -> Bool,
         magicLinkVerify: @escaping (_ token: String) async throws -> MagicLinkVerifyResult,
         magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> MagicLinkVerifyResult)? = nil,
@@ -101,6 +107,7 @@ public final class AuthAPI: @unchecked Sendable {
         self._getUserId = getUserId
         self._getToken = getToken
         self._isAuthenticated = isAuthenticated
+        self._emailSignInRequest = emailSignInRequest
         self._magicLinkRequest = magicLinkRequest
         self._magicLinkVerify = magicLinkVerify
         self._magicLinkVerifyWithInvite = magicLinkVerifyWithInvite
@@ -165,8 +172,45 @@ public final class AuthAPI: @unchecked Sendable {
         throw AuthError(code: .unauthorized, message: "waitForUserId timeout")
     }
 
+    // MARK: - Email sign-in (#2884)
+
+    /// Request ONE sign-in email carrying both credentials — a 6-digit code
+    /// and, when the app allow-lists the redirect target, a magic link. The
+    /// user finishes by typing the code or tapping the link; nothing here
+    /// picks a method. Mirrors JS
+    /// `auth.emailSignInRequest({ email, redirectUri })`.
+    ///
+    /// Without a usable redirect target the server issues a code-only email
+    /// from the same template rather than refusing (DSO-2884-002).
+    public func emailSignInRequest(
+        _ params: EmailSignInRequestParams
+    ) async throws -> EmailSignInRequestResult {
+        guard let request = _emailSignInRequest else {
+            throw JsBaoError(
+                code: .unavailable,
+                message: "emailSignInRequest is not wired on this AuthAPI instance"
+            )
+        }
+        let success = try await request(params.email, params.redirectUri)
+        return EmailSignInRequestResult(success: success)
+    }
+
+    /// Convenience overload taking the fields directly.
+    public func emailSignInRequest(
+        email: String,
+        redirectUri: String? = nil
+    ) async throws -> EmailSignInRequestResult {
+        try await emailSignInRequest(
+            EmailSignInRequestParams(email: email, redirectUri: redirectUri)
+        )
+    }
+
     // MARK: - Magic link
 
+    /// - Warning: Deprecated by #2884 — `emailSignInRequest` is the one email
+    ///   entry point, and this endpoint is now an alias of it that sends the
+    ///   same email.
+    ///
     /// Request a magic-link email. Mirrors JS
     /// `auth.magicLinkRequest({ email, redirectUri })`. Returns the typed
     /// `{ success }` result.

@@ -26,6 +26,26 @@ public struct AuthUser: Decodable, Sendable, Equatable {
 
 /// Parameters for `auth.magicLinkRequest(...)`. Mirrors JS
 /// `magicLinkRequest({ email, redirectUri })`.
+/// Parameters for `auth.emailSignInRequest(...)` (#2884). Mirrors JS
+/// `emailSignInRequest({ email, redirectUri })`.
+///
+/// `redirectUri` is optional: without a usable redirect target the server
+/// issues a code-only email from the same unified template.
+public struct EmailSignInRequestParams: Sendable {
+    public var email: String
+    public var redirectUri: String?
+
+    public init(email: String, redirectUri: String? = nil) {
+        self.email = email
+        self.redirectUri = redirectUri
+    }
+}
+
+/// Result of `auth.emailSignInRequest(...)`. Mirrors JS `{ success: boolean }`.
+public struct EmailSignInRequestResult: Decodable, Sendable, Equatable {
+    public let success: Bool
+}
+
 public struct MagicLinkRequestParams: Sendable {
     public var email: String
     public var redirectUri: String
@@ -170,6 +190,14 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     /// `false` against servers that predate the Apple port.
     public let appleSignInEnabled: Bool
     public let hasApple: Bool
+    /// Is email sign-in available at all (#2884)? ONE flag: one request sends
+    /// one email carrying a code and, when a link can be issued, a link, so
+    /// there is no per-method availability to report.
+    public let emailSignInEnabled: Bool
+    /// - Warning: Deprecated by #2884. A server that has the unified flow
+    ///   reports both of these equal to `emailSignInEnabled`; they exist so
+    ///   already-published clients keep reading a value that matches
+    ///   behavior. New code reads `emailSignInEnabled`.
     public let magicLinkEnabled: Bool
     public let otpEnabled: Bool
 
@@ -188,13 +216,21 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
         hasApple = try c.decodeIfPresent(Bool.self, forKey: .hasApple) ?? false
         magicLinkEnabled = try c.decodeIfPresent(Bool.self, forKey: .magicLinkEnabled) ?? false
         otpEnabled = try c.decodeIfPresent(Bool.self, forKey: .otpEnabled) ?? false
+        // A server that predates #2884 sends no `emailSignInEnabled` at all,
+        // so derive it from the pair it replaced: email sign-in is off only
+        // when BOTH legacy flags are explicitly false. Reading the absent key
+        // as `false` would black out the email button against every older
+        // server.
+        emailSignInEnabled =
+            try c.decodeIfPresent(Bool.self, forKey: .emailSignInEnabled)
+            ?? (magicLinkEnabled || otpEnabled)
     }
 
     private enum CodingKeys: String, CodingKey {
         case appId, name, mode, waitlistEnabled, googleOAuthEnabled, googleClients
         case passkeyEnabled
         case passkeyRpConfig, hasPasskey, appleSignInEnabled, hasApple
-        case magicLinkEnabled, otpEnabled
+        case emailSignInEnabled, magicLinkEnabled, otpEnabled
     }
 }
 

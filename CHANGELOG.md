@@ -20,6 +20,44 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Type configs carry `metadataManifest` (#2926)
+
+The declared-access manifest the JS client has always carried on both
+type-config surfaces was missing from Swift, so an app could read the
+deprecation message on `celContext` / `metadataAccess` pointing at metadata
+categories but could not declare one. Purely additive:
+`CollectionTypeConfigInfo` / `DatabaseTypeConfigInfo` now decode
+`metadataManifest`, the two `Create…Params` take an optional manifest, and the
+two `Update…Params` take `Updatable<DeclaredMetadataManifest>` (`.value` to
+replace, `.clear` to null it out, omit to leave alone).
+
+```swift
+try await client.databaseTypeConfigs.update(
+    databaseType: "userDB",
+    params: UpdateDatabaseTypeConfigParams(
+        metadataManifest: .value(
+            DeclaredMetadataManifest(
+                // A `from`/`via` hop reads `via`'s category off its source
+                // node, so that category must be declared there too — hence
+                // `membership` on `self` alongside `billing`.
+                selfCategories: .init(categories: ["billing", "membership"]),
+                paths: ["org": .from(
+                    from: "self", via: "membership.orgId",
+                    type: "group", categories: ["plan"]
+                )]
+            )
+        )
+    )
+)
+```
+
+Two spellings differ from JS, both to dodge Swift language rules: the manifest's
+`self` field is `selfCategories` (a property named `self` would collide with the
+`x.self` identity expression) and encodes as `self` on the wire, and a path is
+an enum — `.from(from:via:type:categories:)` or `.rootFrom(rootFrom:type:categories:)` —
+so the shapes the server rejects with a 400 are compile errors, which is what
+JS's `never`-keyed union does there.
+
 ### The codegen plugin can read a schema outside the target: `bao-codegen.json` (#2889)
 
 `JsBaoCodegenPlugin` used to find its input only by scanning the target's own

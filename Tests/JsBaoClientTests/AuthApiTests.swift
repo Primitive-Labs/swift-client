@@ -100,17 +100,22 @@ final class AuthApiTests: XCTestCase {
         }
     }
 
-    /// Edge: with OTP disabled the request endpoint rejects rather than
-    /// silently succeeding.
-    func testOtpRequestRejectsWhenDisabled() async throws {
+    /// Edge: with email sign-in disabled the request endpoint rejects rather
+    /// than silently succeeding. Since #2884 there is no per-method OTP
+    /// toggle: `otpEnabled` is a compatibility field derived from the one
+    /// `emailSignInEnabled` flow (writing `otpEnabled: false` alone leaves
+    /// email sign-in on), and `/auth/otp/request` is a deprecated alias of
+    /// the unified issuance path — so only turning email sign-in off as a
+    /// whole produces the rejection.
+    func testOtpRequestRejectsWhenEmailSignInDisabled() async throws {
         try await ctx.updateAppSettings(
             appId: testApp.appId,
-            settings: ["otpEnabled": false]
+            settings: ["emailSignInEnabled": false]
         )
 
         do {
             _ = try await client.auth.otpRequest(email: "test@example.com")
-            XCTFail("otpRequest must throw when OTP is disabled for the app")
+            XCTFail("otpRequest must throw when email sign-in is disabled for the app")
         } catch {
             let msg = String(describing: error)
             XCTAssertTrue(

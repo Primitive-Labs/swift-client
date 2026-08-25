@@ -1405,8 +1405,39 @@ public final class AuthController: @unchecked Sendable {
         }
     }
 
+    // MARK: - Email sign-in (#2884)
+
+    /// Request one sign-in email carrying both credentials — a 6-digit code
+    /// and, when the redirect target validates against the app's allow-list,
+    /// a magic link. The user finishes with whichever one suits them; nothing
+    /// here selects a method.
+    ///
+    /// `redirectUri` is optional. Omit it (or pass a target the app has not
+    /// allow-listed) and the server issues a code-only email from the same
+    /// template rather than refusing — link issuance is fail-closed.
+    public func emailSignInRequest(
+        email: String,
+        redirectUri: String? = nil
+    ) async throws -> Bool {
+        let transport = try requireTransport()
+
+        var body: [String: JSONValue] = ["email": .string(email)]
+        if let redirectUri = redirectUri, !redirectUri.isEmpty {
+            body["redirectUri"] = .string(redirectUri)
+        }
+        let response: SuccessResponse? = try await transport.requestOptional(
+            method: .post,
+            path: "/auth/email/request",
+            body: body
+        )
+        return response?.success ?? false
+    }
+
     // MARK: - Magic Link
 
+    /// - Warning: Deprecated by #2884. `/auth/magic-link/request` is now an
+    ///   alias of the unified issuance path and sends the same email
+    ///   `emailSignInRequest` does. Call `emailSignInRequest` instead.
     public func magicLinkRequest(email: String, redirectUri: String) async throws -> Bool {
         let transport = try requireTransport()
 
@@ -1464,6 +1495,8 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - OTP
 
+    /// - Warning: Deprecated by #2884. `/auth/otp/request` is now an alias of
+    ///   the unified issuance path. Call `emailSignInRequest` instead.
     public func otpRequest(email: String) async throws -> Bool {
         let transport = try requireTransport()
 

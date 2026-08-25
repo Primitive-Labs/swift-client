@@ -4652,6 +4652,13 @@ public final class JsBaoClient: @unchecked Sendable {
             getUserId: { [weak self] in self?.authController.getUserId() },
             getToken: { [weak self] in self?.authController.getToken() },
             isAuthenticated: { [weak self] in self?.authController.isAuthenticated() ?? false },
+            emailSignInRequest: { [weak self] email, redirectUri in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.emailSignInRequest(
+                    email: email,
+                    redirectUri: redirectUri
+                )
+            },
             magicLinkRequest: { [weak self] email, redirectUri in
                 guard let self = self else { throw JsBaoError(code: .unavailable) }
                 return try await self.authController.magicLinkRequest(email: email, redirectUri: redirectUri)
