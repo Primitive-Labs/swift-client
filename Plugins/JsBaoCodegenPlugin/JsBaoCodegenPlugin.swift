@@ -66,10 +66,12 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         // config throws rather than falling back to the scan, which would
         // codegen from the wrong schema.
         //
-        // `target.directory`, not `target.directoryURL`: the URL accessor
-        // arrived in PackageDescription 6.1 and this package is
-        // swift-tools-version 6.0.
-        let targetDirectory = URL(fileURLWithPath: target.directory.string, isDirectory: true)
+        // `target.directoryURL`, not `target.directory`: `Path` is deprecated
+        // in favour of `URL`, and reading `.string` off it warned on every
+        // consumer build (#2966). The URL accessor arrived in
+        // PackageDescription 6.1, which is why the manifest declares
+        // swift-tools-version 6.1.
+        let targetDirectory = target.directoryURL
         let configured = try JsBaoCodegenConfig.resolveInput(targetDirectory: targetDirectory)
 
         // Otherwise: every `*schema.toml` in the target, plus the bare

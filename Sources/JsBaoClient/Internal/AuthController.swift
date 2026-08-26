@@ -1407,14 +1407,17 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - Email sign-in (#2884)
 
-    /// Request one sign-in email carrying both credentials — a 6-digit code
-    /// and, when the redirect target validates against the app's allow-list,
-    /// a magic link. The user finishes with whichever one suits them; nothing
-    /// here selects a method.
+    /// Request one sign-in email carrying a 6-digit code — and, when a
+    /// redirect target is supplied and allow-listed, a magic link too. The
+    /// user finishes with whichever one suits them; nothing here selects a
+    /// method.
     ///
-    /// `redirectUri` is optional. Omit it (or pass a target the app has not
-    /// allow-listed) and the server issues a code-only email from the same
-    /// template rather than refusing — link issuance is fail-closed.
+    /// `redirectUri` is optional, and that is how a code-only email is asked
+    /// for: OMIT it and the server issues one from the same template, with no
+    /// allow-list involved. A target that IS supplied must match the app's
+    /// non-empty `emailRedirectUris` allow-list, or the request is rejected
+    /// 400 `Invalid redirect URI` — the server does not fall back to a
+    /// code-only email for an un-allow-listed target (#2967).
     public func emailSignInRequest(
         email: String,
         redirectUri: String? = nil

@@ -83,12 +83,15 @@ final class SwiftSixLanguageModeTests: XCTestCase {
     }
 
     /// `.swiftLanguageMode` is a tools-version 6.0 manifest API — without the
-    /// bump the manifest does not even parse.
-    func testManifestDeclaresToolsVersionSixPointZero() throws {
+    /// bump the manifest does not even parse. The declared version is 6.1
+    /// since #2966, which the codegen plugin needs for `Target.directoryURL`;
+    /// `PluginDeprecationHermeticTests` owns that half.
+    func testManifestDeclaresAToolsVersionThatOffersSwiftLanguageMode() throws {
         let manifest = try Self.manifest()
         XCTAssertTrue(
-            manifest.hasPrefix("// swift-tools-version: 6.0"),
-            "the .swiftLanguageMode setting requires swift-tools-version 6.0"
+            manifest.hasPrefix("// swift-tools-version: 6.1"),
+            "the .swiftLanguageMode setting requires swift-tools-version 6.0 or newer, "
+                + "and the codegen plugin requires 6.1"
         )
     }
 

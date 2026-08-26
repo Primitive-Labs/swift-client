@@ -180,8 +180,10 @@ public final class AuthAPI: @unchecked Sendable {
     /// picks a method. Mirrors JS
     /// `auth.emailSignInRequest({ email, redirectUri })`.
     ///
-    /// Without a usable redirect target the server issues a code-only email
-    /// from the same template rather than refusing (DSO-2884-002).
+    /// Omitting `redirectUri` is how a code-only email is requested: the
+    /// server issues one from the same template, consulting no allow-list. A
+    /// supplied target must match the app's non-empty `emailRedirectUris`, or
+    /// the request is rejected 400 `Invalid redirect URI` (#2967).
     public func emailSignInRequest(
         _ params: EmailSignInRequestParams
     ) async throws -> EmailSignInRequestResult {

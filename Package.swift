@@ -1,4 +1,14 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
+//
+// 6.1, not 6.0 (#2966): the tools version is what PackagePlugin gates its API
+// on, and `Target.directoryURL` — the only non-deprecated way for
+// `JsBaoCodegenPlugin` to read the consuming target's source directory —
+// arrived in PackageDescription 6.1. At 6.0 the plugin had to go through
+// `target.directory.string`, and SwiftPM compiles the plugin inside every
+// package that uses it, so that deprecation warning printed on every consumer
+// build. The floor this imposes on consumers is a Swift 6.1 toolchain
+// (Xcode 16.3); `docs/README.md` documents it and
+// `PluginDeprecationHermeticTests` keeps the two in step.
 import PackageDescription
 
 let package = Package(

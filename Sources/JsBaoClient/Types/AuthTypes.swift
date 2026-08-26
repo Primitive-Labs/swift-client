@@ -29,8 +29,10 @@ public struct AuthUser: Decodable, Sendable, Equatable {
 /// Parameters for `auth.emailSignInRequest(...)` (#2884). Mirrors JS
 /// `emailSignInRequest({ email, redirectUri })`.
 ///
-/// `redirectUri` is optional: without a usable redirect target the server
-/// issues a code-only email from the same unified template.
+/// `redirectUri` is optional, and omitting it is how a code-only email is
+/// requested — the server issues one from the same unified template. A target
+/// that IS supplied must match the app's non-empty `emailRedirectUris`
+/// allow-list, or the request is rejected 400 `Invalid redirect URI` (#2967).
 public struct EmailSignInRequestParams: Sendable {
     public var email: String
     public var redirectUri: String?

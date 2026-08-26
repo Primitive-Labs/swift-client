@@ -2,6 +2,8 @@
 
 A native Swift SDK for the [Primitive](https://primitive.dev) collaboration platform. Real-time document editing via Yjs CRDTs, offline-first persistence, authentication, blob management, and a full REST API surface — designed for iOS 16+ and macOS 13+.
 
+**Toolchain floor: Swift 6.1 (Xcode 16.3) or newer.** `Package.swift` declares `swift-tools-version: 6.1`, so an older toolchain cannot resolve the package at all. The manifest went from 6.0 to 6.1 in #2966: `Target.directoryURL` is the only non-deprecated way for the codegen plugin to read a consuming target's source directory, and SwiftPM compiles that plugin inside every package that uses it, so the 6.0 spelling printed a deprecation warning on every consumer build.
+
 This directory is the navigation guide for everything in `swift-client/`. Start here.
 
 ## Where to look

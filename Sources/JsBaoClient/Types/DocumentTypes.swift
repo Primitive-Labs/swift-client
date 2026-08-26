@@ -510,10 +510,15 @@ public struct LinkAccessResult: Decodable, Sendable, Equatable {
 }
 
 /// A user's permission entry on a document.
+///
+/// `name` is `nil` for a user who has none — the server omits the key rather
+/// than sending an empty string, and a user provisioned through the
+/// email-code flow gets no name (#2980) — so display code should fall back
+/// to `email`. Mirrors js-bao's `DocumentPermissionEntry.name?: string`.
 public struct DocumentPermissionEntry: Decodable, Sendable, Equatable {
     public let userId: String
     public let email: String
-    public let name: String
+    public let name: String?
     public let permission: DocumentPermission
     public let grantedAt: String
 }

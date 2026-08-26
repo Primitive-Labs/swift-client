@@ -179,6 +179,41 @@ final class TestContext: @unchecked Sendable {
         return TestUser(userId: userId, email: userEmail, name: userName, role: role, jwt: jwt)
     }
 
+    /// Sign in through the email-code path with the `+primitivetest` bypass
+    /// (magic code `000000`) and return the provisioned user's id. The app
+    /// must have `otpEnabled` on and the address's base listed in
+    /// `testAccountBaseEmails` (both via `updateAppSettings(appId:settings:)`).
+    ///
+    /// Unlike `createTestUser`, which goes through admin add-by-email and gets
+    /// the email's local part written as a placeholder name, OTP provisioning
+    /// passes no `name` — so this is the only harness path that produces a user
+    /// the server has no name for (#2980).
+    func signInWithTestOtp(appId: String, email: String) async throws -> String {
+        let url = URL(string: "\(TestConfig.httpUrl)/app/\(appId)/api/auth/otp/verify")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(TestConfig.globalAdminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: ["email": email, "code": "000000"]
+        )
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TestSetupError("Non-HTTP response")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? ""
+            throw TestSetupError("HTTP \(httpResponse.statusCode) POST /auth/otp/verify: \(text)")
+        }
+
+        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        guard let userId = (json["user"] as? [String: Any])?["userId"] as? String else {
+            throw TestSetupError("OTP verify returned no user id: \(json)")
+        }
+        return userId
+    }
+
     /// Update app settings via `PUT /app/{appId}/api/settings` (owner JWT).
     /// Used by the passkey tests to flip `passkeyEnabled` / RP config the
     /// same way the JS suite does (tests/api/http/app-passkeys.test.ts).

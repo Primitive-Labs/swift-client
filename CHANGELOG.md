@@ -20,6 +20,42 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### The package moves to `swift-tools-version: 6.1` (#2966)
+
+**Action required if you build on a toolchain older than Swift 6.1
+(Xcode 16.3).** SwiftPM refuses to resolve a package whose tools version is
+newer than the toolchain, so the client no longer builds on Swift 6.0. Nothing
+in the API changed.
+
+The reason is the codegen plugin. `JsBaoCodegenPlugin` read the consuming
+target's source directory as `target.directory.string`, and PackagePlugin has
+deprecated `Path` in favour of `URL`, so every build of every package that uses
+the plugin printed:
+
+```
+warning: 'string' is deprecated: Use `URL` type instead of `Path`.
+```
+
+The replacement, `Target.directoryURL`, is unavailable before PackageDescription
+6.1 ("'directoryURL' was introduced in PackageDescription 6.1"), and the only
+other route at 6.0 went back through the deprecated `Path`. Silencing the
+diagnostic was not an option — the plugin compiles in the consumer's package,
+where the warning is theirs, not ours.
+
+A package that depends on the client can stay at its own tools version:
+`swift-tools-version: 6.0` app manifests resolve and build against a 6.1
+dependency as long as the toolchain is 6.1 or newer.
+
+### `DocumentPermissionEntry.name` is now optional (#2980)
+
+**Breaking.** The server omits `name` from a permission entry when the user
+has none — a user provisioned through the email-code sign-in flow gets no
+name — so the required `String` made `documents.getPermissions(documentId:)`
+throw `keyNotFound("name")` and lose the whole listing whenever any permittee
+lacked one. The field is now `String?`, matching what the server has always
+sent (and the JS client's `name?: string`). Code that read `entry.name`
+non-optionally must unwrap; display code should fall back to `entry.email`.
+
 ### Type configs carry `metadataManifest` (#2926)
 
 The declared-access manifest the JS client has always carried on both
