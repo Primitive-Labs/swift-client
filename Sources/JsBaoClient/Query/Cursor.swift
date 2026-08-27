@@ -66,24 +66,20 @@ public enum CursorManager {
     /// Byte-compatible with js-bao's `encodeCursor` — the JSON is
     /// UTF-8 and uses standard base64.
     public static func encodeCursor(_ data: CursorData) throws -> String {
-        // Build a JSON object manually to control key order and
-        // PrimitiveValue unwrapping. The JSON shape is fixed:
+        // The JSON shape is fixed:
         //   {"values":{...},"sortFields":[...],"direction":1|-1}
-        var valueDict: [String: Any] = [:]
+        var valueObject: [String: JSONValue] = [:]
         for (k, v) in data.values {
-            valueDict[k] = primitiveToAny(v)
+            valueObject[k] = primitiveToJSON(v)
         }
-        let dict: [String: Any] = [
-            "values":     valueDict,
-            "sortFields": data.sortFields,
-            "direction":  data.direction,
-        ]
-        guard JSONSerialization.isValidJSONObject(dict) else {
+        let payload: JSONValue = .object([
+            "values":     .object(valueObject),
+            "sortFields": .array(data.sortFields.map { .string($0) }),
+            "direction":  .number(Double(data.direction)),
+        ])
+        guard let jsonData = try? JSONCoding.encodeData(payload) else {
             throw InvalidCursorError(reason: "Unencodable cursor values")
         }
-        let jsonData = try JSONSerialization.data(
-            withJSONObject: dict, options: []
-        )
         return jsonData.base64EncodedString()
     }
 
@@ -95,34 +91,32 @@ public enum CursorManager {
                 cursor: cursor
             )
         }
-        guard let any = try? JSONSerialization.jsonObject(
-            with: raw, options: []
-        ) else {
+        guard let payload = try? JSONCoding.decodeData(JSONValue.self, from: raw) else {
             throw InvalidCursorError(
                 reason: "Base64 payload isn't JSON",
                 cursor: cursor
             )
         }
-        guard let dict = any as? [String: Any] else {
+        guard let dict = payload.objectValue else {
             throw InvalidCursorError(
                 reason: "Cursor JSON must be an object",
                 cursor: cursor
             )
         }
-        guard let rawValues = dict["values"] as? [String: Any] else {
+        guard let rawValues = dict["values"]?.objectValue else {
             throw InvalidCursorError(
                 reason: "Cursor missing 'values' object",
                 cursor: cursor
             )
         }
-        guard let sortFields = dict["sortFields"] as? [String] else {
+        guard let sortFields = dict["sortFields"]?.stringArrayValue else {
             throw InvalidCursorError(
                 reason: "Cursor missing 'sortFields' array",
                 cursor: cursor
             )
         }
-        guard let direction = dict["direction"] as? Int,
-              direction == 1 || direction == -1 else {
+        guard let rawDirection = dict["direction"]?.numberValue,
+              rawDirection == 1 || rawDirection == -1 else {
             throw InvalidCursorError(
                 reason: "Cursor 'direction' must be 1 or -1",
                 cursor: cursor
@@ -130,10 +124,10 @@ public enum CursorManager {
         }
         var values: [String: PrimitiveValue] = [:]
         for (k, v) in rawValues {
-            values[k] = anyToPrimitive(v)
+            values[k] = jsonToPrimitive(v)
         }
         return CursorData(
-            values: values, sortFields: sortFields, direction: direction
+            values: values, sortFields: sortFields, direction: Int(rawDirection)
         )
     }
 
@@ -211,7 +205,7 @@ public enum CursorManager {
     /// - `hasMore`: `nextCursor` is only emitted when there could be
     ///   another page.
     public static func generateResultCursors(
-        rows: [[String: Any]],
+        rows: [[String: JSONValue]],
         sortFields: [String],
         direction: CursorDirection,
         hasMore: Bool,
@@ -234,7 +228,7 @@ public enum CursorManager {
     }
 
     private static func cursorFromRow(
-        _ row: [String: Any],
+        _ row: [String: JSONValue],
         sortFields: [String],
         direction: CursorDirection
     ) throws -> String {
@@ -246,7 +240,7 @@ public enum CursorManager {
                         "Row missing sort field '\(f)'; cannot generate cursor"
                 )
             }
-            values[f] = anyToPrimitive(raw)
+            values[f] = jsonToPrimitive(raw)
         }
         return try encodeCursor(CursorData(
             values: values,
@@ -257,33 +251,31 @@ public enum CursorManager {
 
     // MARK: - Value conversion
 
-    /// `PrimitiveValue → JSON-serializable` for encoding.
-    private static func primitiveToAny(_ v: PrimitiveValue) -> Any {
+    /// `PrimitiveValue → JSONValue` for encoding.
+    private static func primitiveToJSON(_ v: PrimitiveValue) -> JSONValue {
         switch v {
-        case let .string(s):    return s
-        case let .number(n):    return n
-        case let .boolean(b):   return b
-        case let .id(s):        return s
-        case let .date(s):      return s
-        case let .stringset(s): return Array(s).sorted()
-        case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
+        case let .string(s):    return .string(s)
+        case let .number(n):    return .number(n)
+        case let .boolean(b):   return .bool(b)
+        case let .id(s):        return .string(s)
+        case let .date(s):      return .string(s)
+        case let .stringset(s): return .array(Array(s).sorted().map { .string($0) })
+        case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
         }
     }
 
-    /// `JSON value → PrimitiveValue` for decoding. Reconstructs a
+    /// `JSONValue → PrimitiveValue` for decoding. Reconstructs a
     /// best-guess type from raw JSON — we don't have field-type info at
     /// the cursor layer, only the value.
-    private static func anyToPrimitive(_ v: Any) -> PrimitiveValue {
-        if let s = v as? String      { return .string(s) }
-        if let b = v as? Bool        { return .boolean(b) }
-        if let n = v as? Double      { return .number(n) }
-        if let n = v as? Int         { return .number(Double(n)) }
-        if let n = v as? Int64       { return .number(Double(n)) }
-        if let arr = v as? [String]  {
-            return .stringset(Set(arr))
-        }
+    private static func jsonToPrimitive(_ v: JSONValue) -> PrimitiveValue {
+        switch v {
+        case let .string(s):  return .string(s)
+        case let .bool(b):    return .boolean(b)
+        case let .number(n):  return .number(n)
+        case let .array(a):   return .stringset(Set(a.compactMap { $0.stringValue }))
         // Fallback — treat unknown as an empty string.
-        return .string("")
+        case .object, .null:  return .string("")
+        }
     }
 
     /// `PrimitiveValue → SQLite-bind-friendly Any` used when binding

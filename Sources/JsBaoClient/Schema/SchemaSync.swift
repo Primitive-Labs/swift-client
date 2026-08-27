@@ -36,23 +36,40 @@ public enum SchemaSync {
     // MARK: - Public API
 
     /// Sync the given schema's metadata into `_meta_{schema.name}` on the
-    /// doc. Opens a transaction if not already in one.
+    /// doc. Opens its own transaction; the guard here only avoids opening an
+    /// empty one, the authoritative cache check lives in the in-transaction
+    /// form below.
     public static func syncModelMeta(doc: YDocument, schema: PrimitiveSchema) {
-        if cachedContains(doc: doc, model: schema.name) {
-            return
-        }
-
+        if cachedContains(doc: doc, model: schema.name) { return }
         doc.transactSync { txn in
             syncModelMeta(doc: doc, schema: schema, transaction: txn)
         }
+    }
 
+    /// Same as above, but reuses an existing transaction. Prefer this form
+    /// when already inside a `transactSync` / `transactAsync` block — the
+    /// record-write path (#2587) uses it so `_meta_*` is written at save-time
+    /// like js-bao (`BaseModel.save` -> `syncModelMeta`) rather than at
+    /// doc-connect, which keeps a client that only reads a document from
+    /// writing into it.
+    ///
+    /// Both forms are cache-guarded identically: the session cache makes
+    /// repeat calls per (doc, model) free, and `setEncodedIfChanged` makes
+    /// even the first call of a session op-free when the doc already carries
+    /// matching metadata.
+    public static func syncModelMeta(
+        doc: YDocument,
+        schema: PrimitiveSchema,
+        transaction txn: YrsTransaction
+    ) {
+        if cachedContains(doc: doc, model: schema.name) { return }
+        writeModelMeta(schema: schema, transaction: txn)
         cachedInsert(doc: doc, model: schema.name)
     }
 
-    /// Same as above, but reuses an existing transaction. Prefer this
-    /// form when already inside a `transactSync` / `transactAsync` block.
-    public static func syncModelMeta(
-        doc: YDocument,
+    /// The unconditional writer both public forms funnel through — no cache
+    /// check, no transaction management.
+    private static func writeModelMeta(
         schema: PrimitiveSchema,
         transaction txn: YrsTransaction
     ) {
@@ -204,18 +221,33 @@ public enum SchemaSync {
 
     // MARK: - Primitive writers (route typed values through the Rust FFI)
 
+    /// Write the encoded value only when it differs from what the map
+    /// already holds — js-bao's `setIfChanged` (metaSync.ts). Re-syncing a
+    /// schema against a doc that already carries matching `_meta_*` (every
+    /// synced existing doc) must be op-free: an unconditional write emits a
+    /// fresh CRDT op per field per launch, growing the doc's update log and
+    /// pushing redundant frames to the server (#2587).
+    private static func setEncodedIfChanged(
+        _ map: YrsMap, key: String, encoded: String, tx: YrsTransaction
+    ) {
+        if let existing = try? map.get(tx: tx, key: key), existing == encoded {
+            return
+        }
+        _ = map.tryUpdate(tx: tx, key: key, value: encoded)
+    }
+
     /// Set a String value (JSON-encoded on the wire).
     private static func setScalar(
         _ map: YrsMap, key: String, value: String, tx: YrsTransaction
     ) {
-        _ = map.tryUpdate(tx: tx, key: key, value: PrimitiveValue.jsonEncodeString(value))
+        setEncodedIfChanged(map, key: key, encoded: PrimitiveValue.jsonEncodeString(value), tx: tx)
     }
 
     /// Set a Bool value.
     private static func setScalar(
         _ map: YrsMap, key: String, value: Bool, tx: YrsTransaction
     ) {
-        _ = map.tryUpdate(tx: tx, key: key, value: value ? "true" : "false")
+        setEncodedIfChanged(map, key: key, encoded: value ? "true" : "false", tx: tx)
     }
 
     /// Set a Double value. Skip non-finite values (NaN, ±Infinity)
@@ -226,7 +258,7 @@ public enum SchemaSync {
         _ map: YrsMap, key: String, value: Double, tx: YrsTransaction
     ) {
         guard let encoded = PrimitiveValue.encodeNumber(value) else { return }
-        _ = map.tryUpdate(tx: tx, key: key, value: encoded)
+        setEncodedIfChanged(map, key: key, encoded: encoded, tx: tx)
     }
 
     /// Set a heterogeneous `Any` value produced by `DefaultValue.encodedForMeta()`.

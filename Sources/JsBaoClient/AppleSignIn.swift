@@ -108,16 +108,16 @@ enum AppleSignInHelpers {
         firstName: String? = nil,
         lastName: String? = nil,
         inviteToken: String? = nil
-    ) -> [String: Any] {
-        var body: [String: Any] = [
-            "identityToken": identityToken,
-            "nonce": rawNonce,
-            "user": user,
+    ) -> [String: JSONValue] {
+        var body: [String: JSONValue] = [
+            "identityToken": .string(identityToken),
+            "nonce": .string(rawNonce),
+            "user": .string(user),
         ]
-        if let email, !email.isEmpty { body["email"] = email }
-        if let firstName, !firstName.isEmpty { body["firstName"] = firstName }
-        if let lastName, !lastName.isEmpty { body["lastName"] = lastName }
-        if let inviteToken, !inviteToken.isEmpty { body["inviteToken"] = inviteToken }
+        if let email, !email.isEmpty { body["email"] = .string(email) }
+        if let firstName, !firstName.isEmpty { body["firstName"] = .string(firstName) }
+        if let lastName, !lastName.isEmpty { body["lastName"] = .string(lastName) }
+        if let inviteToken, !inviteToken.isEmpty { body["inviteToken"] = .string(inviteToken) }
         return body
     }
 
@@ -205,7 +205,7 @@ extension JsBaoClient {
         // 3. Exchange with the server. This applies the session token
         //    (cause "apple"), emits .authSuccess/.authState, and reconnects
         //    the WebSocket — same sequencing as handleOAuthCallback.
-        let response: [String: Any]
+        let response: OAuthCallbackResult
         do {
             response = try await handleAppleCallback(
                 identityToken: identityToken,
@@ -221,8 +221,8 @@ extension JsBaoClient {
         }
 
         return AppleSignInResult(
-            userId: getUserId(),
-            isNewUser: response["isNewUser"] as? Bool ?? false
+            userId: userId,
+            isNewUser: response.isNewUser ?? false
         )
     }
 }

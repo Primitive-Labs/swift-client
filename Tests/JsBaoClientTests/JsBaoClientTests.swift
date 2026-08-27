@@ -127,12 +127,12 @@ final class JsBaoClientTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let result = try await client.makeRequest("GET", "/me", nil)
-        guard let dict = result as? [String: Any] else {
-            XCTFail("Expected dictionary response from /me")
+        let result = try await client.requestJSON(method: .get, path: "/me")
+        guard let object = result?.objectValue else {
+            XCTFail("Expected object response from /me")
             return
         }
-        XCTAssertNotNil(dict["userId"])
+        XCTAssertNotNil(object["userId"]?.stringValue)
     }
 
     func testHandleHttpErrors() async throws {
@@ -140,7 +140,7 @@ final class JsBaoClientTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         do {
-            let _ = try await client.makeRequest("GET", "/nonexistent-endpoint", nil)
+            let _ = try await client.requestJSON(method: .get, path: "/nonexistent-endpoint")
             XCTFail("Should have thrown an error")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 404)
@@ -298,11 +298,15 @@ final class JsBaoClientTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        XCTAssertTrue(client.isOnline())
+        // Default mode .auto: reporting-only isOnline() reflects transport, so
+        // it is false while disconnected; the networking gate stays open.
+        XCTAssertEqual(client.networkMode, .auto)
+        XCTAssertFalse(client.isOnline())
+        XCTAssertTrue(client.networkingAllowed())
 
         await client.goOffline()
         XCTAssertFalse(client.isOnline())
-        XCTAssertEqual(client.getNetworkMode(), .offline)
+        XCTAssertEqual(client.networkMode, .offline)
 
         await client.goOnline()
         XCTAssertTrue(client.isOnline())

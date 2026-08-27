@@ -1,5 +1,51 @@
 import Foundation
 
+// MARK: - Event delivery metadata
+
+/// When an event was emitted, and where it sits in the emitter's emit order.
+///
+/// Delivered alongside the payload by
+/// ``JsBaoClient/observeOnMainActor(_:withDelivery:)``. Both fields are captured
+/// inside the emit itself, before any handler or stream sees the payload, so a
+/// handler that runs a hop later — or several hops later, on a busy main
+/// thread — still reports the instant the client emitted rather than the instant
+/// it got around to handling. That difference is the whole point: a tool
+/// measuring client latency from the handler's own clock measures scheduler
+/// latency along with it.
+///
+/// ```swift
+/// subscription = client.observeOnMainActor(DocumentLoadedEvent.self, withDelivery: { event, delivery in
+///     let hop = Date().timeIntervalSince(delivery.emittedAt)
+///     timeline.append(row(event, at: delivery.emittedAt, order: delivery.sequence, hop: hop))
+/// })
+/// ```
+public struct EventDelivery: Sendable {
+    /// The wall-clock instant the event was emitted.
+    ///
+    /// Wall clock, so it can be compared against timestamps from outside the
+    /// process — which also means it can move backwards when the system clock
+    /// is adjusted between two emits. Sort on ``sequence`` when order has to
+    /// hold regardless.
+    public let emittedAt: Date
+
+    /// Position in this emitter's **emit** order, starting at 1 and increasing
+    /// by one per emit across all event keys.
+    ///
+    /// Emit order, never delivery order. A handler that emits a second event
+    /// synchronously gives that nested event a *higher* sequence even though
+    /// the nested delivery finishes first — the number records when the emit
+    /// was entered, not when any handler completed.
+    ///
+    /// Per emitter, so per client: two `JsBaoClient` instances in one process
+    /// count independently and their sequences must not be compared.
+    public let sequence: UInt64
+
+    public init(emittedAt: Date, sequence: UInt64) {
+        self.emittedAt = emittedAt
+        self.sequence = sequence
+    }
+}
+
 // MARK: - Connection Status
 
 public enum ConnectionStatus: String, Sendable {
@@ -43,19 +89,21 @@ public enum StartNetworkMode: String, Sendable {
 
 // MARK: - Event Types
 
+/// Every event key the client can deliver.
+///
+/// Each key has exactly one `JsBaoEventPayload` type, which is what
+/// `client.stream(for:)` resolves a subscription from. Since #2367 there are no
+/// exceptions: the three never-emitted or Swift-only cases (`auth`,
+/// `blobsUploadQueued`, `remoteUpdate`) were removed with the rest of the
+/// deprecated surface.
+///
+/// Not `CaseIterable`: the compiler declines to synthesize it for an enum with
+/// `@available` cases. `JsBaoEventPayloadTests` reads the case list out of this
+/// file instead, so a newly added event still has to come with a payload type.
 public enum JsBaoEvent: String, Sendable {
     case status
     case networkMode
 
-    /// Generic "auth" event. **Swift-only and never emitted** — js-bao has
-    /// no `"auth"` event, and nothing in this client emits it. It was dead
-    /// surface. Subscribe to the specific typed auth events that JS actually
-    /// emits instead: `.authSuccess` (`auth-success`), `.authFailed`
-    /// (`auth-failed`), `.authState` (`auth:state`), `.authLogout`
-    /// (`auth:logout`), `.authLogoutComplete` (`auth:logout:complete`).
-    /// Scheduled for removal once the deprecation window closes (#1120).
-    @available(*, deprecated, message: "Swift-only and never emitted; JS has no `auth` event. Subscribe to a specific event instead: .authSuccess / .authFailed / .authState / .authLogout / .authLogoutComplete (#1120).")
-    case auth
     case authSuccess = "auth-success"
     case authFailed = "auth-failed"
     case authState = "auth:state"
@@ -71,52 +119,21 @@ public enum JsBaoEvent: String, Sendable {
     case blobsUploadProgress = "blobs:upload-progress"
     case blobsUploadCompleted = "blobs:upload-completed"
     case blobsUploadFailed = "blobs:upload-failed"
-    /// **Swift-only and never emitted** — js-bao does not emit a distinct
-    /// "queued" upload event. A blob that is enqueued surfaces through the
-    /// regular `.blobsUploadProgress` (`blobs:upload-progress`) event with
-    /// `status == "queued"`, exactly as on JS. Migrate any
-    /// `.blobsUploadQueued` subscriber to `.blobsUploadProgress` and branch
-    /// on `event.status`. Scheduled for removal once the deprecation window
-    /// closes (#1120).
-    @available(*, deprecated, message: "Swift-only and never emitted; JS has no queued event. Subscribe to .blobsUploadProgress and check `event.status == \"queued\"` (#1120).")
-    case blobsUploadQueued = "blobs:upload-queued"
     case blobsUploadPaused = "blobs:upload-paused"
     case blobsUploadResumed = "blobs:upload-resumed"
     case blobsQueueDrained = "blobs:queue-drained"
     case permission
     case meUpdated
     case invitation
+    /// Live mirror of a durable in-app notification (#779 / #1601). Payload:
+    /// `NotificationEvent`. Emitted when the signed-in user receives an in-app
+    /// notification while connected. Mirrors the JS client's `notification`
+    /// event; fetch older rows via `client.notifications.list()`.
+    case notification
     case workflowStatus
     case documentMetadataChanged
     case pendingCreateFailed
     case authRefreshDeferred = "auth-refresh-deferred"
-
-    // ── Swift-only (deprecated, #1120) ────────────────────────────
-    /// Fires after a remote Yjs update lands in a local doc. **Swift-
-    /// only**: js-bao uses the string `"remoteUpdate"` as a `Y.Doc`
-    /// origin tag (passed to `Y.Doc.transact(fn, "remoteUpdate")`),
-    /// not as an emitted event. Cross-language code that subscribes
-    /// to `"remoteUpdate"` on the JS side will never fire.
-    ///
-    /// **Deprecated (#1120).** This is a Swift-only client event with no JS
-    /// counterpart, so it's being retired for cross-platform parity. It is
-    /// still emitted today (deprecation window) so existing subscribers keep
-    /// working, but new code should migrate:
-    ///   - **For a non-deprecated client event**: subscribe to
-    ///     `.documentSyncStateChanged` and react when `state == "synced"` —
-    ///     it now fires on every remote-update landing (see
-    ///     `DocumentSyncStateChangedEvent`). This is the supported in-client
-    ///     replacement.
-    ///   - **For true JS parity**: observe the `Y.Doc` directly (the JS
-    ///     pattern), e.g. a YSwift map/array/text observer, so your code
-    ///     reacts to the actual CRDT change rather than a client-emitted
-    ///     ping.
-    ///
-    /// Scheduled for removal once the deprecation window closes. It is
-    /// load-bearing for downstream reload-on-remote-write loaders, so it will
-    /// not be hard-removed until consumers have migrated.
-    @available(*, deprecated, message: "Swift-only; JS has no `remoteUpdate` event (it's a Y.Doc origin tag there). Still emitted during the deprecation window. Migrate to .documentSyncStateChanged (state == \"synced\") for an in-client event, or observe the Y.Doc directly for JS parity (#1120).")
-    case remoteUpdate
 
     // ── JS events not previously surfaced on Swift ────────────────
     // Added in the parity pass so cross-platform code can subscribe
@@ -232,16 +249,6 @@ public struct AwarenessEvent: Sendable {
     }
 }
 
-/// Payload for the deprecated `.remoteUpdate` event (#1120). See
-/// `JsBaoEvent.remoteUpdate` for the migration path
-/// (`.documentSyncStateChanged` with `state == "synced"`, or a direct
-/// `Y.Doc` observer). Not annotated `@available(deprecated)` itself so the
-/// internal emit site and the still-supported subscribers don't trip a
-/// warning during the deprecation window.
-public struct RemoteUpdateEvent: Sendable {
-    public let documentId: String
-}
-
 /// Payload for `.permission`. JS delivers `permission` as a plain string
 /// (`"owner" | "read-write" | "reader" | "admin"`); Swift keeps a typed
 /// enum whose `rawValue`s are exactly those wire strings (#996 decision:
@@ -260,12 +267,12 @@ public struct PermissionEvent: Sendable {
 /// client's `documentMetadataChanged` event and the server-side
 /// `docMetadata` frame. `metadata` is nil when `action == "deleted"`
 /// (the server clears the metadata as part of the delete/revoke).
-public struct DocumentMetadataChangedEvent: @unchecked Sendable {
+public struct DocumentMetadataChangedEvent: Sendable {
     public let documentId: String
     /// `"created" | "updated" | "deleted" | "evicted"`. See the JS
     /// client's `documentMetadataChanged` docs for the full vocabulary.
     public let action: String
-    public let metadata: [String: Any]?
+    public let metadata: [String: JSONValue]?
     public let changedFields: [String]?
     /// Where the change originated. Always present (#996). Matches js-bao's
     /// `documentMetadataChanged.source` vocabulary field-for-field:
@@ -282,7 +289,7 @@ public struct DocumentMetadataChangedEvent: @unchecked Sendable {
     public init(
         documentId: String,
         action: String,
-        metadata: [String: Any]? = nil,
+        metadata: [String: JSONValue]? = nil,
         changedFields: [String]? = nil,
         source: String
     ) {
@@ -516,12 +523,20 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
     public let workflowId: String
     public let runKey: String
     public let runId: String
-    public let status: String   // "completed" | "failed" | "terminated"
+    public let status: String   // "completed" | "failed" | "terminated" | "skipped"
     public let output: Any?
     public let error: String?
+    /// #2636 — the platform's classification of a `"failed"` run
+    /// (`"LOCK_CONTENTION"` / `"LOCK_TIMEOUT"`); `nil` on any other status.
+    public let errorCode: String?
+    /// #2636 — why a `"skipped"` run did not run (`"LOCK_CONTENTION"`): its
+    /// declarative lock was held and the definition declared
+    /// `onContention: "ignore"`. `nil` on any other status; such a frame
+    /// carries no `error`.
+    public let skipReason: String?
     public let contextDocId: String?
     public let needsApply: Bool
-    public let meta: [String: Any]?
+    public let meta: [String: JSONValue]?
     public let startedByUserId: String?
 
     public init(
@@ -532,9 +547,11 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
         status: String,
         output: Any? = nil,
         error: String? = nil,
+        errorCode: String? = nil,
+        skipReason: String? = nil,
         contextDocId: String? = nil,
         needsApply: Bool = false,
-        meta: [String: Any]? = nil,
+        meta: [String: JSONValue]? = nil,
         startedByUserId: String? = nil
     ) {
         self.workflowKey = workflowKey
@@ -544,6 +561,8 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
         self.status = status
         self.output = output
         self.error = error
+        self.errorCode = errorCode
+        self.skipReason = skipReason
         self.contextDocId = contextDocId
         self.needsApply = needsApply
         self.meta = meta
@@ -553,7 +572,8 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
 
 /// Real-time notification that a document invitation has changed state.
 ///
-/// Payload for `.invitation` (`client.events.on(.invitation) { (e: InvitationEvent) in … }`).
+/// Payload for `.invitation`
+/// (`for await e in client.stream(for: InvitationEvent.self)`).
 /// Mirrors the JS client's `InvitationEvent` (`src/client/JsBaoClient.ts`)
 /// field-for-field, including optionality.
 ///
@@ -642,6 +662,44 @@ public struct InvitationEvent: Sendable, Equatable {
     }
 }
 
+/// Payload for `.notification`
+/// (`for await e in client.stream(for: NotificationEvent.self)`).
+///
+/// Real-time mirror of a durable in-app notification (#779 / #1601). Mirrors
+/// the JS client's `NotificationEvent` (`src/client/JsBaoClient.ts`)
+/// field-for-field, including optionality. Emitted over the `notification`
+/// channel when the signed-in user receives an in-app notification while
+/// connected. The durable inbox row is the source of truth — fetch it (and
+/// older rows) via `client.notifications.list()`.
+public struct NotificationEvent: Sendable, Equatable {
+    public let notificationId: String
+    public let title: String
+    public let body: String
+    public let iconUrl: String?
+    public let deepLink: String?
+    /// Where the send came from, e.g. `workflowKey:runKey` or `api:<userId>`.
+    public let sourceRef: String?
+    public let createdAt: String
+
+    public init(
+        notificationId: String,
+        title: String,
+        body: String,
+        iconUrl: String? = nil,
+        deepLink: String? = nil,
+        sourceRef: String? = nil,
+        createdAt: String
+    ) {
+        self.notificationId = notificationId
+        self.title = title
+        self.body = body
+        self.iconUrl = iconUrl
+        self.deepLink = deepLink
+        self.sourceRef = sourceRef
+        self.createdAt = createdAt
+    }
+}
+
 /// Context delivered to the user's `onApply` handler registered via
 /// `client.workflows.define(...)`. Mirrors the JS client's apply context.
 public struct WorkflowApplyContext: @unchecked Sendable {
@@ -651,7 +709,7 @@ public struct WorkflowApplyContext: @unchecked Sendable {
     public let contextDocId: String?
     public let output: Any?
     public let startedByUserId: String?
-    public let meta: [String: Any]?
+    public let meta: [String: JSONValue]?
 
     public init(
         workflowKey: String,
@@ -660,7 +718,7 @@ public struct WorkflowApplyContext: @unchecked Sendable {
         contextDocId: String? = nil,
         output: Any? = nil,
         startedByUserId: String? = nil,
-        meta: [String: Any]? = nil
+        meta: [String: JSONValue]? = nil
     ) {
         self.workflowKey = workflowKey
         self.runKey = runKey
@@ -710,7 +768,25 @@ public struct ConnectionCloseEvent: Sendable {
 
 public struct ConnectionErrorEvent: Sendable {
     public let message: String?
-    public init(message: String? = nil) { self.message = message }
+    /// Document the failed message was about, when the server's `error` frame
+    /// names one. Nil for transport-level failures, which are not per-document.
+    public let documentId: String?
+    /// The client message type the server rejected (e.g. `syncStep1`).
+    public let messageType: String?
+    /// Free-form server-supplied context for the failure.
+    public let detail: JSONValue?
+
+    public init(
+        message: String? = nil,
+        documentId: String? = nil,
+        messageType: String? = nil,
+        detail: JSONValue? = nil
+    ) {
+        self.message = message
+        self.documentId = documentId
+        self.messageType = messageType
+        self.detail = detail
+    }
 }
 
 public struct DocumentOpenedEvent: Sendable {
@@ -784,18 +860,18 @@ public struct SchemaDiscoveredEvent: Sendable {
 ///
 /// (#996: the previous Swift-only `phase`/`elapsedMs` pair was removed —
 /// JS never carried those fields.)
-public struct SyncPerfEvent: @unchecked Sendable {
+public struct SyncPerfEvent: Sendable {
     public let documentId: String
     /// Server-provided per-phase timing map (mirrors JS `timings`).
-    public let timings: [String: Any]
+    public let timings: [String: JSONValue]
     /// Client-side derived timings (mirrors JS `clientTimings?`). `nil`
     /// until Swift grows sync-timing instrumentation.
-    public let clientTimings: [String: Any]?
+    public let clientTimings: [String: JSONValue]?
 
     public init(
         documentId: String,
-        timings: [String: Any] = [:],
-        clientTimings: [String: Any]? = nil
+        timings: [String: JSONValue] = [:],
+        clientTimings: [String: JSONValue]? = nil
     ) {
         self.documentId = documentId
         self.timings = timings
@@ -812,14 +888,14 @@ public struct SyncPerfEvent: @unchecked Sendable {
 /// pre-#1112, which double-emitted every start observed over WS.
 /// All fields beyond `workflowKey`/`runId` are optional so decoding /
 /// construction stays lenient when the frame omits them.
-public struct WorkflowStartedEvent: @unchecked Sendable {
+public struct WorkflowStartedEvent: Sendable {
     public let workflowKey: String
     public let runId: String
     public let workflowId: String?
     public let runKey: String?
     public let instanceId: String?
     public let contextDocId: String?
-    public let meta: [String: Any]?
+    public let meta: [String: JSONValue]?
 
     public init(
         workflowKey: String,
@@ -828,7 +904,7 @@ public struct WorkflowStartedEvent: @unchecked Sendable {
         runKey: String? = nil,
         instanceId: String? = nil,
         contextDocId: String? = nil,
-        meta: [String: Any]? = nil
+        meta: [String: JSONValue]? = nil
     ) {
         self.workflowKey = workflowKey
         self.runId = runId
@@ -894,24 +970,51 @@ public struct CacheUpdateFailedEvent: Sendable {
 
 // MARK: - Analytics context (P2)
 
-/// Bundle returned by `client.getLlmAnalyticsContext()` /
-/// `getGeminiAnalyticsContext()`. Lets feature code log structured
+/// Bundle returned by `client.llmAnalyticsContext` /
+/// `geminiAnalyticsContext`. Lets feature code log structured
 /// analytics events without holding a direct reference to the client.
 /// Matches js-bao's shape — `logEvent(event)` plus an `isEnabled`
 /// guard for callers that want to skip work when analytics is off.
-public final class AnalyticsContext: @unchecked Sendable {
-    private let logger: @Sendable ([String: Any]) -> Void
+public final class AnalyticsContext: Sendable {
+    private let logger: @Sendable ([String: JSONValue]) -> Void
+    private let asyncLogger: (@Sendable ([String: JSONValue]) async -> Void)?
     private let enabledCheck: @Sendable (String?) -> Bool
 
+    /// - Parameters:
+    ///   - logEvent: The synchronous logger. Still required, and still what a
+    ///     context built without an async logger falls back to.
+    ///   - logEventAsync: The logger `logEventAsync(_:)` awaits. Defaulted, so
+    ///     a context constructed before this parameter existed keeps compiling
+    ///     and keeps its old behavior.
+    ///   - isEnabled: Phase gate — see ``isEnabled(_:)``.
     public init(
-        logEvent: @escaping @Sendable ([String: Any]) -> Void,
+        logEvent: @escaping @Sendable ([String: JSONValue]) -> Void,
+        logEventAsync: (@Sendable ([String: JSONValue]) async -> Void)? = nil,
         isEnabled: @escaping @Sendable (String?) -> Bool = { _ in true }
     ) {
         self.logger = logEvent
+        self.asyncLogger = logEventAsync
         self.enabledCheck = isEnabled
     }
 
-    public func logEvent(_ event: [String: Any]) { logger(event) }
+    /// Log an event and return once it has reached the analytics buffer.
+    ///
+    /// The twin of `logEvent(_:)`, in the same shape as
+    /// `client.analytics.logEventAsync(_:)`. Use it when the event has to be
+    /// ordered against something that follows — a flush, a sign-out, a
+    /// teardown.
+    ///
+    /// A context constructed without a `logEventAsync:` closure falls back to
+    /// the synchronous one, calling it exactly once. That keeps a
+    /// hand-constructed context working; it just cannot promise the event has
+    /// landed, because its only logger does not report that either.
+    public func logEventAsync(_ event: [String: JSONValue]) async {
+        if let asyncLogger {
+            await asyncLogger(event)
+            return
+        }
+        logger(event)
+    }
 
     /// Optional `phase` argument — `"start"`, `"success"`, `"failure"`,
     /// or `nil` for "any phase". Matches js-bao's signature so the call

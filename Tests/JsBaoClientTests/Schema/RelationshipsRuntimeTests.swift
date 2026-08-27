@@ -212,12 +212,11 @@ final class RelationshipsRuntimeTests: XCTestCase {
                 type: .hasMany, target: posts!, foreignKey: "userId"
             )]
         )
-        let related = (batchRows.first?["_related"] as? [String: Any])?["posts_rel"]
-            as? [[String: Any]] ?? []
+        let related = batchRows.first?["_related"]?.objectValue?["posts_rel"]?.rowsValue ?? []
 
         XCTAssertEqual(
             lazy.map(\.id),
-            related.compactMap { $0["id"] as? String },
+            related.compactMap { $0["id"]?.stringValue },
             "lazy hasMany must return the same records in the same order as the batch include path"
         )
         XCTAssertEqual(lazy.map(\.id), ["p1", "p2", "p3"])
@@ -251,12 +250,11 @@ final class RelationshipsRuntimeTests: XCTestCase {
                 sort: ["createdAt": -1]
             )]
         )
-        let related = (batchRows.first?["_related"] as? [String: Any])?["posts_rel"]
-            as? [[String: Any]] ?? []
+        let related = batchRows.first?["_related"]?.objectValue?["posts_rel"]?.rowsValue ?? []
 
         XCTAssertEqual(
             lazy.map(\.id),
-            related.compactMap { $0["id"] as? String }
+            related.compactMap { $0["id"]?.stringValue }
         )
         XCTAssertEqual(lazy.map(\.id), ["pB", "pC", "pA"])
     }

@@ -10,23 +10,18 @@ import Foundation
 
 // MARK: Enums
 
-/// Lifecycle state of a cron trigger. Mirrors JS
-/// `CronTriggerInfo.state` — note `error_paused` only ever appears on a
-/// *read* (a trigger the platform auto-paused after repeated failures);
-/// it is not a value you can set via `update` (see `UpdateCronTriggerState`).
-public enum CronTriggerState: String, Codable, Sendable {
+/// Whether an object is in service. Mirrors JS `ObjectStatus` — one
+/// server-owned field with one writer pair (`disable` / `enable`), shared by
+/// every type that has it. `archived` is a delete tombstone and only appears
+/// on the types whose delete flow writes one.
+///
+/// It replaces `CronTriggerState`, which mixed availability (`paused`) with
+/// lifecycle (`error_paused`, `archived`) and was settable through `update`.
+/// A trigger the platform took out of service after a failed fire is
+/// `.inactive` with `lastError` set; `enable` clears both.
+public enum ObjectStatus: String, Codable, Sendable {
     case active
-    case paused
-    case errorPaused = "error_paused"
-    case archived
-}
-
-/// The subset of `CronTriggerState` a caller may assign through `update`.
-/// JS `UpdateCronTriggerParams.state` is `"active" | "paused" | "archived"`
-/// — `error_paused` is platform-set only.
-public enum UpdateCronTriggerState: String, Codable, Sendable {
-    case active
-    case paused
+    case inactive
     case archived
 }
 
@@ -59,7 +54,7 @@ public struct CronTriggerInfo: Decodable, Sendable, Equatable {
     public let overlapPolicy: CronOverlapPolicy
     public let rootInput: String?
     public let inputMapping: String?
-    public let state: CronTriggerState
+    public let status: ObjectStatus
     public let lastError: String?
     public let lastTriggeredAt: String?
     public let lastTriggeredRunId: String?
@@ -139,7 +134,6 @@ public struct UpdateCronTriggerParams: Encodable, Sendable {
     public var overlapPolicy: CronOverlapPolicy?
     public var rootInput: JSONValue?
     public var inputMapping: JSONValue?
-    public var state: UpdateCronTriggerState?
 
     public init(
         displayName: String? = nil,
@@ -149,8 +143,7 @@ public struct UpdateCronTriggerParams: Encodable, Sendable {
         workflowKey: String? = nil,
         overlapPolicy: CronOverlapPolicy? = nil,
         rootInput: JSONValue? = nil,
-        inputMapping: JSONValue? = nil,
-        state: UpdateCronTriggerState? = nil
+        inputMapping: JSONValue? = nil
     ) {
         self.displayName = displayName
         self.description = description
@@ -160,7 +153,6 @@ public struct UpdateCronTriggerParams: Encodable, Sendable {
         self.overlapPolicy = overlapPolicy
         self.rootInput = rootInput
         self.inputMapping = inputMapping
-        self.state = state
     }
 }
 

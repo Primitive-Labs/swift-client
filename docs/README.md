@@ -2,6 +2,8 @@
 
 A native Swift SDK for the [Primitive](https://primitive.dev) collaboration platform. Real-time document editing via Yjs CRDTs, offline-first persistence, authentication, blob management, and a full REST API surface — designed for iOS 16+ and macOS 13+.
 
+**Toolchain floor: Swift 6.1 (Xcode 16.3) or newer.** `Package.swift` declares `swift-tools-version: 6.1`, so an older toolchain cannot resolve the package at all. The manifest went from 6.0 to 6.1 in #2966: `Target.directoryURL` is the only non-deprecated way for the codegen plugin to read a consuming target's source directory, and SwiftPM compiles that plugin inside every package that uses it, so the 6.0 spelling printed a deprecation warning on every consumer build.
+
 This directory is the navigation guide for everything in `swift-client/`. Start here.
 
 ## Where to look
@@ -72,10 +74,20 @@ doc.transactSync { txn in
     map.updateValue("world", forKey: "hello", transaction: txn)
 }
 
-// Listen for events
-client.events.on(.sync) { (event: SyncEvent) in
+// Listen for events. The payload type names its own event, so there is no
+// separate event argument to get wrong.
+for await event in client.stream(for: SyncEvent.self) {
     print("Document \(event.documentId) synced: \(event.synced)")
 }
+
+// For a callback instead of a loop — an ObservableObject wiring itself up, say
+// — `observeOnMainActor` runs the handler on the main actor. Hold the returned
+// EventSubscription for as long as you want the handler live.
+syncSubscription = client.observeOnMainActor(SyncEvent.self) { event in
+    print("Document \(event.documentId) synced: \(event.synced)")
+}
+
+// For one occurrence: `try await client.nextEvent(SyncEvent.self, timeout: 30)`.
 ```
 
 ## Status
@@ -84,12 +96,24 @@ This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method
 
 ## Breaking changes in the current parity batch
 
+- The whole untyped event surface — `client.events`, `on`, `onAny`,
+  `emit(_:_:)` and the free `waitForEvent(emitter:...)` — is **deprecated** and
+  is removed in the next major release. Migrate to
+  `client.stream(for:buffering:replayingLatest:)`,
+  `client.observeOnMainActor(_:handler:)` and
+  `client.nextEvent(_:timeout:where:)`, which derive the event key from the
+  payload type. Deprecated calls keep working — and keep their synchronous,
+  in-registration-order delivery — for the whole window.
 - `.invitation` event handlers now receive `InvitationEvent`, not the raw
   `[String: Any]` WebSocket dictionary. Existing subscribers written as
   `client.events.on(.invitation) { (payload: [String: Any]) in ... }` will no
   longer match the typed payload. Migrate to
-  `client.events.on(.invitation) { (event: InvitationEvent) in ... }`, or use
-  `onAny(.invitation)` during a temporary migration window.
+  `for await event in client.stream(for: InvitationEvent.self)`.
+- Nine events that used to be emitted as bare `[String: Any]` dictionaries are
+  typed payloads now (`meUpdated`, `pendingCreateFailed`, `authRefreshDeferred`,
+  the five `offlineAuth*` events, and `blobsQueueDrained`). A handler still
+  annotated `[String: Any]` keeps receiving the pre-conversion dictionary for
+  the whole deprecation window.
 
 ## Parity policy
 

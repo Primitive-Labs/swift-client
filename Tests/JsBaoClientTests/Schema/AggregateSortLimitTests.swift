@@ -49,7 +49,7 @@ final class AggregateSortLimitTests: XCTestCase {
             sort: AggregateSort(field: "n", direction: -1)
         ))
         XCTAssertEqual(
-            rows.compactMap { $0["kind"] as? String },
+            rows.compactMap { $0["kind"]?.stringValue },
             ["login", "signup", "purchase"],
             "Ordered by count DESC"
         )
@@ -63,7 +63,7 @@ final class AggregateSortLimitTests: XCTestCase {
             sort: AggregateSort(field: "n", direction: 1)
         ))
         XCTAssertEqual(
-            rows.compactMap { $0["kind"] as? String },
+            rows.compactMap { $0["kind"]?.stringValue },
             ["purchase", "signup", "login"]
         )
     }
@@ -78,7 +78,7 @@ final class AggregateSortLimitTests: XCTestCase {
             sort: AggregateSort(field: "kind", direction: 1)
         ))
         XCTAssertEqual(
-            rows.compactMap { $0["kind"] as? String },
+            rows.compactMap { $0["kind"]?.stringValue },
             ["login", "purchase", "signup"]
         )
     }
@@ -94,7 +94,7 @@ final class AggregateSortLimitTests: XCTestCase {
             limit: 1
         ))
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0]["kind"] as? String, "login")
+        XCTAssertEqual(rows[0]["kind"]?.stringValue, "login")
     }
 
     /// Top-2 by sum of score — combines sort by a numeric aggregate
@@ -109,8 +109,8 @@ final class AggregateSortLimitTests: XCTestCase {
         ))
         XCTAssertEqual(rows.count, 2)
         // login sum = 15, signup sum = 14, purchase sum = 12
-        XCTAssertEqual(rows[0]["kind"] as? String, "login")
-        XCTAssertEqual(rows[1]["kind"] as? String, "signup")
+        XCTAssertEqual(rows[0]["kind"]?.stringValue, "login")
+        XCTAssertEqual(rows[1]["kind"]?.stringValue, "signup")
     }
 
     // MARK: - sort + limit + filter
@@ -130,8 +130,8 @@ final class AggregateSortLimitTests: XCTestCase {
             limit: 1
         ))
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0]["kind"] as? String, "login")
-        XCTAssertEqual(rows[0]["n"] as? Int, 2)
+        XCTAssertEqual(rows[0]["kind"]?.stringValue, "login")
+        XCTAssertEqual(rows[0]["n"]?.numberValue, 2)
     }
 
     // MARK: - cross-doc via MultiDocModel
@@ -158,7 +158,7 @@ final class AggregateSortLimitTests: XCTestCase {
         ))
         XCTAssertEqual(rows.count, 1,
                        "Scoped aggregate with ORDER BY/LIMIT must execute")
-        XCTAssertEqual(rows[0]["n"] as? Int, 2,
+        XCTAssertEqual(rows[0]["n"]?.numberValue, 2,
                        "Must count only this doc's 2 records")
     }
 
@@ -207,8 +207,8 @@ final class AggregateSortLimitTests: XCTestCase {
         ))
         XCTAssertEqual(rows.count, 1,
                        "Only 'login' in docA has records tagged 'red'")
-        XCTAssertEqual(rows[0]["kind"] as? String, "login")
-        XCTAssertEqual(rows[0]["n"] as? Int, 2,
+        XCTAssertEqual(rows[0]["kind"]?.stringValue, "login")
+        XCTAssertEqual(rows[0]["n"]?.numberValue, 2,
                        "Must count only docA's 2 red-tagged login records")
     }
 
@@ -233,7 +233,7 @@ final class AggregateSortLimitTests: XCTestCase {
             limit: 1
         ))
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0]["kind"] as? String, "login")
-        XCTAssertEqual(rows[0]["n"] as? Int, 3, "3 login records across both docs")
+        XCTAssertEqual(rows[0]["kind"]?.stringValue, "login")
+        XCTAssertEqual(rows[0]["n"]?.numberValue, 3, "3 login records across both docs")
     }
 }

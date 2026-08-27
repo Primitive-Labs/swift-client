@@ -69,11 +69,11 @@ final class PerRecordObservationTests: XCTestCase {
             "name": .string("before"), "score": .number(1),
         ])
         let first = try model.query(["id": "r1"])
-        XCTAssertEqual(first.first?["name"] as? String, "before")
+        XCTAssertEqual(first.first?["name"]?.stringValue, "before")
 
         try model.update(id: "r1", values: ["name": .string("after")])
         let second = try model.query(["id": "r1"])
-        XCTAssertEqual(second.first?["name"] as? String, "after",
+        XCTAssertEqual(second.first?["name"]?.stringValue, "after",
                        "query immediately after update must see new state")
     }
 
@@ -114,8 +114,8 @@ final class PerRecordObservationTests: XCTestCase {
 
         // query() drains pending observer work before reading.
         let rows = try modelA.query(["id": "remote_r"])
-        XCTAssertEqual(rows.first?["name"] as? String, "from-b")
-        XCTAssertEqual(rows.first?["score"] as? Double, 7)
+        XCTAssertEqual(rows.first?["name"]?.stringValue, "from-b")
+        XCTAssertEqual(rows.first?["score"]?.numberValue, 7)
     }
 
     /// Remote delete: another doc removes the record → applyUpdate →
@@ -168,7 +168,7 @@ final class PerRecordObservationTests: XCTestCase {
         record["score"] = .number(42)
 
         let row = try model.query(["id": "r1"]).first
-        XCTAssertEqual(row?["score"] as? Double, 42)
+        XCTAssertEqual(row?["score"]?.numberValue, 42)
     }
 
     /// Model deinit clears its subscriptions — no memory leaks via
@@ -202,7 +202,7 @@ final class PerRecordObservationTests: XCTestCase {
         // findAll pass.
         let fresh = DynamicModel(doc: doc, schema: schema)
         let rows = try fresh.query(nil)
-        XCTAssertEqual(Set(rows.compactMap { $0["id"] as? String }),
+        XCTAssertEqual(Set(rows.compactMap { $0["id"]?.stringValue }),
                        ["r1", "r2"])
     }
 

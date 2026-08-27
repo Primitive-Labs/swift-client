@@ -392,9 +392,61 @@ final class SchemaSyncTests: XCTestCase {
         )
     }
 
-    /// After `clearCache`, a repeat sync may still be a no-op because the
-    /// underlying Y.Map is idempotent — but the function must not throw
-    /// or corrupt the doc.
+    /// Collects update frames off a doc's observer.
+    private final class UpdateSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var frames: [[UInt8]] = []
+        func append(_ update: [UInt8]) { lock.withLock { frames.append(update) } }
+        var count: Int { lock.withLock { frames.count } }
+    }
+
+    /// The load-bearing claim behind "a warm relaunch sends zero meta frames"
+    /// (#2587): with the session cache cold — a fresh process opening a doc
+    /// whose state already carries `_meta_*` — the sync must emit NO CRDT ops
+    /// at all. That rests on `setEncodedIfChanged` comparing the encoder's
+    /// output against what yrs hands back out of the map, so a divergence in
+    /// JSON spelling between the two (float formatting, string escaping) would
+    /// silently re-write every field on every launch. Assert on the update
+    /// stream rather than on state bytes: a re-write of an identical value is
+    /// still a new op, and only the observer sees it.
+    func testColdCacheSyncAgainstMatchingMetaEmitsNoOps() throws {
+        SchemaSync.clearCache()
+        let schema = PrimitiveSchema(
+            name: "items",
+            fields: [
+                "id":    FieldDescriptor(type: .id, default: .function(name: "generate_ulid")),
+                "title": FieldDescriptor(type: .string, indexed: true, required: true, maxLength: 120),
+                "score": FieldDescriptor(type: .number, default: .scalar(.number(1.5))),
+                "done":  FieldDescriptor(type: .boolean, default: .scalar(.boolean(false))),
+            ]
+        )
+
+        // Session 1: author the meta.
+        let authored = YDocument()
+        SchemaSync.syncModelMeta(doc: authored, schema: schema)
+        let state = fullStateBytes(authored)
+
+        // Session 2: a relaunch loading that state, with a cold cache.
+        SchemaSync.clearCache()
+        let relaunched = YDocument()
+        relaunched.transactSync { txn in
+            try? txn.transactionApplyUpdate(update: [UInt8](state))
+        }
+
+        let sink = UpdateSink()
+        let subscription = relaunched.observeUpdate { sink.append($0) }
+        defer { _ = subscription }
+
+        SchemaSync.syncModelMeta(doc: relaunched, schema: schema)
+
+        XCTAssertEqual(
+            sink.count, 0,
+            "re-syncing a schema into a doc that already carries matching _meta_ must emit zero ops"
+        )
+    }
+
+    /// Same invariant on a single doc: clearing the cache and re-syncing must
+    /// be op-free, not merely non-destructive.
     func testSyncAfterClearCacheIsSafe() throws {
         let doc = YDocument()
         SchemaSync.clearCache()
@@ -404,7 +456,13 @@ final class SchemaSyncTests: XCTestCase {
         )
         SchemaSync.syncModelMeta(doc: doc, schema: schema)
         SchemaSync.clearCache(doc: doc)
+
+        let sink = UpdateSink()
+        let subscription = doc.observeUpdate { sink.append($0) }
+        defer { _ = subscription }
         SchemaSync.syncModelMeta(doc: doc, schema: schema)
+
+        XCTAssertEqual(sink.count, 0, "cache-cold re-sync of identical meta must be op-free")
 
         // Still present and correct
         XCTAssertEqual(

@@ -81,7 +81,7 @@ final class WireFormatGapFixesTests: XCTestCase {
     func test_A_ne_excludes_null_rows() throws {
         let model = try seededAssignees()
         let rows = try model.query(["assignee": ["$ne": "alice"]])
-        let assignees = rows.compactMap { $0["assignee"] as? String }
+        let assignees = rows.compactMap { $0["assignee"]?.stringValue }
         XCTAssertEqual(
             assignees, ["bob"],
             "$ne should match js-bao: exclude NULL rows. " +
@@ -96,7 +96,7 @@ final class WireFormatGapFixesTests: XCTestCase {
     func test_B_nin_excludes_null_rows() throws {
         let model = try seededAssignees()
         let rows = try model.query(["assignee": ["$nin": ["alice"]]])
-        let assignees = rows.compactMap { $0["assignee"] as? String }
+        let assignees = rows.compactMap { $0["assignee"]?.stringValue }
         XCTAssertEqual(
             assignees, ["bob"],
             "$nin should match js-bao: exclude NULL rows. Same " +
@@ -141,7 +141,7 @@ final class WireFormatGapFixesTests: XCTestCase {
         let rows = try model.query([
             "title": ["$containsText": "  widget  "],
         ])
-        let titles = rows.compactMap { $0["title"] as? String }
+        let titles = rows.compactMap { $0["title"]?.stringValue }
         XCTAssertEqual(
             titles, ["Alpha widget"],
             "js-bao's browser.ts trims `$containsText` input before " +
@@ -159,7 +159,7 @@ final class WireFormatGapFixesTests: XCTestCase {
         // old silent cap-at-1024.
         let longProbe = "widget" + String(repeating: "Z", count: 2000)
         XCTAssertThrowsError(
-            try model.query(["title": ["$containsText": longProbe]])
+            try model.query(["title": ["$containsText": .string(longProbe)]])
         ) { error in
             guard let jbe = error as? JsBaoError else {
                 XCTFail("expected JsBaoError, got \(error)"); return
@@ -376,7 +376,7 @@ final class WireFormatGapFixesTests: XCTestCase {
             "SELECT \"_meta_doc_id\" FROM \"\(model.inspectionTableName)\" WHERE id = 'm0'"
         )
         XCTAssertEqual(
-            rows.first?["_meta_doc_id"] as? String,
+            rows.first?["_meta_doc_id"]?.stringValue,
             "__legacy_default__",
             "mirror rows must carry js-bao's DEFAULT_LEGACY_DOC_ID"
         )

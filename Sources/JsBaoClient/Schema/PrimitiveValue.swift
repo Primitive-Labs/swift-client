@@ -138,7 +138,18 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
             switch yrsString {
             case "true":  return .boolean(true)
             case "false": return .boolean(false)
-            default:      return nil
+            default:
+                // A `boolean` field whose CRDT value is the NUMBER 0/1 rather
+                // than a literal boolean (#2825). Workflow writes produce that
+                // today (#2823, #2824), and the JS client reads those rows fine
+                // via truthiness — a strict decode here returned nil, the field
+                // never landed in the SQLite mirror row, and the generated
+                // `init?(row:)` required-field guard then dropped the whole
+                // record. The row-side `rowBoolValue` already reads
+                // `.number(0)` / `.number(1)`; this is the same rule on the
+                // yrs-string side. Non-finite values are not booleans.
+                guard let n = Double(yrsString), n.isFinite else { return nil }
+                return .boolean(n != 0)
             }
         case .id:
             guard let s = decodeJsonString(yrsString) else { return nil }

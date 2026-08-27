@@ -28,14 +28,14 @@ final class AuthApiTests: XCTestCase {
     // MARK: - Identity accessors
 
     /// Happy path: with a valid token applied, the typed accessors mirror JS
-    /// `getUserId()/getToken()/isAuthenticated()` and `waitForUserId` resolves
+    /// `userId`/`token`/`isAuthenticated()` and `waitForUserId` resolves
     /// immediately with the JWT's user id.
     func testIdentityAccessorsReflectToken() async throws {
         XCTAssertTrue(client.auth.isAuthenticated())
-        XCTAssertEqual(client.auth.getToken(), testApp.ownerJWT)
-        XCTAssertEqual(client.auth.getUserId(), testApp.ownerUserId)
+        XCTAssertEqual(client.auth.token, testApp.ownerJWT)
+        XCTAssertEqual(client.auth.userId, testApp.ownerUserId)
 
-        let uid = try await client.auth.waitForUserId(timeoutMs: 2000)
+        let uid = try await client.auth.waitForUserId(timeout: 2)
         XCTAssertEqual(uid, testApp.ownerUserId)
     }
 
@@ -100,17 +100,22 @@ final class AuthApiTests: XCTestCase {
         }
     }
 
-    /// Edge: with OTP disabled the request endpoint rejects rather than
-    /// silently succeeding.
-    func testOtpRequestRejectsWhenDisabled() async throws {
+    /// Edge: with email sign-in disabled the request endpoint rejects rather
+    /// than silently succeeding. Since #2884 there is no per-method OTP
+    /// toggle: `otpEnabled` is a compatibility field derived from the one
+    /// `emailSignInEnabled` flow (writing `otpEnabled: false` alone leaves
+    /// email sign-in on), and `/auth/otp/request` is a deprecated alias of
+    /// the unified issuance path — so only turning email sign-in off as a
+    /// whole produces the rejection.
+    func testOtpRequestRejectsWhenEmailSignInDisabled() async throws {
         try await ctx.updateAppSettings(
             appId: testApp.appId,
-            settings: ["otpEnabled": false]
+            settings: ["emailSignInEnabled": false]
         )
 
         do {
             _ = try await client.auth.otpRequest(email: "test@example.com")
-            XCTFail("otpRequest must throw when OTP is disabled for the app")
+            XCTFail("otpRequest must throw when email sign-in is disabled for the app")
         } catch {
             let msg = String(describing: error)
             XCTAssertTrue(
@@ -130,7 +135,10 @@ final class AuthApiTests: XCTestCase {
             appId: testApp.appId,
             settings: [
                 "magicLinkEnabled": true,
-                "redirectUris": ["https://example.com/callback"],
+                // The magic-link allow-list is its own key as of #2891, and it
+                // is fail-closed: with none of these set the server rejects
+                // every request rather than allowing any redirect.
+                "emailRedirectUris": ["https://example.com/callback"],
             ]
         )
 
@@ -158,7 +166,10 @@ final class AuthApiTests: XCTestCase {
             appId: testApp.appId,
             settings: [
                 "magicLinkEnabled": true,
-                "redirectUris": ["https://example.com/callback"],
+                // The magic-link allow-list is its own key as of #2891, and it
+                // is fail-closed: with none of these set the server rejects
+                // every request rather than allowing any redirect.
+                "emailRedirectUris": ["https://example.com/callback"],
             ]
         )
 
@@ -189,7 +200,7 @@ final class AuthApiTests: XCTestCase {
         XCTAssertTrue(loggedOut.auth.isAuthenticated())
         try await loggedOut.auth.logout()
         XCTAssertFalse(loggedOut.auth.isAuthenticated())
-        XCTAssertNil(loggedOut.auth.getToken())
-        XCTAssertNil(loggedOut.auth.getUserId())
+        XCTAssertNil(loggedOut.auth.token)
+        XCTAssertNil(loggedOut.auth.userId)
     }
 }

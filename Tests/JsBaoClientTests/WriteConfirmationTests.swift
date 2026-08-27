@@ -60,7 +60,7 @@ final class WriteConfirmationTests: XCTestCase {
                       "precondition: initial sync marks the doc synced")
 
         do {
-            try await client.waitForWriteConfirmation(documentId: docId, timeoutMs: 300, pollMs: 50)
+            try await client.waitForWriteConfirmation(documentId: docId, timeout: 0.3, pollInterval: 0.05)
             XCTFail("waitForWriteConfirmation confirmed with the socket down — it trusted the sticky isSynced flag")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .unavailable, "expected a timeout, not \(error.code)")
@@ -79,7 +79,7 @@ final class WriteConfirmationTests: XCTestCase {
         XCTAssertTrue(client.documentManager.isSynced(docId))
 
         do {
-            try await client.waitForInSync(documentId: docId, timeoutMs: 300, pollMs: 50)
+            try await client.waitForInSync(documentId: docId, timeout: 0.3, pollInterval: 0.05)
             XCTFail("waitForInSync confirmed with the socket down — it trusted the sticky isSynced flag")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .unavailable, "expected a timeout, not \(error.code)")
@@ -98,7 +98,7 @@ final class WriteConfirmationTests: XCTestCase {
         client.documentManager.handleSyncComplete(documentId: docId)
 
         do {
-            try await client.documents.waitForInSync(documentId: docId, timeoutMs: 300, pollMs: 50)
+            try await client.documents.waitForInSync(documentId: docId, timeout: 0.3, pollInterval: 0.05)
             XCTFail("documents.waitForInSync confirmed with the socket down")
         } catch {
             // expected timeout
@@ -180,7 +180,7 @@ final class WriteConfirmationTests: XCTestCase {
             globalAdminAppId: TestConfig.globalAdminAppId,
             logLevel: .none,
             storageConfig: .memory,
-            sync: SyncConfig(outboundDebounceMs: 60_000),
+            sync: SyncConfig(outboundDebounce: 60),
             autoNetwork: false
         ))
         defer { Task { await client.destroy() } }
@@ -212,7 +212,7 @@ final class WriteConfirmationTests: XCTestCase {
     // MARK: - Waiter honors the caller's short timeout (codex review #1979)
 
     /// When the socket is open but the server never answers a
-    /// `stateVectorCheck`, `waitForInSync(timeoutMs:)` must return within
+    /// `stateVectorCheck`, `waitForInSync(timeout:)` must return within
     /// roughly its requested window — not block for `checkStateVector`'s full
     /// 5s default. Uses an in-process loopback server that accepts the socket
     /// and stays silent, plus a locally-opened doc so `checkStateVector`
@@ -253,7 +253,7 @@ final class WriteConfirmationTests: XCTestCase {
 
         let start = Date()
         do {
-            try await client.waitForInSync(documentId: docId, timeoutMs: 300, pollMs: 50)
+            try await client.waitForInSync(documentId: docId, timeout: 0.3, pollInterval: 0.05)
             XCTFail("waitForInSync confirmed although the server never answered")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .unavailable)

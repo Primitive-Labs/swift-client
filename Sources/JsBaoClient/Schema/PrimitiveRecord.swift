@@ -9,7 +9,21 @@ import Yniffi
 /// The record holds a reference to its parent `DynamicModel` so writes
 /// are scoped to the same transaction dispatch policy (sync or
 /// client-integrated) the model was set up with.
-public final class PrimitiveRecord {
+///
+/// ## `Sendable` — plain and checked (#1992, Phase C)
+///
+/// No `@unchecked` here, and none is needed: all three stored properties are
+/// `let` and `Sendable` (`String`, `String`, and `DynamicModel`, which is
+/// `@unchecked Sendable` behind its documented lock invariants). The compiler
+/// verifies this conformance, so the type carries no safety-argument debt of
+/// its own — that debt is `DynamicModel`'s, stated once there.
+///
+/// It stays a **live handle**, not a value snapshot: a subscript read goes
+/// through the model to the CRDT and so reflects concurrent writes, and the
+/// subscript setter writes through (#1156). Sending a `PrimitiveRecord` across
+/// an isolation boundary sends the handle; the data it reads through stays
+/// serialized by the model's locks.
+public final class PrimitiveRecord: Sendable {
     public let modelName: String
     public let id: String
 

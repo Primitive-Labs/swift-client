@@ -17,9 +17,14 @@ enum CrossPlatformHarness {
     /// `require("js-bao")` / `require("yjs")` against the repo's
     /// `node_modules`, which lives two levels above `harness/`.
     static var harnessDir: URL {
-        // __FILE__ equivalent — this file lives at
+        // This file lives at
         // swift-client/Tests/JsBaoClientTests/CrossPlatform/CrossPlatformHarness.swift
-        let thisFile = URL(fileURLWithPath: #file)
+        //
+        // `#filePath`, not `#file`: under the Swift 6 language mode `#file` is
+        // the *concise* form (`<module>/<file>`), so it resolves against the
+        // process's working directory instead of the source tree and every
+        // cross-platform test silently turns into an XCTSkip (#2310).
+        let thisFile = URL(fileURLWithPath: #filePath)
         return thisFile.deletingLastPathComponent().appendingPathComponent("harness")
     }
 

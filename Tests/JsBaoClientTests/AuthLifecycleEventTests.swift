@@ -32,10 +32,10 @@ final class AuthLifecycleEventTests: XCTestCase {
         try await waitForConnection(client: client)
 
         let order = OrderRecorder()
-        let logoutSub = client.events.on(.authLogout) { (_: AuthLogoutEvent) in
+        let logoutSub = client.eventEmitter.subscribe(AuthLogoutEvent.self) { _ in
             order.append("logout")
         }
-        let completeSub = client.events.on(.authLogoutComplete) { (_: AuthLogoutCompleteEvent) in
+        let completeSub = client.eventEmitter.subscribe(AuthLogoutCompleteEvent.self) { _ in
             order.append("complete")
         }
 
@@ -46,7 +46,7 @@ final class AuthLifecycleEventTests: XCTestCase {
             order.snapshot(), ["logout", "complete"],
             "Expected auth:logout to fire immediately and auth:logout:complete after teardown"
         )
-        XCTAssertNil(client.auth.getToken(), "Token should be cleared after logout")
+        XCTAssertNil(client.auth.token, "Token should be cleared after logout")
         XCTAssertFalse(client.isAuthenticated(), "Client should be signed out after logout")
 
         logoutSub.cancel()
@@ -60,10 +60,10 @@ final class AuthLifecycleEventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let order = OrderRecorder()
-        let logoutSub = client.events.on(.authLogout) { (_: AuthLogoutEvent) in
+        let logoutSub = client.eventEmitter.subscribe(AuthLogoutEvent.self) { _ in
             order.append("logout")
         }
-        let completeSub = client.events.on(.authLogoutComplete) { (_: AuthLogoutCompleteEvent) in
+        let completeSub = client.eventEmitter.subscribe(AuthLogoutCompleteEvent.self) { _ in
             order.append("complete")
         }
 
@@ -87,10 +87,10 @@ final class AuthLifecycleEventTests: XCTestCase {
 
         // Sign out so there is no token, then try to come back online.
         try await client.auth.logout()
-        XCTAssertNil(client.auth.getToken())
+        XCTAssertNil(client.auth.token)
 
         let order = OrderRecorder()
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 
@@ -102,7 +102,7 @@ final class AuthLifecycleEventTests: XCTestCase {
             "Expected auth:onlineAuthRequired when going online without a valid token"
         )
         XCTAssertEqual(
-            client.getNetworkMode(), .offline,
+            client.networkMode, .offline,
             "Client should revert to offline mode when online auth is required"
         )
         XCTAssertFalse(client.isConnected, "Client must not connect without a token")
@@ -121,19 +121,19 @@ final class AuthLifecycleEventTests: XCTestCase {
 
         // Sign out so there is no token, then force online via the sync API.
         try await client.auth.logout()
-        XCTAssertNil(client.auth.getToken())
+        XCTAssertNil(client.auth.token)
 
         let order = OrderRecorder()
-        let modeSub = client.events.on(.networkMode) { (e: NetworkModeEvent) in
+        let modeSub = client.eventEmitter.subscribe(NetworkModeEvent.self) { e in
             order.append("networkMode:\(e.mode.rawValue)")
         }
-        let authSub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let authSub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 
         client.setNetworkMode(.online)
         try await eventually(timeout: 5, description: "handoff reverts to offline") {
-            client.getNetworkMode() == .offline
+            client.networkMode == .offline
         }
         try await delay(0.2)
 
@@ -142,7 +142,7 @@ final class AuthLifecycleEventTests: XCTestCase {
             ["networkMode:online", "onlineAuthRequired", "networkMode:offline"],
             "setNetworkMode(.online) must produce the JS event sequence: online -> onlineAuthRequired -> offline revert"
         )
-        XCTAssertEqual(client.getNetworkMode(), .offline)
+        XCTAssertEqual(client.networkMode, .offline)
         XCTAssertFalse(client.isConnected, "Client must not connect without a token")
 
         modeSub.cancel()
@@ -156,7 +156,7 @@ final class AuthLifecycleEventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let order = OrderRecorder()
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 
@@ -166,7 +166,7 @@ final class AuthLifecycleEventTests: XCTestCase {
 
         XCTAssertTrue(order.snapshot().isEmpty,
                       "auth:onlineAuthRequired must not fire when a token is present")
-        XCTAssertEqual(client.getNetworkMode(), .online,
+        XCTAssertEqual(client.networkMode, .online,
                        "mode must not revert when the token is usable")
 
         sub.cancel()
@@ -178,7 +178,7 @@ final class AuthLifecycleEventTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let order = OrderRecorder()
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             order.append("onlineAuthRequired")
         }
 

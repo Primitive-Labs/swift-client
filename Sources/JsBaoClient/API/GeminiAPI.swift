@@ -3,21 +3,22 @@ import Foundation
 // MARK: - GeminiAPI
 
 public final class GeminiAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
 
     /// Emits a lifecycle analytics event. Injected by the client so the API
     /// can fire `prompt_started` / `prompt_succeeded` / `prompt_failed`
     /// around each call without holding a reference to the client. Mirrors
     /// js-bao's `getGeminiAnalyticsContext().logEvent(...)`
-    /// (`src/client/api/geminiApi.ts`). Defaults to a no-op so existing
-    /// callers/tests that construct `GeminiAPI(makeRequest:)` keep working.
+    /// (`src/client/api/geminiApi.ts`). Defaults to a no-op so a caller that
+    /// constructs `GeminiAPI(transport:)` without the client keeps working.
     private let logAnalytics: (AnalyticsEventInput) -> Void
 
+    /// Designated initializer — the typed transport spine.
     public init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
+        transport: any Transport,
         logAnalytics: @escaping (AnalyticsEventInput) -> Void = { _ in }
     ) {
-        self.makeRequest = makeRequest
+        self.transport = transport
         self.logAnalytics = logAnalytics
     }
 
@@ -38,14 +39,17 @@ public final class GeminiAPI: @unchecked Sendable {
     ///   `candidates`, `usage`, and the `raw` provider response.
     @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow gemini.generate step instead.")
     public func generate(options: GeminiGenerateOptions) async throws -> GeminiGenerateResult {
-        let body = try JSONCoding.jsonObject(from: options)
         let startedAt = Date()
         let details = Self.promptDetails(options)
         emitAnalytics(.start, operation: .generate, details: details)
         do {
-            let result = try await makeRequest("POST", "/gemini/generate", body)
+            let result: GeminiGenerateResult = try await transport.request(
+                method: .post,
+                path: "/gemini/generate",
+                body: options
+            )
             emitAnalytics(.success, operation: .generate, details: details, startedAt: startedAt)
-            return try JSONCoding.decode(GeminiGenerateResult.self, from: result)
+            return result
         } catch {
             emitAnalytics(.failure, operation: .generate, details: details, startedAt: startedAt, error: error)
             throw Self.rethrowAsGeminiError(error)
@@ -56,8 +60,7 @@ public final class GeminiAPI: @unchecked Sendable {
     /// - Returns: A typed `GeminiModelsResult` with `models` and `defaultModel`.
     @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow gemini.generate step instead.")
     public func models() async throws -> GeminiModelsResult {
-        let result = try await makeRequest("GET", "/gemini/models", nil)
-        return try JSONCoding.decode(GeminiModelsResult.self, from: result)
+        try await transport.request(method: .get, path: "/gemini/models")
     }
 
     /// Counts the number of tokens in a prompt without generating a response.
@@ -69,14 +72,17 @@ public final class GeminiAPI: @unchecked Sendable {
     ///   optional `promptTokens`, `candidates`, and `raw`.
     @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Use client.prompts.execute (managed prompts) or a workflow gemini.generate step instead.")
     public func countTokens(options: GeminiPromptOptions) async throws -> GeminiCountTokensResult {
-        let body = try JSONCoding.jsonObject(from: options)
         let startedAt = Date()
         let details = Self.promptDetails(options)
         emitAnalytics(.start, operation: .countTokens, details: details)
         do {
-            let result = try await makeRequest("POST", "/gemini/count-tokens", body)
+            let result: GeminiCountTokensResult = try await transport.request(
+                method: .post,
+                path: "/gemini/count-tokens",
+                body: options
+            )
             emitAnalytics(.success, operation: .countTokens, details: details, startedAt: startedAt)
-            return try JSONCoding.decode(GeminiCountTokensResult.self, from: result)
+            return result
         } catch {
             emitAnalytics(.failure, operation: .countTokens, details: details, startedAt: startedAt, error: error)
             throw Self.rethrowAsGeminiError(error)
@@ -100,36 +106,34 @@ public final class GeminiAPI: @unchecked Sendable {
             throw JsBaoError(code: .geminiError, message: "body must be a JSON object for generateRaw")
         }
 
-        var queryParts = ["model=\(model.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? model)"]
-        if let query = options.query {
-            for (key, value) in query {
+        var query = URLQuery()
+        query.append("model", model)
+        if let extraQuery = options.query {
+            for (key, value) in extraQuery {
                 if value.isNull { continue }
-                let stringValue = Self.queryStringValue(value)
-                let encodedKey = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key
-                let encodedValue = stringValue.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? stringValue
-                queryParts.append("\(encodedKey)=\(encodedValue)")
+                query.append(key, Self.queryStringValue(value))
             }
         }
-        let path = "/gemini/generate-raw?\(queryParts.joined(separator: "&"))"
-
-        // Re-materialize the typed `body` into the `Any` graph `makeRequest`
-        // expects for its JSON body argument.
-        let bodyAny = try JSONCoding.jsonObject(from: JSONValue.object(bodyObject))
+        let path = "/gemini/generate-raw\(query.queryString)"
 
         let startedAt = Date()
         let details = Self.rawDetails(model: model, body: bodyObject)
         emitAnalytics(.start, operation: .generateRaw, details: details)
         do {
-            let result = try await makeRequest("POST", path, bodyAny)
+            let result: JSONValue = try await transport.request(
+                method: .post,
+                path: path,
+                body: JSONValue.object(bodyObject)
+            )
             emitAnalytics(.success, operation: .generateRaw, details: details, startedAt: startedAt)
-            return try JSONCoding.decode(JSONValue.self, from: result)
+            return result
         } catch {
             emitAnalytics(.failure, operation: .generateRaw, details: details, startedAt: startedAt, error: error)
             throw Self.rethrowAsGeminiError(error)
         }
     }
 
-    /// Normalize any provider/transport failure from `makeRequest` into a
+    /// Normalize any provider/transport failure from the transport into a
     /// uniform `JsBaoError(code: .geminiError, …)`, so callers can catch a
     /// single stable code across every `gemini.*` method. Mirrors the JS
     /// client's `rethrowAsGeminiError` / `parseHttpError`

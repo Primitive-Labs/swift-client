@@ -6,7 +6,7 @@ import Foundation
 // shapes (`packages/js-bao/src/initialize-do.ts` +
 // `engines/cloudflare/DOClientEngine.ts` + `createDocumentDO.ts`). The
 // Swift `DoDb` handle (`API/DoDb.swift`) routes every method through the
-// same `makeRequest` closure `DatabasesAPI` uses, hitting the per-database
+// same transport `DatabasesAPI` uses, hitting the per-database
 // `/databases/{id}/records` endpoint with a `?docId={id}` query param —
 // the exact route the JS engine builds from its `endpoint` + `docId`.
 //

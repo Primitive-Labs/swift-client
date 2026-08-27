@@ -101,11 +101,12 @@ final class CollectionsTests: XCTestCase {
 
     func testGrantGroupPermissionAndSeeInAccess() async throws {
         // Create a group via HTTP
-        _ = try await client.makeRequest("POST", "/groups", [
+        let devGroup: [String: JSONValue] = [
             "groupType": "team",
             "groupId": "devs",
             "name": "Developers",
-        ])
+        ]
+        _ = try await client.requestJSON(method: .post, path: "/groups", body: devGroup)
 
         let created = try await client.collections.create(params: CreateCollectionParams(name: "group-perm-test"))
         let collectionId = created.collectionId
@@ -129,11 +130,12 @@ final class CollectionsTests: XCTestCase {
 
     func testRevokeGroupPermission() async throws {
         // Create a group via HTTP (may already exist from previous test, ignore error)
-        _ = try? await client.makeRequest("POST", "/groups", [
+        let revokeGroup: [String: JSONValue] = [
             "groupType": "team",
             "groupId": "revoke-devs",
             "name": "Revoke Developers",
-        ])
+        ]
+        _ = try? await client.requestJSON(method: .post, path: "/groups", body: revokeGroup)
 
         let created = try await client.collections.create(params: CreateCollectionParams(name: "revoke-perm-test"))
         let collectionId = created.collectionId
@@ -178,5 +180,36 @@ final class CollectionsTests: XCTestCase {
 
         let removeResult = try await client.collections.removeMember(collectionId: collectionId, userId: user2.userId)
         XCTAssertTrue(removeResult.success)
+    }
+
+    /// Live coverage for `documents.listGroupPermissions(includeSystem:)`
+    /// (#2360). Adding a document to a collection materializes the
+    /// collection's `_col-reader` / `_col-writer` system group permissions
+    /// onto the document. Before the fix Swift never sent
+    /// `?includeSystem=true`, so the server had already stripped those rows
+    /// and the flag could not return a system group at any input.
+    func testListGroupPermissionsIncludeSystemReturnsCollectionGroups() async throws {
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "system-groups-test"))
+        let collectionId = created.collectionId
+        _ = try await client.collections.addDocument(collectionId: collectionId, documentId: documentId)
+
+        let withSystem = try await client.documents.listGroupPermissions(
+            documentId: documentId, includeSystem: true
+        )
+        let systemTypes = withSystem.map { $0.groupType }.filter { $0.hasPrefix("_col-") }
+        XCTAssertFalse(
+            systemTypes.isEmpty,
+            "includeSystem: true must return the collection's _col-* group permissions, got \(withSystem.map { $0.groupType })"
+        )
+
+        let withoutSystem = try await client.documents.listGroupPermissions(documentId: documentId)
+        XCTAssertTrue(
+            withoutSystem.allSatisfy { !$0.groupType.hasPrefix("_") },
+            "the default must not return system groups"
+        )
+
+        // Cleanup
+        _ = try await client.collections.removeDocument(collectionId: collectionId, documentId: documentId)
+        _ = try await client.collections.delete(collectionId: collectionId)
     }
 }

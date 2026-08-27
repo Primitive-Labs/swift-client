@@ -85,7 +85,7 @@ public struct PasskeyRegisterStartResult: Sendable {
 
 /// Result of `auth.passkeyAuthFinish(...)` / `auth.signInWithPasskey(...)`.
 /// Mirrors JS `{ user, isNewUser? }`. On success the SDK has already applied
-/// the returned access token (cause `"passkey"`), emitting
+/// the returned access token (cause `"passkeyAuth"`), emitting
 /// `.authSuccess` / `.authState` like the other sign-in paths.
 public struct PasskeySignInResult: Decodable, Sendable, Equatable {
     public let user: AuthUser

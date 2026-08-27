@@ -6,17 +6,16 @@ import Foundation
 // MARK: - IntegrationsAPI
 
 public final class IntegrationsAPI: @unchecked Sendable {
-    /// The raw-response form of `makeRequest`. Returns the full
-    /// `HttpClientResponse` so we can read `status`, `headers`, and
-    /// the parsed `data` — the integration proxy contract puts the
-    /// upstream status in the response body, not the HTTP status, so
-    /// we need both layers to surface a structured response.
-    private let makeRawRequest: (String, String, Any?) async throws -> HttpClientResponse
+    /// Calls go through `Transport.requestRaw`, which returns the full
+    /// `HttpClientResponse` without throwing on a non-2xx status — the
+    /// integration proxy contract puts the upstream status in the response
+    /// body, not the HTTP status, so both layers are needed to surface a
+    /// structured response.
+    private let transport: any Transport
 
-    public init(
-        makeRawRequest: @escaping (String, String, Any?) async throws -> HttpClientResponse
-    ) {
-        self.makeRawRequest = makeRawRequest
+    /// Designated initializer — the typed transport spine.
+    public init(transport: any Transport) {
+        self.transport = transport
     }
 
     /// Call a third-party integration through the server proxy.
@@ -41,28 +40,26 @@ public final class IntegrationsAPI: @unchecked Sendable {
 
         // Build the proxy URL with the integration key URL-encoded so
         // keys containing slashes or special chars route correctly.
-        let escapedKey = request.integrationKey
-            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
-            ?? request.integrationKey
+        let escapedKey = URLEncoding.encodeComponent(request.integrationKey)
         let path = "/integrations/\(escapedKey)/proxy"
 
         // Wire payload mirrors the JS shape exactly. JS builds
         // `{ method, path, query, headers, body }` straight off the
         // request and lets `JSON.stringify` drop the `undefined` fields —
-        // it applies NO `method`/`path` defaults (#958). We do the same:
-        // include each field only when the caller supplied it. The typed
-        // `JSONValue` request body/query encode losslessly via
-        // `JSONCoding.jsonObject`.
-        var payload: [String: Any] = [:]
-        if let method = request.method { payload["method"] = method }
-        if let path = request.path { payload["path"] = path }
-        if let query = request.query { payload["query"] = try JSONCoding.jsonObject(from: query) }
-        if let headers = request.headers { payload["headers"] = headers }
-        if let body = request.body { payload["body"] = try JSONCoding.jsonObject(from: body) }
+        // it applies NO `method`/`path` defaults (#958). The typed payload
+        // below does the same: a `nil` field is omitted by `JSONEncoder`,
+        // and `JSONValue` carries the opaque query/body losslessly.
+        let payload = IntegrationProxyRequest(
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request.headers,
+            body: request.body
+        )
 
         let raw: HttpClientResponse
         do {
-            raw = try await makeRawRequest("POST", path, payload)
+            raw = try await transport.requestRaw(method: .post, path: path, body: payload)
         } catch let error as JsBaoError {
             throw error
         } catch {
@@ -83,10 +80,9 @@ public final class IntegrationsAPI: @unchecked Sendable {
             throw createIntegrationError(raw)
         }
 
-        // Validate the proxy envelope shape before unwrapping. `raw.data`
-        // is a `Sendable` `JSONValue?`; bridge it back to the loosely-typed
-        // Foundation graph this envelope parsing walks with `as?` casts.
-        guard let data = raw.data.flatMap({ try? JSONCoding.jsonObject(from: $0) }) as? [String: Any] else {
+        // Validate the proxy envelope shape before unwrapping. `raw.data` is
+        // a `Sendable` `JSONValue?`, walked directly — no `Any` graph.
+        guard let data = raw.data?.objectValue else {
             throw JsBaoError(
                 code: .integrationProxyFailed,
                 message: "Integration response malformed"
@@ -94,41 +90,36 @@ public final class IntegrationsAPI: @unchecked Sendable {
         }
 
         // The upstream HTTP status lives in the body, not the proxy's
-        // own status. JS rejects non-finite numbers; Swift does the
-        // same by requiring an Int (or Double-coercible) value.
-        let upstreamStatus: Int
-        if let i = data["status"] as? Int {
-            upstreamStatus = i
-        } else if let d = data["status"] as? Double, d.isFinite {
-            upstreamStatus = Int(d)
-        } else {
+        // own status. JS rejects non-finite numbers; so does this.
+        // `Int(_: Double)` traps on ±infinity, NaN, and anything past
+        // `Int.max`, so the range check is part of the guard rather than a
+        // separate conversion the parser could crash on (#2056).
+        guard let statusNumber = data["status"]?.numberValue, statusNumber.isFinite,
+              let upstreamStatus = Int(exactly: statusNumber.rounded(.towardZero)) else {
             throw JsBaoError(
                 code: .integrationProxyFailed,
+                // Kept verbatim from JS (`src/client/JsBaoClient.ts`) even
+                // though a present-but-out-of-range status also lands here:
+                // JS rejects non-finite statuses with this same message, and
+                // diverging the text would break error-message parity between
+                // the clients.
                 message: "Integration response missing status"
             )
         }
 
-        let headers = normalizeIntegrationHeaders(
-            (data["headers"] as? [String: Any]) ?? [:]
-        )
+        let headers = normalizeIntegrationHeaders(data["headers"]?.objectValue ?? [:])
 
-        // Decode the opaque upstream body into a typed `JSONValue`. A
-        // missing key yields `nil`; `null` decodes to `.null`.
-        let body: JSONValue?
-        if let rawBody = data["body"] {
-            body = try? JSONCoding.decode(JSONValue.self, from: rawBody)
-        } else {
-            body = nil
-        }
+        // The opaque upstream body is already a typed `JSONValue`. A missing
+        // key yields `nil`; `null` is `.null`.
+        let body = data["body"]
 
         return IntegrationCallResponse(
             status: upstreamStatus,
             headers: headers,
             body: body,
-            traceId: data["traceId"] as? String,
-            durationMs: (data["durationMs"] as? Double)
-                ?? (data["durationMs"] as? Int).map(Double.init),
-            errorCode: data["errorCode"] as? String
+            traceId: data["traceId"]?.stringValue,
+            durationMs: data["durationMs"]?.numberValue,
+            errorCode: data["errorCode"]?.stringValue
         )
     }
 
@@ -136,44 +127,54 @@ public final class IntegrationsAPI: @unchecked Sendable {
     /// `normalizeIntegrationHeaders` so a Swift caller and a JS caller
     /// see identically-shaped header strings even when the upstream
     /// proxied non-string header values.
-    private func normalizeIntegrationHeaders(_ raw: [String: Any]) -> [String: String] {
+    private func normalizeIntegrationHeaders(_ raw: [String: JSONValue]) -> [String: String] {
         var result: [String: String] = [:]
         for (key, value) in raw {
-            if value is NSNull { continue }
-            if let s = value as? String {
+            switch value {
+            case .null:
+                continue
+            case let .string(s):
                 result[key] = s
-            } else if let n = value as? NSNumber {
-                // NSNumber covers both Bool and numeric types in
-                // bridged dictionaries — branch on objCType to format
-                // bools as "true"/"false" rather than "1"/"0".
-                if String(cString: n.objCType) == "c" {
-                    result[key] = n.boolValue ? "true" : "false"
+            case let .bool(b):
+                result[key] = b ? "true" : "false"
+            case let .number(n):
+                result[key] = Self.headerNumberString(n)
+            case .object, .array:
+                if let json = try? JSONCoding.encodeData(value),
+                   let str = String(data: json, encoding: .utf8) {
+                    result[key] = str
                 } else {
-                    result[key] = "\(n)"
+                    result[key] = String(describing: value)
                 }
-            } else if JSONSerialization.isValidJSONObject(value),
-                      let json = try? JSONSerialization.data(withJSONObject: value),
-                      let str = String(data: json, encoding: .utf8) {
-                result[key] = str
-            } else {
-                result[key] = String(describing: value)
             }
         }
         return result
+    }
+
+    /// JSON has one number type, so an integral header value must still print
+    /// as `200`, not `200.0` — matching JS's `String(200)` and the previous
+    /// `NSNumber` formatting.
+    private static func headerNumberString(_ n: Double) -> String {
+        guard n.isFinite else { return "\(n)" }
+        if n == n.rounded(), abs(n) < 9_007_199_254_740_992 {
+            return String(Int64(n))
+        }
+        return "\(n)"
     }
 
     /// Map a non-OK proxy response into a typed `JsBaoError`. Mirrors
     /// the JS error categorization so a cross-platform caller sees the
     /// same code for the same upstream condition.
     private func createIntegrationError(_ response: HttpClientResponse) -> JsBaoError {
-        let payload = response.data.flatMap { try? JSONCoding.jsonObject(from: $0) } as? [String: Any]
-        let upstreamCode = (payload?["errorCode"] as? String)
-            ?? (payload?["code"] as? String)
-            ?? ((payload?["details"] as? [String: Any])?["code"] as? String)
-        let traceId = (payload?["traceId"] as? String)
-            ?? ((payload?["details"] as? [String: Any])?["traceId"] as? String)
-        let message = (payload?["message"] as? String)
-            ?? (payload?["error"] as? String)
+        let payload = response.data?.objectValue
+        let payloadDetails = payload?["details"]?.objectValue
+        let upstreamCode = payload?["errorCode"]?.stringValue
+            ?? payload?["code"]?.stringValue
+            ?? payloadDetails?["code"]?.stringValue
+        let traceId = payload?["traceId"]?.stringValue
+            ?? payloadDetails?["traceId"]?.stringValue
+        let message = payload?["message"]?.stringValue
+            ?? payload?["error"]?.stringValue
             ?? "Integration call failed with HTTP \(response.status)"
 
         let code: JsBaoErrorCode
@@ -184,6 +185,8 @@ public final class IntegrationsAPI: @unchecked Sendable {
             code = .integrationNotFound
         case (_, "INTEGRATION_INACTIVE"), (_, "INTEGRATION_NOT_FOUND"):
             code = .integrationNotFound
+        // Retired in #2257: current servers emit neither a 409 nor
+        // `MISSING_SECRET` on the integration path. Kept for older servers.
         case (409, _), (_, "MISSING_SECRET"):
             code = .integrationSecretMissing
         case (400, _), (413, _), (422, _):
@@ -199,4 +202,17 @@ public final class IntegrationsAPI: @unchecked Sendable {
         if let upstreamCode = upstreamCode { details["upstreamCode"] = .string(upstreamCode) }
         return JsBaoError(code: code, message: message, details: details)
     }
+}
+
+// MARK: - Wire shim
+
+/// The proxy request envelope. `nil` fields are omitted by `JSONEncoder`,
+/// matching JS's `JSON.stringify` dropping `undefined` (#958) — no `method`
+/// or `path` default is applied.
+private struct IntegrationProxyRequest: Encodable, Sendable {
+    let method: String?
+    let path: String?
+    let query: [String: JSONValue]?
+    let headers: [String: String]?
+    let body: JSONValue?
 }

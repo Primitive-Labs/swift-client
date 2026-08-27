@@ -6,10 +6,11 @@ import Foundation
 // MARK: - PromptsAPI
 
 public final class PromptsAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
 
-    public init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.makeRequest = makeRequest
+    /// Designated initializer — the typed transport spine.
+    public init(transport: any Transport) {
+        self.transport = transport
     }
 
     /// Execute a prompt template. Preferred entry point — accepts an
@@ -31,16 +32,14 @@ public final class PromptsAPI: @unchecked Sendable {
                 message: "promptKey is required for prompts.execute"
             )
         }
-        let escaped = promptKey.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? promptKey
-        // Encode the typed options to the JSON `Any` graph. JSONEncoder
-        // omits nil `modelOverride`/`configId`, matching the JS client,
-        // which only sets those keys when truthy.
-        let body = try JSONCoding.jsonObject(from: options)
-        let result = try await makeRequest(
-            "POST", "/prompts/\(escaped)/execute", body
+        let escaped = URLEncoding.encodeComponent(promptKey)
+        // The typed options are encoded straight to the wire bytes.
+        // JSONEncoder omits nil `modelOverride`/`configId`, matching the JS
+        // client, which only sets those keys when truthy.
+        return try await transport.request(
+            method: .post,
+            path: "/prompts/\(escaped)/execute",
+            body: options
         )
-        return try JSONCoding.decode(ExecutePromptResult.self, from: result)
     }
 }

@@ -54,7 +54,7 @@ final class AwarenessTests: XCTestCase {
         // a snapshot of states.
         var receivedAwareness = false
         var addedIds: [String] = []
-        let sub = client2.events.on(.awareness) { (event: AwarenessEvent) in
+        let sub = client2.eventEmitter.subscribe(AwarenessEvent.self) { event in
             if event.documentId == docId {
                 receivedAwareness = true
                 addedIds.append(contentsOf: event.added)
@@ -99,7 +99,7 @@ final class AwarenessTests: XCTestCase {
         try await waitForSync(client: client, documentId: docId)
 
         var deltas: [AwarenessEvent] = []
-        let sub = client.events.on(.awareness) { (event: AwarenessEvent) in
+        let sub = client.eventEmitter.subscribe(AwarenessEvent.self) { event in
             if event.documentId == docId {
                 deltas.append(event)
             }

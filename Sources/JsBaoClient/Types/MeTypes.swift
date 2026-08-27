@@ -77,15 +77,23 @@ public enum AvatarContentType: String, Sendable, Equatable, CaseIterable {
 ///   cached metadata (defaults to `true`). `localOnly: true` forces this off.
 /// - `localOnly` — return only docs with local data on this device, ignoring
 ///   the server entirely.
-/// - `serverTimeoutMs` — max time to wait for the server response
-///   (JS default 10000).
-/// - `waitForLoad` — cache-read strategy.
+/// - `serverTimeout` — bound on a server fetch, a `TimeInterval` in
+///   **seconds** (default `10`; renamed from `serverTimeoutMs: Int` in #2367,
+///   which was 10000 milliseconds). Exceeding it throws
+///   `JsBaoError(code: .listTimeout)`; `0` means unbounded, matching how the
+///   client's cache reads the same option. The wire field is still `timeoutMs`.
+/// - `waitForLoad` — when the call resolves:
+///   - `.local` — local cache rows only; never touches the network.
+///   - `.network` — blocking server fetch, merged with local rows; throws
+///     `JsBaoError(code: .listUnavailableOffline)` while offline.
+///   - `.localIfAvailableElseNetwork` (the default) — returns the local cache
+///     rows immediately when it has any and refreshes from the server in the
+///     background so the next call is fresh; falls through to a blocking fetch
+///     when the local cache is empty.
 /// - `forward` — chronological order (oldest first); sent as `forward=true`.
-/// - `returnPage` — return a `DocumentListPage` (cursor) instead of a flat
-///   array. Surfaced in Swift as the separate `ownedDocumentsPage(...)`
-///   overload rather than a union return; this flag mirrors the JS field for
-///   completeness but the page-returning entry point is the canonical way to
-///   get a cursor in Swift.
+///
+/// `limit` / `cursor` are ignored on any local path (the local cache isn't
+/// paginated) and the returned `cursor` is `nil` there.
 ///
 /// `cursor`/`limit`/`tag` stay as positional params on `ownedDocuments(...)`
 /// (they already existed); this struct carries only the additive fields.
@@ -93,27 +101,31 @@ public struct MeOwnedDocumentsOptions: Sendable, Equatable {
     public var includeRoot: Bool?
     public var refreshFromServer: Bool?
     public var localOnly: Bool?
-    public var serverTimeoutMs: Int?
+    public var serverTimeout: TimeInterval?
     public var waitForLoad: WaitForLoadMode?
     public var forward: Bool?
-    public var returnPage: Bool?
 
+    /// `returnPage` was deprecated in #2360 and removed in #2367 — a runtime
+    /// flag can't change a return type in Swift. Call
+    /// `me.ownedDocumentsPage(...)` for the `{ items, cursor }` page.
+    ///
+    /// Note for anyone comparing option values: removing its private storage
+    /// changed the synthesized `Equatable` — two options differing only in
+    /// `returnPage` used to compare unequal and now compare equal.
     public init(
         includeRoot: Bool? = nil,
         refreshFromServer: Bool? = nil,
         localOnly: Bool? = nil,
-        serverTimeoutMs: Int? = nil,
+        serverTimeout: TimeInterval? = nil,
         waitForLoad: WaitForLoadMode? = nil,
-        forward: Bool? = nil,
-        returnPage: Bool? = nil
+        forward: Bool? = nil
     ) {
         self.includeRoot = includeRoot
         self.refreshFromServer = refreshFromServer
         self.localOnly = localOnly
-        self.serverTimeoutMs = serverTimeoutMs
+        self.serverTimeout = serverTimeout
         self.waitForLoad = waitForLoad
         self.forward = forward
-        self.returnPage = returnPage
     }
 }
 

@@ -19,11 +19,11 @@ final class IndexedFlagTests: XCTestCase {
             params: [table]
         )
         return Set(rows.compactMap { row -> String? in
-            guard let origin = row["origin"] as? String, origin == "c" else {
+            guard let origin = row["origin"]?.stringValue, origin == "c" else {
                 // 'c' == CREATE INDEX; 'pk'/'u' == auto-created
                 return nil
             }
-            return row["name"] as? String
+            return row["name"]?.stringValue
         })
     }
 

@@ -2,7 +2,8 @@ import Foundation
 
 /// MongoDB-style filter operators for querying BaoModel records.
 ///
-/// Usage:
+/// Values are `JSONValue`, so literals read the same as they do in JS:
+///
 /// ```swift
 /// // Simple equality
 /// let filter: DocumentFilter = ["completed": true]
@@ -16,7 +17,15 @@ import Foundation
 /// // Logical
 /// let filter: DocumentFilter = ["$or": [["status": "done"], ["priority": ["$gte": 5]]]]
 /// ```
-public typealias DocumentFilter = [String: Any]
+///
+/// A value held in a variable needs its `JSONValue` case spelled out, since
+/// only literals convert implicitly:
+///
+/// ```swift
+/// let filter: DocumentFilter = ["authorId": .string(authorId)]
+/// let filter: DocumentFilter = ["id": ["$in": .array(ids.map { .string($0) })]]
+/// ```
+public typealias DocumentFilter = [String: JSONValue]
 
 /// Options for query operations. Cursor-based pagination is opaque
 /// and works alongside arbitrary sort orders — mirrors js-bao's
@@ -36,18 +45,6 @@ public struct QueryOptions: Sendable {
     public var sortOrder: [(String, Int)]?
     /// Maximum number of results per page.
     public var limit: Int?
-    /// Offset-based pagination — DEPRECATED.
-    ///
-    /// Offset is unstable in CRDT-backed datasets: concurrent inserts
-    /// from another client can shift the rows that come "before
-    /// offset N" between two queries, causing the same row to appear
-    /// twice (insert) or be skipped (delete) across page boundaries.
-    /// Use `cursor` + `direction` instead — the cursor anchors to a
-    /// unique key value and survives concurrent mutations to other
-    /// rows. js-bao deliberately doesn't expose offset for the same
-    /// reason; this field is the only cross-language outlier.
-    @available(*, deprecated, message: "Offset is unstable under concurrent inserts in CRDT-backed docs. Use `cursor` + `direction` for stable pagination.")
-    public var offset: Int?
 
     /// Opaque cursor from a previous `queryPaged` call. Pass
     /// `result.nextCursor` or `result.prevCursor` back here to advance
@@ -73,11 +70,17 @@ public struct QueryOptions: Sendable {
     /// `nil` returns every field.
     public var projection: [String: Int]?
 
+    /// `offset` was removed in #2367: offset paging is unstable in
+    /// CRDT-backed datasets, because a concurrent insert from another client
+    /// shifts the rows before offset N and makes the same row appear twice or
+    /// be skipped across a page boundary. Page with `cursor` + `direction`
+    /// instead — the cursor anchors to a unique key value and survives
+    /// concurrent mutations to other rows. js-bao never exposed offset for the
+    /// same reason, so this also closes the last cross-language outlier.
     public init(
         sort: [String: Int]? = nil,
         sortOrder: [(String, Int)]? = nil,
         limit: Int? = nil,
-        offset: Int? = nil,
         cursor: String? = nil,
         direction: CursorDirection = .forward,
         documents: [String]? = nil,
@@ -86,12 +89,12 @@ public struct QueryOptions: Sendable {
         self.sort = sort
         self.sortOrder = sortOrder
         self.limit = limit
-        self.offset = offset
         self.cursor = cursor
         self.direction = direction
         self.documents = documents
         self.projection = projection
     }
+
 }
 
 /// Ordering spec for aggregation results. `field` can name either a

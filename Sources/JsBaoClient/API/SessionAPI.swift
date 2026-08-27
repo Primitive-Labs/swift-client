@@ -3,10 +3,11 @@ import Foundation
 // MARK: - SessionAPI
 
 public final class SessionAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
 
-    public init(makeRequest: @escaping (String, String, Any?) async throws -> Any) {
-        self.makeRequest = makeRequest
+    /// Designated initializer — the typed transport spine.
+    public init(transport: any Transport) {
+        self.transport = transport
     }
 
     /// Retrieves information about the current authenticated session.
@@ -14,7 +15,6 @@ public final class SessionAPI: @unchecked Sendable {
     /// `GET /session` (returns a typed `SessionInfo`), distinct from
     /// `GET /me` (returns the user profile).
     public func get() async throws -> SessionInfo {
-        let result = try await makeRequest("GET", "/session", nil)
-        return try JSONCoding.decode(SessionInfo.self, from: result)
+        try await transport.request(method: .get, path: "/session")
     }
 }

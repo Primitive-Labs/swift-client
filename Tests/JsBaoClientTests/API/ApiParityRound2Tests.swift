@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import JsBaoClient
 
@@ -6,21 +7,52 @@ import XCTest
 /// `swift-events-wire-polish-may-20`).
 ///
 /// Follows the same `CallRecorder` pattern as `ApiParityTests`:
-/// instantiate each sub-API with a stub `makeRequest`, invoke the
+/// instantiate each sub-API with a stub `Transport`, invoke the
 /// new method, assert verb + path + body shape against the js-bao
 /// counterpart.
 final class ApiParityRound2Tests: XCTestCase {
 
-    final class CallRecorder: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        var response: Any = [String: Any]()
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
+    /// Records the last request and replies with a scripted body. The
+    /// sub-APIs speak bytes through `Transport`, while the assertions below
+    /// are written against the `JSONSerialization` graph, so the recorder
+    /// converts in both directions.
+    final class CallRecorder: Transport, @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastMethod: HTTPMethod?
+        private var lastPath: String?
+        private var lastBody: Data?
+        private var cannedResponse: Any = [String: Any]()
+
+        var method: String? { lock.withLock { lastMethod?.rawValue } }
+        var path: String? { lock.withLock { lastPath } }
+        var body: Any? {
+            guard let data = lock.withLock({ lastBody }) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        }
+        var response: Any {
+            get { lock.withLock { cannedResponse } }
+            set { lock.withLock { cannedResponse = newValue } }
+        }
+
+        func execute(
+            method: HTTPMethod,
+            path: String,
+            body: Data?,
+            options: RequestOptions?
+        ) async throws -> TransportResponse {
+            lock.withLock {
+                lastMethod = method
+                lastPath = path
+                lastBody = body
+            }
+            let data = try JSONSerialization.data(
+                withJSONObject: response, options: [.fragmentsAllowed]
+            )
+            return TransportResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: data
+            )
         }
     }
 
@@ -28,7 +60,7 @@ final class ApiParityRound2Tests: XCTestCase {
 
     func test_me_sharedDocuments_buildsQS() async throws {
         let r = CallRecorder()
-        let api = MeAPI(makeRequest: r.make)
+        let api = MeAPI(transport: r)
 
         _ = try await api.sharedDocuments()
         XCTAssertEqual(r.method, "GET")
@@ -40,7 +72,7 @@ final class ApiParityRound2Tests: XCTestCase {
 
     func test_me_ownedDocuments_buildsQS() async throws {
         let r = CallRecorder()
-        let api = MeAPI(makeRequest: r.make)
+        let api = MeAPI(transport: r)
 
         _ = try await api.ownedDocuments()
         XCTAssertEqual(r.path, "/me/owned-documents")
@@ -56,7 +88,7 @@ final class ApiParityRound2Tests: XCTestCase {
     /// server call). Mirrors js-bao `_listImpl`.
     func test_me_ownedDocuments_optionsThreadIntoQS() async throws {
         let r = CallRecorder()
-        let api = MeAPI(makeRequest: r.make)
+        let api = MeAPI(transport: r)
 
         _ = try await api.ownedDocuments(
             cursor: "c1",
@@ -73,8 +105,7 @@ final class ApiParityRound2Tests: XCTestCase {
     /// `localOnly` (and `refreshFromServer: false`) must NOT hit the network.
     func test_me_ownedDocuments_localOnlySkipsServer() async throws {
         let r = CallRecorder()
-        r.path = nil
-        let api = MeAPI(makeRequest: r.make)
+        let api = MeAPI(transport: r)
 
         _ = try await api.ownedDocuments(options: MeOwnedDocumentsOptions(localOnly: true))
         XCTAssertNil(r.path, "localOnly must not issue a server request")
@@ -88,7 +119,7 @@ final class ApiParityRound2Tests: XCTestCase {
     func test_me_ownedDocumentsPage_returnsCursor() async throws {
         let r = CallRecorder()
         r.response = ["items": [["documentId": "d1"]], "cursor": "next-page"]
-        let api = MeAPI(makeRequest: r.make)
+        let api = MeAPI(transport: r)
 
         let page = try await api.ownedDocumentsPage(limit: 1)
         XCTAssertEqual(page.cursor, "next-page")
@@ -100,7 +131,7 @@ final class ApiParityRound2Tests: XCTestCase {
     func test_documents_getOrCreateWithAlias_POST() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -136,7 +167,7 @@ final class ApiParityRound2Tests: XCTestCase {
         // correctly onto the wire.
         let r = CallRecorder()
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -161,7 +192,7 @@ final class ApiParityRound2Tests: XCTestCase {
         // The typed Swift surface forwards a non-empty `aliasKey` verbatim.
         let r = CallRecorder()
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -186,7 +217,7 @@ final class ApiParityRound2Tests: XCTestCase {
         // throws client-side before any request is made.
         let r = CallRecorder()
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -211,7 +242,7 @@ final class ApiParityRound2Tests: XCTestCase {
         // Parity with JS (`documentsApi.ts:532-533`).
         let r = CallRecorder()
         let api = DocumentsAPI(
-            makeRequest: r.make,
+            transport: r,
             blobManager: BlobManager(
                 logger: createLogger(level: .error, scope: "test"),
                 uploadConcurrency: 1
@@ -235,9 +266,12 @@ final class ApiParityRound2Tests: XCTestCase {
 
     // MARK: - CollectionsAPI new list helpers
 
+    /// #2367 removed `CollectionsAPI.init(makeRequest:)`, so this now builds
+    /// the API on the typed transport spine. The route assertions are what the
+    /// test is for and are unchanged.
     func test_collections_listAll_GET() async throws {
         let r = CallRecorder()
-        let api = CollectionsAPI(makeRequest: r.make)
+        let api = CollectionsAPI(transport: r)
         r.response = ["items": [[String: Any]]()]
         _ = try await api.listAll()
         XCTAssertEqual(r.method, "GET")
@@ -247,9 +281,12 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(r.path, "/admin/collections?limit=25&cursor=tok")
     }
 
+    /// #2367 removed `CollectionsAPI.init(makeRequest:)`, so this now builds
+    /// the API on the typed transport spine. The route and unwrap assertions
+    /// are what the test is for and are unchanged.
     func test_collections_listPendingInvitations_unwrapsItems() async throws {
         let r = CallRecorder()
-        let api = CollectionsAPI(makeRequest: r.make)
+        let api = CollectionsAPI(transport: r)
         func invitationJSON(_ id: String) -> [String: Any] {
             [
                 "email": "\(id)@example.com", "permission": "reader",
@@ -268,7 +305,7 @@ final class ApiParityRound2Tests: XCTestCase {
 
     func test_groups_listDatabases_GET() async throws {
         let r = CallRecorder()
-        let api = GroupsAPI(makeRequest: r.make)
+        let api = GroupsAPI(transport: r)
         r.response = [[String: Any]]()
         _ = try await api.listDatabases(groupType: "team", groupId: "g1")
         XCTAssertEqual(r.method, "GET")
@@ -277,7 +314,7 @@ final class ApiParityRound2Tests: XCTestCase {
 
     func test_groups_listPendingInvitations_unwrapsItems() async throws {
         let r = CallRecorder()
-        let api = GroupsAPI(makeRequest: r.make)
+        let api = GroupsAPI(transport: r)
         r.response = ["items": [[
             "invitationId": "i1",
             "email": "i1@example.com",
@@ -295,16 +332,20 @@ final class ApiParityRound2Tests: XCTestCase {
 
     // MARK: - AnalyticsContext
 
-    func test_analyticsContext_logsEventThroughClosure() {
-        var captured: [[String: Any]] = []
+    /// #2367 removed the synchronous `AnalyticsContext.logEvent(_:)` method
+    /// (the `logEvent:` closure the context is built with stays). A context
+    /// with no async logger falls back to that closure, so `logEventAsync`
+    /// still delivers the event to it — which is what this test checks.
+    func test_analyticsContext_logsEventThroughClosure() async {
+        let captured = LockedBox([[String: JSONValue]]())
         let ctx = AnalyticsContext(
             logEvent: { event in
-                captured.append(event)
+                captured.withValue { $0.append(event) }
             }
         )
-        ctx.logEvent(["action": "click", "feature": "cta"])
-        XCTAssertEqual(captured.count, 1)
-        XCTAssertEqual(captured.first?["action"] as? String, "click")
+        await ctx.logEventAsync(["action": "click", "feature": "cta"])
+        XCTAssertEqual(captured.value.count, 1)
+        XCTAssertEqual(captured.value.first?["action"], JSONValue.string("click"))
         XCTAssertTrue(ctx.isEnabled())
     }
 

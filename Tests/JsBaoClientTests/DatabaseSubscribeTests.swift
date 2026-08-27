@@ -31,10 +31,13 @@ final class DatabaseSubscribeTests: XCTestCase {
         // Type config FIRST (with schema) — implicit auto-create on
         // `POST /databases` would materialize a schemaless type and the op
         // gate would refuse the seed op with 422 (mirrors the JS setup).
-        _ = try await client.makeRequest("POST", "/databases/types", [
-            "databaseType": databaseType,
-            "schema": Self.taskSchema,
-        ])
+        let typeConfig: [String: JSONValue] = [
+            "databaseType": .string(databaseType),
+            "schema": .string(Self.taskSchema),
+        ]
+        _ = try await client.requestJSON(
+            method: .post, path: "/databases/types", body: typeConfig
+        )
 
         let db = try await client.databases.create(params: CreateDatabaseParams(
             title: "Swift DB Subs",
@@ -43,7 +46,7 @@ final class DatabaseSubscribeTests: XCTestCase {
         databaseId = db.databaseId
 
         // Seed mutation op the tests use to trigger changes.
-        _ = try await client.makeRequest("POST", "/databases/types/\(databaseType)/operations", [
+        let seedOperation: [String: JSONValue] = [
             "name": "seed_save",
             "type": "mutation",
             "modelName": "$params.modelName",
@@ -56,7 +59,12 @@ final class DatabaseSubscribeTests: XCTestCase {
                 "id": ["type": "string", "required": true],
                 "data": ["type": "object", "required": false],
             ],
-        ])
+        ]
+        _ = try await client.requestJSON(
+            method: .post,
+            path: "/databases/types/\(databaseType)/operations",
+            body: seedOperation
+        )
 
         try await client.connect()
         try await waitForConnection(client: client, timeout: 10)
@@ -70,13 +78,18 @@ final class DatabaseSubscribeTests: XCTestCase {
     // MARK: - Helpers
 
     private func createSubscription(key: String) async throws {
-        _ = try await client.makeRequest("POST", "/databases/types/\(databaseType)/subscriptions", [
-            "subscriptionKey": key,
-            "displayName": "Swift \(key)",
+        let subscription: [String: JSONValue] = [
+            "subscriptionKey": .string(key),
+            "displayName": .string("Swift \(key)"),
             "modelName": "Task",
             "filter": "record.modelName == 'Task'",
             "access": "true",
-        ])
+        ]
+        _ = try await client.requestJSON(
+            method: .post,
+            path: "/databases/types/\(databaseType)/subscriptions",
+            body: subscription
+        )
     }
 
     private func saveTask(id: String, title: String) async throws {
@@ -113,12 +126,11 @@ final class DatabaseSubscribeTests: XCTestCase {
         try await createSubscription(key: "swift-basic-v1")
 
         let box = EventBox()
-        let unsub = try client.databases.subscribe(
+        let sub = try client.databases.subscribe(
             databaseId: databaseId,
-            subscriptionKey: "swift-basic-v1",
-            options: DatabaseSubscribeOptions { box.append($0) }
-        )
-        defer { unsub() }
+            subscriptionKey: "swift-basic-v1"
+        ) { box.append($0) }
+        defer { sub.cancel() }
 
         // Allow db.subscribe to go over the wire.
         try await delay(0.6)
@@ -155,7 +167,7 @@ final class DatabaseSubscribeTests: XCTestCase {
         XCTAssertEqual(data?["title"] as? String, "hi")
     }
 
-    /// Edge: after `unsub()` the callback must stop receiving frames; a
+    /// Edge: after `cancel()` the callback must stop receiving frames; a
     /// second live subscription on the same connection keeps working
     /// (independent routing by subscriptionKey).
     func testUnsubscribeStopsDeliveryOtherSubsUnaffected() async throws {
@@ -166,15 +178,13 @@ final class DatabaseSubscribeTests: XCTestCase {
         let keepBox = EventBox()
         let unsub = try client.databases.subscribe(
             databaseId: databaseId,
-            subscriptionKey: "swift-unsub-v1",
-            options: DatabaseSubscribeOptions { unsubBox.append($0) }
-        )
-        let keepUnsub = try client.databases.subscribe(
+            subscriptionKey: "swift-unsub-v1"
+        ) { unsubBox.append($0) }
+        let keepSub = try client.databases.subscribe(
             databaseId: databaseId,
-            subscriptionKey: "swift-keep-v1",
-            options: DatabaseSubscribeOptions { keepBox.append($0) }
-        )
-        defer { keepUnsub() }
+            subscriptionKey: "swift-keep-v1"
+        ) { keepBox.append($0) }
+        defer { keepSub.cancel() }
         try await delay(0.6)
 
         // Both subs see the first write.
@@ -188,7 +198,7 @@ final class DatabaseSubscribeTests: XCTestCase {
         }
 
         // Unsubscribe one; the other keeps receiving.
-        unsub()
+        unsub.cancel()
         try await delay(0.4)
         let countAfterUnsub = unsubBox.all.count
 
@@ -200,7 +210,56 @@ final class DatabaseSubscribeTests: XCTestCase {
 
         XCTAssertEqual(
             unsubBox.all.count, countAfterUnsub,
-            "unsubscribed callback must not receive frames after unsub()"
+            "unsubscribed callback must not receive frames after cancel()"
+        )
+    }
+
+    /// #2367's registration identity: subscribing the same
+    /// `(databaseId, subscriptionKey)` twice replaces the first callback, and
+    /// the first handle must then remove nothing.
+    ///
+    /// `DatabaseSubscriptionRegistry.unregister` compares the handle's
+    /// `RegistrationID` against the live registration's and returns `false` when
+    /// they differ, so a superseded handle neither drops the second callback nor
+    /// sends `db.unsubscribe`. Without that check, cancelling the first
+    /// handle — which `EventSubscription.deinit` does on its own as soon as the
+    /// caller lets go of it — would tear down the live subscription and the
+    /// second callback would silently stop firing.
+    func testCancellingASupersededHandleLeavesTheLiveSubscriptionAlone() async throws {
+        try await createSubscription(key: "swift-identity-v1")
+
+        let firstBox = EventBox()
+        let secondBox = EventBox()
+
+        let firstSub = try client.databases.subscribe(
+            databaseId: databaseId,
+            subscriptionKey: "swift-identity-v1"
+        ) { firstBox.append($0) }
+        try await delay(0.6)
+
+        // Same pair again: this replaces the first registration.
+        let secondSub = try client.databases.subscribe(
+            databaseId: databaseId,
+            subscriptionKey: "swift-identity-v1"
+        ) { secondBox.append($0) }
+        defer { secondSub.cancel() }
+        try await delay(0.6)
+
+        // Cancel the superseded handle. It owns no live registration, so this
+        // must be a no-op rather than an unsubscribe.
+        firstSub.cancel()
+        try await delay(0.4)
+
+        let firstCountAtCancel = firstBox.all.count
+        let taskId = "id_" + UUID().uuidString.prefix(8)
+        try await saveTask(id: String(taskId), title: "still-live")
+
+        try await eventually(timeout: 10, description: "second subscription still receives db.change") {
+            secondBox.all.contains { $0.changes.contains { $0.id == String(taskId) } }
+        }
+        XCTAssertEqual(
+            firstBox.all.count, firstCountAtCancel,
+            "the replaced callback must not fire — the second registration owns the pair"
         )
     }
 
@@ -211,14 +270,14 @@ final class DatabaseSubscribeTests: XCTestCase {
         XCTAssertThrowsError(try client.databases.subscribe(
             databaseId: "",
             subscriptionKey: "k",
-            options: DatabaseSubscribeOptions { _ in }
+            onChange: { _ in }
         )) { error in
             XCTAssertEqual((error as? JsBaoError)?.code, .invalidArgument)
         }
         XCTAssertThrowsError(try client.databases.subscribe(
             databaseId: databaseId,
             subscriptionKey: "",
-            options: DatabaseSubscribeOptions { _ in }
+            onChange: { _ in }
         )) { error in
             XCTAssertEqual((error as? JsBaoError)?.code, .invalidArgument)
         }

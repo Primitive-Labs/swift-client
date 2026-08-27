@@ -33,7 +33,12 @@ public struct TriggerDefInfo: Codable, Sendable, Equatable {
     }
 }
 
-/// The rule definitions for a single model. Mirrors JS `ModelRulesInfo`.
+/// Per-model trigger config as stored on a `DatabaseTypeConfig` (`{ triggers }`).
+/// Mirrors JS `ModelRulesInfo`.
+///
+/// NOTE: `ModelRulesInfo` models **triggers**, not rule-set operation
+/// expressions. Rule-set `rules` values are per-operation CEL expressions and
+/// use ``CategoryRules`` / ``RuleExpression`` instead (issue #1525).
 public struct ModelRulesInfo: Codable, Sendable, Equatable {
     public var triggers: [TriggerDefInfo]?
 
@@ -41,6 +46,105 @@ public struct ModelRulesInfo: Codable, Sendable, Equatable {
         self.triggers = triggers
     }
 }
+
+/// A single declared traversal edge for a per-rule `loads` block. Mirrors the
+/// JS `PathDeclaration` / the server-side `PathDeclaration`
+/// (`src/app-api/helpers/metadata-cel-access.ts`). Exactly one of `from` /
+/// `rootFrom` roots the edge.
+public struct PathDeclaration: Codable, Sendable, Equatable {
+    public var from: String?
+    public var rootFrom: String?
+    public var via: String?
+    public var type: String
+    public var categories: [String]
+
+    public init(
+        from: String? = nil,
+        rootFrom: String? = nil,
+        via: String? = nil,
+        type: String,
+        categories: [String]
+    ) {
+        self.from = from
+        self.rootFrom = rootFrom
+        self.via = via
+        self.type = type
+        self.categories = categories
+    }
+}
+
+/// Per-rule declared loads colocated on a rule-set operation entry (issue
+/// #1525). Mirrors JS `RuleLoads`. Carries **only** `paths` (Fork 4A):
+/// memberships are inferred from `memberGroupsOf`, and `secrets`/`vars` stay on
+/// the config-level `metadataManifest` allowlist — a per-rule
+/// `loads.secrets`/`loads.vars` is a save-time 400.
+public struct RuleLoads: Codable, Sendable, Equatable {
+    public var paths: [String: PathDeclaration]?
+
+    public init(paths: [String: PathDeclaration]? = nil) {
+        self.paths = paths
+    }
+}
+
+/// A rule-set operation entry value. Mirrors JS
+/// `RuleExpression = string | { expr, loads? }`. Either a bare CEL string
+/// (unchanged legacy form, stored verbatim) or an object carrying the
+/// expression plus its declared `loads` (issue #1525). Parse-on-read: bare
+/// strings are never rewritten to the object form, so the two cases round-trip
+/// back to the same wire shape they decoded from.
+public enum RuleExpression: Codable, Sendable, Equatable {
+    /// A bare CEL string — the legacy form, encoded verbatim as a JSON string.
+    case string(String)
+    /// The object form `{ expr, loads? }` colocating declared loads.
+    case object(expr: String, loads: RuleLoads?)
+
+    /// The private object shape backing the `.object` case. Kept internal so
+    /// the public surface is just the two-case enum.
+    private struct ObjectForm: Codable {
+        var expr: String
+        var loads: RuleLoads?
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let string = try? container.decode(String.self) {
+            self = .string(string)
+        } else {
+            let form = try container.decode(ObjectForm.self)
+            self = .object(expr: form.expr, loads: form.loads)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .string(string):
+            try container.encode(string)
+        case let .object(expr, loads):
+            try container.encode(ObjectForm(expr: expr, loads: loads))
+        }
+    }
+
+    /// The CEL expression, regardless of which case is stored.
+    public var expr: String {
+        switch self {
+        case let .string(string): return string
+        case let .object(expr, _): return expr
+        }
+    }
+
+    /// The colocated declared loads, or `nil` for the bare-string form.
+    public var loads: RuleLoads? {
+        switch self {
+        case .string: return nil
+        case let .object(_, loads): return loads
+        }
+    }
+}
+
+/// A category's per-operation rules: operation name → ``RuleExpression``.
+/// Mirrors JS `CategoryRules = Record<string, RuleExpression>`.
+public typealias CategoryRules = [String: RuleExpression]
 
 // MARK: Rule set metadata
 
@@ -52,8 +156,9 @@ public struct RuleSetInfo: Decodable, Sendable, Equatable {
     /// Nullable on the wire — `description: string | null`.
     public let description: String?
     public let resourceType: String
-    /// Map of model name → that model's rule definitions.
-    public let rules: [String: ModelRulesInfo]
+    /// Rules keyed by category/model name, each a ``CategoryRules`` map of
+    /// operation → ``RuleExpression`` (bare CEL string or `{ expr, loads }`).
+    public let rules: [String: CategoryRules]
     public let version: Int
     public let createdAt: String
     public let modifiedAt: String
@@ -74,15 +179,17 @@ public struct CreateRuleSetParams: Encodable, Sendable {
     public var name: String
     /// The type of resource these rules apply to (e.g. `"document"`, `"group"`).
     public var resourceType: String
-    /// Map of model names to their rule definitions.
-    public var rules: [String: ModelRulesInfo]
+    /// Rules keyed by category/model name, each a ``CategoryRules`` map of
+    /// operation → ``RuleExpression`` (a bare CEL string or, to colocate
+    /// declared `loads`, an object `{ expr, loads }`).
+    public var rules: [String: CategoryRules]
     /// Optional human-readable description of the rule set's purpose.
     public var description: String?
 
     public init(
         name: String,
         resourceType: String,
-        rules: [String: ModelRulesInfo],
+        rules: [String: CategoryRules],
         description: String? = nil
     ) {
         self.name = name
@@ -99,13 +206,14 @@ public struct UpdateRuleSetParams: Encodable, Sendable {
     public var name: String?
     /// New description for the rule set.
     public var description: String?
-    /// Replacement rule definitions, keyed by model name.
-    public var rules: [String: ModelRulesInfo]?
+    /// Replacement rule definitions, keyed by category/model name. Each value
+    /// is a ``CategoryRules`` map of operation → ``RuleExpression``.
+    public var rules: [String: CategoryRules]?
 
     public init(
         name: String? = nil,
         description: String? = nil,
-        rules: [String: ModelRulesInfo]? = nil
+        rules: [String: CategoryRules]? = nil
     ) {
         self.name = name
         self.description = description

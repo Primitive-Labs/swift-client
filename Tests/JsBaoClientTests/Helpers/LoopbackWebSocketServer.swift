@@ -20,11 +20,33 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
     /// The loopback port the server is listening on, valid after `start()`.
     private(set) var port: UInt16 = 0
 
-    init() throws {
+    private var _acceptedCount = 0
+    private var _receivedFrames: [String] = []
+
+    /// Every text frame the server has received, in arrival order. Lets a test
+    /// assert on what the client actually put on the wire (e.g. that no
+    /// syncStep1 went out) without reaching into the client's internals.
+    var receivedFrames: [String] { lock.withLock { _receivedFrames } }
+
+    /// How many connections the listener has accepted since it started. It is
+    /// the server-side view of "a fresh socket was built", which is what a test
+    /// driving the client facade can observe without reaching into the client's
+    /// private `WebSocketManager` (#2171 behavior 15).
+    var acceptedCount: Int { lock.withLock { _acceptedCount } }
+
+    /// - Parameter completesHandshake: when `false` the listener speaks plain
+    ///   TCP and never answers the WebSocket upgrade, so a client's `connect()`
+    ///   stays in flight indefinitely. #2171's ordering tests need that: they
+    ///   have to inject a constructed `didOpen` / `didCloseWith` pair *while* a
+    ///   connect is pending, which is impossible against a server that
+    ///   completes the handshake on its own.
+    init(completesHandshake: Bool = true) throws {
         let params = NWParameters.tcp
-        let wsOptions = NWProtocolWebSocket.Options()
-        wsOptions.autoReplyPing = true
-        params.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
+        if completesHandshake {
+            let wsOptions = NWProtocolWebSocket.Options()
+            wsOptions.autoReplyPing = true
+            params.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
+        }
         listener = try NWListener(using: params, on: .any)
     }
 
@@ -37,7 +59,10 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
         }
         listener.newConnectionHandler = { [weak self] connection in
             guard let self = self else { return }
-            self.lock.withLock { self.connections.append(connection) }
+            self.lock.withLock {
+                self.connections.append(connection)
+                self._acceptedCount += 1
+            }
             connection.start(queue: self.queue)
             self.drain(connection)
         }
@@ -53,12 +78,22 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
 
     /// Recursively drains messages from a connection so the WebSocket close
     /// handshake completes when the client cancels its task.
+    ///
+    /// It re-arms on **every** delivery, including a complete one. `isComplete`
+    /// marks the end of one WebSocket *message*, not the end of the connection,
+    /// so stopping there left the drain armed exactly once: the client's frames
+    /// then piled up in the receive buffer until TCP backpressure stalled its
+    /// `send` for good, which is what a sustained send loop hits (#2171
+    /// behavior 23). Only an error — which a peer close produces — ends it.
     private func drain(_ connection: NWConnection) {
-        connection.receiveMessage { [weak self] _, _, isComplete, error in
+        connection.receiveMessage { [weak self] data, _, _, error in
             guard let self = self else { return }
-            if error != nil || isComplete {
+            if let data, let text = String(data: data, encoding: .utf8) {
+                self.lock.withLock { self._receivedFrames.append(text) }
+            }
+            if error != nil {
                 // Peer closed or errored — let the connection tear down.
-                if error != nil { connection.cancel() }
+                connection.cancel()
                 return
             }
             self.drain(connection)

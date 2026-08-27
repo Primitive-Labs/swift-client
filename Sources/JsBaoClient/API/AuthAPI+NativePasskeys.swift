@@ -37,7 +37,7 @@ extension AuthAPI {
     /// Sign in with a passkey using the system sheet (discoverable
     /// credential flow — the user picks from passkeys saved for the app's
     /// RP domain). On success the SDK has already applied the returned
-    /// access token (cause `"passkey"`), emitting `.authSuccess` /
+    /// access token (cause `"passkeyAuth"`), emitting `.authSuccess` /
     /// `.authState` like the other sign-in paths.
     ///
     /// - Parameters:
@@ -58,8 +58,8 @@ extension AuthAPI {
         presentationAnchor: ASPresentationAnchor? = nil,
         preferImmediatelyAvailableCredentials: Bool = false
     ) async throws -> PasskeySignInResult {
-        let start = try await passkeyAuthStartRaw()
-        let challenge = try PasskeyWire.parseAuthenticationOptions(start.options)
+        let start = try await passkeyAuthStart()
+        let challenge = try PasskeyWire.parseAuthenticationOptions(start.wireOptions)
 
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
             relyingPartyIdentifier: challenge.rpId
@@ -88,11 +88,10 @@ extension AuthAPI {
             signature: assertion.signature,
             userHandle: assertion.userID
         )
-        let raw = try await passkeyAuthFinishRaw(
-            credential: credential,
+        return try await passkeyAuthFinish(
+            credential: try JSONCoding.decode(JSONValue.self, from: credential),
             challengeToken: start.challengeToken
         )
-        return try JSONCoding.decode(PasskeySignInResult.self, from: raw)
     }
 
     /// Register a new passkey for the **current (authenticated) user** using
@@ -115,8 +114,8 @@ extension AuthAPI {
         inviteToken: String? = nil,
         presentationAnchor: ASPresentationAnchor? = nil
     ) async throws -> PasskeyRegistrationResult {
-        let start = try await passkeyRegisterStartRaw()
-        let challenge = try PasskeyWire.parseRegistrationOptions(start.options)
+        let start = try await passkeyRegisterStart()
+        let challenge = try PasskeyWire.parseRegistrationOptions(start.wireOptions)
 
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
             relyingPartyIdentifier: challenge.rpId
@@ -158,13 +157,12 @@ extension AuthAPI {
             attestationObject: attestationObject,
             transports: ["internal", "hybrid"]
         )
-        let raw = try await passkeyRegisterFinishRaw(
-            credential: credential,
+        return try await passkeyRegisterFinish(
+            credential: try JSONCoding.decode(JSONValue.self, from: credential),
             challengeToken: start.challengeToken,
             deviceName: deviceName,
             inviteToken: inviteToken
         )
-        return try JSONCoding.decode(PasskeyRegistrationResult.self, from: raw)
     }
 }
 

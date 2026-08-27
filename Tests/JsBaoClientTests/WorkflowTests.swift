@@ -26,7 +26,7 @@ final class WorkflowTests: XCTestCase {
     func testListWorkflowDefinitions() async throws {
         // Query workflow definitions via HTTP API
         do {
-            let result = try await client.makeRequest("GET", "/workflows", nil)
+            let result = try await client.requestJSON(method: .get, path: "/workflows")
             XCTAssertNotNil(result)
         } catch {
             // Workflow endpoints may not be available in all environments
@@ -42,7 +42,7 @@ final class WorkflowTests: XCTestCase {
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Workflow Doc")
 
         do {
-            let result = try await client.makeRequest("GET", "/documents/\(docId)/workflow-runs", nil)
+            let result = try await client.requestJSON(method: .get, path: "/documents/\(docId)/workflow-runs")
             XCTAssertNotNil(result)
         } catch {
             // May 404 if no workflows configured
@@ -57,7 +57,7 @@ final class WorkflowTests: XCTestCase {
     func testGetWorkflowDefinitionById() async throws {
         // Attempt to get a specific workflow definition -- should 404 with a non-existent ID
         do {
-            let result = try await client.makeRequest("GET", "/workflows/nonexistent-id", nil)
+            let result = try await client.requestJSON(method: .get, path: "/workflows/nonexistent-id")
             // If it succeeds, the endpoint exists
             XCTAssertNotNil(result)
         } catch {
@@ -72,7 +72,7 @@ final class WorkflowTests: XCTestCase {
     func testGetWorkflowRunStatus() async throws {
         // Attempt to query a workflow run status -- should 404 with a non-existent run ID
         do {
-            let result = try await client.makeRequest("GET", "/workflow-runs/nonexistent-run-id", nil)
+            let result = try await client.requestJSON(method: .get, path: "/workflow-runs/nonexistent-run-id")
             XCTAssertNotNil(result)
         } catch {
             let msg = String(describing: error)
@@ -91,7 +91,7 @@ final class WorkflowTests: XCTestCase {
         try await waitForConnection(client: client)
 
         var receivedEvents: [WorkflowStatusEvent] = []
-        let sub = client.events.on(.workflowStatus) { (e: WorkflowStatusEvent) in
+        let sub = client.eventEmitter.subscribe(WorkflowStatusEvent.self) { e in
             receivedEvents.append(e)
         }
         defer { sub.cancel() }

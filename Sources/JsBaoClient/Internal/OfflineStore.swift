@@ -2,8 +2,18 @@ import Foundation
 
 /// Manages offline storage for metadata, grants, analytics, and JWT persistence.
 /// Replaces IndexedDB-based OfflineStore from the JS client with SQLite-backed storage.
-public final class OfflineStore: @unchecked Sendable {
-    private let lock = NSLock()
+///
+/// ## An actor since #1993, Phase D2
+///
+/// This is one of the async-domain service managers: every operation on it
+/// already awaited the storage provider, so there was nothing synchronous worth
+/// preserving. Actor isolation replaces the `NSLock` + `@unchecked Sendable`
+/// pair outright — no snapshot holder survives, so the whole type is
+/// compiler-checked. The provider accessors that used to be synchronous
+/// (`setStorageProvider`, `setAuthStorageProvider`, `getStorageProvider`) are
+/// isolated now and their callers `await`; `DocumentManager` is the only one in
+/// the client, and both of its call sites already sat in `async` functions.
+public actor OfflineStore {
     private var storageProvider: StorageProvider?
     private var authStorageProvider: StorageProvider?
     private var currentNamespace: String?
@@ -25,35 +35,40 @@ public final class OfflineStore: @unchecked Sendable {
     // MARK: - Provider Setup
 
     public func setStorageProvider(_ provider: StorageProvider) {
-        lock.withLock { self.storageProvider = provider }
+        self.storageProvider = provider
     }
 
     public func setAuthStorageProvider(_ provider: StorageProvider) {
-        lock.withLock { self.authStorageProvider = provider }
+        self.authStorageProvider = provider
     }
 
     public func getStorageProvider() -> StorageProvider? {
-        lock.withLock { storageProvider }
+        storageProvider
     }
 
     // MARK: - Initialization
 
+    /// Bind the app+user database, at most once per namespace.
+    ///
+    /// The three steps are the same three the `NSLock` version had — read the
+    /// decision from isolated state, `await` the provider's `initialize` with
+    /// nothing held, then write the result back — and the reentrancy story is
+    /// unchanged with it: the `await` is a suspension point, so two concurrent
+    /// first calls for the same namespace can both pass the guard and both
+    /// initialize. That was equally true under the lock (it was released across
+    /// the same `await`), and every `StorageProvider` in the client treats a
+    /// repeated `initialize` for the same namespace as idempotent. Converting
+    /// this to a single-flight would be a behavior change, not part of the
+    /// conversion, so it is deliberately left alone.
     public func ensureMetadataDb(appId: String, userId: String) async throws {
         let namespace = "\(appId):\(userId)"
-        let existing: (provider: StorageProvider, alreadyInit: Bool)? = lock.withLock {
-            guard let provider = storageProvider else { return nil }
-            return (provider, currentNamespace == namespace && isInitialized)
-        }
-        guard let existing else { return }
+        guard let provider = storageProvider else { return }
+        if currentNamespace == namespace && isInitialized { return }
 
-        if existing.alreadyInit { return }
+        try await provider.initialize(namespace: namespace)
 
-        try await existing.provider.initialize(namespace: namespace)
-
-        lock.withLock {
-            currentNamespace = namespace
-            isInitialized = true
-        }
+        currentNamespace = namespace
+        isInitialized = true
     }
 
     // MARK: - Metadata Operations
@@ -89,10 +104,25 @@ public final class OfflineStore: @unchecked Sendable {
     }
 
     public func getMetadata(appId: String, userId: String, documentId: String) async throws -> LocalMetadataEntry? {
+        try await readMetadata(appId: appId, userId: userId, documentId: documentId).entry
+    }
+
+    /// `getMetadata`, but reporting whether the store was actually read.
+    ///
+    /// `nil` means two different things on a cold start: "no row for this
+    /// document" and "no provider bound yet, so nothing could be read". The
+    /// local-only classification (#2691) has to tell them apart — the second is
+    /// *unknown*, not "ordinary", and a document whose classification is
+    /// unknown may not have its content put on the wire.
+    public func readMetadata(
+        appId: String,
+        userId: String,
+        documentId: String
+    ) async throws -> (entry: LocalMetadataEntry?, readable: Bool) {
         try await ensureMetadataDb(appId: appId, userId: userId)
-        guard let provider = storageProvider else { return nil }
+        guard let provider = storageProvider else { return (nil, false) }
         let record: StorageRecord<LocalMetadataEntry>? = try await provider.get(store: Self.storeMetaDocs, key: documentId)
-        return record?.value
+        return (record?.value, true)
     }
 
     /// Store-level purge of ALL locally persisted document data for this
@@ -135,10 +165,19 @@ public final class OfflineStore: @unchecked Sendable {
 
     // MARK: - Analytics
 
-    public func persistAnalyticsQueue(appId: String, userId: String, events: [[String: Any]]) async throws {
+    /// Persist the buffered analytics events.
+    ///
+    /// The payload is `[[String: JSONValue]]`, not `[[String: Any]]` (#1993,
+    /// Phase D2): the events cross this type's new isolation boundary, and an
+    /// `Any` cannot do that under Swift 6. `JSONValue` is also what the events
+    /// already had to be — they are serialized to JSON on the very next line —
+    /// so the type now states a constraint the storage format always imposed.
+    /// Since Phase D3 `AnalyticsQueue` buffers `[[String: JSONValue]]` itself,
+    /// so it hands its rows straight over with no bridging step in between.
+    public func persistAnalyticsQueue(appId: String, userId: String, events: [[String: JSONValue]]) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
         guard let provider = storageProvider else { return }
-        let data = try JSONSerialization.data(withJSONObject: events)
+        let data = try JSONCoding.encodeData(events)
         let jsonString = String(data: data, encoding: .utf8) ?? "[]"
         try await provider.put(
             store: Self.storeAnalytics,
@@ -148,13 +187,13 @@ public final class OfflineStore: @unchecked Sendable {
         )
     }
 
-    public func loadAnalyticsQueue(appId: String, userId: String) async throws -> [[String: Any]] {
+    public func loadAnalyticsQueue(appId: String, userId: String) async throws -> [[String: JSONValue]] {
         try await ensureMetadataDb(appId: appId, userId: userId)
         guard let provider = storageProvider else { return [] }
         let record: StorageRecord<String>? = try await provider.get(store: Self.storeAnalytics, key: Self.analyticsQueueKey)
         guard let jsonString = record?.value,
               let data = jsonString.data(using: .utf8),
-              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+              let arr = try? JSONCoding.decodeData([[String: JSONValue]].self, from: data) else {
             return []
         }
         return arr
@@ -211,13 +250,15 @@ public final class OfflineStore: @unchecked Sendable {
     // MARK: - Lifecycle
 
     public func closeStorage() async {
-        let (provider, authProvider) = lock.withLock { () -> (StorageProvider?, StorageProvider?) in
-            let provider = storageProvider
-            let authProvider = authStorageProvider
-            isInitialized = false
-            currentNamespace = nil
-            return (provider, authProvider)
-        }
+        // Read the two providers and reset the init state in one uninterrupted
+        // isolated step — no `await` between them, so a concurrent
+        // `ensureMetadataDb` cannot observe "still initialized" against a
+        // provider that is about to close. (The `lock.withLock` this replaces
+        // was doing exactly that job.)
+        let provider = storageProvider
+        let authProvider = authStorageProvider
+        isInitialized = false
+        currentNamespace = nil
 
         // Await both closes so the SQLite handles are fully released
         // before this returns. A subsequent client that opens the same
@@ -263,6 +304,47 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// `LocalMetadataEntry.docMetadata` (#673).
     public var docMetadata: JSONValue?
 
+    // The fields below mirror js-bao's `LocalMetadataEntry`
+    // (`src/client/internal/documentManager.ts`) so offline listings can
+    // report the same state the JS client reports (#2662, parity C26). All
+    // optional: rows written before the widening still decode.
+
+    /// The permission last known for this document, cached locally so an
+    /// offline listing can still report access level. Mirrors js-bao
+    /// `lastKnownPermission`. `permission` above stays as the raw
+    /// server-listing value; this one is written by the permission-apply path.
+    public var lastKnownPermission: String?
+    /// ISO-8601 timestamp of when `lastKnownPermission` was cached — the age
+    /// a caller needs to decide whether to trust it. Mirrors js-bao
+    /// `permissionCachedAt`.
+    public var permissionCachedAt: String?
+    /// ISO-8601 timestamp of the document's last known server-side
+    /// modification, tracked separately from `metadataSyncedAt` (which records
+    /// when *this client* last refreshed the metadata). Mirrors js-bao
+    /// `lastSyncedAt`.
+    public var lastSyncedAt: String?
+    /// Whether this document holds a local edit that has not reached the
+    /// server. Persisted so the flag survives a restart — the in-memory
+    /// `unconfirmedLocalWrites` set does not. Mirrors js-bao
+    /// `hasUnsyncedLocalChanges`.
+    public var hasUnsyncedLocalChanges: Bool?
+    /// Blob id of the document's thumbnail, for offline listings that render
+    /// one. Mirrors js-bao `thumbnailBlobId`.
+    public var thumbnailBlobId: String?
+    /// ISO-8601 timestamp of when access to this document was granted.
+    /// Mirrors js-bao `grantedAt`.
+    public var grantedAt: String?
+    /// ISO-8601 timestamp of when a pending create actually committed to the
+    /// server. Mirrors js-bao `createCommittedAt`, the #1953 GSI-lag bridge:
+    /// the owned-docs merge recency-gates on the later of this and
+    /// `createdAt`, so a slow-to-commit offline create is still bridged while
+    /// the server's `permissionsForUser` GSI catches up.
+    public var createCommittedAt: String?
+    /// Whether a local CRDT snapshot exists for this document. Named for
+    /// js-bao's `hasIndexedDbSnapshot`; Swift's local store is SQLite, and the
+    /// field keeps the JS name so cross-platform consumers read one vocabulary.
+    public var hasIndexedDbSnapshot: Bool?
+
     public init(
         documentId: String,
         title: String? = nil,
@@ -279,7 +361,15 @@ public struct LocalMetadataEntry: Codable, Sendable {
         localBytes: Int? = nil,
         commitRetryCount: Int? = nil,
         nextCommitAttemptAt: String? = nil,
-        docMetadata: JSONValue? = nil
+        docMetadata: JSONValue? = nil,
+        lastKnownPermission: String? = nil,
+        permissionCachedAt: String? = nil,
+        lastSyncedAt: String? = nil,
+        hasUnsyncedLocalChanges: Bool? = nil,
+        thumbnailBlobId: String? = nil,
+        grantedAt: String? = nil,
+        createCommittedAt: String? = nil,
+        hasIndexedDbSnapshot: Bool? = nil
     ) {
         self.documentId = documentId
         self.title = title
@@ -297,6 +387,14 @@ public struct LocalMetadataEntry: Codable, Sendable {
         self.commitRetryCount = commitRetryCount
         self.nextCommitAttemptAt = nextCommitAttemptAt
         self.docMetadata = docMetadata
+        self.lastKnownPermission = lastKnownPermission
+        self.permissionCachedAt = permissionCachedAt
+        self.lastSyncedAt = lastSyncedAt
+        self.hasUnsyncedLocalChanges = hasUnsyncedLocalChanges
+        self.thumbnailBlobId = thumbnailBlobId
+        self.grantedAt = grantedAt
+        self.createCommittedAt = createCommittedAt
+        self.hasIndexedDbSnapshot = hasIndexedDbSnapshot
     }
 }
 

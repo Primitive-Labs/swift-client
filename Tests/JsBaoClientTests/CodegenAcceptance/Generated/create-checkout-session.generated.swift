@@ -56,7 +56,7 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
-        timeoutMs: Int? = nil
+        timeout: TimeInterval? = nil
     ) async throws -> RunSyncResult<CreateCheckoutSessionOutput> {
         try await client.workflows.runSync(
             workflowKey: "create-checkout-session",
@@ -64,7 +64,7 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
             runKey: runKey,
             contextDocId: contextDocId,
             meta: meta,
-            timeoutMs: timeoutMs
+            timeout: timeout
         )
     }
 
@@ -97,6 +97,98 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
             runKey: runKey,
             contextDocId: contextDocId
         )
+    }
+
+    /// Terminate a run; `output` is bound to `CreateCheckoutSessionOutput` (a terminated
+    /// run can carry partial output).
+    @discardableResult
+    public func terminate(
+        runKey: String,
+        contextDocId: String? = nil
+    ) async throws -> WorkflowStatus<CreateCheckoutSessionOutput> {
+        try await client.workflows.terminate(
+            workflowKey: "create-checkout-session",
+            runKey: runKey,
+            contextDocId: contextDocId
+        )
+    }
+
+    /// Register this workflow's apply handler. Emitted only because
+    /// `create-checkout-session` is apply-mode (parity with JS). The context's `output`
+    /// is the client's untyped `Any?`.
+    public func define(onApply: @escaping WorkflowApplyHandler) {
+        client.workflows.define("create-checkout-session", onApply: onApply)
+    }
+
+    /// Cron triggers scoped to the `create-checkout-session` workflow. The workflow key is
+    /// pinned by the helpers below, so a trigger cannot be redirected.
+    public var cronTriggers: CronTriggers {
+        CronTriggers(client: client)
+    }
+
+    /// Typed cron-trigger management for the `create-checkout-session` workflow.
+    public struct CronTriggers: Sendable {
+        public let client: JsBaoClient
+
+        public init(client: JsBaoClient) {
+            self.client = client
+        }
+
+        /// Create a cron trigger that fires this workflow.
+        @discardableResult
+        public func create(
+            triggerKey: String,
+            displayName: String,
+            cron: String,
+            timezone: String? = nil,
+            description: String? = nil,
+            overlapPolicy: CronOverlapPolicy? = nil,
+            rootInput: JSONValue? = nil,
+            inputMapping: JSONValue? = nil
+        ) async throws -> CronTriggerInfo {
+            try await client.cronTriggers.create(
+                params: CreateCronTriggerParams(
+                    triggerKey: triggerKey,
+                    displayName: displayName,
+                    cron: cron,
+                    workflowKey: "create-checkout-session",
+                    timezone: timezone,
+                    description: description,
+                    overlapPolicy: overlapPolicy,
+                    rootInput: rootInput,
+                    inputMapping: inputMapping
+                )
+            )
+        }
+
+        /// Update a cron trigger that fires this workflow. Omitted fields stay
+        /// unchanged; `description` removes the stored value with `.clear`
+        /// and `rootInput` with `.null`.
+        @discardableResult
+        public func update(
+            triggerId: String,
+            displayName: String? = nil,
+            description: Updatable<String>? = nil,
+            cron: String? = nil,
+            timezone: String? = nil,
+            overlapPolicy: CronOverlapPolicy? = nil,
+            rootInput: JSONValue? = nil,
+            inputMapping: JSONValue? = nil
+        ) async throws -> CronTriggerInfo {
+            try await client.cronTriggers.update(
+                triggerId: triggerId,
+                params: UpdateCronTriggerParams(
+                    displayName: displayName,
+                    description: description,
+                    cron: cron,
+                    timezone: timezone,
+                    workflowKey: "create-checkout-session",
+                    overlapPolicy: overlapPolicy,
+                    rootInput: rootInput,
+                    inputMapping: inputMapping
+                )
+            )
+        }
     }
 }
 

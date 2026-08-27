@@ -71,19 +71,22 @@ struct SwiftEmitter {
         out += "\(access) extension \(typeName) {\n"
         out += "    // MARK: Reads (cross-document by default)\n\n"
         out += "    /// Query across all open documents. Rows that fail to decode (schema\n"
-        out += "    /// drift) are skipped. Scope to one/some docs via `options.documents`.\n"
+        out += "    /// drift) are skipped — but never silently: each one is logged with\n"
+        out += "    /// the row id and the unreadable field(s) and reported to\n"
+        out += "    /// `PrimitiveRowDecoder.onDecodeFailure`. Scope to one/some docs via\n"
+        out += "    /// `options.documents`.\n"
         out += "    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [\(typeName)] {\n"
-        out += "        try JsBaoClient.requireDefault()\n"
-        out += "            .queryShared(primitiveSchema, filter: filter, options: options)\n"
-        out += "            .compactMap { \(typeName)(row: $0) }\n"
+        out += "        let rows = try JsBaoClient.requireDefault()\n"
+        out += "            .codegen.query(primitiveSchema, filter: filter, options: options)\n"
+        out += "        return PrimitiveRowDecoder.decodeAll(rows, as: \(typeName).self)\n"
         out += "    }\n\n"
         out += "    /// Query across all open documents and batch-prefetch related\n"
         out += "    /// records into each row's `related` bag. Mirrors JS\n"
         out += "    /// `BaseModel.query(filter, { include })`.\n"
         out += "    static func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> [\(typeName)] {\n"
-        out += "        try JsBaoClient.requireDefault()\n"
-        out += "            .queryShared(primitiveSchema, filter: filter, options: options, include: include)\n"
-        out += "            .compactMap { \(typeName)(row: $0) }\n"
+        out += "        let rows = try JsBaoClient.requireDefault()\n"
+        out += "            .codegen.query(primitiveSchema, filter: filter, options: options, include: include)\n"
+        out += "        return PrimitiveRowDecoder.decodeAll(rows, as: \(typeName).self)\n"
         out += "    }\n\n"
         out += "    /// Paginated query across all open documents. Returns the page's\n"
         out += "    /// rows plus `nextCursor`/`prevCursor`/`hasMore` — round-trip\n"
@@ -91,9 +94,9 @@ struct SwiftEmitter {
         out += "    /// `BaseModel.query()`'s `{ data, nextCursor, hasMore }` shape.\n"
         out += "    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<\(typeName)> {\n"
         out += "        let page = try JsBaoClient.requireDefault()\n"
-        out += "            .queryPagedShared(primitiveSchema, filter: filter, options: options)\n"
+        out += "            .codegen.queryPaged(primitiveSchema, filter: filter, options: options)\n"
         out += "        return PagedQueryResult(\n"
-        out += "            data: page.data.compactMap { \(typeName)(row: $0) },\n"
+        out += "            data: PrimitiveRowDecoder.decodeAll(page.data, as: \(typeName).self),\n"
         out += "            nextCursor: page.nextCursor,\n"
         out += "            prevCursor: page.prevCursor,\n"
         out += "            hasMore: page.hasMore\n"
@@ -102,9 +105,9 @@ struct SwiftEmitter {
         out += "    /// Paginated query with query-time relationship includes.\n"
         out += "    static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<\(typeName)> {\n"
         out += "        let page = try JsBaoClient.requireDefault()\n"
-        out += "            .queryPagedShared(primitiveSchema, filter: filter, options: options, include: include)\n"
+        out += "            .codegen.queryPaged(primitiveSchema, filter: filter, options: options, include: include)\n"
         out += "        return PagedQueryResult(\n"
-        out += "            data: page.data.compactMap { \(typeName)(row: $0) },\n"
+        out += "            data: PrimitiveRowDecoder.decodeAll(page.data, as: \(typeName).self),\n"
         out += "            nextCursor: page.nextCursor,\n"
         out += "            prevCursor: page.prevCursor,\n"
         out += "            hasMore: page.hasMore\n"
@@ -112,7 +115,7 @@ struct SwiftEmitter {
         out += "    }\n\n"
         out += "    /// Count across all open documents.\n"
         out += "    static func count(_ filter: DocumentFilter? = nil) throws -> Int {\n"
-        out += "        try JsBaoClient.requireDefault().countShared(primitiveSchema, filter: filter)\n"
+        out += "        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)\n"
         out += "    }\n\n"
         out += "    /// Every record across all open documents. Synchronous like the\n"
         out += "    /// rest of the facade reads (#1156) — the shared store never\n"
@@ -122,10 +125,10 @@ struct SwiftEmitter {
         out += "    /// the result.\n"
         out += "    static func findAll() throws -> [\(typeName)] {\n"
         out += "        try JsBaoClient.requireDefault()\n"
-        out += "            .queryShared(primitiveSchema, filter: nil, options: nil)\n"
+        out += "            .codegen.query(primitiveSchema, filter: nil, options: nil)\n"
         out += "            .map { row in\n"
         out += "                guard let decoded = \(typeName)(row: row) else {\n"
-        out += "                    throw PrimitiveDecodeError(modelName: modelName, row: row)\n"
+        out += "                    throw PrimitiveDecodeError(modelName: modelName, row: row, schema: primitiveSchema)\n"
         out += "                }\n"
         out += "                return decoded\n"
         out += "            }\n"
@@ -136,11 +139,11 @@ struct SwiftEmitter {
         out += "    /// `PrimitiveDecodeError` when the row exists but no longer decodes\n"
         out += "    /// as `\(typeName)` — distinct from the `nil` not-found case.\n"
         out += "    static func find(_ id: String) throws -> \(typeName)? {\n"
-        out += "        guard let row = JsBaoClient.requireDefault().findShared(primitiveSchema, id: id) else {\n"
+        out += "        guard let row = JsBaoClient.requireDefault().codegen.find(primitiveSchema, id: id) else {\n"
         out += "            return nil\n"
         out += "        }\n"
         out += "        guard let decoded = \(typeName)(row: row) else {\n"
-        out += "            throw PrimitiveDecodeError(modelName: modelName, row: row)\n"
+        out += "            throw PrimitiveDecodeError(modelName: modelName, row: row, schema: primitiveSchema)\n"
         out += "        }\n"
         out += "        return decoded\n"
         out += "    }\n\n"
@@ -150,46 +153,73 @@ struct SwiftEmitter {
         out += "    /// same value may exist in more than one open doc). Mirrors the\n"
         out += "    /// JS client's `Model.findByUnique(constraintName, value)`.\n"
         out += "    static func findByUnique(_ constraint: String, _ value: PrimitiveValue) throws -> \(typeName)? {\n"
-        out += "        try JsBaoClient.requireDefault()\n"
-        out += "            .findByUniqueShared(primitiveSchema, constraint: constraint, value: value)\n"
-        out += "            .flatMap { \(typeName)(row: $0) }\n"
+        out += "        let row = try JsBaoClient.requireDefault()\n"
+        out += "            .codegen.findByUnique(primitiveSchema, constraint: constraint, value: value)\n"
+        out += "        return PrimitiveRowDecoder.decodeOne(row, as: \(typeName).self)\n"
         out += "    }\n\n"
         out += "    /// The first record matching `filter` across all open documents,\n"
         out += "    /// or `nil`. Equivalent to `query(filter, options).first` — mirrors\n"
         out += "    /// the JS client's `Model.queryOne(filter, options)`.\n"
         out += "    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> \(typeName)? {\n"
-        out += "        try JsBaoClient.requireDefault()\n"
-        out += "            .queryOneShared(primitiveSchema, filter: filter, options: options)\n"
-        out += "            .flatMap { \(typeName)(row: $0) }\n"
+        out += "        let row = try JsBaoClient.requireDefault()\n"
+        out += "            .codegen.queryOne(primitiveSchema, filter: filter, options: options)\n"
+        out += "        return PrimitiveRowDecoder.decodeOne(row, as: \(typeName).self)\n"
         out += "    }\n\n"
         out += "    /// The first record matching `filter` with query-time relationship\n"
         out += "    /// includes attached under `related`, or `nil`. Equivalent to\n"
         out += "    /// `query(filter, options, include:).first` — mirrors the JS client's\n"
         out += "    /// `Model.queryOne(filter, { include })`.\n"
         out += "    static func queryOne(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> \(typeName)? {\n"
-        out += "        try JsBaoClient.requireDefault()\n"
-        out += "            .queryOneShared(primitiveSchema, filter: filter, options: options, include: include)\n"
-        out += "            .flatMap { \(typeName)(row: $0) }\n"
+        out += "        let row = try JsBaoClient.requireDefault()\n"
+        out += "            .codegen.queryOne(primitiveSchema, filter: filter, options: options, include: include)\n"
+        out += "        return PrimitiveRowDecoder.decodeOne(row, as: \(typeName).self)\n"
         out += "    }\n\n"
         out += "    /// Fire `callback` after any add/update/delete in any open document's\n"
         out += "    /// copy of this model (local or remote). Returns an unsubscribe closure.\n"
+        out += "    ///\n"
+        out += "    /// The callback is `@Sendable` (#1992): it runs on whichever thread\n"
+        out += "    /// committed the change — a local writer's thread, or the\n"
+        out += "    /// observer-drain queue — so state it captures must be safe to touch\n"
+        out += "    /// from either.\n"
         out += "    @discardableResult\n"
-        out += "    static func subscribe(_ callback: @escaping () -> Void) -> () -> Void {\n"
-        out += "        JsBaoClient.requireDefault().subscribeShared(primitiveSchema, callback)\n"
+        out += "    static func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {\n"
+        out += "        JsBaoClient.requireDefault().codegen.subscribe(primitiveSchema, callback)\n"
         out += "    }\n\n"
         out += "    /// Aggregate (group / count / sum / avg / …) across all open documents.\n"
-        out += "    static func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {\n"
-        out += "        try JsBaoClient.requireDefault().aggregateShared(primitiveSchema, options: options)\n"
+        out += "    static func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {\n"
+        out += "        try JsBaoClient.requireDefault().codegen.aggregate(primitiveSchema, options: options)\n"
         out += "    }\n\n"
         out += "    // MARK: Writes (target one document; throw if it isn't open)\n\n"
         out += "    /// Persist this record to document `documentId` — inserts it if it\n"
         out += "    /// doesn't exist yet, updates it in place if it does. One call for\n"
         out += "    /// both, matching the JS client's `save()`. Throws if the doc isn't\n"
-        out += "    /// open. Returns `self` so you can `let saved = try note.save(in:)`.\n"
+        out += "    /// open.\n"
+        out += "    ///\n"
+        out += "    /// Updating writes only the fields assigned since this value was\n"
+        out += "    /// read (`_changedFields`), so two devices editing different fields\n"
+        out += "    /// of the same record merge instead of clobbering. Inserting writes\n"
+        out += "    /// every field.\n"
+        out += "    ///\n"
+        out += "    /// Returns the record AS SAVED, re-read from the document with no\n"
+        out += "    /// pending changes left — so a field this save didn't write carries\n"
+        out += "    /// whatever another device put there, and an insert's schema\n"
+        out += "    /// defaults and `auto_stamp` values are filled in. Assign it back\n"
+        out += "    /// (`task = try task.save(in: doc)`) when you keep using the value\n"
+        out += "    /// after the save; `self` itself still holds the values you had.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String) throws -> \(typeName) {\n"
-        out += "        try JsBaoClient.requireDefault().saveShared(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId)\n"
-        out += "        return self\n"
+        out += "        let record = try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)\n"
+        out += "        guard var saved = \(typeName)(record: record) else {\n"
+        out += "            var fallback = self\n"
+        out += "            fallback.discardChanges()\n"
+        out += "            return fallback\n"
+        out += "        }\n"
+        out += "        // Carried over, not persisted: query-time includes and the\n"
+        out += "        // caller-pinned-id flag have no representation in the stored\n"
+        out += "        // record, and this path never changes the record's id.\n"
+        out += "        saved.related = related\n"
+        out += "        saved._explicitId = _explicitId\n"
+        out += "        return saved\n"
         out += "    }\n\n"
         out += "    /// Insert-or-update this record in `documentId`, matched by the\n"
         out += "    /// single-field unique constraint on `upsertOn` rather than `id` —\n"
@@ -205,10 +235,11 @@ struct SwiftEmitter {
         out += "    /// its fields reflect the merged state, NOT necessarily `self`.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String, upsertOn: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().upsertShared(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId)\n"
+        out += "        let result = try JsBaoClient.requireDefault().codegen.upsert(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
+        out += "        copy.discardChanges()\n"
         out += "        return copy\n"
         out += "    }\n\n"
         out += "    /// Insert-or-update this record, matched by the NAMED unique\n"
@@ -233,10 +264,11 @@ struct SwiftEmitter {
         out += "    /// EXISTING record's id and its fields reflect the merged state.\n"
         out += "    @discardableResult\n"
         out += "    func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId)\n"
+        out += "        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
+        out += "        copy.discardChanges()\n"
         out += "        return copy\n"
         out += "    }\n\n"
         out += "    /// `upsertByUnique` overload taking an EXPLICIT lookup value (one\n"
@@ -246,15 +278,16 @@ struct SwiftEmitter {
         out += "    /// when you want to make the lookup key explicit at the call site.\n"
         out += "    @discardableResult\n"
         out += "    func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().upsertByUniqueShared(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue)\n"
+        out += "        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
+        out += "        copy.discardChanges()\n"
         out += "        return copy\n"
         out += "    }\n\n"
         out += "    /// Delete this record from document `documentId`. Throws if the doc isn't open.\n"
         out += "    func delete(in documentId: String) throws {\n"
-        out += "        try JsBaoClient.requireDefault().deleteShared(Self.primitiveSchema, id: id, in: documentId)\n"
+        out += "        try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)\n"
         out += "    }\n"
         out += "}\n"
         return out
@@ -367,16 +400,24 @@ struct SwiftEmitter {
         let typeName = schema.swiftName
         // `Equatable`, `Hashable`, and `Codable` synthesis only fires
         // when the conformance lives in the SAME file as the type
-        // declaration. Adding the conformances here lets callers get
+        // declaration. Declaring the conformances here lets callers get
         // them for free — saves ~80 lines of hand-rolled boilerplate
         // per model. All generated stored-property types conform
         // (`String`, `Double`, `Bool`, `Set<String>`, plus their
-        // optional forms), so synthesis succeeds for every schema.
-        // CodingKeys synthesis also handles backtick-escaped property
-        // names automatically (Swift 5.1+), so reserved-keyword
-        // fields like `default` / `where` round-trip through
-        // `JSONEncoder` / `JSONDecoder` without needing a manual
-        // `CodingKeys` enum.
+        // optional forms), so the members below compile for every
+        // schema.
+        //
+        // Three of the four members are emitted rather than synthesized,
+        // because the struct carries non-schema bookkeeping the
+        // synthesized versions would pick up: `CodingKeys`, `==`, and
+        // `hash(into:)` list the real fields only (see
+        // `equatableHashableCodableConformance`), and `init(from:)` is
+        // emitted so a decoded record marks its fields changed (see
+        // `codableDecodeInit`). Only `encode(to:)` is synthesized — it
+        // follows the emitted `CodingKeys`, so `_explicitId` /
+        // `_changedFields` / `related` can't leak into the JSON.
+        // Backtick-escaped property names (`default`, `where`) round-trip
+        // fine: the emitted `CodingKeys` cases carry the same escapes.
         var out = "\(access) struct \(typeName): PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {\n"
         out += staticMembers(schema: schema)
         out += "\n"
@@ -388,6 +429,8 @@ struct SwiftEmitter {
         out += "\n"
         out += idProvenanceProperty(schema: schema)
         out += "\n"
+        out += changeTrackingMembers(schema: schema)
+        out += "\n"
         out += designatedInit(schema: schema)
         out += "\n"
         out += autoIdInit(schema: schema)
@@ -397,6 +440,8 @@ struct SwiftEmitter {
         out += rowInit(schema: schema)
         out += "\n"
         out += primitiveValuesFn(schema: schema)
+        out += "\n"
+        out += codableDecodeInit(schema: schema)
         out += "\n"
         out += equatableHashableCodableConformance(schema: schema)
         out += relationshipAccessors(schema: schema)
@@ -473,6 +518,7 @@ struct SwiftEmitter {
         }
         out += "        self.related = .empty\n"
         out += "        self._explicitId = false\n"
+        out += "        self._changedFields = Set(primitiveValues().keys)\n"
         out += "    }\n"
         return out
     }
@@ -520,7 +566,7 @@ struct SwiftEmitter {
     /// `static let primitiveSchema`. So the accessor resolves the target
     /// model from `TargetRecord.primitiveSchema` and delegates to the
     /// configured default `JsBaoClient`'s cross-document relationship
-    /// helpers (`refersToShared` / `hasManyShared` / `hasManyThroughShared`)
+    /// helpers (`codegen.refersTo` / `codegen.hasMany` / `codegen.hasManyThrough`)
     /// — the same shared store the rest of the facade reads. This matches
     /// JS, where the target model class is baked in at codegen and the
     /// accessor queries it (`relationshipManager.ts`). No global model
@@ -557,9 +603,9 @@ struct SwiftEmitter {
                 out += "    /// or points at a missing record. Mirrors the JS `\(method)()`\n"
                 out += "    /// instance accessor.\n"
                 out += "    \(access) func \(method)() throws -> \(targetType)? {\n"
-                out += "        JsBaoClient.requireDefault()\n"
-                out += "            .refersToShared(target: \(targetType).primitiveSchema, foreignKey: \(fkProp))\n"
-                out += "            .flatMap { \(targetType)(row: $0) }\n"
+                out += "        let row = JsBaoClient.requireDefault()\n"
+                out += "            .codegen.refersTo(target: \(targetType).primitiveSchema, foreignKey: \(fkProp))\n"
+                out += "        return PrimitiveRowDecoder.decodeOne(row, as: \(targetType).self)\n"
                 out += "    }\n\n"
                 out += "    /// Typed query-time include payload for `\(rname)`, when present in `related`.\n"
                 out += "    \(access) var \(relatedAccessor): \(targetType)? {\n"
@@ -575,7 +621,7 @@ struct SwiftEmitter {
                 out += "    ) -> Include {\n"
                 out += "        Include(\n"
                 out += "            type: .refersTo,\n"
-                out += "            target: JsBaoClient.requireDefault().includeTarget(for: \(targetType).primitiveSchema),\n"
+                out += "            target: JsBaoClient.requireDefault().codegen.includeTarget(for: \(targetType).primitiveSchema),\n"
                 out += "            sourceField: \(quoted(fk)),\n"
                 out += "            filter: filter,\n"
                 out += "            projection: projection,\n"
@@ -597,13 +643,13 @@ struct SwiftEmitter {
                 out += "    /// `order_by_field` / `order_direction`. Mirrors the JS\n"
                 out += "    /// `\(method)()` instance accessor.\n"
                 out += "    \(access) func \(method)() throws -> [\(targetType)] {\n"
-                out += "        try JsBaoClient.requireDefault()\n"
-                out += "            .hasManyShared(\n"
+                out += "        let rows = try JsBaoClient.requireDefault()\n"
+                out += "            .codegen.hasMany(\n"
                 out += "                target: \(targetType).primitiveSchema,\n"
                 out += "                relatedIdField: \(quoted(fk)),\n"
                 out += "                sourceId: id\(orderArgs)\n"
                 out += "            )\n"
-                out += "            .compactMap { \(targetType)(row: $0) }\n"
+                out += "        return PrimitiveRowDecoder.decodeAll(rows, as: \(targetType).self)\n"
                 out += "    }\n\n"
                 out += "    /// Typed query-time include payload for `\(rname)`, when present in `related`.\n"
                 out += "    \(access) var \(relatedAccessor): [\(targetType)] {\n"
@@ -623,7 +669,7 @@ struct SwiftEmitter {
                 out += "    ) -> Include {\n"
                 out += "        Include(\n"
                 out += "            type: .hasMany,\n"
-                out += "            target: JsBaoClient.requireDefault().includeTarget(for: \(targetType).primitiveSchema),\n"
+                out += "            target: JsBaoClient.requireDefault().codegen.includeTarget(for: \(targetType).primitiveSchema),\n"
                 out += "            foreignKey: \(quoted(fk)),\n"
                 out += "            localField: \"id\",\n"
                 out += "            filter: filter,\n"
@@ -651,15 +697,15 @@ struct SwiftEmitter {
                 out += "    /// `join_model_order_direction` to the join leg. Mirrors the JS\n"
                 out += "    /// `\(method)()` instance accessor.\n"
                 out += "    \(access) func \(method)() throws -> [\(targetType)] {\n"
-                out += "        try JsBaoClient.requireDefault()\n"
-                out += "            .hasManyThroughShared(\n"
+                out += "        let rows = try JsBaoClient.requireDefault()\n"
+                out += "            .codegen.hasManyThrough(\n"
                 out += "                target: \(targetType).primitiveSchema,\n"
                 out += "                joinModel: \(joinType).primitiveSchema,\n"
                 out += "                sourceId: id,\n"
                 out += "                joinModelLocalField: \(quoted(localField)),\n"
                 out += "                joinModelRelatedField: \(quoted(relatedField))\(joinOrderArgs)\n"
                 out += "            )\n"
-                out += "            .compactMap { \(targetType)(row: $0) }\n"
+                out += "        return PrimitiveRowDecoder.decodeAll(rows, as: \(targetType).self)\n"
                 out += "    }\n\n"
                 out += "    /// Paginated `\(method)` — pages the `\(joinModel)` join leg by its\n"
                 out += "    /// declared order (default `id ASC`) through the shared\n"
@@ -678,7 +724,7 @@ struct SwiftEmitter {
                 out += "        direction: CursorDirection = .forward\n"
                 out += "    ) throws -> PagedQueryResult<\(targetType)> {\n"
                 out += "        let page = try JsBaoClient.requireDefault()\n"
-                out += "            .hasManyThroughShared(\n"
+                out += "            .codegen.hasManyThrough(\n"
                 out += "                target: \(targetType).primitiveSchema,\n"
                 out += "                joinModel: \(joinType).primitiveSchema,\n"
                 out += "                sourceId: id,\n"
@@ -690,7 +736,7 @@ struct SwiftEmitter {
                 out += "                direction: direction\n"
                 out += "            )\n"
                 out += "        return PagedQueryResult(\n"
-                out += "            data: page.data.compactMap { \(targetType)(row: $0) },\n"
+                out += "            data: PrimitiveRowDecoder.decodeAll(page.data, as: \(targetType).self),\n"
                 out += "            nextCursor: page.nextCursor,\n"
                 out += "            prevCursor: page.prevCursor,\n"
                 out += "            hasMore: page.hasMore\n"
@@ -918,13 +964,98 @@ struct SwiftEmitter {
 
     // MARK: - Stored properties
 
+    /// Emit one stored property per schema field, each carrying a `didSet`
+    /// that records the assignment in `_changedFields` (#2459).
+    ///
+    /// This is the Swift analogue of js-bao's `setValue` → `_localChanges`:
+    /// `save(in:)` writes only the fields the caller actually assigned, so
+    /// two devices editing different fields of the same record merge instead
+    /// of clobbering. Property observers do not fire for the initializers'
+    /// own assignments, which is exactly right — each init below sets
+    /// `_changedFields` explicitly to what that construction path means.
     private func storedProperties(schema: ParsedSchema) -> String {
         let access = options.accessLevel
         var out = ""
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
-            out += "    \(access) var \(propName(fname)): \(swiftStoredType(f, fieldName: fname))\n"
+            out += "    \(access) var \(propName(fname)): \(swiftStoredType(f, fieldName: fname)) {\n"
+            out += "        didSet { _changedFields.insert(\(quoted(fname))) }\n"
+            out += "    }\n"
         }
+        return out
+    }
+
+    // MARK: - Change tracking (#2459)
+
+    /// Emit the non-persisted `_changedFields` set plus `discardChanges()`.
+    /// Mirrors js-bao's `_localChanges` / `discardChanges()`: the write
+    /// facade passes the set to the runtime, which writes only those fields
+    /// when the record already exists.
+    private func changeTrackingMembers(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        var out = ""
+        out += "    /// Fields assigned since this value was constructed or read\n"
+        out += "    /// from the store — js-bao's `_localChanges`. `save(in:)` writes\n"
+        out += "    /// only these when the record already exists, so a save built\n"
+        out += "    /// from a stale read can't clobber another device's concurrent\n"
+        out += "    /// edit to a field you never touched. A record built through an\n"
+        out += "    /// initializer starts with every field it carries marked changed\n"
+        out += "    /// (it's new data); one read back out of the store starts clean.\n"
+        out += "    /// Inserting a record that doesn't exist yet always writes every\n"
+        out += "    /// field, whatever this holds.\n"
+        out += "    /// Not part of the record's persisted/equatable identity.\n"
+        out += "    \(access) private(set) var _changedFields: Set<String> = []\n\n"
+        out += "    /// Forget the pending field changes without writing them, so a\n"
+        out += "    /// later `save(in:)` treats this value as unmodified. Mirrors\n"
+        out += "    /// js-bao's `discardChanges()`. The field values themselves are\n"
+        out += "    /// left alone — re-read the record to get the stored ones back.\n"
+        out += "    \(access) mutating func discardChanges() {\n"
+        out += "        _changedFields = []\n"
+        out += "    }\n\n"
+        out += "    /// Mark every field this record carries as changed, so the next\n"
+        out += "    /// `save(in:)` writes all of them even if nothing was assigned.\n"
+        out += "    /// The counterpart to `discardChanges()`.\n"
+        out += "    ///\n"
+        out += "    /// Use it to force a whole-record write: saving a record you READ\n"
+        out += "    /// out of the store into another document that already holds it is\n"
+        out += "    /// an update with an empty change set, so it writes nothing. Call\n"
+        out += "    /// this first when you mean \"copy the whole record over\":\n"
+        out += "    ///\n"
+        out += "    ///     var copy = try Model.find(id)!\n"
+        out += "    ///     copy.markAllChanged()\n"
+        out += "    ///     try copy.save(in: otherDocId)\n"
+        out += "    ///\n"
+        out += "    /// Every field it writes wins last-writer-wins against a concurrent\n"
+        out += "    /// remote edit to that field, which is the cost of a full copy.\n"
+        out += "    \(access) mutating func markAllChanged() {\n"
+        out += "        _changedFields = Set(primitiveValues().keys)\n"
+        out += "    }\n"
+        return out
+    }
+
+    /// Emit an explicit `init(from:)` so a decoded value is treated like a
+    /// constructed one: every decoded field counts as a change. The
+    /// compiler's synthesized decode would leave `_changedFields` at its
+    /// empty default, and a decoded record would then silently save nothing
+    /// over an existing record (#2459). `encode(to:)` stays synthesized.
+    private func codableDecodeInit(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        var out = ""
+        out += "    /// Decode a record. A decoded value is treated like a\n"
+        out += "    /// constructed one — every decoded field is marked changed, so\n"
+        out += "    /// `save(in:)` writes all of them.\n"
+        out += "    \(access) init(from decoder: Decoder) throws {\n"
+        out += "        let container = try decoder.container(keyedBy: CodingKeys.self)\n"
+        for fname in displayFieldOrder(schema) {
+            guard let f = schema.fields[fname] else { continue }
+            let stored = swiftStoredType(f, fieldName: fname)
+            let base = stored.hasSuffix("?") ? String(stored.dropLast()) : stored
+            let call = stored.hasSuffix("?") ? "decodeIfPresent" : "decode"
+            out += "        self.\(propName(fname)) = try container.\(call)(\(base).self, forKey: .\(propName(fname)))\n"
+        }
+        out += "        self.related = .empty\n"
+        out += "        self._changedFields = Set(primitiveValues().keys)\n"
+        out += "    }\n"
         return out
     }
 
@@ -971,6 +1102,9 @@ struct SwiftEmitter {
             out += "        self.\(propName(fname)) = \(propName(fname))\n"
         }
         out += "        self.related = .empty\n"
+        // A constructed record is new data: every field it carries counts as
+        // a change, matching js-bao's `new Model({...})` (#2459).
+        out += "        self._changedFields = Set(primitiveValues().keys)\n"
         out += "    }\n"
         return out
     }
@@ -1014,6 +1148,9 @@ struct SwiftEmitter {
             }
         }
         out += "        self.related = .empty\n"
+        // Read back from the store: nothing is pending. A later `save(in:)`
+        // writes only what the caller assigns from here on (#2459).
+        out += "        self._changedFields = []\n"
         out += "    }\n"
         return out
     }
@@ -1038,9 +1175,9 @@ struct SwiftEmitter {
     private func rowInit(schema: ParsedSchema) -> String {
         let access = options.accessLevel
         var out = "    /// Build from a SQLite-backed query row (`dynamic.query(...)`).\n"
-        out += "    \(access) init?(row: [String: Any]) {\n"
+        out += "    \(access) init?(row: [String: JSONValue]) {\n"
         // Always require id from the row.
-        var guardClauses: [String] = ["let id = row[\"id\"] as? String"]
+        var guardClauses: [String] = ["let id = row[\"id\"]?.stringValue"]
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
@@ -1063,53 +1200,46 @@ struct SwiftEmitter {
                 out += "        self.\(propName(fname)) = \(rowReadExpression(f, key: quoted(fname)))\n"
             }
         }
-        out += "        self.related = RelatedRecords(raw: row[\"_related\"] as? [String: Any] ?? [:])\n"
+        out += "        self.related = RelatedRecords(raw: row[\"_related\"]?.objectValue ?? [:])\n"
+        // Read back from the store: nothing is pending (#2459).
+        out += "        self._changedFields = []\n"
         out += "    }\n"
         return out
     }
 
-    /// The expression that reads one field out of a SQLite-row dict.
+    /// The expression that reads one field out of a query row
+    /// (`[String: JSONValue]`).
     ///
-    /// Scalars (`string` / `number` / `boolean` / `id` / `date`) are
-    /// straight `as?` casts to their Swift type. Stringsets are special:
-    /// `BaoModelQueryEngine.populateStringsetsFiltered` writes stringset
-    /// columns back into the row dict as `[String]` (Swift array), not
-    /// as `Set<String>`, so a direct `as? Set<String>` cast always
-    /// fails and the row is silently dropped. Cast to `[String]` first
-    /// and convert.
+    /// Scalars (`string` / `number` / `id` / `date`) read through the matching
+    /// `JSONValue` accessor. Two field types need a row-specific one:
+    ///
+    /// - **stringset**: `BaoModelQueryEngine.populateStringsetsFiltered`
+    ///   writes the column back as an array of strings, so read it as
+    ///   `[String]` (`stringArrayValue`) and convert to the `Set<String>` the
+    ///   generated property stores.
+    /// - **boolean**: SQLite has no boolean type — a boolean field is stored
+    ///   as INTEGER, so the row carries `.number(0)` / `.number(1)`.
+    ///   `rowBoolValue` reads either that or a real `.bool`, so the field
+    ///   doesn't drop silently (optional) or abort the whole row (required).
     ///
     /// The expression returns an `Optional` of the field's storage
     /// type — caller wraps in `let prop = ...` to unwrap it.
     private func rowReadExpression(_ f: ParsedField, key: String) -> String {
         if f.type == .stringset {
-            return "(row[\(key)] as? [String]).map(Set.init)"
+            return "(row[\(key)]?.stringArrayValue).map(Set.init)"
         }
-        if f.type == .boolean {
-            // BaoModelQueryEngine.executeQuery returns SQLite INTEGER
-            // columns as `Int` — boolean fields are stored as INTEGER,
-            // so a direct `as? Bool` cast always fails and the row's
-            // bool either drops silently (optional) or aborts the
-            // whole row (required). Fall back through Int → Bool.
-            //
-            // Use a non-trailing closure on `.map` because the read
-            // expression sits inside a `guard let X = ..., let Y = ...
-            // else { return nil }` chain — a trailing closure there
-            // triggers the "trailing closure in this context is
-            // confusable with the body of the statement" warning.
-            return "(row[\(key)] as? Bool) ?? (row[\(key)] as? Int).map({ $0 != 0 })"
-        }
-        return "row[\(key)] as? \(swiftRowCastType(f))"
+        return "row[\(key)]?.\(rowAccessor(f))"
     }
 
-    /// The non-optional Swift type for a SQLite row-cast (`as? T`).
-    /// `.stringset` does not appear here — `rowReadExpression` handles
-    /// it via the `[String] → Set<String>` conversion path.
-    private func swiftRowCastType(_ f: ParsedField) -> String {
+    /// The `JSONValue` accessor a row read goes through for each field type.
+    /// `.stringset` does not appear here — `rowReadExpression` handles it via
+    /// the `[String] → Set<String>` conversion path.
+    private func rowAccessor(_ f: ParsedField) -> String {
         switch f.type {
-        case .string, .id, .date: return "String"
-        case .number:              return "Double"
-        case .boolean:             return "Bool"
-        case .stringset:           return "Set<String>"   // unused; handled in rowReadExpression
+        case .string, .id, .date: return "stringValue"
+        case .number:              return "numberValue"
+        case .boolean:             return "rowBoolValue"
+        case .stringset:           return "stringArrayValue"  // unused; see rowReadExpression
         }
     }
 

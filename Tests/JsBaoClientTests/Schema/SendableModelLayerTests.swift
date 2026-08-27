@@ -1,0 +1,486 @@
+import XCTest
+@testable import JsBaoClient
+import YSwift
+
+/// Phase C of the concurrency-modernization epic (#1992): the model / schema /
+/// query layer conforms to `Sendable` **honestly** — class-plus-lock kept, each
+/// unchecked conformance carrying a written safety argument, `PrimitiveRecord`
+/// plainly checked, and one shared `Sendable` row bag behind the paginated
+/// query surface.
+///
+/// What each kind of check here is worth:
+///
+///  - The `requireSendable(_:)` calls **document** the intended conformance
+///    set at each call site, and since #2310 they also enforce it: this test
+///    target builds in the Swift 6 language mode along with the rest of the
+///    package, so passing a non-`Sendable` type to a `T: Sendable` generic
+///    parameter is a compile error here. (Between #1946 and #2310 the target
+///    was still `.v5`, where the same call produced no diagnostic at all.)
+///  - `scripts/v6-sendable-gate.sh`, run with `--max` / `--max-warnings` /
+///    `--require-zero` from `run-tests.sh`, is the per-file half: it builds
+///    the library target and exits non-zero if any Phase C file regains a
+///    Sendable site, naming the file — which a bare build failure does not.
+///  - The source-text checks assert the *written safety argument* exists and
+///    names the actual locks. An `@unchecked Sendable` is only as good as its
+///    argument, so a future conformance added without one fails here.
+///  - The rest are ordinary behavior tests: the live-handle semantics that
+///    must survive (#1156), and read-path parity through the row bag.
+final class SendableModelLayerTests: XCTestCase {
+
+    private let schema = PrimitiveSchema(
+        name: "sendable_items",
+        fields: [
+            "id":    FieldDescriptor(type: .id),
+            "title": FieldDescriptor(type: .string),
+            "score": FieldDescriptor(type: .number),
+            "tags":  FieldDescriptor(type: .stringset),
+        ]
+    )
+
+    private func seeded() throws -> DynamicModel {
+        SchemaSync.clearCache()
+        let model = DynamicModel(doc: YDocument(), schema: schema)
+        for i in 1...3 {
+            _ = try model.create(id: "s\(i)", values: [
+                "title": .string("title-\(i)"),
+                "score": .number(Double(i * 10)),
+                "tags":  .stringset(["t\(i)"]),
+            ])
+        }
+        return model
+    }
+
+    /// Records the intended `Sendable` conformance at a call site. Generic over
+    /// `T: Sendable`, so every use below is a compile error since #2310 put this
+    /// test target in the Swift 6 language mode — see the note on the type.
+    private func requireSendable<T: Sendable>(_ value: T) -> T { value }
+
+    // MARK: - Behavior 7 — the conformances exist and are checked
+
+    /// `PrimitiveRecord` conforms to **plain** `Sendable` (no `@unchecked`),
+    /// and a `PagedQueryResult<PrimitiveRecord>` is `Sendable` through the
+    /// conditional conformance on the container.
+    func testPrimitiveRecordAndItsPageAreSendable() throws {
+        let model = try seeded()
+        let record = try XCTUnwrap(model.find(id: "s1"))
+
+        _ = requireSendable(record)
+
+        let page = PagedQueryResult(data: [record], nextCursor: nil, prevCursor: nil, hasMore: false)
+        _ = requireSendable(page)
+        XCTAssertEqual(page.data.first?.id, "s1")
+    }
+
+    /// The same values actually cross a `Task` boundary at runtime, and the
+    /// record still reads through to the CRDT on the far side.
+    func testPrimitiveRecordCrossesATaskBoundary() async throws {
+        let model = try seeded()
+        let record = try XCTUnwrap(model.find(id: "s2"))
+        let page = PagedQueryResult(
+            data: [record], nextCursor: "c", prevCursor: nil, hasMore: true
+        )
+
+        let title = await Task { record["title"]?.asString }.value
+        XCTAssertEqual(title, "title-2")
+
+        let ids = await Task { page.data.map(\.id) }.value
+        XCTAssertEqual(ids, ["s2"])
+    }
+
+    /// The untyped paginated surface is `Sendable` too — that is what the row
+    /// bag buys: `PagedQueryResult<PrimitiveRow>` from `queryPaged` (and, in
+    /// the facade, from `codegen.queryPaged` / `codegen.hasManyThrough`) can be
+    /// handed to another isolation domain.
+    func testPagedRowsAreSendable() throws {
+        let model = try seeded()
+        let page = try model.queryPaged(nil, options: QueryOptions(sortOrder: [("id", 1)], limit: 2))
+        _ = requireSendable(page)
+        _ = requireSendable(page.data)
+        XCTAssertEqual(page.data.count, 2)
+        XCTAssertEqual(page.data.first?["id"]?.stringValue, "s1")
+    }
+
+    /// `DynamicModel`, `MultiDocModel` and `BaoModelQueryEngine` are the
+    /// unchecked-but-argued conformances; `ConfinedYDocument` is the shared
+    /// document holder Phase D adopts, and `OpenDocumentResult` is plainly
+    /// `Sendable` now that it holds one.
+    func testSyncDomainTypesAreSendable() throws {
+        let model = try seeded()
+        _ = requireSendable(model)
+        _ = requireSendable(model.inspectionQueryEngine)
+        _ = requireSendable(MultiDocModel(schema: schema))
+
+        let doc = YDocument()
+        _ = requireSendable(ConfinedYDocument(doc))
+        _ = requireSendable(OpenDocumentResult(doc: doc, metadata: nil))
+    }
+
+    // MARK: - Behavior 11 — the shared YDocument confinement holder
+
+    /// The holder carries the SAME live document across a `Task` boundary —
+    /// it confines, it does not copy or snapshot. Phase D (#1993) adopts this
+    /// type rather than inventing a second one.
+    func testConfinedYDocumentCarriesTheLiveDocument() async throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let model = DynamicModel(doc: doc, schema: schema)
+        _ = try model.create(id: "c1", values: ["title": .string("before")])
+
+        let confined = ConfinedYDocument(doc)
+        // Read the document on the FAR side of the hop and send back a
+        // `Sendable` identity. `Task { confined.document }` would return the
+        // non-`Sendable` `YDocument` itself, which the `.v6` mode rejects;
+        // hoisting the read to this side (`Task { confined }.value.document`)
+        // would compile but no longer cross the boundary the test exists to
+        // check.
+        let farSideIdentity = await Task { ObjectIdentifier(confined.document) }.value
+        XCTAssertEqual(
+            farSideIdentity, ObjectIdentifier(doc),
+            "the holder must carry the live document, not a copy")
+        let sameDocument = confined.document
+
+        // A write made through the model after the hop is visible through the
+        // document the far side received.
+        try model.update(id: "c1", values: ["title": .string("after")])
+        let readBack = DynamicModel(doc: sameDocument, schema: schema).find(id: "c1")
+        XCTAssertEqual(readBack?["title"]?.asString, "after")
+
+        // `OpenDocumentResult.doc` still resolves to the same document.
+        XCTAssertTrue(OpenDocumentResult(doc: doc, metadata: nil).doc === doc)
+    }
+
+    // MARK: - Behavior 5 — PrimitiveRecord is still a live handle
+
+    /// Two handles to the same record share the CRDT, not a snapshot: a write
+    /// through one is visible through the other, in both directions. This is
+    /// the regression that would tell us `PrimitiveRecord` had been quietly
+    /// converted to a value snapshot (#1156).
+    func testPrimitiveRecordStaysALiveHandle() throws {
+        let model = try seeded()
+        let handleA = try XCTUnwrap(model.find(id: "s1"))
+        let handleB = try XCTUnwrap(model.find(id: "s1"))
+        XCTAssertFalse(handleA === handleB, "expected two distinct handles to the same record")
+
+        handleA["title"] = .string("written-through-A")
+        XCTAssertEqual(handleB["title"]?.asString, "written-through-A")
+
+        handleB["score"] = .number(99)
+        XCTAssertEqual(handleA["score"]?.asNumber, 99)
+
+        // And a write made directly on the model is visible through both.
+        try model.update(id: "s1", values: ["title": .string("written-on-model")])
+        XCTAssertEqual(handleA["title"]?.asString, "written-on-model")
+        XCTAssertEqual(handleB["title"]?.asString, "written-on-model")
+    }
+
+    /// The handle survives a `Task` hop and still writes through afterwards —
+    /// the point of making it `Sendable` in the first place.
+    func testPrimitiveRecordWritesThroughAfterATaskHop() async throws {
+        let model = try seeded()
+        let record = try XCTUnwrap(model.find(id: "s3"))
+
+        await Task { record["title"] = .string("set-off-thread") }.value
+
+        XCTAssertEqual(model.find(id: "s3")?["title"]?.asString, "set-off-thread")
+    }
+
+    // MARK: - Behavior 9 — read-path parity through the row bag
+
+    /// Wrapping rows in `PrimitiveRow` changes the container, not the data:
+    /// a paged read returns field-for-field what the unpaged read returns.
+    func testPagedRowsMatchUnpagedRows() throws {
+        let model = try seeded()
+        let options = QueryOptions(sortOrder: [("id", 1)])
+        let unpaged = try model.query(nil, options: options)
+        let paged = try model.queryPaged(nil, options: options)
+
+        XCTAssertEqual(paged.data.count, unpaged.count)
+        for (row, dict) in zip(paged.data, unpaged) {
+            XCTAssertEqual(Set(row.raw.keys), Set(dict.keys))
+            XCTAssertEqual(row["id"]?.stringValue, dict["id"]?.stringValue)
+            XCTAssertEqual(row["title"]?.stringValue, dict["title"]?.stringValue)
+            XCTAssertEqual(row["score"]?.numberValue, dict["score"]?.numberValue)
+            XCTAssertEqual(row["tags"]?.stringArrayValue, dict["tags"]?.stringArrayValue)
+        }
+    }
+
+    /// `RelatedRecords` and `PrimitiveRow` are ONE type, not two competing
+    /// unchecked dictionary wrappers — the sponsor's "no competing
+    /// conventions" decision, checked rather than assumed.
+    func testRelatedRecordsIsTheSharedRowBag() {
+        XCTAssertTrue(RelatedRecords.self == PrimitiveRow.self)
+        let asRelated: RelatedRecords = PrimitiveRow(raw: ["a": 1])
+        XCTAssertEqual(asRelated["a"]?.numberValue, 1)
+        XCTAssertTrue(RelatedRecords.empty.raw.isEmpty)
+    }
+
+    // MARK: - Edge cases: nested `_related` and the NSNull sentinel
+
+    /// The bag's `Sendable` safety argument claims the nested `_related`
+    /// dictionaries and arrays `IncludeResolver` produces stay readable
+    /// through the wrapper. Check the round-trip on the paginated path, which
+    /// is where rows are wrapped.
+    func testNestedRelatedSurvivesTheRowBagRoundTrip() throws {
+        SchemaSync.clearCache()
+        let doc = YDocument()
+        let authors = DynamicModel(doc: doc, schema: PrimitiveSchema(
+            name: "bag_authors",
+            fields: ["id": FieldDescriptor(type: .id), "name": FieldDescriptor(type: .string)]
+        ))
+        let books = DynamicModel(doc: doc, schema: PrimitiveSchema(
+            name: "bag_books",
+            fields: [
+                "id":       FieldDescriptor(type: .id),
+                "authorId": FieldDescriptor(type: .string, indexed: true),
+                "title":    FieldDescriptor(type: .string),
+            ]
+        ))
+        _ = try authors.create(id: "a1", values: ["name": .string("Ada")])
+        _ = try books.create(id: "b1", values: [
+            "authorId": .string("a1"), "title": .string("Notes"),
+        ])
+
+        // refersTo → a nested row object under `_related`.
+        let page = try books.queryPaged(
+            nil, options: QueryOptions(sortOrder: [("id", 1)]),
+            include: [Include(type: .refersTo, target: authors,
+                              sourceField: "authorId", resultKey: "author")]
+        )
+        let row = try XCTUnwrap(page.data.first)
+        let related = try XCTUnwrap(row["_related"]?.objectValue)
+        let author = try XCTUnwrap(related["author"]?.objectValue)
+        XCTAssertEqual(author["name"]?.stringValue, "Ada")
+
+        // hasMany → a nested array of rows, and it decodes through the
+        // bag's typed accessors on the `_related` bag itself.
+        let authorPage = try authors.queryPaged(
+            nil, options: QueryOptions(sortOrder: [("id", 1)]),
+            include: [Include(type: .hasMany, target: books,
+                              foreignKey: "authorId", resultKey: "books")]
+        )
+        let authorRow = try XCTUnwrap(authorPage.data.first)
+        let authorRelated = PrimitiveRow(raw: try XCTUnwrap(authorRow["_related"]?.objectValue))
+        XCTAssertTrue(authorRelated.contains("books"))
+        let decoded: [BagBook] = authorRelated.many("books")
+        XCTAssertEqual(decoded.map(\.title), ["Notes"])
+        XCTAssertNil(authorRelated.one("books", as: BagBook.self),
+                     "a hasMany payload is an array, so `one` must not decode it")
+
+        // And the whole page is still Sendable with the nested bag inside.
+        _ = requireSendable(authorPage)
+    }
+
+    /// A `.null` a caller puts in a row reads back unchanged through the
+    /// wrapper — present as a key, and distinguishable from an absent one.
+    /// (The query engine omits SQL NULLs rather than emitting `.null`, so
+    /// this is about callers, not the engine.)
+    func testNullSentinelReadsBackThroughTheBag() {
+        let row = PrimitiveRow(raw: ["present": "x", "explicitNull": .null])
+        XCTAssertEqual(row["present"]?.stringValue, "x")
+        XCTAssertTrue(row.contains("explicitNull"))
+        XCTAssertEqual(row["explicitNull"]?.isNull, true)
+        XCTAssertFalse(row.contains("absent"))
+        XCTAssertNil(row["absent"])
+    }
+
+    // MARK: - Behavior 6 — every unchecked conformance carries its argument
+
+    /// `@unchecked Sendable` is a claim the compiler does not check, so the
+    /// acceptance bar for this phase is a written safety argument that names
+    /// the specific locks. Assert the argument exists — and names the right
+    /// locks — for each of the three sync-domain classes, so a later
+    /// conformance can't be added bare.
+    func testUncheckedConformancesCarryWrittenSafetyArguments() throws {
+        let cases: [(file: String, declaration: String, mustMention: [String])] = [
+            (
+                "Schema/DynamicModel.swift",
+                "public final class DynamicModel: @unchecked Sendable",
+                ["observerLock", "listenerLock", "ffiLock", "NSRecursiveLock",
+                 "withExclusiveAccess", "transactSync"]
+            ),
+            (
+                "Schema/MultiDocModel.swift",
+                "final class MultiDocModel: IncludeTarget, @unchecked Sendable",
+                // `listenerLock` is the member's lock, taken while `lock` is
+                // still held — naming it is what completes the acquisition
+                // order (a two-lock claim would be incomplete, not wrong).
+                ["subscribeLock", "activeSubs", "members", "NSLock", "listenerLock"]
+            ),
+            (
+                "Query/BaoModelQueryEngine.swift",
+                "public final class BaoModelQueryEngine: @unchecked Sendable",
+                ["_rowWriteCount", "registeredJunctions", "stringFieldsByModel",
+                 "fieldTypeNamesByModel", "NSLock"]
+            ),
+            (
+                "Types/DocumentTypes.swift",
+                "public struct ConfinedYDocument: @unchecked Sendable",
+                ["ffiLock", "NSRecursiveLock", "transactSync"]
+            ),
+        ]
+
+        for entry in cases {
+            let source = try Self.clientSource(entry.file)
+            guard let argument = Self.docComment(precedingDeclaration: entry.declaration, in: source) else {
+                XCTFail("\(entry.file): expected declaration `\(entry.declaration)`")
+                continue
+            }
+            XCTAssertTrue(
+                argument.contains("safety argument"),
+                "\(entry.file): `\(entry.declaration)` must be preceded by a written safety argument"
+            )
+            for token in entry.mustMention {
+                XCTAssertTrue(
+                    argument.contains(token),
+                    "\(entry.file): the safety argument must name `\(token)`"
+                )
+            }
+        }
+    }
+
+    /// The safety table says every subscription handle is `observerLock`-
+    /// confined outside `deinit`. `testUncheckedConformancesCarryWrittenSafety
+    /// Arguments` only proves the token `observerLock` appears somewhere in the
+    /// block, which a handle written with no lock at all would still satisfy —
+    /// so check the write sites themselves. Every assignment to
+    /// `rootSubscription` / `docUpdateSubscription` outside `deinit` must be on
+    /// an `observerLock.withLock` line.
+    ///
+    /// Note the constraint this places on formatting: the check is per-line, so
+    /// `observerLock.withLock` has to sit on the *same physical line* as the
+    /// assignment. Both write sites are one-liners today. A correct multi-line
+    /// `observerLock.withLock { … handle = x … }` would fail this test — that
+    /// failure means "reformat the write onto one line (or teach this test to
+    /// track `withLock` blocks by brace depth)", not "the confinement broke".
+    func testSubscriptionHandleWritesTakeObserverLock() throws {
+        let source = try Self.clientSource("Schema/DynamicModel.swift")
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        // `deinit` is the documented exception (nothing left to exclude by
+        // then, and the handles are dropped under the doc's `ffiLock`
+        // instead), so skip its body — tracked by brace depth, not by
+        // "everything after", so a write added further down the file is still
+        // checked.
+        var inDeinit = false
+        var depth = 0
+        var writes: [String: Int] = [:]
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !inDeinit, trimmed.hasPrefix("deinit {") {
+                inDeinit = true
+                depth = 0
+            }
+            if inDeinit {
+                depth += line.filter { $0 == "{" }.count
+                depth -= line.filter { $0 == "}" }.count
+                if depth <= 0 { inDeinit = false }
+                continue
+            }
+            guard !trimmed.hasPrefix("//") else { continue }
+            for handle in ["rootSubscription", "docUpdateSubscription"]
+            where trimmed.contains("\(handle) =") || trimmed.contains("\(handle)=") {
+                writes[handle, default: 0] += 1
+                XCTAssertTrue(
+                    trimmed.contains("observerLock.withLock"),
+                    "`\(handle)` is assigned without `observerLock` at: \(trimmed)"
+                )
+            }
+        }
+
+        for handle in ["rootSubscription", "docUpdateSubscription"] {
+            XCTAssertGreaterThan(writes[handle] ?? 0, 0,
+                                 "expected at least one write to `\(handle)` outside deinit")
+        }
+    }
+
+    /// The gate script is what names the offending file when a Phase C
+    /// regression appears — so make sure it stays wired up as an assertion.
+    /// Without `--max` / `--require-zero` it only measures and always exits 0,
+    /// which is the state the review flagged.
+    func testV6SendableGateIsWiredAsAnAssertion() throws {
+        let gate = try ClientSourceText.packageFile("scripts/v6-sendable-gate.sh")
+        XCTAssertTrue(gate.contains("--max"), "the gate script must support a failing budget assertion")
+        XCTAssertTrue(gate.contains("--require-zero"), "the gate script must support a per-file zero assertion")
+        XCTAssertTrue(gate.contains("exit \"$FAILED\""), "the gate script must exit non-zero on a regression")
+
+        let runner = try ClientSourceText.packageFile("run-tests.sh")
+        XCTAssertTrue(runner.contains("v6-sendable-gate.sh --max"),
+                      "run-tests.sh must invoke the gate in assertion mode")
+        for file in ["JsBaoClient.swift", "Schema/DynamicModel.swift", "Schema/MultiDocModel.swift",
+                     "Schema/RelationshipResolution.swift", "Query/BaoModelQueryEngine.swift",
+                     // #2172 — the new actor boundary. Kept here in lockstep
+                     // with run-tests.sh's V6_ZERO_FILES so a half-update fails.
+                     "Internal/BlobManager.swift"] {
+            XCTAssertTrue(runner.contains("\"\(file)\""),
+                          "run-tests.sh must hold \(file) at zero .v6 Sendable sites")
+        }
+    }
+
+    /// `PrimitiveRecord` is the one type in this layer that must NOT be
+    /// unchecked — its conformance is compiler-verified, so it carries no
+    /// safety-argument debt.
+    func testPrimitiveRecordConformanceIsChecked() throws {
+        let source = try Self.clientSource("Schema/PrimitiveRecord.swift")
+        XCTAssertTrue(source.contains("public final class PrimitiveRecord: Sendable"))
+        XCTAssertTrue(
+            Self.uncheckedDeclarations(in: source).isEmpty,
+            "PrimitiveRecord's conformance is checked — an @unchecked here would be a regression"
+        )
+    }
+
+    /// `PrimitiveRow` is the ONE row representation, and since #2546 its
+    /// values are `JSONValue`, so its `Sendable` conformance is checked. An
+    /// `@unchecked` wrapper reappearing here would be both the competing
+    /// convention the sponsor ruled out and a return to unverifiable
+    /// `Sendable` debt.
+    func testTheRowBagConformanceIsChecked() throws {
+        let source = try Self.clientSource("Schema/PrimitiveModel.swift")
+        XCTAssertTrue(
+            source.contains("public struct PrimitiveRow: Sendable, Codable, Equatable, Hashable"),
+            "PrimitiveRow's conformance is checked — an @unchecked here would be a regression"
+        )
+        XCTAssertTrue(
+            Self.uncheckedDeclarations(in: source).isEmpty,
+            "no unchecked wrapper belongs in PrimitiveModel.swift, found "
+            + "\(Self.uncheckedDeclarations(in: source))"
+        )
+        XCTAssertTrue(
+            source.contains("public let raw: [String: JSONValue]"),
+            "the row bag carries `[String: JSONValue]`, which is what makes the "
+            + "conformance checkable"
+        )
+    }
+
+    // MARK: - Helpers
+
+    // The implementations live in `Helpers/ClientSourceText.swift` — the same
+    // three helpers were copied into every phase's structural suite, so there
+    // is one copy now (consolidated in Phase D4 of #1993). These are the local
+    // names the tests above use.
+
+    private static func docComment(precedingDeclaration declaration: String, in source: String) -> String? {
+        ClientSourceText.docComment(precedingDeclaration: declaration, in: source)
+    }
+
+    private static func uncheckedDeclarations(in source: String) -> [String] {
+        ClientSourceText.uncheckedDeclarations(in: source)
+    }
+
+    private static func clientSource(_ relativePath: String) throws -> String {
+        try ClientSourceText.clientSource(relativePath)
+    }
+}
+
+/// Minimal row-decodable used to prove the shared bag's typed accessors still
+/// work on a nested `_related` payload.
+private struct BagBook: PrimitiveRowDecodable, Equatable {
+    let id: String
+    let title: String
+
+    init?(row: [String: JSONValue]) {
+        guard let id = row["id"]?.stringValue, let title = row["title"]?.stringValue else { return nil }
+        self.id = id
+        self.title = title
+    }
+}

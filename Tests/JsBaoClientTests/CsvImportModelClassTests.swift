@@ -7,12 +7,12 @@ import XCTest
 /// number/boolean fields from the schema, and sync the model's indexes after
 /// import (reported as `CsvImportResult.indexesCreated`).
 ///
-/// These exercise the full `importCsv` pipeline through an in-process request
-/// closure (the same `(method, path, body)` closure shape `DatabasesAPI`
-/// holds), so they run without a dev server. The closure records the `/batch`
-/// and `/indexes/sync` payloads and returns the canned engine responses, which
-/// is enough to assert the column filtering, type coercion, and index-sync
-/// behavior end-to-end.
+/// These exercise the full `importCsv` pipeline through a `RecordingTransport`
+/// — the same `Transport` `DatabasesAPI` holds in production — so they run
+/// without a dev server. The transport records the `/batch` and
+/// `/indexes/sync` request bodies and returns the canned engine responses,
+/// which is enough to assert the column filtering, type coercion, and
+/// index-sync behavior end-to-end.
 final class CsvImportModelClassTests: XCTestCase {
 
     // A codegen-shaped model: `id`, an indexed string, a unique string, a
@@ -90,42 +90,49 @@ final class CsvImportModelClassTests: XCTestCase {
         XCTAssertTrue(DatabasesAPI.coercionMap(from: nil).isEmpty)
     }
 
-    // MARK: - Full pipeline through an in-process request closure (offline)
+    // MARK: - Full pipeline through a recording transport (offline)
 
     /// Records every batch operation and the sync-indexes payload.
     private actor Recorder {
         var batchedRows: [[String: JSONValue]] = []
+        var modelNames: [String] = []
         var syncCount = 0
         func addRows(_ rows: [[String: JSONValue]]) { batchedRows.append(contentsOf: rows) }
+        func addModelName(_ name: String?) { if let name { modelNames.append(name) } }
         func bumpSync() { syncCount += 1 }
+    }
+
+    private static func jsonResponse(_ json: String) -> TransportResponse {
+        TransportResponse(
+            status: 200,
+            headers: ["Content-Type": "application/json"],
+            body: Data(json.utf8)
+        )
+    }
+
+    /// The batch operations in a `/batch` request body, which the API builds as
+    /// `{ operationName, batch: [{ params: { modelName, id, data } }] }`.
+    private static func batchParams(in call: RecordedRequest) -> [JSONValue] {
+        (call.jsonBody?["batch"]?.arrayValue ?? []).compactMap { $0["params"] }
     }
 
     private func makeApi(
         recorder: Recorder,
         registeredIndexes: Int
     ) -> DatabasesAPI {
-        DatabasesAPI(makeRequest: { _, path, body in
-            if path.contains("/batch") {
-                // body: { operationName, batch: [{ params: { modelName, id, data } }] }
-                let dict = body as? [String: Any] ?? [:]
-                let batch = dict["batch"] as? [[String: Any]] ?? []
-                var rows: [[String: JSONValue]] = []
-                for op in batch {
-                    let params = op["params"] as? [String: Any] ?? [:]
-                    if let data = params["data"] {
-                        let row = try JSONCoding.decode([String: JSONValue].self, from: data)
-                        rows.append(row)
-                    }
-                }
-                await recorder.addRows(rows)
-                return ["imported": rows.count, "failed": 0, "results": [Any]()]
+        DatabasesAPI(transport: RecordingTransport(responder: { call in
+            if call.path.contains("/batch") {
+                let params = Self.batchParams(in: call)
+                await recorder.addModelName(params.first?["modelName"]?.stringValue)
+                await recorder.addRows(params.compactMap { $0["data"]?.objectValue })
+                return Self.jsonResponse(#"{"imported":\#(params.count),"failed":0}"#)
             }
-            if path.contains("/indexes/sync") {
+            if call.path.contains("/indexes/sync") {
                 await recorder.bumpSync()
-                return ["registered": registeredIndexes]
+                return Self.jsonResponse(#"{"registered":\#(registeredIndexes)}"#)
             }
-            return [String: Any]()
-        })
+            return Self.jsonResponse("{}")
+        }))
     }
 
     func testModelClassFiltersColumnsCoercesAndSyncsIndexes() async throws {
@@ -165,21 +172,7 @@ final class CsvImportModelClassTests: XCTestCase {
 
     func testModelClassResolvesModelNameInBatch() async throws {
         let recorder = Recorder()
-        var capturedModelName: String?
-        let api = DatabasesAPI(makeRequest: { _, path, body in
-            if path.contains("/batch") {
-                let dict = body as? [String: Any] ?? [:]
-                let batch = dict["batch"] as? [[String: Any]] ?? []
-                if let params = (batch.first?["params"]) as? [String: Any] {
-                    capturedModelName = params["modelName"] as? String
-                }
-                let rows = batch.compactMap { ($0["params"] as? [String: Any])?["data"] }
-                return ["imported": rows.count, "failed": 0, "results": [Any]()]
-            }
-            if path.contains("/indexes/sync") { return ["registered": 0] }
-            return [String: Any]()
-        })
-        _ = recorder
+        let api = makeApi(recorder: recorder, registeredIndexes: 0)
 
         _ = try await api.importCsv(
             databaseId: "db-1",
@@ -188,6 +181,7 @@ final class CsvImportModelClassTests: XCTestCase {
                 model: Product.self
             )
         )
+        let capturedModelName = await recorder.modelNames.first
         XCTAssertEqual(capturedModelName, "products",
                        "model class must resolve its modelName for the batch")
     }

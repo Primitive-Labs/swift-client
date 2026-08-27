@@ -383,12 +383,44 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         return StorageRecord(key: key, value: value, metadata: metadata, updatedAt: updatedAt)
     }
 
+    /// Carries the closure ``onQueue(_:)`` runs across the hop onto ``queue``.
+    ///
+    /// `DispatchQueue.async` takes a `@Sendable` closure, and the work this
+    /// provider hands it is a plain `() throws -> Output` built from generic
+    /// parameters the public ``StorageProvider`` protocol does not constrain to
+    /// `Sendable`. Without this box the compiler reports the capture
+    /// (`#SendableClosureCaptures`, 11 diagnostics from the one site — #2318);
+    /// constraining the protocol instead would push the same annotation onto
+    /// every caller of `iterate` (#2318, Fork 1).
+    ///
+    /// **What the `@unchecked` claim means here.** It contains the storage
+    /// layer's *existing* API contract at the queue boundary; it is not a proof
+    /// that the wrapped closure's captures are safe to share:
+    ///
+    /// * `queue` is a serial `DispatchQueue`, so at most one boxed closure runs
+    ///   at a time, and the caller stays suspended on the continuation for the
+    ///   whole hop — the provider never touches the closure from two places.
+    /// * The box is created and consumed inside ``onQueue(_:)`` and never
+    ///   stored, so no reference to it outlives the hop.
+    /// * It says nothing about whether a caller still holds its own reference
+    ///   to the `value`, `records` or `callback` it passed in. That exposure is
+    ///   the shape of the public protocol, it predates this box, and this box
+    ///   neither widens nor narrows it.
+    ///
+    /// The first two points are what `SwiftSixLanguageModeTests` checks in
+    /// source text — a change that makes `queue` concurrent, or that stores the
+    /// box, invalidates the claim.
+    private struct QueueWork<Output>: @unchecked Sendable {
+        let run: () throws -> Output
+    }
+
     /// Execute a throwing closure on the serial queue, bridging back to async/await.
     private func onQueue<T>(_ work: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
+        let work = QueueWork(run: work)
+        return try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 do {
-                    let result = try work()
+                    let result = try work.run()
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)

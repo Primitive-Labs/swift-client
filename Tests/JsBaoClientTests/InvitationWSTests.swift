@@ -2,7 +2,7 @@ import XCTest
 @testable import JsBaoClient
 
 /// Port of tests/client/js-bao-client-invitation-ws.test.ts
-/// Tests invitation WebSocket events.
+/// Tests the WebSocket event a share delivers to the recipient.
 final class InvitationWSTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -17,7 +17,20 @@ final class InvitationWSTests: XCTestCase {
         await ctx.cleanup()
     }
 
-    func testReceiveInvitationEvent() async throws {
+    /// Sharing a document with an existing app user must reach that user over
+    /// their WebSocket within a few seconds.
+    ///
+    /// This used to assert the typed `InvitationEvent` raised by
+    /// `documents.sendInvitation`. That verb is gone (#619 / #2367), and the
+    /// `invitation` / `created` frame it produced came from the legacy
+    /// per-document invitation route, so nothing the client can call raises one
+    /// any more: an email that resolves to an app user now gets a live
+    /// permission row, and the server announces it with a
+    /// `documentMetadataChanged` frame carrying the granted permission. That
+    /// frame is what this test now waits for — same contract (the recipient is
+    /// told, over the socket, which document and which permission), same
+    /// three-second budget.
+    func testShareDeliversDocumentMetadataEventToRecipient() async throws {
         // Create two users
         let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member", email: "invitee-ws@test.local")
 
@@ -38,63 +51,52 @@ final class InvitationWSTests: XCTestCase {
         // Create a document
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Invitation WS Doc")
 
-        // Listen for invitation events on the invitee client. NSLock is
+        // Listen for the share event on the invitee client. NSLock is
         // overkill but it's the simplest way to share a mutable flag
         // between the event-emitter callback (called off the main
-        // thread) and the assertion below.
+        // thread) and the assertion below. Only frames for this document
+        // count — the client also emits local metadata changes.
         let lock = NSLock()
-        var invitationReceived = false
-        var receivedEvent: InvitationEvent?
-        // Subscribe via the typed path (#1146). Pre-#1146 `.invitation`
-        // delivered the raw `[String: Any]`, so a `(e: InvitationEvent)`
-        // handler would silently never fire; now it's a fully-typed struct.
-        let sub = inviteeClient.events.on(.invitation) { (e: InvitationEvent) in
+        var shareReceived = false
+        var receivedEvent: DocumentMetadataChangedEvent?
+        let sub = inviteeClient.eventEmitter.subscribe(DocumentMetadataChangedEvent.self) { e in
+            guard e.documentId == docId, e.source == "server" else { return }
             lock.lock()
-            invitationReceived = true
+            shareReceived = true
             receivedEvent = e
             lock.unlock()
         }
 
-        // Send invitation
-        _ = try await ownerClient.documents.sendInvitation(
+        // Share the document with the invitee
+        _ = try await ownerClient.documents.updatePermissions(
             documentId: docId,
-            email: user2.email,
-            permission: "read-write"
+            params: .email(user2.email, permission: "read-write")
         )
 
         // Wait for WS event
         try await delay(3)
         sub.cancel()
 
-        lock.lock()
-        let received = invitationReceived
-        let event = receivedEvent
-        lock.unlock()
+        let (received, event) = lock.withLock { (shareReceived, receivedEvent) }
 
-        // Previous version of this test cancelled the subscription and
+        // An earlier version of this test cancelled the subscription and
         // returned without asserting. That made it a no-op smoke test
-        // ("didn't crash"). The actual server contract guarantees an
-        // invitation WS event lands on the invitee within a few
-        // seconds, so we assert it.
+        // ("didn't crash"). The server contract guarantees the share lands
+        // on the recipient within a few seconds, so we assert it.
         XCTAssertTrue(
             received,
-            "Expected an invitation WS event on the invitee client " +
-            "within 3 seconds of `documents.sendInvitation`. If this " +
-            "starts failing, check whether the server-side notifier " +
-            "is still wired to forward invitation events to the " +
-            "invitee's session — same place WorkflowStatusEvent is " +
-            "delivered."
+            "Expected a document metadata WS event on the invitee client " +
+            "within 3 seconds of the share. If this starts failing, check " +
+            "whether the server-side notifier is still wired to forward " +
+            "permission grants to the recipient's session — same place " +
+            "WorkflowStatusEvent is delivered."
         )
 
-        // #1146: the event must be delivered as a typed `InvitationEvent`
-        // with the document/permission fields populated, not a raw dict.
-        XCTAssertNotNil(event, "Expected the typed InvitationEvent payload")
-        XCTAssertEqual(event?.action, "created")
-        XCTAssertEqual(event?.documentId, docId)
-        XCTAssertEqual(event?.permission, "read-write")
-        XCTAssertFalse(
-            event?.invitationId.isEmpty ?? true,
-            "Expected a non-empty invitationId on the typed event"
-        )
+        // The event must be delivered as a typed payload with the document
+        // and permission populated, not a raw dictionary.
+        let payload = try XCTUnwrap(event, "Expected the typed DocumentMetadataChangedEvent payload")
+        XCTAssertEqual(payload.action, "created")
+        XCTAssertEqual(payload.documentId, docId)
+        XCTAssertEqual(payload.metadata?["permission"], .string("read-write"))
     }
 }

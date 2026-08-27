@@ -22,12 +22,12 @@ final class RefreshTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         // Token in memory should work for a simple request
-        let result = try await client.makeRequest("GET", "/me", nil)
-        guard let dict = result as? [String: Any] else {
-            XCTFail("Expected dictionary response")
+        let result = try await client.requestJSON(method: .get, path: "/me")
+        guard let object = result?.objectValue else {
+            XCTFail("Expected object response")
             return
         }
-        XCTAssertNotNil(dict["userId"])
+        XCTAssertNotNil(object["userId"]?.stringValue)
     }
 
     func testInvalidTokenFailsGracefully() async throws {
@@ -36,7 +36,7 @@ final class RefreshTests: XCTestCase {
 
         // Request with invalid token should throw
         do {
-            _ = try await client.makeRequest("GET", "/me", nil)
+            _ = try await client.requestJSON(method: .get, path: "/me")
             XCTFail("Should have thrown with invalid token")
         } catch {
             // Expected: auth failure
@@ -55,9 +55,9 @@ final class RefreshTests: XCTestCase {
         // Wait for auth to initialize
         try await delay(1)
 
-        let state = client.getAuthState()
+        let state = client.authState
         XCTAssertTrue(state.authenticated)
-        XCTAssertNotNil(client.getUserId())
+        XCTAssertNotNil(client.userId)
     }
 
     func testIsAuthenticated() async throws {
@@ -164,7 +164,7 @@ final class RefreshTests: XCTestCase {
         // 2h so the bootstrap path sees it as stale.
         let bootstrapStore = OfflineStore()
         let bootstrapProvider = SQLiteStorageProvider(path: dbPath)
-        bootstrapStore.setStorageProvider(bootstrapProvider)
+        await bootstrapStore.setStorageProvider(bootstrapProvider)
 
         let iso = ISO8601DateFormatter()
         let expiredRecord = PersistedJwtRecord(
@@ -202,13 +202,13 @@ final class RefreshTests: XCTestCase {
             client.isAuthenticated(),
             "Cold start with expired persisted JWT + live refresh cookie should refresh, not log the user out"
         )
-        XCTAssertEqual(client.getUserId(), testApp.ownerUserId)
+        XCTAssertEqual(client.userId, testApp.ownerUserId)
 
         // Token we end up with must be freshly issued, not the placeholder
         // we seeded. A nil payload or a stale exp would both indicate the
         // fix path didn't run.
-        guard let payload = client.getJwtPayload(),
-              let exp = payload["exp"] as? TimeInterval else {
+        guard let payload = client.jwtPayload,
+              let exp = payload["exp"]?.numberValue else {
             XCTFail("Expected a parseable JWT payload after cold-start refresh")
             return
         }

@@ -16,7 +16,51 @@ import Yniffi
 ///     ...
 /// _meta_{modelName} (Y.Map — written by SchemaSync.syncModelMeta)
 /// ```
-public final class DynamicModel {
+///
+/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+///
+/// `DynamicModel` is deliberately a class guarded by locks, not an actor:
+/// generated reads are synchronous by design (#1156) and the fork's sync
+/// transaction API is first-class (#1911). The conformance is therefore
+/// unchecked, and this is the argument a reviewer should check it against.
+///
+/// | State | Confinement |
+/// |---|---|
+/// | `schema`, `docId` | `let`, `Sendable` value types |
+/// | `doc` (`YDocument`) | `let`. `YDocument` is a reference type that is not `Sendable`; **every** FFI touch goes through `doc.withExclusiveAccess` / `doc.transact` / `doc.transactSync`, all of which serialize on the doc's single `ffiLock` (`yswift-fork/Sources/YSwift/YDocument.swift:53,61`) |
+/// | `queryEngine` | `let`; `BaoModelQueryEngine` is itself `@unchecked Sendable` under its own `NSLock` |
+/// | `recordSubscriptions`, `rootSubscription` | mutated and read under `observerLock` — including the `init`-time installs, which take it *inside* the open transaction (`ffiLock → observerLock`, the same order `installRecordObserverUnlocked` / `cancelRecordObserverUnlocked` use) — except in `deinit` (see below) |
+/// | `docUpdateSubscription` | assigned in `init` under `observerLock`; read-and-cleared in `deinit` under `observerLock`, with the `cancel()` FFI call made after the lock is released (#1992 — it was previously touched with no lock at all) |
+/// | `listeners` | mutated and read under `listenerLock`; the snapshot taken there is invoked **outside** the lock so a callback may (un)subscribe re-entrantly |
+/// | `observerDrainQueue`, `reconcileQueue`, `drainQueueKey` | `let` Dispatch primitives, themselves thread-safe |
+/// | the `activeTx` / `pendingNotify` transaction bookkeeping | thread-local (`Thread.current.threadDictionary`), so it is per-thread by construction and never shared |
+///
+/// **`ffiLock` is an `NSRecursiveLock`, and that reentrancy is required, not
+/// incidental.** The observer path re-enters `withExclusiveAccess` while a
+/// transaction on the same thread is already open (`deinit` dropping raw
+/// `Yniffi.YSubscription` handles can itself run inside a held transaction),
+/// so a safety argument that claimed mutual exclusion *without* reentrancy
+/// would be wrong. `observerLock` and `listenerLock` are plain `NSLock`s and
+/// are never re-entered.
+///
+/// **`deinit` is the one place `recordSubscriptions` / `rootSubscription` are
+/// touched without `observerLock`** — by then no other reference to the
+/// instance exists, so there is nothing to exclude; they are instead dropped
+/// under the doc's `ffiLock` (`withExclusiveAccess`), which is what actually
+/// matters there: observer deregistration must be serialized against
+/// transactions on the shared doc (#1126).
+///
+/// **Listener closures are `@Sendable` (#1992).** Confining the `listeners`
+/// dictionary under `listenerLock` says nothing about state a callback
+/// captures, and callbacks run on whichever thread committed the change (a
+/// local writer's thread, or the observer-drain queue), so the closure type
+/// carries the requirement rather than the container.
+///
+/// **What the locks do NOT give you.** Sync and async transactions serialize
+/// on separate queues with no cross-paradigm ordering guarantee: never split
+/// one logical batch across `transact` and `transactSync`. That is a review
+/// invariant, not a compiler-checked one.
+public final class DynamicModel: @unchecked Sendable {
     public let schema: PrimitiveSchema
     internal let doc: YDocument
 
@@ -53,6 +97,11 @@ public final class DynamicModel {
     public var inspectionTableName: String {
         BaoModelQueryEngine.sanitizeTableName(schema.name)
     }
+    /// Doc-level `observe_update_v1` handle, kept so `deinit` can cancel it.
+    /// Guarded by `observerLock` like the other subscription handles — it was
+    /// previously assigned in `init` and cancelled in `deinit` with no lock at
+    /// all, which the `@unchecked Sendable` argument above could not have
+    /// covered (#1992).
     private var docUpdateSubscription: YSwift.YSubscription?
 
     // MARK: - Per-record observation
@@ -71,7 +120,7 @@ public final class DynamicModel {
     /// Registered change listeners. Keyed by UUID so unsubscribe can
     /// find and remove its own entry without an identity trick on the
     /// closure. Guarded by `listenerLock`.
-    private var listeners: [UUID: () -> Void] = [:]
+    private var listeners: [UUID: @Sendable () -> Void] = [:]
     private let listenerLock = NSLock()
 
     /// Register a callback that fires after any add, update, or
@@ -87,7 +136,7 @@ public final class DynamicModel {
     /// model (query, write) since no transaction is open when they
     /// run. Keep callbacks fast and non-blocking.
     @discardableResult
-    public func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+    public func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         let id = UUID()
         listenerLock.lock()
         listeners[id] = callback
@@ -376,7 +425,13 @@ public final class DynamicModel {
         )
         self.queryEngine = engine
 
-        SchemaSync.syncModelMeta(doc: doc, schema: schema)
+        // NOTE: _meta_* is NOT written here. js-bao parity (#2587): the JS
+        // client writes model metadata at save-time (`BaseModel.save` ->
+        // `syncModelMeta`), never at open/connect, so a client that only
+        // reads a document sends no pre-sync CRDT writes — a cold open's
+        // syncStep1 carries a genuinely empty state vector. See
+        // `applyWrite`/`save`, which call the in-transaction
+        // `SchemaSync.syncModelMeta(doc:schema:transaction:)`.
 
         // One-shot init transaction: install the root observer, then
         // iterate existing records and install per-record observers
@@ -388,7 +443,17 @@ public final class DynamicModel {
             guard let root = txn.transactionGetOrInsertMap(name: self.schema.name)
                     as YrsMap? else { return }
             let rootDelegate = RootMapObserver(model: self)
-            self.rootSubscription = root.observe(delegate: rootDelegate)
+            // Assigned under `observerLock` for the same reason as
+            // `docUpdateSubscription` below (#1992): the instance has not
+            // escaped yet, but taking the lock here is what makes the "every
+            // subscription handle is `observerLock`-confined" claim in the
+            // type's safety argument true without an extra exception. This
+            // runs inside `transactSync`, so it nests `ffiLock -> observerLock`
+            // — the same one-directional order the install path at
+            // `installRecordObserverUnlocked` / `cancelRecordObserverUnlocked`
+            // already uses.
+            let subscription = root.observe(delegate: rootDelegate)
+            self.observerLock.withLock { self.rootSubscription = subscription }
             let idCollector = KeyCollector()
             root.keys(tx: txn, delegate: idCollector)
             for recordId in idCollector.keys {
@@ -399,16 +464,30 @@ public final class DynamicModel {
 
         // Keep the doc-level subscription for post-merge unique
         // reconciliation. Cheap: just queues async work.
-        self.docUpdateSubscription = doc.observeUpdate { [weak self] _ in
+        //
+        // Registered under `observerLock` so the handle's lifetime is covered
+        // by the same lock as the other subscription handles (#1992). The
+        // instance has not escaped yet, but taking the lock here is what makes
+        // the "every subscription handle is `observerLock`-confined" claim in
+        // the type's safety argument true without an exception.
+        let subscription = doc.observeUpdate { [weak self] _ in
             guard let self else { return }
             self.reconcileQueue.async { [weak self] in
                 self?.reconcileUniqueConstraints()
             }
         }
+        observerLock.withLock { self.docUpdateSubscription = subscription }
     }
 
     deinit {
-        docUpdateSubscription?.cancel()
+        // Read + clear under `observerLock`, then cancel outside it: `cancel()`
+        // calls into the FFI and must not run with an unrelated lock held.
+        let docSub = observerLock.withLock { () -> YSwift.YSubscription? in
+            let s = docUpdateSubscription
+            docUpdateSubscription = nil
+            return s
+        }
+        docSub?.cancel()
         // `Yniffi.YSubscription` is the raw FFI handle — it auto-cancels on
         // Drop, which calls into yrs to unobserve. That unobserve MUST be
         // serialized against transactions on the same doc: multiple
@@ -470,14 +549,38 @@ public final class DynamicModel {
     /// the same default-filling difference as `create` vs `update` — a new
     /// id fills unspecified fields from schema defaults; an existing id
     /// leaves omitted fields untouched.
+    ///
+    /// - Parameter changedFields: the fields the caller actually assigned,
+    ///   js-bao's `_localChanges`. On the **update** path only these are
+    ///   written, so a save built from a stale fetch doesn't re-write — and
+    ///   clobber — fields another device changed concurrently (#2459). `nil`
+    ///   means "no tracking information": every supplied value counts as a
+    ///   change, which is the contract for untyped callers that already pass
+    ///   just the fields they mean to write. The insert path ignores the set
+    ///   and writes every supplied value — a brand-new record needs all of
+    ///   its fields.
+    ///
+    ///   One thing `nil` does NOT opt out of: the second-stage value diff
+    ///   (js-bao's `_diffWithYjsData`) runs on every update. A supplied
+    ///   value that already equals the persisted one emits no op either
+    ///   way, so an unchanged field never gets a fresh last-writer-wins
+    ///   clock. Writing the same value again is not a way to win against a
+    ///   concurrent remote edit.
     @discardableResult
-    public func save(id: String, values: [String: PrimitiveValue]) throws -> PrimitiveRecord {
+    public func save(
+        id: String,
+        values: [String: PrimitiveValue],
+        changedFields: Set<String>? = nil
+    ) throws -> PrimitiveRecord {
         try withThrowingTx { [self] txn in
             let root = txn.transactionGetOrInsertMap(name: self.schema.name)
             let isUpdate = root.getMap(tx: txn, key: id) != nil
             try self.applyWriteInternal(
-                id: id, values: values, isUpdate: isUpdate, tx: txn
+                id: id, values: values, isUpdate: isUpdate,
+                changedFields: changedFields, tx: txn
             )
+            // JS parity: meta syncs at save-time (see applyWrite; #2587).
+            SchemaSync.syncModelMeta(doc: self.doc, schema: self.schema, transaction: txn)
         }
         return PrimitiveRecord(modelName: schema.name, id: id, model: self)
     }
@@ -599,6 +702,36 @@ public final class DynamicModel {
         }
     }
 
+    /// Reject an empty primary key the CALLER supplied to an upsert,
+    /// before any match resolution runs.
+    ///
+    /// `applyWriteInternal`'s guard sees only the *resolved* id, and on an
+    /// upsert merge that's the matched record's id — the caller's invalid
+    /// one is discarded on the way there (JS auto-id parity), so the guard
+    /// never fires and the write lands on the matched record. js-bao draws
+    /// the line earlier: `save()` runs its falsy-id check (`if (!this.id)
+    /// throw "Cannot save item without an id."`) BEFORE the deferred
+    /// `upsertOn` lookup, and `upsertByUnique` assigns `dataToUpsert` onto
+    /// the matched record so an empty `id` there trips that same check on
+    /// the merge path. So an empty key is rejected whether or not the
+    /// unique value already names a record (#2885).
+    ///
+    /// "Supplied" follows the same precedence the insert paths use to
+    /// resolve the id: the explicit `id:` argument first, then an `id`
+    /// carried in the caller's values. `nil` means the caller supplied no
+    /// key at all — that's the auto-generate path, not an empty one.
+    internal static func requireNonEmptySuppliedId(
+        _ id: String?,
+        data: [String: PrimitiveValue],
+        modelName: String
+    ) throws {
+        let supplied = id ?? data["id"].flatMap { $0.asId ?? $0.asString }
+        guard let supplied, supplied.isEmpty else { return }
+        throw FieldValidationError.requiredFieldMissing(
+            field: "id", modelName: modelName
+        )
+    }
+
     /// Insert-or-update by a single-field unique value. Mirrors
     /// js-bao's `save({ upsertOn: field })`.
     ///
@@ -618,12 +751,17 @@ public final class DynamicModel {
     ///   `_constructorProvidedId && this.id !== existingId` guard. A
     ///   non-explicit id is silently discarded on merge (JS auto-id
     ///   parity), which is the default.
+    /// - Parameter changedFields: the fields the caller actually assigned
+    ///   (see `save(id:values:changedFields:)`). Applies to the merge path
+    ///   only — the insert path writes every supplied value. The lookup key
+    ///   is always built from the full `values`, changed or not.
     @discardableResult
     public func upsert(
         _ values: [String: PrimitiveValue],
         on field: String,
         id: String? = nil,
-        explicitId: Bool = false
+        explicitId: Bool = false,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         // --- Validate the upsert-on input up-front (no tx yet) -------
         guard let fieldValue = values[field] else {
@@ -647,6 +785,14 @@ public final class DynamicModel {
         guard let key = UniqueIndex.buildKey(fields: [field], values: values) else {
             throw UpsertError.nullOrEmptyField(field: field)
         }
+
+        // The caller's key is checked here, not just after resolution —
+        // the merge path below would otherwise substitute the matched
+        // record's id for it. js-bao's guard sits in the same place: after
+        // the `upsertOn` validation, before the deferred lookup.
+        try Self.requireNonEmptySuppliedId(
+            id, data: values, modelName: schema.name
+        )
 
         // --- Resolve inside a single transaction to avoid TOCTOU ----
         var resolved: Result<(id: String, wasCreated: Bool), Error> =
@@ -711,7 +857,10 @@ public final class DynamicModel {
         // defaults only on the insert path.
         var toWrite = values
         toWrite.removeValue(forKey: "id")
-        try applyWrite(id: outcome.id, values: toWrite, isUpdate: !outcome.wasCreated)
+        try applyWrite(
+            id: outcome.id, values: toWrite, isUpdate: !outcome.wasCreated,
+            changedFields: changedFields
+        )
 
         return UpsertResult(
             record: PrimitiveRecord(
@@ -749,7 +898,7 @@ public final class DynamicModel {
     /// up-to-date; remote writes are picked up asynchronously via
     /// the root-map observer. We drain that queue before reading so
     /// callers always see the latest state.
-    public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [[String: Any]] {
+    public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [[String: JSONValue]] {
         awaitObserverDrain()
         return try queryEngine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -776,7 +925,7 @@ public final class DynamicModel {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         awaitObserverDrain()
         var rows = try queryEngine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -789,21 +938,25 @@ public final class DynamicModel {
 
     /// Paginated include variant. Same batching semantics, but the
     /// result carries cursors.
+    ///
+    /// Rows come back as the shared `Sendable` row bag (`PrimitiveRow`, #1992)
+    /// with the `_related` attachment inside `raw` exactly as before.
     public func queryPaged(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         awaitObserverDrain()
         let base = try queryEngine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
             scopedToDocId: docId,
             stringsetFields: stringsetFieldNames
         )
-        var rows = base.data
+        // Unwrap → resolve includes (which mutates the rows in place) → rewrap.
+        var rows = base.data.map(\.raw)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
         return PagedQueryResult(
-            data: rows,
+            data: rows.map(PrimitiveRow.init(raw:)),
             nextCursor: base.nextCursor,
             prevCursor: base.prevCursor,
             hasMore: base.hasMore
@@ -817,7 +970,7 @@ public final class DynamicModel {
     public func queryPaged(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         awaitObserverDrain()
         return try queryEngine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
@@ -834,7 +987,7 @@ public final class DynamicModel {
         )
     }
 
-    public func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+    public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         awaitObserverDrain()
         return try queryEngine.aggregate(
             modelName: schema.name, options: options, scopedToDocId: docId,
@@ -849,15 +1002,15 @@ public final class DynamicModel {
     /// on the main table's row dict. `upsertSqliteRow` pulls stringset
     /// values out separately and passes them to the engine via its
     /// `stringsets` parameter so they land in the junction tables.
-    private func sqliteRepresentation(of value: PrimitiveValue) -> Any? {
+    private func sqliteRepresentation(of value: PrimitiveValue) -> JSONValue? {
         switch value {
-        case let .string(s):    return s
-        case let .number(n):    return n
-        case let .boolean(b):   return b
-        case let .id(s):        return s
-        case let .date(s):      return s
+        case let .string(s):    return .string(s)
+        case let .number(n):    return .number(n)
+        case let .boolean(b):   return .bool(b)
+        case let .id(s):        return .string(s)
+        case let .date(s):      return .string(s)
         case .stringset:        return nil
-        case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
+        case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
         }
     }
 
@@ -955,12 +1108,20 @@ public final class DynamicModel {
 
     /// Merge `data` into the existing record `existingId` in this doc.
     /// Shared by the single- and cross-doc merge paths.
+    ///
+    /// - Parameter changedFields: the caller-assigned fields (see
+    ///   `save(id:values:changedFields:)`); `nil` merges every supplied value.
     func mergeExisting(
-        existingId: String, data: [String: PrimitiveValue]
+        existingId: String,
+        data: [String: PrimitiveValue],
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         var values = data
         values.removeValue(forKey: "id")
-        try applyWrite(id: existingId, values: values, isUpdate: true)
+        try applyWrite(
+            id: existingId, values: values, isUpdate: true,
+            changedFields: changedFields
+        )
         return UpsertResult(
             record: PrimitiveRecord(
                 modelName: schema.name, id: existingId, model: self
@@ -1011,6 +1172,8 @@ public final class DynamicModel {
     ///   - uniqueLookupValue: optional explicit lookup value(s), one per
     ///     constraint field. Mirrors js-bao's separate `uniqueLookupValue`
     ///     argument; when nil the key is built from `data`.
+    ///   - changedFields: the fields the caller actually assigned (see
+    ///     `save(id:values:changedFields:)`). Applies to the merge path only.
     ///
     /// Single-doc scope: searches only this doc. Cross-doc search (every
     /// connected document, per js-bao) is `MultiDocModel.upsertByUnique`.
@@ -1020,10 +1183,17 @@ public final class DynamicModel {
         data: [String: PrimitiveValue],
         mode: UpsertMode = .either,
         id: String? = nil,
-        uniqueLookupValue: [PrimitiveValue]? = nil
+        uniqueLookupValue: [PrimitiveValue]? = nil,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         let (constraint, key) = try resolveUpsertConstraintKey(
             constraint: name, data: data, uniqueLookupValue: uniqueLookupValue
+        )
+
+        // Before the lookup: a match would otherwise supply the id the
+        // caller failed to (see `requireNonEmptySuppliedId`).
+        try Self.requireNonEmptySuppliedId(
+            id, data: data, modelName: schema.name
         )
 
         let existingId = existingRecordId(constraintName: name, key: key)
@@ -1044,7 +1214,9 @@ public final class DynamicModel {
         }
 
         if let existingId {
-            return try mergeExisting(existingId: existingId, data: data)
+            return try mergeExisting(
+                existingId: existingId, data: data, changedFields: changedFields
+            )
         }
         return try insertNew(id: id, data: data)
     }
@@ -1263,15 +1435,21 @@ public final class DynamicModel {
     private func applyWrite(
         id: String,
         values newValues: [String: PrimitiveValue],
-        isUpdate: Bool
+        isUpdate: Bool,
+        changedFields: Set<String>? = nil
     ) throws {
         try withThrowingTx { [self] txn in
             try self.applyWriteInternal(
                 id: id,
                 values: newValues,
                 isUpdate: isUpdate,
+                changedFields: changedFields,
                 tx: txn
             )
+            // After a successful write, mirror js-bao `BaseModel.save`:
+            // ensure the doc carries this model's `_meta_*` (op-free when
+            // it already matches; #2587).
+            SchemaSync.syncModelMeta(doc: self.doc, schema: self.schema, transaction: txn)
         }
     }
 
@@ -1279,8 +1457,26 @@ public final class DynamicModel {
         id: String,
         values: [String: PrimitiveValue],
         isUpdate: Bool,
+        changedFields: Set<String>? = nil,
         tx txn: YrsTransaction
     ) throws {
+        // Every write funnels through here — `create`, `update`, `save`,
+        // both upsert forms — so this is where the primary key's presence
+        // is enforced, once, for all of them. Mirrors js-bao's `save()`
+        // guard (`if (!this.id) throw new Error("Cannot save item without
+        // an id. Ensure id is set.")`, BaseModel.ts), which likewise runs
+        // before `validateBeforeSave` and is falsy-based: `""` is not an
+        // id. Swift's non-optional `String` covers the null half already,
+        // so emptiness is all that's left to check (#2885).
+        //
+        // It runs before anything is read or materialized, so a rejected
+        // write leaves no record and no root map behind.
+        guard !id.isEmpty else {
+            throw FieldValidationError.requiredFieldMissing(
+                field: "id", modelName: self.schema.name
+            )
+        }
+
         var newValues = values
         let root = txn.transactionGetOrInsertMap(name: self.schema.name)
 
@@ -1291,6 +1487,31 @@ public final class DynamicModel {
         let oldData: [String: PrimitiveValue] = existing.map {
             self.snapshotFromMap(rec: $0, tx: txn)
         } ?? [:]
+
+        // Stage 1 of js-bao's two-stage narrowing — `_localChanges` (#2459).
+        // Keep only the fields the caller actually assigned. `nil` means the
+        // caller supplied no tracking information, so every supplied value
+        // counts as a change (the untyped `DynamicModel` contract).
+        //
+        // Stage 2 below is NOT gated on `changedFields` — it runs on every
+        // update, so `nil` is "no narrowing by assignment", not "write
+        // everything unconditionally".
+        //
+        // UPDATE path only: an insert must write every field it was handed —
+        // that's what makes "read a record from doc A, save it into doc B"
+        // carry the whole record even though nothing was assigned.
+        //
+        // Why this matters: writing a Y.Map key is a real op with a fresh
+        // clock even when the value is identical, so it wins last-writer-wins
+        // against another device's concurrent edit to that key. A save built
+        // from a stale read would therefore silently revert fields the caller
+        // never touched. Everything downstream — the merged `dataToSave`
+        // view, validation, the dirty check, unique-index reconciliation, and
+        // the write itself — sees the narrowed set, so the record's post-write
+        // state is `persisted + real changes`.
+        if isUpdate, let changedFields {
+            newValues = newValues.filter { changedFields.contains($0.key) }
+        }
 
         // Apply schema-declared auto-timestamps BEFORE validation so a
         // `required: true` + `auto_stamp = "create"` field doesn't trip
@@ -1330,6 +1551,15 @@ public final class DynamicModel {
             newValues[fname] = .number(nowMillis)
         }
 
+        // Stage 2 of the narrowing — js-bao's `_diffWithYjsData` (#2459):
+        // drop any change whose value already equals what's persisted. Runs
+        // AFTER the stamp block so an explicitly-supplied auto_stamp value
+        // still counts as explicit (js-bao stamps off `_localChanges`, then
+        // diffs), and on the UPDATE path only for the same reason as stage 1.
+        if isUpdate {
+            newValues = newValues.filter { oldData[$0.key] != $0.value }
+        }
+
         // Merge caller values on top of existing, and fill in
         // schema defaults for anything still missing (only
         // meaningful on create; a no-op on update since existing
@@ -1355,8 +1585,26 @@ public final class DynamicModel {
         // Presence check only — matches js-bao's `null || undefined`
         // guard (BaseModel.ts line 844). Empty strings are
         // considered present and pass.
+        //
+        // `id` is the one field read off the write itself rather than out of
+        // the merged data (#2885). The primary key never travels in `values`
+        // — the generated `primitiveValues()` omits it and every write path
+        // resolves it into the separate `id:` argument (caller-supplied, or
+        // auto-assigned from the id field's generator) before getting here.
+        // So on an insert `dataToSave["id"]` is empty for a value the runtime
+        // has already guaranteed, and `required = true` on `id` — a shape the
+        // codegen accepts, and `auto_assign` gives no `default` for the
+        // materialization loop above to fill — used to fail every insert.
+        // js-bao's `validateBeforeSave` reads the same field the same way
+        // (`fieldKey === "id" ? this.id : this.getValue(fieldKey)`, #613), so
+        // one `models.toml` now behaves identically from both clients. It is
+        // a different *source* for the value, not an exemption: an id that
+        // isn't there still fails — the guard at the top of this method has
+        // already rejected it, exactly as js-bao's `save()` does before its
+        // validator runs.
         for (fname, desc) in self.schema.fields where desc.required {
-            guard dataToSave[fname] != nil else {
+            let present = fname == "id" ? !id.isEmpty : dataToSave[fname] != nil
+            guard present else {
                 throw FieldValidationError.requiredFieldMissing(
                     field: fname, modelName: self.schema.name
                 )
@@ -1756,7 +2004,7 @@ public final class DynamicModel {
         }
         // Main-row dict (scalars only). `_meta_doc_id` makes the row
         // addressable under the shared-engine compound PK.
-        var row: [String: Any] = ["id": id, "_meta_doc_id": docId]
+        var row: [String: JSONValue] = ["id": .string(id), "_meta_doc_id": .string(docId)]
         // Stringsets routed separately into junction tables.
         var stringsets: [String: [String]] = [:]
         let snap = snapshotFromMap(rec: rec, tx: tx)

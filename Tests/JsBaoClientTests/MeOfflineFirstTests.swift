@@ -27,9 +27,19 @@ final class MeOfflineFirstTests: XCTestCase {
         if let ctx: TestContext = ctx { await ctx.cleanup() }
     }
 
-    /// Happy path: while ONLINE, `ownedDocuments` returns the union of the
-    /// server list (REST-created doc) and locally-known owned docs the server
-    /// can't return (a `localOnly` doc that never syncs) — deduped by id.
+    /// Happy path: while ONLINE, a server-backed `ownedDocuments` returns the
+    /// union of the server list (REST-created doc) and locally-known owned
+    /// docs the server can't return (a `localOnly` doc that never syncs) —
+    /// deduped by id.
+    ///
+    /// This asserts on `waitForLoad: .network` rather than the default.
+    /// #2360 changed the default (`.localIfAvailableElseNetwork`) to js-bao's
+    /// local-first meaning — a warm local cache answers immediately and the
+    /// server refresh happens in the background — so the default no longer
+    /// guarantees the server's rows are present at return time. `.network` is
+    /// the mode that still means "wait for the server", which is what this
+    /// merge assertion is about. The default's own contract is covered below
+    /// and in `MeOwnedDocumentsLocalFirstTests`.
     func testOwnedDocumentsMergesServerAndLocalRows() async throws {
         let serverDocId = try await ctx.createDocument(
             appId: testApp.appId, jwt: testApp.ownerJWT, title: "Server Owned Doc"
@@ -42,7 +52,8 @@ final class MeOfflineFirstTests: XCTestCase {
         try await client.connect()
         try await waitForConnection(client: client)
 
-        let owned = try await client.me.ownedDocuments()
+        let networkOptions = MeOwnedDocumentsOptions(waitForLoad: .network)
+        let owned = try await client.me.ownedDocuments(options: networkOptions)
         let ids = owned.map { $0.documentId }
         XCTAssertTrue(ids.contains(serverDocId), "server-side doc missing from merged owned list")
         XCTAssertTrue(ids.contains(localDocId), "localOnly doc missing from merged owned list")
@@ -51,9 +62,54 @@ final class MeOfflineFirstTests: XCTestCase {
             "merged owned list must be deduped by documentId"
         )
 
-        // The page overload carries the same merged rows.
-        let page = try await client.me.ownedDocumentsPage()
-        XCTAssertTrue(page.items.map { $0.documentId }.contains(localDocId))
+        // The page overload deliberately does NOT union the local-only rows
+        // into the page (#2360): a page must not exceed `limit`, and a cursor
+        // walk would otherwise see the same local-only rows repeated on every
+        // page. js-bao returns its page before the equivalent merge
+        // (`documentsApi.ts:1338-1340`). It carries the server's rows only.
+        let page = try await client.me.ownedDocumentsPage(options: networkOptions)
+        let pageIds = page.items.map { $0.documentId }
+        XCTAssertTrue(pageIds.contains(serverDocId), "the paged form carries the server's rows")
+        XCTAssertFalse(
+            pageIds.contains(localDocId),
+            "the paged form must not append unpaginated local-only rows"
+        )
+    }
+
+    /// The default `waitForLoad` is local-first (#2360): with a warm local
+    /// cache it answers from the cache — the locally-known doc is there — and
+    /// refreshes in the background, so a later call also carries the server's
+    /// rows.
+    func testOwnedDocumentsDefaultIsLocalFirstThenRefreshes() async throws {
+        let serverDocId = try await ctx.createDocument(
+            appId: testApp.appId, jwt: testApp.ownerJWT, title: "Server Doc For LocalFirst"
+        )
+        let (localDocId, _) = try await client.createDocumentForTest(options: CreateDocumentOptions(
+            title: "Warm Cache Doc",
+            localOnly: true
+        ))
+
+        try await client.connect()
+        try await waitForConnection(client: client)
+
+        let first = try await client.me.ownedDocuments()
+        XCTAssertTrue(
+            first.map { $0.documentId }.contains(localDocId),
+            "the warm local cache answers the default call"
+        )
+
+        // The background refresh writes the server rows into the local
+        // metadata cache; a subsequent local-first call sees them.
+        var sawServerDoc = false
+        for _ in 0..<20 {
+            let ids = try await client.me.ownedDocuments().map { $0.documentId }
+            if ids.contains(serverDocId) {
+                sawServerDoc = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        XCTAssertTrue(sawServerDoc, "background refresh never made the server row visible")
     }
 
     /// Edge: OFFLINE, `ownedDocuments` answers from the local cache only —
@@ -136,8 +192,12 @@ final class MeOfflineFirstTests: XCTestCase {
         let sharedIds = shared.items.map { $0.document.documentId }
         XCTAssertTrue(sharedIds.contains(sharedDocId), "granted doc missing from sharedDocuments")
 
-        // The shared doc must NOT be classified as owned.
-        let ownedIds = try await client.me.ownedDocuments().map { $0.documentId }
+        // The shared doc must NOT be classified as owned. `.network` so the
+        // assertion is about the server-backed list, not whatever the local
+        // cache happens to hold (#2360 made the default local-first).
+        let ownedIds = try await client.me.ownedDocuments(
+            options: MeOwnedDocumentsOptions(waitForLoad: .network)
+        ).map { $0.documentId }
         XCTAssertFalse(ownedIds.contains(sharedDocId), "shared doc leaked into ownedDocuments")
 
         // Offline: cache-only subset, no throw, no owner rows.

@@ -7,9 +7,9 @@ import JsBaoClient
 /// Aggregates every model generated from the schema so an app can
 /// register them in one call. Mirrors the JS codegen's `index.ts`
 /// barrel (\`allModels\` + auto-registration).
-internal enum GeneratedModels {
+public enum GeneratedModels {
     /// Every generated model type, in TOML declaration order.
-    internal static let all: [any PrimitiveModel.Type] = [
+    public static let all: [any PrimitiveModel.Type] = [
         BareBonesRecord.self,
         CrashTestRecord.self,
         RelTestRecord.self,
@@ -22,7 +22,7 @@ internal enum GeneratedModels {
     /// `register(on:)` self-check below — mirrors the JS barrel,
     /// which re-loads the bundled TOML at import time and asserts
     /// the generated set matches.
-    internal static let modelNames: [String] = [
+    public static let modelNames: [String] = [
         "barebones",
         "crashTest",
         "relTest",
@@ -41,7 +41,7 @@ internal enum GeneratedModels {
     /// generated model with no matching TOML entry, and a TOML entry
     /// with no generated model, are surfaced — there, by throwing on
     /// import; here, by a precondition in `register(on:)`.
-    internal static func register(on client: JsBaoClient) {
+    public static func register(on client: JsBaoClient) {
         let registered = all.map { $0.primitiveSchema.name }
         let expected = Set(modelNames)
         let got = Set(registered)

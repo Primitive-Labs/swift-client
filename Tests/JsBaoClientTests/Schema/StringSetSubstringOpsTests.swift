@@ -51,7 +51,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
     func testStartsWithMatchesAnyMemberPrefix() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$startsWith": "draft-"]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["p1", "p2"])
     }
 
@@ -66,7 +66,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
     func testEndsWithMatchesAnyMemberSuffix() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$endsWith": "-A"]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["p3"])
     }
 
@@ -75,7 +75,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
     func testContainsTextMatchesSubstringWithinAnyMember() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$containsText": "rove"]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["p1", "p3"],
                        "'rove' is a substring of 'approved' — both p1 and p3 carry 'approved'")
     }
@@ -97,7 +97,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
     func testStartsWithOnEmptyStringsetNoMatch() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$startsWith": "anything"]])
-        let ids = rows.compactMap { $0["id"] as? String }
+        let ids = rows.compactMap { $0["id"]?.stringValue }
         XCTAssertFalse(ids.contains("p4"))
     }
 
@@ -108,7 +108,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
     func testSubstringOpsOnStringFieldStillMatchColumn() throws {
         let model = try seeded()
         let rows = try model.query(["name": ["$startsWith": "fir"]])
-        XCTAssertEqual(rows.compactMap { $0["id"] as? String }, ["p1"])
+        XCTAssertEqual(rows.compactMap { $0["id"]?.stringValue }, ["p1"])
     }
 
     // MARK: - Cross-doc via MultiDocModel
@@ -130,7 +130,7 @@ final class StringSetSubstringOpsTests: XCTestCase {
 
         let rows = try multi.query(["tags": ["$startsWith": "draft-"]])
         XCTAssertEqual(
-            Set(rows.compactMap { $0["id"] as? String }),
+            Set(rows.compactMap { $0["id"]?.stringValue }),
             ["a1", "b1"]
         )
     }

@@ -21,11 +21,30 @@ struct TestUser {
 /// Requires TEST_SUPERADMIN_JWT environment variable to be set with a valid super-admin
 /// JWT. Get one by running the JS tests first (which set up the superuser in DynamoDB),
 /// then mint a JWT via the admin API.
-final class TestContext {
-    private var createdApps: [String] = []
+///
+/// `@unchecked Sendable`: the harness is shared by concurrent tasks in several
+/// tests (a `TaskGroup` creating documents in parallel, for instance). Its three
+/// mutable slots are the only shared state and each one lives in a `LockedBox`,
+/// so every read and write of them is serialised. `URLSession` is `Sendable`
+/// already.
+final class TestContext: @unchecked Sendable {
+    private let createdAppsBox = LockedBox([String]())
     private let session: URLSession
-    private var superuserJWT: String = ""
-    private var superuserEmail: String = ""
+    private let superuserJWTBox = LockedBox("")
+    private let superuserEmailBox = LockedBox("")
+
+    private var createdApps: [String] {
+        get { createdAppsBox.value }
+        set { createdAppsBox.value = newValue }
+    }
+    private var superuserJWT: String {
+        get { superuserJWTBox.value }
+        set { superuserJWTBox.value = newValue }
+    }
+    private var superuserEmail: String {
+        get { superuserEmailBox.value }
+        set { superuserEmailBox.value = newValue }
+    }
 
     init() {
         let config = URLSessionConfiguration.default
@@ -120,7 +139,7 @@ final class TestContext {
             throw TestSetupError("Failed to create app: missing appId in response \(appResult)")
         }
 
-        createdApps.append(appId)
+        createdAppsBox.withValue { $0.append(appId) }
 
         // The create-app response includes "createdBy" which is the userId of
         // the owner that was auto-created for the initialAdminEmail.
@@ -158,6 +177,41 @@ final class TestContext {
         let jwt = try await mintTestJwt(appId: appId, userId: userId, role: role)
 
         return TestUser(userId: userId, email: userEmail, name: userName, role: role, jwt: jwt)
+    }
+
+    /// Sign in through the email-code path with the `+primitivetest` bypass
+    /// (magic code `000000`) and return the provisioned user's id. The app
+    /// must have `otpEnabled` on and the address's base listed in
+    /// `testAccountBaseEmails` (both via `updateAppSettings(appId:settings:)`).
+    ///
+    /// Unlike `createTestUser`, which goes through admin add-by-email and gets
+    /// the email's local part written as a placeholder name, OTP provisioning
+    /// passes no `name` — so this is the only harness path that produces a user
+    /// the server has no name for (#2980).
+    func signInWithTestOtp(appId: String, email: String) async throws -> String {
+        let url = URL(string: "\(TestConfig.httpUrl)/app/\(appId)/api/auth/otp/verify")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(TestConfig.globalAdminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: ["email": email, "code": "000000"]
+        )
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TestSetupError("Non-HTTP response")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? ""
+            throw TestSetupError("HTTP \(httpResponse.statusCode) POST /auth/otp/verify: \(text)")
+        }
+
+        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        guard let userId = (json["user"] as? [String: Any])?["userId"] as? String else {
+            throw TestSetupError("OTP verify returned no user id: \(json)")
+        }
+        return userId
     }
 
     /// Update app settings via `PUT /app/{appId}/api/settings` (owner JWT).
@@ -204,9 +258,9 @@ final class TestContext {
     /// `syncCallable` opts the workflow into `runSync` (mirrors the JS
     /// `createSyncWorkflow` helper in
     /// tests/client/js-bao-client-workflow-runSync.test.ts — which, like
-    /// this helper, does NOT call the legacy `/publish` endpoint: the
-    /// server now answers 409 WORKFLOW_CONFIG_MODEL for workflows that
-    /// already have an active configuration).
+    /// this helper, does not go near the legacy publish endpoint: it was
+    /// retired in #2768, and activation is the workflow's active
+    /// configuration).
     @discardableResult
     func setupWorkflow(
         appId: String,
@@ -221,6 +275,8 @@ final class TestContext {
                 "workflowKey": workflowKey,
                 "name": workflowKey,
                 "description": "Swift test workflow",
+                // #2652: caller workflows must state who may start them.
+                "accessRule": "true",
                 "steps": steps,
                 "syncCallable": syncCallable,
             ]
@@ -230,11 +286,12 @@ final class TestContext {
             throw TestSetupError("Failed to create workflow: \(createRes)")
         }
 
+        // No status here: it is server-owned (#2803) and creation already
+        // yields an active workflow — the endpoint rejects a status key.
         _ = try await adminRequest(
             method: "PATCH",
             path: "/admin/api/apps/\(appId)/workflows/\(workflowId)",
             body: [
-                "status": "active",
                 "requiresClientApply": requiresClientApply,
             ]
         )
@@ -261,7 +318,7 @@ final class TestContext {
         for appId in createdApps {
             _ = try? await adminRequest(method: "DELETE", path: "/admin/api/apps/\(appId)", body: nil)
         }
-        createdApps.removeAll()
+        createdAppsBox.withValue { $0.removeAll() }
     }
 
     // MARK: - Private HTTP Helpers
@@ -306,8 +363,10 @@ final class TestContext {
     }
 
     /// Update writable app fields via `PUT /admin/api/apps/{appId}` (e.g.
-    /// `googleClientId` / `googleClientSecret` / `redirectUris` for the
-    /// OAuth flow tests). Returns the canonical admin-API app shape.
+    /// `googleClients` — the per-platform client map — for the OAuth flow
+    /// tests, or `emailRedirectUris` for magic link). Returns the canonical
+    /// admin-API app shape. The retired scalars (`googleClientId`,
+    /// `googleClientSecret`, `redirectUris`) are rejected by the server (#2891).
     @discardableResult
     func updateTestApp(appId: String, fields: [String: Any]) async throws -> [String: Any] {
         try await adminRequest(method: "PUT", path: "/admin/api/apps/\(appId)", body: fields)
@@ -349,8 +408,11 @@ final class TestContext {
         try await appRequest(method: "POST", appId: appId, path: path, body: body, jwt: jwt)
     }
 
+    /// Raw app-API request as a given user. Internal (not private) so tests can
+    /// exercise endpoints the Swift client does not expose yet — e.g. the
+    /// metadata-category configs and metadata read/write routes (#1451).
     @discardableResult
-    private func appRequest(method: String, appId: String, path: String, body: [String: Any]?, jwt: String) async throws -> [String: Any] {
+    func appRequest(method: String, appId: String, path: String, body: [String: Any]?, jwt: String) async throws -> [String: Any] {
         let url = URL(string: "\(TestConfig.httpUrl)/app/\(appId)/api\(path)")!
         var request = URLRequest(url: url)
         request.httpMethod = method

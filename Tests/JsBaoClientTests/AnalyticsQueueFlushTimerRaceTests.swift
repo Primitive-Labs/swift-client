@@ -10,6 +10,11 @@ import XCTest
 /// double-scheduling the flush. The fix brings the check-and-schedule under a
 /// single lock hold so it is atomic; only one racer creates the timer.
 ///
+/// #1993 Phase D3 replaced that lock with actor isolation. The invariant is
+/// unchanged and so is this test — what provides the atomicity now is that
+/// `scheduleFlush()`'s check-and-assign region contains no `await`
+/// (`ActorizedAnalyticsQueueTests` asserts that structurally).
+///
 /// Server-free: constructs `AnalyticsQueue` directly with no connection, so
 /// the scheduled flush harmlessly re-buffers. It observes how many timers were
 /// scheduled via the internal `onFlushScheduled` hook.
@@ -42,12 +47,15 @@ final class AnalyticsQueueFlushTimerRaceTests: XCTestCase {
 
         for _ in 0..<rounds {
             let queue = AnalyticsQueue(logger: Logger(level: .none, scope: "flush-race-test"))
-            queue.onFlushScheduled = { scheduled.increment() }
+            await queue.setOnFlushScheduled { scheduled.increment() }
 
             await withTaskGroup(of: Void.self) { group in
                 for i in 0..<concurrency {
                     group.addTask {
-                        queue.logEvent(["action": "race", "feature": "flush_timer_\(i)"])
+                        await queue.logEvent([
+                            "action": .string("race"),
+                            "feature": .string("flush_timer_\(i)"),
+                        ])
                     }
                 }
                 await group.waitForAll()

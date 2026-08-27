@@ -203,22 +203,28 @@ func recordToValuesForSchema(
     return out
 }
 
-/// Convert a query-row dict (`[String: Any]` from
+/// Convert a query-row dict (`[String: JSONValue]` from
 /// `dynamic.query`) into the harness's normalized JSON shape.
-/// Stringsets become sorted arrays; everything else passes through.
-/// Internal `_meta_*` columns (added by the shared-engine path
+/// Stringsets become sorted arrays; an integral number is emitted as an
+/// integer so the shape matches the JS side (every row number is a `Double`
+/// since #2546). Internal `_meta_*` columns (added by the shared-engine path
 /// when the engine hosts multiple docs) get filtered out — they're
 /// not user fields.
-func dynamicRowToJson(_ row: [String: Any]) -> [String: Any] {
+func dynamicRowToJson(_ row: [String: JSONValue]) -> [String: Any] {
     var out: [String: Any] = [:]
     for (k, v) in row {
         if k.hasPrefix("_meta_") { continue }
-        if let arr = v as? [String] {
-            out[k] = arr.sorted()
-        } else if let i = v as? Int, !(v is Bool) {
-            out[k] = i
-        } else {
-            out[k] = v
+        switch v {
+        case let .string(s):
+            out[k] = s
+        case let .bool(b):
+            out[k] = b
+        case let .number(n):
+            out[k] = (n == n.rounded() && abs(n) < 9_007_199_254_740_992) ? Int(n) : n
+        case let .array(items):
+            out[k] = items.compactMap { $0.stringValue }.sorted()
+        case .object, .null:
+            continue  // no row column carries these in the fixtures
         }
     }
     return out
@@ -317,7 +323,7 @@ func cmdSeed(
 
 func cmdQuery(
     docB64: String,
-    filter: [String: Any]?,
+    filter: DocumentFilter?,
     sort: [[String: Any]]?,
     limit: Int?,
     cursor: String?,
@@ -336,7 +342,7 @@ func cmdQuery(
         let dyn = DynamicModel(doc: doc, schema: schema)
         do {
             let page = try dyn.queryPaged(filter, options: opts)
-            emitPage(rows: page.data.map(dynamicRowToJson),
+            emitPage(rows: page.data.map { dynamicRowToJson($0.raw) },
                      nextCursor: page.nextCursor)
         } catch {
             emitError("queryPaged failed: \(error)")
@@ -600,7 +606,8 @@ while let cmd = readCommand() {
         guard let docB64 = cmd["doc"] as? String else {
             emitError("query: missing doc")
         }
-        let filter = cmd["filter"] as? [String: Any]
+        let filter = (cmd["filter"] as? [String: Any])
+            .flatMap { try? JSONValue.typedRow(from: $0, subject: "Filter values") }
         let sort   = cmd["sort"]   as? [[String: Any]]
         let limit  = cmd["limit"]  as? Int
         let cursor = cmd["cursor"] as? String

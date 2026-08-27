@@ -114,7 +114,7 @@ final class AutoStampWriteTests: XCTestCase {
         _ = try m.save(id: "r1", values: ["title": .string("a")])
         m.awaitObserverDrain()
 
-        let fired = NSCountedSet()
+        let fired = FireCounter()
         let unsub = m.subscribe { fired.add("x") }
         defer { unsub() }
 

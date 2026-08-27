@@ -64,11 +64,41 @@ public struct AnalyticsEventInput: Encodable, Sendable {
         self.user_created_at_epoch_s = user_created_at_epoch_s
     }
 
-    /// Bridge to the untyped `[String: Any]` graph the `AnalyticsQueue`
-    /// consumes. Nil fields are dropped (so the queue's defaulting and
-    /// override logic still applies), and `context_json` is lowered to
-    /// its underlying JSON `Any` value. Keys stay snake_case exactly as
-    /// the queue expects.
+    /// The event as the typed `[String: JSONValue]` row the `AnalyticsQueue`
+    /// buffers since #1993 Phase D3. Nil fields are dropped (so the queue's
+    /// defaulting and override logic still applies) and keys stay snake_case
+    /// exactly as the queue expects.
+    ///
+    /// This is the direct path — no `Any` graph in the middle — so the typed
+    /// `client.analytics.logEvent` surface never pays for a conversion the
+    /// untyped one needs.
+    public func asJSONObject() -> [String: JSONValue] {
+        var row: [String: JSONValue] = ["action": .string(action)]
+        if let feature { row["feature"] = .string(feature) }
+        if let route { row["route"] = .string(route) }
+        if let plan { row["plan"] = .string(plan) }
+        if let tenant_id { row["tenant_id"] = .string(tenant_id) }
+        if let user_ulid { row["user_ulid"] = .string(user_ulid) }
+        if let device_type { row["device_type"] = .string(device_type) }
+        if let os_name { row["os_name"] = .string(os_name) }
+        if let os_version { row["os_version"] = .string(os_version) }
+        if let browser_name { row["browser_name"] = .string(browser_name) }
+        if let browser_version { row["browser_version"] = .string(browser_version) }
+        if let app_version { row["app_version"] = .string(app_version) }
+        if let user_created_at_epoch_s {
+            row["user_created_at_epoch_s"] = .number(Double(user_created_at_epoch_s))
+        }
+        if let context_json { row["context_json"] = context_json }
+        return row
+    }
+
+    /// Bridge to the untyped `[String: Any]` graph. Nil fields are dropped (so
+    /// the queue's defaulting and override logic still applies), and
+    /// `context_json` is lowered to its underlying JSON `Any` value. Keys stay
+    /// snake_case exactly as the queue expects.
+    ///
+    /// The analytics queue itself takes `asJSONObject()` now; this stays for
+    /// callers that still speak the `Any` graph.
     public func asDictionary() -> [String: Any] {
         var dict: [String: Any] = ["action": action]
         if let feature { dict["feature"] = feature }
@@ -90,10 +120,14 @@ public struct AnalyticsEventInput: Encodable, Sendable {
 
 // MARK: - JSONValue → Any lowering
 
-extension JSONValue {
+public extension JSONValue {
     /// Lower a `JSONValue` into the loosely-typed `Any` graph that
-    /// `JSONSerialization` (and therefore the analytics queue's buffer)
-    /// speaks. `.null` becomes `NSNull` so it survives serialization.
+    /// `JSONSerialization` speaks — the inverse of ``JSONValue/init(jsonAny:subject:)``.
+    /// `.null` becomes `NSNull` so it survives serialization.
+    ///
+    /// Use this at a boundary that has to hand JSON to an API taking `Any`
+    /// (`JSONSerialization`, a debug/inspector payload). Inside the client,
+    /// prefer passing the `JSONValue` itself.
     func toAny() -> Any {
         switch self {
         case let .string(s): return s

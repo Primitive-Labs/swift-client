@@ -15,52 +15,55 @@ import Foundation
 /// client can retry). `JsBaoClient` calls `handleApplyEvent` automatically
 /// when a `workflowStatus` WS message arrives with `needsApply = true`.
 public final class WorkflowsAPI: @unchecked Sendable {
-    private let makeRequest: (String, String, Any?) async throws -> Any
+    private let transport: any Transport
     private let getConnectionId: () -> String
     private let logger: Logger?
+
+    /// The client's shared event emitter. `waitFor` subscribes to the
+    /// `.workflowStatus` and `.status` events through it (mirroring the JS
+    /// self-contained `waitFor`). Optional so the API can still be constructed
+    /// standalone in unit tests that don't exercise `waitFor` — those pass a
+    /// real emitter when they do.
+    private let events: EventEmitter?
 
     /// Registered apply handlers, keyed by `workflowKey`. Protected by
     /// `handlersLock` so `define` and `handleApplyEvent` can be called from
     /// any thread.
     private var applyHandlers: [String: WorkflowApplyHandler] = [:]
 
-    /// One-shot per-run waiter keyed by `runKey`. Carries the full run
-    /// context so reconnect-recovery (`recheckPendingRuns`) and
-    /// claim-refused retries can operate without the caller feeding
-    /// metadata back in.
-    fileprivate struct PerRunWaiter {
-        let workflowKey: String
-        let contextDocId: String?
-        let continuation: CheckedContinuation<WorkflowApplyContext, Error>
-        var claimRetryCount: Int
-    }
-
-    /// Keyed by `runKey`. Consumed atomically on the first terminal event
-    /// (success, failure, timeout, cancellation).
-    fileprivate var perRunWaiters: [String: PerRunWaiter] = [:]
-
-    /// Lease TTL on the server is 30s. Retry ~5s after that so the
-    /// lease has reliably expired before we re-attempt the claim.
-    private static let claimRetryAfter: TimeInterval = 35
-    /// Stop retrying claims after this many attempts — the per-run
-    /// waiter's timeout will still cover it.
-    private static let maxClaimRetries = 3
-
     private let handlersLock = NSLock()
 
-    private enum RunReconcileDisposition {
-        case waitingForFutureEvents
-        case resolvedOrInFlight
+    /// Designated initializer — the typed transport spine.
+    ///
+    /// The client's logger is module-internal (#2363), so it is not a
+    /// parameter here; the internal overload below carries it for
+    /// `JsBaoClient`'s own construction.
+    public convenience init(
+        transport: any Transport,
+        getConnectionId: @escaping () -> String = { "" },
+        events: EventEmitter? = nil
+    ) {
+        self.init(
+            transport: transport,
+            getConnectionId: getConnectionId,
+            logger: nil,
+            events: events
+        )
     }
 
-    public init(
-        makeRequest: @escaping (String, String, Any?) async throws -> Any,
+    /// In-module initializer — same as the public one plus the internal
+    /// logger. `logger` deliberately has no default value: that is what keeps
+    /// `WorkflowsAPI(transport:)` unambiguous between the two.
+    init(
+        transport: any Transport,
         getConnectionId: @escaping () -> String = { "" },
-        logger: Logger? = nil
+        logger: Logger?,
+        events: EventEmitter? = nil
     ) {
-        self.makeRequest = makeRequest
+        self.transport = transport
         self.getConnectionId = getConnectionId
         self.logger = logger
+        self.events = events
     }
 
     // MARK: - Workflow Execution
@@ -83,19 +86,69 @@ public final class WorkflowsAPI: @unchecked Sendable {
         input: [String: Any],
         options: StartWorkflowOptions? = nil
     ) async throws -> StartWorkflowResult {
-        let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
-        var body: [String: Any] = ["rootInput": input]
-        if let runKey = options?.runKey { body["runKey"] = runKey }
-        if let contextDocId = options?.contextDocId { body["contextDocId"] = contextDocId }
-        if let meta = options?.meta { body["meta"] = meta }
-        if options?.forceRerun == true { body["forceRerun"] = true }
+        // The `input` PARAMETER is opaque caller data the server does not
+        // introspect and the client cannot interpret, so it is serialized
+        // directly: `JSONSerialization` writes an `Int64` exactly, where
+        // `JSONValue`'s single `.number(Double)` case loses exactness past
+        // 2^53. That is why this parameter stayed `[String: Any]` in #2367.
+        //
+        // `StartWorkflowOptions.input` / `.meta` did NOT stay untyped — they
+        // are `[String: JSONValue]`, because the struct's `Sendable`
+        // conformance was unchecked while it held `[String: Any]`. So a `meta`
+        // that arrives through the options struct is already `JSONValue`-shaped
+        // and cannot be made exact here; a `meta` passed positionally (the
+        // generic `start` and both `runSync` overloads) never goes near
+        // `JSONValue`. Both the CHANGELOG and the migration guide record which
+        // form is which; closing the gap needs a `JSONValue` integer case.
+        //
+        // Lower the typed `meta` back to the `Any` graph the request body is
+        // built from. `try`, not `try?`: an unencodable value (a non-finite
+        // `.number`, which `JSONEncoder` rejects by default) must fail the
+        // start rather than silently start the workflow without its `meta`.
+        let loweredMeta = try options?.meta.map { try JSONCoding.jsonObject(from: $0) }
+        return try await startRequest(
+            workflowKey: workflowKey,
+            input: input,
+            runKey: options?.runKey,
+            contextDocId: options?.contextDocId,
+            meta: loweredMeta,
+            forceRerun: options?.forceRerun
+        )
+    }
 
-        let result = try await makeRequest("POST", "/workflows/\(encodedKey)/start", body)
+    /// The one place a start request body is composed.
+    ///
+    /// Every public `start` form funnels here with values that are already
+    /// untyped, so a caller who spelled `meta` untyped gets it on the wire
+    /// exactly as spelled — `meta` is `Any?` rather than `[String: JSONValue]`
+    /// precisely so nothing on this path can silently round an `Int64`. Only
+    /// `StartWorkflowOptions.meta` has been through `JSONValue` by the time it
+    /// reaches here, because that struct's field is typed.
+    private func startRequest(
+        workflowKey: String,
+        input: [String: Any],
+        runKey: String?,
+        contextDocId: String?,
+        meta: Any?,
+        forceRerun: Bool?
+    ) async throws -> StartWorkflowResult {
+        let encodedKey = URLEncoding.encodeComponent(workflowKey)
+        var payload: [String: Any] = ["rootInput": input]
+        if let runKey { payload["runKey"] = runKey }
+        if let contextDocId { payload["contextDocId"] = contextDocId }
+        if let meta { payload["meta"] = meta }
+        if forceRerun == true { payload["forceRerun"] = true }
+        let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
+
         // No local `workflowStarted` emit here (#1112): JS emits the event
         // exclusively from the server-pushed `workflowStarted` WS frame
         // (handled in `JsBaoClient.handleWebSocketMessage`), so emitting
         // from the HTTP start path too produced a double emit per start.
-        return try JSONCoding.decode(StartWorkflowResult.self, from: result)
+        return try await transport.request(
+            method: .post,
+            path: "/workflows/\(encodedKey)/start",
+            bodyData: bodyData
+        )
     }
 
     /// Options-struct overload of `start`, mirroring js-bao's single
@@ -104,9 +157,19 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// the options object rather than as separate positional parameters.
     @discardableResult
     public func start(_ options: StartWorkflowOptions) async throws -> StartWorkflowResult {
-        try await start(
+        // `options.input` is the typed `[String: JSONValue]` shape (#2367);
+        // lower it back to the `Any` graph the untyped `rootInput` body wants.
+        // `try`, not `try?` — an unencodable value used to start the workflow
+        // with `rootInput: {}` and report success.
+        guard let inputAny = try JSONCoding.jsonObject(from: options.input) as? [String: Any] else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "StartWorkflowOptions.input did not encode to a JSON object"
+            )
+        }
+        return try await start(
             workflowKey: options.workflowKey,
-            input: options.input,
+            input: inputAny,
             options: options
         )
     }
@@ -116,9 +179,10 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// terminal `status` (`completed`/`failed`/`terminated`/`timeout`/
     /// `apply_pending`); only transport/connectivity errors throw.
     ///
-    /// - Parameter timeoutMs: hard wall-clock ceiling (default server-side
-    ///   5000, capped at 30000). On exceed the run resolves with
-    ///   `status == "timeout"`.
+    /// - Parameter timeout: hard wall-clock ceiling in **seconds** (renamed
+    ///   from `timeoutMs` in #2367; the wire field is still `timeoutMs`).
+    ///   Defaults server-side to 5s, capped at 30s. On exceed the run resolves
+    ///   with `status == "timeout"`.
     ///
     /// (Swift omits the JS `AbortSignal` — the JS transport doesn't wire it
     /// through either; cancel via the surrounding `Task` and read final state
@@ -129,37 +193,51 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
-        timeoutMs: Int? = nil
+        timeout: TimeInterval? = nil
     ) async throws -> RunSyncWorkflowResult {
-        let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
-        var body: [String: Any] = ["rootInput": input]
-        if let runKey { body["runKey"] = runKey }
-        if let contextDocId { body["contextDocId"] = contextDocId }
-        if let meta { body["meta"] = meta }
-        if let timeoutMs, timeoutMs > 0 { body["timeoutMs"] = timeoutMs }
-        let result = try await makeRequest("POST", "/workflows/\(encodedKey)/run-sync", body)
-        return try JSONCoding.decode(RunSyncWorkflowResult.self, from: result)
+        let encodedKey = URLEncoding.encodeComponent(workflowKey)
+        // Same reasoning as `start`: `input`/`meta` are opaque caller data, so
+        // the bytes are composed here rather than passed through `JSONValue`.
+        var payload: [String: Any] = ["rootInput": input]
+        if let runKey { payload["runKey"] = runKey }
+        if let contextDocId { payload["contextDocId"] = contextDocId }
+        if let meta { payload["meta"] = meta }
+        // The Swift parameter is a `TimeInterval` (#2367); the wire field
+        // stays `timeoutMs`, so convert here rather than renaming the key.
+        if let timeout, timeout > 0 {
+            payload["timeoutMs"] = timeout.wholeMilliseconds
+        }
+        let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
+        return try await transport.request(
+            method: .post,
+            path: "/workflows/\(encodedKey)/run-sync",
+            bodyData: bodyData
+        )
     }
 
     /// Gets the status of a workflow run. Mirrors the JS client's
     /// `getStatus` — returns a decoded `WorkflowStatusResult` (#954) whose
-    /// `status` (CF status) and `run` (DB record) carry the raw shapes.
-    /// Throws on a response shape mismatch instead of coercing to `[:]`
+    /// `status` is the server's reconciled run status and `run` is the DB
+    /// record. Throws on a response shape mismatch instead of coercing to `[:]`
     /// (#991).
+    ///
+    /// #2348: the server now returns ONE canonical status on the wire — one of
+    /// `queued`, `running`, `apply_pending`, `apply_claimed`, `completed`,
+    /// `failed`, `terminated`, `missing`. Raw Cloudflare spellings (`complete`,
+    /// `errored`) never reach the client, and the server never rolls a terminal
+    /// run back to `running`, so the client passes `status` through verbatim
+    /// instead of re-deriving it from the run row.
     public func getStatus(
         workflowKey: String,
         runKey: String,
         contextDocId: String? = nil
     ) async throws -> WorkflowStatusResult {
-        let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
-        let encodedRunKey = runKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runKey
-        var path = "/workflows/\(encodedKey)/instances/\(encodedRunKey)/status"
-        if let contextDocId = contextDocId,
-           let encoded = contextDocId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            path += "?contextDocId=\(encoded)"
-        }
-        let result = try await makeRequest("GET", path, nil)
-        return try JSONCoding.decode(WorkflowStatusResult.self, from: result)
+        let encodedKey = URLEncoding.encodeComponent(workflowKey)
+        let encodedRunKey = URLEncoding.encodeComponent(runKey)
+        var query = URLQuery()
+        query.appendIfPresent("contextDocId", contextDocId)
+        let path = "/workflows/\(encodedKey)/instances/\(encodedRunKey)/status\(query.queryString)"
+        return try await transport.request(method: .get, path: path)
     }
 
     // MARK: - Typed generic overloads (#1547)
@@ -183,7 +261,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String? = nil,
         contextDocId: String? = nil,
         meta: [String: Any]? = nil,
-        timeoutMs: Int? = nil
+        timeout: TimeInterval? = nil
     ) async throws -> RunSyncResult<Output> {
         let encoded = try Self.encodeInputObject(input)
         let untyped = try await runSync(
@@ -192,7 +270,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
             runKey: runKey,
             contextDocId: contextDocId,
             meta: meta,
-            timeoutMs: timeoutMs
+            timeout: timeout
         )
         return RunSyncResult(
             runId: untyped.runId,
@@ -201,13 +279,21 @@ public final class WorkflowsAPI: @unchecked Sendable {
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
             run: untyped.run,
-            existing: untyped.existing
+            existing: untyped.existing,
+            // #2636 — the typed envelope mirrors every field of the untyped
+            // one, so an app on the generated invokers can branch on the reason
+            // an elided run did not run.
+            skipReason: untyped.skipReason
         )
     }
 
     /// Start a workflow with a typed `Codable` input. Mirrors the JS
     /// `start<I>` — the start result (`StartWorkflowResult`) is not output-typed
     /// on either client, so only the input is generic here.
+    ///
+    /// `meta` is `[String: Any]` and reaches the wire untouched, so an `Int64`
+    /// past 2^53 stays exact. Use this form (or `runSync`) rather than
+    /// `StartWorkflowOptions.meta` when you pass large integer IDs.
     @discardableResult
     public func start<Input: Encodable>(
         workflowKey: String,
@@ -218,18 +304,19 @@ public final class WorkflowsAPI: @unchecked Sendable {
         forceRerun: Bool? = nil
     ) async throws -> StartWorkflowResult {
         let encoded = try Self.encodeInputObject(input)
-        let options = StartWorkflowOptions(
+        // Straight to the body composer, not through `StartWorkflowOptions`
+        // (#2367). Routing via the options struct would have raised this
+        // `meta` into `[String: JSONValue]` and back, rounding an `Int64` past
+        // 2^53 — a silent change on a signature that did not change. The
+        // declared `[String: Any]` and the wire bytes agree again this way, and
+        // the input graph is no longer converted into a value nothing reads.
+        return try await startRequest(
             workflowKey: workflowKey,
             input: encoded,
             runKey: runKey,
             contextDocId: contextDocId,
             meta: meta,
             forceRerun: forceRerun
-        )
-        return try await start(
-            workflowKey: workflowKey,
-            input: encoded,
-            options: options
         )
     }
 
@@ -250,7 +337,34 @@ public final class WorkflowsAPI: @unchecked Sendable {
             status: untyped.status,
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
-            run: untyped.run
+            run: untyped.run,
+            // #2636 — same reason as the typed run-sync result above.
+            skipReason: untyped.skipReason
+        )
+    }
+
+    /// Terminate a run with a typed `output` bound to `Output`. Mirrors the JS
+    /// `terminate<O>` — a terminated run can carry partial output, so the
+    /// generated per-workflow factory binds `<Key>Output` here exactly as it
+    /// does over `getStatus<O>` (#2806). Delegates to the untyped `terminate`
+    /// above, so the request is byte-identical; only the `output` blob is
+    /// decoded. An absent output decodes to `nil`.
+    public func terminate<Output: Decodable & Sendable>(
+        workflowKey: String,
+        runKey: String,
+        contextDocId: String? = nil
+    ) async throws -> WorkflowStatus<Output> {
+        let untyped = try await terminate(
+            workflowKey: workflowKey,
+            runKey: runKey,
+            contextDocId: contextDocId
+        )
+        return WorkflowStatus(
+            status: untyped.status,
+            output: try Self.decodeTypedOutput(untyped.output),
+            error: untyped.error,
+            run: untyped.run,
+            skipReason: untyped.skipReason
         )
     }
 
@@ -291,15 +405,12 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String,
         contextDocId: String? = nil
     ) async throws -> WorkflowStatusResult {
-        let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
-        let encodedRunKey = runKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runKey
-        var path = "/workflows/\(encodedKey)/instances/\(encodedRunKey)/terminate"
-        if let contextDocId,
-           let encoded = contextDocId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            path += "?contextDocId=\(encoded)"
-        }
-        let result = try await makeRequest("POST", path, nil)
-        return try JSONCoding.decode(WorkflowStatusResult.self, from: result)
+        let encodedKey = URLEncoding.encodeComponent(workflowKey)
+        let encodedRunKey = URLEncoding.encodeComponent(runKey)
+        var query = URLQuery()
+        query.appendIfPresent("contextDocId", contextDocId)
+        let path = "/workflows/\(encodedKey)/instances/\(encodedRunKey)/terminate\(query.queryString)"
+        return try await transport.request(method: .post, path: path)
     }
 
     /// Options-struct overload of `terminate`, mirroring js-bao's single
@@ -323,9 +434,8 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// throws on a response shape mismatch instead of coercing to `[:]`
     /// (#991).
     public func listStepRuns(runId: String) async throws -> ListWorkflowStepRunsResult {
-        let encoded = runId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runId
-        let result = try await makeRequest("GET", "/workflows/runs/\(encoded)/steps", nil)
-        return try JSONCoding.decode(ListWorkflowStepRunsResult.self, from: result)
+        let encoded = URLEncoding.encodeComponent(runId)
+        return try await transport.request(method: .get, path: "/workflows/runs/\(encoded)/steps")
     }
 
     /// Lists workflow runs with optional filtering and pagination.
@@ -335,29 +445,18 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// existing filters (`workflowKey`, `status`, `limit`, `cursor`,
     /// `forward`, `contextDocId`) are preserved.
     public func listRuns(options: ListWorkflowRunsOptions? = nil) async throws -> ListWorkflowRunsResult {
-        var queryParts: [String] = []
-        if let workflowKey = options?.workflowKey {
-            queryParts.append("workflowKey=\(workflowKey.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? workflowKey)")
-        }
-        if let status = options?.status {
-            queryParts.append("status=\(status.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? status)")
-        }
+        var query = URLQuery()
+        query.appendIfPresent("workflowKey", options?.workflowKey)
+        query.appendIfPresent("status", options?.status)
         if let limit = options?.limit {
-            queryParts.append("limit=\(limit)")
+            query.append("limit", limit)
         }
-        if let cursor = options?.cursor {
-            queryParts.append("cursor=\(cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cursor)")
-        }
+        query.appendIfPresent("cursor", options?.cursor)
         if let forward = options?.forward {
-            queryParts.append("forward=\(forward ? "true" : "false")")
+            query.append("forward", forward ? "true" : "false")
         }
-        if let contextDocId = options?.contextDocId,
-           let encoded = contextDocId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            queryParts.append("contextDocId=\(encoded)")
-        }
-        let query = queryParts.isEmpty ? "" : "?\(queryParts.joined(separator: "&"))"
-        let result = try await makeRequest("GET", "/workflows/runs\(query)", nil)
-        return try JSONCoding.decode(ListWorkflowRunsResult.self, from: result)
+        query.appendIfPresent("contextDocId", options?.contextDocId)
+        return try await transport.request(method: .get, path: "/workflows/runs\(query.queryString)")
     }
 
     // MARK: - Apply Flow
@@ -376,16 +475,14 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String,
         contextDocId: String? = nil
     ) async throws -> ClaimApplyResult {
-        let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
-        let encodedRunKey = runKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runKey
-        var payload: [String: Any] = ["connectionId": getConnectionId()]
-        if let contextDocId = contextDocId { payload["contextDocId"] = contextDocId }
-        let result = try await makeRequest(
-            "POST",
-            "/workflows/\(encodedKey)/instances/\(encodedRunKey)/claim-apply",
-            payload
+        let encodedKey = URLEncoding.encodeComponent(workflowKey)
+        let encodedRunKey = URLEncoding.encodeComponent(runKey)
+        let payload = ApplyPayload(connectionId: getConnectionId(), contextDocId: contextDocId)
+        return try await transport.request(
+            method: .post,
+            path: "/workflows/\(encodedKey)/instances/\(encodedRunKey)/claim-apply",
+            body: payload
         )
-        return try JSONCoding.decode(ClaimApplyResult.self, from: result)
     }
 
     /// Confirm a previously-claimed apply. The server transitions the run
@@ -400,16 +497,14 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String,
         contextDocId: String? = nil
     ) async throws -> ConfirmApplyResult {
-        let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
-        let encodedRunKey = runKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runKey
-        var payload: [String: Any] = ["connectionId": getConnectionId()]
-        if let contextDocId = contextDocId { payload["contextDocId"] = contextDocId }
-        let result = try await makeRequest(
-            "POST",
-            "/workflows/\(encodedKey)/instances/\(encodedRunKey)/confirm-apply",
-            payload
+        let encodedKey = URLEncoding.encodeComponent(workflowKey)
+        let encodedRunKey = URLEncoding.encodeComponent(runKey)
+        let payload = ApplyPayload(connectionId: getConnectionId(), contextDocId: contextDocId)
+        return try await transport.request(
+            method: .post,
+            path: "/workflows/\(encodedKey)/instances/\(encodedRunKey)/confirm-apply",
+            body: payload
         )
-        return try JSONCoding.decode(ConfirmApplyResult.self, from: result)
     }
 
     /// Release a previously-claimed apply, sending the run back to
@@ -423,16 +518,14 @@ public final class WorkflowsAPI: @unchecked Sendable {
         runKey: String,
         contextDocId: String? = nil
     ) async throws -> ReleaseApplyResult {
-        let encodedKey = workflowKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? workflowKey
-        let encodedRunKey = runKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? runKey
-        var payload: [String: Any] = ["connectionId": getConnectionId()]
-        if let contextDocId = contextDocId { payload["contextDocId"] = contextDocId }
-        let result = try await makeRequest(
-            "POST",
-            "/workflows/\(encodedKey)/instances/\(encodedRunKey)/release-apply",
-            payload
+        let encodedKey = URLEncoding.encodeComponent(workflowKey)
+        let encodedRunKey = URLEncoding.encodeComponent(runKey)
+        let payload = ApplyPayload(connectionId: getConnectionId(), contextDocId: contextDocId)
+        return try await transport.request(
+            method: .post,
+            path: "/workflows/\(encodedKey)/instances/\(encodedRunKey)/release-apply",
+            body: payload
         )
-        return try JSONCoding.decode(ReleaseApplyResult.self, from: result)
     }
 
     /// Fetch the list of workflow runs that are currently in
@@ -446,14 +539,13 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// mismatch in the `pendingApplies` envelope instead of silently
     /// dropping rows (#991).
     public func getPendingApplies(contextDocId: String) async throws -> [PendingApplyInfo] {
-        guard let encoded = contextDocId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
-            return []
-        }
-        let result = try await makeRequest("GET", "/workflows/pending-applies?contextDocId=\(encoded)", nil)
-        if let dict = result as? [String: Any], let items = dict["pendingApplies"] {
-            return try JSONCoding.decode([PendingApplyInfo].self, from: items)
-        }
-        return []
+        var query = URLQuery()
+        query.append("contextDocId", contextDocId)
+        let response: PendingAppliesResponse? = try await transport.requestOptional(
+            method: .get,
+            path: "/workflows/pending-applies\(query.queryString)"
+        )
+        return response?.items ?? []
     }
 
     // MARK: - High-Level Define API
@@ -472,144 +564,317 @@ public final class WorkflowsAPI: @unchecked Sendable {
         applyHandlers[workflowKey] = onApply
     }
 
-    // MARK: - Apply waiter errors
+    // MARK: - waitFor (#1443 / #1582)
 
-    /// Thrown when a workflow run reaches a terminal non-success state or
-    /// times out before output is delivered to a per-run waiter.
-    public enum WorkflowRunError: Error, LocalizedError, Sendable {
-        /// The workflow reached a terminal `failed` / `terminated` /
-        /// `error` state. `message` carries the server's `error` field
-        /// when present.
-        case terminalFailure(status: String, message: String?)
-        /// The client didn't receive output within the timeout budget.
-        case timedOut(TimeInterval)
+    /// Wait for a workflow run to reach a terminal state — robustly, even across
+    /// a WebSocket outage. Ports the JS client's `workflows.waitFor` (#1443).
+    ///
+    /// Resolves from the terminal `workflowStatus` WS frame with zero extra HTTP
+    /// when the socket is up. Because that frame is emitted once and never
+    /// replayed, `waitFor` also reconciles against the runId-keyed, non-
+    /// destructive `GET /workflows/runs/:runId/status` endpoint immediately after
+    /// subscribing (closes the started-before-subscribed race) and again on every
+    /// WS reconnect (recovers a terminal frame missed while the socket was down —
+    /// the core iOS-backgrounding fix). No interval polling.
+    ///
+    /// A failed run RESOLVES with `status == "failed"` and the error message — it
+    /// does NOT throw. Terminality comes from the server-declared status alone
+    /// (#2348): `completed`, `failed`, `terminated`, `apply_pending`, or
+    /// `apply_claimed`.
+    ///
+    /// If a reconcile lands while a run is finishing — the server reports the
+    /// execution's status until the platform has published the run's `output`,
+    /// while the run record already carries its terminal status — `waitFor`
+    /// re-checks on a one-second timer until the status endpoint agrees, so a
+    /// caller that missed the terminal frame settles in seconds rather than
+    /// waiting out `timeoutMs`.
+    ///
+    /// Throws on three conditions: the reconcile fetch 404s (unknown or
+    /// not-owned `runId` → `.notFound`), the run reports `missing` (its record
+    /// no longer resolves to an execution, so it will never reach a terminal
+    /// state → `.notFound`), or `timeoutMs` elapses (`.workflowWaitTimeout`).
+    /// Every exit path clears the timer and cancels both event subscriptions.
+    ///
+    /// - Note: reconcile deliberately uses the runId-keyed status endpoint, never
+    ///   the runKey-keyed `getStatus`. Keying on `runId` avoids the runKey
+    ///   route's history of answering 404 for a `runSync` run.
+    public func waitFor(
+        runId: String,
+        options: WaitForWorkflowOptions? = nil
+    ) async throws -> WaitForWorkflowResult {
+        guard !runId.isEmpty else {
+            throw JsBaoError(code: .invalidArgument, message: "runId is required for workflows.waitFor")
+        }
+        guard let events = self.events else {
+            throw JsBaoError(code: .unavailable, message: "workflows.waitFor requires the client event emitter")
+        }
 
-        public var errorDescription: String? {
-            switch self {
-            case .terminalFailure(let status, let msg):
-                if let msg = msg, !msg.isEmpty {
-                    return "Workflow \(status): \(msg)"
+        let defaultTimeout: TimeInterval = 15 * 60  // 15 minutes
+        let timeoutMs = (options?.timeout ?? defaultTimeout).wholeMilliseconds
+
+        // Honor a caller that was already cancelled before we set anything up —
+        // return promptly instead of subscribing and leaking listeners.
+        if Task.isCancelled {
+            throw CancellationError()
+        }
+
+        let coordinator = WaitForCoordinator()
+
+        // withTaskCancellationHandler so a cancelled awaiting Task settles the
+        // wait (throwing CancellationError) and tears down the subscriptions +
+        // timer, instead of staying suspended until a terminal frame or timeout
+        // — which never arrives when timeoutMs <= 0. The cancel handler routes
+        // through the same single-settle `coordinator.settle(...)` path as every
+        // other exit, so the continuation can never be resumed twice.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<WaitForWorkflowResult, Error>) in
+                // Settle exactly once: whichever of {terminal frame, reconcile,
+                // timeout, cancellation} arrives first claims the resume, cancels
+                // the timer, and removes both subscriptions.
+                func finish(_ result: Result<WaitForWorkflowResult, Error>) {
+                    coordinator.settle(result)
                 }
-                return "Workflow \(status)"
-            case .timedOut(let seconds):
-                return "Workflow did not complete within \(Int(seconds))s"
+
+                func reconcile() {
+                    guard coordinator.beginReconcile() else { return }
+                    Task { [weak self] in
+                        guard let self = self else {
+                            _ = coordinator.endReconcile()
+                            return
+                        }
+                        // Coalescing loop: if a reconnect requested another
+                        // reconcile while this fetch was in flight,
+                        // `endReconcile()` returns true and we run exactly one
+                        // more fetch (multiple requests collapse into a single
+                        // pending re-run). Once the wait settles, `endReconcile()`
+                        // returns false and the loop stops — no unbounded stacking
+                        // of fetches, no fetch after settle.
+                        repeat {
+                            do {
+                                if let terminal = try await self.reconcileTerminal(
+                                    runId: runId,
+                                    isSettled: { coordinator.isSettled }
+                                ) {
+                                    finish(.success(terminal))
+                                }
+                            } catch {
+                                // A 404 means the run is unknown or not readable by
+                                // this caller — fail immediately. Other
+                                // (transient/network) errors are swallowed; the next
+                                // frame, reconnect, or timeout still covers the wait.
+                                if Self.isNotFound(error) {
+                                    finish(.failure(JsBaoError(
+                                        code: .notFound,
+                                        message: "Workflow run \(runId) not found"
+                                    )))
+                                }
+                            }
+                        } while coordinator.endReconcile()
+                    }
+                }
+
+                let workflowSub = events.subscribe(WorkflowStatusEvent.self) { event in
+                    guard event.runId == runId else { return }
+                    // The workflowStatus frame is only emitted on a terminal
+                    // transition and carries the terminal payload directly —
+                    // resolve from it with zero extra HTTP. Apply-required
+                    // workflows are the one wrinkle: the server broadcasts status
+                    // "completed" with needsApply true while the run row is
+                    // apply_pending; map the frame to apply_pending so the event
+                    // path agrees with the reconcile path. This mapping stays
+                    // after #2348 — the frame is the one surface where the apply
+                    // state is only recoverable from `needsApply` (the HTTP
+                    // status endpoints report `apply_pending` directly).
+                    let status = event.needsApply ? "apply_pending" : event.status
+                    finish(.success(WaitForWorkflowResult(
+                        status: status,
+                        output: Self.jsonValueFromAny(event.output),
+                        error: event.error,
+                        // #2636 — an elided run's frame carries the reason
+                        // instead of an error, so the event path reports the
+                        // same shape the reconcile path does.
+                        skipReason: event.skipReason
+                    )))
+                }
+
+                let statusSub = events.subscribe(StatusChangedEvent.self) { event in
+                    // On WS reconnect, re-run the single reconcile fetch to recover
+                    // a terminal frame missed during the outage. No interval timer.
+                    if event.status == .connected {
+                        reconcile()
+                    }
+                }
+
+                var timeoutTask: Task<Void, Never>? = nil
+                // 0 (or any non-positive value) disables the timeout — the
+                // listeners live until the run terminates (or the caller cancels).
+                if timeoutMs > 0 {
+                    timeoutTask = Task {
+                        try? await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+                        finish(.failure(JsBaoError(
+                            code: .workflowWaitTimeout,
+                            message: "workflows.waitFor timed out after \(timeoutMs)ms waiting for run \(runId)"
+                        )))
+                    }
+                }
+
+                coordinator.install(statusSub: statusSub, workflowSub: workflowSub, timeoutTask: timeoutTask)
+                // Hand the continuation to the coordinator last. If a cancellation
+                // already settled the wait (its handler can fire before or during
+                // this closure), the continuation resumes immediately with the
+                // stored result rather than suspending forever.
+                coordinator.setContinuation(continuation)
+
+                // Reconcile once at start to close the started-before-subscribed
+                // race — the terminal frame may have fired before these listeners
+                // attached and is never replayed.
+                reconcile()
             }
+        } onCancel: {
+            // Cancellation settles the wait once and tears everything down via the
+            // same claim path — safe even if it races the setup above.
+            coordinator.settle(.failure(CancellationError()))
         }
     }
 
-    /// Check the server's current state for a pending waiter and take
-    /// whichever branch matches (trigger apply flow, resolve with
-    /// output, throw, or wait). Used by `recheckPendingRuns`
-    /// (reconnect-driven re-check).
-    private func reconcileRun(
-        workflowKey: String,
-        runKey: String,
-        contextDocId: String?
-    ) async -> RunReconcileDisposition {
-        do {
-            let statusResult = try await getStatus(
-                workflowKey: workflowKey,
-                runKey: runKey,
-                contextDocId: contextDocId
+    /// Typed generic overload of `waitFor` — decodes the run's opaque `output`
+    /// blob into `Output`. Mirrors the `getStatus<Output>` / `runSync<Output>`
+    /// overloads. `output` is `nil` when absent or when `status != "completed"`.
+    public func waitFor<Output: Decodable & Sendable>(
+        runId: String,
+        as outputType: Output.Type,
+        options: WaitForWorkflowOptions? = nil
+    ) async throws -> WaitForResult<Output> {
+        let base = try await waitFor(runId: runId, options: options)
+        return WaitForResult(
+            status: base.status,
+            output: try Self.decodeTypedOutput(base.output),
+            error: base.error,
+            skipReason: base.skipReason
+        )
+    }
+
+    /// Fetch a run's status keyed by `runId` via the #1443 endpoint
+    /// (`GET /workflows/runs/:runId/status`). Like `getStatus`, the server's
+    /// canonical `status` is returned verbatim (#2348). A 404 surfaces as an
+    /// `HttpError` (status 404) that `waitFor` maps to `.notFound`.
+    internal func getStatusByRunId(runId: String) async throws -> WorkflowStatusResult {
+        let encoded = URLEncoding.encodeComponent(runId)
+        return try await transport.request(
+            method: .get,
+            path: "/workflows/runs/\(encoded)/status"
+        )
+    }
+
+    /// How long the finalization re-check waits between fetches, and how many
+    /// times it retries before settling from the run record (#2348).
+    static let finalizeRecheckIntervalMs: UInt64 = 1000
+    static let finalizeMaxRechecks = 30
+
+    /// One reconcile fetch, plus a bounded re-check through the server's
+    /// finalization window (#2348).
+    ///
+    /// A workflow writes its own run row terminal from inside the execution, and
+    /// the platform publishes the run's `output` only once that execution
+    /// returns; in between, the server deliberately reports the EXECUTION's
+    /// in-flight status so a status read never carries `completed` with a `nil`
+    /// output. The terminal `workflowStatus` frame fires at the start of that
+    /// window and is never replayed, so a caller that missed it and reconciles
+    /// inside the window has nothing left to wake it and would wait out the
+    /// whole timeout. When the response's own run record says the run has ended,
+    /// re-check on a short timer instead; if the execution still has not
+    /// published after the window, settle from the record rather than hang.
+    ///
+    /// Throws `.notFound` for a `missing` run: its record no longer resolves to
+    /// an execution, so it will never reach a terminal state (the CLI stops on
+    /// `missing` too, and this path used to be a 404).
+    private func reconcileTerminal(
+        runId: String,
+        isSettled: @escaping @Sendable () -> Bool
+    ) async throws -> WaitForWorkflowResult? {
+        var res = try await getStatusByRunId(runId: runId)
+        if let terminal = Self.terminalFromReconcile(res) { return terminal }
+        if res.status == "missing" {
+            throw JsBaoError(
+                code: .notFound,
+                message: "Workflow run \(runId) is no longer resolvable (status: missing)"
             )
-            let runRecord = statusResult.run
-            let runStatus = (runRecord?.status)?.lowercased() ?? ""
-            let canonicalWorkflowKey = runRecord?.workflowKey ?? workflowKey
-
-            switch runStatus {
-            case "apply_pending", "apply_claimed":
-                let event = WorkflowStatusEvent(
-                    workflowKey: canonicalWorkflowKey,
-                    workflowId: "",
-                    runKey: runKey,
-                    runId: runRecord?.runId ?? "",
-                    status: "completed",
-                    contextDocId: contextDocId,
-                    needsApply: true,
-                    meta: Self.metaToAny(runRecord?.meta),
-                    startedByUserId: runRecord?.startedByUserId
-                )
-                await handleApplyEvent(event)
-                return .resolvedOrInFlight
-            case "completed":
-                let ctx = WorkflowApplyContext(
-                    workflowKey: workflowKey,
-                    runKey: runKey,
-                    runId: runRecord?.runId ?? "",
-                    contextDocId: contextDocId,
-                    output: Self.outputToAny(statusResult.output),
-                    startedByUserId: runRecord?.startedByUserId,
-                    meta: Self.metaToAny(runRecord?.meta)
-                )
-                consumePerRunWaiter(runKey: runKey)?
-                    .continuation.resume(returning: ctx)
-                return .resolvedOrInFlight
-            case "failed", "terminated", "error":
-                consumePerRunWaiter(runKey: runKey)?
-                    .continuation.resume(throwing: WorkflowRunError.terminalFailure(
-                        status: runStatus, message: statusResult.error
-                    ))
-                return .resolvedOrInFlight
-            case "":
-                consumePerRunWaiter(runKey: runKey)?
-                    .continuation.resume(throwing: WorkflowRunError.terminalFailure(
-                        status: "not_found",
-                        message: "Workflow run \(runKey) not found"
-                    ))
-                return .resolvedOrInFlight
-            default:
-                // Still running — leave the waiter registered;
-                // `workflowStatus` will deliver when it completes.
-                return .waitingForFutureEvents
-            }
-        } catch let error as HttpError where error.status == 404 {
-            consumePerRunWaiter(runKey: runKey)?
-                .continuation.resume(throwing: WorkflowRunError.terminalFailure(
-                    status: "not_found",
-                    message: error.body ?? error.message
-                ))
-            return .resolvedOrInFlight
-        } catch {
-            consumePerRunWaiter(runKey: runKey)?
-                .continuation.resume(throwing: error)
-            return .resolvedOrInFlight
         }
+
+        var attempts = 0
+        while let stored = Self.finalizingTerminalStatus(res), !isSettled() {
+            if attempts >= Self.finalizeMaxRechecks {
+                return WaitForWorkflowResult(
+                    status: stored,
+                    output: res.output,
+                    error: res.error,
+                    skipReason: res.skipReason
+                )
+            }
+            attempts += 1
+            try? await Task.sleep(nanoseconds: Self.finalizeRecheckIntervalMs * 1_000_000)
+            if isSettled() { return nil }
+            // A transient failure inside the window must not abandon the
+            // re-check. The caller swallows anything that isn't `.notFound` and
+            // then leaves the `repeat` loop, and inside the window nothing else
+            // would wake the wait — the terminal frame fired at the start of
+            // the window and is never replayed. So keep re-checking here
+            // (still bounded by `finalizeMaxRechecks`) against the last good
+            // response, and propagate only `.notFound`.
+            do {
+                res = try await getStatusByRunId(runId: runId)
+            } catch {
+                if Self.isNotFound(error) { throw error }
+                continue
+            }
+            if let terminal = Self.terminalFromReconcile(res) { return terminal }
+        }
+        return nil
     }
 
-    /// Atomically remove and return the per-run waiter for a runKey.
-    /// Returns nil if no waiter is registered (already resolved, timed
-    /// out, cancelled, or a stale runKey from a prior session).
-    fileprivate func consumePerRunWaiter(runKey: String) -> PerRunWaiter? {
-        handlersLock.lock()
-        defer { handlersLock.unlock() }
-        return perRunWaiters.removeValue(forKey: runKey)
+    /// The run record's terminal status when the server reports a NON-terminal
+    /// status for a run that has already ended — the finalization window. `nil`
+    /// when the report and the record agree.
+    static func finalizingTerminalStatus(_ res: WorkflowStatusResult) -> String? {
+        guard !WaitForWorkflowResult.terminalStatuses.contains(res.status) else { return nil }
+        guard let stored = res.run?.status else { return nil }
+        return WaitForWorkflowResult.terminalStatuses.contains(stored) ? stored : nil
     }
 
-    /// Peek at a registered waiter without consuming it.
-    fileprivate func peekPerRunWaiter(runKey: String) -> PerRunWaiter? {
-        handlersLock.lock()
-        defer { handlersLock.unlock() }
-        return perRunWaiters[runKey]
+    /// Map a reconcile response to a terminal `waitFor` result, or `nil` if the
+    /// run is not yet terminal.
+    ///
+    /// #2348: terminality is decided by the server-declared status alone — one
+    /// of `completed`, `failed`, `terminated`, `apply_pending`, `apply_claimed`,
+    /// or `skipped` (#2636 — a run elided by its declarative lock).
+    /// The client no longer infers a terminal state from `run.endedAt` or from
+    /// the presence of `run.errorMessage`, and no longer maps raw Cloudflare
+    /// spellings: the server reconciles the run before responding, so its
+    /// `status` is authoritative.
+    static func terminalFromReconcile(_ res: WorkflowStatusResult) -> WaitForWorkflowResult? {
+        guard WaitForWorkflowResult.terminalStatuses.contains(res.status) else { return nil }
+        return WaitForWorkflowResult(
+            status: res.status,
+            output: res.output,
+            error: res.error,
+            skipReason: res.skipReason
+        )
     }
 
-    /// Snapshot the currently-registered waiters for iteration by
-    /// `recheckPendingRuns`. Dictionary values are value types so this
-    /// is safe to release the lock after.
-    fileprivate func snapshotPendingWaiters() -> [(runKey: String, waiter: PerRunWaiter)] {
-        handlersLock.lock()
-        defer { handlersLock.unlock() }
-        return perRunWaiters.map { ($0.key, $0.value) }
+    /// Recognise a "run not found" (HTTP 404) from either error shape the status
+    /// endpoint can throw: an `HttpError` with `status == 404`, or a `JsBaoError`
+    /// with code `.notFound`.
+    static func isNotFound(_ error: Error) -> Bool {
+        if let http = error as? HttpError, http.status == 404 { return true }
+        if let jsBao = error as? JsBaoError, jsBao.code == .notFound { return true }
+        return false
     }
 
-    /// Bump the claim-retry counter for a runKey. Returns the new count,
-    /// or nil if the waiter is no longer registered.
-    fileprivate func incrementClaimRetry(runKey: String) -> Int? {
-        handlersLock.lock()
-        defer { handlersLock.unlock() }
-        guard var waiter = perRunWaiters[runKey] else { return nil }
-        waiter.claimRetryCount += 1
-        perRunWaiters[runKey] = waiter
-        return waiter.claimRetryCount
+    /// Convert a raw WS-frame `Any?` payload into a `JSONValue?`. `nil`/`NSNull`
+    /// map to `nil`.
+    static func jsonValueFromAny(_ value: Any?) -> JSONValue? {
+        guard let value, !(value is NSNull) else { return nil }
+        return try? JSONCoding.decode(JSONValue.self, from: value)
     }
 
     /// Bridge a typed `JSONValue` output back into the `Any?` the
@@ -621,49 +886,33 @@ public final class WorkflowsAPI: @unchecked Sendable {
         return try? JSONCoding.jsonObject(from: value)
     }
 
-    /// Bridge a typed `JSONValue` meta blob into the `[String: Any]?` the
-    /// untouchable event/context structs carry. Non-object metas map to
-    /// `nil` (the wire shape is always an object when present).
-    private static func metaToAny(_ value: JSONValue?) -> [String: Any]? {
-        guard let value, !value.isNull else { return nil }
-        return (try? JSONCoding.jsonObject(from: value)) as? [String: Any]
+    /// Narrow a typed `JSONValue` meta blob into the `[String: JSONValue]?`
+    /// the event/context structs carry (#2367 — both sides are `JSONValue`
+    /// now, so this is a plain `objectValue` read, not a conversion).
+    /// Non-object metas map to `nil` (the wire shape is always an object
+    /// when present).
+    private static func metaToObject(_ value: JSONValue?) -> [String: JSONValue]? {
+        value?.objectValue
     }
 
-    /// Internal — invoked by `JsBaoClient` when a `workflowStatus` WS
-    /// message arrives with `needsApply = true`. Looks up a registered
-    /// handler (per-runKey waiter first, then per-workflowKey handler),
-    /// runs the claim → handler → confirm sequence, and releases the
-    /// claim on any failure.
+    /// Internal — invoked by `JsBaoClient` when a `workflowStatus` WS message
+    /// arrives with `needsApply = true`. Looks up the per-workflowKey handler
+    /// registered via `define(...)`, runs the claim → handler → confirm
+    /// sequence, and releases the claim on any failure. No-op when no handler is
+    /// registered for the key (the "any one client wins" model — another client
+    /// with a handler applies it).
     ///
-    /// On claim refused (stale lease held by a dead connection),
-    /// schedules a retry ~35s later (server's lease TTL is 30s). Retries
-    /// up to `maxClaimRetries` times, then silently drops the attempt —
-    /// the per-run waiter's timeout will eventually fire.
+    /// (#1975: the per-run waiter branch is gone — completion waiting is now
+    /// handled by the self-contained `waitFor`, which resolves at `apply_pending`
+    /// without claiming/applying. `define()` and this apply flow are unchanged.)
     internal func handleApplyEvent(_ event: WorkflowStatusEvent) async {
-        // Peek (don't consume yet) — if we consumed before claim, a
-        // refused claim would permanently orphan the waiter.
-        let hasPerRunWaiter = (peekPerRunWaiter(runKey: event.runKey) != nil)
-        let perKeyHandler: WorkflowApplyHandler? = {
+        let handler: WorkflowApplyHandler? = {
             handlersLock.lock()
             defer { handlersLock.unlock() }
             return applyHandlers[event.workflowKey]
         }()
 
-        guard hasPerRunWaiter || perKeyHandler != nil else { return }
-
-        // Shim — consumes the per-run waiter ONLY at the moment we fire
-        // it, after claim + status have succeeded. If claim fails, the
-        // waiter stays registered (server may re-emit needsApply once
-        // the lease expires, or retry / timeout resolves it).
-        let handler: WorkflowApplyHandler = { [weak self] ctx in
-            if let waiter = self?.consumePerRunWaiter(runKey: ctx.runKey) {
-                waiter.continuation.resume(returning: ctx)
-                return
-            }
-            if let perKey = perKeyHandler {
-                try await perKey(ctx)
-            }
-        }
+        guard let handler else { return }
 
         do {
             // 1. Claim the lease.
@@ -679,12 +928,6 @@ public final class WorkflowsAPI: @unchecked Sendable {
                     "runKey": event.runKey,
                     "reason": reason
                 ])
-                // Only retry for per-run waiters — per-key-only handlers
-                // are the "any one client wins" model and don't need
-                // this machinery.
-                if hasPerRunWaiter {
-                    scheduleApplyRetry(event: event)
-                }
                 return
             }
 
@@ -696,7 +939,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
                 contextDocId: event.contextDocId
             )
             let output = Self.outputToAny(statusResult.output)
-            let metaFromRun = Self.metaToAny(statusResult.run?.meta)
+            let metaFromRun = Self.metaToObject(statusResult.run?.meta)
 
             // 3. Run the user's handler.
             try await handler(WorkflowApplyContext(
@@ -737,103 +980,164 @@ public final class WorkflowsAPI: @unchecked Sendable {
             }
         }
     }
+}
 
-    /// Background task: after the server's lease TTL (~30s) the refused
-    /// claim should become claimable. Re-invokes `handleApplyEvent` up
-    /// to `maxClaimRetries` times so a stale apply_claimed state doesn't
-    /// hang awaiters until their timeout.
-    private func scheduleApplyRetry(event: WorkflowStatusEvent) {
-        guard let retryCount = incrementClaimRetry(runKey: event.runKey) else {
-            return   // waiter gone (resolved, timed out, cancelled)
-        }
-        guard retryCount <= Self.maxClaimRetries else {
-            logger?.debug("[workflowApply] claim-retry budget exhausted", [
-                "runKey": event.runKey,
-                "attempts": retryCount
-            ])
+// MARK: - Request / response shims
+
+/// Body shared by the three apply-lease verbs (claim / confirm / release).
+private struct ApplyPayload: Encodable, Sendable {
+    let connectionId: String
+    let contextDocId: String?
+}
+
+/// The pending-applies endpoint answers with a `{ pendingApplies }` envelope.
+/// Any other shape yields an empty list (matching the previous
+/// `result as? [String: Any]` probe), while a present-but-malformed
+/// `pendingApplies` still throws rather than silently dropping rows (#991).
+private struct PendingAppliesResponse: Decodable, Sendable {
+    let items: [PendingApplyInfo]
+
+    private enum CodingKeys: String, CodingKey { case pendingApplies }
+
+    init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self),
+              container.contains(.pendingApplies) else {
+            items = []
             return
         }
-        let delayNs = UInt64(Self.claimRetryAfter * 1_000_000_000)
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: delayNs)
-            guard let self = self,
-                  self.peekPerRunWaiter(runKey: event.runKey) != nil
-            else { return }
-            self.logger?.debug("[workflowApply] retrying claim", [
-                "runKey": event.runKey,
-                "attempt": retryCount
-            ])
-            await self.handleApplyEvent(event)
+        items = try container.decode([PendingApplyInfo].self, forKey: .pendingApplies)
+    }
+}
+
+/// Thread-safe one-shot settle coordinator for `WorkflowsAPI.waitFor`. Guards
+/// the single continuation-resume against the racing settle sources (terminal
+/// frame, reconcile fetch, timeout, caller cancellation) and coalesces
+/// overlapping reconcile requests.
+private final class WaitForCoordinator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var settled = false
+    private var reconciling = false
+    /// A reconcile was requested while one was already in flight. Coalesces any
+    /// number of concurrent requests into a single queued re-run.
+    private var pendingReconcile = false
+    private var continuation: CheckedContinuation<WaitForWorkflowResult, Error>?
+    /// Set when `settle` runs before the continuation is installed (cancellation
+    /// can fire before/while the continuation closure sets up). Drained by
+    /// `setContinuation`.
+    private var pendingResult: Result<WaitForWorkflowResult, Error>?
+    private var statusSub: EventSubscription?
+    private var workflowSub: EventSubscription?
+    private var timeoutTask: Task<Void, Never>?
+
+    /// Record the subscriptions/timer so a later settle can tear them down. If
+    /// the wait already settled before install (a terminal frame delivered
+    /// during subscription, or an early cancellation), cancel them immediately
+    /// so nothing leaks.
+    func install(
+        statusSub: EventSubscription?,
+        workflowSub: EventSubscription?,
+        timeoutTask: Task<Void, Never>?
+    ) {
+        lock.lock()
+        if settled {
+            lock.unlock()
+            statusSub?.cancel()
+            workflowSub?.cancel()
+            timeoutTask?.cancel()
+            return
         }
+        self.statusSub = statusSub
+        self.workflowSub = workflowSub
+        self.timeoutTask = timeoutTask
+        lock.unlock()
     }
 
-    /// Internal — invoked by `JsBaoClient` for a `workflowStatus` WS
-    /// message whose `status` is terminal (`completed` / `failed` /
-    /// `terminated` / `error`) and whose `needsApply` is false. Resolves
-    /// any per-run waiter awaiting that `runKey`:
-    ///
-    /// - `completed` (run already applied by some client): fetch output
-    ///   via `getStatus` and resume the waiter with success. Without
-    ///   this path a waiter would hang until its timeout when another
-    ///   client on the same user account applies the run first.
-    /// - `failed` / `terminated` / `error`: resume with
-    ///   `.terminalFailure`.
-    ///
-    /// No-op if nothing is waiting for this runKey.
-    internal func handleTerminalEvent(_ event: WorkflowStatusEvent) async {
-        guard peekPerRunWaiter(runKey: event.runKey) != nil else { return }
-
-        let status = event.status.lowercased()
-        if status == "completed" {
-            do {
-                let statusResult = try await getStatus(
-                    workflowKey: event.workflowKey,
-                    runKey: event.runKey,
-                    contextDocId: event.contextDocId
-                )
-                let output = Self.outputToAny(statusResult.output)
-                let ctx = WorkflowApplyContext(
-                    workflowKey: event.workflowKey,
-                    runKey: event.runKey,
-                    runId: event.runId,
-                    contextDocId: event.contextDocId,
-                    output: output,
-                    startedByUserId: event.startedByUserId,
-                    meta: Self.metaToAny(statusResult.run?.meta) ?? event.meta
-                )
-                consumePerRunWaiter(runKey: event.runKey)?
-                    .continuation.resume(returning: ctx)
-            } catch {
-                consumePerRunWaiter(runKey: event.runKey)?
-                    .continuation.resume(throwing: error)
-            }
-        } else {
-            // failed / terminated / error
-            consumePerRunWaiter(runKey: event.runKey)?
-                .continuation.resume(throwing: WorkflowRunError.terminalFailure(
-                    status: event.status,
-                    message: event.error
-                ))
+    /// Hand the continuation to the coordinator once the closure has it. If the
+    /// wait already settled (e.g. cancellation raced the setup), resume it
+    /// immediately with the stored result rather than leaving the caller
+    /// suspended forever.
+    func setContinuation(_ c: CheckedContinuation<WaitForWorkflowResult, Error>) {
+        lock.lock()
+        if let pending = pendingResult {
+            pendingResult = nil
+            lock.unlock()
+            c.resume(with: pending)
+            return
         }
+        continuation = c
+        lock.unlock()
     }
 
-    /// Internal — re-checks every currently-registered per-run waiter
-    /// against the server's current state. Called by `JsBaoClient` after
-    /// the client reconnects: pending applies that the server tried to
-    /// deliver while we were offline (and whose `workflowStatus` events
-    /// we missed) get picked up here.
-    ///
-    /// Per-run waiters carry enough context (workflowKey, contextDocId) to
-    /// do this without the caller re-supplying anything. No-op for
-    /// `define`-style per-key handlers — those don't have a waiter.
-    internal func recheckPendingRuns() async {
-        let pending = snapshotPendingWaiters()
-        for (runKey, waiter) in pending {
-            _ = await reconcileRun(
-                workflowKey: waiter.workflowKey,
-                runKey: runKey,
-                contextDocId: waiter.contextDocId
-            )
+    /// Single settle path: claim the exclusive right to resume, tear down the
+    /// subscriptions/timer, and resume the continuation (or stash the result for
+    /// `setContinuation` if it isn't installed yet). Idempotent — a second call
+    /// is a no-op, so the continuation can never be resumed twice.
+    /// Whether the wait has already settled — read by the finalization re-check
+    /// loop so it stops fetching once someone else claimed the resume.
+    var isSettled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return settled
+    }
+
+    func settle(_ result: Result<WaitForWorkflowResult, Error>) {
+        lock.lock()
+        if settled {
+            lock.unlock()
+            return
         }
+        settled = true
+        let statusSub = self.statusSub
+        let workflowSub = self.workflowSub
+        let timeoutTask = self.timeoutTask
+        self.statusSub = nil
+        self.workflowSub = nil
+        self.timeoutTask = nil
+        let c = continuation
+        continuation = nil
+        if c == nil {
+            // Continuation not installed yet — resumed by setContinuation.
+            pendingResult = result
+        }
+        lock.unlock()
+
+        statusSub?.cancel()
+        workflowSub?.cancel()
+        timeoutTask?.cancel()
+        c?.resume(with: result)
+    }
+
+    /// Overlap guard: returns `true` if the caller may start a reconcile fetch.
+    /// If one is already in flight, records a queued request (`pendingReconcile`)
+    /// and returns `false` so the in-flight fetch runs one more time on
+    /// completion instead of dropping this request. Returns `false` if the wait
+    /// already settled.
+    func beginReconcile() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if settled { return false }
+        if reconciling {
+            pendingReconcile = true
+            return false
+        }
+        reconciling = true
+        return true
+    }
+
+    /// Called when a reconcile fetch finishes. Returns `true` if a reconcile was
+    /// queued while this one was in flight and the wait hasn't settled — the
+    /// caller should loop and run exactly one more fetch, keeping the in-flight
+    /// flag held so a concurrent `beginReconcile` can't also start one. Returns
+    /// `false` otherwise, releasing the in-flight flag.
+    func endReconcile() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if !settled && pendingReconcile {
+            pendingReconcile = false
+            // Keep `reconciling == true`: we're looping, still in flight.
+            return true
+        }
+        reconciling = false
+        return false
     }
 }

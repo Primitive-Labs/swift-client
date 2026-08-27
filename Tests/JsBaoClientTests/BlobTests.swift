@@ -119,16 +119,23 @@ final class BlobTests: XCTestCase {
     }
 
     /// The upload-queue facade is exposed on the per-document context and is
-    /// scoped to this document. With no queued uploads, `uploads()` is empty and
-    /// pause/resume are no-ops returning `false`. Synchronous, no server.
-    func testUploadQueueFacadeScoping() {
+    /// scoped to this document. With no queued uploads, `uploadsAsync()` is
+    /// empty and pause/resume are no-ops returning `false`. No server.
+    ///
+    /// On the `Async` twins since the manager became an actor (#2172) — the
+    /// synchronous spellings are `unavailable, renamed:` stubs now.
+    func testUploadQueueFacadeScoping() async {
         let blobContext = client.documents.blobs(documentId: documentId)
-        XCTAssertTrue(blobContext.uploads().isEmpty)
-        XCTAssertFalse(blobContext.pauseUpload(blobId: "missing"))
-        XCTAssertFalse(blobContext.resumeUpload(blobId: "missing"))
+        let observed1 = await blobContext.uploadsAsync().isEmpty
+        XCTAssertTrue(observed1)
+        let observed2 = await blobContext.pauseUploadAsync(blobId: "missing")
+        XCTAssertFalse(observed2)
+        let observed3 = await blobContext.resumeUploadAsync(blobId: "missing")
+        XCTAssertFalse(observed3)
         // pauseAll/resumeAll are safe to call with an empty queue.
-        blobContext.pauseAll()
-        blobContext.resumeAll()
-        XCTAssertTrue(blobContext.uploads().isEmpty)
+        await blobContext.pauseAllAsync()
+        await blobContext.resumeAllAsync()
+        let observed4 = await blobContext.uploadsAsync().isEmpty
+        XCTAssertTrue(observed4)
     }
 }

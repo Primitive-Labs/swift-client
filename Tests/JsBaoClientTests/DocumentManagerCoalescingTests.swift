@@ -89,15 +89,19 @@ final class DocumentManagerCoalescingTests: XCTestCase {
         let docId = "coalesce-\(UUID().uuidString.prefix(8))"
         let n = 50
 
-        var instances: [YDocument] = []
+        // `YDocument` is not `Sendable`, so it crosses the task-group boundary
+        // in the library's own `ConfinedYDocument` holder — the same handover
+        // `DocumentManager.pendingOpens` uses internally.
+        let instancesBox = LockedBox([YDocument]())
+        let options = localOptions()
         await assertAsyncCompletes(within: 8, "50 concurrent openDocument callers all resolve") {
-            let collected: [YDocument] = await withThrowingTaskGroup(of: YDocument.self) { group in
+            let collected: [ConfinedYDocument] = await withThrowingTaskGroup(of: ConfinedYDocument.self) { group in
                 for _ in 0..<n {
                     group.addTask {
-                        try await mgr.openDocument(documentId: docId, options: self.localOptions())
+                        ConfinedYDocument(try await mgr.openDocument(documentId: docId, options: options))
                     }
                 }
-                var docs: [YDocument] = []
+                var docs: [ConfinedYDocument] = []
                 // `try?` inside the collector: a genuine open failure surfaces
                 // below as a short `instances` count, not a swallowed hang.
                 while let next = try? await group.next() {
@@ -105,8 +109,9 @@ final class DocumentManagerCoalescingTests: XCTestCase {
                 }
                 return docs
             }
-            instances = collected
+            instancesBox.value = collected.map(\.document)
         }
+        let instances = instancesBox.value
 
         XCTAssertEqual(
             instances.count, n,

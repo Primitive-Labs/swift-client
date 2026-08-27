@@ -15,8 +15,35 @@ import Foundation
 /// ```swift
 /// let meta: JSONValue = ["color": "blue", "pinned": true, "order": 3]
 /// ```
+///
+/// ## Numeric precision — every number is a `Double`
+///
+/// There is one numeric case, `.number(Double)`, so **every** JSON number
+/// round-trips through a 64-bit float. This matches JavaScript's single
+/// `number` type, which is what the platform's servers and the JS client
+/// speak, so a value that survives the JS client survives this one.
+///
+/// The limit is the usual one: integers are exact only up to 2^53
+/// (`9_007_199_254_740_992`). An `Int64` larger than that — a raw Snowflake
+/// ID, a nanosecond timestamp, a big accounting amount in minor units —
+/// loses its low bits when it passes through a `JSONValue`, and comes back
+/// as a nearby value rather than the one that was sent. Nothing throws; the
+/// digits just change.
+///
+/// This bites on the dynamic payloads specifically: `DoDb` record fields
+/// (`[String: JSONValue]`), document `metadata`, and workflow inputs are all
+/// caller-defined, so the client cannot know a field was meant to be an
+/// exact large integer. Platform identifiers are unaffected — they are ULID
+/// **strings**, not numbers.
+///
+/// If a value needs more than 53 bits of integer precision, store it as a
+/// `String` (the same advice the JS client gives) or model that field with a
+/// typed `Codable` struct using `Int64`, which decodes straight from the
+/// wire bytes and never passes through `JSONValue`.
 public enum JSONValue: Codable, Sendable, Equatable {
     case string(String)
+    /// All JSON numbers, integral or not — see the type's "Numeric
+    /// precision" note: exact only to 2^53, like JavaScript's `number`.
     case number(Double)
     case bool(Bool)
     case object([String: JSONValue])
@@ -69,6 +96,131 @@ public enum JSONValue: Codable, Sendable, Equatable {
     /// Subscript into an object value; returns `nil` for non-objects or
     /// missing keys.
     public subscript(key: String) -> JSONValue? { objectValue?[key] }
+
+    // MARK: - Query-row accessors
+    //
+    // A query row (`[String: JSONValue]`) comes out of SQLite, where two
+    // column shapes don't line up with the strict accessors above. These two
+    // read them; generated `init?(row:)` uses both.
+
+    /// A row column read as a boolean. SQLite has no boolean type — a boolean
+    /// field is stored as INTEGER, so the row carries `.number(0)` /
+    /// `.number(1)`. A real `.bool` is accepted too; anything else is `nil`.
+    public var rowBoolValue: Bool? {
+        switch self {
+        case let .bool(b):   return b
+        case let .number(n): return n != 0
+        default:             return nil
+        }
+    }
+
+    /// A row column read as `[String]` — the shape a stringset field takes
+    /// after the engine's junction-table population pass (an `.array` of
+    /// `.string`). Non-string members are dropped; a non-array is `nil`.
+    public var stringArrayValue: [String]? {
+        guard case let .array(items) = self else { return nil }
+        return items.compactMap { $0.stringValue }
+    }
+}
+
+public extension JSONValue {
+    /// Wrap any `Encodable` value as a `JSONValue`.
+    ///
+    /// This is how a typed model becomes one leaf of a dynamic request body
+    /// (`[String: JSONValue]`) without ever materializing a
+    /// `JSONSerialization` `Any` graph.
+    init<T: Encodable>(encoding value: T) throws {
+        self = try JSONCoding.decodeData(JSONValue.self, from: JSONCoding.encodeData(value))
+    }
+
+    /// Build a `JSONValue` from a loosely-typed JSON `Any` graph — the shape
+    /// `JSONSerialization` produces, and the shape the client's remaining
+    /// `[String: Any]` public surfaces hand in.
+    ///
+    /// Containers are converted element by element rather than round-tripped
+    /// through `JSONSerialization`, which is what makes this cheap enough for a
+    /// per-event path (#1993, behavior 13). The cast order is chosen for the
+    /// same reason and is explained inline.
+    ///
+    /// - Parameter subject: names the values in the error message, so a caller
+    ///   can say "KvCache values" or "Analytics event fields".
+    init(jsonAny value: Any, subject: String = "Values") throws {
+        if let string = value as? String { self = .string(string); return }
+
+        // The native Swift number types next, matched on the value's **concrete
+        // type** rather than by a bare `as?`. The type check is what keeps this
+        // correct: `NSNumber` bridges, so a plain `value as? Bool` succeeds for
+        // the `NSNumber(value: 1)` that `JSONSerialization` produces for `1`,
+        // and the number would be read back as `true`. `type(of:)` reports
+        // `__NSCFNumber` there, so a bridged number falls through to the
+        // `NSNumber` branch below, which tells booleans apart properly.
+        //
+        // These come first because they are the overwhelming majority of leaves
+        // and a matched cast is far cheaper than bridging to `NSNumber` or
+        // reflecting — which is what makes the per-event path affordable.
+        let concreteType = type(of: value)
+        if concreteType == Bool.self, let bool = value as? Bool { self = .bool(bool); return }
+        if concreteType == Int.self, let int = value as? Int { self = .number(Double(int)); return }
+        if concreteType == Double.self, let double = value as? Double { self = .number(double); return }
+
+        if let json = value as? JSONValue { self = json; return }
+        if value is NSNull { self = .null; return }
+        if let number = value as? NSNumber {
+            // A value that came from Objective-C (or `JSONSerialization`) is an
+            // `NSNumber`, and there the boolean has to be told apart by its
+            // CoreFoundation type rather than by a cast
+            // (`NSNumber(value: 1) as? Bool` succeeds).
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { self = .bool(number.boolValue); return }
+            self = .number(number.doubleValue); return
+        }
+
+        if let dictionary = value as? [String: Any] {
+            var object: [String: JSONValue] = [:]
+            object.reserveCapacity(dictionary.count)
+            for (key, element) in dictionary {
+                object[key] = try JSONValue(jsonAny: element, subject: subject)
+            }
+            self = .object(object); return
+        }
+        if let array = value as? [Any] {
+            self = .array(try array.map { try JSONValue(jsonAny: $0, subject: subject) }); return
+        }
+
+        // A `nil` optional boxed into `Any` is not `NSNull` and is not
+        // JSON-serializable — reflect to spot it. Reflection is the most
+        // expensive check here, so it comes after everything a real value can
+        // match rather than before, as it did when this lived on `KvCache`.
+        let mirror = Mirror(reflecting: value)
+        if mirror.displayStyle == .optional, mirror.children.isEmpty { self = .null; return }
+
+        // `Date`, `Data`, `URL` and `Decimal` reach this branch: they are
+        // `Encodable`, so they lower to their encoded JSON form (a number, a
+        // base64 string, a string) and read back as that rather than as the
+        // original type. For a cached `[String: Any]` this now applies to the
+        // memory tier too, where such a value used to survive untouched.
+        if let encodable = value as? any Encodable, let json = try? JSONValue(encoding: encodable) {
+            self = json; return
+        }
+        throw JsBaoError(
+            code: .invalidArgument,
+            message: "\(subject) must be JSON-representable; \(type(of: value)) is not"
+        )
+    }
+
+    /// Lower a string-keyed `Any` graph straight to its typed row, skipping the
+    /// scalar-cast chain `init(jsonAny:)` has to try before it reaches the
+    /// dictionary branch. A caller that already knows it holds a dictionary —
+    /// every untyped public surface that feeds a typed one — should use this:
+    /// on a three-key event it saves seven failed dynamic casts, which is
+    /// measurable on the analytics hot path (#1993, behavior 13).
+    static func typedRow(from dictionary: [String: Any], subject: String = "Values") throws -> [String: JSONValue] {
+        var row: [String: JSONValue] = [:]
+        row.reserveCapacity(dictionary.count)
+        for (key, element) in dictionary {
+            row[key] = try JSONValue(jsonAny: element, subject: subject)
+        }
+        return row
+    }
 }
 
 // MARK: - Literal conformances
@@ -131,25 +283,40 @@ public enum Updatable<Wrapped: Encodable & Sendable>: Encodable, Sendable {
 
 // MARK: - JSON bridging helpers
 
-/// Bridges between the JSON `Any` graph that `makeRequest` speaks (the
-/// output of `JSONSerialization`) and the typed `Codable` request/response
-/// models. This is the seam that lets the API layer hand back real Swift
+/// Bridges between the JSON `Any` graph `JSONSerialization` produces and the
+/// typed `Codable` request/response models. This is the seam that lets the API layer hand back real Swift
 /// types instead of `[String: Any]`.
 enum JSONCoding {
     static let decoder = JSONDecoder()
     static let encoder = JSONEncoder()
 
-    /// Decode a typed value from the loosely-typed JSON object a
-    /// `makeRequest` call returns.
+    /// Decode a typed value from a loosely-typed JSON object.
     static func decode<T: Decodable>(_ type: T.Type, from any: Any) throws -> T {
         let data = try JSONSerialization.data(withJSONObject: any, options: [.fragmentsAllowed])
         return try decoder.decode(T.self, from: data)
     }
 
-    /// Encode a typed request body back into the JSON `Any` graph
-    /// `makeRequest` expects as its body argument.
+    /// Encode a typed request body back into a JSON `Any` graph.
     static func jsonObject<T: Encodable>(from value: T) throws -> Any {
         let data = try encoder.encode(value)
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    }
+
+    // MARK: - Byte-level coding (the typed `Transport` path)
+
+    /// Encode a typed request body straight to the wire bytes — no
+    /// intermediate `JSONSerialization` `Any` graph.
+    static func encodeData<T: Encodable>(_ value: T) throws -> Data {
+        try encoder.encode(value)
+    }
+
+    /// Decode a typed value straight from the raw response bytes — no
+    /// intermediate `JSONSerialization` `Any` graph.
+    ///
+    /// Keeping this next to `encoder`/`decoder` means encoding policy (key
+    /// strategy, fragment handling) lives in exactly one place rather than
+    /// being split between `JSONCoding` and the `Transport` extension.
+    static func decodeData<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        try decoder.decode(T.self, from: data)
     }
 }

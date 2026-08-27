@@ -18,7 +18,7 @@ import Foundation
 ///    row was seen and dropped). It is NOT "a prevCursor is present":
 ///    backward pages report `hasMore` for earlier rows the same way
 ///    forward pages report it for later rows.
-public struct PagedQueryResult<Row>: Sendable where Row: Sendable {
+public struct PagedQueryResult<Row> {
     public let data: [Row]
     public let nextCursor: String?
     public let prevCursor: String?
@@ -36,3 +36,16 @@ public struct PagedQueryResult<Row>: Sendable where Row: Sendable {
         self.hasMore = hasMore
     }
 }
+
+/// `Sendable` **conditionally**, not as a declaration requirement.
+///
+/// The requirement used to sit on the type declaration
+/// (`struct PagedQueryResult<Row>: Sendable where Row: Sendable`), which made
+/// every `PagedQueryResult<Row>` a hard error for any non-`Sendable` `Row`
+/// even when the page never crossed an isolation boundary. As a conditional
+/// conformance the container tracks the row instead of constraining it: a page
+/// of `Sendable` rows (`PrimitiveRow`, `PrimitiveRecord`, a generated model
+/// struct) is `Sendable`; a page of some non-`Sendable` row type still
+/// compiles and simply can't be sent — which is the honest answer rather than
+/// a compile error at the declaration. (#1992, Phase C.)
+extension PagedQueryResult: Sendable where Row: Sendable {}

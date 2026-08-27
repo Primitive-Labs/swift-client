@@ -77,15 +77,13 @@ final class CrossDocIncludeTests: XCTestCase {
         )
         XCTAssertEqual(rows.count, 2)
 
-        let aliceAuthor = ((rows[0]["_related"] as? [String: Any])?["author"]
-                           as? [String: Any])
-        XCTAssertEqual(aliceAuthor?["id"] as? String, "u1")
-        XCTAssertEqual(aliceAuthor?["name"] as? String, "Alice")
+        let aliceAuthor = rows[0]["_related"]?.objectValue?["author"]?.objectValue
+        XCTAssertEqual(aliceAuthor?["id"]?.stringValue, "u1")
+        XCTAssertEqual(aliceAuthor?["name"]?.stringValue, "Alice")
 
-        let bobAuthor = ((rows[1]["_related"] as? [String: Any])?["author"]
-                         as? [String: Any])
-        XCTAssertEqual(bobAuthor?["id"] as? String, "u2")
-        XCTAssertEqual(bobAuthor?["name"] as? String, "Bob",
+        let bobAuthor = (rows[1]["_related"]?.objectValue?["author"]?.objectValue)
+        XCTAssertEqual(bobAuthor?["id"]?.stringValue, "u2")
+        XCTAssertEqual(bobAuthor?["name"]?.stringValue, "Bob",
                        "Author record lives in a different doc — must still resolve")
     }
 
@@ -116,8 +114,8 @@ final class CrossDocIncludeTests: XCTestCase {
                     sourceField: "userId", resultKey: "author")
         ])
         let names = rows.compactMap {
-            (($0["_related"] as? [String: Any])?["author"] as? [String: Any])?["name"]
-                as? String
+            $0["_related"]?.objectValue?["author"]?.objectValue?["name"]?
+                .stringValue
         }
         XCTAssertEqual(names, ["Alice", "Bob"])
     }
@@ -151,17 +149,15 @@ final class CrossDocIncludeTests: XCTestCase {
         ])
         XCTAssertEqual(rows.count, 2)
 
-        let alicePosts = (rows[0]["_related"] as? [String: Any])?["posts"]
-                         as? [[String: Any]] ?? []
+        let alicePosts = rows[0]["_related"]?.objectValue?["posts"]?.rowsValue ?? []
         XCTAssertEqual(alicePosts.count, 2)
         XCTAssertEqual(
-            Set(alicePosts.compactMap { $0["id"] as? String }),
+            Set(alicePosts.compactMap { $0["id"]?.stringValue }),
             ["p1", "p2"]
         )
 
-        let bobPosts = (rows[1]["_related"] as? [String: Any])?["posts"]
-                       as? [[String: Any]] ?? []
-        XCTAssertEqual(bobPosts.map { $0["id"] as? String }, ["p3"])
+        let bobPosts = rows[1]["_related"]?.objectValue?["posts"]?.rowsValue ?? []
+        XCTAssertEqual(bobPosts.map { $0["id"]?.stringValue }, ["p3"])
     }
 
     /// `refersToMany` (stringset of FKs): a post's `tagIds` stringset
@@ -191,10 +187,9 @@ final class CrossDocIncludeTests: XCTestCase {
                         sourceField: "tagIds", resultKey: "tags")
             ]
         )
-        let tagRows = (rows[0]["_related"] as? [String: Any])?["tags"]
-                      as? [[String: Any]] ?? []
+        let tagRows = rows[0]["_related"]?.objectValue?["tags"]?.rowsValue ?? []
         XCTAssertEqual(
-            Set(tagRows.compactMap { $0["id"] as? String }),
+            Set(tagRows.compactMap { $0["id"]?.stringValue }),
             ["t1", "t2"],
             "Both tags resolved even though they live in separate docs"
         )

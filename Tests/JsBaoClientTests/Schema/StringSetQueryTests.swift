@@ -70,14 +70,14 @@ final class StringSetQueryTests: XCTestCase {
     func testContainsFindsAllRecordsHoldingTheMember() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$contains": "red"]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["p1", "p2"])
     }
 
     func testContainsWithDifferentMember() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$contains": "blue"]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["p2", "p3"])
     }
 
@@ -93,12 +93,12 @@ final class StringSetQueryTests: XCTestCase {
         let model = try seeded()
 
         let forRed = Set(try model.query(["tags": ["$contains": "red"]])
-            .compactMap { $0["id"] as? String })
+            .compactMap { $0["id"]?.stringValue })
         XCTAssertFalse(forRed.contains("p4"),
                        "Must not match 'red' as substring of 'predicament'")
 
         let forEd = Set(try model.query(["tags": ["$contains": "ed"]])
-            .compactMap { $0["id"] as? String })
+            .compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(
             forEd, ["p4"],
             "Only p4 has 'ed' as a discrete member; p1 has 'red' which contains 'ed' but that's not a membership match"
@@ -133,12 +133,12 @@ final class StringSetQueryTests: XCTestCase {
 
         let helloRows = try model.query(["tags": ["$contains": "hello, world"]])
         XCTAssertEqual(
-            helloRows.compactMap { $0["id"] as? String }, ["p_weird"],
+            helloRows.compactMap { $0["id"]?.stringValue }, ["p_weird"],
             "Member with a comma + space round-trips cleanly"
         )
         let appleRows = try model.query(["tags": ["$contains": "apple,pie"]])
         XCTAssertEqual(
-            appleRows.compactMap { $0["id"] as? String }, ["p_weird"],
+            appleRows.compactMap { $0["id"]?.stringValue }, ["p_weird"],
             "Member with a bare comma round-trips cleanly"
         )
     }
@@ -149,7 +149,7 @@ final class StringSetQueryTests: XCTestCase {
     func testQueryRowsReturnStringsetAsArray() throws {
         let model = try seeded()
         let rows = try model.query(["id": "p2"])
-        let tags = rows.first?["tags"] as? [String]
+        let tags = rows.first?["tags"]?.stringArrayValue
         XCTAssertNotNil(tags, "Row must carry stringset as [String]")
         XCTAssertEqual(Set(tags ?? []), ["red", "blue"])
     }
@@ -159,7 +159,7 @@ final class StringSetQueryTests: XCTestCase {
     func testContainsOnEmptyStringsetDoesNotMatch() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$contains": "anything"]])
-        let ids = rows.compactMap { $0["id"] as? String }
+        let ids = rows.compactMap { $0["id"]?.stringValue }
         XCTAssertFalse(ids.contains("p5"),
                        "An empty stringset should never match $contains")
     }
@@ -167,7 +167,7 @@ final class StringSetQueryTests: XCTestCase {
     func testContainsWhenFieldMissingDoesNotMatch() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$contains": "red"]])
-        let ids = rows.compactMap { $0["id"] as? String }
+        let ids = rows.compactMap { $0["id"]?.stringValue }
         XCTAssertFalse(ids.contains("p6"),
                        "A record that never set the stringset field should not match")
     }
@@ -194,7 +194,7 @@ final class StringSetQueryTests: XCTestCase {
 
         let rows = try multi.query(["tags": ["$contains": "shared"]])
         XCTAssertEqual(
-            Set(rows.compactMap { $0["id"] as? String }),
+            Set(rows.compactMap { $0["id"]?.stringValue }),
             ["a1", "b1"]
         )
     }

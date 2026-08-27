@@ -168,6 +168,52 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
     }
 }
 
+// MARK: YDocument confinement
+
+/// The one holder that carries a live `YDocument` across an isolation
+/// boundary, and the one place the safety argument for doing so is written
+/// down (#1992, Phase C).
+///
+/// `YDocument` (from the `YSwift` fork) is a reference type wrapping yrs FFI
+/// state and is not `Sendable`. Rather than let each type that needs to hand a
+/// document to another isolation domain grow its own `@unchecked Sendable`
+/// conformance — which is how two holders with two different (and
+/// unverifiable) arguments appear — every such type wraps the document in this
+/// value and becomes plainly `Sendable` itself. `OpenDocumentResult` below is
+/// the first adopter; `DocumentManager`'s document handoffs are the next
+/// (#1993, Phase D).
+///
+/// ## `@unchecked Sendable` — safety argument
+///
+/// - `document` is a `let`; the holder itself has no mutable state, so
+///   *transferring* it is a copy of one reference and nothing else.
+/// - The document it points at is **lock-confined, not isolation-confined**:
+///   every raw-FFI mutation and every read on `YDocument` runs inside
+///   `withExclusiveAccess` / `transact` / `transactSync`, all of which
+///   serialize on the document's single `ffiLock`
+///   (`yswift-fork/Sources/YSwift/YDocument.swift:53,61`). That lock is an
+///   `NSRecursiveLock` **by design** — the observer path re-enters it while a
+///   transaction on the same thread is open — so the guarantee is mutual
+///   exclusion between threads, not non-reentrancy on one thread.
+/// - So two isolation domains holding the same document is safe in exactly the
+///   way two threads holding it is safe: their operations interleave at
+///   transaction granularity under `ffiLock`. What it does NOT give you is
+///   ordering across the sync and async transaction paths, which serialize on
+///   separate queues — never split one logical batch across `transact` and
+///   `transactSync` (the same invariant `DynamicModel` records).
+///
+/// Unwrapping is deliberately explicit (`.document`) so a reviewer can grep
+/// for the points where a confined document re-enters ordinary code.
+public struct ConfinedYDocument: @unchecked Sendable {
+    /// The live, editable document. Every access still goes through the
+    /// document's own transaction API, which takes `ffiLock`.
+    public let document: YDocument
+
+    public init(_ document: YDocument) {
+        self.document = document
+    }
+}
+
 // MARK: Open results
 
 /// Result of `documents.open` / `documents.openAlias` / `documents.openRoot`.
@@ -175,18 +221,24 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
 /// `open`/`openAlias`): the live `YDocument` plus the document's locally
 /// cached metadata at open time (`nil` when no metadata is stored yet).
 ///
-/// `@unchecked Sendable`: `YDocument` (from `YSwift`) is a reference type that
-/// is not itself `Sendable`, matching how `DocumentsAPI`/`DocumentManager`
-/// carry live documents across actors via `@unchecked Sendable`.
-public struct OpenDocumentResult: @unchecked Sendable {
+/// Plainly `Sendable` since #1992: the live document is carried in a
+/// `ConfinedYDocument`, so this type owns no unchecked claim of its own and
+/// the compiler checks the rest (`LocalMetadataEntry` is `Sendable`).
+public struct OpenDocumentResult: Sendable {
+    /// The live document, in the shared confinement holder. Prefer `doc` for
+    /// ordinary use; reach for this when you need to pass the document on to
+    /// another isolation domain without re-stating the safety argument.
+    public let confinedDoc: ConfinedYDocument
+
     /// The live, editable document.
-    public let doc: YDocument
+    public var doc: YDocument { confinedDoc.document }
+
     /// Locally cached metadata for the document at open time, or `nil` when
     /// none is stored.
     public let metadata: LocalMetadataEntry?
 
     public init(doc: YDocument, metadata: LocalMetadataEntry?) {
-        self.doc = doc
+        self.confinedDoc = ConfinedYDocument(doc)
         self.metadata = metadata
     }
 }
@@ -194,25 +246,22 @@ public struct OpenDocumentResult: @unchecked Sendable {
 // MARK: List inputs
 
 /// Options for the deprecated `documents.list(options:)`. Mirrors js-bao's
-/// `DocumentListOptions` field-for-field so the deprecated surface lines up
-/// across platforms.
+/// `DocumentListOptions` for the fields Swift implements, so the deprecated
+/// surface lines up across platforms.
 ///
 /// Deprecated alongside `documents.list` — migrate to
 /// `client.me.ownedDocuments(...)` / `client.me.sharedDocuments(...)`.
+///
+/// The five never-implemented fields (`refreshFromServer`, `localOnly`,
+/// `serverTimeoutMs`, `waitForLoad`, `returnPage`) were deprecated in #2360 and
+/// removed in #2367. `documents.list` is a blocking server fetch: the
+/// local-first behavior those fields described lives on
+/// `client.me.ownedDocuments(...)`, and the `{ items, cursor }` page shape lives
+/// on `documents.listPage(...)`.
 public struct ListDocumentsOptions: Sendable {
     /// Include the app's root document in results (excluded by default).
     public var includeRoot: Bool?
-    /// When `false`, skip the server fetch and return only cached metadata
-    /// (defaults to `true`).
-    public var refreshFromServer: Bool?
-    /// Return only documents that have local data on this device, ignoring
-    /// the server entirely.
-    public var localOnly: Bool?
-    /// Maximum time to wait for the server response, in milliseconds.
-    public var serverTimeoutMs: Int?
-    /// When the call resolves: `"local"`, `"network"`, or
-    /// `"localIfAvailableElseNetwork"`.
-    public var waitForLoad: String?
+
     /// Maximum number of documents per page (enables server-side pagination).
     public var limit: Int?
     /// Pagination cursor from a previous response.
@@ -221,31 +270,19 @@ public struct ListDocumentsOptions: Sendable {
     public var tag: String?
     /// Sort chronologically (oldest first) instead of reverse-chronological.
     public var forward: Bool?
-    /// Return a `DocumentListPage` (items + cursor) instead of a flat array.
-    public var returnPage: Bool?
 
     public init(
         includeRoot: Bool? = nil,
-        refreshFromServer: Bool? = nil,
-        localOnly: Bool? = nil,
-        serverTimeoutMs: Int? = nil,
-        waitForLoad: String? = nil,
         limit: Int? = nil,
         cursor: String? = nil,
         tag: String? = nil,
-        forward: Bool? = nil,
-        returnPage: Bool? = nil
+        forward: Bool? = nil
     ) {
         self.includeRoot = includeRoot
-        self.refreshFromServer = refreshFromServer
-        self.localOnly = localOnly
-        self.serverTimeoutMs = serverTimeoutMs
-        self.waitForLoad = waitForLoad
         self.limit = limit
         self.cursor = cursor
         self.tag = tag
         self.forward = forward
-        self.returnPage = returnPage
     }
 }
 
@@ -473,10 +510,15 @@ public struct LinkAccessResult: Decodable, Sendable, Equatable {
 }
 
 /// A user's permission entry on a document.
+///
+/// `name` is `nil` for a user who has none — the server omits the key rather
+/// than sending an empty string, and a user provisioned through the
+/// email-code flow gets no name (#2980) — so display code should fall back
+/// to `email`. Mirrors js-bao's `DocumentPermissionEntry.name?: string`.
 public struct DocumentPermissionEntry: Decodable, Sendable, Equatable {
     public let userId: String
     public let email: String
-    public let name: String
+    public let name: String?
     public let permission: DocumentPermission
     public let grantedAt: String
 }

@@ -204,7 +204,7 @@ final class PersistenceTests: XCTestCase {
         try await storageProvider.initialize(namespace: "hydration-test")
 
         let offlineStore = OfflineStore()
-        offlineStore.setStorageProvider(storageProvider)
+        await offlineStore.setStorageProvider(storageProvider)
 
         let docId = "test-doc-\(UUID().uuidString.prefix(6))"
 
@@ -284,8 +284,8 @@ final class PersistenceTests: XCTestCase {
             auth: AuthConfig(persistJwtInStorage: true, storageKeyPrefix: "test")
         ))
 
-        let info = client1.getAuthPersistenceInfo()
-        XCTAssertEqual(info["mode"] as? String, "persisted")
+        let info = client1.authPersistenceInfo
+        XCTAssertEqual(info["mode"]?.stringValue, "persisted")
 
         await client1.destroy()
     }
@@ -310,8 +310,8 @@ final class PersistenceTests: XCTestCase {
         ))
 
         // Verify persistence mode is active
-        let info1 = client1.getAuthPersistenceInfo()
-        XCTAssertEqual(info1["mode"] as? String, "persisted")
+        let info1 = client1.authPersistenceInfo
+        XCTAssertEqual(info1["mode"]?.stringValue, "persisted")
 
         // Connect to ensure the token is stored
         try await client1.connect()
@@ -469,6 +469,9 @@ final class PersistenceTests: XCTestCase {
 
     // MARK: - Eviction removes persisted data
 
+    /// Rewritten for #2668: this used to assert only through `hasLocalCopy`,
+    /// which reports on in-memory bookkeeping and was blind to the CRDT
+    /// snapshot eviction left in `yjs_docs`. It now reads that row directly.
     func testEvictionRemovesPersistedData() async throws {
         let dbPath = tempDir + "evict-test-\(UUID().uuidString.prefix(6)).sqlite"
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Eviction Test")
@@ -486,15 +489,39 @@ final class PersistenceTests: XCTestCase {
         _ = try await client.openDocument(docId, options: OpenDocumentOptions(waitForLoad: .network))
         try await waitForSync(client: client, documentId: docId)
 
+        // Write something, so there are CRDT bytes on disk to evict.
+        let writeMap: YMap<String> = try XCTUnwrap(client.getDoc(docId)).getOrCreateMap(named: "evict")
+        try client.transactAndSync(docId) { txn in
+            writeMap.updateValue("v", forKey: "k", transaction: txn)
+        }
+
         // Confirm local copy exists
         try await delay(1)
         XCTAssertTrue(client.hasLocalCopy(docId), "Should have a local copy after syncing")
+
+        let storageProvider = await client.documentManager.offlineStore?.getStorageProvider()
+        let storage = try XCTUnwrap(storageProvider, "storage provider should be initialized")
+        let beforeRow: StorageRecord<Data>? = try await storage.get(
+            store: YjsSQLitePersistence.store, key: docId
+        )
+        XCTAssertNotNil(beforeRow, "the CRDT snapshot should be on disk before eviction")
+
+        // The server has our write, so the evict guard lets the eviction through.
+        try await client.waitForWriteConfirmation(documentId: docId)
 
         // Close with eviction
         await client.closeDocument(docId, options: CloseDocumentOptions(evictLocal: true))
 
         // After eviction, local copy should be gone
         XCTAssertFalse(client.hasLocalCopy(docId), "Local copy should be gone after eviction")
+
+        let afterRow: StorageRecord<Data>? = try await storage.get(
+            store: YjsSQLitePersistence.store, key: docId
+        )
+        XCTAssertNil(
+            afterRow,
+            "eviction left the CRDT snapshot in yjs_docs, so a re-open rehydrates evicted content (#2668 C23)"
+        )
 
         await client.destroy()
 

@@ -29,7 +29,54 @@ import YSwift
 /// `Model.*` facade. App code never references this type; it reaches the
 /// store through `JsBaoClient.queryShared`/`saveShared`/etc. (and the
 /// generated facade methods that call them).
-final class MultiDocModel: IncludeTarget {
+///
+/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+///
+/// A class with mutable state, so the conformance is unchecked. Every stored
+/// property is either immutable-and-`Sendable` or confined to a named lock:
+///
+/// | State | Confinement |
+/// |---|---|
+/// | `schema` (`PrimitiveSchema`) | `let`, `Sendable` value type |
+/// | `engine` (`BaoModelQueryEngine`) | `let`; the engine is itself `@unchecked Sendable` under its own `lock` (see its safety argument) |
+/// | `members`, `orderedDocIds` | mutated in `connect`/`disconnect` and read via `snapshotMembersInOrder` / `connectedDocIds`, all under `lock` |
+/// | `activeSubs` | mutated and read only under the **separate** `subscribeLock` |
+///
+/// **Two locks with a fixed acquisition order: `lock` → `subscribeLock`.**
+/// The nesting is real and one-directional. `connect`/`disconnect` hold `lock`
+/// and call `installActiveSubsOn` / `uninstallActiveSubsFrom`, which take
+/// `subscribeLock` inside it. Nothing ever takes `lock` while holding
+/// `subscribeLock`: `subscribe` snapshots members through
+/// `snapshotMembersInOrder()` (which takes and releases `lock`) *before*
+/// touching `subscribeLock`, and the unsubscribe closure only touches
+/// `subscribeLock`. Since both locks are `NSLock` (non-reentrant), the
+/// inner sections also never re-enter their own lock, and callbacks
+/// (`model.subscribe`, the collected `unsub` closures) are always invoked
+/// with `subscribeLock` released.
+///
+/// **A third lock is in that order: the member's `listenerLock`.**
+/// `installActiveSubsOn` / `uninstallActiveSubsFrom` call
+/// `DynamicModel.subscribe` and the collected `unsub` closures, both of which
+/// take the member's `listenerLock` — and `connect`/`disconnect` still hold
+/// `lock` at that point. So the full order is
+/// `lock` → (`subscribeLock` released) → `listenerLock`. Still
+/// one-directional: nothing in `DynamicModel` takes a `MultiDocModel` lock,
+/// so `listenerLock` is always a leaf here and cannot close a cycle.
+///
+/// **Concurrent `connect`/`disconnect` while a cross-doc query iterates.**
+/// The query methods do not hold `lock` for the duration of the query: they
+/// drain observers over a *snapshot* of members and then run one SQL statement
+/// against `engine`, whose own lock serializes it against the row
+/// inserts/deletes a concurrent `connect`/`disconnect` performs. So a query
+/// concurrent with a membership change is not a data race; it returns a page
+/// that is consistent per SQL statement and may or may not include the doc
+/// being connected/disconnected. That is the same visibility contract a remote
+/// change already has, not a new one.
+///
+/// Listener closures are `@Sendable` (#1992): confining the `activeSubs`
+/// dictionary under a lock says nothing about state a callback captures, so
+/// the closure type carries the requirement instead.
+final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     public let schema: PrimitiveSchema
 
     /// Satisfies `IncludeTarget` — derived from the schema so
@@ -51,7 +98,7 @@ final class MultiDocModel: IncludeTarget {
     /// `DynamicModel`.
     public struct Located {
         public let docId: String
-        public let row: [String: Any]
+        public let row: [String: JSONValue]
     }
 
     public init(
@@ -164,7 +211,7 @@ final class MultiDocModel: IncludeTarget {
 
     // MARK: - Reads
 
-    public func findAll() -> [[String: Any]] {
+    public func findAll() -> [[String: JSONValue]] {
         // `nil` filter never carries a substring operator, so the
         // now-throwing `query` can't actually throw here — handle the
         // unreachable error locally to keep `findAll` non-throwing
@@ -187,20 +234,25 @@ final class MultiDocModel: IncludeTarget {
         // can't trigger the substring-op validator, so the now-throwing
         // `engine.query` is unreachable-error here — handle it locally
         // so `find` stays non-throwing.
+        // `stringsetFields` is what drives the post-query pass that pulls
+        // members out of the per-field junction tables. Without it the
+        // returned row simply has no stringset keys — `find` handed back a
+        // record `query` would have returned complete (#2485).
         let rows = (try? engine.query(
             modelName: schema.name,
-            filter: ["id": id]
+            filter: ["id": .string(id)],
+            stringsetFields: stringsetFieldNames
         )) ?? []
         guard !rows.isEmpty else { return nil }
         let connectOrder = snapshot.enumerated().reduce(
             into: [String: Int]()
         ) { $0[$1.element.docId] = $1.offset }
         let sorted = rows.sorted {
-            (connectOrder[$0["_meta_doc_id"] as? String ?? ""] ?? .max) <
-            (connectOrder[$1["_meta_doc_id"] as? String ?? ""] ?? .max)
+            (connectOrder[$0["_meta_doc_id"]?.stringValue ?? ""] ?? .max) <
+            (connectOrder[$1["_meta_doc_id"]?.stringValue ?? ""] ?? .max)
         }
         guard let first = sorted.first,
-              let docId = first["_meta_doc_id"] as? String else { return nil }
+              let docId = first["_meta_doc_id"]?.stringValue else { return nil }
         return Located(docId: docId, row: first)
     }
 
@@ -222,14 +274,20 @@ final class MultiDocModel: IncludeTarget {
             guard let rec = try model.findByUnique(
                 constraint: name, values: values
             ) else { continue }
-            var row: [String: Any] = ["id": rec.id]
+            var row: [String: JSONValue] = ["id": .string(rec.id)]
             let snap = rec.snapshot()
             for (fname, _) in schema.fields where fname != "id" {
                 if let v = snap[fname] {
-                    row[fname] = sqliteRepresentation(of: v)
+                    row[fname] = rowRepresentation(of: v)
                 }
             }
-            row["_meta_doc_id"] = docId
+            // A record with no members has no snapshot entry at all, so give
+            // every stringset field the same `[]` the engine's population pass
+            // produces — one row shape whether the set is empty or not (#2485).
+            for fname in stringsetFieldNames where row[fname] == nil {
+                row[fname] = .array([])
+            }
+            row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
         return nil
@@ -257,6 +315,9 @@ final class MultiDocModel: IncludeTarget {
     ///   - uniqueLookupValue: optional explicit lookup value(s) (one per
     ///     constraint field). Mirrors js-bao's separate
     ///     `uniqueLookupValue` argument; validated against `data`.
+    ///   - changedFields: the fields the caller actually assigned (see
+    ///     `DynamicModel.save(id:values:changedFields:)`). Applies to the
+    ///     merge path only; the insert path writes every supplied value.
     @discardableResult
     public func upsertByUnique(
         constraint name: String,
@@ -265,7 +326,8 @@ final class MultiDocModel: IncludeTarget {
         id: String? = nil,
         explicitId: Bool = false,
         targetDocId: String,
-        uniqueLookupValue: [PrimitiveValue]? = nil
+        uniqueLookupValue: [PrimitiveValue]? = nil,
+        changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
         let members = snapshotMembersInOrder()
         for (_, model) in members { model.awaitObserverDrain() }
@@ -282,6 +344,13 @@ final class MultiDocModel: IncludeTarget {
         }
         let (constraint, key) = try keyResolver.resolveUpsertConstraintKey(
             constraint: name, data: data, uniqueLookupValue: uniqueLookupValue
+        )
+
+        // Before the search: a match in any doc would otherwise supply the
+        // id the caller failed to (see
+        // `DynamicModel.requireNonEmptySuppliedId`).
+        try DynamicModel.requireNonEmptySuppliedId(
+            id, data: data, modelName: schema.name
         )
 
         // Cross-doc search: first connected doc that holds the key wins.
@@ -325,7 +394,9 @@ final class MultiDocModel: IncludeTarget {
                              "(client.openDocument) before writing `\(schema.name)` records."
                 )
             }
-            _ = try target.save(id: matchRecordId, values: data)
+            _ = try target.save(
+                id: matchRecordId, values: data, changedFields: changedFields
+            )
             return UpsertResult(
                 record: PrimitiveRecord(
                     modelName: schema.name, id: matchRecordId, model: target
@@ -351,7 +422,7 @@ final class MultiDocModel: IncludeTarget {
     public func query(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         drainAllObservers()
         return try engine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -386,7 +457,7 @@ final class MultiDocModel: IncludeTarget {
     /// Cross-doc aggregation. Runs one SQL query against the shared
     /// table. Group by `_meta_doc_id` to get per-doc rollups; omit
     /// grouping for a single global rollup.
-    public func aggregate(_ options: AggregateOptions) throws -> [[String: Any]] {
+    public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         drainAllObservers()
         return try engine.aggregate(
             modelName: schema.name, options: options,
@@ -408,8 +479,8 @@ final class MultiDocModel: IncludeTarget {
     /// doc's hook and the top-level unsubscribe can tear down every
     /// hook at once.
     private struct ActiveSub {
-        let callback: () -> Void
-        var unsubByDocId: [String: () -> Void]
+        let callback: @Sendable () -> Void
+        var unsubByDocId: [String: @Sendable () -> Void]
     }
     private var activeSubs: [UUID: ActiveSub] = [:]
     private let subscribeLock = NSLock()
@@ -421,13 +492,15 @@ final class MultiDocModel: IncludeTarget {
     /// on the new member; `disconnect` tears down the per-doc hook.
     /// Matches `DynamicModel.subscribe` semantics (js-bao browser.js:3628).
     @discardableResult
-    public func subscribe(_ callback: @escaping () -> Void) -> () -> Void {
+    public func subscribe(_ callback: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         let id = UUID()
-        // Pre-install on currently-connected members OUTSIDE
-        // subscribeLock so we don't nest locks (members access goes
-        // through the main `lock` via snapshotMembersInOrder). Then
-        // record the active sub.
-        var unsubByDocId: [String: () -> Void] = [:]
+        // Pre-install on currently-connected members BEFORE taking
+        // `subscribeLock` — member access goes through the main `lock` via
+        // `snapshotMembersInOrder`, and taking `lock` while holding
+        // `subscribeLock` would invert the one-directional
+        // `lock` → `subscribeLock` order the type's safety argument relies
+        // on. Then record the active sub.
+        var unsubByDocId: [String: @Sendable () -> Void] = [:]
         for (docId, model) in snapshotMembersInOrder() {
             unsubByDocId[docId] = model.subscribe(callback)
         }
@@ -446,16 +519,19 @@ final class MultiDocModel: IncludeTarget {
 
     /// Install every active subscriber onto a freshly-connected
     /// member. Called from `connectInternal` after the member is
-    /// registered. Caller holds the main `lock`; we take
-    /// `subscribeLock` to snapshot the active-sub set, release both
-    /// before invoking `model.subscribe` (which takes the model's
-    /// own listener lock).
+    /// registered, so the caller still holds the main `lock` — this is
+    /// the `lock` → `subscribeLock` nesting the type's safety argument
+    /// describes. We take `subscribeLock` only to snapshot the
+    /// active-sub set and release it before invoking `model.subscribe`
+    /// (which takes the model's own listener lock); the main `lock`
+    /// stays held throughout, which is fine because nothing on that
+    /// path tries to reacquire it.
     private func installActiveSubsOn(model: DynamicModel, docId: String) {
         subscribeLock.lock()
         let callbacks = activeSubs.map { (id: $0.key, callback: $0.value.callback) }
         subscribeLock.unlock()
         // `model.subscribe` is safe to call without our locks held.
-        var newUnsubs: [(UUID, () -> Void)] = []
+        var newUnsubs: [(UUID, @Sendable () -> Void)] = []
         for entry in callbacks {
             let unsub = model.subscribe(entry.callback)
             newUnsubs.append((entry.id, unsub))
@@ -474,7 +550,7 @@ final class MultiDocModel: IncludeTarget {
     /// chase stale references.
     private func uninstallActiveSubsFrom(docId: String) {
         subscribeLock.lock()
-        var toFire: [() -> Void] = []
+        var toFire: [@Sendable () -> Void] = []
         for (id, var sub) in activeSubs {
             if let unsub = sub.unsubByDocId.removeValue(forKey: docId) {
                 toFire.append(unsub)
@@ -494,7 +570,7 @@ final class MultiDocModel: IncludeTarget {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> [[String: Any]] {
+    ) throws -> [[String: JSONValue]] {
         drainAllObservers()
         var rows = try engine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -512,7 +588,7 @@ final class MultiDocModel: IncludeTarget {
     public func queryPaged(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         drainAllObservers()
         return try engine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
@@ -526,16 +602,17 @@ final class MultiDocModel: IncludeTarget {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil,
         include: [Include]
-    ) throws -> PagedQueryResult<[String: Any]> {
+    ) throws -> PagedQueryResult<PrimitiveRow> {
         drainAllObservers()
         let base = try engine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
             stringsetFields: stringsetFieldNames
         )
-        var rows = base.data
+        // Unwrap → resolve includes (in-place mutation) → rewrap (#1992).
+        var rows = base.data.map(\.raw)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
         return PagedQueryResult(
-            data: rows,
+            data: rows.map(PrimitiveRow.init(raw:)),
             nextCursor: base.nextCursor,
             prevCursor: base.prevCursor,
             hasMore: base.hasMore
@@ -558,16 +635,23 @@ final class MultiDocModel: IncludeTarget {
         }
     }
 
-    /// `PrimitiveValue → SQLite-bind-friendly Any`.
-    private func sqliteRepresentation(of value: PrimitiveValue) -> Any {
+    /// `PrimitiveValue` → the value a query row carries for that field.
+    ///
+    /// Matches what `BaoModelQueryEngine` emits, so a row built here (only
+    /// `findByUnique` does) decodes through the same accessors as one that
+    /// came out of a SQL query. In particular a stringset is `[String]`, the
+    /// shape the engine's junction-table population pass writes and the
+    /// generated row decoder casts to — a comma-joined `String` would fail
+    /// that cast and silently drop the field (#2485).
+    private func rowRepresentation(of value: PrimitiveValue) -> JSONValue {
         switch value {
-        case let .string(s):    return s
-        case let .number(n):    return n
-        case let .boolean(b):   return b
-        case let .id(s):        return s
-        case let .date(s):      return s
-        case let .stringset(s): return Array(s).joined(separator: ",")
-        case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
+        case let .string(s):    return .string(s)
+        case let .number(n):    return .number(n)
+        case let .boolean(b):   return .bool(b)
+        case let .id(s):        return .string(s)
+        case let .date(s):      return .string(s)
+        case let .stringset(s): return .array(Array(s).map { .string($0) })
+        case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
         }
     }
 }

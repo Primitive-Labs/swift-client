@@ -56,7 +56,7 @@ final class MultiDocModelTests: XCTestCase {
         let multi = try seededPair()
         let rows = multi.findAll()
         XCTAssertEqual(rows.count, 3)
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a1", "a2", "b1"])
     }
 
@@ -66,11 +66,11 @@ final class MultiDocModelTests: XCTestCase {
         let multi = try seededPair()
         let rows = multi.findAll()
         for row in rows {
-            XCTAssertNotNil(row["_meta_doc_id"] as? String,
+            XCTAssertNotNil(row["_meta_doc_id"]?.stringValue,
                             "Every row must carry _meta_doc_id")
         }
         let byDoc = Dictionary(grouping: rows) {
-            $0["_meta_doc_id"] as? String ?? ""
+            $0["_meta_doc_id"]?.stringValue ?? ""
         }
         XCTAssertEqual(byDoc["docA"]?.count, 2)
         XCTAssertEqual(byDoc["docB"]?.count, 1)
@@ -82,7 +82,7 @@ final class MultiDocModelTests: XCTestCase {
         let multi = try seededPair()
         let result = multi.find(id: "b1")
         XCTAssertEqual(result?.docId, "docB")
-        XCTAssertEqual(result?.row["name"] as? String, "Carol-B")
+        XCTAssertEqual(result?.row["name"]?.stringValue, "Carol-B")
     }
 
     func testFindReturnsNilWhenNoDocHasIt() throws {
@@ -99,7 +99,7 @@ final class MultiDocModelTests: XCTestCase {
             value: .string("carol@b.com")
         )
         XCTAssertEqual(carol?.docId, "docB")
-        XCTAssertEqual(carol?.row["name"] as? String, "Carol-B")
+        XCTAssertEqual(carol?.row["name"]?.stringValue, "Carol-B")
     }
 
     func testFindByUniqueSearchesEveryDoc() throws {
@@ -125,7 +125,7 @@ final class MultiDocModelTests: XCTestCase {
     func testQueryFiltersFanOutAndMerge() throws {
         let multi = try seededPair()
         let rows = try multi.query(["rank": ["$gte": 2]])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a2", "b1"])
     }
 
@@ -136,7 +136,7 @@ final class MultiDocModelTests: XCTestCase {
         let rows = try multi.query(nil, options: QueryOptions(
             sortOrder: [("rank", 1)]
         ))
-        XCTAssertEqual(rows.map { $0["id"] as? String },
+        XCTAssertEqual(rows.map { $0["id"]?.stringValue },
                        ["a1", "b1", "a2"],
                        "Merged sort by rank ASC across docs")
     }
@@ -147,7 +147,7 @@ final class MultiDocModelTests: XCTestCase {
         let rows = try multi.query(nil, options: QueryOptions(
             sortOrder: [("rank", 1)], limit: 2
         ))
-        XCTAssertEqual(rows.map { $0["id"] as? String }, ["a1", "b1"])
+        XCTAssertEqual(rows.map { $0["id"]?.stringValue }, ["a1", "b1"])
     }
 
     /// `_meta_doc_id` is a real SQLite column on the shared table —
@@ -155,7 +155,7 @@ final class MultiDocModelTests: XCTestCase {
     func testQueryCanFilterByMetaDocId() throws {
         let multi = try seededPair()
         let rows = try multi.query(["_meta_doc_id": "docA"])
-        let ids = Set(rows.compactMap { $0["id"] as? String })
+        let ids = Set(rows.compactMap { $0["id"]?.stringValue })
         XCTAssertEqual(ids, ["a1", "a2"])
     }
 
@@ -185,8 +185,8 @@ final class MultiDocModelTests: XCTestCase {
         ))
         XCTAssertEqual(result.count, 1)
         // rank: 1 + 3 + 2 = 6
-        let sum = (result.first?["sum_rank"] as? Double) ??
-                  Double(result.first?["sum_rank"] as? Int ?? 0)
+        let sum = (result.first?["sum_rank"]?.numberValue) ??
+                  Double(result.first?["sum_rank"]?.numberValue ?? 0)
         XCTAssertEqual(sum, 6)
     }
 
@@ -201,15 +201,15 @@ final class MultiDocModelTests: XCTestCase {
                 AggregateOperation(type: .avg, field: "rank"),
             ]
         ))
-        let byDoc = Dictionary(uniqueKeysWithValues: rows.compactMap { row -> (String, [String: Any])? in
-            guard let docId = row["_meta_doc_id"] as? String else { return nil }
+        let byDoc = Dictionary(uniqueKeysWithValues: rows.compactMap { row -> (String, [String: JSONValue])? in
+            guard let docId = row["_meta_doc_id"]?.stringValue else { return nil }
             return (docId, row)
         })
-        XCTAssertEqual(byDoc["docA"]?["n"] as? Int, 2)
-        XCTAssertEqual(byDoc["docB"]?["n"] as? Int, 1)
+        XCTAssertEqual(byDoc["docA"]?["n"]?.numberValue, 2)
+        XCTAssertEqual(byDoc["docB"]?["n"]?.numberValue, 1)
         // docA avg rank: (1+3)/2 = 2
-        XCTAssertEqual(byDoc["docA"]?["avg_rank"] as? Double, 2.0)
-        XCTAssertEqual(byDoc["docB"]?["avg_rank"] as? Double, 2.0)
+        XCTAssertEqual(byDoc["docA"]?["avg_rank"]?.numberValue, 2.0)
+        XCTAssertEqual(byDoc["docB"]?["avg_rank"]?.numberValue, 2.0)
     }
 
     func testAggregateWithFilter() throws {
@@ -218,7 +218,7 @@ final class MultiDocModelTests: XCTestCase {
             operations: [AggregateOperation(type: .count, outputField: "n")],
             filter: ["rank": ["$gte": 2]]
         ))
-        XCTAssertEqual(rows.first?["n"] as? Int, 2)
+        XCTAssertEqual(rows.first?["n"]?.numberValue, 2)
     }
 
     // MARK: - connect / disconnect at runtime
@@ -334,7 +334,7 @@ final class MultiDocModelTests: XCTestCase {
         XCTAssertEqual(result.record["name"], .string("Carol V2"))
         XCTAssertEqual(multi.find(id: "b1")?.docId, "docA",
                        "targetDocument parity writes the resolved id into docA")
-        XCTAssertEqual(multi.find(id: "b1")?.row["name"] as? String, "Carol V2")
+        XCTAssertEqual(multi.find(id: "b1")?.row["name"]?.stringValue, "Carol V2")
     }
 
     /// No match in any connected doc → insert into the target doc.
@@ -348,8 +348,8 @@ final class MultiDocModelTests: XCTestCase {
         )
         XCTAssertTrue(result.wasCreated)
         XCTAssertEqual(result.record.id, "d1")
-        let inserted = multi.findAll().first { ($0["id"] as? String) == "d1" }
-        XCTAssertEqual(inserted?["_meta_doc_id"] as? String, "docA",
+        let inserted = multi.findAll().first { ($0["id"]?.stringValue) == "d1" }
+        XCTAssertEqual(inserted?["_meta_doc_id"]?.stringValue, "docA",
                        "fresh insert lands in the target doc")
     }
 

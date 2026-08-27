@@ -29,6 +29,20 @@ public struct GroupMemberInfo: Decodable, Sendable, Equatable {
     public let addedBy: String
     public let userName: String?
     public let userEmail: String?
+    /// The member's avatar URL. Only populated when the member was fetched
+    /// with `include: .profiles` (see `GroupsAPI.listMembers`). `null` when
+    /// the user has no avatar, or the membership is orphaned (the user no
+    /// longer exists). Absent from the default (no-`include`) response.
+    public let avatarUrl: String?
+}
+
+/// Optional joins for `GroupsAPI.listMembers`. Mirrors the JS client's
+/// `include?: "profiles"` option (serialized as `?include=profiles`). With
+/// `.profiles`, each member is joined with their basic profile in the same
+/// round trip: `userName`/`userEmail` are reliably populated and `avatarUrl`
+/// is included. The server rejects unknown values with HTTP 400.
+public enum GroupMemberInclude: String, Sendable {
+    case profiles
 }
 
 /// One of the current user's (or a queried user's) group memberships.

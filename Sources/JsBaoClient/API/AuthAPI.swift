@@ -22,22 +22,28 @@ public final class AuthAPI: @unchecked Sendable {
     private let _getToken: () -> String?
     private let _isAuthenticated: () -> Bool
 
-    // Non-native sign-in flows
+    // Non-native sign-in flows.
+    //
+    // `_emailSignInRequest` (#2884) is the one email entry point; it is
+    // optional only so an instance wired before the unified flow existed
+    // still compiles (it throws when called unwired).
+    private let _emailSignInRequest: ((_ email: String, _ redirectUri: String?) async throws -> Bool)?
     private let _magicLinkRequest: (_ email: String, _ redirectUri: String) async throws -> Bool
-    private let _magicLinkVerify: (_ token: String) async throws -> Any
+    private let _magicLinkVerify: (_ token: String) async throws -> MagicLinkVerifyResult
     // Carries the optional #466 invite token through verify. When unwired,
     // `magicLinkVerify(token:inviteToken:)` falls back to the token-only path.
-    private let _magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> Any)?
+    private let _magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> MagicLinkVerifyResult)?
     private let _otpRequest: (_ email: String) async throws -> Bool
-    private let _otpVerify: (_ email: String, _ code: String) async throws -> Any
+    private let _otpVerify: (_ email: String, _ code: String) async throws -> OtpVerifyResult
     // Carries the optional #466 invite token through verify. When unwired,
     // `otpVerify` falls back to the email+code-only path.
-    private let _otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> Any)?
+    private let _otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> OtpVerifyResult)?
 
     // App auth config (`GET /oauth-config`)
-    private let _getAuthConfig: () async throws -> Any
-    // App-launch config subset. When unwired, derived from `_getAuthConfig`.
-    private let _getAppConfig: (() async throws -> Any)?
+    private let _getAuthConfig: () async throws -> AuthConfigInfo
+    // App-launch config subset. When unwired, derived from `_getAuthConfig`
+    // by projecting the shared `/oauth-config` envelope.
+    private let _getAppConfig: (() async throws -> AppConfigInfo)?
 
     // Logout. `_logout` is the legacy wipeLocal-only closure retained for the
     // existing `JsBaoClient` wiring; `_logoutWithOptions`, when wired, carries
@@ -47,56 +53,61 @@ public final class AuthAPI: @unchecked Sendable {
     private let _logoutWithOptions: ((_ options: LogoutOptions) async throws -> Void)?
 
     // Offline-grant suite
-    private let _enableOfflineAccess: (_ options: EnableOfflineAccessOptions) async throws -> Any
+    private let _enableOfflineAccess: (_ options: EnableOfflineAccessOptions) async throws -> EnableOfflineAccessResult
     private let _unlockOffline: () async throws -> Bool
     private let _getOfflineGrantStatus: () -> OfflineGrantStatus
     private let _renewOfflineGrant: (_ options: EnableOfflineAccessOptions) async throws -> Bool
     private let _revokeOfflineGrant: (_ options: RevokeOfflineGrantOptions) async throws -> Void
     private let _hasOfflineGrantStored: () -> Bool
 
-    // Passkeys (#929). Wire-level closures returning the raw response dicts;
+    // Passkeys (#929). Wire-level closures returning the typed DTOs;
     // `internal` (not `private`) so the AuthenticationServices-gated native
     // flows in `AuthAPI+NativePasskeys.swift` (a separate file) can reach
     // them. All optional for source compatibility — unwired instances throw.
-    let _passkeyAuthStart: (() async throws -> [String: Any])?
-    let _passkeyAuthFinish: ((_ credential: [String: Any], _ challengeToken: String) async throws -> [String: Any])?
-    let _passkeyRegisterStart: (() async throws -> [String: Any])?
-    let _passkeyRegisterFinish: ((_ credential: [String: Any], _ challengeToken: String, _ deviceName: String?, _ inviteToken: String?) async throws -> [String: Any])?
-    let _passkeyList: (() async throws -> [String: Any])?
-    let _passkeyDelete: ((_ passkeyId: String) async throws -> [String: Any])?
-    let _passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> [String: Any])?
+    // The `credential` argument stays a `JSONValue` object: it is the
+    // authenticator's response, whose shape belongs to WebAuthn rather than
+    // to this SDK.
+    let _passkeyAuthStart: (() async throws -> PasskeyAuthStartResult)?
+    let _passkeyAuthFinish: ((_ credential: JSONValue, _ challengeToken: String) async throws -> PasskeySignInResult)?
+    let _passkeyRegisterStart: (() async throws -> PasskeyRegisterStartResult)?
+    let _passkeyRegisterFinish: ((_ credential: JSONValue, _ challengeToken: String, _ deviceName: String?, _ inviteToken: String?) async throws -> PasskeyRegistrationResult)?
+    let _passkeyList: (() async throws -> PasskeyListResult)?
+    let _passkeyDelete: ((_ passkeyId: String) async throws -> PasskeyDeleteResult)?
+    let _passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> PasskeyUpdateResult)?
 
     public init(
         getUserId: @escaping () -> String?,
         getToken: @escaping () -> String?,
         isAuthenticated: @escaping () -> Bool,
+        emailSignInRequest: ((_ email: String, _ redirectUri: String?) async throws -> Bool)? = nil,
         magicLinkRequest: @escaping (_ email: String, _ redirectUri: String) async throws -> Bool,
-        magicLinkVerify: @escaping (_ token: String) async throws -> Any,
-        magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> Any)? = nil,
+        magicLinkVerify: @escaping (_ token: String) async throws -> MagicLinkVerifyResult,
+        magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> MagicLinkVerifyResult)? = nil,
         otpRequest: @escaping (_ email: String) async throws -> Bool,
-        otpVerify: @escaping (_ email: String, _ code: String) async throws -> Any,
-        otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> Any)? = nil,
-        getAuthConfig: @escaping () async throws -> Any,
-        getAppConfig: (() async throws -> Any)? = nil,
+        otpVerify: @escaping (_ email: String, _ code: String) async throws -> OtpVerifyResult,
+        otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> OtpVerifyResult)? = nil,
+        getAuthConfig: @escaping () async throws -> AuthConfigInfo,
+        getAppConfig: (() async throws -> AppConfigInfo)? = nil,
         logout: @escaping (_ wipeLocal: Bool) async throws -> Void,
         logoutWithOptions: ((_ options: LogoutOptions) async throws -> Void)? = nil,
-        enableOfflineAccess: @escaping (_ options: EnableOfflineAccessOptions) async throws -> Any,
+        enableOfflineAccess: @escaping (_ options: EnableOfflineAccessOptions) async throws -> EnableOfflineAccessResult,
         unlockOffline: @escaping () async throws -> Bool,
         getOfflineGrantStatus: @escaping () -> OfflineGrantStatus,
         renewOfflineGrant: @escaping (_ options: EnableOfflineAccessOptions) async throws -> Bool,
         revokeOfflineGrant: @escaping (_ options: RevokeOfflineGrantOptions) async throws -> Void,
         hasOfflineGrantStored: @escaping () -> Bool,
-        passkeyAuthStart: (() async throws -> [String: Any])? = nil,
-        passkeyAuthFinish: ((_ credential: [String: Any], _ challengeToken: String) async throws -> [String: Any])? = nil,
-        passkeyRegisterStart: (() async throws -> [String: Any])? = nil,
-        passkeyRegisterFinish: ((_ credential: [String: Any], _ challengeToken: String, _ deviceName: String?, _ inviteToken: String?) async throws -> [String: Any])? = nil,
-        passkeyList: (() async throws -> [String: Any])? = nil,
-        passkeyDelete: ((_ passkeyId: String) async throws -> [String: Any])? = nil,
-        passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> [String: Any])? = nil
+        passkeyAuthStart: (() async throws -> PasskeyAuthStartResult)? = nil,
+        passkeyAuthFinish: ((_ credential: JSONValue, _ challengeToken: String) async throws -> PasskeySignInResult)? = nil,
+        passkeyRegisterStart: (() async throws -> PasskeyRegisterStartResult)? = nil,
+        passkeyRegisterFinish: ((_ credential: JSONValue, _ challengeToken: String, _ deviceName: String?, _ inviteToken: String?) async throws -> PasskeyRegistrationResult)? = nil,
+        passkeyList: (() async throws -> PasskeyListResult)? = nil,
+        passkeyDelete: ((_ passkeyId: String) async throws -> PasskeyDeleteResult)? = nil,
+        passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> PasskeyUpdateResult)? = nil
     ) {
         self._getUserId = getUserId
         self._getToken = getToken
         self._isAuthenticated = isAuthenticated
+        self._emailSignInRequest = emailSignInRequest
         self._magicLinkRequest = magicLinkRequest
         self._magicLinkVerify = magicLinkVerify
         self._magicLinkVerifyWithInvite = magicLinkVerifyWithInvite
@@ -125,10 +136,10 @@ public final class AuthAPI: @unchecked Sendable {
     // MARK: - Identity / token accessors
 
     /// The current user's id, or `nil` when unauthenticated.
-    public func getUserId() -> String? { _getUserId() }
+    public var userId: String? { _getUserId() }
 
     /// The current access token, or `nil` when unauthenticated.
-    public func getToken() -> String? { _getToken() }
+    public var token: String? { _getToken() }
 
     /// Whether the client currently holds an authenticated session.
     /// Mirrors JS `client.isAuthenticated()`.
@@ -136,17 +147,22 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Block until a user id is available (e.g. while a persisted session
     /// rehydrates or a refresh completes), or throw on timeout. Mirrors JS
-    /// `client.waitForUserId({ timeoutMs })` (default 5s). Returns immediately
-    /// if a user id is already present.
+    /// `client.waitForUserId({ timeoutMs })`. Returns immediately if a user id
+    /// is already present.
+    ///
+    /// `timeout` is a `TimeInterval` in **seconds** (renamed from `timeoutMs`
+    /// in #2367), and its default moved from 5s to **10s** in the same change
+    /// so it agrees with the client-level wait it sits beside. JS still
+    /// defaults to 5s.
     ///
     /// Implemented here by polling the injected `getUserId` accessor — the
     /// Swift `AuthController` exposes no event-driven waiter, so this matches
     /// the JS contract (resolve-with-id / throw-on-timeout) without one.
     @discardableResult
-    public func waitForUserId(timeoutMs: Int = 5000) async throws -> String {
+    public func waitForUserId(timeout: TimeInterval = 10) async throws -> String {
         if let uid = _getUserId() { return uid }
 
-        let deadline = Date().addingTimeInterval(Double(max(0, timeoutMs)) / 1000.0)
+        let deadline = Date().addingTimeInterval(Swift.max(0, timeout))
         let pollIntervalNs: UInt64 = 50_000_000 // 50ms
         while Date() < deadline {
             if let uid = _getUserId() { return uid }
@@ -156,8 +172,47 @@ public final class AuthAPI: @unchecked Sendable {
         throw AuthError(code: .unauthorized, message: "waitForUserId timeout")
     }
 
+    // MARK: - Email sign-in (#2884)
+
+    /// Request ONE sign-in email carrying both credentials — a 6-digit code
+    /// and, when the app allow-lists the redirect target, a magic link. The
+    /// user finishes by typing the code or tapping the link; nothing here
+    /// picks a method. Mirrors JS
+    /// `auth.emailSignInRequest({ email, redirectUri })`.
+    ///
+    /// Omitting `redirectUri` is how a code-only email is requested: the
+    /// server issues one from the same template, consulting no allow-list. A
+    /// supplied target must match the app's non-empty `emailRedirectUris`, or
+    /// the request is rejected 400 `Invalid redirect URI` (#2967).
+    public func emailSignInRequest(
+        _ params: EmailSignInRequestParams
+    ) async throws -> EmailSignInRequestResult {
+        guard let request = _emailSignInRequest else {
+            throw JsBaoError(
+                code: .unavailable,
+                message: "emailSignInRequest is not wired on this AuthAPI instance"
+            )
+        }
+        let success = try await request(params.email, params.redirectUri)
+        return EmailSignInRequestResult(success: success)
+    }
+
+    /// Convenience overload taking the fields directly.
+    public func emailSignInRequest(
+        email: String,
+        redirectUri: String? = nil
+    ) async throws -> EmailSignInRequestResult {
+        try await emailSignInRequest(
+            EmailSignInRequestParams(email: email, redirectUri: redirectUri)
+        )
+    }
+
     // MARK: - Magic link
 
+    /// - Warning: Deprecated by #2884 — `emailSignInRequest` is the one email
+    ///   entry point, and this endpoint is now an alias of it that sends the
+    ///   same email.
+    ///
     /// Request a magic-link email. Mirrors JS
     /// `auth.magicLinkRequest({ email, redirectUri })`. Returns the typed
     /// `{ success }` result.
@@ -181,13 +236,10 @@ public final class AuthAPI: @unchecked Sendable {
     /// invited email. Threaded through only when the invite-aware closure is
     /// wired; otherwise the token-only path is used.
     public func magicLinkVerify(token: String, inviteToken: String? = nil) async throws -> MagicLinkVerifyResult {
-        let raw: Any
         if let verifyWithInvite = _magicLinkVerifyWithInvite {
-            raw = try await verifyWithInvite(token, inviteToken)
-        } else {
-            raw = try await _magicLinkVerify(token)
+            return try await verifyWithInvite(token, inviteToken)
         }
-        return try JSONCoding.decode(MagicLinkVerifyResult.self, from: raw)
+        return try await _magicLinkVerify(token)
     }
 
     // MARK: - OTP
@@ -209,13 +261,10 @@ public final class AuthAPI: @unchecked Sendable {
     /// email. Threaded through only when the invite-aware closure is wired;
     /// otherwise the email+code-only path is used.
     public func otpVerify(_ params: OtpVerifyParams) async throws -> OtpVerifyResult {
-        let raw: Any
         if let verifyWithInvite = _otpVerifyWithInvite {
-            raw = try await verifyWithInvite(params.email, params.code, params.inviteToken)
-        } else {
-            raw = try await _otpVerify(params.email, params.code)
+            return try await verifyWithInvite(params.email, params.code, params.inviteToken)
         }
-        return try JSONCoding.decode(OtpVerifyResult.self, from: raw)
+        return try await _otpVerify(params.email, params.code)
     }
 
     /// Convenience overload taking the fields directly.
@@ -228,24 +277,25 @@ public final class AuthAPI: @unchecked Sendable {
     /// Fetch the app's auth configuration (`GET /oauth-config`). Mirrors JS
     /// `auth.getAuthConfig()`, returning the typed `AuthConfigInfo`.
     public func getAuthConfig() async throws -> AuthConfigInfo {
-        let raw = try await _getAuthConfig()
-        return try JSONCoding.decode(AuthConfigInfo.self, from: raw)
+        try await _getAuthConfig()
     }
 
     /// Fetch the app-launch config subset (`appId`, `name`, `mode`,
-    /// `waitlistEnabled`, `hasOAuth`, `hasPasskey`, `magicLinkEnabled`).
+    /// `waitlistEnabled`, `googleAvailable`, `hasPasskey`, `magicLinkEnabled`).
     /// Mirrors JS `client.getAppConfig()` — the 7-field projection of the
     /// `/oauth-config` envelope used to decide what login UI to show before a
     /// session exists. Decodes the same `/oauth-config` payload as
     /// `getAuthConfig()`; the extra fields are simply ignored.
     public func getAppConfig() async throws -> AppConfigInfo {
-        let raw: Any
         if let getAppConfig = _getAppConfig {
-            raw = try await getAppConfig()
-        } else {
-            raw = try await _getAuthConfig()
+            return try await getAppConfig()
         }
-        return try JSONCoding.decode(AppConfigInfo.self, from: raw)
+        // Unwired: project the 7 launch-UI fields out of the full
+        // `/oauth-config` envelope (the same payload, extra fields ignored).
+        // Projected by `AppConfigInfo`'s own initializer, not restated here:
+        // the launch UI and the flow must not be able to disagree about
+        // whether Google sign-in is available (#2891).
+        return AppConfigInfo(from: try await _getAuthConfig())
     }
 
     // MARK: - Logout
@@ -271,8 +321,7 @@ public final class AuthAPI: @unchecked Sendable {
     public func enableOfflineAccess(
         options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()
     ) async throws -> EnableOfflineAccessResult {
-        let raw = try await _enableOfflineAccess(options)
-        return try JSONCoding.decode(EnableOfflineAccessResult.self, from: raw)
+        try await _enableOfflineAccess(options)
     }
 
     /// Unlock a stored offline grant (triggers Face ID / Touch ID when the
@@ -285,7 +334,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Status of the stored offline grant (availability, expiry, method).
     /// Mirrors JS `auth.getOfflineGrantStatus()`.
-    public func getOfflineGrantStatus() -> OfflineGrantStatus {
+    public var offlineGrantStatus: OfflineGrantStatus {
         _getOfflineGrantStatus()
     }
 
@@ -326,23 +375,36 @@ public final class AuthAPI: @unchecked Sendable {
     /// returns the WebAuthn request options (challenge is base64url) plus a
     /// short-lived `challengeToken` to pass back to `passkeyAuthFinish`.
     public func passkeyAuthStart() async throws -> PasskeyAuthStartResult {
-        let (options, challengeToken) = try await passkeyAuthStartRaw()
-        return PasskeyAuthStartResult(
-            options: try JSONCoding.decode(JSONValue.self, from: options),
-            challengeToken: challengeToken
-        )
+        guard let passkeyAuthStart = _passkeyAuthStart else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        return try await passkeyAuthStart()
     }
 
     /// Complete passkey sign-in with an authenticator's
     /// `AuthenticationResponseJSON` (all binary fields base64url). Mirrors JS
     /// `passkeyAuthFinish(credential, challengeToken)`. On success the SDK
-    /// has already applied the returned access token (cause `"passkey"`).
+    /// has already applied the returned access token (cause `"passkeyAuth"`).
     public func passkeyAuthFinish(
         credential: [String: Any],
         challengeToken: String
     ) async throws -> PasskeySignInResult {
-        let raw = try await passkeyAuthFinishRaw(credential: credential, challengeToken: challengeToken)
-        return try JSONCoding.decode(PasskeySignInResult.self, from: raw)
+        try await passkeyAuthFinish(
+            credential: try JSONCoding.decode(JSONValue.self, from: credential),
+            challengeToken: challengeToken
+        )
+    }
+
+    /// `passkeyAuthFinish` taking the credential as an already-typed
+    /// `JSONValue` — what the native flow builds.
+    func passkeyAuthFinish(
+        credential: JSONValue,
+        challengeToken: String
+    ) async throws -> PasskeySignInResult {
+        guard let passkeyAuthFinish = _passkeyAuthFinish else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        return try await passkeyAuthFinish(credential, challengeToken)
     }
 
     /// Start registering a passkey for the **current (authenticated) user**.
@@ -350,11 +412,10 @@ public final class AuthAPI: @unchecked Sendable {
     /// options (challenge and `user.id` are base64url) plus a short-lived
     /// `challengeToken` to pass back to `passkeyRegisterFinish`.
     public func passkeyRegisterStart() async throws -> PasskeyRegisterStartResult {
-        let (options, challengeToken) = try await passkeyRegisterStartRaw()
-        return PasskeyRegisterStartResult(
-            options: try JSONCoding.decode(JSONValue.self, from: options),
-            challengeToken: challengeToken
-        )
+        guard let passkeyRegisterStart = _passkeyRegisterStart else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        return try await passkeyRegisterStart()
     }
 
     /// Complete passkey registration with an authenticator's
@@ -367,13 +428,26 @@ public final class AuthAPI: @unchecked Sendable {
         deviceName: String? = nil,
         inviteToken: String? = nil
     ) async throws -> PasskeyRegistrationResult {
-        let raw = try await passkeyRegisterFinishRaw(
-            credential: credential,
+        try await passkeyRegisterFinish(
+            credential: try JSONCoding.decode(JSONValue.self, from: credential),
             challengeToken: challengeToken,
             deviceName: deviceName,
             inviteToken: inviteToken
         )
-        return try JSONCoding.decode(PasskeyRegistrationResult.self, from: raw)
+    }
+
+    /// `passkeyRegisterFinish` taking the credential as an already-typed
+    /// `JSONValue` — what the native flow builds.
+    func passkeyRegisterFinish(
+        credential: JSONValue,
+        challengeToken: String,
+        deviceName: String?,
+        inviteToken: String?
+    ) async throws -> PasskeyRegistrationResult {
+        guard let passkeyRegisterFinish = _passkeyRegisterFinish else {
+            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
+        }
+        return try await passkeyRegisterFinish(credential, challengeToken, deviceName, inviteToken)
     }
 
     /// List the current user's registered passkeys. Mirrors JS
@@ -382,8 +456,7 @@ public final class AuthAPI: @unchecked Sendable {
         guard let passkeyList = _passkeyList else {
             throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
         }
-        let raw = try await passkeyList()
-        return try JSONCoding.decode(PasskeyListResult.self, from: raw)
+        return try await passkeyList()
     }
 
     /// Delete a registered passkey by id. Mirrors JS
@@ -393,8 +466,7 @@ public final class AuthAPI: @unchecked Sendable {
         guard let passkeyDelete = _passkeyDelete else {
             throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
         }
-        let raw = try await passkeyDelete(passkeyId)
-        return try JSONCoding.decode(PasskeyDeleteResult.self, from: raw)
+        return try await passkeyDelete(passkeyId)
     }
 
     /// Rename a registered passkey. Mirrors JS
@@ -404,59 +476,27 @@ public final class AuthAPI: @unchecked Sendable {
         guard let passkeyUpdate = _passkeyUpdate else {
             throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
         }
-        let raw = try await passkeyUpdate(passkeyId, deviceName)
-        return try JSONCoding.decode(PasskeyUpdateResult.self, from: raw)
+        return try await passkeyUpdate(passkeyId, deviceName)
     }
+}
 
-    // MARK: Passkeys — raw plumbing shared with the native flows
+// MARK: - PasskeyWire bridging
+//
+// `PasskeyWire` speaks the WebAuthn `[String: Any]` dictionaries that
+// AuthenticationServices and @simplewebauthn exchange. The typed passkey
+// results carry the options as a `JSONValue`, so the native flows convert
+// once, here, rather than each call site re-deriving the bridge.
 
-    /// Like `passkeyAuthStart()` but returns the options as the raw
-    /// `[String: Any]` dict the native flow parses with `PasskeyWire`.
-    func passkeyAuthStartRaw() async throws -> (options: [String: Any], challengeToken: String) {
-        guard let passkeyAuthStart = _passkeyAuthStart else {
-            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
-        }
-        var dict = try await passkeyAuthStart()
-        guard let challengeToken = dict["challengeToken"] as? String else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey auth start response")
-        }
-        dict.removeValue(forKey: "challengeToken")
-        return (dict, challengeToken)
+extension PasskeyAuthStartResult {
+    /// The WebAuthn request options as the dictionary `PasskeyWire` parses.
+    var wireOptions: [String: Any] {
+        get throws { try JSONCoding.jsonObject(from: options) as? [String: Any] ?? [:] }
     }
+}
 
-    func passkeyAuthFinishRaw(
-        credential: [String: Any],
-        challengeToken: String
-    ) async throws -> [String: Any] {
-        guard let passkeyAuthFinish = _passkeyAuthFinish else {
-            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
-        }
-        return try await passkeyAuthFinish(credential, challengeToken)
-    }
-
-    /// Like `passkeyRegisterStart()` but returns the options as the raw
-    /// `[String: Any]` dict the native flow parses with `PasskeyWire`.
-    func passkeyRegisterStartRaw() async throws -> (options: [String: Any], challengeToken: String) {
-        guard let passkeyRegisterStart = _passkeyRegisterStart else {
-            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
-        }
-        var dict = try await passkeyRegisterStart()
-        guard let challengeToken = dict["challengeToken"] as? String else {
-            throw JsBaoError(code: .unavailable, message: "Invalid passkey register start response")
-        }
-        dict.removeValue(forKey: "challengeToken")
-        return (dict, challengeToken)
-    }
-
-    func passkeyRegisterFinishRaw(
-        credential: [String: Any],
-        challengeToken: String,
-        deviceName: String?,
-        inviteToken: String?
-    ) async throws -> [String: Any] {
-        guard let passkeyRegisterFinish = _passkeyRegisterFinish else {
-            throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
-        }
-        return try await passkeyRegisterFinish(credential, challengeToken, deviceName, inviteToken)
+extension PasskeyRegisterStartResult {
+    /// The WebAuthn creation options as the dictionary `PasskeyWire` parses.
+    var wireOptions: [String: Any] {
+        get throws { try JSONCoding.jsonObject(from: options) as? [String: Any] ?? [:] }
     }
 }

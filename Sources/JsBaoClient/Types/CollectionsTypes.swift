@@ -152,6 +152,17 @@ public struct CreateCollectionParams: Encodable, Sendable {
     /// Deprecated — mirrors js-bao's `@deprecated` on `CreateCollectionParams.contextId`.
     @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
     public var contextId: String? = nil
+    /// Create-time resource metadata to stamp on the new collection, keyed by
+    /// category name → that category's values (issue #1420). Each entry is
+    /// schema-validated but the category `writeRule` is waived — creation
+    /// authority covers the initial stamp. At most 10 categories; any invalid
+    /// entry fails the whole create.
+    ///
+    /// The values are staged before the collection type's `collection.create`
+    /// rule runs (issue #1876), so a CEL create rule can gate on them via
+    /// `md.self.<category>.<key>`. Mirrors js-bao's
+    /// `CreateCollectionParams.initialMetadata`.
+    public var initialMetadata: [String: [String: JSONValue]]? = nil
 
     /// Non-deprecated initializer. Set `contextId` through the deprecated
     /// overload below so that binding a context surfaces the warning at the call
@@ -159,11 +170,13 @@ public struct CreateCollectionParams: Encodable, Sendable {
     public init(
         name: String,
         description: String? = nil,
-        collectionType: String? = nil
+        collectionType: String? = nil,
+        initialMetadata: [String: [String: JSONValue]]? = nil
     ) {
         self.name = name
         self.description = description
         self.collectionType = collectionType
+        self.initialMetadata = initialMetadata
     }
 
     /// Deprecated overload that accepts `contextId`, so
@@ -175,12 +188,14 @@ public struct CreateCollectionParams: Encodable, Sendable {
         name: String,
         description: String? = nil,
         collectionType: String? = nil,
-        contextId: String?
+        contextId: String?,
+        initialMetadata: [String: [String: JSONValue]]? = nil
     ) {
         self.name = name
         self.description = description
         self.collectionType = collectionType
         self.contextId = contextId
+        self.initialMetadata = initialMetadata
     }
 }
 

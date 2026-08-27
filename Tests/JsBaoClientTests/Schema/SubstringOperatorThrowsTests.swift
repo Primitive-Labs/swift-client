@@ -111,7 +111,7 @@ final class SubstringOperatorThrowsTests: XCTestCase {
         let model = try seeded()
         let oversize = String(repeating: "x", count: 1025)
         assertSubstringThrows(expectedFieldType: "string") {
-            try model.query(["title": ["$containsText": oversize]])
+            try model.query(["title": ["$containsText": .string(oversize)]])
         }
     }
 
@@ -120,7 +120,7 @@ final class SubstringOperatorThrowsTests: XCTestCase {
         let exact = String(repeating: "x", count: 1024)
         // Exactly 1024 is allowed (js-bao throws only on > 1024). No match
         // is expected, but the call must NOT throw.
-        let rows = try model.query(["title": ["$containsText": exact]])
+        let rows = try model.query(["title": ["$containsText": .string(exact)]])
         XCTAssertEqual(rows.count, 0)
     }
 
@@ -141,7 +141,7 @@ final class SubstringOperatorThrowsTests: XCTestCase {
         // op adds no condition, so every row matches (not "no rows").
         let rows = try model.query(["title": ["$containsText": "   "]])
         XCTAssertEqual(
-            Set(rows.compactMap { $0["id"] as? String }), ["a", "b"],
+            Set(rows.compactMap { $0["id"]?.stringValue }), ["a", "b"],
             "whitespace-only substring op contributes no condition (js-bao no-op)"
         )
     }
@@ -151,13 +151,13 @@ final class SubstringOperatorThrowsTests: XCTestCase {
     func testValidSubstringOnStringFieldStillReturnsRows() throws {
         let model = try seeded()
         let rows = try model.query(["title": ["$startsWith": "Alpha"]])
-        XCTAssertEqual(rows.compactMap { $0["id"] as? String }, ["a"])
+        XCTAssertEqual(rows.compactMap { $0["id"]?.stringValue }, ["a"])
     }
 
     func testValidSubstringOnStringsetFieldStillReturnsRows() throws {
         let model = try seeded()
         let rows = try model.query(["tags": ["$startsWith": "draft-"]])
-        XCTAssertEqual(rows.compactMap { $0["id"] as? String }, ["a"])
+        XCTAssertEqual(rows.compactMap { $0["id"]?.stringValue }, ["a"])
     }
 
     // MARK: - Throws propagate through count / aggregate
@@ -185,7 +185,7 @@ final class SubstringOperatorThrowsTests: XCTestCase {
         let model = try seeded()
         assertSubstringThrows(expectedFieldType: "number") {
             try model.query([
-                "$and": [["priority": ["$startsWith": "1"]] as DocumentFilter]
+                "$and": [["priority": ["$startsWith": "1"]]]
             ])
         }
     }

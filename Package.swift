@@ -1,4 +1,14 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.1
+//
+// 6.1, not 6.0 (#2966): the tools version is what PackagePlugin gates its API
+// on, and `Target.directoryURL` — the only non-deprecated way for
+// `JsBaoCodegenPlugin` to read the consuming target's source directory —
+// arrived in PackageDescription 6.1. At 6.0 the plugin had to go through
+// `target.directory.string`, and SwiftPM compiles the plugin inside every
+// package that uses it, so that deprecation warning printed on every consumer
+// build. The floor this imposes on consumers is a Swift 6.1 toolchain
+// (Xcode 16.3); `docs/README.md` documents it and
+// `PluginDeprecationHermeticTests` keeps the two in step.
 import PackageDescription
 
 let package = Package(
@@ -54,20 +64,18 @@ let package = Package(
                 .product(name: "TOMLKit", package: "TOMLKit"),
             ],
             path: "Sources/JsBaoClient",
-            // Swift 6 language mode is NOT yet enabled on this target.
-            // Issue #1910 eliminated the 231 `unavailable from
-            // asynchronous contexts` warnings (hard errors under Swift 6)
-            // by converting raw NSLock lock/unlock to scoped `withLock`.
-            // Turning on the language mode here
-            // (`swiftSettings: [.swiftLanguageMode(.v6)]`, plus a
-            // `swift-tools-version` 6.0 bump and a package-level
-            // `swiftLanguageModes: [.v5]` pin to keep the flip scoped to
-            // this one target) then surfaces ~851 further strict-
-            // concurrency errors — ~740 of them `Sendable`-conformance on
-            // the public generic model API (`Any` payloads, `YDocument`,
-            // the `R` model parameter) — which is a substantial adoption
-            // beyond the NSLock refactor's scope. Tracked in #1946; flip
-            // this target once that lands.
+            // No `swiftSettings:` here any more — the whole package is in the
+            // Swift 6 language mode via `swiftLanguageModes: [.v6]` at the
+            // bottom of this manifest (#2310). This target carried the only
+            // per-target opt-in between #1946 and #2310.
+            //
+            // `scripts/v6-sendable-gate.sh` is still the regression gate for
+            // this target: it builds it, reports any `Sendable` error site per
+            // file, counts the warning-level strict-concurrency sites, and
+            // asserts a budget when given `--max` / `--max-warnings` /
+            // `--require-zero`. `run-tests.sh` runs it that way before the
+            // suite. Its first check is that the committed mode is still `.v6`
+            // — a silent revert would otherwise read as "zero sites".
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]
@@ -122,5 +130,24 @@ let package = Package(
             path: "Tests/JsBaoClientTests/CrossPlatform/E2E/swift",
             plugins: [.plugin(name: "JsBaoCodegenPlugin")]
         ),
-    ]
+    ],
+    // Package-wide: every target compiles in the Swift 6 language mode, so
+    // strict concurrency checking is `complete` and its diagnostics are hard
+    // errors everywhere in this package.
+    //
+    // Getting the library here took the whole concurrency-modernization epic:
+    // #1910 removed the 231 `unavailable from asynchronous contexts` sites (raw
+    // NSLock lock/unlock → scoped `withLock`), then #1988 (A, mechanical
+    // fixes), #1991 (B, typed transport spine), #1992 (C, honest
+    // model/schema/query `Sendable`), #1993 (D1-D3, actorized async managers)
+    // and #1994 (E, AsyncStream events) drove the remaining `Sendable` error
+    // sites from 67 to 0, and #1946 (F) flipped the `JsBaoClient` target on its
+    // own. #2310 finished the job: `JsBaoClientTests` needed 91 sites cleared
+    // (the same classes, plus lock-guarded `static var` test stubs, which are
+    // global mutable state under `.v6`), and `SwiftBaoCodegen`,
+    // `SwiftBaoCodegenTests` and `E2EMiniApp` were already clean.
+    //
+    // Because the mode is now the package default, a NEW target added below
+    // inherits it — there is no per-target opt-in to remember.
+    swiftLanguageModes: [.v6]
 )

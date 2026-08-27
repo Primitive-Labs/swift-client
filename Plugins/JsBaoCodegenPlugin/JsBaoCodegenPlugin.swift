@@ -21,9 +21,19 @@ import Foundation
 /// narrow rule keeps unrelated TOML files in the target (e.g. tool
 /// configs) from accidentally getting codegen'd, while `models.toml`
 /// matches js-bao's `js-bao-codegen-v2` input so one shared file feeds
-/// both runtimes (#944). Need to use a different filename? Pass `--input`
-/// via a custom plugin or a build-phase script — the plugin is meant for
-/// the common case.
+/// both runtimes (#944).
+///
+/// Schema outside the target — e.g. one `models.toml` shared with a web
+/// client in a sibling directory (#2889)? Add `bao-codegen.json` at the
+/// root of the target's source directory:
+/// ```json
+/// { "input": "../../models/models.toml" }
+/// ```
+/// The path resolves against the target directory (absolute paths are used
+/// as-is), and it names exactly ONE schema — see `JsBaoCodegenConfig`
+/// below. When the file is present it replaces the scan; when it is absent
+/// nothing changes. Also `exclude: ["bao-codegen.json"]` in the target so
+/// SwiftPM doesn't warn about an unhandled resource.
 ///
 /// Why `buildCommand` (not `prebuildCommand`): modern SwiftPM rejects
 /// prebuild commands that point at source-built executables ("a prebuild
@@ -48,20 +58,36 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         // SwiftPM only allows tools that appear in the plugin's
         // dependency list.
         let tool = try context.tool(named: "SwiftBaoCodegen")
-        let outputDir = context.pluginWorkDirectory.appending("GeneratedModels")
+        let outputDir = context.pluginWorkDirectoryURL.appending(path: "GeneratedModels")
 
-        // Find every `*schema.toml` in the target, plus the bare
+        // A `bao-codegen.json` naming the schema replaces the scan entirely
+        // (#2889) — that is how a shared `models.toml` outside the target,
+        // feeding a web client and this one, gets selected. An unusable
+        // config throws rather than falling back to the scan, which would
+        // codegen from the wrong schema.
+        //
+        // `target.directoryURL`, not `target.directory`: `Path` is deprecated
+        // in favour of `URL`, and reading `.string` off it warned on every
+        // consumer build (#2966). The URL accessor arrived in
+        // PackageDescription 6.1, which is why the manifest declares
+        // swift-tools-version 6.1.
+        let targetDirectory = target.directoryURL
+        let configured = try JsBaoCodegenConfig.resolveInput(targetDirectory: targetDirectory)
+
+        // Otherwise: every `*schema.toml` in the target, plus the bare
         // `models.toml` filename js-bao's codegen reads (#944) — so a
         // single `models.toml` drives both the JS and Swift generators
         // without renaming. The `hasSuffix("schema.toml")` rule still
         // accepts `models.schema.toml`, `app.schema.toml`, etc.; the
         // explicit `models.toml` match adds the JS-canonical name.
-        let inputs = target.sourceFiles
+        let inputs =
+            configured.map { [$0] }
+            ?? target.sourceFiles
             .filter {
-                let name = $0.path.lastComponent
+                let name = $0.url.lastPathComponent
                 return name.hasSuffix("schema.toml") || name == "models.toml"
             }
-            .map { $0.path }
+            .map { $0.url }
 
         guard !inputs.isEmpty else { return [] }
 
@@ -72,14 +98,14 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
             // itself remains the canonical writer — this scan only has
             // to agree on which filenames will exist.
             let predicted = try predictGeneratedFiles(at: input)
-            let outputs = predicted.map { outputDir.appending($0) }
+            let outputs = predicted.map { outputDir.appending(path: $0) }
 
             commands.append(.buildCommand(
-                displayName: "swift-bao-codegen \(input.lastComponent)",
-                executable: tool.path,
+                displayName: "swift-bao-codegen \(input.lastPathComponent)",
+                executable: tool.url,
                 arguments: [
-                    "--input", input.string,
-                    "--output", outputDir.string,
+                    "--input", input.path(percentEncoded: false),
+                    "--output", outputDir.path(percentEncoded: false),
                 ],
                 inputFiles: [input],
                 outputFiles: outputs
@@ -96,8 +122,7 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
     /// without a heavyweight dep, and we only need to identify
     /// `[models.X]` headers and any per-model `class_name` override.
     /// The scan mirrors `SwiftBaoCodegen.TomlParser` / `Naming.pascalCase`.
-    private func predictGeneratedFiles(at path: Path) throws -> [String] {
-        let url = URL(fileURLWithPath: path.string)
+    private func predictGeneratedFiles(at url: URL) throws -> [String] {
         let text = try String(contentsOf: url, encoding: .utf8)
 
         // Track ordered set of model names so the same TOML always
@@ -222,3 +247,135 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         return out
     }
 }
+
+// MARK: - bao-codegen.json
+//
+// Mirrored verbatim in Tests/SwiftBaoCodegenTests/PluginConfigHermeticTests.swift,
+// because SwiftPM does not let a test target import plugin code. That file's
+// `testPluginSourceMatchesTheMirror` compares these bytes against its copy, so
+// edit both — and keep the marker comments exactly as they are.
+// PLUGIN-CONFIG-MIRROR: BEGIN
+/// Error thrown when a `bao-codegen.json` exists but cannot be honored.
+/// The plugin fails the build instead of falling back to the filename
+/// scan — a silent fallback would generate against the wrong schema.
+struct JsBaoCodegenConfigError: Error, CustomStringConvertible {
+    let description: String
+}
+
+/// Optional per-target codegen configuration: `bao-codegen.json` at the
+/// root of the target's source directory, shape `{ "input": "<path>" }`.
+///
+/// It exists so one shared `models.toml` can live OUTSIDE the SwiftPM
+/// target (#2889): a web client and a Swift client in sibling directories
+/// must read the same schema file, because the TOML keys are wire field
+/// names and a second copy that drifts orphans the other client's records.
+///
+/// Exactly one input, deliberately: every build command the plugin emits
+/// writes into a single `GeneratedModels` directory, where the codegen tool
+/// emits one barrel and sweeps generated files it did not write on that
+/// run. Two schemas in one target would delete each other's output.
+enum JsBaoCodegenConfig {
+
+    /// Config filename, looked up directly on disk rather than through
+    /// `target.sourceFiles` so consumers can `exclude:` it from the target.
+    static let filename = "bao-codegen.json"
+
+    /// Resolve the configured schema for a target's source directory.
+    ///
+    /// Returns `nil` only when no config file exists — the caller then falls
+    /// back to the `*schema.toml` / `models.toml` scan. A config that exists
+    /// but is unusable throws; it never degrades to the scan.
+    static func resolveInput(targetDirectory: URL) throws -> URL? {
+        let configURL = targetDirectory.appending(path: filename)
+        let configPath = configURL.path(percentEncoded: false)
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: configPath) else { return nil }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: configURL)
+        } catch {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) could not be read: \(error)"
+            )
+        }
+
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) is not valid JSON: "
+                    + "\(error.localizedDescription)"
+            )
+        }
+
+        guard let object = parsed as? [String: Any] else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) must be a JSON object "
+                    + "of the form {\"input\": \"<path>\"}."
+            )
+        }
+
+        // Caught explicitly: an `inputs` array is the obvious guess, and
+        // silently ignoring it would codegen from the wrong schema.
+        if object["inputs"] != nil {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) uses \"inputs\"; exactly "
+                    + "one \"input\" is supported per target, because the plugin "
+                    + "routes every schema into one GeneratedModels directory whose "
+                    + "barrel and stale-file sweep cannot host two schemas."
+            )
+        }
+
+        guard let rawInput = object["input"] else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) is missing the required "
+                    + "\"input\" key; expected {\"input\": \"<path>\"}."
+            )
+        }
+
+        guard let inputPath = rawInput as? String else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) has a non-string \"input\" "
+                    + "(\(rawInput)); expected a path to a schema TOML."
+            )
+        }
+
+        let trimmed = inputPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) has an empty \"input\"; "
+                    + "expected a path to a schema TOML."
+            )
+        }
+
+        // Relative paths resolve against the target directory, so
+        // "../../models/models.toml" reaches a shared schema outside the
+        // package; absolute paths are used as-is.
+        //
+        // The base is rebuilt with `isDirectory: true`: relative resolution
+        // drops the base's last component unless the URL is known to be a
+        // directory, which would silently shift every `../` up one level.
+        let baseDirectory = URL(
+            fileURLWithPath: targetDirectory.path(percentEncoded: false), isDirectory: true)
+        let resolved =
+            trimmed.hasPrefix("/")
+            ? URL(fileURLWithPath: trimmed).standardizedFileURL
+            : URL(fileURLWithPath: trimmed, relativeTo: baseDirectory).standardizedFileURL
+
+        var isDirectory: ObjCBool = false
+        let exists = fileManager.fileExists(
+            atPath: resolved.path(percentEncoded: false), isDirectory: &isDirectory)
+        guard exists, !isDirectory.boolValue else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) names input \"\(trimmed)\", "
+                    + "which resolves to \(resolved.path(percentEncoded: false)) — "
+                    + "no such file."
+            )
+        }
+
+        return resolved
+    }
+}
+// PLUGIN-CONFIG-MIRROR: END

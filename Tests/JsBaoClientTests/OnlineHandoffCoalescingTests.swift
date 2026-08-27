@@ -26,6 +26,7 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
         private let lock = NSLock()
         private var _value = 0
         func increment() { lock.withLock { _value += 1 } }
+        func reset() { lock.withLock { _value = 0 } }
         var value: Int { lock.withLock { _value } }
     }
 
@@ -77,7 +78,7 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
     private func makeOfflineClient(
         refreshCalls: AtomicCounter,
         holdMs: UInt64
-    ) -> JsBaoClient {
+    ) async -> JsBaoClient {
         let client = JsBaoClient(options: JsBaoClientOptions(
             apiUrl: "http://127.0.0.1:1",
             wsUrl: "ws://127.0.0.1:1",
@@ -86,11 +87,16 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
             storageConfig: .memory,
             autoNetwork: false
         ))
-        client.authController.makeRequest = { _, _, _ in
+        client.authController.replaceTransportForTesting(RecordingTransport(responder: { _ in
             refreshCalls.increment()
             if holdMs > 0 { try await Task.sleep(nanoseconds: holdMs * 1_000_000) }
             throw RefreshUnavailable()
-        }
+        }))
+        // A token-less client now spends one startup refresh on the cookie
+        // (#2656). Let it settle and discard it, so the counts below are the
+        // handoff's own round trips.
+        await client.authController.waitForAuthReady()
+        refreshCalls.reset()
         return client
     }
 
@@ -102,10 +108,10 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
         let onlineAuthRequired = AtomicCounter()
         // 200ms in-flight hold lets every concurrent caller reach the
         // coalescing check before the leader's handoff settles.
-        let client = makeOfflineClient(refreshCalls: refreshCalls, holdMs: 200)
+        let client = await makeOfflineClient(refreshCalls: refreshCalls, holdMs: 200)
         defer { Task { await client.destroy() } }
 
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             onlineAuthRequired.increment()
         }
         defer { sub.cancel() }
@@ -132,7 +138,7 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
             "the single coalesced handoff performs exactly one refresh round trip"
         )
         XCTAssertEqual(
-            client.getNetworkMode(), .offline,
+            client.networkMode, .offline,
             "the failed handoff reverts the client to offline mode"
         )
     }
@@ -144,10 +150,10 @@ final class OnlineHandoffCoalescingTests: XCTestCase {
     func testSequentialGoOnlineEachRunsHandoff() async throws {
         let refreshCalls = AtomicCounter()
         let onlineAuthRequired = AtomicCounter()
-        let client = makeOfflineClient(refreshCalls: refreshCalls, holdMs: 0)
+        let client = await makeOfflineClient(refreshCalls: refreshCalls, holdMs: 0)
         defer { Task { await client.destroy() } }
 
-        let sub = client.events.on(.authOnlineRequired) { (_: AuthOnlineRequiredEvent) in
+        let sub = client.eventEmitter.subscribe(AuthOnlineRequiredEvent.self) { _ in
             onlineAuthRequired.increment()
         }
         defer { sub.cancel() }

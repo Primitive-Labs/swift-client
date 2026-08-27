@@ -8,22 +8,31 @@ import Yniffi
 /// specific to opening / owning a model.
 final class DynamicModelTests: XCTestCase {
 
-    /// Opening a model automatically runs `SchemaSync.syncModelMeta`
-    /// so `_meta_{name}` exists immediately after init.
-    func testInitWritesMetaSchema() throws {
+    /// Opening a model writes NOTHING into the doc; the first record write
+    /// carries `_meta_{name}` (js-bao parity: `BaseModel.save` ->
+    /// `syncModelMeta`, #2587). A read-only client must leave the ydoc
+    /// byte-empty so a cold open's syncStep1 carries an empty state vector.
+    func testInitWritesNothingAndFirstSaveWritesMetaSchema() throws {
         let doc = YDocument()
         SchemaSync.clearCache()
-
-        _ = DynamicModel(doc: doc, schema: PrimitiveSchema(
+        let schema = PrimitiveSchema(
             name: "todos",
-            fields: ["title": FieldDescriptor(type: .string)]
-        ))
-
-        // Confirm _meta_todos exists with the field.
-        let discovered = SchemaDiscovery.discoverSchema(
-            doc: doc,
-            modelNames: ["todos"]
+            fields: [
+                "id": FieldDescriptor(type: .id),
+                "title": FieldDescriptor(type: .string),
+            ]
         )
+
+        let model = DynamicModel(doc: doc, schema: schema)
+
+        XCTAssertNil(
+            SchemaDiscovery.discoverSchema(doc: doc, modelNames: ["todos"]).models["todos"],
+            "opening a model must not write _meta_todos — meta is a save-time write (#2587)"
+        )
+
+        _ = try model.create(id: "t1", values: ["title": .string("first")])
+
+        let discovered = SchemaDiscovery.discoverSchema(doc: doc, modelNames: ["todos"])
         XCTAssertEqual(discovered.models["todos"]?.fields["title"]?.type, .string)
     }
 

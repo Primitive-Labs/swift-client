@@ -157,7 +157,15 @@ final class GoogleSignInUnitTests: XCTestCase {
         XCTAssertEqual(bare, "/oauth/callback?code=abc&state=c3RhdGU%3D")
     }
 
-    func testHandleOAuthCallbackEmitsGoogleAuthCause() async throws {
+    /// #2657 (audit item A10): the cause is the JS client's `oauthCallback`,
+    /// not the Swift-only `google`. The token is a real (decodable) JWT because
+    /// `.authSuccess` is now gated on a derivable userId — a token the client
+    /// cannot read a user out of is not reported as a sign-in.
+    func testHandleOAuthCallbackEmitsOauthCallbackCause() async throws {
+        // Minted once: `makeTestJwt` serializes a dictionary, so two calls with
+        // the same claims can order the keys differently and produce different
+        // strings.
+        let token = makeTestJwt(userId: "google-user")
         let emitter = EventEmitter()
         let controller = AuthController(
             appId: "test-app",
@@ -168,17 +176,17 @@ final class GoogleSignInUnitTests: XCTestCase {
             refreshProxy: nil,
             persistConfig: AuthConfig()
         )
-        controller.makeRequest = { _, _, _ in
-            ["token": "token-google", "isNewUser": false]
-        }
+        controller.setTransport(RecordingTransport(
+            json: #"{"token": "\#(token)", "isNewUser": false}"#
+        ))
 
-        let events = try await collectEvents(from: emitter, event: .authSuccess) {
+        let events = try await collectEvents(from: emitter, event: AuthSuccessEvent.self) {
             _ = try await controller.handleOAuthCallback(code: "code", state: "state")
         }
 
-        let success = try XCTUnwrap(events.first as? AuthSuccessEvent)
-        XCTAssertEqual(success.token, "token-google")
-        XCTAssertEqual(success.cause, "google")
+        let success = try XCTUnwrap(events.first)
+        XCTAssertEqual(success.token, token)
+        XCTAssertEqual(success.cause, "oauthCallback")
     }
 
     func testStrictPercentEncodeLeavesUnreservedCharacters() throws {
@@ -303,17 +311,27 @@ final class GoogleSignInLiveTests: XCTestCase {
     }
 
     func testStartOAuthFlowBuildsAuthorizeUrlFromServerConfig() async throws {
-        // NOTE: the admin API currently only allow-lists https/localhost
-        // redirect URIs, so a custom-scheme URI (the native
-        // `com.googleusercontent.apps.*:/oauth2redirect/google` shape) can't
-        // be registered against today's server. Use an https URI here — the
-        // client-side flow under test is identical either way.
+        // The configuration is the `ios` ENTRY of the Google client map
+        // (#2891), because that is the entry a Swift app reads: Google
+        // registers a client per platform, and a `web` entry would leave this
+        // client correctly reporting Google unavailable. No `clientSecret` —
+        // Google issues none for the iOS client type and the server rejects one
+        // outright; PKCE is what proves possession.
+        //
+        // An https redirect URI rather than the native
+        // `com.googleusercontent.apps.*:/oauth2redirect/google` shape only
+        // because the client-side flow under test is identical either way.
         let redirectUri = "https://example.com/oauth/callback"
         _ = try await ctx.updateTestApp(appId: testApp.appId, fields: [
-            "googleClientId": "test-123.apps.googleusercontent.com",
-            "googleClientSecret": "test-secret",
             "googleOAuthEnabled": true,
-            "redirectUris": [redirectUri],
+            "googleClients": [
+                "clients": [
+                    "ios": [
+                        "clientId": "test-123.apps.googleusercontent.com",
+                        "redirectUris": [redirectUri],
+                    ],
+                ],
+            ],
         ])
 
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
@@ -343,8 +361,8 @@ final class GoogleSignInLiveTests: XCTestCase {
     }
 
     func testStartOAuthFlowThrowsWhenOAuthNotConfigured() async throws {
-        // Fresh app has no googleClientId — mirrors the JS client throwing
-        // "OAuth not configured".
+        // A fresh app has no Google client map at all, so its `ios` entry is
+        // absent — mirrors the JS client throwing "OAuth not configured".
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 

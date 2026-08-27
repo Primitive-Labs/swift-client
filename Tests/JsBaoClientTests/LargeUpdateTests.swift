@@ -55,7 +55,7 @@ final class LargeUpdateTests: XCTestCase {
         // Write a large payload (>100KB) to trigger R2 storage
         let largeString = String(repeating: "A", count: 150_000)
         let map1: YMap<String> = doc1.getOrCreateMap(named: "document")
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             map1.updateValue(largeString, forKey: "largeField", transaction: txn)
         }
 
@@ -105,7 +105,7 @@ final class LargeUpdateTests: XCTestCase {
         let map1: YMap<String> = doc1.getOrCreateMap(named: "seqData")
         for i in 0..<3 {
             let largeValue = String(repeating: String(Character(UnicodeScalar(65 + i)!)), count: 120_000) // "AAA...", "BBB...", "CCC..."
-            client1.transactAndSync(docId) { txn in
+            try client1.transactAndSync(docId) { txn in
                 map1.updateValue(largeValue, forKey: "large_\(i)", transaction: txn)
             }
             // Allow each update to propagate before the next
@@ -164,14 +164,14 @@ final class LargeUpdateTests: XCTestCase {
         // Client 1 writes a large update
         let largeMap: YMap<String> = doc1.getOrCreateMap(named: "largeContent")
         let bigData = String(repeating: "X", count: 150_000)
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             largeMap.updateValue(bigData, forKey: "bigData", transaction: txn)
         }
 
         // Client 2 writes small updates concurrently
         let smallMap: YMap<String> = doc2.getOrCreateMap(named: "smallUpdates")
         for i in 0..<10 {
-            client2.transactAndSync(docId) { txn in
+            try client2.transactAndSync(docId) { txn in
                 smallMap.updateValue("value_\(i)", forKey: "small_\(i)", transaction: txn)
             }
             try await delay(0.2)
@@ -235,7 +235,7 @@ final class LargeUpdateTests: XCTestCase {
         // Client 1 writes a large, structured payload
         let map1: YMap<String> = doc1.getOrCreateMap(named: "document")
         let largeContent = String(repeating: "Z", count: 130_000)
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             map1.updateValue(largeContent, forKey: "content", transaction: txn)
         }
         try await delay(5)
@@ -250,7 +250,7 @@ final class LargeUpdateTests: XCTestCase {
 
         // Now client 2 writes back another large update
         let largeContent2 = String(repeating: "W", count: 125_000)
-        client2.transactAndSync(docId) { txn in
+        try client2.transactAndSync(docId) { txn in
             map2.updateValue(largeContent2, forKey: "content2", transaction: txn)
         }
         try await delay(5)

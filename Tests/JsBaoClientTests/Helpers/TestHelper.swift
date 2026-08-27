@@ -98,19 +98,23 @@ func eventuallyValue<T>(
     )
 }
 
-/// Collect events emitted during a block.
-func collectEvents(
+/// Collect the payloads of one event emitted during a block.
+///
+/// Typed on the payload, matching the client's own event surface — the event key
+/// comes from `E.eventKey`, so a caller cannot ask for a payload type under the
+/// wrong key.
+func collectEvents<E: JsBaoEventPayload>(
     from emitter: EventEmitter,
-    event: JsBaoEvent,
+    event type: E.Type,
     during block: () async throws -> Void
-) async rethrows -> [Any] {
-    var events: [Any] = []
-    let sub = emitter.onAny(event) { payload in
-        events.append(payload)
+) async rethrows -> [E] {
+    let collected = ThreadSafeBox<[E]>([])
+    let sub = emitter.subscribe(type) { payload in
+        collected.mutate { $0.append(payload) }
     }
     try await block()
     sub.cancel()
-    return events
+    return collected.value
 }
 
 /// Sleep for given seconds.

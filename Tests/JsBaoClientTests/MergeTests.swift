@@ -53,12 +53,12 @@ final class MergeTests: XCTestCase {
 
         // Both clients write to different keys
         let map1a: YMap<String> = doc1.getOrCreateMap(named: "data")
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             map1a.updateValue("from-client1", forKey: "key1", transaction: txn)
         }
 
         let map2a: YMap<String> = doc2.getOrCreateMap(named: "data")
-        client2.transactAndSync(docId) { txn in
+        try client2.transactAndSync(docId) { txn in
             map2a.updateValue("from-client2", forKey: "key2", transaction: txn)
         }
 
@@ -111,12 +111,12 @@ final class MergeTests: XCTestCase {
 
         // Both clients write to the same key concurrently
         let map1c: YMap<String> = doc1.getOrCreateMap(named: "data")
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             map1c.updateValue("value-from-1", forKey: "sharedKey", transaction: txn)
         }
 
         let map2c: YMap<String> = doc2.getOrCreateMap(named: "data")
-        client2.transactAndSync(docId) { txn in
+        try client2.transactAndSync(docId) { txn in
             map2c.updateValue("value-from-2", forKey: "sharedKey", transaction: txn)
         }
 
@@ -185,17 +185,17 @@ final class MergeTests: XCTestCase {
 
         // Each client writes to its own key
         let map1: YMap<String> = doc1.getOrCreateMap(named: "data")
-        client1.transactAndSync(docId) { txn in
+        try client1.transactAndSync(docId) { txn in
             map1.updateValue("from-client1", forKey: "key1", transaction: txn)
         }
 
         let map2: YMap<String> = doc2.getOrCreateMap(named: "data")
-        client2.transactAndSync(docId) { txn in
+        try client2.transactAndSync(docId) { txn in
             map2.updateValue("from-client2", forKey: "key2", transaction: txn)
         }
 
         let map3: YMap<String> = doc3.getOrCreateMap(named: "data")
-        client3.transactAndSync(docId) { txn in
+        try client3.transactAndSync(docId) { txn in
             map3.updateValue("from-client3", forKey: "key3", transaction: txn)
         }
 
@@ -266,11 +266,11 @@ final class MergeTests: XCTestCase {
         // Alternate edits rapidly: client1 writes even keys, client2 writes odd keys
         for i in 0..<totalEdits {
             if i % 2 == 0 {
-                client1.transactAndSync(docId) { txn in
+                try client1.transactAndSync(docId) { txn in
                     map1.updateValue("c1_val_\(i)", forKey: "edit_\(i)", transaction: txn)
                 }
             } else {
-                client2.transactAndSync(docId) { txn in
+                try client2.transactAndSync(docId) { txn in
                     map2.updateValue("c2_val_\(i)", forKey: "edit_\(i)", transaction: txn)
                 }
             }

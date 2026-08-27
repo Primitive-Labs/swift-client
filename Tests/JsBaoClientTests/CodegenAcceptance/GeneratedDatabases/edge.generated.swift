@@ -1,4 +1,4 @@
-// AUTO-GENERATED FROM database-types/edge.toml — DO NOT EDIT.
+// AUTO-GENERATED FROM database-type-configs/edge.toml — DO NOT EDIT.
 // Run `primitive databases codegen --lang swift` to regenerate.
 // fingerprint: aa77e65e0ce86595
 

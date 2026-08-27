@@ -4,10 +4,13 @@ import XCTest
 /// Live integration coverage for the typed `client.analytics` namespace
 /// (#951) and the `analyticsAutoEvents` gating (#963) — #1058 bucket 1.
 ///
-/// Observability: events are captured via `AnalyticsQueue.onEventLogged`
+/// Observability: events are captured via `AnalyticsQueue.setOnEventLogged`
 /// (internal, `@testable`-only) — the Swift analog of the JS tests poking
 /// `client.analyticsQueue`. The queue itself, the WS transport, and the dev
 /// server are all real.
+///
+/// The captured rows are `[String: JSONValue]` since #1993 Phase D3: the queue
+/// is an actor, so its buffer had to lose `Any`.
 final class AnalyticsAutoEventsTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -25,10 +28,10 @@ final class AnalyticsAutoEventsTests: XCTestCase {
     /// Thread-safe captured-events box.
     final class EventBox: @unchecked Sendable {
         private let lock = NSLock()
-        private var events: [[String: Any]] = []
-        func append(_ e: [String: Any]) { lock.lock(); events.append(e); lock.unlock() }
-        var all: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return events }
-        func actions() -> [String] { all.compactMap { $0["action"] as? String } }
+        private var events: [[String: JSONValue]] = []
+        func append(_ e: [String: JSONValue]) { lock.lock(); events.append(e); lock.unlock() }
+        var all: [[String: JSONValue]] { lock.lock(); defer { lock.unlock() }; return events }
+        func actions() -> [String] { all.compactMap { $0["action"]?.stringValue } }
     }
 
     // MARK: - Typed namespace (#951)
@@ -42,39 +45,39 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let box = EventBox()
-        client.analyticsQueue.onEventLogged = { box.append($0) }
+        await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
-        client.analytics.setPlanOverride("pro")
-        client.analytics.setAppVersionOverride("9.9.9-test")
-        client.analytics.logEvent(AnalyticsEventInput(
+        await client.analytics.setPlanOverrideAsync("pro")
+        await client.analytics.setAppVersionOverrideAsync("9.9.9-test")
+        await client.analytics.logEventAsync(AnalyticsEventInput(
             action: "button_click",
             feature: "cta",
             context_json: .object(["marker": .string("typed-namespace-test")])
         ))
-        client.analytics.logSnapshot(context: .object(["screen": .string("home")]))
+        await client.analytics.logSnapshotAsync(context: .object(["screen": .string("home")]))
 
         try await eventually(timeout: 5, description: "typed events captured") {
             box.actions().contains("button_click") && box.actions().contains("_snapshot")
         }
 
-        guard let click = box.all.first(where: { $0["action"] as? String == "button_click" }) else {
+        guard let click = box.all.first(where: { $0["action"]?.stringValue == "button_click" }) else {
             XCTFail("button_click event not captured")
             return
         }
-        XCTAssertEqual(click["feature"] as? String, "cta")
-        XCTAssertEqual(click["plan"] as? String, "pro")
-        XCTAssertEqual(click["app_version"] as? String, "9.9.9-test")
-        XCTAssertEqual(click["user_ulid"] as? String, testApp.ownerUserId)
+        XCTAssertEqual(click["feature"]?.stringValue, "cta")
+        XCTAssertEqual(click["plan"]?.stringValue, "pro")
+        XCTAssertEqual(click["app_version"]?.stringValue, "9.9.9-test")
+        XCTAssertEqual(click["user_ulid"]?.stringValue, testApp.ownerUserId)
         XCTAssertNotNil(click["timestamp"], "queue must stamp a timestamp")
 
-        let snapshot = box.all.first { $0["action"] as? String == "_snapshot" }
-        XCTAssertEqual(snapshot?["feature"] as? String, "_state")
+        let snapshot = box.all.first { $0["action"]?.stringValue == "_snapshot" }
+        XCTAssertEqual(snapshot?["feature"]?.stringValue, "_state")
 
         // Drain over the live socket — flush must not error or kill the
         // connection (the server accepts the analytics.batch frame).
         try await client.connect()
         try await waitForConnection(client: client)
-        client.analytics.flush()
+        await client.analytics.flushAsync()
         try await delay(1)
         XCTAssertTrue(client.isConnected, "connection must survive an analytics.batch flush")
     }
@@ -97,9 +100,9 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let box = EventBox()
-        client.analyticsQueue.onEventLogged = { box.append($0) }
+        await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
-        client.analytics.logSnapshot(context: .object(["screen": .string("home")]))
+        await client.analytics.logSnapshotAsync(context: .object(["screen": .string("home")]))
         try await delay(0.5)
         XCTAssertTrue(
             box.actions().isEmpty,
@@ -117,7 +120,7 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let box = EventBox()
-        client.analyticsQueue.onEventLogged = { box.append($0) }
+        await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
         // Re-apply the token — emits `.authSuccess`, which drives the
         // dailyAuth auto-event (fresh in-memory store, so no prior
@@ -126,8 +129,8 @@ final class AnalyticsAutoEventsTests: XCTestCase {
 
         try await eventually(timeout: 5, description: "user_active_daily auto-event") {
             box.all.contains {
-                $0["action"] as? String == "user_active_daily"
-                    && $0["feature"] as? String == "session"
+                $0["action"]?.stringValue == "user_active_daily"
+                    && $0["feature"]?.stringValue == "session"
             }
         }
     }
@@ -145,7 +148,7 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let box = EventBox()
-        client.analyticsQueue.onEventLogged = { box.append($0) }
+        await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
         client.updateToken(testApp.ownerJWT, cause: "login")
         try await delay(2)
@@ -163,7 +166,7 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         let box = EventBox()
-        client.analyticsQueue.onEventLogged = { box.append($0) }
+        await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
         client.updateToken(testApp.ownerJWT, cause: "login")
         try await eventually(timeout: 5, description: "first user_active_daily") {
@@ -189,7 +192,7 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
         let box = EventBox()
-        client.analyticsQueue.onEventLogged = { box.append($0) }
+        await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
         let blobs = client.documents.blobs(documentId: docId)
         let upload = try await blobs.upload(
@@ -198,8 +201,8 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         )
         try await eventually(timeout: 8, description: "blob_upload_succeeded auto-event") {
             box.all.contains {
-                $0["action"] as? String == "blob_upload_succeeded"
-                    && $0["feature"] as? String == "blobs"
+                $0["action"]?.stringValue == "blob_upload_succeeded"
+                    && $0["feature"]?.stringValue == "blobs"
             }
         }
 
@@ -213,7 +216,7 @@ final class AnalyticsAutoEventsTests: XCTestCase {
         )
         defer { Task { await gated.destroy() } }
         let gatedBox = EventBox()
-        gated.analyticsQueue.onEventLogged = { gatedBox.append($0) }
+        await gated.analyticsQueue.setOnEventLogged { gatedBox.append($0) }
 
         _ = try await gated.documents.blobs(documentId: docId).upload(
             data: "gated payload".data(using: .utf8)!,

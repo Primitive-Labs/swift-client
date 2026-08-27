@@ -28,7 +28,7 @@ final class OAuthTests: XCTestCase {
         // Wait for auth bootstrap
         try await delay(1)
 
-        let state = client.getAuthState()
+        let state = client.authState
         XCTAssertTrue(state.authenticated)
     }
 
@@ -47,7 +47,7 @@ final class OAuthTests: XCTestCase {
 
         try await delay(1)
 
-        let state = client.getAuthState()
+        let state = client.authState
         XCTAssertFalse(state.authenticated)
     }
 
@@ -55,8 +55,8 @@ final class OAuthTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let info = client.getAuthPersistenceInfo()
-        XCTAssertEqual(info["mode"] as? String, "memory")
+        let info = client.authPersistenceInfo
+        XCTAssertEqual(info["mode"]?.stringValue, "memory")
     }
 
     func testAuthPersistenceInfoPersistedMode() async throws {
@@ -73,8 +73,8 @@ final class OAuthTests: XCTestCase {
         ))
         defer { Task { await client.destroy() } }
 
-        let info = client.getAuthPersistenceInfo()
-        XCTAssertEqual(info["mode"] as? String, "persisted")
-        XCTAssertEqual(info["prefix"] as? String, "test-prefix")
+        let info = client.authPersistenceInfo
+        XCTAssertEqual(info["mode"]?.stringValue, "persisted")
+        XCTAssertEqual(info["prefix"]?.stringValue, "test-prefix")
     }
 }

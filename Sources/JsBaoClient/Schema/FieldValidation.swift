@@ -8,6 +8,14 @@ public enum FieldValidationError: Error, Equatable, Sendable {
     /// A field declared `required: true` was not supplied and no
     /// default resolved to a value. Matches js-bao's `null || undefined`
     /// guard — empty strings are considered present and pass.
+    ///
+    /// `field: "id"` is the one case that isn't driven by the `required`
+    /// declaration: every record is keyed by its id, so a write whose
+    /// resolved id is empty is rejected whatever the schema says. That
+    /// mirrors js-bao's falsy `!this.id` guard in `save()` ("Cannot save
+    /// item without an id. Ensure id is set.", `BaseModel.ts`), which also
+    /// runs regardless of the declaration — and unlike every other field,
+    /// an empty id does NOT pass.
     case requiredFieldMissing(field: String, modelName: String)
 
     /// A stringset write would exceed the field's declared `maxCount`.

@@ -261,9 +261,8 @@ final class PasskeyEndpointTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(challenge.count, 16, "challenge should be real random bytes")
         XCTAssertEqual(result.options["rpId"]?.stringValue, "example.com")
 
-        // And the raw plumbing the native flow uses parses the same payload.
-        let raw = try await client.auth.passkeyAuthStartRaw()
-        let parsed = try PasskeyWire.parseAuthenticationOptions(raw.options)
+        // And the bridge the native flow uses parses the same payload.
+        let parsed = try PasskeyWire.parseAuthenticationOptions(result.wireOptions)
         XCTAssertEqual(parsed.rpId, "example.com")
     }
 
@@ -294,12 +293,12 @@ final class PasskeyEndpointTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let raw = try await client.auth.passkeyRegisterStartRaw()
-        XCTAssertFalse(raw.challengeToken.isEmpty)
+        let start = try await client.auth.passkeyRegisterStart()
+        XCTAssertFalse(start.challengeToken.isEmpty)
 
         // The native flow must be able to derive a platform registration
         // request from the live server payload.
-        let parsed = try PasskeyWire.parseRegistrationOptions(raw.options)
+        let parsed = try PasskeyWire.parseRegistrationOptions(start.wireOptions)
         XCTAssertEqual(parsed.rpId, "example.com")
         XCTAssertEqual(parsed.rpName, "Swift Passkey Test")
         XCTAssertGreaterThanOrEqual(parsed.challenge.count, 16)
@@ -315,7 +314,7 @@ final class PasskeyEndpointTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let start = try await client.auth.passkeyAuthStartRaw()
+        let start = try await client.auth.passkeyAuthStart()
         // A structurally-valid assertion for a credential id the server has
         // never seen. The server must 401 ("Passkey not found") before any
         // signature verification happens.

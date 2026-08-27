@@ -104,36 +104,26 @@ final class AuthOptionSurfaceTests: XCTestCase {
 
     // MARK: - magicLinkVerify inviteToken (#466)
 
-    /// Captures the most recent request the stub closure was asked to make.
-    private final class CallRecorder: @unchecked Sendable {
-        var method: String?
-        var path: String?
-        var body: Any?
-        /// Canned magic-link-verify response with no "token" key, so the
-        /// controller doesn't try to apply/parse a JWT.
-        var response: Any = [
-            "user": ["userId": "u1", "email": "ml@example.com"],
-            "isNewUser": false,
-        ]
+    /// Canned magic-link-verify response. It carries a real (decodable) JWT
+    /// because a 2xx verify without a `token` is a broken server contract the
+    /// controller rejects (#1991 Phase B3). These tests only assert the
+    /// outbound request body, so the token just has to be applicable.
+    private static let magicLinkResponse = #"""
+    {"token": "\#(makeTestJwt(userId: "u1"))", "user": {"userId": "u1", "email": "ml@example.com"}, "isNewUser": false}
+    """#
 
-        func make(_ method: String, _ path: String, _ data: Any?) async throws -> Any {
-            self.method = method
-            self.path = path
-            self.body = data
-            return response
-        }
+    private func makeRecorder() -> RecordingTransport {
+        RecordingTransport(json: Self.magicLinkResponse)
     }
 
-    private func makeClient(_ recorder: CallRecorder) -> JsBaoClient {
+    private func makeClient(_ recorder: RecordingTransport) -> JsBaoClient {
         let client = JsBaoClient(options: JsBaoClientOptions(
             apiUrl: "http://localhost:8787",
             wsUrl: "ws://localhost:8787",
             appId: "test-app",
             offline: true
         ))
-        client.authController.makeRequest = { method, path, data in
-            try await recorder.make(method, path, data)
-        }
+        client.authController.replaceTransportForTesting(recorder)
         return client
     }
 
@@ -141,42 +131,45 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// forwards `inviteToken` to the auth controller. The Swift wrapper
     /// previously dropped it.
     func test_topLevel_magicLinkVerify_forwardsInviteToken() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
         _ = try await client.magicLinkVerify(token: "ml-token", inviteToken: "invite-tok-ml")
 
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/auth/magic-link/verify")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["token"] as? String, "ml-token")
-        XCTAssertEqual(body?["inviteToken"] as? String, "invite-tok-ml")
+        // Select the verify call by path rather than taking the last one: a
+        // token-less client now issues a startup POST /auth/refresh (#2656),
+        // which can land after this call.
+        let call = r.lastCall(to: "/auth/magic-link/verify")
+        XCTAssertEqual(call?.method, .post)
+        let body = call?.jsonBody
+        XCTAssertEqual(body?["token"]?.stringValue, "ml-token")
+        XCTAssertEqual(body?["inviteToken"]?.stringValue, "invite-tok-ml")
     }
 
     /// Source compatibility: the one-arg call still works and sends no
     /// inviteToken (same body shape JS sends: just the token).
     func test_topLevel_magicLinkVerify_omitsInviteToken_whenNotPassed() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
         _ = try await client.magicLinkVerify(token: "ml-token")
 
-        let body = r.body as? [String: Any]
+        let body = r.lastCall(to: "/auth/magic-link/verify")?.jsonBody
         XCTAssertNotNil(body)
         XCTAssertNil(body?["inviteToken"])
-        XCTAssertEqual(body?["token"] as? String, "ml-token")
+        XCTAssertEqual(body?["token"]?.stringValue, "ml-token")
     }
 
     func test_topLevel_magicLinkVerify_trimsAndOmitsBlankInviteToken() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
         _ = try await client.magicLinkVerify(token: "ml-token", inviteToken: "   ")
 
-        let body = r.body as? [String: Any]
+        let body = r.lastCall(to: "/auth/magic-link/verify")?.jsonBody
         XCTAssertNil(body?["inviteToken"])
     }
 
@@ -188,7 +181,7 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// surface exists and forwards. (The controller-level honoring of each
     /// field is covered by the auth-controller logout tests.)
     func test_topLevel_logout_acceptsFullOptionBag() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
@@ -205,7 +198,7 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// Source compatibility: the original `logout(wipeLocal:)` overload still
     /// works and is equivalent to `logout(options: .init(wipeLocal:))`.
     func test_topLevel_logout_wipeLocalOverload_stillWorks() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
@@ -216,8 +209,22 @@ final class AuthOptionSurfaceTests: XCTestCase {
     /// Regression: `client.auth.logout(options:)` must route through the
     /// top-level client cleanup path, not directly to `AuthController`, so
     /// `wipeLocal` clears cached document data.
+    ///
+    /// JS parity (#2874): the logout itself closes every open document —
+    /// `authController.logout` awaits the client's cleanup hook before it
+    /// signals completion — and the `wipeLocal` purge runs after that sweep.
+    /// So a still-open local-only document is closed by the logout, its
+    /// persisted data and metadata row go with the wipe, and `hasLocalCopy`
+    /// is `false` the moment the call returns. No explicit close is needed,
+    /// and none is available: leaving the previous user's documents open is
+    /// what let the next user read their rows.
+    ///
+    /// This reverses the #2836-era expectation that the document is held
+    /// across the wipe. The #2691 marker rule (a local-only marker survives a
+    /// store purge while its document is still held) is unchanged for the
+    /// non-logout eviction path, `evictAllLocal(force:)`.
     func test_auth_logout_options_wipeLocal_clearsLocalDocuments() async throws {
-        let r = CallRecorder()
+        let r = makeRecorder()
         let client = makeClient(r)
         defer { Task { await client.destroy() } }
 
@@ -228,8 +235,9 @@ final class AuthOptionSurfaceTests: XCTestCase {
 
         try await client.auth.logout(options: LogoutOptions(wipeLocal: true))
 
-        XCTAssertFalse(client.hasLocalCopy(docId))
         XCTAssertFalse(client.isAuthenticated())
+        XCTAssertNil(client.getDoc(docId), "the logout must close the document")
+        XCTAssertFalse(client.hasLocalCopy(docId), "closed and wiped: nothing local is left")
     }
 
     func test_logoutOptions_defaults_matchJS() {
