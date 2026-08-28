@@ -4720,6 +4720,14 @@ public final class JsBaoClient: @unchecked Sendable {
             hasOfflineGrantStored: { [weak self] in
                 self?.authController.isOfflineGrantAvailable() ?? false
             },
+            passkeyAuthStartWithRpId: { [weak self] rpId in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyAuthStart(rpId: rpId)
+            },
+            passkeyRegisterStartWithRpId: { [weak self] rpId in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.passkeyRegisterStart(rpId: rpId)
+            },
             passkeyAuthStart: { [weak self] in
                 guard let self = self else { throw JsBaoError(code: .unavailable) }
                 return try await self.authController.passkeyAuthStart()

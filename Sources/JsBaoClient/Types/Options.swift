@@ -165,15 +165,29 @@ public struct AuthConfig: Sendable {
     public let persistJwtInStorage: Bool
     public let storageKeyPrefix: String?
     public let refreshProxy: RefreshProxyConfig?
+    /// The relying party every passkey ceremony runs against, unless a call
+    /// names another one (#3024).
+    ///
+    /// Set it to the host in the app's `webcredentials:` associated-domains
+    /// entitlement. A native request carries no `Origin` header, so without
+    /// this the server has to guess which of the app's configured relying
+    /// parties was meant, and on a multi-RP app it can guess the dev host —
+    /// the Apple sheet then fails with "not associated with domain". The
+    /// value must be one of the app's configured passkey relying parties;
+    /// the server rejects an unconfigured one with
+    /// `PASSKEY_RP_NOT_CONFIGURED` rather than substituting another.
+    public let passkeyRpId: String?
 
     public init(
         persistJwtInStorage: Bool = false,
         storageKeyPrefix: String? = nil,
-        refreshProxy: RefreshProxyConfig? = nil
+        refreshProxy: RefreshProxyConfig? = nil,
+        passkeyRpId: String? = nil
     ) {
         self.persistJwtInStorage = persistJwtInStorage
         self.storageKeyPrefix = storageKeyPrefix
         self.refreshProxy = refreshProxy
+        self.passkeyRpId = passkeyRpId
     }
 }
 

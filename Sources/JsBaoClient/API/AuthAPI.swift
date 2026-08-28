@@ -67,6 +67,15 @@ public final class AuthAPI: @unchecked Sendable {
     // The `credential` argument stays a `JSONValue` object: it is the
     // authenticator's response, whose shape belongs to WebAuthn rather than
     // to this SDK.
+    // The rpId-aware start closures (#3024). Separate from the originals for
+    // the same reason `magicLinkVerifyWithInvite` is separate from
+    // `magicLinkVerify`: the existing closure types are part of this public
+    // initializer's signature. `JsBaoClient` wires these; an instance that
+    // wired only the legacy closure cannot carry an rpId, and asking for one
+    // there throws rather than silently dropping it — dropping the requested
+    // relying party is exactly the bug #3024 fixes.
+    let _passkeyAuthStartWithRpId: ((_ rpId: String?) async throws -> PasskeyAuthStartResult)?
+    let _passkeyRegisterStartWithRpId: ((_ rpId: String?) async throws -> PasskeyRegisterStartResult)?
     let _passkeyAuthStart: (() async throws -> PasskeyAuthStartResult)?
     let _passkeyAuthFinish: ((_ credential: JSONValue, _ challengeToken: String) async throws -> PasskeySignInResult)?
     let _passkeyRegisterStart: (() async throws -> PasskeyRegisterStartResult)?
@@ -96,6 +105,8 @@ public final class AuthAPI: @unchecked Sendable {
         renewOfflineGrant: @escaping (_ options: EnableOfflineAccessOptions) async throws -> Bool,
         revokeOfflineGrant: @escaping (_ options: RevokeOfflineGrantOptions) async throws -> Void,
         hasOfflineGrantStored: @escaping () -> Bool,
+        passkeyAuthStartWithRpId: ((_ rpId: String?) async throws -> PasskeyAuthStartResult)? = nil,
+        passkeyRegisterStartWithRpId: ((_ rpId: String?) async throws -> PasskeyRegisterStartResult)? = nil,
         passkeyAuthStart: (() async throws -> PasskeyAuthStartResult)? = nil,
         passkeyAuthFinish: ((_ credential: JSONValue, _ challengeToken: String) async throws -> PasskeySignInResult)? = nil,
         passkeyRegisterStart: (() async throws -> PasskeyRegisterStartResult)? = nil,
@@ -124,6 +135,8 @@ public final class AuthAPI: @unchecked Sendable {
         self._renewOfflineGrant = renewOfflineGrant
         self._revokeOfflineGrant = revokeOfflineGrant
         self._hasOfflineGrantStored = hasOfflineGrantStored
+        self._passkeyAuthStartWithRpId = passkeyAuthStartWithRpId
+        self._passkeyRegisterStartWithRpId = passkeyRegisterStartWithRpId
         self._passkeyAuthStart = passkeyAuthStart
         self._passkeyAuthFinish = passkeyAuthFinish
         self._passkeyRegisterStart = passkeyRegisterStart
@@ -374,8 +387,18 @@ public final class AuthAPI: @unchecked Sendable {
     /// Start the passkey sign-in flow. Mirrors JS `passkeyAuthStart()`:
     /// returns the WebAuthn request options (challenge is base64url) plus a
     /// short-lived `challengeToken` to pass back to `passkeyAuthFinish`.
-    public func passkeyAuthStart() async throws -> PasskeyAuthStartResult {
-        guard let passkeyAuthStart = _passkeyAuthStart else {
+    ///
+    /// `rpId` names the relying party the ceremony runs against — pass the
+    /// host in the app's `webcredentials:` entitlement (#3024). Defaults to
+    /// `AuthConfig.passkeyRpId`; with neither, the server picks from the
+    /// request's `Origin`, which a native client never sends.
+    public func passkeyAuthStart(
+        rpId: String? = nil
+    ) async throws -> PasskeyAuthStartResult {
+        if let passkeyAuthStartWithRpId = _passkeyAuthStartWithRpId {
+            return try await passkeyAuthStartWithRpId(rpId)
+        }
+        guard let passkeyAuthStart = _passkeyAuthStart, rpId == nil else {
             throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
         }
         return try await passkeyAuthStart()
@@ -411,8 +434,16 @@ public final class AuthAPI: @unchecked Sendable {
     /// Mirrors JS `passkeyRegisterStart()`: returns the WebAuthn creation
     /// options (challenge and `user.id` are base64url) plus a short-lived
     /// `challengeToken` to pass back to `passkeyRegisterFinish`.
-    public func passkeyRegisterStart() async throws -> PasskeyRegisterStartResult {
-        guard let passkeyRegisterStart = _passkeyRegisterStart else {
+    ///
+    /// `rpId` names the relying party to register the passkey under, exactly
+    /// as in `passkeyAuthStart(rpId:)` (#3024).
+    public func passkeyRegisterStart(
+        rpId: String? = nil
+    ) async throws -> PasskeyRegisterStartResult {
+        if let passkeyRegisterStartWithRpId = _passkeyRegisterStartWithRpId {
+            return try await passkeyRegisterStartWithRpId(rpId)
+        }
+        guard let passkeyRegisterStart = _passkeyRegisterStart, rpId == nil else {
             throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
         }
         return try await passkeyRegisterStart()
