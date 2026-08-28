@@ -16,9 +16,11 @@ import Foundation
 //    `apple-app-site-association` file listing the app — otherwise the
 //    system sheet fails with "application not associated with domain".
 //  * The RP id must be one of the app's configured passkey RP ids
-//    (`passkeyRpConfig` / `passkeyRpId` in app settings), and the server's
-//    CORS allowed origins must include `https://<rpId>` because Apple
-//    reports that as the clientDataJSON origin for native flows.
+//    (`passkeyRpConfig` / `passkeyRpId` in app settings). Name it — via
+//    `AuthConfig.passkeyRpId` or the `rpId:` argument — because a native
+//    request carries no `Origin` header for the server to derive it from
+//    (#3024). Verification accepts `https://<rpId>`, which is what Apple
+//    reports as the clientDataJSON origin, with no CORS entry needed.
 //
 // Gated so `swift build` succeeds on platforms without
 // AuthenticationServices (e.g. Linux). `webauthn-large-blob` remains
@@ -43,6 +45,11 @@ extension AuthAPI {
     /// - Parameters:
     ///   - presentationAnchor: The window to present the system sheet from.
     ///     Pass `nil` to let the system pick a default anchor.
+    ///   - rpId: The relying party to sign in against — the host in the app's
+    ///     `webcredentials:` entitlement. Defaults to `AuthConfig.passkeyRpId`.
+    ///     A native request sends no `Origin` header, so with neither the
+    ///     server picks among the app's configured relying parties on its own
+    ///     and a multi-RP app can get the wrong one (#3024).
     ///   - preferImmediatelyAvailableCredentials: When `true`, only consult
     ///     passkeys already on this device — if none exist the request fails
     ///     fast with `PasskeyError.canceled` instead of showing the
@@ -56,9 +63,10 @@ extension AuthAPI {
     ///   server-side verification failures.
     public func signInWithPasskey(
         presentationAnchor: ASPresentationAnchor? = nil,
-        preferImmediatelyAvailableCredentials: Bool = false
+        preferImmediatelyAvailableCredentials: Bool = false,
+        rpId: String? = nil
     ) async throws -> PasskeySignInResult {
-        let start = try await passkeyAuthStart()
+        let start = try await passkeyAuthStart(rpId: rpId)
         let challenge = try PasskeyWire.parseAuthenticationOptions(start.wireOptions)
 
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
@@ -106,15 +114,19 @@ extension AuthAPI {
     ///     acceptance into the registration call.
     ///   - presentationAnchor: The window to present the system sheet from.
     ///     Pass `nil` to let the system pick a default anchor.
+    ///   - rpId: The relying party to register the passkey under — the host in
+    ///     the app's `webcredentials:` entitlement. Defaults to
+    ///     `AuthConfig.passkeyRpId` (#3024).
     /// - Throws: `PasskeyError.canceled` when the user dismisses the sheet;
     ///   `HttpError` for server-side verification failures.
     @discardableResult
     public func registerPasskey(
         deviceName: String? = nil,
         inviteToken: String? = nil,
-        presentationAnchor: ASPresentationAnchor? = nil
+        presentationAnchor: ASPresentationAnchor? = nil,
+        rpId: String? = nil
     ) async throws -> PasskeyRegistrationResult {
-        let start = try await passkeyRegisterStart()
+        let start = try await passkeyRegisterStart(rpId: rpId)
         let challenge = try PasskeyWire.parseRegistrationOptions(start.wireOptions)
 
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(

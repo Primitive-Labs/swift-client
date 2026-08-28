@@ -1551,16 +1551,34 @@ public final class AuthController: @unchecked Sendable {
     // The native AuthenticationServices orchestration lives in
     // `AuthAPI+NativePasskeys.swift`; these methods only speak HTTP.
 
+    /// The body a passkey `start` request carries: `{ rpId }` when a relying
+    /// party is named for this ceremony, else `{}` (#3024).
+    ///
+    /// The call's `rpId` wins over `AuthConfig.passkeyRpId`; a blank one names
+    /// nothing, and the server then falls back to the request's `Origin` —
+    /// which a native client does not send at all.
+    private func passkeyStartBody(rpId: String?) -> [String: JSONValue] {
+        let requested = (rpId ?? persistConfig.passkeyRpId)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let requested, !requested.isEmpty else { return [:] }
+        return ["rpId": .string(requested)]
+    }
+
     /// `POST /passkey/auth/start` (no auth). The server spreads the WebAuthn
     /// request options at the top level alongside `challengeToken`; the
     /// options travel as an opaque `JSONValue` because the SDK hands them
     /// straight to `PasskeyWire` / AuthenticationServices.
-    public func passkeyAuthStart() async throws -> PasskeyAuthStartResult {
+    ///
+    /// `rpId` names the relying party the ceremony runs against, defaulting to
+    /// `AuthConfig.passkeyRpId` (#3024).
+    public func passkeyAuthStart(
+        rpId: String? = nil
+    ) async throws -> PasskeyAuthStartResult {
         let transport = try requireTransport()
         let response: JSONValue = try await transport.request(
             method: .post,
             path: "/passkey/auth/start",
-            body: [String: JSONValue]()
+            body: passkeyStartBody(rpId: rpId)
         )
         let split = try Self.splitChallengeToken(
             response,
@@ -1596,13 +1614,17 @@ public final class AuthController: @unchecked Sendable {
     }
 
     /// `POST /passkey/register/start` (requires auth). WebAuthn creation
-    /// options plus `challengeToken`, same split as `passkeyAuthStart`.
-    public func passkeyRegisterStart() async throws -> PasskeyRegisterStartResult {
+    /// options plus `challengeToken`, same split as `passkeyAuthStart` —
+    /// including the optional `rpId` naming the relying party to register the
+    /// passkey under (#3024).
+    public func passkeyRegisterStart(
+        rpId: String? = nil
+    ) async throws -> PasskeyRegisterStartResult {
         let transport = try requireTransport()
         let response: JSONValue = try await transport.request(
             method: .post,
             path: "/passkey/register/start",
-            body: [String: JSONValue]()
+            body: passkeyStartBody(rpId: rpId)
         )
         let split = try Self.splitChallengeToken(
             response,

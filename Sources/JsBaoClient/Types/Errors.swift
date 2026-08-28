@@ -95,6 +95,10 @@ public enum AuthCode: String, Sendable {
     case domainNotAllowed = "DOMAIN_NOT_ALLOWED"
     case invalidToken = "INVALID_TOKEN"
     case passkeyNotEnabled = "PASSKEY_NOT_ENABLED"
+    /// A passkey start call named an `rpId` the app does not configure
+    /// (#3024) — the app asked for a relying party that isn't the
+    /// server's, rather than the server failing to work out which one.
+    case passkeyRpNotConfigured = "PASSKEY_RP_NOT_CONFIGURED"
     case magicLinkNotEnabled = "MAGIC_LINK_NOT_ENABLED"
     case waitlistEntryUpdated = "WAITLIST_ENTRY_UPDATED"
     case inviteTokenInvalid = "INVITE_TOKEN_INVALID"
