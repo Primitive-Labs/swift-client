@@ -99,7 +99,24 @@ public enum AuthCode: String, Sendable {
     /// (#3024) — the app asked for a relying party that isn't the
     /// server's, rather than the server failing to work out which one.
     case passkeyRpNotConfigured = "PASSKEY_RP_NOT_CONFIGURED"
+    /// The passkey provider returned a credential it had not verified the
+    /// user for, while the ceremony required verification (#3027). Ask the
+    /// user to try again and complete Face ID / their passcode — a generic
+    /// sign-in failure gives them nothing to act on.
+    case passkeyUserVerificationFailed = "PASSKEY_USER_VERIFICATION_FAILED"
     case magicLinkNotEnabled = "MAGIC_LINK_NOT_ENABLED"
+    /// Native Sign in with Apple (`POST /auth/apple/callback`, #3084). The
+    /// callback is a Swift-only surface — the JS client has no Apple path —
+    /// so these mirror `AUTH_CODES` in `src/auth/auth-codes.ts` directly.
+    /// `APPLE_IDENTITY_INVALID` (401) is the signature/claims/nonce
+    /// rejection, `APPLE_IDENTITY_UNKNOWN` (401) means no user carries this
+    /// Apple `sub` and Apple withheld the email, `APPLE_REQUEST_INVALID`
+    /// (400) is a malformed body, and `APPLE_AUTH_NOT_CONFIGURED` (501)
+    /// means the app has no `appleAudiences` or has Apple sign-in off.
+    case appleIdentityInvalid = "APPLE_IDENTITY_INVALID"
+    case appleIdentityUnknown = "APPLE_IDENTITY_UNKNOWN"
+    case appleRequestInvalid = "APPLE_REQUEST_INVALID"
+    case appleAuthNotConfigured = "APPLE_AUTH_NOT_CONFIGURED"
     case waitlistEntryUpdated = "WAITLIST_ENTRY_UPDATED"
     case inviteTokenInvalid = "INVITE_TOKEN_INVALID"
     case inviteTokenExpired = "INVITE_TOKEN_EXPIRED"

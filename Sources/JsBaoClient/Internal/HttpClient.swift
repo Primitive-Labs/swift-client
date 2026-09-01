@@ -260,6 +260,14 @@ public final class HttpClient: @unchecked Sendable {
     /// (`src/client/internal/authController.ts`); this set is the port of that
     /// behavior (#2658).
     ///
+    /// The native Sign in with Apple callback (`/auth/apple/callback`) belongs
+    /// to the same family as the native Google one (`/auth/oauth/callback`): a
+    /// signed-out client posts a single-use identity token to it. Its absence
+    /// made the two provider paths disagree — the server's own rejection code
+    /// (`ADDED_TO_WAITLIST`, `APPLE_IDENTITY_INVALID`, …) was replaced by
+    /// `HttpError(401, "Invalid credentials")`, and a sign-in attempt made with
+    /// no session emitted `authFailed` (#3084).
+    ///
     /// Authenticated passkey management (`/passkey/register/*`,
     /// `/passkey/list`, `/passkey/{id}`) is deliberately absent: those requests
     /// do carry a bearer token, so an expired one should still refresh.
@@ -274,6 +282,7 @@ public final class HttpClient: @unchecked Sendable {
         "/oauth-config",
         "/oauth/callback",
         "/auth/oauth/callback",
+        "/auth/apple/callback",
     ]
 
     /// Whether `path` is exempt from the refresh interceptor. The query string
