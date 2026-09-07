@@ -3844,14 +3844,21 @@ public final class JsBaoClient: @unchecked Sendable {
         ]
     }
 
-    /// Build the `syncMetadata` request path, routing both query values
-    /// through the shared `URLQuery` builder (#2076). `payloadType` was
-    /// previously appended unescaped. `internal` for unit testing.
-    static func syncMetadataPath(documentId: String?, payloadType: String?) -> String {
+    /// Build the whole-scope `syncMetadata` request path, routing the query
+    /// value through the shared `URLQuery` builder (#2076); `payloadType` was
+    /// previously appended unescaped. A scoped sync does not come through
+    /// here — it asks about its document by path (`documentMetadataPath`), as
+    /// js-bao does. `internal` for unit testing.
+    static func syncMetadataPath(payloadType: String?) -> String {
         var query = URLQuery()
-        query.appendIfPresent("documentId", documentId)
         query.appendIfPresent("payloadType", payloadType)
         return "/documents\(query.queryString)"
+    }
+
+    /// The single-document fetch a scoped sync answers from, mirroring
+    /// js-bao's `GET /documents/${documentId}`. `internal` for unit testing.
+    static func documentMetadataPath(documentId: String) -> String {
+        "/documents/\(URLEncoding.encodeComponent(documentId))"
     }
 
     /// Sync metadata. With no options, refreshes the full doc list.
@@ -3859,42 +3866,164 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `options.payloadType` (`"ids"` | `"full"`) controls the wire
     /// shape; `options.background` runs without blocking. Matches
     /// js-bao's `syncMetadata(opts)` shape.
+    ///
+    /// Both scopes evict by default (`options.authoritative`): a whole-scope
+    /// listing removes the cached documents it does not mention, and a
+    /// single-document sync removes its target when the server answers that
+    /// the document is gone. That is how a document deleted — or revoked —
+    /// while this client was offline leaves the device.
     public func syncMetadata(
         options: SyncMetadataOptions = SyncMetadataOptions()
     ) async throws {
-        let path = Self.syncMetadataPath(
-            documentId: options.documentId,
-            payloadType: options.payloadType
-        )
-
         if options.background == true {
             // Fire-and-forget; caller wants the sync to run but doesn't
             // want to await its completion.
             Task { [weak self] in
                 guard let self = self else { return }
-                if let result = try? await self.legacyJSONGraph("GET", path, nil),
-                   let docs = result as? [[String: Any]] {
-                    await self.documentManager.handleServerDocuments(
-                        docs,
-                        authoritative: Self.listingIsAuthoritative(options)
-                    )
-                }
+                try? await self.runSyncMetadata(options)
             }
             return
         }
+        try await runSyncMetadata(options)
+    }
+
+    /// The body of `syncMetadata`, shared by the awaited and the background
+    /// call.
+    private func runSyncMetadata(_ options: SyncMetadataOptions) async throws {
+        if let documentId = options.documentId, !documentId.isEmpty {
+            try await syncOneDocumentMetadata(documentId: documentId, options: options)
+            return
+        }
+
+        let path = Self.syncMetadataPath(payloadType: options.payloadType)
         let result = try await legacyJSONGraph("GET", path, nil)
         guard let docs = result as? [[String: Any]] else { return }
         await documentManager.handleServerDocuments(
             docs,
             authoritative: Self.listingIsAuthoritative(options)
         )
+
+        // An ids listing does not authorize an eviction by itself (see
+        // `listingIsAuthoritative`), so it defers to a per-document check
+        // rather than skipping eviction altogether — js-bao's ids branch
+        // (`src/client/JsBaoClient.ts`).
+        guard options.payloadType == "ids", options.authoritative != false else { return }
+        var seenIds: Set<String> = []
+        for doc in docs {
+            if let documentId = doc["documentId"] as? String { seenIds.insert(documentId) }
+        }
+        await verifyThenEvictUnlistedDocuments(seenIds: seenIds)
     }
 
-    /// Whether a `syncMetadata` response may evict local documents it does not
-    /// mention. Mirrors js-bao's rule (`src/client/JsBaoClient.ts`):
-    /// authoritative by default, but never for a single-document sync (it says
-    /// nothing about the other documents) and never for an ids-only payload
-    /// (js-bao verifies such a listing against the server before deleting).
+    /// Sync one document's metadata, which is the call an app makes to ask
+    /// whether a document it has cached is still theirs.
+    ///
+    /// Authoritative for that one row unless `options.authoritative == false`:
+    /// a 404 (deleted) or 403 (access revoked) is the server saying the
+    /// document is gone, and the row leaves the local index with a `deleted`
+    /// metadata event. Any other failure is a failed sync and propagates —
+    /// only an answer evicts. The `payloadType` does not change this: the
+    /// client verifies the target against the server either way, so an ids
+    /// payload defers the eviction rather than disabling it. Mirrors js-bao's
+    /// `syncMetadata({ scope: "single", documentId })`.
+    ///
+    /// The eviction carries the metadata stamp the row had before the request
+    /// went out, as the ids branch does: a `docMetadata` frame or a listing
+    /// confirming this document while the GET is in flight is newer news than
+    /// the denial coming back, so the eviction is abandoned rather than
+    /// deleting the row — and the CRDT snapshot — the confirmation just wrote.
+    private func syncOneDocumentMetadata(
+        documentId: String,
+        options: SyncMetadataOptions
+    ) async throws {
+        let candidate = documentManager.evictionCandidate(for: documentId)
+        var row: [String: Any]?
+        do {
+            let result = try await legacyJSONGraph(
+                "GET", Self.documentMetadataPath(documentId: documentId), nil
+            )
+            // An answer that is not a document row says nothing either way,
+            // and nothing is what it is allowed to do.
+            guard let fetched = result as? [String: Any] else { return }
+            row = fetched
+        } catch {
+            guard Self.isAccessLostError(error) else { throw error }
+            row = nil
+        }
+
+        if let row {
+            await documentManager.handleServerDocuments([row])
+            return
+        }
+        guard options.authoritative != false else { return }
+        await documentManager.handleServerDocumentAbsent(
+            documentId, ifUnconfirmedSince: candidate
+        )
+    }
+
+    /// Ask the server about each cached document an ids listing did not
+    /// mention, and evict the ones it no longer has.
+    ///
+    /// The listing itself proves nothing — an id list can be partial, and
+    /// deleting on the strength of one would take out documents the server
+    /// still has. So the eviction is deferred to a per-document `GET
+    /// /documents/{id}`, and only a 404 / 403 removes a row. Mirrors js-bao's
+    /// ids branch (`src/client/JsBaoClient.ts`).
+    ///
+    /// The candidates carry the metadata stamp they had before the checks
+    /// started, so a document confirmed by some other path while this runs is
+    /// not evicted on the strength of a stale decision.
+    private func verifyThenEvictUnlistedDocuments(seenIds: Set<String>) async {
+        var retainIds: Set<String> = []
+        // The app root is not part of the user's document listing, so its
+        // absence from one is not news.
+        if let rootDocId { retainIds.insert(rootDocId) }
+
+        let candidates = documentManager.evictionCandidateSnapshot(
+            seenIds: seenIds, retainIds: retainIds
+        )
+        for candidate in candidates {
+            let documentId = candidate.documentId
+            do {
+                let result = try await legacyJSONGraph(
+                    "GET", Self.documentMetadataPath(documentId: documentId), nil
+                )
+                guard let row = result as? [String: Any] else { continue }
+                await documentManager.handleServerDocuments([row])
+            } catch {
+                guard Self.isAccessLostError(error) else { continue }
+                await documentManager.handleServerDocumentAbsent(
+                    documentId, ifUnconfirmedSince: candidate
+                )
+            }
+        }
+    }
+
+    /// Whether an error is the server saying "this document is not yours any
+    /// more" — a 404 (deleted) or a 403 (access revoked). Those are the only
+    /// answers a sync may delete a local row on; anything else (a 500, an
+    /// unreachable network) is a failed request that proves nothing. Mirrors
+    /// js-bao's 404/403 check. `internal` for unit testing.
+    static func isAccessLostError(_ error: Error) -> Bool {
+        if let httpError = error as? HttpError {
+            return httpError.status == 404 || httpError.status == 403
+        }
+        if let jsBaoError = error as? JsBaoError {
+            return jsBaoError.code == .notFound || jsBaoError.code == .accessDenied
+        }
+        let message = String(describing: error)
+        return message.contains("HTTP 404") || message.contains("HTTP 403")
+            || message.contains("status: 404") || message.contains("status: 403")
+    }
+
+    /// Whether a whole-scope `syncMetadata` listing may evict local documents
+    /// it does not mention on its own. Mirrors js-bao's upsert rule
+    /// (`authoritative && payloadType !== "ids"`, `src/client/JsBaoClient.ts`):
+    /// authoritative by default, but never for an ids-only payload — which
+    /// *defers* its evictions to a per-document check
+    /// (`verifyThenEvictUnlistedDocuments`) rather than skipping them. A
+    /// single-document sync never reaches here: it has its own scope
+    /// (`syncOneDocumentMetadata`), authoritative for its target row alone.
     /// `internal` for unit testing.
     static func listingIsAuthoritative(_ options: SyncMetadataOptions) -> Bool {
         if options.authoritative == false { return false }

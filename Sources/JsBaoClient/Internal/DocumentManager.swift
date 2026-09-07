@@ -1394,9 +1394,26 @@ public final class DocumentManager: @unchecked Sendable {
     public func setMetadata(_ documentId: String, entry: LocalMetadataEntry) {
         lock.withLock {
             metadataIndex[documentId] = entry
-            metadataTouchCounter &+= 1
-            metadataTouches[documentId] = metadataTouchCounter
+            noteMetadataTouchLocked(documentId)
         }
+    }
+
+    /// Record that the server just confirmed this document, so a reconciliation
+    /// in flight can tell "nothing has vouched for this since I asked" from
+    /// "the server vouched for it while my request was out" (see
+    /// `evictLocalData(ifUnconfirmedSince:)`). Mirrors js-bao's
+    /// `noteMetadataTouch` (`src/client/internal/documentManager.ts`).
+    ///
+    /// Every path a server confirmation lands through has to stamp, not just
+    /// the ones that happen to write through `setMetadata`: a confirmation the
+    /// stamp does not record is one a stale 404 will overrule, deleting the
+    /// document — and its persisted CRDT snapshot — the server just vouched
+    /// for. Callers already holding `lock` use this; the rest go through
+    /// `setMetadata`.
+    private func noteMetadataTouchLocked(_ documentId: String) {
+        guard !documentId.isEmpty else { return }
+        metadataTouchCounter &+= 1
+        metadataTouches[documentId] = metadataTouchCounter
     }
 
     /// Encode a `LocalMetadataEntry` to a `[String: JSONValue]` for event
@@ -1512,6 +1529,7 @@ public final class DocumentManager: @unchecked Sendable {
             // The server confirmed it in the meantime; nothing was deleted and
             // nothing may be announced as deleted.
             guard evicted else { continue }
+            guard announcementIsStillTrue(documentId) else { continue }
             let alreadyDeleted = lock.withLock { !deletedMetadataIds.insert(documentId).inserted }
             if alreadyDeleted { continue }
             emitter?.emit(DocumentMetadataChangedEvent(
@@ -1522,6 +1540,72 @@ public final class DocumentManager: @unchecked Sendable {
                 source: "server"
             ))
         }
+    }
+
+    /// Apply "the server no longer has this document" to one cached document:
+    /// evict its local data and emit the `deleted` metadata event.
+    ///
+    /// This is the eviction half of `handleServerDocuments` narrowed to a
+    /// single target, for the caller that asked about one document and got a
+    /// 404 / 403 back — a scoped `syncMetadata`, which cannot use the listing
+    /// form because an answer about one document says nothing about the rest
+    /// of the cache. Mirrors js-bao's
+    /// `upsertServerDocuments([], ctx, { scope: "single", targetDocumentId,
+    /// authoritative: true })` (`src/client/internal/documentManager.ts`),
+    /// including its emit for a target that was not cached: the caller asked
+    /// about that document, so the answer is news whether or not a row existed.
+    ///
+    /// Exempt, exactly as in the listing form: a pending create and a
+    /// local-only document, which the server has never heard of, so its "no"
+    /// is about a document that was never there.
+    ///
+    /// `ifUnconfirmedSince` carries the stamp the document had when the caller
+    /// decided to verify it, so a confirmation that landed while the request
+    /// was in flight abandons the eviction (see `evictLocalData`).
+    public func handleServerDocumentAbsent(
+        _ documentId: String,
+        ifUnconfirmedSince candidate: EvictionCandidate? = nil
+    ) async {
+        let exempt = lock.withLock {
+            pendingCreates.contains(documentId)
+                || localOnlyDocs.contains(documentId)
+                || metadataIndex[documentId]?.pendingCreate == true
+                || metadataIndex[documentId]?.localOnly == true
+        }
+        guard !exempt else { return }
+
+        let hadMetadata = getLocalMetadata(documentId) != nil
+        let evicted = await evictLocalData(
+            documentId: documentId, ifUnconfirmedSince: candidate
+        )
+        // A cached row that survived the eviction is one the server confirmed
+        // in the meantime: nothing was deleted, so nothing may be announced as
+        // deleted.
+        guard evicted || !hadMetadata else { return }
+        guard announcementIsStillTrue(documentId) else { return }
+
+        let alreadyDeleted = lock.withLock { !deletedMetadataIds.insert(documentId).inserted }
+        guard !alreadyDeleted else { return }
+        emitter?.emit(DocumentMetadataChangedEvent(
+            documentId: documentId,
+            action: "deleted",
+            metadata: nil,
+            changedFields: ["deleted"],
+            source: "server"
+        ))
+    }
+
+    /// Whether a `deleted` announcement is still true at the moment it would go
+    /// out: the row has to be gone.
+    ///
+    /// `evictLocalData` takes the row away under the lock and then awaits the
+    /// persistence deletes, so a confirmation can land after the row is gone
+    /// but before the event is emitted. Nothing can un-delete what the disk
+    /// work already removed, but the announcement is still ours to withhold —
+    /// telling subscribers a document is deleted while it sits in the index the
+    /// confirmation just rewrote is a contradiction they would act on.
+    private func announcementIsStillTrue(_ documentId: String) -> Bool {
+        lock.withLock { metadataIndex[documentId] == nil }
     }
 
     /// The cached documents an authoritative listing of `seenIds` would evict:
@@ -1592,6 +1676,21 @@ public final class DocumentManager: @unchecked Sendable {
             ids.map {
                 EvictionCandidate(documentId: $0, metadataTouch: metadataTouches[$0])
             }
+        }
+    }
+
+    /// The same capture for one named document, for the caller that is about
+    /// to ask the server about it — a scoped `syncMetadata`.
+    ///
+    /// Unlike `evictionCandidateSnapshot` this does not require the document to
+    /// be cached: a scoped sync may be asking about a document it has no row
+    /// for, and a candidate stamped `nil` is exactly the "nothing has confirmed
+    /// this since" state that lets the answer through.
+    func evictionCandidate(for documentId: String) -> EvictionCandidate {
+        lock.withLock {
+            EvictionCandidate(
+                documentId: documentId, metadataTouch: metadataTouches[documentId]
+            )
         }
     }
 
@@ -1872,6 +1971,10 @@ public final class DocumentManager: @unchecked Sendable {
                 entry.tags = tags.compactMap { $0.stringValue }
             }
             metadataIndex[documentId] = entry
+            // A frame carrying metadata is the server saying the document is
+            // there — the same confirmation a listing gives (js-bao stamps
+            // every server-sourced metadata apply, #2852).
+            noteMetadataTouchLocked(documentId)
             return entry
         }
         persistMetadata(merged)
@@ -1904,6 +2007,11 @@ public final class DocumentManager: @unchecked Sendable {
             entry.commitRetryCount = nil
             entry.nextCommitAttemptAt = nil
             metadataIndex[documentId] = entry
+            // The commit is a server confirmation, and the one that takes the
+            // pending-create exemption away: a scoped `syncMetadata` that went
+            // out before it — when a 404 was the truthful answer — must not
+            // come back and evict the document the server has since accepted.
+            noteMetadataTouchLocked(documentId)
             return entry
         }
         persistMetadata(committed)
@@ -2001,6 +2109,10 @@ public final class DocumentManager: @unchecked Sendable {
                 meta.pendingCreate = false
                 meta.commitError = nil
                 metadataIndex[documentId] = meta
+                // The server accepted the create: a confirmation, and the end
+                // of the pending-create exemption (see
+                // `handlePendingCreateCommitted`).
+                noteMetadataTouchLocked(documentId)
                 return meta
             }
             if let metaToPersist {
@@ -2016,6 +2128,9 @@ public final class DocumentManager: @unchecked Sendable {
                     guard var meta = metadataIndex[documentId] else { return nil }
                     meta.pendingCreate = false
                     metadataIndex[documentId] = meta
+                    // 409 + `onExists: "link"`: the server has the document,
+                    // which is as much a confirmation as a fresh create.
+                    noteMetadataTouchLocked(documentId)
                     return meta
                 }
                 if let metaToPersist {

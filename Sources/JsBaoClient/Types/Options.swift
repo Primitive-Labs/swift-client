@@ -490,23 +490,29 @@ public struct SyncMetadataOptions: Sendable {
     /// Restrict the sync to a single document. `nil` syncs all open
     /// docs (default).
     public var documentId: String?
-    /// `"ids"` (default) syncs only the doc ID list; `"full"` syncs
-    /// every doc's full metadata blob. js-bao name parity.
+    /// `"full"` (default) syncs every doc's full metadata blob; `"ids"` syncs
+    /// only the doc ID list. js-bao name parity.
     public var payloadType: String?
     /// When true, the sync runs without blocking the caller.
     public var background: Bool?
-    /// Whether the server's listing replaces the local index rather than
-    /// merely merging into it: local documents absent from the response are
-    /// evicted and a `deleted` metadata event is emitted for each (pending
-    /// creates and local-only documents are exempt). This is how a document
-    /// whose access was revoked while this client was offline leaves the
-    /// device.
+    /// Whether the server's answer replaces the local index rather than merely
+    /// merging into it: local documents the server no longer has are evicted
+    /// and a `deleted` metadata event is emitted for each (pending creates and
+    /// local-only documents are exempt). This is how a document whose access
+    /// was revoked while this client was offline leaves the device.
     ///
     /// Mirrors js-bao's `SyncMetadataOptions.authoritative`, **including its
-    /// default**: a full-listing sync is authoritative unless you set this to
-    /// `false`. A single-document sync (`documentId`) and an ids-only payload
-    /// (`payloadType: "ids"`) are never authoritative — neither carries enough
-    /// to prove a document is gone.
+    /// default**: every sync evicts unless you set this to `false`.
+    ///
+    /// What counts as "the server no longer has it" depends on the scope. A
+    /// whole-scope listing evicts the documents it does not mention. A
+    /// single-document sync (`documentId`) is authoritative for its target row
+    /// alone — it says nothing about the other documents — and evicts it when
+    /// the server answers the fetch with 404 or 403. An ids-only payload
+    /// (`payloadType: "ids"`) carries too little to prove a document is gone,
+    /// so it *defers* its evictions rather than skipping them: each row the
+    /// listing did not mention is checked against the server, and only a 404 /
+    /// 403 removes it.
     public var authoritative: Bool?
     public init(
         documentId: String? = nil,

@@ -596,7 +596,14 @@ final class TransportSpineTests: XCTestCase {
             // `{type:"auth", token}`, encoded the same way the other outbound
             // frames in this file are. The dictionary it encodes is
             // `[String: String]`, so the untyped-dictionary count is unchanged.
-            "JsBaoClient.swift": (21, 6, 0),
+            // #3079 took the dictionary count 21 -> 23: a scoped `syncMetadata`
+            // asks about one document (`GET /documents/{id}`) and an ids
+            // listing verifies each unconfirmed row the same way, and both read
+            // a single row off the same legacy JSON graph the whole-scope
+            // listing already read an array of — one `[String: Any]?` holding
+            // the answer plus the two casts that unwrap it. Same wire boundary,
+            // one row instead of a list, not new untyped surface.
+            "JsBaoClient.swift": (23, 6, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP

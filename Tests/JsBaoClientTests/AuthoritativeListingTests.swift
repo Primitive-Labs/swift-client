@@ -120,10 +120,14 @@ final class AuthoritativeListingTests: XCTestCase {
         )
     }
 
-    // MARK: - Which syncMetadata responses may evict
+    // MARK: - Which syncMetadata listings may evict on their own
 
-    /// Mirrors js-bao's rule: a full listing is authoritative by default; a
-    /// single-document sync and an ids-only payload never are.
+    /// Mirrors js-bao's upsert rule: a full listing is authoritative by
+    /// default; an ids-only payload never is, because it defers its evictions
+    /// to a per-document check instead
+    /// (`SyncMetadataAuthorityHermeticTests`). A single-document sync never
+    /// reaches this rule — it has its own scope, authoritative for its target
+    /// row alone (#3079).
     func test_listingIsAuthoritative_matchesTheJsRule() {
         XCTAssertTrue(JsBaoClient.listingIsAuthoritative(SyncMetadataOptions()))
         XCTAssertTrue(
