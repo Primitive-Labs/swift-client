@@ -70,17 +70,22 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     // MARK: - CRUD
 
-    /// Create a new document. **Local-first**, mirroring js-bao's
-    /// `documents.create(options)`, which simply forwards to
-    /// `client.createDocument`: the doc is created locally and is
-    /// immediately writable, the server commit races in the background,
-    /// and `localOnly: true` keeps it on-device. A create issued while
-    /// offline therefore queues instead of failing.
+    /// Create a new document. **Local-first and metadata-only**, mirroring
+    /// js-bao's `documents.create(options)`, which simply forwards to
+    /// `client.createDocument`: the document's local metadata row is written
+    /// immediately, the server commit races in the background, and
+    /// `localOnly: true` keeps it on-device. A create issued while offline
+    /// therefore queues instead of failing.
     ///
-    /// The response carries only the document's `metadata` blob — not its
-    /// id (use `createWithAlias` when you need the id back). When no owning
-    /// client is wired (isolated/test construction) it falls back to the
-    /// legacy blocking `POST /documents`.
+    /// The new document is **not open**. Call `open(_:)` before querying or
+    /// writing it — a write to an unopened document throws
+    /// `JsBaoError(code: .notFound, "Document `<id>` is not open…")`, exactly
+    /// as in the JS client (#3200).
+    ///
+    /// The response carries the document's `metadata` blob, with the new id
+    /// inside it (`metadata.documentId`). When no owning client is wired
+    /// (isolated/test construction) it falls back to the legacy blocking
+    /// `POST /documents`.
     public func create(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> CreateDocumentResult {
         guard let client else {
             // No client to route through (tests / isolated construction):
@@ -92,147 +97,6 @@ public final class DocumentsAPI: @unchecked Sendable {
         // js-bao's `DocumentsAPI.create` forwards to `client.createDocument`
         // — which itself returns the `{ metadata }` result since #1108.
         return try await client.createDocument(options: options)
-    }
-
-    /// List documents accessible to the current user.
-    ///
-    /// - Parameter includeRoot: when `false` (default), the app's root
-    ///   document is filtered out of the returned items. Pass `true` to
-    ///   keep it. The server endpoint always returns the root; we filter
-    ///   client-side to match js-bao behavior.
-    ///
-    /// Deprecated: this returns the legacy owner + read-write + reader
-    /// union and will eventually be removed. Migrate to
-    /// `client.me.ownedDocuments(...)` for the owner-only subset and
-    /// `client.me.sharedDocuments(...)` for the non-owner subset.
-    /// Mirrors js-bao's `@deprecated` annotation on `DocumentsAPI.list`
-    /// (issue #628).
-    @available(*, deprecated, message: "documents.list() returns the legacy owner+read-write+reader union. Use client.me.ownedDocuments(...) for owned docs and client.me.sharedDocuments(...) for shared docs.")
-    public func list(
-        options: ListDocumentsOptions? = nil,
-        includeRoot: Bool = false
-    ) async throws -> [DocumentInfo] {
-        let page = try await _listImpl(options: options, includeRoot: includeRoot)
-        return page.items
-    }
-
-    /// Page-returning form of `documents.list`. Mirrors js-bao's
-    /// `list(options & { returnPage: true })` overload — returns a
-    /// `DocumentListPage` (items + pagination cursor) instead of a flat array.
-    @available(*, deprecated, message: "documents.list() returns the legacy owner+read-write+reader union. Use client.me.ownedDocuments(...) for owned docs and client.me.sharedDocuments(...) for shared docs.")
-    public func listPage(
-        options: ListDocumentsOptions? = nil,
-        includeRoot: Bool = false
-    ) async throws -> DocumentListPage {
-        return try await _listImpl(options: options, includeRoot: includeRoot, returnPage: true)
-    }
-
-    /// Underscore-prefixed implementation that internal callers (e.g.
-    /// `PrimitiveAppState`-style consumers that want to migrate
-    /// gradually) can reach without tripping the deprecation warning.
-    /// Mirrors js-bao's `_internalListImpl` pattern from `documentsApi.ts`.
-    ///
-    /// Threads the implemented `ListDocumentsOptions` fields
-    /// (`limit`/`cursor`/`tag`/`forward`/`includeRoot`) into the query string
-    /// and returns a `DocumentListPage`; the public `list` unwraps `.items`,
-    /// `listPage` returns the page directly.
-    ///
-    /// This is always a blocking server fetch. The struct's local-first
-    /// fields (`refreshFromServer`, `localOnly`, `serverTimeoutMs`,
-    /// `waitForLoad`) are not implemented here and carry a deprecation warning
-    /// saying so — `client.me.ownedDocuments(...)` is where they work (#2360).
-    ///
-    /// `returnPage` says the caller asked for the page shape (`listPage`).
-    /// Only the reconciliation reads it: a page is a subset of the cached
-    /// scope, so it may not evict.
-    public func _listImpl(
-        options: ListDocumentsOptions? = nil,
-        includeRoot includeRootArg: Bool = false,
-        returnPage: Bool = false
-    ) async throws -> DocumentListPage {
-        // `includeRoot` may arrive either as the dedicated parameter (legacy
-        // Swift call sites) or inside `options` (js-bao parity). Either enables it.
-        let includeRoot = includeRootArg || (options?.includeRoot == true)
-        var query = URLQuery()
-        if includeRoot { query.append("includeRoot", "true") }
-        if let limit = options?.limit, limit > 0 {
-            query.append("limit", limit)
-        }
-        if let cursor = options?.cursor, !cursor.isEmpty {
-            query.append("cursor", cursor)
-        }
-        if let tag = options?.tag, !tag.isEmpty {
-            query.append("tag", tag)
-        }
-        if options?.forward == true { query.append("forward", "true") }
-        // The server may return either a bare array or an `{ items, cursor }`
-        // (or legacy `{ documents }`) envelope — accept both.
-        let response: DocumentListEnvelope = try await transport.request(
-            method: .get,
-            path: "/documents\(query.queryString)"
-        )
-        var items = response.items
-        let cursor = response.cursor
-        // Documents the server listed but the client-side root filter drops.
-        // They are still on the server, so the reconciliation must retain
-        // them rather than read their absence as a deletion.
-        var retainIds: Set<String> = []
-        // Do not filter the root when filtering by tag — a root that carries
-        // the requested tag should be returned (mirrors js-bao's `filterRoot`).
-        if !includeRoot, options?.tag == nil {
-            var rootDocId: String? = nil
-            if let client { rootDocId = client.rootDocId }
-            items = Self.filterOutRoot(items, rootDocId: rootDocId)
-            // js-bao retains the root by id (`syncMetadata({ includeRoot })`
-            // → `retainIds`); retaining every filtered row on top of that also
-            // covers a token whose payload carries no `rootDocId` claim.
-            if let rootDocId { retainIds.insert(rootDocId) }
-            let kept = Set(items.map { $0.documentId })
-            retainIds.formUnion(
-                response.items.map { $0.documentId }.filter { !kept.contains($0) }
-            )
-        }
-        // The caller's own response never evicts. An unpaged `GET /documents`
-        // is a bare array with no cursor and no `hasMore` (#858), and the
-        // controller silently truncates it at dynamo-bao's 100-row
-        // `defaultQueryLimit` — a truncated listing and a complete one are the
-        // same bytes. So merge what the caller got, then, only when the cache
-        // holds documents that response did not mention, walk the scope
-        // through the paged envelope and let *that* union do the evicting.
-        //
-        // Both halves run against the loaded metadata index: before the client
-        // has read the persisted `meta` rows back, the cache looks empty, so
-        // the merge would be undone by the load and the walk would find nothing
-        // to evict (#2827).
-        let metadataIsLoaded = await localMetadataIsLoaded()
-        await reconcileIntoLocalCache(items, authoritative: false, retainIds: retainIds)
-        if Self.listingScopeIsReconcilable(options: options, returnPage: returnPage),
-           metadataIsLoaded {
-            await reconcileByWalkingScope(
-                seenIds: Set(response.items.map { $0.documentId }),
-                retainIds: retainIds
-            )
-        }
-        return DocumentListPage(items: items, cursor: cursor)
-    }
-
-    /// Whether this request asked about the whole scope, and so may be
-    /// reconciled authoritatively (after the scope walk confirms what that
-    /// scope contains). Mirrors js-bao's `isPaged` rule (`documentsApi.ts`): a
-    /// limit, a cursor, a tag filter, `forward`, or the page-returning form
-    /// each make the request a question about a slice, and a slice's absences
-    /// prove nothing. `internal` for unit testing.
-    static func listingScopeIsReconcilable(
-        options: ListDocumentsOptions?,
-        returnPage: Bool
-    ) -> Bool {
-        if returnPage { return false }
-        guard let options else { return true }
-        if options.limit != nil { return false }
-        if !(options.cursor ?? "").isEmpty { return false }
-        if !(options.tag ?? "").isEmpty { return false }
-        if options.forward == true { return false }
-        return true
     }
 
     /// Write a listing response back into the local metadata cache. When the
@@ -348,76 +212,93 @@ public final class DocumentsAPI: @unchecked Sendable {
         )
         guard !candidates.isEmpty else { return }
 
+        // #2951 removed the legacy `GET /documents` union list, so the scope
+        // is the pair that replaced it — `me/owned-documents` plus
+        // `me/shared-documents`. BOTH halves must complete: a walk that saw
+        // only the owned half would read every shared document as evictable.
         var union: [DocumentInfo] = []
         var unionIds: Set<String> = []
-        var cursor: String? = nil
 
-        for _ in 0..<Self.scopeWalkMaxPages {
-            var query = URLQuery()
-            // The server returns the root whatever this says; asking for it
-            // keeps the union a superset of what the caller's response could
-            // have contained.
-            query.append("includeRoot", "true")
-            query.append("limit", Self.scopeWalkPageSize)
-            if let cursor, !cursor.isEmpty { query.append("cursor", cursor) }
+        for endpoint in ["me/owned-documents", "me/shared-documents"] {
+            let owned = endpoint == "me/owned-documents"
+            var cursor: String? = nil
+            var reachedEndOfScope = false
 
-            guard isCurrent() else { return }
-            let page: DocumentListEnvelope
-            do {
-                page = try await transport.request(
-                    method: .get,
-                    path: "/documents\(query.queryString)"
-                )
-            } catch {
-                return
-            }
-            // A bare array in answer to `limit` means the server ignored it.
-            guard !page.isBareArray else { return }
-            // A body that never mentioned `items` (or legacy `documents`) is
-            // not a page of this scope — decoding it leaves an empty list, and
-            // an empty list read as the whole scope evicts everything.
-            guard page.listsItems else { return }
+            for _ in 0..<Self.scopeWalkMaxPages {
+                var query = URLQuery()
+                if owned {
+                    // The server returns the root whatever this says; asking
+                    // for it keeps the union a superset of what the caller's
+                    // response could have contained. `/me/shared-documents`
+                    // takes no `includeRoot` — a shared list never carries the
+                    // caller's own root.
+                    query.append("includeRoot", "true")
+                }
+                query.append("limit", Self.scopeWalkPageSize)
+                if let cursor, !cursor.isEmpty { query.append("cursor", cursor) }
 
-            for item in page.items where unionIds.insert(item.documentId).inserted {
-                union.append(item)
-            }
-
-            guard let next = page.cursor, !next.isEmpty else {
-                // No continuation token. If the page nevertheless says more
-                // rows remain, the walk cannot ask for them and so never
-                // reached the end of the scope — an inconsistent envelope
-                // authorizes nothing.
-                guard !page.hasMore else { return }
-                // A scope walked as one user says nothing about the one signed
-                // in now.
                 guard isCurrent() else { return }
-                // A completed walk that found nothing at all. The request asks
-                // `includeRoot=true`, so the server's answer to it always
-                // carries at least the caller's root: zero rows is an anomalous
-                // answer, not a user with no documents, and reading it as the
-                // whole scope evicts every cached document on the device
-                // (#2859). One row — the root, and nothing else — is the user
-                // whose documents really were all deleted, and that page still
-                // evicts the rest of the cache.
-                guard !union.isEmpty else {
-                    logger.debug(
-                        "[documents] scope reconcile declined: the walk found no documents"
+                let page: DocumentListEnvelope
+                do {
+                    page = try await transport.request(
+                        method: .get,
+                        path: "/\(endpoint)\(query.queryString)"
                     )
+                } catch {
                     return
                 }
-                // The walk reached the end of the scope and the union is the
-                // server's whole view of it.
-                await reconcileIntoLocalCache(
-                    union,
-                    authoritative: true,
-                    retainIds: retainIds,
-                    evictOnly: candidates
-                )
-                return
+                // A bare array in answer to `limit` means the server ignored it.
+                guard !page.isBareArray else { return }
+                // A body that never mentioned `items` (or legacy `documents`)
+                // is not a page of this scope — decoding it leaves an empty
+                // list, and an empty list read as the whole scope evicts
+                // everything.
+                guard page.listsItems else { return }
+
+                for item in page.items where unionIds.insert(item.documentId).inserted {
+                    union.append(item)
+                }
+
+                guard let next = page.cursor, !next.isEmpty else {
+                    // No continuation token. If the page nevertheless says more
+                    // rows remain, the walk cannot ask for them and so never
+                    // reached the end of the scope — an inconsistent envelope
+                    // authorizes nothing.
+                    guard !page.hasMore else { return }
+                    reachedEndOfScope = true
+                    break
+                }
+                if next == cursor { return }
+                cursor = next
             }
-            if next == cursor { return }
-            cursor = next
+
+            // The page cap: an unfinished half authorizes nothing.
+            guard reachedEndOfScope else { return }
         }
+
+        // A scope walked as one user says nothing about the one signed in now.
+        guard isCurrent() else { return }
+        // A completed walk that found nothing at all. The owned request asks
+        // `includeRoot=true`, so the server's answer to it always carries at
+        // least the caller's root: zero rows is an anomalous answer, not a user
+        // with no documents, and reading it as the whole scope evicts every
+        // cached document on the device (#2859). One row — the root, and
+        // nothing else — is the user whose documents really were all deleted,
+        // and that walk still evicts the rest of the cache.
+        guard !union.isEmpty else {
+            logger.debug(
+                "[documents] scope reconcile declined: the walk found no documents"
+            )
+            return
+        }
+        // The walk reached the end of the scope and the union is the server's
+        // whole view of it.
+        await reconcileIntoLocalCache(
+            union,
+            authoritative: true,
+            retainIds: retainIds,
+            evictOnly: candidates
+        )
     }
 
     /// Reconcile the local cache against the user's whole document scope,
@@ -524,29 +405,6 @@ public final class DocumentsAPI: @unchecked Sendable {
             retainIds: retainIds,
             isCurrent: { [weak self] in self?.scopeReconcileIsCurrent(generation) ?? false }
         )
-    }
-
-    /// Sentinel tag the server attaches to a root document. Mirrors
-    /// js-bao's `ROOT_DOCUMENT_TAG` in `documentsApi.ts`. Defined once in
-    /// `LocalFirstListing` so this filter and `me.ownedDocuments`' local-path
-    /// filter test the same sentinel.
-    private static let rootDocumentTag = LocalFirstListing.rootDocumentTag
-
-    /// Strip the app root document from a list response, matching js-bao's
-    /// `_listImpl` filter exactly: drop any entry whose `documentId` equals
-    /// the known root id, OR whose `tags` include the `__ROOT_TAG__`
-    /// sentinel. The tag check runs even when `rootDocId` is unknown (e.g. a
-    /// JWT without the `rootDocId` claim), so the root never leaks on tokens
-    /// that lack the claim.
-    private static func filterOutRoot(
-        _ items: [DocumentInfo],
-        rootDocId: String?
-    ) -> [DocumentInfo] {
-        items.filter { item in
-            let isIdRoot = rootDocId != nil && item.documentId == rootDocId
-            let isRootTagged = item.tags?.contains(Self.rootDocumentTag) ?? false
-            return !isIdRoot && !isRootTagged
-        }
     }
 
     /// Get a document by ID.
@@ -725,8 +583,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     // MARK: - Invitations
 
     /// List pending deferred-grant invitations for a document. Returns
-    /// rows from the new `DeferredDocumentPermission` model (the
-    /// replacement for the legacy `DocumentInvitation` model).
+    /// rows from the `DeferredDocumentPermission` model, which replaced the
+    /// per-document invitation model removed in #2951.
     /// Mirrors js-bao's `documents.listPendingInvitations` (issue #619).
     /// Sends `GET /documents/:documentId/pending-invitations`.
     public func listPendingInvitations(documentId: String) async throws -> [PendingInvitationEntry] {

@@ -34,9 +34,9 @@ final class ServerPushFramesTests: XCTestCase {
         return s.hasSuffix("/") ? String(s.dropLast()) : s
     }
 
-    /// A local document that is a pending create, with its sync protocol and
-    /// awareness entry built (the same setup `createLocalDocument` gives a
-    /// freshly created document).
+    /// A locally created document, then opened — the create-then-open shape
+    /// every caller writes since #3200 (create is metadata-only). Its sync
+    /// protocol, awareness entry and update observer are built by the open.
     @discardableResult
     private func makeLocalDocument(
         _ client: JsBaoClient,
@@ -44,14 +44,13 @@ final class ServerPushFramesTests: XCTestCase {
         localOnly: Bool = false
     ) async throws -> YDocument {
         client.documentManager.createRemoteDocument = { _ in ["documentId": docId] }
-        let doc = try await client.documentManager.createLocalDocument(
+        try await client.documentManager.createLocalDocument(
             documentId: docId, title: "push-frames", localOnly: localOnly
         )
-        _ = try await client.openDocument(
+        return try await client.openDocument(
             docId,
             options: OpenDocumentOptions(enableNetworkSync: false, deferNetworkSync: true)
         )
-        return doc
     }
 
     // MARK: - B7: error frames

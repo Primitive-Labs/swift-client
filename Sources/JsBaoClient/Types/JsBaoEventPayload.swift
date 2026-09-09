@@ -328,10 +328,6 @@ extension MeUpdateFailedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .meUpdateFailed }
 }
 
-extension InvitationEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .invitation }
-}
-
 extension NotificationEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .notification }
 }
@@ -416,7 +412,6 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     GenericErrorEvent.self,
     MeUpdatedEvent.self,
     MeUpdateFailedEvent.self,
-    InvitationEvent.self,
     NotificationEvent.self,
     WorkflowStatusEvent.self,
     WorkflowStartedEvent.self,

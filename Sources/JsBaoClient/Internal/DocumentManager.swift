@@ -1,5 +1,9 @@
 import Foundation
 import YSwift
+// `YrsTransaction` (the suppressed-apply helper's parameter) is a Yniffi type.
+// Imported by name, not wholesale: `Yniffi` has a `YSubscription` of its own,
+// and this file names YSwift's.
+import class Yniffi.YrsTransaction
 
 /// Tracks per-document awareness (presence) state for local and remote clients.
 public struct AwarenessEntry: Sendable {
@@ -73,6 +77,44 @@ public final class DocumentManager: @unchecked Sendable {
     /// is reopened. Without this, retention "reclaiming" an open document was
     /// undone by its own next persist (#2668).
     private var persistenceSuspended: Set<String> = []
+
+    /// Whether local storage has finished binding a provider. Flipped by
+    /// `storageDidBecomeReady()` under `lock`, and read under the same lock by
+    /// the two skip paths below — that shared hold is what makes the handoff
+    /// race-free: a skip either enqueues (not ready) or retries at once
+    /// (ready), so a provider that binds between the nil read and the enqueue
+    /// cannot strand the entry in an already-drained set (#3200, review F3).
+    private var storageReady = false
+
+    /// Documents whose debounced persist ran while no storage provider was
+    /// bound. Replayed by the drain; a document closed, deleted or
+    /// persistence-suspended by then is skipped and forgotten.
+    private var persistsAwaitingStorage: Set<String> = []
+
+    /// Documents whose metadata put found no bound provider. Since
+    /// `documents.create` is metadata-only (#3200), that row is the create's
+    /// only durable artifact — dropping it loses the document id, its
+    /// pending-create state and its commit retry information.
+    private var metadataAwaitingStorage: Set<String> = []
+
+    /// Documents whose open has published them but not yet restored their
+    /// stored snapshot and metadata row. Persistence is held for as long as an
+    /// id is in here.
+    ///
+    /// The observer is installed before the document is reachable (#3200), so a
+    /// write made during the open — from a `DocumentOpenedEvent` handler, or by
+    /// a caller the already-open fast path handed the document to — schedules a
+    /// persist while the document still holds nothing but that write. Letting
+    /// it run would save that state over the snapshot the open is about to
+    /// load, and write a metadata row rebuilt from an index that has not read
+    /// the stored one yet: the offline records replaced by the early edit, and
+    /// `localOnly` erased from a row whose flag is the only thing keeping the
+    /// document's content off the wire.
+    private var openRestoreInFlight: Set<String> = []
+
+    /// Ids from the set above whose persist was actually held. Replayed once
+    /// the open finishes, so the write is not left waiting for the next one.
+    private var persistsAwaitingOpenRestore: Set<String> = []
 
     // Metadata
     private var metadataIndex: [String: LocalMetadataEntry] = [:]
@@ -201,6 +243,12 @@ public final class DocumentManager: @unchecked Sendable {
     /// Fires only for documents in `immediate` mode — see
     /// `applyPostCommitPolicy` below.
     var onPendingCreateCommitted: ((String) -> Void)?
+    /// Fires once an open has settled a document's local-only classification
+    /// that it had claimed as unknown. An edit made while the answer was
+    /// unknown is held rather than sent (#2691), and this is what tells the
+    /// client to flush the held batch — the per-document counterpart of the
+    /// startup-wide `resolveLocalOnlyClassifications()` release.
+    var onLocalOnlyClassificationResolved: ((String) -> Void)?
     var commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff()
     /// Online-state probe used to gate background-commit retries (mirrors
     /// js-bao's `ctx.isOnline()`). When nil, retries assume online.
@@ -392,12 +440,50 @@ public final class DocumentManager: @unchecked Sendable {
         let doc = YDocument()
         let startTime = CFAbsoluteTimeGetCurrent()
 
+        // Register the update observer BEFORE the document is published, so
+        // there is no interval in which a document reports open and is not
+        // observed. `openDocs`, `DocumentOpenedEvent`, `getDoc` and the
+        // already-open fast path all become reachable in the `withLock` below,
+        // and a write made from an opened-event handler (or by a caller that
+        // raced the open) would otherwise bypass outbound forwarding, unsynced
+        // marking and debounced persistence entirely — the observer is the
+        // single forwarding owner, so that hole would be the size of the open
+        // (#3200). The local hydration apply below runs through the observer
+        // now, and is suppressed from forwarding by `applyingRemoteUpdate`.
+        registerUpdateObserver(documentId: documentId, doc: doc)
+
+        // Whatever this open does with the document, the persistence it holds
+        // below is released exactly once — including on the paths that throw.
+        defer { finishOpenRestore(documentId: documentId) }
+
         lock.withLock {
+            // Hold persistence for the length of this open, claimed in the same
+            // critical section that publishes the document: from here until the
+            // stored snapshot and metadata row have been read, this Y.Doc is
+            // not the document — it is whatever a write racing the open put in
+            // it, and saving that would replace what the open is about to load
+            // (#3200). Claimed before publication for the same reason the
+            // observer is: after it, a write can already be in flight.
+            openRestoreInFlight.insert(documentId)
+            persistsAwaitingOpenRestore.remove(documentId)
             // Cleared here and decided once this open has loaded the
             // document's stored metadata (see `recordLocalCopyClaim` below) —
             // a claim left over from a previous open must not leak into this
             // one.
             localCopyClaimedAtOpen.remove(documentId)
+            // Local-only is *unknown* until this open has read the stored row,
+            // and the document becomes writable on the next line. Claim the
+            // unknown state before that happens, not after the read: the
+            // observer above forwards from the first instant, so a write made
+            // in the meantime would otherwise be sent on `isLocalOnly`'s
+            // out-of-ignorance `false` — the #2691 leak, now reachable through
+            // a plain write (#3200). Resolved (or confirmed) right after the
+            // read below, which is also what releases anything held here.
+            if offlineStore != nil,
+               metadataIndex[documentId] == nil,
+               !localOnlyDocs.contains(documentId) {
+                localOnlyClassificationPending.insert(documentId)
+            }
             openDocs[documentId] = doc
             docOpenStartTime[documentId] = startTime
             docSyncStates[documentId] = false
@@ -415,6 +501,13 @@ public final class DocumentManager: @unchecked Sendable {
         // for a document that is not open yet, so a client that never emits
         // it strands a deferred-sync document (#2666).
         emitter?.emit(DocumentOpenedEvent(documentId: documentId))
+
+        // Test seam for the window this open is now inside: the document is
+        // published and observed, and its stored state has not been read yet.
+        // A test parks here to let an early write's debounced persist run
+        // against a document the open has not restored. Never set in
+        // production code.
+        if let hook = onOpenPublishedForTest { await hook(documentId) }
 
         // Create sync protocol for this document
         let syncProtocol = YProtocol(document: doc)
@@ -462,17 +555,27 @@ public final class DocumentManager: @unchecked Sendable {
                 loaded = nil
             }
             if let data = loaded, !data.isEmpty {
-                var applied = false
-                doc.transactSync { txn in
+                // The observer is attached before this point now, so the
+                // hydration apply would otherwise look like a local edit and be
+                // forwarded to the server (and marked unsynced). Suppress it
+                // the same way a remote apply is suppressed — restoring what is
+                // already on disk is not a new local change. JS holds its
+                // outbound updates across the IndexedDB replay for the same
+                // reason. The persist the observer schedules for it is
+                // debounced and harmless.
+                let applied = applySuppressingForwarding(
+                    documentId: documentId, doc: doc
+                ) { txn in
                     do {
                         try txn.transactionApplyUpdate(update: Array(data))
-                        applied = true
+                        return true
                     } catch {
                         self.logger.warn(
                             "Failed to apply persisted Y.Doc state:",
                             documentId,
                             error.localizedDescription
                         )
+                        return false
                     }
                 }
                 if applied {
@@ -509,21 +612,14 @@ public final class DocumentManager: @unchecked Sendable {
         // cold start the provider may not be bound yet, and then a missing row
         // says nothing about the document: local-only is unknown, not false,
         // and its edits are held until the classification lands (#2691).
+        var metadataWasReadable = false
         if let offlineStore {
             let read = try? await offlineStore.readMetadata(
                 appId: appId, userId: userId, documentId: documentId
             )
+            metadataWasReadable = read?.readable == true
             lock.withLock {
                 if let entry = read?.entry { metadataIndex[documentId] = entry }
-                if read?.readable == true
-                    || metadataIndex[documentId] != nil
-                    || localOnlyDocs.contains(documentId) {
-                    // Either the store answered, or this session already knows
-                    // what the document is (it was created or listed here).
-                    localOnlyClassificationPending.remove(documentId)
-                } else {
-                    localOnlyClassificationPending.insert(documentId)
-                }
             }
         }
 
@@ -558,6 +654,27 @@ public final class DocumentManager: @unchecked Sendable {
             }
         }
 
+        // Settle the classification this open claimed as unknown — after the
+        // pin above, never between it and the read: a batch released while the
+        // answer was known but not yet pinned would be sent on the same
+        // out-of-ignorance `false` the hold exists to refuse (#2691/#3200). The
+        // answer stands unknown when the store could not be read and nothing
+        // else in this session knows the document; then the hold outlives the
+        // open and `loadLocalMetadata` releases it.
+        let classificationSettled: Bool = lock.withLock {
+            guard localOnlyClassificationPending.contains(documentId) else { return false }
+            guard metadataWasReadable
+                || metadataIndex[documentId] != nil
+                || localOnlyDocs.contains(documentId) else { return false }
+            localOnlyClassificationPending.remove(documentId)
+            return true
+        }
+        if classificationSettled {
+            // Whatever was held while this open ran is classified now: the
+            // flush sends it, or drops it as local-only.
+            onLocalOnlyClassificationResolved?(documentId)
+        }
+
         // Decide the local-copy claim now: the stored metadata has been loaded
         // (a fresh session's metadata index is otherwise still empty, and the
         // claim would be missed for exactly the restart-with-a-stale-snapshot
@@ -577,10 +694,26 @@ public final class DocumentManager: @unchecked Sendable {
             metadataIndex[documentId] = meta
             return meta
         }
-        try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
+        try? await putMetadataTracked(metaSnapshot)
 
-        // Register update observer — equivalent to JS `doc.on("update", handler)`.
-        // This captures ALL writes and forwards local ones for WebSocket sync.
+        return doc
+    }
+
+    /// Attach the per-document update observer — equivalent to JS
+    /// `doc.on("update", handler)`. It captures ALL writes and forwards local
+    /// ones for WebSocket sync; it is the single owner of that forwarding
+    /// (#3200), so `_openDocumentImpl` installs it before the document is
+    /// reachable by anyone.
+    ///
+    /// Lock discipline: the entry is replaced under `lock`, and any
+    /// subscription it displaced is cancelled *after* the lock is released.
+    /// `YSubscription.cancel` (and its `deinit`) takes the owning document's
+    /// FFI lock, while this callback takes `lock` under that FFI lock — so
+    /// cancelling under `lock` inverts the two and deadlocks against a thread
+    /// mid-transaction. A displaced entry is reachable in practice:
+    /// `evictAllLocalData` deliberately leaves `updateSubscriptions` populated,
+    /// so reopening an evicted id lands here with a live prior subscription.
+    private func registerUpdateObserver(documentId: String, doc: YDocument) {
         let docId = documentId
         let subscription = doc.observeUpdate { [weak self] update in
             guard let self = self else { return }
@@ -603,9 +736,49 @@ public final class DocumentManager: @unchecked Sendable {
             // YDoc state. Closes the durability gap left by #852.
             self.schedulePersist(documentId: docId)
         }
-        lock.withLock { updateSubscriptions[documentId] = subscription }
+        let displaced: YSubscription? = lock.withLock {
+            let previous = updateSubscriptions[documentId]
+            updateSubscriptions[documentId] = subscription
+            return previous
+        }
+        // Outside the lock, deliberately.
+        displaced?.cancel()
+    }
 
-        return doc
+    /// Apply an update that is not a new local change — a remote frame, or the
+    /// local hydration replay — so the observer above does not forward it.
+    ///
+    /// The suppression is scoped to *this transaction*, not to a span of time.
+    /// `applyingRemoteUpdate` is raised and lowered while this thread holds the
+    /// document's FFI exclusion lock, and every mutation of the document must
+    /// hold that same lock — so while the flag is up, no other thread can be
+    /// inside a transaction whose commit callback would read it. Raising it
+    /// before taking the lock (as this path used to) suppressed whatever a
+    /// concurrent local write happened to commit in the meantime: since the
+    /// observer became the single forwarding owner, that write was simply
+    /// dropped — not sent, not marked unsynced, on a document still reporting
+    /// itself synced (#3200).
+    ///
+    /// Raw transaction rather than `transactSync` for the same reason
+    /// `transactAndSyncAsync` uses one: the FFI lock is the real mutual
+    /// exclusion domain, and it has to span the flag window, which nesting it
+    /// around `transactSync`'s own queue hop could not do safely. The observer
+    /// callback fires from `free()` — the commit — on this thread, still inside
+    /// both the lock and the flag.
+    @discardableResult
+    private func applySuppressingForwarding<T>(
+        documentId: String,
+        doc: YDocument,
+        _ body: (YrsTransaction) -> T
+    ) -> T {
+        doc.withExclusiveAccess {
+            lock.withLock { applyingRemoteUpdate[documentId] = true }
+            let txn = doc.document.transact(origin: nil)
+            let result = body(txn)
+            txn.free()
+            lock.withLock { applyingRemoteUpdate[documentId] = false }
+            return result
+        }
     }
 
     /// Open-time permission bootstrap, mirroring js-bao's `_openCore`
@@ -665,7 +838,7 @@ public final class DocumentManager: @unchecked Sendable {
             metadataIndex[documentId] = meta
             return meta
         }
-        try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: snapshot)
+        try? await putMetadataTracked(snapshot)
     }
 
     /// Drop a document that never finished opening, without any of
@@ -676,14 +849,17 @@ public final class DocumentManager: @unchecked Sendable {
     /// full initialization instead of short-circuiting to a half-open
     /// document (#2667).
     public func removeOpenDoc(_ documentId: String) {
-        lock.withLock {
+        // Removed under the lock, cancelled after it is released — see
+        // `registerUpdateObserver` for the FFI-lock/manager-lock inversion this
+        // avoids (#3200).
+        let removedSubscription: YSubscription? = lock.withLock {
             _ = openDocs.removeValue(forKey: documentId)
             docSyncStates.removeValue(forKey: documentId)
             docAwareness.removeValue(forKey: documentId)
             docPermissions.removeValue(forKey: documentId)
             docPersistence.removeValue(forKey: documentId)
             syncProtocols.removeValue(forKey: documentId)
-            updateSubscriptions.removeValue(forKey: documentId)?.cancel()
+            let subscription = updateSubscriptions.removeValue(forKey: documentId)
             pendingSyncOperations.removeValue(forKey: documentId)
             docOpenStartTime.removeValue(forKey: documentId)
             docServerBytes.removeValue(forKey: documentId)
@@ -695,7 +871,9 @@ public final class DocumentManager: @unchecked Sendable {
             serverLoadedEmitted.remove(documentId)
             localCopyClaimedAtOpen.remove(documentId)
             retainLocalByDoc.removeValue(forKey: documentId)
+            return subscription
         }
+        removedSubscription?.cancel()
     }
 
     /// Close a document and optionally evict local data
@@ -720,7 +898,9 @@ public final class DocumentManager: @unchecked Sendable {
             await persistDocumentToLocal(documentId: documentId)
         }
 
-        lock.withLock {
+        // As in `removeOpenDoc`: the entry goes under the lock, the cancel
+        // happens after it is released (#3200).
+        let removedSubscription: YSubscription? = lock.withLock {
             retainLocalByDoc.removeValue(forKey: documentId)
             persistenceSuspended.remove(documentId)
             _ = openDocs.removeValue(forKey: documentId)
@@ -730,7 +910,7 @@ public final class DocumentManager: @unchecked Sendable {
             docOpenStartTime.removeValue(forKey: documentId)
             docServerBytes.removeValue(forKey: documentId)
             syncProtocols.removeValue(forKey: documentId)
-            updateSubscriptions.removeValue(forKey: documentId)?.cancel()
+            let subscription = updateSubscriptions.removeValue(forKey: documentId)
             docAwareness.removeValue(forKey: documentId)
             docPersistence.removeValue(forKey: documentId)
             syncPerfRequestedDocs.remove(documentId)
@@ -752,7 +932,9 @@ public final class DocumentManager: @unchecked Sendable {
                 localOnlyDocs.remove(documentId)
             }
             localOnlyClassificationPending.remove(documentId)
+            return subscription
         }
+        removedSubscription?.cancel()
 
         if evictLocal {
             await evictLocalData(documentId: documentId)
@@ -1086,16 +1268,12 @@ public final class DocumentManager: @unchecked Sendable {
     /// `updateUrl` pointing at R2; the router downloads those to raw bytes,
     /// so the apply path must not require a base64 round-trip.
     func handleRemoteUpdate(documentId: String, updateData: Data) {
-        let doc: YDocument? = lock.withLock {
-            guard let d = openDocs[documentId] else { return nil }
-            applyingRemoteUpdate[documentId] = true
-            return d
-        }
+        let doc: YDocument? = lock.withLock { openDocs[documentId] }
         guard let doc else { return }
 
         let updateBytes = [UInt8](updateData)
         let applyStartMs = Self.nowMs()
-        doc.transactSync { [self] txn in
+        applySuppressingForwarding(documentId: documentId, doc: doc) { txn in
             do {
                 try txn.transactionApplyUpdate(update: updateBytes)
                 self.logger.debug("Remote update applied for doc:", documentId)
@@ -1104,8 +1282,6 @@ public final class DocumentManager: @unchecked Sendable {
             }
         }
         let applyMs = Self.nowMs() - applyStartMs
-
-        lock.withLock { applyingRemoteUpdate[documentId] = false }
 
         let bytes = updateData.count
         // Accumulate server bytes applied for first-sync metrics — JS does this
@@ -1191,7 +1367,7 @@ public final class DocumentManager: @unchecked Sendable {
                     self.metadataIndex[documentId] = e
                     return e
                 }
-                try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: entry)
+                try? await self.putMetadataTracked(entry)
             }
         }
     }
@@ -1493,7 +1669,7 @@ public final class DocumentManager: @unchecked Sendable {
             }
 
             // Persist
-            try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: entry)
+            try? await putMetadataTracked(entry)
 
             // Per-doc typed event, mirroring JS `handleServerDocuments`
             // (`src/client/internal/documentManager.ts`): action "updated",
@@ -1776,7 +1952,7 @@ public final class DocumentManager: @unchecked Sendable {
 
         setMetadata(documentId, entry: next)
         lock.withLock { _ = deletedMetadataIds.remove(documentId) }
-        try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: next)
+        try? await putMetadataTracked(next)
 
         // A server `created` for a document we already knew about is an
         // update; emitting `created` twice would make listeners double-insert.
@@ -1846,19 +2022,30 @@ public final class DocumentManager: @unchecked Sendable {
         }
     }
 
-    /// Create a document locally (offline or local-only). Pass
-    /// `tags` to carry them through the eventual server commit
-    /// (`commitOfflineCreate`) — mirrors js-bao's local-first create
-    /// path (#852).
+    /// Create a document locally (offline or local-only): write its metadata
+    /// row and nothing else. Pass `tags` to carry them through the eventual
+    /// server commit (`commitOfflineCreate`) — mirrors js-bao's local-first
+    /// create path (#852), which is metadata-only ("create document metadata
+    /// only (no Y.Doc open)", `src/client/JsBaoClient.ts`).
+    ///
+    /// No `YDocument` is built here, and the document is deliberately NOT
+    /// registered in `openDocs`: opening is always an explicit step. Until
+    /// `openDocument` runs there is no update observer for the document, so a
+    /// write accepted here could never reach the server — it would be applied
+    /// locally, read back, and lost on the next launch (#3200). Every write
+    /// funnel already guards on openness (`requireMember`, `transactAndSync`),
+    /// so leaving the document closed is what makes those guards fire, exactly
+    /// as they do in JS.
+    ///
+    /// Returns the freshly-written metadata entry.
+    @discardableResult
     public func createLocalDocument(
         documentId: String,
         title: String?,
         localOnly: Bool,
         tags: [String]? = nil,
         docMetadata: JSONValue? = nil
-    ) async throws -> YDocument {
-        let doc = YDocument()
-
+    ) async throws -> LocalMetadataEntry {
         var metadata = LocalMetadataEntry(documentId: documentId)
         metadata.title = title
         metadata.tags = tags
@@ -1870,30 +2057,12 @@ public final class DocumentManager: @unchecked Sendable {
         // rather than dropping it. Mirrors js-bao (#673).
         metadata.docMetadata = docMetadata
 
-        // A freshly-created doc is immediately "open" (added to `openDocs`
-        // below), so a subsequent `openDocument` hits the fast-path and never
-        // runs `_openDocumentImpl` — which is where the per-doc sync protocol
-        // and awareness entry are normally built. Set up both here so a
-        // created-then-opened doc behaves like one opened via the full path:
-        //   • Sync protocol: without it `buildSyncStep1Message` returns nil,
-        //     `startNetworkSync` sends nothing, and a `.network` open of the
-        //     new doc stalls until the 30s `availabilityWaitMs` timeout
-        //     (#852 local-first-create regression).
-        //   • Awareness entry: without it `setLocalAwarenessState` / remote
-        //     awareness applies silently no-op (presence/cursors).
-        // (`docPersistence` is intentionally not built here — it late-binds on
-        // the first save, mirroring `_openDocumentImpl`'s deferred path.)
-        let syncProtocol = YProtocol(document: doc)
-
+        // The sync protocol, the awareness entry and the update observer are
+        // all built by `_openDocumentImpl`, which is now the only writer of
+        // `openDocs` — a created document runs the full open path like any
+        // other. What the create registers is the classification the open (and
+        // the outbound filter) reads back: the pending commit, or local-only.
         lock.withLock {
-            openDocs[documentId] = doc
-            docSyncStates[documentId] = false
-            syncProtocols[documentId] = syncProtocol
-            docAwareness[documentId] = AwarenessEntry()
-            // This is the start of an open cycle too — the created doc goes
-            // straight into `openDocs`, so a later `openDocument` takes the
-            // fast path and never reaches `_openDocumentImpl`'s reset.
-            serverLoadedEmitted.remove(documentId)
             metadataIndex[documentId] = metadata
             deletedMetadataIds.remove(documentId)
             if localOnly {
@@ -1904,7 +2073,7 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         // Persist metadata
-        try await offlineStore?.putMetadata(appId: appId, userId: userId, record: metadata)
+        try await putMetadataTracked(metadata)
 
         // Typed event (#996 — was an untyped dict that typed subscribers
         // never received). A local create originates on-device: source
@@ -1917,7 +2086,7 @@ public final class DocumentManager: @unchecked Sendable {
             source: "local"
         ))
 
-        return doc
+        return metadata
     }
 
     /// js-bao's `applyPostCommitPolicy`: run once a `pendingCreate` document
@@ -2066,9 +2235,7 @@ public final class DocumentManager: @unchecked Sendable {
         guard offlineStore != nil else { return }
         Task { [weak self] in
             guard let self else { return }
-            try? await self.offlineStore?.putMetadata(
-                appId: self.appId, userId: self.userId, record: entry
-            )
+            try? await self.putMetadataTracked(entry)
         }
     }
 
@@ -2116,7 +2283,7 @@ public final class DocumentManager: @unchecked Sendable {
                 return meta
             }
             if let metaToPersist {
-                try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
+                try? await putMetadataTracked(metaToPersist)
             }
             applyPostCommitPolicy(documentId)
 
@@ -2134,7 +2301,7 @@ public final class DocumentManager: @unchecked Sendable {
                     return meta
                 }
                 if let metaToPersist {
-                    try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
+                    try? await putMetadataTracked(metaToPersist)
                 }
                 applyPostCommitPolicy(documentId)
                 return ["linked": true]
@@ -2152,7 +2319,7 @@ public final class DocumentManager: @unchecked Sendable {
                 return meta
             }
             if let metaToPersist {
-                try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaToPersist)
+                try? await putMetadataTracked(metaToPersist)
             }
 
             emitter?.emit(PendingCreateFailedEvent(documentId: documentId, error: error.localizedDescription))
@@ -2195,7 +2362,7 @@ public final class DocumentManager: @unchecked Sendable {
                     return meta
                 }
                 if let metaAfterError {
-                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: metaAfterError)
+                    try? await self.putMetadataTracked(metaAfterError)
                 }
 
                 self.emitter?.emit(
@@ -2232,7 +2399,7 @@ public final class DocumentManager: @unchecked Sendable {
                     return meta
                 }
                 if let metaAfterSchedule {
-                    try? await self.offlineStore?.putMetadata(appId: self.appId, userId: self.userId, record: metaAfterSchedule)
+                    try? await self.putMetadataTracked(metaAfterSchedule)
                 }
 
                 // Give up after maxAttempts.
@@ -2711,7 +2878,8 @@ public final class DocumentManager: @unchecked Sendable {
     ///   - it has a local edit queued for send that hasn't reached the socket
     ///     yet (still in the outbound debounce, or the send failed because the
     ///     connection is down) — the real outbound-drain signal, and
-    ///   - it's open but hasn't completed its initial sync round-trip.
+    ///   - it's open but hasn't completed its initial sync round-trip — unless
+    ///     it is a confirmed local-only document, which never will.
     /// The middle clause is what makes this honest after initial sync:
     /// `docSyncStates` does not reset on a later *edit* (only on a transport
     /// change — see `applySyncState`), so it alone can't protect a just-made
@@ -2722,7 +2890,20 @@ public final class DocumentManager: @unchecked Sendable {
             if pendingCreates.contains(documentId) { return true }
             if unconfirmedLocalWrites.contains(documentId) { return true }
             if openDocs[documentId] != nil, !(docSyncStates[documentId] ?? false) {
-                return true
+                // …except for a document that is never going to sync. The third
+                // clause is Swift-only — JS's guard is the outbound flag map
+                // alone (`documentManager.ts`) — and a confirmed local-only
+                // document opened with `enableNetworkSync: false` can never
+                // receive the sync completion that would clear it, so `evict`
+                // refused it without `force` and `evictAll(onlySynced:)` skipped
+                // it forever (#3200, review F4). A document whose local-only
+                // classification is still unknown (#2691) keeps the guard: the
+                // answer might yet be "ordinary".
+                let confirmedLocalOnly =
+                    (localOnlyDocs.contains(documentId)
+                        || metadataIndex[documentId]?.localOnly == true)
+                    && !localOnlyClassificationPending.contains(documentId)
+                if !confirmedLocalOnly { return true }
             }
             return false
         }
@@ -2779,6 +2960,32 @@ public final class DocumentManager: @unchecked Sendable {
         }
     }
 
+    /// End the persistence hold an open takes over its own document, and
+    /// replay a persist it held.
+    ///
+    /// Called from `_openDocumentImpl`'s `defer`, so it runs on the failing
+    /// paths too: a hold left behind would silence persistence for that
+    /// document until it was opened again. The replay goes back through the
+    /// debounce rather than saving here — the write that asked for it has the
+    /// document's full restored state behind it now, and a burst still
+    /// coalesces into one snapshot.
+    private func finishOpenRestore(documentId: String) {
+        let replay: Bool = lock.withLock {
+            openRestoreInFlight.remove(documentId)
+            return persistsAwaitingOpenRestore.remove(documentId) != nil
+        }
+        guard replay else { return }
+        logger.debug(
+            "openDocument: replaying the persist held during the open", documentId
+        )
+        schedulePersist(documentId: documentId)
+    }
+
+    /// Test seam inside `_openDocumentImpl`, awaited after the document is
+    /// published and observed and before its stored snapshot and metadata row
+    /// are read. Internal; never set in production code.
+    var onOpenPublishedForTest: (@Sendable (String) async -> Void)?
+
     /// Cancel a pending debounced persist for one doc, if any. Called
     /// from the explicit-flush paths (`closeDocument`,
     /// `evictLocalData`) so we don't race the immediate save / delete
@@ -2787,9 +2994,25 @@ public final class DocumentManager: @unchecked Sendable {
         lock.withLock { persistDebounceTasks.removeValue(forKey: documentId)?.cancel() }
     }
 
-    private func persistDocumentToLocal(documentId: String) async {
-        let (doc, suspended) = lock.withLock {
-            (openDocs[documentId], persistenceSuspended.contains(documentId))
+    /// - Parameter replayingStorageReady: `true` only for the retry the
+    ///   storage-ready latch drives, so a retry that still finds no provider
+    ///   records itself once instead of recursing.
+    private func persistDocumentToLocal(
+        documentId: String,
+        replayingStorageReady: Bool = false
+    ) async {
+        let (doc, suspended, restoring) = lock.withLock { () -> (YDocument?, Bool, Bool) in
+            let held = openRestoreInFlight.contains(documentId)
+            // Recorded in the same hold that reads the flag, so an open
+            // finishing in between cannot leave the request behind an already
+            // released document: either this sees the hold and the release
+            // below sees the request, or the hold is gone and the persist runs.
+            if held { persistsAwaitingOpenRestore.insert(documentId) }
+            return (
+                openDocs[documentId],
+                persistenceSuspended.contains(documentId),
+                held
+            )
         }
         guard let doc else { return }
         // Evicted while open: keep the local store clear until the document is
@@ -2797,6 +3020,17 @@ public final class DocumentManager: @unchecked Sendable {
         if suspended {
             logger.debug(
                 "persistDocumentToLocal: skipped for evicted open document", documentId
+            )
+            return
+        }
+        // Mid-open: this document holds whatever a write racing the open put in
+        // it, and not yet what storage holds for it. Saving now would overwrite
+        // the snapshot the open is about to read, and rewrite its metadata row
+        // from an index that has not read the stored one — so hold the persist
+        // and let the open replay it (#3200).
+        if restoring {
+            logger.debug(
+                "persistDocumentToLocal: held until the open finishes restoring", documentId
             )
             return
         }
@@ -2866,6 +3100,25 @@ public final class DocumentManager: @unchecked Sendable {
                 documentId,
                 "(offlineStore=\(offlineStore == nil ? "nil" : "set"))"
             )
+            // Test seam for the interleaving this latch exists to survive:
+            // storage binding and draining between the nil provider read above
+            // and the latch below. Never set in production code.
+            if let hook = onPersistProviderMissingForTest { await hook() }
+            // Enqueue or retry, decided under one lock hold (#3200, review F3).
+            // Skipped for a retry that still found nothing — storage was ready
+            // and the provider still would not answer, which is the
+            // log-and-continue case, not a missing wakeup.
+            guard !replayingStorageReady else { return }
+            let readyNow: Bool = lock.withLock {
+                if storageReady { return true }
+                persistsAwaitingStorage.insert(documentId)
+                return false
+            }
+            if readyNow {
+                await persistDocumentToLocal(
+                    documentId: documentId, replayingStorageReady: true
+                )
+            }
             return
         }
 
@@ -2893,8 +3146,137 @@ public final class DocumentManager: @unchecked Sendable {
             metadataIndex[documentId] = meta
             return meta
         }
-        try? await offlineStore?.putMetadata(appId: appId, userId: userId, record: metaSnapshot)
+        try? await putMetadataTracked(metaSnapshot)
     }
+
+    // MARK: - Storage-ready handoff
+
+    /// Write a metadata row, remembering it if storage cannot take it yet.
+    ///
+    /// `OfflineStore.putMetadata` silently does nothing while no provider is
+    /// bound, and `setupStorage()` runs as an independent Task — so a write
+    /// issued before it finishes used to be lost with no error and no retry.
+    /// Every metadata write the manager makes goes through here, and the same
+    /// enqueue-or-retry latch the skipped persist uses decides what happens to
+    /// the ones storage could not take (#3200).
+    @discardableResult
+    private func putMetadataTracked(_ record: LocalMetadataEntry) async throws -> Bool {
+        guard let offlineStore else { return false }
+        let wrote = try await offlineStore.putMetadataReporting(
+            appId: appId, userId: userId, record: record
+        )
+        if wrote { return true }
+
+        // Test seam for the interleaving below: a delete landing between the
+        // write that found no provider and the latch. Never set in production
+        // code.
+        if let hook = onMetadataProviderMissingForTest { await hook() }
+
+        let readyNow: Bool = lock.withLock {
+            if storageReady { return true }
+            metadataAwaitingStorage.insert(record.documentId)
+            return false
+        }
+        if readyNow {
+            // Storage bound between the write and this check: one retry, and
+            // then it is the ordinary log-and-continue case.
+            //
+            // With the row as it stands now, under the same rule the drain
+            // applies: an eviction or a server-reported delete can have landed
+            // in the gap — and with no provider bound, neither that delete nor
+            // this write reached the disk, so replaying the stale record here
+            // would write back a row nothing should be able to read again
+            // (#3200).
+            guard let surviving = survivingMetadataRecord(record.documentId) else {
+                logger.log(
+                    "putMetadata: row deleted while storage was unbound, not replaying",
+                    record.documentId
+                )
+                return false
+            }
+            return try await offlineStore.putMetadataReporting(
+                appId: appId, userId: userId, record: surviving
+            )
+        }
+        logger.log(
+            "putMetadata: no storage provider yet for",
+            record.documentId,
+            "— will replay on storage-ready"
+        )
+        return false
+    }
+
+    /// The row to write for a replayed metadata put, or nil when there is
+    /// nothing left to write: the document was evicted, or the server reported
+    /// it deleted, while the write waited for a provider. Shared by the
+    /// immediate retry and the storage-ready drain so neither can resurrect
+    /// what the other would skip — the in-memory index is the authority, and a
+    /// stale snapshot of it is not what goes to disk.
+    private func survivingMetadataRecord(_ documentId: String) -> LocalMetadataEntry? {
+        lock.withLock {
+            guard !deletedMetadataIds.contains(documentId) else { return nil }
+            return metadataIndex[documentId]
+        }
+    }
+
+    /// Local storage has bound a provider: replay everything skipped for the
+    /// lack of one.
+    ///
+    /// Called by the client once `setupStorage()` has bound the provider and
+    /// snapshotted the user-scoped state. The flag flip and the set handover
+    /// happen under one lock hold, and every skip path decides enqueue-or-retry
+    /// under that same lock, so no interleaving can leave an entry in a set
+    /// that has already been drained (#3200, review F3).
+    public func storageDidBecomeReady() async {
+        let (persists, metadataIds) : (Set<String>, Set<String>) = lock.withLock {
+            storageReady = true
+            let p = persistsAwaitingStorage
+            let m = metadataAwaitingStorage
+            persistsAwaitingStorage.removeAll()
+            metadataAwaitingStorage.removeAll()
+            return (p, m)
+        }
+
+        for documentId in metadataIds {
+            // A row deleted (evicted, or reported deleted by the server) while
+            // it waited has nothing left to replay.
+            guard let record = survivingMetadataRecord(documentId) else { continue }
+            try? await offlineStore?.putMetadataReporting(
+                appId: appId, userId: userId, record: record
+            )
+        }
+
+        for documentId in persists {
+            // Closed, deleted or persistence-suspended since: skipped and
+            // forgotten, exactly like the debounced persist itself would.
+            let stillPersistable: Bool = lock.withLock {
+                openDocs[documentId] != nil && !persistenceSuspended.contains(documentId)
+            }
+            guard stillPersistable else { continue }
+            await persistDocumentToLocal(
+                documentId: documentId, replayingStorageReady: true
+            )
+        }
+
+        // Fires even for an empty drain — "the handoff ran" is the thing worth
+        // observing. Never set in production code.
+        onStorageReadyDrainForTest?()
+    }
+
+    /// Test-observability hook: invoked after each storage-ready drain,
+    /// outside `lock`. Internal (visible only via `@testable import`).
+    var onStorageReadyDrainForTest: (() -> Void)?
+
+    /// Test seam for the storage-ready race: awaited inside the persist skip
+    /// path, between the provider read that came back nil and the latch that
+    /// decides enqueue-or-retry. Internal; never set in production code.
+    var onPersistProviderMissingForTest: (@Sendable () async -> Void)?
+
+    /// The metadata twin of the seam above: awaited inside the skipped-write
+    /// path, between the put that found no provider and the latch. What it
+    /// makes testable is the row's fate when it is deleted in that gap.
+    /// Internal; never set in production code.
+    var onMetadataProviderMissingForTest: (@Sendable () async -> Void)?
 
     /// Drop the retry state a logout leaves behind (#2874). JS parity with
     /// `resetUserScopedState` (`documentManager.ts`), run on EVERY logout:

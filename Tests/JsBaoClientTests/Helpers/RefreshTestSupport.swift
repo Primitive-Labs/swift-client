@@ -20,12 +20,24 @@ import Foundation
 ///     the proxy routing.
 ///   - emitter: the emitter the controller publishes to, for suites that assert
 ///     on the events an app observes (#2723).
+/// A session whose configuration carries `protocolClass`, for the client
+/// surfaces that take a session rather than a configuration.
+func makeStubSession(protocolClass: AnyClass) -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [protocolClass]
+    return URLSession(configuration: configuration)
+}
+
 func makeWiredClients(
     initialToken: String,
     protocolClass: AnyClass = RefreshStubURLProtocol.self,
     refreshProxy: RefreshProxyConfig? = nil,
     emitter: EventEmitter = EventEmitter()
 ) -> (auth: AuthController, http: HttpClient) {
+    // The proxy calls run on the controller's own session, which is injected
+    // here so the stub answers them too: the client's sessions are built from
+    // a configuration, and such a session ignores `URLProtocol.registerClass`
+    // (#3170).
     let auth = AuthController(
         appId: "test-app",
         apiUrl: "http://stub.local",
@@ -33,7 +45,8 @@ func makeWiredClients(
         offlineStore: OfflineStore(),
         emitter: emitter,
         refreshProxy: refreshProxy,
-        persistConfig: AuthConfig()
+        persistConfig: AuthConfig(),
+        networkSession: makeStubSession(protocolClass: protocolClass)
     )
 
     let stubConfig = URLSessionConfiguration.ephemeral

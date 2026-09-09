@@ -11,20 +11,19 @@ import XCTest
 ///     expiry preflight, no refresh-and-retry on 401, and the server's error
 ///     code surfaces verbatim instead of `HttpError(401, "Invalid credentials")`.
 ///
-/// Server-free. The stub answers both the `HttpClient` session (injected via the
-/// session configuration) and `URLSession.shared` (registered globally, which is
-/// what the proxy requests use — same wiring as
-/// `AuthControllerProxyRefreshUrlTests`).
+/// Server-free. The stub answers both sessions `makeWiredClients` builds — the
+/// `HttpClient` one and the controller's own, which is what the proxy requests
+/// use — each injected through its configuration, because a session built from
+/// a configuration ignores `URLProtocol.registerClass` (#3170). Same wiring as
+/// `AuthControllerProxyRefreshUrlTests`.
 final class AuthUnauthenticatedEndpointsTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        URLProtocol.registerClass(AuthEndpointCaptureURLProtocol.self)
         AuthEndpointCaptureURLProtocol.reset()
     }
 
     override func tearDown() {
-        URLProtocol.unregisterClass(AuthEndpointCaptureURLProtocol.self)
         AuthEndpointCaptureURLProtocol.reset()
         super.tearDown()
     }

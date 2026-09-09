@@ -85,9 +85,23 @@ public actor OfflineStore {
     }
 
     public func putMetadata(appId: String, userId: String, record: LocalMetadataEntry) async throws {
+        _ = try await putMetadataReporting(appId: appId, userId: userId, record: record)
+    }
+
+    /// `putMetadata`, but reporting whether anything was actually written.
+    ///
+    /// With no provider bound this silently wrote nothing, which on a cold
+    /// start is how a `documents.create` — metadata-only since #3200 — could
+    /// return successfully and leave no durable trace at all. The caller uses
+    /// the answer to remember the row and replay it when storage binds.
+    @discardableResult
+    public func putMetadataReporting(
+        appId: String, userId: String, record: LocalMetadataEntry
+    ) async throws -> Bool {
         try await ensureMetadataDb(appId: appId, userId: userId)
-        guard let provider = storageProvider else { return }
+        guard let provider = storageProvider else { return false }
         try await provider.put(store: Self.storeMetaDocs, key: record.documentId, value: record, metadata: nil)
+        return true
     }
 
     public func putMetadataBatch(appId: String, userId: String, records: [LocalMetadataEntry]) async throws {

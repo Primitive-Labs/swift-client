@@ -20,6 +20,143 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### `documents.create` no longer opens the document (#3200)
+
+**Breaking.** `documents.create(options:)` / `JsBaoClient.createDocument` is now
+metadata-only, matching the JavaScript client: it writes the new document's
+local metadata row and schedules the background server commit, but it does not
+build a `YDocument`, does not register the document as open, and does not
+connect it to the model stores.
+
+What this removes is the "immediately writable" contract of #852/#1108. It
+removes a capability that never worked: a created document had no per-document
+update observer, so a write made before an explicit open was applied locally,
+was readable back through `Model.query()`, and **never reached the server** —
+while the client reported `isSynced: true`. On the next launch the document
+reconciled against server state and those rows were gone. The JavaScript client
+throws for the same write; Swift now does too.
+
+**Action required.** Open the document after creating it:
+
+```swift
+let result = try await client.documents.create(
+    options: CreateDocumentOptions(title: "New Project", tags: ["workspace"])
+)
+let documentId = result.metadata?["documentId"]?.stringValue ?? ""
+_ = try await client.documents.open(documentId)   // ← now required
+try Household(name: "T", baseCurrency: "USD").save(in: documentId)
+```
+
+- A write to a document that is not open throws the error it always threw for a
+  closed document: `JsBaoError(code: .notFound, "Document `<id>` is not open.
+  Open it (client.openDocument) before writing `<Model>` records.")` from the
+  generated `save`/`upsert`/`upsertByUnique`/`delete`, and
+  `JsBaoError(code: .notFound, "Document `<id>` is not open")` from
+  `transactAndSync` / `transactAndSyncAsync`.
+- `getDoc(documentId)` returns `nil` until the document is opened.
+- `localOnly` documents are opened the same way; the recommended options are
+  `OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: false)`, the
+  shape the published local-only example already uses. Their content still
+  never goes on the wire (#2691).
+- Opening a just-created document does **not** wait on the network: a pending
+  create and a `localOnly` document now count as locally available in the
+  open's early-resolve decision, so a default-options open resolves locally,
+  offline included, instead of spending the availability budget.
+- `DocumentManager.createLocalDocument` (public on an `Internal/` type) returns
+  the written `LocalMetadataEntry` instead of a `YDocument`.
+
+Two behaviour changes ride with it, on documents that are already open:
+
+- **A confirmed `localOnly` document no longer reports unsynced changes it can
+  never clear.** `hasUnsyncedLocalChanges` used to answer `true` for any open
+  document whose initial sync had not completed — which, for a document opened
+  with `enableNetworkSync: false`, is forever. So `documents.evict` refused it
+  without `force` and `evictAll(onlySynced:)` skipped it every time. A document
+  whose `localOnly` classification is confirmed is now exempt from that clause
+  (the JavaScript client's guard is its outbound flag map alone), so with
+  nothing queued it reports no unsynced changes and evicts normally. A document
+  whose classification is still pending keeps the conservative guard.
+- **A wrapped transaction is sent once, not twice.** `transactAndSync` and
+  `transactAndSyncAsync` used to compute their own diff and enqueue it on top of
+  the per-document update observer's copy of the same write. The observer is now
+  the single owner of outbound forwarding — and it is installed before the
+  document is reachable, so a write made from a `DocumentOpenedEvent` handler is
+  forwarded like any other. Both wrappers keep their signatures and their
+  not-open guard; writing through `doc.transactSync` directly is forwarded just
+  as well.
+
+### `$ne` and `$nin` now match records where the field is absent (#3166)
+
+**Breaking change on the query surface, on every client and on the server.**
+`$ne` and `$nin` used to compile to `col != ?` / `col NOT IN (…)`, which SQLite
+evaluates as UNKNOWN when the column is NULL, so a record that never wrote the
+field was silently excluded. `{deleted: {$ne: true}}` — the "false or not set"
+predicate every soft-delete list needs — returned nothing against a model whose
+records never carried `deleted`, and the empty list read as data loss.
+
+They now **match records where the field is absent**, following MongoDB (and
+matching js-bao, which changed in the same release):
+
+- `$ne: <value>` → the field is missing, null, or holds a different value.
+- `$ne: nil` → the field is present and non-null (unchanged in Swift).
+- `$nin: [values]` → the field is missing or holds none of the values.
+- `$nin` containing `nil` → the field is present, non-null, and not in the rest
+  of the list (previously the NULL entry made the filter match nothing).
+
+Unchanged: equality with a value, `$eq`, the comparison operators and `$in`
+still **match only records that carry the field**; `$exists` is unchanged.
+
+**Action required.** Any filter that used a negative operator to *exclude*
+records by a possibly-absent field now matches those records too. To keep the
+old result set, exclude the missing case with a `nil` entry in `$nin`:
+`["deleted": ["$nin": [nil, true]]]` matches only records carrying a non-null
+value other than the excluded one, identically on every path. `$exists: true`
+alongside the negative operator is not equivalent — the server counts an
+explicitly stored JSON null as present, so `["$ne": true, "$exists": true]`
+still matches a null-valued record there, which the old filter excluded.
+
+Note on presence tests: `$exists` handles an *explicitly stored* null
+differently per path. The server counts a stored JSON null as present; the
+Swift and browser replicas keep each field in a typed column where a stored
+null is indistinguishable from an absent field, so `$exists: false` matches it
+there. Absent fields behave identically everywhere.
+### The client never caches an HTTP response (#3170)
+
+**Behavior change, no API change.** Every session the client builds now sets
+`urlCache = nil` and `requestCachePolicy = .reloadIgnoringLocalCacheData`, and
+every request it builds carries that same cache policy.
+
+`URLCache` keys entries by URL alone — it ignores `Authorization` — and the
+cache backing `URLSessionConfiguration.default` / `URLSession.shared` is
+disk-backed on iOS. Authenticated responses (document metadata, permission
+grants, user records, blob bytes, the OAuth exchange's access token) were
+therefore persisted unencrypted where a request carrying a different token, or
+none, could read them.
+
+Two consequences for apps:
+
+- **An app-supplied `sessionConfiguration` is overridden.** If you passed a
+  configuration that deliberately carried a `URLCache`, the client no longer
+  uses it: `HttpClient.init` clears the cache and forces the policy on
+  whatever configuration you supply. `/app/{appId}/api/*` responses now
+  default to `Cache-Control: no-store` on the server unless the handler sets
+  its own directive — `GET /avatars/:userId` deliberately keeps serving its
+  world-readable bytes with `public, max-age=31536000, immutable` — and this
+  override is what protects apps running against workers older than that.
+  Cookie handling is untouched — the sessions are still built from
+  `URLSessionConfiguration.default`, so the refresh-proxy flow keeps using
+  `HTTPCookieStorage.shared`.
+- **Authenticated blob responses are no longer storable by intermediary
+  caches** for revalidation reuse, because they now carry
+  `Cache-Control: no-store`. Their `ETag` is unchanged and a conditional
+  request with `If-None-Match` still answers 304, so application-managed
+  conditional fetching works exactly as before; what disappears is automatic
+  reuse of a stored body, which was the exposure.
+
+Entries an older client version already wrote into the host app's
+`URLCache.shared` are deliberately left alone — the cache belongs to the app,
+and the client no longer reads, writes or purges anything there.
+
 ### The package moves to `swift-tools-version: 6.1` (#2966)
 
 **Action required if you build on a toolchain older than Swift 6.1

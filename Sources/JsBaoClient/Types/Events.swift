@@ -124,7 +124,6 @@ public enum JsBaoEvent: String, Sendable {
     case blobsQueueDrained = "blobs:queue-drained"
     case permission
     case meUpdated
-    case invitation
     /// Live mirror of a durable in-app notification (#779 / #1601). Payload:
     /// `NotificationEvent`. Emitted when the signed-in user receives an in-app
     /// notification while connected. Mirrors the JS client's `notification`
@@ -567,98 +566,6 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
         self.needsApply = needsApply
         self.meta = meta
         self.startedByUserId = startedByUserId
-    }
-}
-
-/// Real-time notification that a document invitation has changed state.
-///
-/// Payload for `.invitation`
-/// (`for await e in client.stream(for: InvitationEvent.self)`).
-/// Mirrors the JS client's `InvitationEvent` (`src/client/JsBaoClient.ts`)
-/// field-for-field, including optionality.
-///
-/// **Important:** events are targeted — most actions are delivered to only
-/// one side of the invitation (inviter _or_ invitee, not both). Consumers
-/// should `switch` on `action` and handle every value, with a `default`
-/// branch for forward-compatibility (new action values may be added without
-/// a breaking change). See {@link InvitationEvent.action} on the JS side for
-/// the full targeting matrix:
-///
-/// - `"created"`   — invitee only. A new invitation was sent to them.
-/// - `"updated"`   — invitee only. An existing pending invitation changed.
-/// - `"cancelled"` — invitee only. The inviter/admin cancelled it.
-/// - `"declined"`  — both invitee and inviter. The invitee declined.
-/// - `"accepted"`  — inviter only. The invitee accepted; `acceptedBy`
-///                   carries the accepting user's `userId`.
-public struct InvitationEvent: Sendable, Equatable {
-    /// Nested document summary carried on the event. Mirrors the JS
-    /// `InvitationEvent.document` object field-for-field; every field is
-    /// optional, matching JS.
-    public struct Document: Sendable, Equatable {
-        public let documentId: String?
-        public let title: String?
-        public let tags: [String]?
-        public let createdAt: String?
-        public let lastModified: String?
-        public let createdBy: String?
-
-        public init(
-            documentId: String? = nil,
-            title: String? = nil,
-            tags: [String]? = nil,
-            createdAt: String? = nil,
-            lastModified: String? = nil,
-            createdBy: String? = nil
-        ) {
-            self.documentId = documentId
-            self.title = title
-            self.tags = tags
-            self.createdAt = createdAt
-            self.lastModified = lastModified
-            self.createdBy = createdBy
-        }
-    }
-
-    /// The lifecycle transition that just occurred. JS types this as a
-    /// closed union (`"created" | "updated" | "cancelled" | "declined" |
-    /// "accepted"`) but documents that new values may appear; Swift keeps
-    /// it as the raw `String` so an unknown server value is delivered
-    /// rather than dropped. Compare against the literals above.
-    public let action: String
-    public let invitationId: String
-    public let documentId: String
-    public let permission: String
-    public let title: String?
-    public let invitedBy: String?
-    public let invitedAt: String?
-    public let expiresAt: String?
-    /// UserId of the invitee who accepted. Populated only when
-    /// `action == "accepted"` (matches JS).
-    public let acceptedBy: String?
-    public let document: Document?
-
-    public init(
-        action: String,
-        invitationId: String,
-        documentId: String,
-        permission: String,
-        title: String? = nil,
-        invitedBy: String? = nil,
-        invitedAt: String? = nil,
-        expiresAt: String? = nil,
-        acceptedBy: String? = nil,
-        document: Document? = nil
-    ) {
-        self.action = action
-        self.invitationId = invitationId
-        self.documentId = documentId
-        self.permission = permission
-        self.title = title
-        self.invitedBy = invitedBy
-        self.invitedAt = invitedAt
-        self.expiresAt = expiresAt
-        self.acceptedBy = acceptedBy
-        self.document = document
     }
 }
 

@@ -112,7 +112,9 @@ public struct RequestOptions: Sendable {
 public final class HttpClient: @unchecked Sendable {
     private let config: HttpClientConfig
     private let logger: Logger
-    private let session: URLSession
+    /// Module-internal rather than private so the cache settings `init` forces
+    /// on it are assertable under `@testable import` (#3170).
+    let session: URLSession
 
     public init(config: HttpClientConfig) {
         self.config = config
@@ -121,6 +123,15 @@ public final class HttpClient: @unchecked Sendable {
         let sessionConfig = config.sessionConfiguration ?? URLSessionConfiguration.default
         sessionConfig.httpCookieAcceptPolicy = .always
         sessionConfig.httpShouldSetCookies = true
+        // Never cache an authenticated response. `URLCache` keys entries by
+        // URL alone — it ignores `Authorization` — and the default cache is
+        // disk-backed on iOS, so a stored response is readable by a request
+        // carrying a different token or none, and outlives the app run
+        // unencrypted (#3170). Forced on an app-supplied configuration too:
+        // that override is what protects apps running against workers older
+        // than the server's `Cache-Control: no-store`.
+        sessionConfig.urlCache = nil
+        sessionConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: sessionConfig)
     }
 
@@ -475,6 +486,10 @@ public final class HttpClient: @unchecked Sendable {
         }
 
         var urlRequest = URLRequest(url: url)
+        // The no-cache contract travels with the request as well as the
+        // session, so a request handed to any other session still refuses to
+        // read or write a cached response (#3170).
+        urlRequest.cachePolicy = .reloadIgnoringLocalCacheData
         let upperMethod = method.uppercased()
         urlRequest.httpMethod = upperMethod
 

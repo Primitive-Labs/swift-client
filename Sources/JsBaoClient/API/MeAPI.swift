@@ -529,11 +529,6 @@ public final class MeAPI: @unchecked Sendable {
         await task?.value
     }
 
-    /// Lists pending document invitations for the current user.
-    public func pendingDocumentInvitations() async throws -> [PendingDocumentInvitation] {
-        try await transport.request(method: .get, path: "/me/document-invitations")
-    }
-
     /// Update the current user's profile (name and/or external avatar URL).
     /// Mirrors js-bao's `me.update(params)` → `UserProfile`. Pass
     /// `avatarUrl: .clear` to remove the current avatar (JS `avatarUrl: null`).

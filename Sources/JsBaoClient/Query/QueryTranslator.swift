@@ -181,13 +181,12 @@ public struct QueryTranslator {
 
         case "$ne":
             if value.isNull { return ("\(col) IS NOT NULL", []) }
-            // Exclude NULL rows so the result set matches js-bao
-            // (browser.ts `$ne` emits `col != ?`, which SQLite evaluates
-            // as UNKNOWN for NULL → row excluded). The earlier OR-NULL
-            // wing made `field $ne X` behave like "anything except X,
-            // including missing", which silently disagreed with the JS
-            // client on a very common query shape.
-            return ("\(col) != ?", [sqlValue(value)])
+            // Include NULL rows (#3166): a record that never wrote the field
+            // is not equal to any value, which is what MongoDB does and what
+            // js-bao does since the same release. `col != ?` alone is UNKNOWN
+            // for a NULL column, so the row needs its own wing — parenthesized
+            // because sibling operators on the same field AND-join.
+            return ("(\(col) IS NULL OR \(col) != ?)", [sqlValue(value)])
 
         case "$gt":
             return ("\(col) > ?", [sqlValue(value)])
@@ -207,10 +206,23 @@ public struct QueryTranslator {
 
         case "$nin":
             if let arr = value.arrayValue, !arr.isEmpty {
-                let placeholders = arr.map { _ in "?" }.joined(separator: ",")
-                // Same NULL-handling alignment as `$ne` above — exclude
-                // missing values so result sets match js-bao.
-                return ("\(col) NOT IN (\(placeholders))", arr.map { sqlValue($0) })
+                // Same absent-field semantics as `$ne` above (#3166). A null
+                // entry in the list means "exclude missing/null" in MongoDB;
+                // binding it into `NOT IN` would make the whole comparison
+                // UNKNOWN, so it is split out into an IS NOT NULL wing.
+                let values = arr.filter { !$0.isNull }
+                let placeholders = values.map { _ in "?" }.joined(separator: ",")
+                if values.count < arr.count {
+                    if values.isEmpty { return ("\(col) IS NOT NULL", []) }
+                    return (
+                        "(\(col) IS NOT NULL AND \(col) NOT IN (\(placeholders)))",
+                        values.map { sqlValue($0) }
+                    )
+                }
+                return (
+                    "(\(col) IS NULL OR \(col) NOT IN (\(placeholders)))",
+                    values.map { sqlValue($0) }
+                )
             }
             return ("1", []) // empty $nin matches everything
 

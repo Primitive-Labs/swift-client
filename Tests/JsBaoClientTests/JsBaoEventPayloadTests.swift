@@ -53,7 +53,6 @@ final class JsBaoEventPayloadTests: XCTestCase {
         GenericErrorEvent(scope: "ws", message: "boom"),
         MeUpdatedEvent(value: ["name": "Ada"]),
         MeUpdateFailedEvent(reason: "conflict"),
-        InvitationEvent(action: "created", invitationId: "i1", documentId: "d1", permission: "reader"),
         NotificationEvent(notificationId: "n1", title: "t", body: "b", createdAt: "2026-01-01"),
         WorkflowStatusEvent(workflowKey: "w", workflowId: "wid", runKey: "rk", runId: "rid", status: "completed"),
         WorkflowStartedEvent(workflowKey: "w", runId: "rid"),

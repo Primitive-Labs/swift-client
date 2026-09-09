@@ -126,9 +126,16 @@ func delay(_ seconds: TimeInterval) async throws {
 
 extension JsBaoClient {
     /// Test convenience over the JS-parity `createDocument` (which returns
-    /// `{ metadata }` only, like js-bao — #1108): extracts the documentId
-    /// from the returned metadata and pairs it with the already-open local
-    /// `YDocument` so existing tuple-style test call sites keep working.
+    /// `{ metadata }` only, like js-bao — #1108): extracts the documentId from
+    /// the returned metadata and **opens** the document, so existing
+    /// tuple-style test call sites keep working.
+    ///
+    /// The open is what create used to do implicitly. Since #3200 create is
+    /// metadata-only and opening is always an explicit step, so this helper is
+    /// the create-then-open shape every caller now writes. `waitForLoad:
+    /// .local` keeps it hermetic (no availability wait); network sync stays
+    /// enabled for an ordinary document so its recorded start mode is the
+    /// `.immediate` the old create path left in place.
     func createDocumentForTest(
         options: CreateDocumentOptions = CreateDocumentOptions()
     ) async throws -> (documentId: String, doc: YDocument?) {
@@ -139,7 +146,11 @@ extension JsBaoClient {
                 message: "createDocument returned no documentId in metadata"
             )
         }
-        return (id, getDoc(id))
+        let doc = try await openDocument(id, options: OpenDocumentOptions(
+            waitForLoad: .local,
+            enableNetworkSync: !options.localOnly
+        ))
+        return (id, doc)
     }
 }
 

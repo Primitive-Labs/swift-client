@@ -4,8 +4,8 @@ import XCTest
 /// Guard against the defect class #2360 reported: an option field that
 /// compiles, reads like JS parity, and silently does nothing.
 ///
-/// Every field of `ListDocumentsOptions` and `MeOwnedDocumentsOptions` must be
-/// in exactly one of two buckets:
+/// Every field of `MeOwnedDocumentsOptions` must be in exactly one of two
+/// buckets:
 ///
 ///  - **implemented** — it has an observable effect (a query param, a
 ///    suppressed request, or a typed throw), asserted here or in
@@ -18,21 +18,15 @@ import XCTest
 /// read `@available` at runtime, so the inventory is what makes the
 /// requirement mechanical.
 ///
-/// **Both deprecated inventories are empty since #2367**, which removed the
-/// six dead fields #2360 deprecated (`ListDocumentsOptions.refreshFromServer`
-/// / `.localOnly` / `.serverTimeoutMs` / `.waitForLoad` / `.returnPage` and
-/// `MeOwnedDocumentsOptions.returnPage`) rather than leaving them inert. They
-/// stay in the structure because the classification requirement outlives this
-/// particular clearing: a field added tomorrow still has to land in one bucket
-/// or the other.
+/// **The deprecated inventory is empty since #2367**, which removed the dead
+/// fields #2360 deprecated rather than leaving them inert. It stays in the
+/// structure because the classification requirement outlives this particular
+/// clearing: a field added tomorrow still has to land in one bucket or the
+/// other. (#2951 removed `ListDocumentsOptions` along with `documents.list`,
+/// so only the owned-documents inventory is left.)
 final class ListOptionCoverageGuardTests: XCTestCase {
 
     // MARK: - Inventories
-
-    /// `ListDocumentsOptions`: `documents.list` is a blocking server fetch, so
-    /// only the query-string fields are implemented.
-    private static let listDocumentsImplemented = ["includeRoot", "limit", "cursor", "tag", "forward"]
-    private static let listDocumentsDeprecated: [String] = []
 
     /// `MeOwnedDocumentsOptions`: every field is implemented since #2367
     /// removed `returnPage`. `serverTimeoutMs` is now `serverTimeout`, in
@@ -44,17 +38,6 @@ final class ListOptionCoverageGuardTests: XCTestCase {
     private static let ownedDocumentsDeprecated: [String] = []
 
     func testInventoriesCoverEveryField() {
-        let listFields = Mirror(reflecting: ListDocumentsOptions()).children.compactMap { $0.label }
-        XCTAssertEqual(
-            Set(listFields),
-            Set(Self.listDocumentsImplemented + Self.listDocumentsDeprecated),
-            """
-            A ListDocumentsOptions field is unclassified. Either implement it \
-            (and assert its observable effect) or annotate it \
-            @available(*, deprecated) and add it to the inventory here.
-            """
-        )
-
         let ownedFields = Mirror(reflecting: MeOwnedDocumentsOptions()).children.compactMap { $0.label }
         XCTAssertEqual(
             Set(ownedFields),
@@ -65,32 +48,6 @@ final class ListOptionCoverageGuardTests: XCTestCase {
             @available(*, deprecated) and add it to the inventory here.
             """
         )
-    }
-
-    // MARK: - Observable effects: ListDocumentsOptions
-
-    /// Every implemented `ListDocumentsOptions` field reaches the wire.
-    func testImplementedListDocumentsFieldsReachTheWire() async throws {
-        let transport = RecordingTransport(json: #"{"items":[]}"#)
-        let api = DocumentsAPI(
-            transport: transport,
-            blobManager: BlobManager(
-                logger: createLogger(level: .error, scope: "test"),
-                uploadConcurrency: 1
-            )
-        )
-
-        _ = try await api._listImpl(options: ListDocumentsOptions(
-            includeRoot: true, limit: 5, cursor: "c1", tag: "starred", forward: true
-        ))
-
-        let path = try XCTUnwrap(transport.lastCall?.path)
-        for field in Self.listDocumentsImplemented {
-            XCTAssertTrue(
-                path.contains("\(field)="),
-                "\(field) never reached the query string: \(path)"
-            )
-        }
     }
 
     // MARK: - Observable effects: MeOwnedDocumentsOptions

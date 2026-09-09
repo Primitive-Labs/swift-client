@@ -316,6 +316,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// production code.
     var onOutboundFlushedForTest: ((String) -> Void)?
 
+    /// Test seam inside `flushOutboundUpdates`' local-only classification
+    /// hold: awaited between the pending read and the release of ownership,
+    /// which is the window a classification resolving concurrently has to
+    /// survive. Internal; never set in production code.
+    var onOutboundClassificationHoldForTest: (@Sendable (String) async -> Void)?
+
     // MARK: Storage-init completion signal (#1780)
 
     /// Guards `storageReady` + `storageReadyWaiters`.
@@ -2563,7 +2569,16 @@ public final class JsBaoClient: @unchecked Sendable {
         // would report a brand-new empty doc as "has local data" and make
         // `.localIfAvailableElseNetwork` return an empty document instead of
         // waiting for server state (#2475).
+        // A document the server cannot hold yet (its create has not committed)
+        // or will never hold (`localOnly`) counts as locally available even
+        // with an empty ydoc: the network has no answer for it, so waiting on
+        // one burns the availability budget and — because Swift throws
+        // `networkTimeout` where JS resolves with the empty document (#2667,
+        // C8) — would make the create → open → write flow fail offline. JS
+        // counts its pending creates the same way (`hasLocalCopy`).
         let effectiveHasLocal = documentManager.ydocHasData(documentId)
+            || documentManager.isPendingCreate(documentId)
+            || documentManager.isLocalOnly(documentId)
 
         // A document whose metadata claimed a local copy but whose ydoc came up
         // empty is the stale-local-state candidate: if the server then answers
@@ -2641,8 +2656,8 @@ public final class JsBaoClient: @unchecked Sendable {
 
         // The fast-fail checks answer "can this open ever reach the server?",
         // which is only a question for a document this call is opening. A
-        // document that is ALREADY open has been through them (or was created
-        // locally), and JS never re-asks either: its `openDocument` returns on
+        // document that is ALREADY open has been through them, and JS never
+        // re-asks either: its `openDocument` returns on
         // `hasOpenDoc` before `waitForAvailability` runs. Failing a live
         // document's re-open would report an unreachable server for a document
         // the caller is already holding. `.coalesced` is a genuine new open —
@@ -3012,15 +3027,24 @@ public final class JsBaoClient: @unchecked Sendable {
         return CloseDocumentResult(evicted: evicted)
     }
 
-    /// Create a new document
-    /// Create a document. Local-first by default — mirrors js-bao's
-    /// `DocumentManager.createDocument` flow (#852). The created
-    /// `YDocument` is immediately writable (fetch it via
-    /// `getDoc(documentId)`); when `options.localOnly` is false (the
+    /// Create a document. **Metadata-only and local-first**, mirroring
+    /// js-bao's `createDocument` (#852, #3200): the local metadata row is
+    /// written immediately and, when `options.localOnly` is false (the
     /// default), a server commit is scheduled in the background and the
-    /// `pendingCreate` metadata flag is cleared on success. On failure
-    /// the `pendingCreateFailed` event fires and the metadata's
-    /// `commitError` carries the reason.
+    /// `pendingCreate` metadata flag is cleared on success. On failure the
+    /// `pendingCreateFailed` event fires and the metadata's `commitError`
+    /// carries the reason.
+    ///
+    /// The new document is **not open**: open it with
+    /// `openDocument(_:)` / `documents.open` before reading it through the
+    /// model facade or writing to it. A write before that throws
+    /// `JsBaoError(code: .notFound, "Document `<id>` is not open…")`, exactly
+    /// as in the JS client — an unopened document has no update observer, so
+    /// an accepted write could never reach the server (#3200). A `localOnly`
+    /// document is opened the same way (`waitForLoad: .local,
+    /// enableNetworkSync: false` is the recommended shape); a pending-create
+    /// or local-only document counts as locally available, so a default-option
+    /// open resolves without waiting on the network, offline included.
     ///
     /// Returns `{ metadata }` — the freshly-written local metadata for
     /// the new document — matching js-bao's
@@ -3037,7 +3061,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // succeeds.
         let documentId = ULID.generate()
 
-        let doc = try await documentManager.createLocalDocument(
+        try await documentManager.createLocalDocument(
             documentId: documentId,
             title: options.title,
             localOnly: options.localOnly,
@@ -3045,10 +3069,11 @@ public final class JsBaoClient: @unchecked Sendable {
             docMetadata: options.metadata
         )
 
-        // A freshly-created doc is immediately writable; connect it to the
-        // cross-document stores so writes are visible to `Model.query()`
-        // without waiting for an explicit `openDocument`.
-        connectToSharedModels(documentId: documentId, doc: doc)
+        // Deliberately no `connectToSharedModels` here: the document is not
+        // open, so it has no `YDocument` to connect and no update observer to
+        // forward what a caller writes into one. Connecting it anyway is what
+        // made a write before `openDocument` readable through `Model.query()`
+        // and invisible to sync (#3200). `openDocument` connects it.
 
         // Schedule the server commit in the background. `localOnly`
         // docs stay local forever; everything else races up to the
@@ -3063,8 +3088,9 @@ public final class JsBaoClient: @unchecked Sendable {
         }
 
         // Return the freshly-written local metadata as `{ metadata }`,
-        // matching js-bao's return shape (#1108). The open doc stays
-        // reachable via `getDoc(documentId)`, exactly like JS.
+        // matching js-bao's return shape (#1108). The document id rides inside
+        // it; `getDoc(documentId)` answers nil until the caller opens the
+        // document, exactly like JS.
         let entry = documentManager.getLocalMetadata(documentId)
         let metadataValue = try entry.map { entry -> JSONValue in
             let any = try JSONCoding.jsonObject(from: entry)
@@ -3078,17 +3104,23 @@ public final class JsBaoClient: @unchecked Sendable {
         documentManager.getDocument(documentId)
     }
 
-    /// Perform a transaction on a document and send any resulting changes to the server.
+    /// Perform a transaction on a document. Changes reach the server the same
+    /// way every other local write does.
     ///
-    /// YSwift doesn't expose document-level update observers, so local writes to a YDocument
-    /// aren't automatically sent. Use this method instead of calling `doc.transactSync` directly
-    /// when you want changes to propagate to other clients.
+    /// The per-document update observer that `openDocument` installs is the
+    /// single owner of outbound forwarding, so this method does **not** compute
+    /// its own diff and enqueue it — that forwarded every wrapped transaction
+    /// twice (#3200). It survives as the ergonomic write entry point and as the
+    /// open-document guard; `doc.transactSync` directly is equally well
+    /// forwarded.
     ///
     /// Throws `JsBaoError(code: .notFound)` if the document isn't open — a
     /// recoverable, caller-inducible condition (e.g. a lifecycle race between
-    /// close/evict and a write). This mirrors the JS client, whose write path
+    /// close/evict and a write, or a `documents.create` whose document has not
+    /// been opened yet). This mirrors the JS client, whose write path
     /// (`runLocalTransaction`) throws rather than crashing; before #1984 this
     /// method called `fatalError`, taking the host app down.
+    @discardableResult
     public func transactAndSync<T>(_ documentId: String, _ changes: @escaping (YrsTransaction) -> T) throws -> T {
         guard let doc = documentManager.getDocument(documentId) else {
             throw JsBaoError(
@@ -3097,30 +3129,7 @@ public final class JsBaoClient: @unchecked Sendable {
             )
         }
 
-        // Capture state vector before the write
-        let svBefore: [UInt8] = doc.transactSync { txn in
-            txn.transactionStateVector()
-        }
-
-        // Run the user's changes
-        let result = doc.transactSync(changes)
-
-        // Compute the diff (what changed)
-        var update: [UInt8] = []
-        doc.transactSync { [self] txn in
-            do {
-                update = try txn.transactionEncodeStateAsUpdateFromSv(stateVector: svBefore)
-            } catch {
-                self.logger.warn("Failed to encode update after transaction:", error.localizedDescription)
-            }
-        }
-
-        // Send the update if there were changes
-        if !update.isEmpty {
-            queueOutboundUpdate(documentId: documentId, update: update)
-        }
-
-        return result
+        return doc.transactSync(changes)
     }
 
     /// Async version of `transactAndSync` — bypasses syncQueue entirely using the raw YrsDoc
@@ -3143,46 +3152,28 @@ public final class JsBaoClient: @unchecked Sendable {
         // exclusive FFI lock (`withExclusiveAccess`), which serializes it
         // against observer registration on other threads (#1126).
         let unsafeDoc = doc
-        let result: (T, [UInt8]) = await withCheckedContinuation { continuation in
+        return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 // Use raw YrsDoc to bypass syncQueue entirely. Raw access
                 // still must hold the doc's FFI lock — an observer
                 // registration (model connect, doc open) on another thread
                 // while one of these transactions is live panics in yrs and
                 // aborts the process (#1126).
-                let payload: (T, [UInt8]) = unsafeDoc.withExclusiveAccess {
-                    let rawDoc = unsafeDoc.document
-
-                    // 1. Get state vector before write
-                    let svTxn = rawDoc.transact(origin: nil)
-                    let svBefore = svTxn.transactionStateVector()
-                    svTxn.free()
-
-                    // 2. Apply changes
-                    let writeTxn = rawDoc.transact(origin: nil)
+                //
+                // The write is forwarded by the document's update observer, as
+                // any other local write is: a raw transaction fires
+                // `observeUpdate` too, so computing a diff here and enqueueing
+                // it sent the same edit twice (#3200).
+                let payload: T = unsafeDoc.withExclusiveAccess {
+                    let writeTxn = unsafeDoc.document.transact(origin: nil)
                     let result = changes(writeTxn)
                     writeTxn.free()
-
-                    // 3. Compute diff
-                    let diffTxn = rawDoc.transact(origin: nil)
-                    var update: [UInt8] = []
-                    do {
-                        update = try diffTxn.transactionEncodeStateAsUpdateFromSv(stateVector: svBefore)
-                    } catch {}
-                    diffTxn.free()
-
-                    return (result, update)
+                    return result
                 }
 
                 continuation.resume(returning: payload)
             }
         }
-
-        if !result.1.isEmpty {
-            queueOutboundUpdate(documentId: documentId, update: result.1)
-        }
-
-        return result.0
     }
 
     /// Check if a document is synced
@@ -4710,6 +4701,12 @@ public final class JsBaoClient: @unchecked Sendable {
                 await self.startNetworkSync(documentId: documentId, explicit: false)
             }
         }
+        // An open holds its document's outbound edits while it cannot say
+        // whether the document is local-only; this is the release for the one
+        // document, once the open has read the stored row (#2691/#3200).
+        documentManager.onLocalOnlyClassificationResolved = { [weak self] documentId in
+            self?.releaseHeldOutboundClassification(documentId)
+        }
         documentManager.commitRetryBackoff = options.commitRetryBackoff
         documentManager.isOnlineProvider = { [weak self] in self?.networkingAllowed() ?? false }
 
@@ -4996,6 +4993,14 @@ public final class JsBaoClient: @unchecked Sendable {
             // waiting on the network (#1780).
             markStorageReady()
 
+            // Everything that happened before the provider bound — a
+            // metadata-only `documents.create`, a debounced persist — was
+            // skipped for the lack of one. Replay it now: after the
+            // user-scoped bind, so the rows land under the right namespace,
+            // and before the auto-connect, so nothing waits on the network
+            // (#3200).
+            await documentManager.storageDidBecomeReady()
+
             // Start connectivity monitoring (Phase 2) and await the initial
             // reachability snapshot BEFORE the auto-connect gate, so a down
             // path at startup means no auto-connect.
@@ -5035,10 +5040,20 @@ public final class JsBaoClient: @unchecked Sendable {
     func releaseHeldOutboundClassifications() {
         let waiting = documentManager.resolveLocalOnlyClassifications()
         for documentId in waiting {
-            let hasQueued = lock.withLock { !(pendingUpdates[documentId]?.isEmpty ?? true) }
-            guard hasQueued else { continue }
-            Task { [weak self] in await self?.flushOutboundUpdates(documentId: documentId) }
+            releaseHeldOutboundClassification(documentId)
         }
+    }
+
+    /// Release one document's held batch, for the hold an `openDocument` takes
+    /// while it cannot yet say whether the document is local-only — a write
+    /// made during the open (from a `DocumentOpenedEvent` handler, or by a
+    /// caller the already-open fast path handed the document to) is forwarded
+    /// the instant the observer exists, which is before the stored row has been
+    /// read (#3200). The open calls this once it has the answer.
+    func releaseHeldOutboundClassification(_ documentId: String) {
+        let hasQueued = lock.withLock { !(pendingUpdates[documentId]?.isEmpty ?? true) }
+        guard hasQueued else { return }
+        Task { [weak self] in await self?.flushOutboundUpdates(documentId: documentId) }
     }
 
     /// Re-scope the user-owned managers to the currently authenticated user,
@@ -5465,40 +5480,6 @@ public final class JsBaoClient: @unchecked Sendable {
             )
             eventEmitter.emit(startedEvent)
 
-        case "invitation":
-            // Server-pushed invitation lifecycle change. JS delivers a
-            // fully-typed `InvitationEvent` (`handleInvitationMessage` in
-            // `src/client/JsBaoClient.ts`); mirror that here by decoding the
-            // frame into the typed struct instead of emitting the raw JSON
-            // dict (#1146). Required fields fall back to "" when the frame
-            // omits them (it shouldn't); optional fields stay nil.
-            let invitationDoc: InvitationEvent.Document?
-            if let docJson = json["document"] as? [String: Any] {
-                invitationDoc = InvitationEvent.Document(
-                    documentId: docJson["documentId"] as? String,
-                    title: docJson["title"] as? String,
-                    tags: docJson["tags"] as? [String],
-                    createdAt: docJson["createdAt"] as? String,
-                    lastModified: docJson["lastModified"] as? String,
-                    createdBy: docJson["createdBy"] as? String
-                )
-            } else {
-                invitationDoc = nil
-            }
-            let invitationEvent = InvitationEvent(
-                action: json["action"] as? String ?? "",
-                invitationId: json["invitationId"] as? String ?? "",
-                documentId: json["documentId"] as? String ?? "",
-                permission: json["permission"] as? String ?? "",
-                title: json["title"] as? String,
-                invitedBy: json["invitedBy"] as? String,
-                invitedAt: json["invitedAt"] as? String,
-                expiresAt: json["expiresAt"] as? String,
-                acceptedBy: json["acceptedBy"] as? String,
-                document: invitationDoc
-            )
-            eventEmitter.emit(invitationEvent)
-
         case "notification":
             // Server-pushed live mirror of a durable in-app notification
             // (#779 / #1601). JS emits a fully-typed `NotificationEvent`
@@ -5874,14 +5855,16 @@ public final class JsBaoClient: @unchecked Sendable {
     func queueOutboundUpdate(documentId: String, update: [UInt8]) {
         // Four classes of local update never go on the wire (JS parity:
         // `updateHandler`, `src/client/JsBaoClient.ts:6373-6414`; #2665,
-        // #2691). This is the one funnel every local update reaches — the
-        // document observer, `transactAndSync`, and `transactAndSyncAsync` —
-        // so the filter sits here, exactly as JS's single update handler does.
+        // #2691). This is the one funnel every local update reaches, and since
+        // #3200 it has one caller: the per-document update observer, which sees
+        // every write — a plain `doc.transactSync`, a `transactAndSync`, or a
+        // `transactAndSyncAsync` raw transaction alike. The filter sits here,
+        // exactly as JS's single update handler does.
         //
         // JS's fifth case, holding updates while IndexedDB replays into the
-        // Y.Doc, has no analogue here: `DocumentManager.openDocument` applies
-        // the persisted state *before* it registers the update observer, so a
-        // replay never reaches this method.
+        // Y.Doc, is handled a step earlier here: `_openDocumentImpl` wraps its
+        // hydration apply in `applyingRemoteUpdate`, so a replay is not
+        // forwarded and never reaches this method.
         guard !update.isEmpty else {
             logger.debug("[outbound] ignoring zero-length update", documentId)
             return
@@ -5979,9 +5962,10 @@ public final class JsBaoClient: @unchecked Sendable {
     /// 1. **One owner per document.** The first flush to claim the id in
     ///    `outboundFlushOwner` owns the drain; a concurrent flush records its
     ///    request in `outboundReflushRequested` and returns. The owner re-checks
-    ///    the queue each iteration and consumes that request at both of its
-    ///    release points, so an edit queued mid-drain — or a drain requested
-    ///    while the owner sat in a send that then failed — is carried by the
+    ///    the queue each iteration and consumes that request at every one of
+    ///    its release points, so an edit queued mid-drain — or a drain
+    ///    requested while the owner sat in a send that then failed, or while it
+    ///    was deciding to hold an unclassified document — is carried by the
     ///    owner rather than lost. Ownership is a token, and `closeDocument` /
     ///    `destroy` can revoke it while this flush is awaiting a send — so
     ///    every step after an `await` re-checks the token and exits on a
@@ -6098,9 +6082,31 @@ public final class JsBaoClient: @unchecked Sendable {
                     // classification lands — dropping it there if the answer is
                     // local-only after all.
                     logger.debug("[outbound] holding updates while local-only classification is unknown", documentId)
-                    lock.withLock {
-                        guard outboundFlushOwner[documentId] == token else { return }
+                    // Test seam for the interleaving this branch has to
+                    // survive: the classification landing between the read
+                    // above and the release below. Never set in production
+                    // code.
+                    if let hook = onOutboundClassificationHoldForTest { await hook(documentId) }
+                    let retryAfterRequest: Bool = lock.withLock {
+                        guard outboundFlushOwner[documentId] == token else { return false }
+                        // A drain requested while this pass was deciding to
+                        // hold can be the classification itself arriving:
+                        // `releaseHeldOutboundClassification` flushes through
+                        // the same door, finds the document owned, and does
+                        // nothing but set the bit. Releasing over that bit
+                        // strands the batch — the release was the last thing
+                        // that would have carried it, and nothing else is
+                        // scheduled to (#3200). Consume it and take another
+                        // pass, which re-reads the classification. The same
+                        // rule the failed-send exit applies, and bounded the
+                        // same way: one retry per request actually made.
+                        if outboundReflushRequested.remove(documentId) != nil { return true }
                         outboundFlushOwner.removeValue(forKey: documentId)
+                        return false
+                    }
+                    if retryAfterRequest {
+                        logger.debug("[outbound] re-flush requested while holding, retrying", documentId)
+                        continue
                     }
                     onOutboundFlushedForTest?(documentId)
                     return

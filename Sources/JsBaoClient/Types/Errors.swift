@@ -425,9 +425,30 @@ extension JsBaoNetworkError {
 /// anywhere else re-introduces the raw-`URLError` leak this exists to close —
 /// `TransportSpineTests` asserts that it doesn't happen.
 enum NetworkSession {
+    /// The session every default-parameter call runs on: `URLSessionConfiguration
+    /// .default` with caching disabled and nothing else changed.
+    ///
+    /// It replaces `URLSession.shared`, which uses `URLCache.shared` —
+    /// disk-backed on iOS and keyed by URL alone, ignoring `Authorization`.
+    /// An authenticated response stored there is readable by a request
+    /// carrying a different token or none, and survives app restarts
+    /// unencrypted (#3170). The paths that ride this default are the client's
+    /// most sensitive: blob bytes, the OAuth code exchange's access token, the
+    /// refresh proxy, and oversized document updates.
+    ///
+    /// Built from `.default` rather than `.ephemeral` on purpose: the
+    /// refresh-proxy flow keeps its refresh cookie in `HTTPCookieStorage
+    /// .shared`, which an ephemeral configuration would replace with its own.
+    static let uncached: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
+
     static func data(
         for request: URLRequest,
-        using session: URLSession = .shared
+        using session: URLSession = NetworkSession.uncached
     ) async throws -> (Data, URLResponse) {
         do {
             return try await session.data(for: request)
@@ -438,7 +459,7 @@ enum NetworkSession {
 
     static func data(
         from url: URL,
-        using session: URLSession = .shared
+        using session: URLSession = NetworkSession.uncached
     ) async throws -> (Data, URLResponse) {
         do {
             return try await session.data(from: url)

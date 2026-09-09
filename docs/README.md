@@ -104,11 +104,12 @@ This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method
   `client.nextEvent(_:timeout:where:)`, which derive the event key from the
   payload type. Deprecated calls keep working — and keep their synchronous,
   in-registration-order delivery — for the whole window.
-- `.invitation` event handlers now receive `InvitationEvent`, not the raw
-  `[String: Any]` WebSocket dictionary. Existing subscribers written as
-  `client.events.on(.invitation) { (payload: [String: Any]) in ... }` will no
-  longer match the typed payload. Migrate to
-  `for await event in client.stream(for: InvitationEvent.self)`.
+- The `.invitation` event and its `InvitationEvent` payload are **removed**
+  (#2951, with the per-document invitation routes that were its only emitter).
+  There is no replacement push event — the new sharing system grants access
+  immediately, so a subscriber has nothing left to wait for. Subscriptions
+  written as `client.events.on(.invitation) { ... }` or
+  `client.stream(for: InvitationEvent.self)` no longer compile; delete them.
 - Nine events that used to be emitted as bare `[String: Any]` dictionaries are
   typed payloads now (`meUpdated`, `pendingCreateFailed`, `authRefreshDeferred`,
   the five `offlineAuth*` events, and `blobsQueueDrained`). A handler still

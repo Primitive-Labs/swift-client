@@ -78,8 +78,6 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// surface matches the JS client's `lastModified` either way.
     public let lastModified: String
     public let permission: DocumentPermission
-    public let invitationAccepted: Bool?
-    public let upgradedFromPermission: String?
     public let grantedAt: String?
     public let tags: [String]?
     /// Optional reference to a Blob owned by this document.
@@ -102,7 +100,7 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case documentId, title, createdBy, createdAt
         case lastModified, modifiedAt
-        case permission, invitationAccepted, upgradedFromPermission
+        case permission
         case grantedAt, tags, thumbnailBlobId, metadata
         case accessSource, linkAccess
     }
@@ -116,8 +114,6 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         lastModified = try c.decodeIfPresent(String.self, forKey: .lastModified)
             ?? c.decodeIfPresent(String.self, forKey: .modifiedAt) ?? ""
         permission = try c.decodeIfPresent(DocumentPermission.self, forKey: .permission) ?? .reader
-        invitationAccepted = try c.decodeIfPresent(Bool.self, forKey: .invitationAccepted)
-        upgradedFromPermission = try c.decodeIfPresent(String.self, forKey: .upgradedFromPermission)
         grantedAt = try c.decodeIfPresent(String.self, forKey: .grantedAt)
         tags = try c.decodeIfPresent([String].self, forKey: .tags)
         thumbnailBlobId = try c.decodeIfPresent(String.self, forKey: .thumbnailBlobId)
@@ -240,49 +236,6 @@ public struct OpenDocumentResult: Sendable {
     public init(doc: YDocument, metadata: LocalMetadataEntry?) {
         self.confinedDoc = ConfinedYDocument(doc)
         self.metadata = metadata
-    }
-}
-
-// MARK: List inputs
-
-/// Options for the deprecated `documents.list(options:)`. Mirrors js-bao's
-/// `DocumentListOptions` for the fields Swift implements, so the deprecated
-/// surface lines up across platforms.
-///
-/// Deprecated alongside `documents.list` — migrate to
-/// `client.me.ownedDocuments(...)` / `client.me.sharedDocuments(...)`.
-///
-/// The five never-implemented fields (`refreshFromServer`, `localOnly`,
-/// `serverTimeoutMs`, `waitForLoad`, `returnPage`) were deprecated in #2360 and
-/// removed in #2367. `documents.list` is a blocking server fetch: the
-/// local-first behavior those fields described lives on
-/// `client.me.ownedDocuments(...)`, and the `{ items, cursor }` page shape lives
-/// on `documents.listPage(...)`.
-public struct ListDocumentsOptions: Sendable {
-    /// Include the app's root document in results (excluded by default).
-    public var includeRoot: Bool?
-
-    /// Maximum number of documents per page (enables server-side pagination).
-    public var limit: Int?
-    /// Pagination cursor from a previous response.
-    public var cursor: String?
-    /// Filter results to documents carrying this tag.
-    public var tag: String?
-    /// Sort chronologically (oldest first) instead of reverse-chronological.
-    public var forward: Bool?
-
-    public init(
-        includeRoot: Bool? = nil,
-        limit: Int? = nil,
-        cursor: String? = nil,
-        tag: String? = nil,
-        forward: Bool? = nil
-    ) {
-        self.includeRoot = includeRoot
-        self.limit = limit
-        self.cursor = cursor
-        self.tag = tag
-        self.forward = forward
     }
 }
 
@@ -672,14 +625,11 @@ public struct PermissionUpdateResult: Decodable, Sendable {
 
 // MARK: Access
 
-/// Result of `validateAccess` / the deprecated `acceptInvitation`.
+/// Result of `validateAccess`.
 public struct DocumentAccessResult: Decodable, Sendable {
     public let success: Bool
     public let hasAccess: Bool
     public let permission: DocumentPermission?
-    public let viaInvitation: Bool?
-    public let invitationAccepted: Bool?
-    public let upgradedFromPermission: String?
     public let error: String?
 }
 
@@ -768,7 +718,7 @@ public struct DenyAccessRequestOptions: Encodable, Sendable {
     }
 }
 
-// MARK: Invitations (pending + legacy)
+// MARK: Invitations
 
 /// A pending (deferred) invitation scoped to a single document.
 public struct PendingInvitationEntry: Decodable, Sendable {
@@ -780,44 +730,6 @@ public struct PendingInvitationEntry: Decodable, Sendable {
     public let grantedBy: String?
 }
 
-/// A legacy per-document invitation row.
-public struct DocumentInvitation: Decodable, Sendable {
-    public let invitationId: String
-    public let documentId: String?
-    public let email: String
-    public let permission: String
-    public let invitedBy: String
-    public let invitedAt: String
-    public let expiresAt: String?
-    public let accepted: Bool
-    public let acceptedAt: String?
-}
-
-/// Response from the deprecated `sendInvitation` / `updateInvitation`.
-public struct DocumentInvitationResponse: Decodable, Sendable {
-    public let success: Bool
-    public let message: String
-    public let invitationId: String
-    public let email: String
-    public let permission: String
-    public let invitedBy: String
-    public let invitedAt: String
-    public let expiresAt: String
-}
-
-/// Optional email-notification settings for the deprecated invitation verbs.
-public struct InvitationEmailOptions: Encodable, Sendable {
-    public var sendEmail: Bool?
-    public var documentUrl: String?
-    public var note: String?
-
-    public init(sendEmail: Bool? = nil, documentUrl: String? = nil, note: String? = nil) {
-        self.sendEmail = sendEmail
-        self.documentUrl = documentUrl
-        self.note = note
-    }
-}
-
 // MARK: Small result wrappers
 
 /// `{ success }` — returned by `revokeGroupPermission`.
@@ -825,8 +737,7 @@ public struct SuccessResult: Decodable, Sendable {
     public let success: Bool
 }
 
-/// `{ success, message }` — returned by the deprecated `declineInvitation`
-/// and `deleteInvitation`.
+/// `{ success, message }` — a bare success envelope.
 public struct MessageResult: Decodable, Sendable {
     public let success: Bool
     public let message: String

@@ -376,7 +376,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
 
     /// The `__ROOT_TAG__` sentinel filters the root even when the token
     /// carries no `rootDocId` claim (standalone construction), matching
-    /// `DocumentsAPI.filterOutRoot`.
+    /// `LocalFirstListing.rootDocumentTag`.
     func testRootTagFiltersWithoutKnownRootDocId() async throws {
         let store = MetadataStore([
             Self.ownedEntry("local1"),

@@ -12,7 +12,7 @@ import XCTest
 /// launch after launch (#2827 saw a 7.1 MB snapshot survive four days).
 ///
 /// So the reconciliation runs on its own schedule instead: once per connect,
-/// at most once per staleness window, walking the paged `GET /documents` to the
+/// at most once per staleness window, walking the paged owned/shared pair to the
 /// end of the scope — never reading one response as the whole of it.
 ///
 /// Server-free: a `RecordingTransport` answers the walk and a temp SQLite store
@@ -75,7 +75,14 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
     /// A server that answers the paged walk from `pages`, keyed by the incoming
     /// `cursor` (`""` for the first page), and fails any unpaged listing — the
     /// reconciliation must never read one of those as the whole scope.
-    private static func walkServer(pages: [String: String]) -> RecordingTransport {
+    ///
+    /// #2951: the walk covers the pair that replaced `GET /documents`, so
+    /// `pages` answers the owned half and the shared half comes back empty
+    /// unless a test says otherwise via `sharedPage`.
+    private static func walkServer(
+        pages: [String: String],
+        sharedPage: String = #"{"items":[],"hasMore":false}"#
+    ) -> RecordingTransport {
         RecordingTransport(responder: { call in
             func json(_ body: String) -> TransportResponse {
                 TransportResponse(
@@ -84,6 +91,7 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
                     body: Data(body.utf8)
                 )
             }
+            if call.path.contains("shared-documents") { return json(sharedPage) }
             guard call.path.contains("limit=") else {
                 XCTFail("the reconciliation asked an unpaged listing: \(call.path)")
                 return json("[]")
@@ -207,7 +215,9 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
             "a document absent from the walked scope is evicted"
         )
         XCTAssertEqual(
-            transport.calls.count, 2, "the walk pays one request per page, and no more"
+            transport.calls.count, 3,
+            "the walk pays one request per page — two owned pages plus the " +
+            "single shared page (#2951)"
         )
     }
 
@@ -294,7 +304,7 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
 
     /// Each of these is a scope the client could not read to the end, so its
     /// silence about a cached document proves nothing. The bare array is the
-    /// live defect: the unpaged `GET /documents` is silently truncated at
+    /// live defect: an unpaged listing is silently truncated at
     /// dynamo-bao's 100-row `defaultQueryLimit`, so a server that ignores
     /// `limit` answers a walk request with a prefix that looks complete.
     func test_connectReconciliationEvictsNothingFromAWalkItCouldNotFinish() async throws {
