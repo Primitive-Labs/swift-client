@@ -603,7 +603,12 @@ final class TransportSpineTests: XCTestCase {
             // listing already read an array of — one `[String: Any]?` holding
             // the answer plus the two casts that unwrap it. Same wire boundary,
             // one row instead of a list, not new untyped surface.
-            "JsBaoClient.swift": (23, 6, 0),
+            // #2951 took the dictionary count 23 -> 22: the document-invitation
+            // surface left the client, and with it the one
+            // `json["document"] as? [String: Any]` cast that read the accepted
+            // document off the legacy acceptance response. Removed surface,
+            // not a new lowering.
+            "JsBaoClient.swift": (22, 6, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP
