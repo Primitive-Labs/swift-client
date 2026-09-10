@@ -694,7 +694,7 @@ public final class DocumentManager: @unchecked Sendable {
             metadataIndex[documentId] = meta
             return meta
         }
-        try? await putMetadataTracked(metaSnapshot)
+        _ = try? await putMetadataTracked(metaSnapshot)
 
         return doc
     }
@@ -838,7 +838,7 @@ public final class DocumentManager: @unchecked Sendable {
             metadataIndex[documentId] = meta
             return meta
         }
-        try? await putMetadataTracked(snapshot)
+        _ = try? await putMetadataTracked(snapshot)
     }
 
     /// Drop a document that never finished opening, without any of
@@ -1367,7 +1367,7 @@ public final class DocumentManager: @unchecked Sendable {
                     self.metadataIndex[documentId] = e
                     return e
                 }
-                try? await self.putMetadataTracked(entry)
+                _ = try? await self.putMetadataTracked(entry)
             }
         }
     }
@@ -1669,7 +1669,7 @@ public final class DocumentManager: @unchecked Sendable {
             }
 
             // Persist
-            try? await putMetadataTracked(entry)
+            _ = try? await putMetadataTracked(entry)
 
             // Per-doc typed event, mirroring JS `handleServerDocuments`
             // (`src/client/internal/documentManager.ts`): action "updated",
@@ -1952,7 +1952,7 @@ public final class DocumentManager: @unchecked Sendable {
 
         setMetadata(documentId, entry: next)
         lock.withLock { _ = deletedMetadataIds.remove(documentId) }
-        try? await putMetadataTracked(next)
+        _ = try? await putMetadataTracked(next)
 
         // A server `created` for a document we already knew about is an
         // update; emitting `created` twice would make listeners double-insert.
@@ -2235,7 +2235,7 @@ public final class DocumentManager: @unchecked Sendable {
         guard offlineStore != nil else { return }
         Task { [weak self] in
             guard let self else { return }
-            try? await self.putMetadataTracked(entry)
+            _ = try? await self.putMetadataTracked(entry)
         }
     }
 
@@ -2283,7 +2283,7 @@ public final class DocumentManager: @unchecked Sendable {
                 return meta
             }
             if let metaToPersist {
-                try? await putMetadataTracked(metaToPersist)
+                _ = try? await putMetadataTracked(metaToPersist)
             }
             applyPostCommitPolicy(documentId)
 
@@ -2301,7 +2301,7 @@ public final class DocumentManager: @unchecked Sendable {
                     return meta
                 }
                 if let metaToPersist {
-                    try? await putMetadataTracked(metaToPersist)
+                    _ = try? await putMetadataTracked(metaToPersist)
                 }
                 applyPostCommitPolicy(documentId)
                 return ["linked": true]
@@ -2319,7 +2319,7 @@ public final class DocumentManager: @unchecked Sendable {
                 return meta
             }
             if let metaToPersist {
-                try? await putMetadataTracked(metaToPersist)
+                _ = try? await putMetadataTracked(metaToPersist)
             }
 
             emitter?.emit(PendingCreateFailedEvent(documentId: documentId, error: error.localizedDescription))
@@ -2362,7 +2362,7 @@ public final class DocumentManager: @unchecked Sendable {
                     return meta
                 }
                 if let metaAfterError {
-                    try? await self.putMetadataTracked(metaAfterError)
+                    _ = try? await self.putMetadataTracked(metaAfterError)
                 }
 
                 self.emitter?.emit(
@@ -2399,7 +2399,7 @@ public final class DocumentManager: @unchecked Sendable {
                     return meta
                 }
                 if let metaAfterSchedule {
-                    try? await self.putMetadataTracked(metaAfterSchedule)
+                    _ = try? await self.putMetadataTracked(metaAfterSchedule)
                 }
 
                 // Give up after maxAttempts.
@@ -3146,7 +3146,7 @@ public final class DocumentManager: @unchecked Sendable {
             metadataIndex[documentId] = meta
             return meta
         }
-        try? await putMetadataTracked(metaSnapshot)
+        _ = try? await putMetadataTracked(metaSnapshot)
     }
 
     // MARK: - Storage-ready handoff
@@ -3241,7 +3241,7 @@ public final class DocumentManager: @unchecked Sendable {
             // A row deleted (evicted, or reported deleted by the server) while
             // it waited has nothing left to replay.
             guard let record = survivingMetadataRecord(documentId) else { continue }
-            try? await offlineStore?.putMetadataReporting(
+            _ = try? await offlineStore?.putMetadataReporting(
                 appId: appId, userId: userId, record: record
             )
         }

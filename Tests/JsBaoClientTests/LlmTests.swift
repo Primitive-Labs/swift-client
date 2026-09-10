@@ -27,6 +27,9 @@ final class LlmTests: XCTestCase {
         await ctx.cleanup()
     }
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testModelsReturnsModelsOrClearError() async throws {
         do {
             let res = try await client.llm.models()
@@ -42,6 +45,9 @@ final class LlmTests: XCTestCase {
         }
     }
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testChatValidatesInput() async throws {
         do {
             _ = try await client.llm.chat(options: LlmChatOptions(messages: []))
@@ -56,6 +62,9 @@ final class LlmTests: XCTestCase {
     }
 
     /// Ported from JS: "llm.chat() returns assistant message when upstream key present (or clear error otherwise)"
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testChatReturnsAssistantMessageOrClearError() async throws {
         do {
             let result = try await client.llm.chat(options: LlmChatOptions(
@@ -80,6 +89,9 @@ final class LlmTests: XCTestCase {
         }
     }
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testChatReturnsErrorForInvalidModel() async throws {
         do {
             _ = try await client.llm.chat(options: LlmChatOptions(
