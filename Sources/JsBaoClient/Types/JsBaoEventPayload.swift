@@ -340,6 +340,18 @@ extension WorkflowStartedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .workflowStarted }
 }
 
+extension ChannelMessageEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .channelMessage }
+}
+
+extension ChannelSubscribeFailedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .channelSubscribeFailed }
+}
+
+extension DirectMessageEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .directMessage }
+}
+
 extension BlobUploadProgressEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .blobsUploadProgress }
 }
@@ -415,6 +427,9 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     NotificationEvent.self,
     WorkflowStatusEvent.self,
     WorkflowStartedEvent.self,
+    ChannelMessageEvent.self,
+    ChannelSubscribeFailedEvent.self,
+    DirectMessageEvent.self,
     BlobUploadProgressEvent.self,
     BlobUploadCompletedEvent.self,
     BlobUploadFailedEvent.self,

@@ -50,7 +50,7 @@ final class IntegrationsAPITests: XCTestCase {
             XCTAssertEqual(
                 error.code,
                 .invalidArgument,
-                "Expected .invalidArgument; got \(error.code) (\(error.message ?? ""))"
+                "Expected .invalidArgument; got \(error.code) (\(error.message))"
             )
         } catch {
             XCTFail("Expected JsBaoError, got \(type(of: error)): \(error)")
@@ -88,7 +88,7 @@ final class IntegrationsAPITests: XCTestCase {
             ]
             XCTAssertTrue(
                 acceptable.contains(error.code),
-                "Expected one of \(acceptable.map(\.rawValue)); got \(error.code.rawValue) (\(error.message ?? ""))"
+                "Expected one of \(acceptable.map(\.rawValue)); got \(error.code.rawValue) (\(error.message))"
             )
         } catch {
             XCTFail(

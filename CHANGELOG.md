@@ -20,6 +20,37 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Server functions: `client.functions`, channels and direct messages (#3278)
+
+**Additive.** The Swift client gains the server-functions surface the
+JavaScript client already had, so a Swift app can invoke a request function,
+start a task and poll its run, join a channel, and receive direct messages.
+
+- `client.functions` (`FunctionsAPI`) mirrors JS `client.functions`:
+  `invoke` (request functions), `start` (task functions), `getStatus`,
+  `waitFor`, `terminate`, each with an untyped and a typed `Encodable` /
+  `Decodable` overload. A settled invocation never throws — read `status`
+  (`completed` / `failed` / `timeout`); only a platform refusal throws, as an
+  `HttpError` carrying the server's `errorCode` on `serverCode`. `waitFor`
+  polls with a 0.4 s→5 s backoff and a 15-minute default timeout. The typed
+  `input` is sent as whatever JSON value it encodes to — object, array or
+  scalar — so a function whose schema declares a non-object root receives
+  exactly that. Calling `invoke` on a task function, or `start` on a request
+  function, throws `JsBaoError(.functionModeMismatch)`.
+- `subscribeToChannel(_:grant:)` / `unsubscribeFromChannel(_:)` join and leave
+  a channel a function authorized; frames arrive as the new `.channelMessage`
+  and `.directMessage` events, and a reconnect re-presents held grants (a
+  refused re-presentation surfaces as `.channelSubscribeFailed`).
+- Added `JsBaoErrorCode.functionModeMismatch` (`FUNCTION_MODE_MISMATCH`) and
+  `.channelSubscribeFailed` (`CHANNEL_SUBSCRIBE_FAILED`); the `ChannelMessageEvent`,
+  `ChannelSubscribeFailedEvent` and `DirectMessageEvent` payloads; and the
+  `FunctionInvokeResult`, `FunctionResult<Output>`, `FunctionStartResult`,
+  `FunctionInvokeLimits`, `FunctionRunRef` and `ChannelSubscription` types.
+
+Generated per-key Swift types for a function's declared schema are not part of
+this change — they bind over the generic `invoke<Input, Output>` /
+`start<Input>` overloads shipped here and land in #3344.
+
 ### `documents.create` no longer opens the document (#3200)
 
 **Breaking.** `documents.create(options:)` / `JsBaoClient.createDocument` is now
@@ -513,9 +544,7 @@ One deliberate source break covering everything that had been queued behind
 batching is to make the number of unavoidable breaks **exactly one**, not to
 let anyone migrate on their own schedule.
 
-A full symbol-by-symbol migration table is in the migration guide:
-<https://primitive-labs.github.io/primitive-docs-site/getting-started/swift-client-migration>.
-The headlines:
+The headlines, then the full symbol-by-symbol table:
 
 - **Every symbol marked for removal in the next major was removed.** All 61
   `next major` markers, and 76 of the 96 `@available(*, deprecated)`
@@ -563,6 +592,64 @@ The headlines:
   unchanged and the enum is still `Equatable`.
 - **The codegen-backing `*Shared` methods moved to `client.codegen`** and
   dropped the suffix.
+
+#### Every removed symbol and its replacement
+
+| Removed | Use instead |
+| --- | --- |
+| `client.events`, `emitter.on(_:)`, `emitter.onAny(_:)`, `emitter.emit(_:)` (untyped forms) | The typed subscriptions: `client.observeOnMainActor(SomeEvent.self) { event in … }`, or `client.stream(for: SomeEvent.self)` off the main actor |
+| `RemoteUpdateEvent` / the `.remoteUpdate` event | It had no JS twin. Use `DocumentSyncStateChangedEvent` (`state == "synced"`), or observe the `Y.Doc` directly |
+| The `.auth` and `.blobsUploadQueued` event cases | Never emitted. Delete the handler |
+| `client.makeRequest(...)`, `client.makeRawRequest(...)` | The typed sub-APIs, or `Transport.request` / `requestJSON` / `requestData` |
+| The closure-taking `init`s and `ClosureTransport` | The designated `JsBaoClient(options:)` initializers |
+| `client.waitForSync(...)` | `client.waitForInitialSync(documentId:timeout:pollInterval:)` |
+| `QueryOptions.offset` | Cursor pagination — `QueryOptions(limit:cursor:direction:)` |
+| The synchronous analytics verbs (`logAnalyticsEvent`, `flushAnalytics`, `setAnalyticsPlanOverride`, `setAnalyticsAppVersionOverride`) | Their `…Async` twins, or the typed `client.analytics` namespace |
+| `client.forceReconnect()` | `client.forceReconnectAsync()` |
+| `client.setBlobUploadConcurrency(_:)` | `client.setBlobUploadConcurrencyAsync(_:)` |
+| `client.getBlobManager()` | `client.documents` for the app-wide upload-queue verbs, `client.document(id).blobs()` for the per-document ones |
+| `documents.sendInvitation` / `updateInvitation` | `documents.updatePermissions(documentId:params:)` with `.email(...)` — it is idempotent |
+| `documents.listInvitations` | `documents.listPendingInvitations(documentId:)` |
+| `documents.getInvitation` | `client.invitations.get(invitationId:)`, or `listPendingInvitations` filtered by email |
+| `documents.deleteInvitation` | `documents.removePermission(documentId:_:)` with `.email(...)`, or `client.invitations.delete(invitationId:)` |
+| `documents.acceptInvitation` | Email-matched shares resolve themselves; cross-identity uses `client.invitations.accept(inviteToken:)` |
+| `documents.declineInvitation` | No replacement — pending invitations expire on their own; self-remove with `removePermission(documentId:_:)` after acceptance |
+| `databases.grantPermission` / `revokePermission` | `databases.addManager(databaseId:params:)` / `databases.removeManager(databaseId:userId:)` |
+| `databases.importBulk` | `databases.executeBatch(databaseId:operationName:batch:)` |
+| `ListDocumentsOptions.refreshFromServer` / `.localOnly` / `.serverTimeoutMs` / `.waitForLoad` / `.returnPage` | They were declared and never read. Use `me.ownedDocuments(...)`, which implements all of them. Two of the five change type on the way over: `waitForLoad` was `String?` and is `WaitForLoadMode?` on `MeOwnedDocumentsOptions` (`"network"` → `.network`), and `serverTimeoutMs: Int?` in milliseconds is `serverTimeout: TimeInterval?` in seconds |
+| `documents.list` / `documents.listPage` / `ListDocumentsOptions` | Removed outright, along with the `GET /documents` route that backed them. `me.ownedDocuments(...)` for owned documents, `me.sharedDocuments(...)` for shared ones |
+| `me.pendingDocumentInvitations()` and `PendingDocumentInvitation` | Removed with the per-document invitation model. `documents.listPendingInvitations(documentId:)` lists a document's outstanding deferred grants |
+| The `.invitation` event and `InvitationEvent` | Removed — nothing emits it now that the per-document invitation routes are gone. There is no replacement push |
+| `MeOwnedDocumentsOptions.returnPage` | `me.ownedDocumentsPage(...)` |
+
+The `get*()` accessors that became properties: `userId`, `authState`,
+`networkMode`, `networkStatus`, `apiUrl`, `appId`, `globalAdminAppId`,
+`rootDocId`, `defaultDocumentId`, `retentionPolicy`, `offlineGrantStatus`,
+`offlineIdentity`, `jwtPayload`, `authPersistenceInfo`,
+`llmAnalyticsContext`, `geminiAnalyticsContext`, `token`, `doc` — on
+`JsBaoClient`, `AuthAPI` and `DocumentContext`. `networkMode` and
+`retentionPolicy` are settable properties rather than `set*()` methods; two
+more became `async` properties (`client.blobUploadConcurrency`,
+`client.documents.uploadConcurrency`). The four accessors that perform an
+HTTP round trip stayed **functions**, since a property that makes a network
+call hides its cost: `client.auth.getAuthConfig()`,
+`client.auth.getAppConfig()`, `client.documents.getRoot()`,
+`client.session.get()` — the untyped `client.getAuthConfig()` /
+`client.getAppConfig()` on the client itself are gone, replaced by the typed
+`client.auth` twins.
+
+The `TimeInterval`-in-seconds change reaches `waitForInitialSync`,
+`waitForInSync`, `waitForWriteConfirmation`, `checkStateVector` (and their
+`documents` twins), `auth.waitForUserId` (whose default also moved from 5
+seconds to 10), `locks.tryAcquire` / `acquire` / `renew`, both
+`workflows.runSync` overloads, and the option fields on `SyncConfig`,
+`CommitRetryBackoff`, `AnalyticsAutoEventsConfig`, `RetentionPolicy.ttl`,
+`MeOwnedDocumentsOptions.serverTimeout`, `refreshIfOlderThan`,
+`OpenDocumentOptions.availabilityWait`, and `WaitForWorkflowOptions.timeout` —
+plus each generated workflow invoker's `runSync(input:timeout:)`. Not
+affected: `*Ms` fields on responses and telemetry (decoded from the wire),
+`StorageProvider.updatedAtMs` (persisted), and the `ttlMs` / `timeoutMs` JSON
+keys request bodies still send over the wire.
 
 #### Two breaks this batch does NOT close
 

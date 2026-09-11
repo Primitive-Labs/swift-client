@@ -65,19 +65,26 @@ final class TypedModel<T: PrimitiveModel> {
         try? dynamic.update(id: id, values: values)
     }
 
+    // `PrimitiveRecord` carries its id as a stored `String`. Both overloads
+    // used to re-read it through the subscript as `record["id"] as? String`,
+    // a cast from `PrimitiveValue?` to `String` that always fails — so they
+    // returned nil for every input, index hit included (#3314).
     func findByUnique(constraint name: String, value: PrimitiveValue) throws -> T? {
-        guard let record = try dynamic.findByUnique(constraint: name, value: value),
-              let id = record["id"] as? String else { return nil }
-        return find(id: id)
+        guard let record = try dynamic.findByUnique(constraint: name, value: value)
+        else { return nil }
+        return find(id: record.id)
     }
 
     func findByUnique(constraint name: String, values: [PrimitiveValue]) throws -> T? {
-        guard let record = try dynamic.findByUnique(constraint: name, values: values),
-              let id = record["id"] as? String else { return nil }
-        return find(id: id)
+        guard let record = try dynamic.findByUnique(constraint: name, values: values)
+        else { return nil }
+        return find(id: record.id)
     }
 
-    func insert(_ value: T) { try? create(value) }
+    /// Best-effort `create` for call sites that don't care whether the record
+    /// was new. `create` is `@discardableResult`, but `try?` re-wraps it in an
+    /// optional that isn't, so the discard is explicit (#3314).
+    func insert(_ value: T) { _ = try? create(value) }
 }
 
 /// Test-local copy of the removed `PrimitiveValueBridge`, used by the test-only

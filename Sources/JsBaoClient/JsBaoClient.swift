@@ -51,6 +51,11 @@ public final class JsBaoClient: @unchecked Sendable {
     public let integrations: IntegrationsAPI
     public let prompts: PromptsAPI
     public let workflows: WorkflowsAPI
+    /// Server functions (invoke / start / getStatus / waitFor / terminate).
+    /// A request function answers its result; a task function answers a run
+    /// id polled on the workflow routes. Mirrors JS `client.functions.*`
+    /// (#3278).
+    public let functions: FunctionsAPI
     public let invitations: InvitationsAPI
     /// Sub-API for the notification inbox and push-device registration
     /// (list / unreadCount / markRead / markAllRead / send / registerDevice /
@@ -386,6 +391,25 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Guarded by `lock`.
     private var sharedModels: [String: MultiDocModel] = [:]
 
+    // MARK: Channel memberships (#3278)
+
+    /// The grants this client holds, the joins waiting for an answer, and the
+    /// per-channel generation and chain. Its own lock; see the type. Internal
+    /// so a hermetic test can read the bookkeeping nothing else observes.
+    let channelRegistry = ChannelMembershipRegistry()
+
+    /// The last channel control frame handed to the socket; the next one
+    /// waits for it, so `channel.subscribe` / `channel.unsubscribe` reach the
+    /// server in the order the app issued them. Guarded by `lock`.
+    private var channelControlSendChain: Task<Void, Never>?
+
+    /// How long a `subscribeToChannel` waits for its channel's ack — the JS
+    /// client's 20 s.
+    static let channelSubscribeAckTimeout: TimeInterval = 20
+
+    /// Test seam for the ack timeout. Never set in production code.
+    var channelSubscribeAckTimeoutForTest: TimeInterval?
+
     // MARK: - Initialization
 
     /// Public entry point. Delegates to the internal designated init with no
@@ -579,12 +603,16 @@ public final class JsBaoClient: @unchecked Sendable {
                 Task { await analyticsQueue.logEvent(prepared) }
             }
         )
-        self.workflows = WorkflowsAPI(
+        let workflows = WorkflowsAPI(
             transport: httpClient,
             getConnectionId: { [weak wsManager] in wsManager?.connectionId ?? "" },
             logger: logger,
             events: eventEmitter
         )
+        self.workflows = workflows
+        // Server functions ride the same transport; the control routes
+        // delegate to `workflows` with the function key in the key slot.
+        self.functions = FunctionsAPI(transport: httpClient, workflows: workflows, logger: logger)
         // Analytics namespace — a thin facade over the shared
         // `analyticsQueue`. All five methods fan out to the same queue.
         self.analytics = AnalyticsAPI(
@@ -736,6 +764,298 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Get the current connection ID
     public var connectionId: String {
         wsManager.connectionId
+    }
+
+    // MARK: - Channels (#3278)
+
+    /// Join a channel a server function authorized.
+    ///
+    /// `grant` is the token `ctx.channels.authorize` handed back: a signed,
+    /// short-lived credential naming this app, this channel and this user.
+    /// Resolves on the server's ack FOR THIS CHANNEL, so concurrent
+    /// subscribes cannot resolve each other, and throws
+    /// `JsBaoError(.channelSubscribeFailed)` on the server's uniform refusal
+    /// (an expired, tampered, cross-app or cross-user grant are deliberately
+    /// indistinguishable), on a 20 s ack timeout, when the channel is left
+    /// while joining, or when the socket closes while joining.
+    ///
+    /// Calling it again with a fresh grant RENEWS the membership: expiry is
+    /// the only revocation a channel has, so an app that wants a long-lived
+    /// channel re-invokes its authorizing function before `expiresAt` and
+    /// subscribes again. Two calls for the SAME channel run one after the
+    /// other, so a renewal issued while an earlier subscribe is still in flight
+    /// is answered on its own merits rather than by whichever frame arrives
+    /// first. A call made while the socket is down registers the grant, asks
+    /// for a connection, and is sent when the socket opens. Frames arrive as
+    /// the `.channelMessage` event; held grants are presented again after a
+    /// reconnect, and a re-presented grant the server refuses is announced as
+    /// `.channelSubscribeFailed`. Mirrors JS `subscribeToChannel`.
+    public func subscribeToChannel(_ channel: String, grant: String) async throws -> ChannelSubscription {
+        guard !channel.isEmpty else {
+            throw JsBaoError(code: .invalidArgument, message: "subscribeToChannel: channel is required")
+        }
+        guard !grant.isEmpty else {
+            throw JsBaoError(code: .invalidArgument, message: "subscribeToChannel: a channel grant is required")
+        }
+        return try await chainedChannelSubscribe(channel, grant: grant).value
+    }
+
+    /// Leave a channel. Idempotent, and safe on a closed socket: the
+    /// registration goes either way, so a reconnect does not bring it back.
+    ///
+    /// A subscribe still in flight, or queued behind one, is cancelled with
+    /// it: leaving means leaving, so a queued renewal cannot put the
+    /// membership back afterwards, and a `subscribeToChannel` call still
+    /// waiting for its ack throws rather than resolving with a subscription
+    /// to a channel this client has already left. Mirrors JS
+    /// `unsubscribeFromChannel`.
+    public func unsubscribeFromChannel(_ channel: String) {
+        // Grant, chain and generation go together, and the generation is
+        // bumped BEFORE the pending calls are settled: a caller that
+        // subscribes again from its error path starts a new generation rather
+        // than racing this one.
+        let waiting = channelRegistry.leave(channel)
+        // Nothing waiting means nothing to reject and no `channelSubscribeFailed`
+        // to announce: leaving is what the app asked for.
+        for join in waiting {
+            join.continuation.resume(throwing: JsBaoError(
+                code: .channelSubscribeFailed,
+                message: "subscribeToChannel: '\(channel)' was left while joining",
+                details: ["channel": .string(channel)]
+            ))
+        }
+        if wsManager.isSocketOpen {
+            sendControlFrame(ChannelUnsubscribeFrame(channel: channel))
+        }
+    }
+
+    /// Queue one subscribe attempt behind whatever this channel is already
+    /// waiting on, however that one ends — the previous call's outcome is its
+    /// caller's; this one only needs the wire to itself. And only while the
+    /// app still wants this channel: an `unsubscribeFromChannel` between
+    /// queueing and running means this attempt must not resurrect the
+    /// membership it just left, and a `destroy()` means nothing may run at
+    /// all. The generation is read and the chain replaced in one step, so
+    /// two calls for the same channel made at the same moment queue behind
+    /// each other rather than both taking the wire.
+    private func chainedChannelSubscribe(_ channel: String, grant: String) -> Task<ChannelSubscription, Error> {
+        channelRegistry.reserveChain(channel) { epoch, previous in
+            Task<ChannelSubscription, Error> { [weak self] in
+                if let previous { await previous.value }
+                guard let self else { throw JsBaoError(code: .unavailable) }
+                guard self.channelRegistry.isCurrent(channel, epoch: epoch) else {
+                    let reason = self.channelRegistry.isDestroyed
+                        ? "the client was destroyed before this subscribe to '\(channel)' ran"
+                        : "'\(channel)' was left before this subscribe ran"
+                    throw JsBaoError(
+                        code: .channelSubscribeFailed,
+                        message: "subscribeToChannel: \(reason)",
+                        details: ["channel": .string(channel)]
+                    )
+                }
+                return try await self.startChannelSubscribe(channel, grant: grant)
+            }
+        }
+    }
+
+    /// One attempt: register the grant, park the caller, put the frame on the
+    /// wire — or, with the socket down, ask for a connection and let the open
+    /// flush send it.
+    private func startChannelSubscribe(_ channel: String, grant: String) async throws -> ChannelSubscription {
+        // Registered BEFORE the send, so a socket that drops between the two
+        // re-issues this subscribe on reconnect rather than losing it.
+        channelRegistry.setGrant(channel, grant: grant)
+        return try await withCheckedThrowingContinuation { continuation in
+            let join = ChannelMembershipRegistry.PendingJoin(grant: grant, continuation: continuation, sent: false)
+            // A registry that was destroyed between the generation check and
+            // here has already resumed everything it will ever resume; this
+            // caller is resumed here, by the only party that still holds it.
+            guard channelRegistry.addPending(channel, join) else {
+                continuation.resume(throwing: JsBaoError(
+                    code: .channelSubscribeFailed,
+                    message: "subscribeToChannel: the client was destroyed while joining '\(channel)'",
+                    details: ["channel": .string(channel)]
+                ))
+                return
+            }
+            let ackTimeout = channelSubscribeAckTimeoutForTest ?? Self.channelSubscribeAckTimeout
+            channelRegistry.setTimeoutTask(channel, id: join.id, Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(ackTimeout * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                self.settleChannelSubscribe(channel, .failure(JsBaoError(
+                    code: .channelSubscribeFailed,
+                    message: "subscribeToChannel: no answer for '\(channel)' within \(Int(ackTimeout))s",
+                    details: ["channel": .string(channel)]
+                )))
+            })
+            // The send is CLAIMED, so this and the open flush cannot both put
+            // the frame on the wire: whichever sees the socket open first
+            // sends, the other finds the attempt already sent.
+            if wsManager.isSocketOpen {
+                if channelRegistry.claimSend(channel, id: join.id) {
+                    sendControlFrame(ChannelSubscribeFrame(channel: channel, grant: grant))
+                }
+            } else {
+                Task { [weak self] in try? await self?.wsManager.connect() }
+            }
+        }
+    }
+
+    /// Re-present a stored grant after a reconnect — through the SAME chain an
+    /// explicit subscribe uses, so every answer stays attributable to the
+    /// request that asked for it. Nobody is waiting on this one, so its
+    /// refusal is announced as `.channelSubscribeFailed` rather than thrown.
+    private func reissueChannelSubscribe(_ channel: String, grant: String) {
+        let epoch = channelRegistry.epoch(channel)
+        let attempt = chainedChannelSubscribe(channel, grant: grant)
+        Task { [weak self] in
+            do {
+                _ = try await attempt.value
+            } catch {
+                guard let self else { return }
+                // A re-issue the app cancelled is not a failure to announce.
+                guard self.channelRegistry.epoch(channel) == epoch else { return }
+                // A re-issue the socket carried away is not a refusal: keep the
+                // registration so the next reconnect presents the grant again,
+                // and say nothing. Only the SERVER's answer removes a membership.
+                guard self.wsManager.isSocketOpen else {
+                    self.channelRegistry.setGrantIfAbsent(channel, grant: grant)
+                    return
+                }
+                self.eventEmitter.emit(ChannelSubscribeFailedEvent(
+                    channel: channel,
+                    message: (error as? JsBaoError)?.message ?? String(describing: error)
+                ))
+            }
+        }
+    }
+
+    /// Settle every call waiting on one channel — with the ack, or with the
+    /// refusal. Only that channel's waiters and only that channel's
+    /// registration: a client with several subscriptions must not lose the
+    /// ones that worked. A refusal nobody asked for — the reconnect re-issue,
+    /// where the client presented a stored grant on its own initiative — is
+    /// announced as `.channelSubscribeFailed`, since a thrown error cannot
+    /// report it and silently dropping the registration would leave the app
+    /// believing it was still in a channel it had just been removed from.
+    private func settleChannelSubscribe(_ channel: String, _ outcome: Result<Int, Error>) {
+        let waiting = channelRegistry.takePending(channel)
+        switch outcome {
+        case .failure(let error):
+            channelRegistry.removeGrant(channel)
+            if waiting.isEmpty {
+                eventEmitter.emit(ChannelSubscribeFailedEvent(
+                    channel: channel,
+                    message: (error as? JsBaoError)?.message ?? String(describing: error)
+                ))
+            }
+            for join in waiting { join.continuation.resume(throwing: error) }
+        case .success(let expiresAt):
+            for join in waiting {
+                join.continuation.resume(returning: ChannelSubscription(
+                    channel: channel,
+                    expiresAt: expiresAt,
+                    unsubscribe: { [weak self] in self?.unsubscribeFromChannel(channel) }
+                ))
+            }
+        }
+    }
+
+    /// Give up on every subscribe waiting for an answer, because the socket
+    /// that would have carried it is gone. The GRANTS stay: the socket failed,
+    /// not the credential, and the reconnect pass presents each one again.
+    /// What must not stay is a pending attempt — its answer can never arrive,
+    /// and leaving it in the per-channel chain would hold the re-issue behind
+    /// it for the full ack timeout.
+    private func abortPendingChannelSubscribes(reason: String) {
+        rejectChannelJoins(channelRegistry.takeAllPending(), reason: reason)
+    }
+
+    /// `destroy()`'s version: the registry is marked destroyed and drained
+    /// in one step, and only then are the callers resumed. A renewal queued
+    /// behind one of them wakes when its predecessor is rejected here, finds
+    /// the registry destroyed, and rejects itself — it cannot register a
+    /// grant or park a continuation on a client that is gone, and nothing
+    /// registered before the drain is left unresumed.
+    private func destroyChannelSubscriptions() {
+        rejectChannelJoins(channelRegistry.destroy(), reason: "the client was destroyed")
+    }
+
+    private func rejectChannelJoins(
+        _ taken: [(channel: String, joins: [ChannelMembershipRegistry.PendingJoin])],
+        reason: String
+    ) {
+        for (channel, joins) in taken {
+            for join in joins {
+                join.continuation.resume(throwing: JsBaoError(
+                    code: .channelSubscribeFailed,
+                    message: "subscribeToChannel: \(reason) while joining '\(channel)'",
+                    details: ["channel": .string(channel)]
+                ))
+            }
+        }
+    }
+
+    /// The reconnect pass. A channel membership is a server-side row keyed by
+    /// the connection that is now gone, so every held grant has to be
+    /// presented again. First the subscribes made while the socket was down —
+    /// they are already waiting for an ack and have sent nothing, so their
+    /// frame goes now and the re-issue pass skips them (a second attempt
+    /// would queue behind the first, which could then only end in its
+    /// timeout). Then every other held grant, through the ordinary re-issue.
+    private func resubscribeChannelsOnConnect() {
+        guard wsManager.isSocketOpen else { return }
+        var flushed: Set<String> = []
+        for (channel, grant) in channelRegistry.claimUnsentSends() {
+            flushed.insert(channel)
+            sendControlFrame(ChannelSubscribeFrame(channel: channel, grant: grant))
+            logger.debug("[channel] sent a subscribe held back by a closed socket", channel)
+        }
+        for (channel, held) in channelRegistry.heldGrants() where !flushed.contains(channel) {
+            reissueChannelSubscribe(channel, grant: held.grant)
+            logger.debug("[channel] re-subscribed on reconnect", channel)
+        }
+    }
+
+    /// Encode one outbound control frame and hand it to the socket. Fire and
+    /// forget: the frames this carries are answered by frames of their own,
+    /// and a send that fails on a closing socket is covered by the close
+    /// handler's abort.
+    ///
+    /// Sent in INVOCATION order. `WebSocketManager.send` is concurrent, and a
+    /// detached task per frame would let a leave-and-rejoin reach the server
+    /// as subscribe-then-unsubscribe: the new call would resolve on its ack
+    /// and the server would then remove the membership it had just granted
+    /// (CSO-002 on #3278). JS gets the order from `ws.send` for free; here
+    /// every send waits for the one before it.
+    private func sendControlFrame<Frame: Encodable & Sendable>(_ frame: Frame) {
+        guard let data = try? JSONCoding.encodeData(frame),
+              let text = String(data: data, encoding: .utf8) else {
+            logger.debug("[channel] failed to encode control frame")
+            return
+        }
+        lock.withLock {
+            let previous = channelControlSendChain
+            channelControlSendChain = Task { [weak self] in
+                await previous?.value
+                try? await self?.wsManager.send(text)
+            }
+        }
+    }
+
+    /// A frame's `payload`: the function's own value, as `JSONValue`; `nil`
+    /// when absent or JSON `null`.
+    private static func framePayload(_ raw: Any?) -> JSONValue? {
+        guard let raw, !(raw is NSNull) else { return nil }
+        return try? JSONCoding.decode(JSONValue.self, from: raw)
+    }
+
+    /// `expiresAt` as the server sends it — epoch milliseconds — or 0.
+    private static func epochMilliseconds(_ raw: Any?) -> Int {
+        if let int = raw as? Int { return int }
+        if let double = raw as? Double, double.isFinite { return Int(double) }
+        if let number = raw as? NSNumber { return number.intValue }
+        return 0
     }
 
     // MARK: - Authentication
@@ -4626,6 +4946,10 @@ public final class JsBaoClient: @unchecked Sendable {
         // Cancel a pending refresh-retry (#2022) first, so no background
         // refresh starts while the rest of the teardown runs.
         authController.destroy()
+        // Every join still waiting is rejected and every membership forgotten:
+        // nothing may be re-presented by a client that is gone, and nothing
+        // queued may register on the way down (#3278).
+        destroyChannelSubscriptions()
         await disconnect()
         await documentManager.destroy()
         // Stop listening for app-lifecycle notifications and emit a final
@@ -5225,6 +5549,22 @@ public final class JsBaoClient: @unchecked Sendable {
         let roomId = json["roomId"] as? String ?? json["documentId"] as? String
 
         switch action {
+        case "error" where json["context"] as? String == "channel.subscribe":
+            // #3278 (JS #3184) — a refused channel subscribe is a scoped
+            // answer to one request, not a fault on the connection, so it
+            // settles that channel's pending join instead of being emitted as
+            // a connection error. The frame echoes the channel precisely so
+            // this can find the right one.
+            let channel = json["channel"] as? String ?? ""
+            logger.warn("Channel subscribe refused", "channel:", channel)
+            if !channel.isEmpty {
+                settleChannelSubscribe(channel, .failure(JsBaoError(
+                    code: .channelSubscribeFailed,
+                    message: "subscribeToChannel: \(json["message"] as? String ?? "the grant was not accepted")",
+                    details: ["channel": .string(channel)]
+                )))
+            }
+
         case "error":
             // Server-side rejection of something this client sent (bad frame,
             // permission failure, invalid message). JS surfaces it as
@@ -5594,6 +5934,56 @@ public final class JsBaoClient: @unchecked Sendable {
             logger.debug("[db-sub] ack received", action,
                          json["databaseId"] as? String ?? "",
                          json["subscriptionKey"] as? String ?? "")
+
+        case "channel.subscribed":
+            // The server's ack for one channel: it carries the membership's
+            // expiry, so store it on the held grant, then settle only that
+            // channel's waiting joins (#3278). An ack nothing waits on — a
+            // duplicate, or a channel this client never joined — updates the
+            // expiry it can and settles nothing.
+            guard let channel = json["channel"] as? String, !channel.isEmpty else { break }
+            let expiresAt = Self.epochMilliseconds(json["expiresAt"])
+            channelRegistry.updateExpiresAt(channel, expiresAt: expiresAt)
+            settleChannelSubscribe(channel, .success(expiresAt))
+
+        case "channel.unsubscribed":
+            // Nothing to settle: `unsubscribeFromChannel` has already dropped
+            // the registration, and the ack exists so a client CAN wait for it.
+            logger.debug("[channel] unsubscribed", json["channel"] as? String ?? "")
+
+        case "channel.message":
+            // A function published to a channel this client holds. Delivered to
+            // whoever listens, as JS does — the server is the membership
+            // authority, so a frame for a channel nobody holds here is inert
+            // rather than an error (#3278).
+            guard let channel = json["channel"] as? String,
+                  let functionKey = json["functionKey"] as? String else {
+                logger.debug("[channel] dropping malformed channel.message frame")
+                break
+            }
+            eventEmitter.emit(ChannelMessageEvent(
+                channel: channel,
+                payload: Self.framePayload(json["payload"]),
+                functionKey: functionKey,
+                sentAt: json["sentAt"] as? String ?? ""
+            ))
+
+        case "direct.message":
+            // A function sent straight to this user or connection
+            // (`ctx.users.send` / `ctx.connections.send`). Decode and emit,
+            // nothing else: no registry, no grant, no reconnect step (#3278;
+            // JS `handleDirectMessage`). A frame nobody is listening for is not
+            // an error, and a malformed one is logged and dropped rather than
+            // allowed to disturb the socket.
+            guard let functionKey = json["functionKey"] as? String else {
+                logger.debug("[directMessage] dropping malformed direct.message frame")
+                break
+            }
+            eventEmitter.emit(DirectMessageEvent(
+                payload: Self.framePayload(json["payload"]),
+                functionKey: functionKey,
+                sentAt: json["sentAt"] as? String ?? ""
+            ))
 
         default:
             logger.debug("Unhandled WS message:", action)
@@ -6327,6 +6717,11 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // The transport is back, so the next disconnection is a new event worth
         // reporting once per document (#2621).
         clearDisconnectedSyncSkipReports()
+        // Every held channel grant is presented again (#3278): the server-side
+        // membership was keyed by the connection that is gone. Before the
+        // document sweep, as in JS, so a listener is back on its channels as
+        // early as the socket allows; the sends are dispatched, not awaited.
+        resubscribeChannelsOnConnect()
         // Re-subscribe to all open documents — except the ones JS's connect
         // sweep skips too (`JsBaoClient.ts` `[CONNECT] Evaluating sync`):
         //
@@ -6407,6 +6802,9 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // to time out against, and the connect sweep re-syncs on the way back
         // up (#2664, C7 — JS `clearAllSyncWatchdogs` on ws-close).
         clearAllSyncWatchdogs()
+        // No channel ack is coming either: every join waiting for one is
+        // rejected, while its grant stays for the reconnect pass (#3278).
+        abortPendingChannelSubscribes(reason: "the connection closed")
 
         // Nothing open is synced across a dead transport, and none of the
         // remote peers are still there. Both mirror JS `handleWebSocketClose`
@@ -6644,4 +7042,20 @@ final class AuthFailureBox: @unchecked Sendable {
     }
 
     var value: AuthFailedEvent? { lock.withLock { _event } }
+}
+
+// MARK: - Channel control frames (#3278)
+
+/// `{type:"channel.subscribe", channel, grant}` — byte-identical to the JS
+/// client's frame.
+private struct ChannelSubscribeFrame: Encodable, Sendable {
+    let type = "channel.subscribe"
+    let channel: String
+    let grant: String
+}
+
+/// `{type:"channel.unsubscribe", channel}`.
+private struct ChannelUnsubscribeFrame: Encodable, Sendable {
+    let type = "channel.unsubscribe"
+    let channel: String
 }

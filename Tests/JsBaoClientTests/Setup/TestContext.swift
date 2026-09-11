@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import JsBaoClient
 
@@ -297,6 +298,69 @@ final class TestContext: @unchecked Sendable {
         )
 
         return workflowId
+    }
+
+    // MARK: - Server functions (#3278)
+
+    /// What `pushFunction` created: the function header and the config
+    /// version the bundle went into.
+    struct PushedFunction {
+        let functionId: String
+        let functionKey: String
+        let configId: String?
+    }
+
+    /// Push a server function through the admin family, the way the JS
+    /// `pushTestFunction` helper (`tests/helpers/server-function-helper.ts`)
+    /// does: `POST /admin/api/apps/{appId}/functions` creates the header, then
+    /// `POST .../functions/{id}/configs` pushes one config version carrying
+    /// the base64 TOML, sources and bundle plus the bundle's SHA-256
+    /// `contentHash`. `bundle` is ESM whose default export is the handler.
+    ///
+    /// `durable: true` makes it a task function (`mode = "task"`); the default
+    /// is a request function. `inputSchema` / `outputSchema` are the JSON
+    /// schemas the server validates against, when the case is about them.
+    @discardableResult
+    func pushFunction(
+        appId: String,
+        functionKey: String,
+        bundle: String,
+        access: String = "true",
+        durable: Bool = false,
+        inputSchema: [String: Any]? = nil,
+        outputSchema: [String: Any]? = nil
+    ) async throws -> PushedFunction {
+        let base = "/admin/api/apps/\(appId)/functions"
+        var header: [String: Any] = [
+            "functionKey": functionKey,
+            "access": access,
+        ]
+        if let inputSchema { header["inputSchema"] = inputSchema }
+        if let outputSchema { header["outputSchema"] = outputSchema }
+        let created = try await adminPost(base, body: header)
+        guard let functionId = created["functionId"] as? String else {
+            throw TestSetupError("Failed to create function \(functionKey): \(created)")
+        }
+
+        let entry = "functions/\(functionKey).ts"
+        let toml = "[function]\nkey = \"\(functionKey)\"\n"
+        let bundleData = Data(bundle.utf8)
+        let contentHash = SHA256.hash(data: bundleData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let pushed = try await adminPost("\(base)/\(functionId)/configs", body: [
+            "entry": entry,
+            "toml": Data(toml.utf8).base64EncodedString(),
+            "sources": [["path": entry, "content": bundleData.base64EncodedString()]],
+            "bundle": bundleData.base64EncodedString(),
+            "contentHash": contentHash,
+            "durable": durable,
+        ])
+        return PushedFunction(
+            functionId: functionId,
+            functionKey: functionKey,
+            configId: pushed["configId"] as? String
+        )
     }
 
     // MARK: - App settings

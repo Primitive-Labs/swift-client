@@ -223,7 +223,7 @@ final class AuthParityIssue2657HermeticTests: XCTestCase {
         )
         controller.updateToken(first)
 
-        let events = try await collectEvents(from: emitter, event: AuthSuccessEvent.self) {
+        let events = await collectEvents(from: emitter, event: AuthSuccessEvent.self) {
             let outcome = await controller.refreshAccessToken(cause: "test")
             XCTAssertEqual(outcome, .success)
         }
@@ -238,7 +238,7 @@ final class AuthParityIssue2657HermeticTests: XCTestCase {
         let emitter = EventEmitter()
         let controller = makeController(emitter: emitter)
 
-        let events = try await collectEvents(from: emitter, event: AuthSuccessEvent.self) {
+        let events = await collectEvents(from: emitter, event: AuthSuccessEvent.self) {
             controller.updateToken(makeTestJwt(userId: "manual-uid"))
         }
 

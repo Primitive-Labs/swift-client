@@ -311,6 +311,17 @@ final class TransportSpineTests: XCTestCase {
         let exact = "9007199254740993"
         let started = #"{"runId":"r","runKey":"k","status":"queued"}"#
 
+        // 2^53+1: the smallest integer a `Double` cannot hold, which is the
+        // whole point of the lossy half of this test. Written as a `Double`
+        // literal the compiler warns that it "becomes 9007199254740992" — the
+        // rounding is deliberate here, so the conversion is made explicit and
+        // pinned instead of being spelled as a literal that warns (#3314).
+        let lossyId = Double(Int64(9_007_199_254_740_993))
+        XCTAssertEqual(
+            String(format: "%.0f", lossyId), "9007199254740992",
+            "a `Double` rounds 2^53+1 down; if it stops doing so, this test's premise is gone"
+        )
+
         let positional = ScriptedTransport(json: started)
         _ = try await WorkflowsAPI(transport: positional).start(
             workflowKey: "k",
@@ -330,7 +341,7 @@ final class TransportSpineTests: XCTestCase {
             StartWorkflowOptions(
                 workflowKey: "k",
                 input: ["a": .number(1)],
-                meta: ["id": .number(9_007_199_254_740_993)]
+                meta: ["id": .number(lossyId)]
             )
         )
         let optionsBody = String(
@@ -557,6 +568,18 @@ final class TransportSpineTests: XCTestCase {
             // set is net zero on this commit: `JsBaoClient.swift` gave one back
             // (22 -> 21) below.
             "API/WorkflowsAPI.swift": (11, 2, 0),
+            // #3278 — `client.functions`, the same one deliberate surface as
+            // `WorkflowsAPI`: the untyped `invoke` / `start` take
+            // `input: [String: Any]` and every form takes `meta: [String: Any]?`,
+            // both the opaque `rootInput` / `meta` graphs the server does not
+            // introspect, composed straight to request bytes by the one
+            // `JSONSerialization` call in `post` so an `Int64` past 2^53 stays
+            // exact. The eleven sites are the two untyped entry points (input
+            // + meta each), the `meta` of the two typed overloads and of the two
+            // private body composers, the two `payload` locals, and the
+            // `payload` parameter of `post`. Declared in the plan's
+            // typed-surface statement as its any-exception.
+            "API/FunctionsAPI.swift": (11, 1, 0),
             // JWT payload parsing (the serialization boundary the design
             // sanctions). Every HTTP response `AuthController` reads is typed.
             // Phase E (#1994) took it 12 -> 4: the eight event payloads emitted

@@ -130,6 +130,17 @@ public enum JsBaoEvent: String, Sendable {
     /// event; fetch older rows via `client.notifications.list()`.
     case notification
     case workflowStatus
+    /// A message a server function published to a channel this client joined
+    /// (#3278). Payload: `ChannelMessageEvent`. Mirrors JS `channelMessage`.
+    case channelMessage
+    /// A channel subscribe the server refused when nothing was waiting on it
+    /// — the reconnect re-issue of an expired grant (#3278). Payload:
+    /// `ChannelSubscribeFailedEvent`. Mirrors JS `channelSubscribeFailed`.
+    case channelSubscribeFailed
+    /// A message a server function sent straight to this user or connection
+    /// with `ctx.users.send` / `ctx.connections.send` (#3278). Payload:
+    /// `DirectMessageEvent`. Mirrors JS `directMessage`.
+    case directMessage
     case documentMetadataChanged
     case pendingCreateFailed
     case authRefreshDeferred = "auth-refresh-deferred"
@@ -604,6 +615,72 @@ public struct NotificationEvent: Sendable, Equatable {
         self.deepLink = deepLink
         self.sourceRef = sourceRef
         self.createdAt = createdAt
+    }
+}
+
+/// Payload of `.directMessage`: a frame a server function sent straight to
+/// this user or this connection (`ctx.users.send` / `ctx.connections.send`).
+/// Mirrors the JS `DirectMessageEvent` (`src/client/JsBaoClient.ts`).
+///
+/// A LIVE frame with no durable record behind it: a client that was offline
+/// when the function ran does not receive it later. `functionKey` is the
+/// frame's only attribution — a function running in system mode acts for
+/// nobody, so there is no user to name. No subscription is involved: the
+/// frame arrives on the app socket and needs no grant. `payload` is the
+/// function's own value, passed through unread; `nil` when absent or JSON
+/// `null`.
+public struct DirectMessageEvent: Sendable, Equatable {
+    public let payload: JSONValue?
+    public let functionKey: String
+    /// When the platform sent it, ISO 8601.
+    public let sentAt: String
+
+    public init(payload: JSONValue?, functionKey: String, sentAt: String) {
+        self.payload = payload
+        self.functionKey = functionKey
+        self.sentAt = sentAt
+    }
+}
+
+/// Payload of `.channelMessage`: a message a server function published to a
+/// channel this client holds a live membership in — `channel` says which.
+/// Mirrors the JS `ChannelMessageEvent`. Like `DirectMessageEvent` it is a
+/// live frame with no durable record behind it, and `functionKey` is its
+/// only attribution.
+public struct ChannelMessageEvent: Sendable, Equatable {
+    public let channel: String
+    public let payload: JSONValue?
+    public let functionKey: String
+    /// When the platform sent it, ISO 8601.
+    public let sentAt: String
+
+    public init(channel: String, payload: JSONValue?, functionKey: String, sentAt: String) {
+        self.channel = channel
+        self.payload = payload
+        self.functionKey = functionKey
+        self.sentAt = sentAt
+    }
+}
+
+/// Payload of `.channelSubscribeFailed`: a channel subscribe the server
+/// refused when nothing was waiting on it. Mirrors the JS
+/// `ChannelSubscribeFailedEvent`.
+///
+/// The case this exists for is RECONNECT: after the socket comes back the
+/// client presents each held grant again, and a grant that expired while the
+/// connection was down is refused with no pending call to reject. The
+/// registration for that channel — and only that channel — is dropped, and
+/// this is how an app hears about it, so it can ask its authorizing function
+/// for a fresh grant and subscribe again. A refusal that answers a
+/// `subscribeToChannel` call throws from that call instead, so a failure is
+/// never announced twice. `message` is the server's uniform refusal.
+public struct ChannelSubscribeFailedEvent: Sendable, Equatable {
+    public let channel: String
+    public let message: String
+
+    public init(channel: String, message: String) {
+        self.channel = channel
+        self.message = message
     }
 }
 

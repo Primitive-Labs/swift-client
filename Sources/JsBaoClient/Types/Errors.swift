@@ -48,6 +48,18 @@ public enum JsBaoErrorCode: String, Sendable {
     /// it is waiting for. Mirrors JS `waitForAvailability`'s
     /// `NETWORK_REQUIRES_AUTOSTART` (#2667, parity C8).
     case networkRequiresAutostart = "NETWORK_REQUIRES_AUTOSTART"
+    /// `functions.invoke` was called on a task function (the server answered
+    /// a start envelope) or `functions.start` on a request function (the
+    /// server answered a result). Mirrors the JS client's
+    /// `FUNCTION_MODE_MISMATCH` (#3278). `details` carry `functionKey` plus
+    /// `runId` (the run was started) or `status` (the function ran).
+    case functionModeMismatch = "FUNCTION_MODE_MISMATCH"
+    /// `subscribeToChannel` did not get its channel's ack: the server's
+    /// uniform refusal, the 20 s ack timeout, the channel was left while the
+    /// join was in flight, or the socket closed while joining (#3278).
+    /// `details` carry `channel`; the message is the server's refusal text
+    /// when there was one.
+    case channelSubscribeFailed = "CHANNEL_SUBSCRIBE_FAILED"
 }
 
 /// Main error type for the JsBao client library
