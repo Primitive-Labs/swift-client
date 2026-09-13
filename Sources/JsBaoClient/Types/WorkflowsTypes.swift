@@ -167,6 +167,112 @@ public struct StartWorkflowResult: Decodable, Sendable, Equatable {
     }
 }
 
+// MARK: Task slice record
+
+/// The task slice's record on a function run (#3381). Mirrors the JS client's
+/// `WorkflowStatusResult.slice?` field for field.
+///
+/// A task run executes as a series of SLICES: the engine runs the handler until
+/// it returns or hibernates, and each wake is a new slice with its own
+/// credential. `refreshCount` is how many times that credential was refreshed
+/// through the gateway instead of yielding, and `ceilingAt` is the 12-hour bound
+/// on THIS slice, measured from its own start — a run that hibernates and wakes
+/// continues in another slice, with a fresh ceiling. It is the same block
+/// `primitive functions runs` prints as its `REFRESHES` column.
+///
+/// ADDITIVE, and present only for a task run that HAS a record: a request
+/// invocation and a DSL workflow run carry no `slice` key at all, and read
+/// `nil` here. Timestamps are epoch milliseconds (what the route sends), not
+/// the ISO-8601 strings a run record carries — the slice record is the
+/// platform's own bookkeeping, and the client passes its numbers through
+/// verbatim rather than reformatting them.
+public struct WorkflowSliceInfo: Decodable, Sendable, Equatable {
+    /// Id of the slice record. The one field the server always fills.
+    public let sliceId: String
+    /// When this slice started, epoch ms. `nil` when the record does not
+    /// carry it.
+    public let startedAt: Int?
+    /// The 12-hour bound THIS slice ends at, epoch ms — `startedAt` plus the
+    /// slice maximum, not a deadline for the run, which can continue in a
+    /// later slice with a ceiling of its own.
+    public let ceilingAt: Int?
+    /// When THIS slice settled, epoch ms; `nil` while the slice is open. A
+    /// settled slice is not a finished run: a slice that yielded settles here
+    /// and the run continues in the next slice, so a caller watching a run
+    /// still reads `status`, never this field.
+    public let settledAt: Int?
+    /// How THIS slice settled (`"completed"`, `"failed"`, `"cpu-yield"`, …);
+    /// `nil` while the slice is open. `"cpu-yield"` is the slice that gave up
+    /// its CPU budget for the run to carry on in another one. A plain
+    /// `String` for the same reason every other status on this surface is
+    /// one: a server-added spelling must never turn a status read into a
+    /// decode failure.
+    public let settledStatus: String?
+    /// When the credential was last refreshed, epoch ms; `nil` for a slice
+    /// that never refreshed.
+    public let lastRefreshAt: Int?
+    /// How many times the credential was refreshed through the gateway
+    /// instead of yielding. `0` for a run short enough never to need one.
+    public let refreshCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case sliceId, startedAt, ceilingAt, settledAt, settledStatus
+        case lastRefreshAt, refreshCount
+    }
+
+    public init(
+        sliceId: String,
+        startedAt: Int? = nil,
+        ceilingAt: Int? = nil,
+        settledAt: Int? = nil,
+        settledStatus: String? = nil,
+        lastRefreshAt: Int? = nil,
+        refreshCount: Int = 0
+    ) {
+        self.sliceId = sliceId
+        self.startedAt = startedAt
+        self.ceilingAt = ceilingAt
+        self.settledAt = settledAt
+        self.settledStatus = settledStatus
+        self.lastRefreshAt = lastRefreshAt
+        self.refreshCount = refreshCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // `sliceId` is what makes this a record: a block without one is not a
+        // slice, and throwing here is what the status decode reads as "no
+        // record" (see `WorkflowStatusResult.slice`).
+        sliceId = try c.decode(String.self, forKey: .sliceId)
+        startedAt = try Self.epochMillis(c, .startedAt)
+        ceilingAt = try Self.epochMillis(c, .ceilingAt)
+        settledAt = try Self.epochMillis(c, .settledAt)
+        settledStatus = try c.decodeIfPresent(String.self, forKey: .settledStatus)
+        lastRefreshAt = try Self.epochMillis(c, .lastRefreshAt)
+        // Absent and `null` alike read 0 — the server always sends the count,
+        // so this is tolerance for a payload that predates it. A value that is
+        // not a number THROWS, which drops the whole block: a fabricated `0`
+        // would read as "this run never refreshed", which is telemetry the
+        // client does not have.
+        refreshCount = try c.decodeIfPresent(Int.self, forKey: .refreshCount) ?? 0
+    }
+
+    /// One epoch-millisecond field: absent and `null` alike read `nil`, and a
+    /// number arrives as `Double` first so a non-integral value is taken
+    /// rather than refused. A value that is not a number throws, and the block
+    /// it belongs to is dropped rather than published with a hole in it.
+    private static func epochMillis(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        _ key: CodingKeys
+    ) throws -> Int? {
+        guard let raw = try container.decodeIfPresent(Double.self, forKey: key),
+              raw.isFinite else { return nil }
+        // `Int(exactly:)` rather than `Int(_:)`: a value outside `Int`'s range
+        // would TRAP, and no timestamp is worth crashing a status read for.
+        return Int(exactly: raw.rounded())
+    }
+}
+
 // MARK: Status / terminate
 
 /// Result of `getStatus` and `terminate`. Mirrors JS `WorkflowStatusResult`.
@@ -195,9 +301,14 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
     /// sends it next to the status and on the run record; either satisfies it.
     public let skipReason: String?
     public let run: WorkflowRunInfo?
+    /// #3381/#3388 — the run's task slice record, a sibling of `status` and
+    /// `run` on the wire. `nil` for a request invocation and for a DSL
+    /// workflow run, which carry no `slice` key. Same field, same seven
+    /// values, as the JS client's `WorkflowStatusResult.slice?`.
+    public let slice: WorkflowSliceInfo?
 
     private enum CodingKeys: String, CodingKey {
-        case status, output, error, run, skipReason
+        case status, output, error, run, skipReason, slice
     }
 
     /// The Cloudflare workflow status object the server nests under `status`:
@@ -220,13 +331,17 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         output: JSONValue?,
         error: String?,
         run: WorkflowRunInfo?,
-        skipReason: String? = nil
+        skipReason: String? = nil,
+        // Trailing with a default so every pre-#3388 memberwise call still
+        // compiles: the block is additive here exactly as it is on the wire.
+        slice: WorkflowSliceInfo? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.run = run
         self.skipReason = skipReason
+        self.slice = slice
     }
 
     public init(from decoder: Decoder) throws {
@@ -254,6 +369,12 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         let topLevelSkipReason = try c.decodeIfPresent(
             String.self, forKey: .skipReason)
         skipReason = nestedSkipReason ?? topLevelSkipReason ?? run?.skipReason
+        // #3388 — the slice block is OBSERVABILITY, never the answer: a block
+        // whose shape surprises this client is dropped rather than turned into
+        // a failed status read, the same reading the server takes when it
+        // cannot read the record (`readSliceBlock` returns null instead of
+        // 500ing the route).
+        slice = (try? c.decodeIfPresent(WorkflowSliceInfo.self, forKey: .slice)) ?? nil
     }
 }
 
@@ -552,19 +673,24 @@ public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
     /// (next to the status, or on the run record).
     public let skipReason: String?
     public let run: WorkflowRunInfo?
+    /// #3388 — the run's task slice record, forwarded from the untyped result.
+    /// Typing the `output` blob must not cost a caller the block beside it.
+    public let slice: WorkflowSliceInfo?
 
     public init(
         status: String,
         output: Output?,
         error: String?,
         run: WorkflowRunInfo?,
-        skipReason: String? = nil
+        skipReason: String? = nil,
+        slice: WorkflowSliceInfo? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.run = run
         self.skipReason = skipReason
+        self.slice = slice
     }
 }
 

@@ -217,6 +217,35 @@ public final class JsBaoClient: @unchecked Sendable {
     var syncRetryInitial: TimeInterval = 2
     var syncRetryMax: TimeInterval = 15
 
+    /// Documents whose failing sync has been reported to the app as a
+    /// `.documentSyncStateChanged` "error" (#3390). Kept so the matching
+    /// "synced" recovery is emitted only for a document the app was actually
+    /// warned about. Guarded by `lock`.
+    private var syncErrorReported: Set<String> = []
+    /// Documents whose current cycle's `syncStep2` carried an `updateUrl` that
+    /// could not be downloaded (#3390). The frame still counts as received
+    /// for the stale-state check, but no server state reached the document,
+    /// so the `syncComplete` that ends the cycle is not reported to the app as
+    /// the recovery. Cleared when the next cycle's `syncStep1` goes out.
+    /// Guarded by `lock`.
+    private var syncStep2PayloadFailedFor: Set<String> = []
+
+    /// Consecutive handshake-budget timeouts per document, cleared when a cycle
+    /// completes or the document closes (#3390). Guarded by `lock`.
+    private var syncTimeoutStreak: [String: Int] = [:]
+    /// Documents whose stall has already asked for a fresh socket. It outlives
+    /// the reconnect it triggers — only a completed sync or a close clears it —
+    /// so one stalled document rebuilds the connection once rather than every
+    /// few budgets (#3390). Guarded by `lock`.
+    private var syncStallReconnectRequested: Set<String> = []
+    /// Whether the current connection has already been rebuilt for a stalled
+    /// document. Reset on connect, so a burst of stalled documents costs one
+    /// reconnect between them. Guarded by `lock`.
+    private var syncStallReconnectOnThisConnection = false
+    /// Consecutive handshake-budget timeouts on a live socket before the client
+    /// stops trusting the connection and rebuilds it (#3390).
+    private static let syncStallReconnectAfterTimeouts = 3
+
     // MARK: Stale local state recovery (#2664, C14)
 
     /// Documents that have received a `syncStep2` / `update` frame since their
@@ -3133,7 +3162,10 @@ public final class JsBaoClient: @unchecked Sendable {
             outboundFlushOwner.removeValue(forKey: documentId)
             outboundReflushRequested.remove(documentId)
             syncStep2ReceivedFor.remove(documentId)
+            syncStep2PayloadFailedFor.remove(documentId)
             suspectedStaleDocs.remove(documentId)
+            // A document nobody holds has no sync error left to clear (#3390).
+            syncErrorReported.remove(documentId)
         }
         documentManager.removeOpenDoc(documentId)
     }
@@ -3318,7 +3350,10 @@ public final class JsBaoClient: @unchecked Sendable {
             // drain pass.
             outboundReflushRequested.remove(documentId)
             syncStep2ReceivedFor.remove(documentId)
+            syncStep2PayloadFailedFor.remove(documentId)
             suspectedStaleDocs.remove(documentId)
+            // A closed document has no sync error left to clear (#3390).
+            syncErrorReported.remove(documentId)
         }
 
         // Nothing may keep re-syncing a document the caller closed (#2664, C7).
@@ -3678,7 +3713,10 @@ public final class JsBaoClient: @unchecked Sendable {
         // A new cycle: whatever the previous one delivered no longer counts
         // towards this one's "did the server send anything?" question
         // (#2664, C14 — JS clears `syncStep2ReceivedFor` on the same path).
-        lock.withLock { _ = syncStep2ReceivedFor.remove(documentId) }
+        lock.withLock {
+            _ = syncStep2ReceivedFor.remove(documentId)
+            _ = syncStep2PayloadFailedFor.remove(documentId)
+        }
 
         // Arm the watchdog BEFORE the send, not after it returns: `send` is a
         // suspension point, and a fast server can answer while it is suspended.
@@ -3695,7 +3733,13 @@ public final class JsBaoClient: @unchecked Sendable {
             logger.warn("Failed to send syncStep1 for", documentId, error.localizedDescription)
             // No frame went out, so no syncComplete will release the claim.
             documentManager.completePendingSyncOperation(documentId)
-            clearSyncWatchdog(documentId)
+            // Drop the timer this cycle armed — there is nothing for it to time
+            // out against — but keep the backoff and re-drive the document
+            // (#3390). Clearing the whole watchdog here left an open document
+            // unsynced with no timer, no retry and nothing else scheduled to
+            // try again: the stall the issue reports.
+            lock.withLock { syncWatchdogTimers.removeValue(forKey: documentId)?.cancel() }
+            scheduleSyncRetry(documentId)
         }
     }
 
@@ -3734,6 +3778,10 @@ public final class JsBaoClient: @unchecked Sendable {
             syncWatchdogTimers.removeValue(forKey: documentId)?.cancel()
             syncRetryTimers.removeValue(forKey: documentId)?.cancel()
             syncRetryBackoff.removeValue(forKey: documentId)
+            // The stall is over (the cycle completed, or the document closed),
+            // so both stall claims start fresh for the next one (#3390).
+            syncTimeoutStreak.removeValue(forKey: documentId)
+            syncStallReconnectRequested.remove(documentId)
         }
     }
 
@@ -3747,33 +3795,134 @@ public final class JsBaoClient: @unchecked Sendable {
             syncRetryTimers.values.forEach { $0.cancel() }
             syncRetryTimers.removeAll()
             syncRetryBackoff.removeAll()
+            // No cycle is in flight to time out, so no document is carrying a
+            // streak. `syncStallReconnectRequested` is deliberately kept: a
+            // document that asked for this reconnect must not ask for another
+            // one as soon as it has counted up again on the new socket (#3390).
+            syncTimeoutStreak.removeAll()
         }
     }
 
     /// A `syncStep1` went unanswered for the whole handshake budget. Release the
-    /// claim it holds, report the document as unsynced, and re-send after the
-    /// current backoff — then double it, capped. Mirrors JS
-    /// `handleSyncWatchdogTimeout`.
+    /// claim it holds, report the document as unsynced, tell the app, and
+    /// re-send after the current backoff. Follows JS `handleSyncWatchdogTimeout`,
+    /// which #3390 gave the same three additions — a retry chain that re-arms,
+    /// a sync-state error for the app, and a rebuilt socket after repeated
+    /// timeouts — each documented on the three methods below.
     private func handleSyncWatchdogTimeout(_ documentId: String) async {
-        let delay: TimeInterval? = lock.withLock {
+        let streak: Int? = lock.withLock {
             syncWatchdogTimers.removeValue(forKey: documentId)
             guard !isDestroyed else { return nil }
-            let current = syncRetryBackoff[documentId] ?? syncRetryInitial
-            syncRetryBackoff[documentId] = min(current * 2, syncRetryMax)
+            // The timeout owns the next re-send, so a retry an earlier round
+            // armed gives way to the one scheduled below.
             syncRetryTimers.removeValue(forKey: documentId)?.cancel()
-            return current
+            let next = (syncTimeoutStreak[documentId] ?? 0) + 1
+            syncTimeoutStreak[documentId] = next
+            return next
         }
-        guard let delay else { return }
+        guard let streak else { return }
 
         logger.warn(
             "No syncComplete within the handshake budget; re-syncing", documentId
         )
         documentManager.completePendingSyncOperation(documentId)
         documentManager.markUnsynced(documentId)
+        reportSyncError(documentId)
 
-        // Recorded under the same lock hold that creates it, so the retry cannot
-        // remove its own entry before that entry exists.
+        scheduleSyncRetry(documentId)
+
+        if streak >= Self.syncStallReconnectAfterTimeouts {
+            await rebuildConnectionForStalledSync(documentId)
+        }
+    }
+
+    /// Rebuild the socket for a document that has missed the handshake budget
+    /// several times in a row while the transport still reads as open (#3390).
+    ///
+    /// Retrying is only recovery while the connection still carries answers.
+    /// A half-open socket reads as open from here — every `syncStep1` goes
+    /// out, nothing comes back — and no amount of re-sending converges on it.
+    /// So the client builds a new socket itself; the reconnect's document
+    /// sweep re-syncs everything open.
+    ///
+    /// This is NOT what recovered the field report, and could not have been:
+    /// the client keeps one `connectionId` for the life of the process, and
+    /// the stall there was a server-side sync-in-progress marker keyed on
+    /// that id, which a new socket carries along — only a process restart
+    /// (a new id) ended it. That marker, and the broadcast mapping a
+    /// reconnect lost, are fixed on the server (#3390). The rebuild stays for
+    /// the transport failure it does address.
+    ///
+    /// Bounded on purpose. One document rebuilds the connection once — the
+    /// claim outlives the reconnect and is only dropped when the document
+    /// finally syncs or closes — and one connection is rebuilt once however
+    /// many documents are stalled on it. A document that still cannot sync on
+    /// the fresh socket is left to the retry chain rather than reconnected in a
+    /// loop.
+    private func rebuildConnectionForStalledSync(_ documentId: String) async {
+        // Nothing to rebuild on a transport that is already down: the reconnect
+        // path owns that case and its sweep re-syncs on the way back up.
+        guard wsManager.isSocketOpen else { return }
+        let shouldRebuild: Bool = lock.withLock {
+            guard !isDestroyed, !syncStallReconnectOnThisConnection else { return false }
+            guard syncStallReconnectRequested.insert(documentId).inserted else { return false }
+            syncStallReconnectOnThisConnection = true
+            return true
+        }
+        guard shouldRebuild else { return }
+
+        logger.warn(
+            "Repeated handshake-budget timeouts on a live socket; rebuilding the connection for",
+            documentId
+        )
+        await wsManager.forceReconnect()
+    }
+
+    /// Tell the app that a document's sync is failing (#3390).
+    ///
+    /// Before this the timeout only logged, so an app had no way to know that
+    /// what it was rendering had stopped converging — the session just looked
+    /// like a hung peer. The client keeps retrying underneath; this is what
+    /// lets the app say so meanwhile. Emitted on every timeout: the retry
+    /// cadence backs off to `syncRetryMax`, so it is a slow repeat of "still
+    /// not synced" rather than a flood.
+    private func reportSyncError(_ documentId: String) {
+        lock.withLock { _ = syncErrorReported.insert(documentId) }
+        eventEmitter.emit(DocumentSyncStateChangedEvent(documentId: documentId, state: "error"))
+    }
+
+    /// A document the app was warned about has synced. Report the recovery once
+    /// so the app can clear the error it surfaced (#3390).
+    private func reportSyncRecovered(_ documentId: String) {
+        let wasReported = lock.withLock { syncErrorReported.remove(documentId) != nil }
+        guard wasReported else { return }
+        eventEmitter.emit(DocumentSyncStateChangedEvent(documentId: documentId, state: "synced"))
+    }
+
+    /// Arm the next `syncStep1` for a document whose cycle did not complete,
+    /// after the current backoff — then double it, capped.
+    ///
+    /// The retry keeps the chain alive (#3390). `startNetworkSync` returns
+    /// without arming anything whenever it cannot start a cycle: the transport
+    /// is down, a claim from an earlier cycle is still held, the document has
+    /// no state vector to send, or the send itself throws. Before this both
+    /// clients scheduled exactly one retry, so an attempt that hit any of those
+    /// left the document unsynced with no timer and no pending retry — nothing
+    /// to re-drive it short of a reconnect, a remote update, an explicit
+    /// `startNetworkSync` or a process restart. Here the
+    /// retry checks whether its attempt actually put a cycle in flight and
+    /// re-arms itself when it did not, so an open document keeps trying at the
+    /// capped backoff until it syncs.
+    ///
+    /// Idempotent: a retry already armed for the document wins, so the
+    /// re-arm and a concurrent watchdog timeout cannot stack two chains.
+    private func scheduleSyncRetry(_ documentId: String) {
+        // The timer is created inside the same lock hold that records it, so
+        // the retry cannot remove its own entry before that entry exists.
         lock.withLock {
+            guard !isDestroyed, syncRetryTimers[documentId] == nil else { return }
+            let delay = syncRetryBackoff[documentId] ?? syncRetryInitial
+            syncRetryBackoff[documentId] = min(delay * 2, syncRetryMax)
             syncRetryTimers[documentId] = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
                 if Task.isCancelled { return }
@@ -3789,6 +3938,15 @@ public final class JsBaoClient: @unchecked Sendable {
                 // cycle, not the caller taking over a `manual` document's
                 // timing.
                 await self.startNetworkSync(documentId: documentId, explicit: false)
+                // A watchdog armed for this document is the evidence that a
+                // cycle did go out; its own timeout then owns the next round.
+                // Without one, and with the document still open and unsynced,
+                // this attempt produced nothing and the chain has to re-arm.
+                let armed = self.lock.withLock { self.syncWatchdogTimers[documentId] != nil }
+                guard !armed,
+                      self.documentManager.isOpen(documentId),
+                      !self.documentManager.isSynced(documentId) else { return }
+                self.scheduleSyncRetry(documentId)
             }
         }
     }
@@ -3832,7 +3990,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// server state, and recover when it did not for a document that claimed to
     /// hold local data. Mirrors the `receivedSyncStep2` branch of JS's
     /// `syncComplete` handler.
-    private func handleSyncCompleteStaleCheck(_ documentId: String) {
+    ///
+    /// Returns whether a reset was scheduled — a completion that needs another
+    /// sync has not left the document with server state, and the caller must
+    /// not report it to the app as a recovery (#3390).
+    @discardableResult
+    private func handleSyncCompleteStaleCheck(_ documentId: String) -> Bool {
         let shouldReset: Bool = lock.withLock {
             let receivedSyncStep2 = syncStep2ReceivedFor.remove(documentId) != nil
             if receivedSyncStep2 {
@@ -3843,7 +4006,7 @@ public final class JsBaoClient: @unchecked Sendable {
             guard suspectedStaleDocs.remove(documentId) != nil else { return false }
             return staleResetInProgress.insert(documentId).inserted
         }
-        guard shouldReset else { return }
+        guard shouldReset else { return false }
 
         logger.warn(
             "syncComplete carried no server state for a document claiming local data; "
@@ -3863,6 +4026,7 @@ public final class JsBaoClient: @unchecked Sendable {
             // full document.
             await self.startNetworkSync(documentId: documentId, explicit: false)
         }
+        return true
     }
 
     /// Record a syncStep1 skipped because the transport is down, and answer
@@ -4921,7 +5085,11 @@ public final class JsBaoClient: @unchecked Sendable {
             syncRetryTimers.removeAll()
             syncRetryBackoff.removeAll()
             syncStep2ReceivedFor.removeAll()
+            syncStep2PayloadFailedFor.removeAll()
             suspectedStaleDocs.removeAll()
+            syncErrorReported.removeAll()
+            syncTimeoutStreak.removeAll()
+            syncStallReconnectRequested.removeAll()
             // Release every flush-ownership entry (#2105) so teardown can't
             // leave a document wedged for a client that outlives it. Running
             // flushes see their token revoked and exit on their next check.
@@ -5647,6 +5815,11 @@ public final class JsBaoClient: @unchecked Sendable {
                 // syncComplete isn't handled until the full state is applied.
                 if let data = await downloadRemoteUpdate(from: updateUrl, documentId: roomId) {
                     documentManager.handleRemoteUpdate(documentId: roomId, updateData: data)
+                } else {
+                    // The frame was received but its state never reached the
+                    // document, so the syncComplete that ends this cycle must
+                    // not be reported to the app as the recovery (#3390).
+                    lock.withLock { _ = syncStep2PayloadFailedFor.insert(roomId) }
                 }
             } else {
                 // JS parity: "No update and no updateUrl — nothing reached
@@ -5664,7 +5837,7 @@ public final class JsBaoClient: @unchecked Sendable {
             // event has to be able to see that a reset is in flight and keep
             // waiting rather than return the still-empty document. JS orders
             // the two the same way.
-            handleSyncCompleteStaleCheck(roomId)
+            let staleResetScheduled = handleSyncCompleteStaleCheck(roomId)
             // The frame's `synced` field is optional and absent on the happy
             // path, so only an explicit `false` means the round-trip did not
             // leave the document in sync. JS resolves it identically
@@ -5672,6 +5845,29 @@ public final class JsBaoClient: @unchecked Sendable {
             let syncedVerdict = (json["synced"] as? Bool) != false
             documentManager.handleSyncComplete(documentId: roomId, synced: syncedVerdict)
             reconcileUnsyncedAfterSync(documentId: roomId, synced: syncedVerdict)
+            // The document converged after the app was told its sync was
+            // failing, so the app hears that it can drop the warning (#3390).
+            // Not when this completion is the stale-state case: the document
+            // is about to be reset and re-synced and still has no server
+            // state, so the error it was warned about stands until the re-sync
+            // completes for real. Nor when the cycle's syncStep2 carried an
+            // `updateUrl` whose download failed: the frame counted as received
+            // above, but no server state reached the document, so the app
+            // would be told to clear its warning over a document still stale.
+            // The error stands and a later cycle that applies reports it. The
+            // flag is read, not consumed: the server closes one cycle with
+            // more than one syncComplete (another follows the client's answer
+            // to the server's own syncStep1), and every one of them belongs to
+            // the cycle whose payload failed. The next syncStep1 clears it.
+            let payloadFailed = lock.withLock { syncStep2PayloadFailedFor.contains(roomId) }
+            if payloadFailed {
+                logger.warn(
+                    "syncComplete after a syncStep2 payload that did not apply; not reporting recovery",
+                    roomId
+                )
+            } else if syncedVerdict, !staleResetScheduled {
+                reportSyncRecovered(roomId)
+            }
 
         case "stateVectorCheckResponse":
             // Server's verdict for a `checkStateVector` round-trip. The
@@ -6710,6 +6906,9 @@ extension JsBaoClient: WebSocketManagerDelegate {
     func webSocketManagerOnConnected() {
         logger.log("WebSocket connected")
         wsAuthRecovery.noteConnected()
+        // A fresh socket gets a fresh claim: whatever a stalled document spent
+        // on the previous connection says nothing about this one (#3390).
+        lock.withLock { syncStallReconnectOnThisConnection = false }
         // A new connection gets a fresh mid-connection auth budget (#2660):
         // this socket's token was accepted in the handshake, so whatever the
         // previous one spent says nothing about this one.

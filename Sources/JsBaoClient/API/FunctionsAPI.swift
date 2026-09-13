@@ -63,40 +63,28 @@ public final class FunctionsAPI: @unchecked Sendable {
 
     // MARK: - invoke (request functions)
 
-    /// Invoke a request function and wait for its result.
+    /// Invoke a request function and wait for its result: an `Encodable`
+    /// input, `output` decoded into `Output`.
+    ///
+    /// This is the ONLY way in, and the binding surface the generated per-key
+    /// Swift types use. #3278 shipped an untyped `[String: Any]` twin beside
+    /// it because no per-key types existed yet to express an invocation with;
+    /// #3344 generated them, and the twin went with the reason for it. A
+    /// caller whose function has no declared schema — or who is genuinely
+    /// dynamic — names the witness: `invoke(key, input: nil as JSONValue?)`
+    /// bound `as FunctionResult<JSONValue>`.
     ///
     /// `input` is named for what it is on this side of the wire; it travels
-    /// as the envelope's `rootInput`. It stays `[String: Any]` and is
-    /// serialized directly, so an `Int64` past 2^53 reaches the wire exactly
-    /// (the `workflows.start` rule); `[:]` sends `rootInput: {}`. `timeout` is
-    /// seconds here and `timeoutMs` on the wire — the platform default is 5 s
-    /// and the ceiling 30 s; nil, zero or negative omits it. `meta` is passed
-    /// through unvalidated; the server's 1 KB limit is its `400 INVALID_META`.
+    /// as the envelope's `rootInput`. `timeout` is seconds here and
+    /// `timeoutMs` on the wire — the platform default is 5 s and the ceiling
+    /// 30 s; nil, zero or negative omits it. `meta` is passed through
+    /// unvalidated; the server's 1 KB limit is its `400 INVALID_META`.
     ///
     /// A settled invocation never throws, whatever its `status`. A platform
     /// refusal (access, disabled, unpushed, rate, unknown key) throws an
     /// `HttpError` with the server's `errorCode` on `serverCode`. Calling this
     /// on a TASK function throws `.functionModeMismatch` — the server answered
     /// a start envelope, which promises none of what this method's type does.
-    public func invoke(
-        _ functionKey: String,
-        input: [String: Any] = [:],
-        contextDocId: String? = nil,
-        meta: [String: Any]? = nil,
-        timeout: TimeInterval? = nil
-    ) async throws -> FunctionInvokeResult {
-        try await invokeRequest(
-            functionKey: functionKey,
-            rootInput: input,
-            contextDocId: contextDocId,
-            meta: meta,
-            timeout: timeout
-        )
-    }
-
-    /// Typed `invoke`: an `Encodable` input, `output` decoded into `Output`.
-    /// The binding surface for generated per-key Swift types, in the shape the
-    /// workflow overloads use.
     ///
     /// The input is encoded once and sent as the JSON value it produces —
     /// object, array, string, number or boolean — unchanged, exactly as the JS
@@ -133,7 +121,10 @@ public final class FunctionsAPI: @unchecked Sendable {
 
     // MARK: - start (task functions)
 
-    /// Start a task function and get its run id back.
+    /// Start a task function and get its run id back: an `Encodable` input
+    /// sent as the JSON value it encodes to, under the same rules as `invoke`.
+    /// The start envelope is not output-typed on either client, so only the
+    /// input is generic here.
     ///
     /// Same route as `invoke`; the MODE decides what it answers. The run is
     /// polled on exactly the routes a DSL workflow run is (`getStatus`,
@@ -144,26 +135,10 @@ public final class FunctionsAPI: @unchecked Sendable {
     ///
     /// Calling this on a REQUEST function throws `.functionModeMismatch` — the
     /// function ran and answered its result, so there is no run to poll.
-    @discardableResult
-    public func start(
-        _ functionKey: String,
-        input: [String: Any] = [:],
-        runKey: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: Any]? = nil
-    ) async throws -> FunctionStartResult {
-        try await startRequest(
-            functionKey: functionKey,
-            rootInput: input,
-            runKey: runKey,
-            contextDocId: contextDocId,
-            meta: meta
-        )
-    }
-
-    /// Typed `start`: an `Encodable` input sent as the JSON value it encodes
-    /// to, under the same rules as the typed `invoke`. The start envelope is
-    /// not output-typed on either client, so only the input is generic here.
+    ///
+    /// As with `invoke`, the untyped `[String: Any]` twin #3278 shipped is
+    /// gone (#3344): call a generated `<Key>Function`, or name the witness
+    /// (`start(key, input: nil as JSONValue?)`) for a dynamic one.
     @discardableResult
     public func start<Input: Encodable>(
         _ functionKey: String,
@@ -187,6 +162,11 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// The current status of a function run, by run id. Same route and same
     /// flattened envelope as `workflows.getStatus` — a function run IS a run
     /// row. Throws `.invalidArgument` for an empty `runId`.
+    ///
+    /// A task run that has a slice record also carries `slice` (#3388): its
+    /// refresh count, the current slice's 12-hour ceiling and how the slice
+    /// settled. `nil` for a request invocation and for a DSL run — see
+    /// `WorkflowSliceInfo`.
     public func getStatus(runId: String) async throws -> WorkflowStatusResult {
         guard !runId.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "runId is required for functions.getStatus")
@@ -202,7 +182,11 @@ public final class FunctionsAPI: @unchecked Sendable {
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
             run: untyped.run,
-            skipReason: untyped.skipReason
+            skipReason: untyped.skipReason,
+            // #3388 — the task slice record, at parity with the JS client's
+            // `WorkflowStatusResult.slice?`. Typing the output must not cost
+            // a caller the refresh count or the ceiling beside it.
+            slice: untyped.slice
         )
     }
 

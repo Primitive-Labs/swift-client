@@ -308,8 +308,21 @@ final class WithLockUnusedResultHermeticTests: XCTestCase {
             from: "guard let message = documentManager.buildSyncStep1Message(documentId: documentId)",
             to: "scheduleSyncWatchdog(documentId)"
         )
+        // The reset may share its closure with other resets (#3390 added
+        // `syncStep2PayloadFailedFor` beside it), so the guard reads the
+        // statement's enclosing closure rather than one exact line: the
+        // discarded `remove` must appear after a `lock.withLock {` opener with
+        // no `}` between them.
+        let removeStatement = "_ = syncStep2ReceivedFor.remove(documentId)"
+        var underTheLock = false
+        if let removeRange = region.range(of: removeStatement) {
+            let before = region[..<removeRange.lowerBound]
+            if let opener = before.range(of: "lock.withLock {", options: .backwards) {
+                underTheLock = !before[opener.upperBound...].contains("}")
+            }
+        }
         XCTAssertTrue(
-            region.contains("lock.withLock { _ = syncStep2ReceivedFor.remove(documentId) }"),
+            underTheLock,
             """
             the new-cycle reset must still clear `syncStep2ReceivedFor` for the \
             document under the lock (#2664, C14), with the result discarded \

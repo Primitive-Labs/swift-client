@@ -339,7 +339,9 @@ public final class WorkflowsAPI: @unchecked Sendable {
             error: untyped.error,
             run: untyped.run,
             // #2636 — same reason as the typed run-sync result above.
-            skipReason: untyped.skipReason
+            skipReason: untyped.skipReason,
+            // #3388 — the slice block rides the typed read too.
+            slice: untyped.slice
         )
     }
 
@@ -364,7 +366,9 @@ public final class WorkflowsAPI: @unchecked Sendable {
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
             run: untyped.run,
-            skipReason: untyped.skipReason
+            skipReason: untyped.skipReason,
+            // #3388 — the slice block rides the typed read too.
+            slice: untyped.slice
         )
     }
 

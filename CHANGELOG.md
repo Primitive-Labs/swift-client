@@ -20,6 +20,50 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### A stalled document keeps retrying, and the app hears about it (#3390)
+
+**Additive.** A document whose `syncComplete` never arrived could stop
+converging: the watchdog re-sent `syncStep1` once, and when that single
+attempt could not start a cycle — the transport down, a claim from an earlier
+cycle still held, the send throwing — nothing was left armed. The document
+rendered stale state until the process restarted, and nothing reached the app.
+
+- The retry now re-arms itself whenever its attempt did not put a cycle in
+  flight, while the document is open and unsynced, at the same capped backoff
+  (2s → 15s). An open document keeps trying until it syncs.
+- Missing the handshake budget (`SyncConfig.handshakeTimeout`) now emits
+  `DocumentSyncStateChangedEvent(documentId:state:)` with `state == "error"`,
+  repeated at the backoff cadence while the document stays unsynced. A
+  document that recovers emits `"synced"` once, so an app that surfaced the
+  error can clear it. A `syncComplete` that only triggers the #2664
+  stale-state reset is not the recovery — the document is wiped and re-synced
+  — so `"synced"` waits for the re-sync that actually completes.
+- After three consecutive handshake-budget timeouts on a socket the client
+  still reads as open, the client rebuilds the connection itself — retrying
+  converges on nothing on a half-open socket that carries no answers. The
+  rebuild is bounded: once per stalled document (until it syncs or closes) and
+  once per connection.
+- Nothing else changes for an app that does not subscribe: the events are
+  additive and `BaoDataLoader`'s `.onDocumentSyncStateChanged` trigger already
+  reloads only on `"synced"`.
+
+The two stalls in the field report themselves were server-side, and fixed
+on the server in the same change; both clients are affected equally, and the
+client keeps one connection id for the life of its process, which is why a
+socket bounce did not (and could not) recover the first:
+
+- A sync-in-progress marker the document worker keeps per connection
+  survived an eviction mid-sync and silenced every later `syncStep1` from
+  that connection — no `syncComplete`, ever, until a process restart gave the
+  client a new connection id. The server now treats a marker older than any
+  real sync as abandoned.
+- After a reconnect, the connection worker never recreated the row that fans
+  peers' writes out to the connection: the sync cycle still completed
+  (`isSynced` true) while every later peer write was missed, and a bounce
+  converged for seconds. The server now recreates it on every `syncStep1`.
+- The access-denied `error` frame now names `documentId` and `messageType`,
+  so `ConnectionErrorEvent.documentId` is set for a refused document.
+
 ### Server functions: `client.functions`, channels and direct messages (#3278)
 
 **Additive.** The Swift client gains the server-functions surface the

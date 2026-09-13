@@ -568,18 +568,24 @@ final class TransportSpineTests: XCTestCase {
             // set is net zero on this commit: `JsBaoClient.swift` gave one back
             // (22 -> 21) below.
             "API/WorkflowsAPI.swift": (11, 2, 0),
-            // #3278 — `client.functions`, the same one deliberate surface as
-            // `WorkflowsAPI`: the untyped `invoke` / `start` take
-            // `input: [String: Any]` and every form takes `meta: [String: Any]?`,
-            // both the opaque `rootInput` / `meta` graphs the server does not
-            // introspect, composed straight to request bytes by the one
-            // `JSONSerialization` call in `post` so an `Int64` past 2^53 stays
-            // exact. The eleven sites are the two untyped entry points (input
-            // + meta each), the `meta` of the two typed overloads and of the two
-            // private body composers, the two `payload` locals, and the
-            // `payload` parameter of `post`. Declared in the plan's
-            // typed-surface statement as its any-exception.
-            "API/FunctionsAPI.swift": (11, 1, 0),
+            // #3278 opened this at eleven because there were no per-key types
+            // to express an invocation with; #3344 generated them and closed
+            // the four sites that existed only for their absence. The untyped
+            // `invoke` / `start` entry points (`input: [String: Any]` + their
+            // `meta`) are GONE: the generated `<Key>Function` invokers are now
+            // the way a Swift app calls a function, and a dynamic caller uses
+            // the generic overloads with a `JSONValue` witness.
+            //
+            // Seven is the FLOOR, not a milestone toward zero. What remains is
+            // `meta` — caller-supplied, derived from no schema — on the two
+            // typed overloads and the two private body composers, plus the two
+            // `payload` locals and `post`'s `payload` parameter: the opaque
+            // graph composed straight to request bytes by the one
+            // `JSONSerialization` call in `post`. `[String: JSONValue]` cannot
+            // replace them, because `JSONValue.number` is `Double`
+            // (`JSONValue.swift:47`) and would round an `Int64` past 2^53 —
+            // exactly the loss this budget exists to prevent.
+            "API/FunctionsAPI.swift": (7, 1, 0),
             // JWT payload parsing (the serialization boundary the design
             // sanctions). Every HTTP response `AuthController` reads is typed.
             // Phase E (#1994) took it 12 -> 4: the eight event payloads emitted

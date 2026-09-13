@@ -23,12 +23,35 @@ import XCTest
 /// condition C7 is about. `syncComplete` frames are handed to the client's own
 /// message router when a test needs one.
 final class SyncWatchdogTests: XCTestCase {
+    private var apiServers: [LoopbackAPIServer] = []
+
+    override func tearDown() async throws {
+        for server in apiServers { server.stop() }
+        apiServers = []
+    }
 
     private func newDocId() -> String { "watchdog-\(UUID().uuidString.prefix(8))" }
 
-    private func makeClient(wsUrl: String, handshakeTimeout: TimeInterval) -> JsBaoClient {
+    /// An API server that answers the client's own requests, so it keeps the
+    /// token it starts with. Against a dev server this suite's fake token is
+    /// rejected and the client drops its access token — after which it refuses
+    /// to build a socket, so anything that rebuilds the connection (the #3390
+    /// stall recovery) leaves the client down for the rest of the test.
+    private func makeApiServer() throws -> String {
+        let server = try LoopbackAPIServer { request in
+            if request.apiPathOnly == "/auth/refresh" {
+                return .json(#"{"token":"test-token"}"#)
+            }
+            return .json("{}")
+        }
+        let baseUrl = try server.start()
+        apiServers.append(server)
+        return baseUrl
+    }
+
+    private func makeClient(wsUrl: String, handshakeTimeout: TimeInterval) throws -> JsBaoClient {
         let client = JsBaoClient(options: JsBaoClientOptions(
-            apiUrl: TestConfig.httpUrl,
+            apiUrl: try makeApiServer(),
             wsUrl: wsUrl,
             appId: "sync-watchdog-test-app",
             token: "test-token",
@@ -103,7 +126,7 @@ final class SyncWatchdogTests: XCTestCase {
         let url = try server.start()
         defer { server.stop() }
 
-        let client = makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
+        let client = try makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
         defer { Task { await client.destroy() } }
         try await client.connect()
         XCTAssertTrue(client.isConnected, "precondition: transport is up")
@@ -134,7 +157,7 @@ final class SyncWatchdogTests: XCTestCase {
         let url = try server.start()
         defer { server.stop() }
 
-        let client = makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
+        let client = try makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
         // A long first retry keeps the retry itself out of the way, so the free
         // claim observed below is the watchdog's doing and not the retry's.
         client.syncRetryInitial = 30
@@ -163,7 +186,7 @@ final class SyncWatchdogTests: XCTestCase {
         let url = try server.start()
         defer { server.stop() }
 
-        let client = makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
+        let client = try makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
         defer { Task { await client.destroy() } }
         try await client.connect()
 
@@ -190,7 +213,7 @@ final class SyncWatchdogTests: XCTestCase {
         let url = try server.start()
         defer { server.stop() }
 
-        let client = makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
+        let client = try makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
         defer { Task { await client.destroy() } }
         try await client.connect()
 
@@ -228,7 +251,7 @@ final class SyncWatchdogTests: XCTestCase {
         let url = try server.start()
         defer { server.stop() }
 
-        let client = makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
+        let client = try makeClient(wsUrl: wsBase(url), handshakeTimeout: 0.3)
         defer { Task { await client.destroy() } }
         try await client.connect()
 
@@ -261,7 +284,7 @@ final class SyncWatchdogTests: XCTestCase {
         let url = try server.start()
         defer { server.stop() }
 
-        let client = makeClient(wsUrl: wsBase(url), handshakeTimeout: 30)
+        let client = try makeClient(wsUrl: wsBase(url), handshakeTimeout: 30)
         defer { Task { await client.destroy() } }
         try await client.connect()
 
@@ -302,7 +325,7 @@ final class SyncWatchdogTests: XCTestCase {
         let url = try server.start()
         defer { server.stop() }
 
-        let client = makeClient(wsUrl: wsBase(url), handshakeTimeout: 30)
+        let client = try makeClient(wsUrl: wsBase(url), handshakeTimeout: 30)
         defer { Task { await client.destroy() } }
         try await client.connect()
 

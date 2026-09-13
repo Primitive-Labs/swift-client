@@ -11,6 +11,15 @@ import XCTest
 /// what reaches the wire and exactly how a body comes back.
 final class FunctionsAPIHermeticTests: XCTestCase {
 
+    /// #3344 retired the untyped `invoke` / `start` entry points: the
+    /// generated `<Key>Function` invokers are the way a Swift app calls a
+    /// function, and a caller with no per-key type names the witness instead.
+    /// These suites exercise the ENVELOPE rather than any per-key type, so
+    /// they take exactly that route — which also keeps the supported dynamic
+    /// recipe under test.
+    private typealias Dynamic = FunctionResult<JSONValue>
+    private static let noInput: JSONValue? = nil
+
     private func makeApi(_ transport: RecordingTransport) -> FunctionsAPI {
         FunctionsAPI(transport: transport, workflows: WorkflowsAPI(transport: transport))
     }
@@ -47,7 +56,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
             contextDocId: "doc-1",
             meta: ["source": "test"],
             timeout: 10
-        )
+        ) as Dynamic
 
         let call = try XCTUnwrap(transport.lastCall)
         XCTAssertEqual(call.method, .post)
@@ -65,7 +74,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
     /// `URLComponents`.
     func testInvokeEncodesTheFunctionKeyAsOneSegment() async throws {
         let (api, transport) = makeApi(json: Self.completedEnvelope)
-        _ = try await api.invoke("orders/sync it")
+        _ = try await api.invoke("orders/sync it", input: Self.noInput) as Dynamic
         XCTAssertEqual(transport.lastCall?.path, "/functions/orders%2Fsync%20it")
     }
 
@@ -75,22 +84,27 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         let (api, transport) = makeApi(json: Self.completedEnvelope)
 
         for timeout: TimeInterval? in [nil, 0, -1] {
-            _ = try await api.invoke("greet", timeout: timeout)
+            _ = try await api.invoke("greet", input: Self.noInput, timeout: timeout) as Dynamic
             let body = try XCTUnwrap(transport.lastCall?.jsonBody)
             XCTAssertNil(body["timeoutMs"], "timeout \(String(describing: timeout)) must omit timeoutMs")
             XCTAssertNil(body["contextDocId"])
             XCTAssertNil(body["meta"])
         }
 
-        _ = try await api.invoke("greet", timeout: 1.5)
+        _ = try await api.invoke("greet", input: Self.noInput, timeout: 1.5) as Dynamic
         XCTAssertEqual(transport.lastCall?.jsonBody?["timeoutMs"], 1500)
     }
 
-    /// Edge case: an empty untyped `input` still sends `rootInput: {}` — the
-    /// server treats absent and empty alike, and the untyped default is `[:]`.
-    func testInvokeEmptyUntypedInputStillSendsAnEmptyRootInput() async throws {
+    /// Edge case, restated after #3344: the untyped entry point's `[:]`
+    /// default is gone, so "no input" is now the witness recipe's `nil`, which
+    /// OMITS `rootInput` and lets the server supply `{}`. A caller that means
+    /// the empty object says so, and it reaches the wire as `{}`.
+    func testNoInputOmitsRootInputAndAnExplicitEmptyObjectIsSentAsOne() async throws {
         let (api, transport) = makeApi(json: Self.completedEnvelope)
-        _ = try await api.invoke("greet")
+        _ = try await api.invoke("greet", input: Self.noInput) as Dynamic
+        XCTAssertNil(transport.lastCall?.jsonBody?["rootInput"])
+
+        _ = try await api.invoke("greet", input: JSONValue.object([:])) as Dynamic
         XCTAssertEqual(transport.lastCall?.jsonBody?["rootInput"], [:])
     }
 
@@ -98,7 +112,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
 
     func testCompletedEnvelopeDecodesStatusOutputAndLimits() async throws {
         let (api, _) = makeApi(json: Self.completedEnvelope)
-        let result = try await api.invoke("greet")
+        let result: Dynamic = try await api.invoke("greet", input: Self.noInput)
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(result.output?["message"]?.stringValue, "hello Ada")
         XCTAssertNil(result.error)
@@ -116,7 +130,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         {"status":"failed","error":"nope","errorCode":"FUNCTION_HANDLER_THREW",
          "limits":{"cpuMs":5000,"subRequests":64,"ratePerMinute":1200}}
         """)
-        let result = try await api.invoke("boom")
+        let result: Dynamic = try await api.invoke("boom", input: Self.noInput)
         XCTAssertEqual(result.status, "failed")
         XCTAssertEqual(result.error, "nope")
         XCTAssertEqual(result.errorCode, "FUNCTION_HANDLER_THREW")
@@ -127,19 +141,22 @@ final class FunctionsAPIHermeticTests: XCTestCase {
     /// A timeout has no output and — the sandbox never reported — no limits.
     func testTimeoutEnvelopeHasNilOutputAndNilLimits() async throws {
         let (api, _) = makeApi(json: #"{"status":"timeout"}"#)
-        let result = try await api.invoke("slow", timeout: 1)
+        let result: Dynamic = try await api.invoke("slow", input: Self.noInput, timeout: 1)
         XCTAssertEqual(result.status, "timeout")
         XCTAssertNil(result.output)
         XCTAssertNil(result.limits)
         XCTAssertNil(result.error)
     }
 
-    /// Edge case: an untyped `output` of JSON `null` decodes to `.null`; the
-    /// typed overload maps it to nil.
-    func testNullOutputIsDotNullUntypedAndNilTyped() async throws {
+    /// Edge case: an `output` of JSON `null` is an ABSENT output on the typed
+    /// surface, whichever witness the caller binds — the dynamic `JSONValue`
+    /// one included. (Before #3344 the untyped entry point surfaced it as
+    /// `.null`; that entry point is gone, and with it the two spellings.)
+    func testNullOutputDecodesToNilUnderEveryWitness() async throws {
         let (api, _) = makeApi(json: #"{"status":"completed","output":null}"#)
-        let untyped = try await api.invoke("nothing")
-        XCTAssertEqual(untyped.output, .null)
+        let dynamic: Dynamic = try await api.invoke("nothing", input: Self.noInput)
+        XCTAssertEqual(dynamic.status, "completed")
+        XCTAssertNil(dynamic.output)
 
         let typed: FunctionResult<[String: String]> = try await api.invoke("nothing", input: nil as String?)
         XCTAssertEqual(typed.status, "completed")
@@ -154,7 +171,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
             status: 403
         )
         do {
-            _ = try await api.invoke("private")
+            _ = try await api.invoke("private", input: Self.noInput) as Dynamic
             XCTFail("a 403 must throw")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 403)
@@ -171,7 +188,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         )
         let big = String(repeating: "x", count: 2048)
         do {
-            _ = try await api.invoke("greet", meta: ["blob": big])
+            _ = try await api.invoke("greet", input: Self.noInput, meta: ["blob": big]) as Dynamic
             XCTFail("a 400 must throw")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 400)
@@ -275,10 +292,18 @@ final class FunctionsAPIHermeticTests: XCTestCase {
 
     // MARK: - Behavior 5: an Int64 past 2^53 reaches the wire exactly
 
-    func testUntypedInputKeepsALargeInt64Exact() async throws {
+    private struct IdInput: Encodable { let id: Int64 }
+
+    /// Retargeted at #3344: the case used to run through the untyped entry
+    /// point's `[String: Any]`. A TYPED input keeps the same fidelity, because
+    /// `JSONCoding.jsonObject` is `JSONEncoder.encode` →
+    /// `JSONSerialization.jsonObject` and an `Int64` round-trips that exactly.
+    /// The lossy path is `JSONValue` (whose `.number` is a `Double`), which is
+    /// what a dynamic caller opts into either way.
+    func testTypedInputKeepsALargeInt64Exact() async throws {
         let (api, transport) = makeApi(json: Self.completedEnvelope)
         let big: Int64 = 9_007_199_254_740_993  // 2^53 + 1
-        _ = try await api.invoke("ids", input: ["id": big])
+        _ = try await api.invoke("ids", input: IdInput(id: big)) as Dynamic
         let body = try rawBody(transport.lastCall)
         let sent = try XCTUnwrap((body["rootInput"] as? [String: Any])?["id"] as? NSNumber)
         XCTAssertEqual(sent.int64Value, big)
@@ -320,7 +345,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         {"runId":"run-1","runKey":"rk-1","instanceId":"i-1","status":"completed",
          "existing":true,"output":{"doubled":42}}
         """)
-        let replayed = try await api.start("order-sync", runKey: "rk-1")
+        let replayed = try await api.start("order-sync", input: Self.noInput, runKey: "rk-1")
         XCTAssertEqual(replayed.existing, true)
         XCTAssertEqual(replayed.output?["doubled"]?.numberValue, 42)
     }
@@ -330,7 +355,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
     func testInvokeOnAStartEnvelopeThrowsFunctionModeMismatchWithTheRunId() async throws {
         let (api, _) = makeApi(json: Self.startEnvelope)
         do {
-            _ = try await api.invoke("order-sync")
+            _ = try await api.invoke("order-sync", input: Self.noInput) as Dynamic
             XCTFail("a start envelope must be refused by invoke")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .functionModeMismatch)
@@ -344,7 +369,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
     func testStartOnAResultEnvelopeThrowsFunctionModeMismatchWithTheStatus() async throws {
         let (api, _) = makeApi(json: Self.completedEnvelope)
         do {
-            _ = try await api.start("greet")
+            _ = try await api.start("greet", input: Self.noInput)
             XCTFail("a result envelope must be refused by start")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .functionModeMismatch)

@@ -32,6 +32,17 @@ final class LoopbackAPIServer: @unchecked Sendable {
         var apiPathOnly: String {
             String(apiPath.prefix(while: { $0 != "?" }))
         }
+
+        /// The request body, when the request declared a `Content-Length`
+        /// (#3344). A test that only cares about routing ignores it; a test
+        /// that has to say what a generated invoker PUT ON THE WIRE reads it.
+        var body: Data? = nil
+
+        /// The body parsed as a JSON object, for a wire-shape assertion.
+        var jsonBody: [String: Any]? {
+            guard let body else { return nil }
+            return try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+        }
     }
 
     /// What to answer with: an HTTP status and a JSON body.
@@ -113,6 +124,18 @@ final class LoopbackAPIServer: @unchecked Sendable {
                 }
                 return
             }
+            // A declared body that has not fully arrived yet: keep reading
+            // rather than answering a half-read request (#3344). A request with
+            // no `Content-Length` is answered as soon as its head is complete,
+            // exactly as before.
+            if !Self.bodyIsComplete(buffer) {
+                if isComplete {
+                    connection.cancel()
+                } else {
+                    self.answer(connection, received: buffer)
+                }
+                return
+            }
             self.lock.withLock { self._requests.append(request) }
 
             let response = self.responder(request)
@@ -133,13 +156,48 @@ final class LoopbackAPIServer: @unchecked Sendable {
     /// `GET /documents/abc HTTP/1.1` → `Request(method: "GET", path: "/documents/abc")`,
     /// once the whole head has arrived.
     private static func parseRequestLine(_ buffer: Data) -> Request? {
-        guard let text = String(data: buffer, encoding: .utf8),
-              text.contains("\r\n\r\n"),
+        guard let head = headEnd(buffer),
+              let text = String(data: buffer.prefix(head.headerEnd), encoding: .utf8),
               let line = text.components(separatedBy: "\r\n").first
         else { return nil }
         let parts = line.split(separator: " ")
         guard parts.count >= 2 else { return nil }
-        return Request(method: String(parts[0]), path: String(parts[1]))
+        var request = Request(method: String(parts[0]), path: String(parts[1]))
+        if head.contentLength > 0 {
+            let bodyBytes = buffer.dropFirst(head.bodyStart)
+            if bodyBytes.count >= head.contentLength {
+                request.body = Data(bodyBytes.prefix(head.contentLength))
+            }
+        }
+        return request
+    }
+
+    /// Where the head ends, where the body starts, and how long the body is.
+    private static func headEnd(
+        _ buffer: Data
+    ) -> (headerEnd: Int, bodyStart: Int, contentLength: Int)? {
+        let separator = Data("\r\n\r\n".utf8)
+        guard let range = buffer.range(of: separator) else { return nil }
+        let headerEnd = range.lowerBound - buffer.startIndex
+        let bodyStart = range.upperBound - buffer.startIndex
+        var contentLength = 0
+        if let text = String(data: buffer.prefix(headerEnd), encoding: .utf8) {
+            for header in text.components(separatedBy: "\r\n").dropFirst() {
+                let pieces = header.split(separator: ":", maxSplits: 1)
+                guard pieces.count == 2,
+                      pieces[0].trimmingCharacters(in: .whitespaces).lowercased()
+                        == "content-length"
+                else { continue }
+                contentLength = Int(pieces[1].trimmingCharacters(in: .whitespaces)) ?? 0
+            }
+        }
+        return (headerEnd, bodyStart, contentLength)
+    }
+
+    /// True when the buffer holds the whole declared body (or declares none).
+    private static func bodyIsComplete(_ buffer: Data) -> Bool {
+        guard let head = headEnd(buffer) else { return false }
+        return buffer.count - head.bodyStart >= head.contentLength
     }
 
     private static func reason(_ status: Int) -> String {

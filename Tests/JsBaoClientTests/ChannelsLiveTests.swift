@@ -44,21 +44,29 @@ final class ChannelsLiveTests: XCTestCase {
     }
     """
 
-    private func invoke(_ functionKey: String, _ input: [String: Any]) async throws -> JSONValue {
-        let result = try await client.functions.invoke(functionKey, input: input, timeout: generousTimeout)
+    /// #3344 retired the untyped entry points, so this helper's input is a
+    /// `JSONValue` (the type a dynamic caller uses either way) rather than a
+    /// `[String: Any]`, and the result names its own witness.
+    private func invoke(_ functionKey: String, _ input: JSONValue) async throws -> JSONValue {
+        let result: FunctionResult<JSONValue> = try await client.functions.invoke(
+            functionKey, input: input, timeout: generousTimeout
+        )
         XCTAssertEqual(result.status, "completed", "\(String(describing: result.error))")
         return try XCTUnwrap(result.output)
     }
 
-    private func authorize(_ functionKey: String, _ channel: String, options: [String: Any] = [:]) async throws -> (grant: String, expiresAt: Int) {
-        let output = try await invoke(functionKey, ["action": "authorize", "channel": channel, "options": options])
+    private func authorize(_ functionKey: String, _ channel: String, options: JSONValue = [:]) async throws -> (grant: String, expiresAt: Int) {
+        let output = try await invoke(
+            functionKey,
+            ["action": "authorize", "channel": .string(channel), "options": options]
+        )
         let grant = try XCTUnwrap(output["grant"]?.stringValue)
         let expiresAt = try XCTUnwrap(output["expiresAt"]?.numberValue)
         return (grant, Int(expiresAt))
     }
 
-    private func publish(_ functionKey: String, _ channel: String, _ payload: [String: Any]) async throws -> Int {
-        let output = try await invoke(functionKey, ["channel": channel, "payload": payload])
+    private func publish(_ functionKey: String, _ channel: String, _ payload: JSONValue) async throws -> Int {
+        let output = try await invoke(functionKey, ["channel": .string(channel), "payload": payload])
         return Int(try XCTUnwrap(output["connections"]?.numberValue))
     }
 
@@ -159,7 +167,7 @@ final class ChannelsLiveTests: XCTestCase {
         defer { sub.cancel() }
 
         let output = try await invoke(functionKey, [
-            "userId": testApp.ownerUserId,
+            "userId": .string(testApp.ownerUserId),
             "payload": ["greeting": "hello from a function", "n": 3],
         ])
         XCTAssertEqual(output["connections"]?.numberValue, 1)
@@ -181,7 +189,10 @@ final class ChannelsLiveTests: XCTestCase {
         }
         defer { lateSub.cancel() }
 
-        let unheard = try await invoke(functionKey, ["userId": testApp.ownerUserId, "payload": ["unheard": true]])
+        let unheard = try await invoke(
+            functionKey,
+            ["userId": .string(testApp.ownerUserId), "payload": ["unheard": true]]
+        )
         XCTAssertEqual(unheard["connections"]?.numberValue, 0, "nobody was connected to receive it")
 
         try await late.connect()

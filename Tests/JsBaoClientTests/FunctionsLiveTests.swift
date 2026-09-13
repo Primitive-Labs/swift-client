@@ -71,7 +71,9 @@ final class FunctionsLiveTests: XCTestCase {
             functionKey: sum,
             bundle: "export default async function (input) { return { total: input.a + input.b }; }"
         )
-        let completed = try await client.functions.invoke(
+        // #3344 retired the untyped entry points; a dynamic caller names the
+        // witness and binds `JSONValue` on the way out.
+        let completed: FunctionResult<JSONValue> = try await client.functions.invoke(
             sum, input: ["a": 2, "b": 3], timeout: generousTimeout
         )
         XCTAssertEqual(completed.status, "completed")
@@ -86,7 +88,9 @@ final class FunctionsLiveTests: XCTestCase {
             bundle: "export default async () => { throw new Error(\"nope\"); };"
         )
         // A settled invocation, whatever its status — only a platform refusal throws.
-        let failed = try await client.functions.invoke(boom, timeout: generousTimeout)
+        let failed: FunctionResult<JSONValue> = try await client.functions.invoke(
+            boom, input: nil as JSONValue?, timeout: generousTimeout
+        )
         XCTAssertEqual(failed.status, "failed")
         XCTAssertTrue(failed.error?.contains("nope") == true, "\(String(describing: failed.error))")
         XCTAssertNil(failed.output)
@@ -97,7 +101,9 @@ final class FunctionsLiveTests: XCTestCase {
             functionKey: slow,
             bundle: "export default async () => { await new Promise((r) => setTimeout(r, 5000)); return { late: true }; };"
         )
-        let timedOut = try await client.functions.invoke(slow, timeout: 1)
+        let timedOut: FunctionResult<JSONValue> = try await client.functions.invoke(
+            slow, input: nil as JSONValue?, timeout: 1
+        )
         XCTAssertEqual(timedOut.status, "timeout")
         XCTAssertNil(timedOut.output)
     }
@@ -185,8 +191,12 @@ final class FunctionsLiveTests: XCTestCase {
 
         // A repeated runKey replays the run that already exists.
         let runKey = "swift-rk-\(Int(Date().timeIntervalSince1970))"
-        let first = try await client.functions.start(functionKey, runKey: runKey, contextDocId: docId)
-        let second = try await client.functions.start(functionKey, runKey: runKey, contextDocId: docId)
+        let first = try await client.functions.start(
+            functionKey, input: nil as JSONValue?, runKey: runKey, contextDocId: docId
+        )
+        let second = try await client.functions.start(
+            functionKey, input: nil as JSONValue?, runKey: runKey, contextDocId: docId
+        )
         XCTAssertEqual(second.runId, first.runId)
         XCTAssertEqual(second.existing, true)
 
@@ -203,6 +213,94 @@ final class FunctionsLiveTests: XCTestCase {
         )
     }
 
+    // MARK: - #3388: the task run's slice block, live
+
+    /// One step and a return — long enough to open a slice record, short
+    /// enough to settle it inside the wait.
+    private static let oneStep = """
+    export default async function (input, ctx, step) {
+      const one = await step.do("one", async () => 1);
+      return { one };
+    }
+    """
+
+    private struct One: Decodable, Sendable, Equatable { let one: Int }
+
+    /// A settled task run's slice rides `functions.getStatus`, with the seven
+    /// fields the JS client's `WorkflowStatusResult.slice?` carries. The run
+    /// is waited out first: the block is read AFTER `waitFor` settles, which
+    /// is where a caller wants the refresh count and the 12-hour ceiling.
+    func testASettledTaskRunsSliceRidesGetStatusAfterTheWait() async throws {
+        let functionKey = key("slice")
+        try await ctx.pushFunction(
+            appId: testApp.appId,
+            functionKey: functionKey,
+            bundle: Self.oneStep,
+            durable: true
+        )
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
+
+        let started = try await client.functions.start(
+            functionKey, input: nil as JSONValue?, contextDocId: docId
+        )
+        let settled = try await client.functions.waitFor(
+            runId: started.runId, options: WaitForWorkflowOptions(timeout: 120)
+        )
+        XCTAssertEqual(settled.status, "completed", "\(String(describing: settled.error))")
+
+        // The wrapper settles the record as the run ends, so re-read briefly:
+        // the case is about the settled record, not about winning a race with
+        // the write that settles it.
+        var status = try await client.functions.getStatus(runId: started.runId)
+        var attempts = 0
+        while status.slice?.settledAt == nil && attempts < 15 {
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            status = try await client.functions.getStatus(runId: started.runId)
+            attempts += 1
+        }
+
+        let slice = try XCTUnwrap(status.slice, "a task run has a slice record")
+        XCTAssertFalse(slice.sliceId.isEmpty)
+        let startedAt = try XCTUnwrap(slice.startedAt)
+        let ceilingAt = try XCTUnwrap(slice.ceilingAt)
+        // The 12-hour bound, ahead of the slice's start.
+        XCTAssertGreaterThan(ceilingAt, startedAt)
+        XCTAssertNotNil(slice.settledAt)
+        XCTAssertEqual(slice.settledStatus, "completed")
+        // Seconds long: nothing to refresh.
+        XCTAssertEqual(slice.refreshCount, 0)
+        XCTAssertNil(slice.lastRefreshAt)
+
+        // The typed overload reads the same record: binding `output` to a type
+        // must not cost the caller the block beside it.
+        let typed: WorkflowStatus<One> = try await client.functions.getStatus(runId: started.runId)
+        XCTAssertEqual(typed.slice, slice)
+    }
+
+    /// The block is additive: a DSL workflow run is not a function run, so its
+    /// status carries no `slice` key and the Swift result reads `nil`.
+    func testAWorkflowRunsStatusCarriesNoSlice() async throws {
+        let workflowKey = "swift-slice-dsl-\(Int(Date().timeIntervalSince1970))"
+        try await ctx.setupWorkflow(
+            appId: testApp.appId,
+            workflowKey: workflowKey,
+            steps: [["id": "n", "kind": "noop", "message": "hi", "saveAs": "output"]],
+            requiresClientApply: false,
+            syncCallable: true
+        )
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
+
+        let run = try await client.workflows.runSync(
+            workflowKey: workflowKey,
+            runKey: "swift-slice-dsl-run",
+            contextDocId: docId
+        )
+        XCTAssertEqual(run.status, "completed")
+
+        let status = try await client.functions.getStatus(runId: run.runId)
+        XCTAssertNil(status.slice, "a DSL run has no slice record")
+    }
+
     // MARK: - Behavior 15: the mode check, live
 
     func testInvokeOnATaskAndStartOnARequestFunctionThrowFunctionModeMismatch() async throws {
@@ -210,7 +308,9 @@ final class FunctionsLiveTests: XCTestCase {
         try await ctx.pushFunction(appId: testApp.appId, functionKey: task, bundle: Self.sleeper, durable: true)
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
         do {
-            _ = try await client.functions.invoke(task, contextDocId: docId, timeout: generousTimeout)
+            _ = try await client.functions.invoke(
+                task, input: nil as JSONValue?, contextDocId: docId, timeout: generousTimeout
+            ) as FunctionResult<JSONValue>
             XCTFail("invoke on a task function must throw")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .functionModeMismatch)
@@ -225,7 +325,9 @@ final class FunctionsLiveTests: XCTestCase {
             bundle: "export default async function () { return { ok: true }; }"
         )
         do {
-            _ = try await client.functions.start(request, contextDocId: docId)
+            _ = try await client.functions.start(
+                request, input: nil as JSONValue?, contextDocId: docId
+            )
             XCTFail("start on a request function must throw")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .functionModeMismatch)

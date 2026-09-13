@@ -907,6 +907,13 @@ public struct WorkflowStartedEvent: Sendable {
 /// `.remoteUpdate` event (#1120): a `"synced"` change is emitted each time a
 /// remote Yjs update lands for an open document, so reload-on-remote-write
 /// loaders can subscribe here instead of `.remoteUpdate`.
+///
+/// `"error"` is emitted when an open document misses the sync handshake budget
+/// (`SyncConfig.handshakeTimeout`) — the client keeps retrying at a capped
+/// backoff, but what the app is rendering has stopped converging, so it can
+/// tell the user instead of showing stale state as if it were current (#3390).
+/// A document that recovers reports `"synced"` once, so the app can clear the
+/// warning it surfaced.
 public struct DocumentSyncStateChangedEvent: Sendable {
     public let documentId: String
     public let state: String // "syncing" | "synced" | "stale" | "error"
