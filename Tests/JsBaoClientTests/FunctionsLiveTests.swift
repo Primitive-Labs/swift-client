@@ -301,11 +301,47 @@ final class FunctionsLiveTests: XCTestCase {
         XCTAssertNil(status.slice, "a DSL run has no slice record")
     }
 
-    // MARK: - Behavior 15: the mode check, live
+    // MARK: - #3454: the runner is chosen at call time
+
+    /// An `any` function — the DEFAULT since #3454 — takes both verbs, and
+    /// each one gets the runner it names.
+    func testBothVerbsReachAnAnyFunction() async throws {
+        let either = key("mode-any")
+        try await ctx.pushFunction(
+            appId: testApp.appId,
+            functionKey: either,
+            bundle: "export default async function () { return { ok: true }; }",
+            mode: "any"
+        )
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
+
+        let started = try await client.functions.start(
+            either, input: nil as JSONValue?, contextDocId: docId
+        )
+        XCTAssertFalse(started.runId.isEmpty)
+        let settled = try await client.functions.waitFor(
+            runId: started.runId, options: WaitForWorkflowOptions(timeout: 120)
+        )
+        XCTAssertEqual(settled.status, "completed")
+
+        // …and the same version, invoked, answers its result inside the call.
+        let result: FunctionResult<JSONValue> = try await client.functions.invoke(
+            either, input: nil as JSONValue?, contextDocId: docId, timeout: generousTimeout
+        )
+        XCTAssertEqual(result.status, "completed")
+    }
+
+    // MARK: - Behavior 15: the mode check on a LOCK, live
 
     func testInvokeOnATaskAndStartOnARequestFunctionThrowFunctionModeMismatch() async throws {
+        // #3454 — both subjects are LOCKS, spelled out: the refusal is what a
+        // lock's OTHER door earns, and an `any` function has no other door.
+        // The server refuses it now (the call states its runner), so what this
+        // pins is that the public error type did not move with it.
         let task = key("mode-task")
-        try await ctx.pushFunction(appId: testApp.appId, functionKey: task, bundle: Self.sleeper, durable: true)
+        try await ctx.pushFunction(
+            appId: testApp.appId, functionKey: task, bundle: Self.sleeper, mode: "task"
+        )
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
         do {
             _ = try await client.functions.invoke(
@@ -314,15 +350,15 @@ final class FunctionsLiveTests: XCTestCase {
             XCTFail("invoke on a task function must throw")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertTrue(error.message.contains("is a task function"), error.message)
-            XCTAssertNotNil(error.details?["runId"]?.stringValue, "the run was started; its id is in details")
+            XCTAssertTrue(error.message.contains("task function"), error.message)
         }
 
         let request = key("mode-request")
         try await ctx.pushFunction(
             appId: testApp.appId,
             functionKey: request,
-            bundle: "export default async function () { return { ok: true }; }"
+            bundle: "export default async function () { return { ok: true }; }",
+            mode: "request"
         )
         do {
             _ = try await client.functions.start(
@@ -331,8 +367,7 @@ final class FunctionsLiveTests: XCTestCase {
             XCTFail("start on a request function must throw")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertTrue(error.message.contains("is a request function"), error.message)
-            XCTAssertEqual(error.details?["status"]?.stringValue, "completed")
+            XCTAssertTrue(error.message.contains("request function"), error.message)
         }
     }
 }

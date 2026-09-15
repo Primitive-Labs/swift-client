@@ -50,17 +50,26 @@ public struct ExecutePromptResult: Decodable, Sendable, Equatable {
         public let inputTokens: Double?
         public let outputTokens: Double?
         public let totalTokens: Double?
+        /// #3358 — the reasoning/thinking tokens the provider reports,
+        /// separately from `outputTokens`: how the effect of a config's
+        /// `reasoningEffort` / `reasoningBudget` is measured. OpenRouter counts
+        /// reasoning inside its output tokens and Gemini counts it outside, so
+        /// neither headline number says how much of the decode was
+        /// deliberation. `nil` when the provider reports none.
+        public let reasoningTokens: Double?
 
         public init(
             durationMs: Double,
             inputTokens: Double? = nil,
             outputTokens: Double? = nil,
-            totalTokens: Double? = nil
+            totalTokens: Double? = nil,
+            reasoningTokens: Double? = nil
         ) {
             self.durationMs = durationMs
             self.inputTokens = inputTokens
             self.outputTokens = outputTokens
             self.totalTokens = totalTokens
+            self.reasoningTokens = reasoningTokens
         }
     }
 

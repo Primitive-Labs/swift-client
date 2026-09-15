@@ -44,24 +44,33 @@ public struct FunctionInvokeResult: Decodable, Sendable {
     /// Present when `status` is `"completed"`. Opaque blob; a JSON `null`
     /// output decodes to `.null`.
     public let output: JSONValue?
-    /// Present when `status` is `"failed"`.
+    /// Present when `status` is `"failed"` or `"timeout"` (#3448).
     public let error: String?
     public let errorCode: String?
     /// The ceilings the sandbox ran under; `nil` when it never reported.
     public let limits: FunctionInvokeLimits?
+    /// The invocation-log record this answer belongs to (#3448).
+    ///
+    /// Minted before the run, so the record and the answer share it: hand it
+    /// to `primitive functions logs <functionId> --invocation <id>` to read
+    /// what the invocation printed and the error it threw. `nil` when the
+    /// platform recorded nothing, and on a server older than #3448.
+    public let invocationId: String?
 
     public init(
         status: String,
         output: JSONValue? = nil,
         error: String? = nil,
         errorCode: String? = nil,
-        limits: FunctionInvokeLimits? = nil
+        limits: FunctionInvokeLimits? = nil,
+        invocationId: String? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.errorCode = errorCode
         self.limits = limits
+        self.invocationId = invocationId
     }
 }
 
@@ -76,19 +85,24 @@ public struct FunctionResult<Output: Decodable & Sendable>: Sendable {
     public let error: String?
     public let errorCode: String?
     public let limits: FunctionInvokeLimits?
+    /// The invocation-log record this answer belongs to (#3448); see
+    /// `FunctionInvokeResult.invocationId`.
+    public let invocationId: String?
 
     public init(
         status: String,
         output: Output?,
         error: String? = nil,
         errorCode: String? = nil,
-        limits: FunctionInvokeLimits? = nil
+        limits: FunctionInvokeLimits? = nil,
+        invocationId: String? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.errorCode = errorCode
         self.limits = limits
+        self.invocationId = invocationId
     }
 }
 

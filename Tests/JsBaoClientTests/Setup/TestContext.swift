@@ -327,6 +327,11 @@ final class TestContext: @unchecked Sendable {
         bundle: String,
         access: String = "true",
         durable: Bool = false,
+        /// #3454 — `"request"`, `"task"` or `"any"`. Absent leaves the
+        /// pre-#3454 shape: the `durable` boolean alone, which is a LOCK
+        /// either way. An `any` push sends no `durable`, because a boolean
+        /// beside `mode = "any"` is the disagreement the server refuses.
+        mode: String? = nil,
         inputSchema: [String: Any]? = nil,
         outputSchema: [String: Any]? = nil
     ) async throws -> PushedFunction {
@@ -343,19 +348,26 @@ final class TestContext: @unchecked Sendable {
         }
 
         let entry = "functions/\(functionKey).ts"
-        let toml = "[function]\nkey = \"\(functionKey)\"\n"
+        var toml = "[function]\nkey = \"\(functionKey)\"\n"
+        if let mode, mode != "any" { toml += "mode = \"\(mode)\"\n" }
         let bundleData = Data(bundle.utf8)
         let contentHash = SHA256.hash(data: bundleData)
             .map { String(format: "%02x", $0) }
             .joined()
-        let pushed = try await adminPost("\(base)/\(functionId)/configs", body: [
+        var config: [String: Any] = [
             "entry": entry,
             "toml": Data(toml.utf8).base64EncodedString(),
             "sources": [["path": entry, "content": bundleData.base64EncodedString()]],
             "bundle": bundleData.base64EncodedString(),
             "contentHash": contentHash,
-            "durable": durable,
-        ])
+        ]
+        if let mode {
+            config["mode"] = mode
+            if mode != "any" { config["durable"] = mode == "task" }
+        } else {
+            config["durable"] = durable
+        }
+        let pushed = try await adminPost("\(base)/\(functionId)/configs", body: config)
         return PushedFunction(
             functionId: functionId,
             functionKey: functionKey,

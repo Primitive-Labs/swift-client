@@ -115,7 +115,8 @@ public final class FunctionsAPI: @unchecked Sendable {
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
             errorCode: untyped.errorCode,
-            limits: untyped.limits
+            limits: untyped.limits,
+            invocationId: untyped.invocationId
         )
     }
 
@@ -321,7 +322,11 @@ public final class FunctionsAPI: @unchecked Sendable {
         meta: [String: Any]?,
         timeout: TimeInterval?
     ) async throws -> FunctionInvokeResult {
-        var payload: [String: Any] = [:]
+        // #3454 — the RUNNER this call means. The default mode is `any`, which
+        // takes either, so a body that says nothing would be handed the
+        // request runner whatever verb the caller typed. `invoke` means the
+        // request runner; saying so is what makes the choice the caller's.
+        var payload: [String: Any] = ["mode": "request"]
         if let rootInput { payload["rootInput"] = rootInput }
         if let contextDocId { payload["contextDocId"] = contextDocId }
         if let meta { payload["meta"] = meta }
@@ -348,7 +353,8 @@ public final class FunctionsAPI: @unchecked Sendable {
             output: envelope.output,
             error: envelope.error,
             errorCode: envelope.errorCode,
-            limits: envelope.limits
+            limits: envelope.limits,
+            invocationId: envelope.invocationId
         )
     }
 
@@ -360,7 +366,8 @@ public final class FunctionsAPI: @unchecked Sendable {
         contextDocId: String?,
         meta: [String: Any]?
     ) async throws -> FunctionStartResult {
-        var payload: [String: Any] = [:]
+        // #3454 — the mirror of `invoke`: `start` means the TASK runner.
+        var payload: [String: Any] = ["mode": "task"]
         if let rootInput { payload["rootInput"] = rootInput }
         if let runKey { payload["runKey"] = runKey }
         if let contextDocId { payload["contextDocId"] = contextDocId }
@@ -398,12 +405,32 @@ public final class FunctionsAPI: @unchecked Sendable {
     private func post(functionKey: String, payload: [String: Any]) async throws -> FunctionRouteEnvelope {
         let encodedKey = URLEncoding.encodeComponent(functionKey)
         let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
-        return try await transport.request(
-            method: .post,
-            path: "/functions/\(encodedKey)",
-            bodyData: bodyData
-        )
+        do {
+            return try await transport.request(
+                method: .post,
+                path: "/functions/\(encodedKey)",
+                bodyData: bodyData
+            )
+        } catch let error as HttpError where error.serverCode == Self.modeMismatchCode {
+            // #3454, DSO3454-002 — now that the call states a runner, a LOCK's
+            // other door is refused by the SERVER, with a 409. Every 409
+            // reaches here as an `HttpError`, so without this the public error
+            // on a wrong verb would silently have changed from
+            // `JsBaoError(.functionModeMismatch)` — which is what this client
+            // has always thrown, and what applications catch — into a
+            // transport error. EXACTLY this one code is translated; every
+            // other conflict stays what it was.
+            throw JsBaoError(
+                code: .functionModeMismatch,
+                message: error.serverMessage
+                    ?? "Function '\(functionKey)': this call asked for a runner the function's mode does not allow.",
+                details: ["functionKey": .string(functionKey)]
+            )
+        }
     }
+
+    /// The server's stable code for the wrong verb on a locked function.
+    private static let modeMismatchCode = "FUNCTION_MODE_MISMATCH"
 
     /// Encode a typed input into the JSON value it produces — any JSON type,
     /// not just an object — for the `rootInput` slot. `nil` means "no
@@ -493,9 +520,14 @@ private struct FunctionRouteEnvelope: Decodable, Sendable {
     let runKey: String?
     let instanceId: String?
     let existing: Bool?
+    /// #3448 — the invocation-log record's id. Decoded HERE, because this is
+    /// what the wire is read into: a field added only to the public structs
+    /// would be published in the type and `nil` on every real call.
+    let invocationId: String?
 
     private enum CodingKeys: String, CodingKey {
         case status, output, error, errorCode, limits, runId, runKey, instanceId, existing
+        case invocationId
     }
 
     init(from decoder: Decoder) throws {
@@ -518,5 +550,6 @@ private struct FunctionRouteEnvelope: Decodable, Sendable {
         runKey = try c.decodeIfPresent(String.self, forKey: .runKey)
         instanceId = try c.decodeIfPresent(String.self, forKey: .instanceId)
         existing = try c.decodeIfPresent(Bool.self, forKey: .existing)
+        invocationId = try c.decodeIfPresent(String.self, forKey: .invocationId)
     }
 }

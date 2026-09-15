@@ -282,6 +282,8 @@ public struct GeminiUsage: Decodable, Sendable, Equatable {
     public let promptTokens: Int?
     public let responseTokens: Int?
     public let totalTokens: Int?
+    /// #3358 — Gemini's thinking tokens, excluded from `responseTokens`.
+    public let reasoningTokens: Int?
 }
 
 /// Result of `generate`. Mirrors JS `GeminiGenerateResult`.
