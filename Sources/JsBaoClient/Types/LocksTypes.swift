@@ -41,6 +41,9 @@ public struct LockHandle: Codable, Sendable, Equatable {
 public struct LockContention: Sendable, Equatable {
     public let heldBy: String?
     public let holderKind: String?
+    /// The owner the HOLDER named, or `nil` for a hold made without one (#3562)
+    /// — what tells your own hold from another's.
+    public let owner: String?
     public let leaseExpiresAt: String?
     /// Suggested delay before retrying, in milliseconds.
     public let retryAfterMs: Int
@@ -48,11 +51,13 @@ public struct LockContention: Sendable, Equatable {
     public init(
         heldBy: String? = nil,
         holderKind: String? = nil,
+        owner: String? = nil,
         leaseExpiresAt: String? = nil,
         retryAfterMs: Int
     ) {
         self.heldBy = heldBy
         self.holderKind = holderKind
+        self.owner = owner
         self.leaseExpiresAt = leaseExpiresAt
         self.retryAfterMs = retryAfterMs
     }
@@ -69,6 +74,8 @@ public struct LockAcquireResponse: Decodable, Sendable, Equatable {
     public let handle: LockHandle?
     public let heldBy: String?
     public let holderKind: String?
+    /// The owner the HOLDER named, or `nil` for a hold made without one (#3562).
+    public let owner: String?
     public let leaseExpiresAt: String?
     /// Present when `acquired == false`; suggested retry delay in ms.
     public let retryAfterMs: Int?
@@ -79,13 +86,14 @@ public struct LockAcquireResponse: Decodable, Sendable, Equatable {
         return LockContention(
             heldBy: heldBy,
             holderKind: holderKind,
+            owner: owner,
             leaseExpiresAt: leaseExpiresAt,
             retryAfterMs: retryAfterMs ?? LocksAPI.defaultRetryAfterMs
         )
     }
 
     private enum CodingKeys: String, CodingKey {
-        case acquired, handle, heldBy, holderKind, leaseExpiresAt, retryAfterMs
+        case acquired, handle, heldBy, holderKind, owner, leaseExpiresAt, retryAfterMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -94,6 +102,9 @@ public struct LockAcquireResponse: Decodable, Sendable, Equatable {
         handle = try c.decodeIfPresent(LockHandle.self, forKey: .handle)
         heldBy = try c.decodeIfPresent(String.self, forKey: .heldBy)
         holderKind = try c.decodeIfPresent(String.self, forKey: .holderKind)
+        // `decodeIfPresent` throughout (#3562): a body from a server that
+        // predates the owner must decode exactly as it always did.
+        owner = try c.decodeIfPresent(String.self, forKey: .owner)
         leaseExpiresAt = try c.decodeIfPresent(String.self, forKey: .leaseExpiresAt)
         // Decoded through `Double` on purpose: the server computes this from a
         // date difference, so it is always integral, but a JSON number that
@@ -109,6 +120,7 @@ public struct LockAcquireResponse: Decodable, Sendable, Equatable {
         handle: LockHandle? = nil,
         heldBy: String? = nil,
         holderKind: String? = nil,
+        owner: String? = nil,
         leaseExpiresAt: String? = nil,
         retryAfterMs: Int? = nil
     ) {
@@ -116,6 +128,7 @@ public struct LockAcquireResponse: Decodable, Sendable, Equatable {
         self.handle = handle
         self.heldBy = heldBy
         self.holderKind = holderKind
+        self.owner = owner
         self.leaseExpiresAt = leaseExpiresAt
         self.retryAfterMs = retryAfterMs
     }
@@ -167,8 +180,11 @@ public struct LockStatus: Decodable, Sendable, Equatable {
     public let held: Bool
     public let heldBy: String?
     public let holderKind: String?
-    /// `WorkflowRun.runId` when the holder is a workflow; `nil` for user holds.
+    /// `WorkflowRun.runId` when the holder is a workflow; the dispatch's run id
+    /// for a function's hold (#3562); `nil` for a member's own hold.
     public let holderRunId: String?
+    /// The owner the holder named, or `nil` (#3562).
+    public let owner: String?
     public let acquiredAt: String?
     public let leaseExpiresAt: String?
 
@@ -177,6 +193,7 @@ public struct LockStatus: Decodable, Sendable, Equatable {
         heldBy: String? = nil,
         holderKind: String? = nil,
         holderRunId: String? = nil,
+        owner: String? = nil,
         acquiredAt: String? = nil,
         leaseExpiresAt: String? = nil
     ) {
@@ -184,6 +201,7 @@ public struct LockStatus: Decodable, Sendable, Equatable {
         self.heldBy = heldBy
         self.holderKind = holderKind
         self.holderRunId = holderRunId
+        self.owner = owner
         self.acquiredAt = acquiredAt
         self.leaseExpiresAt = leaseExpiresAt
     }
@@ -195,6 +213,8 @@ public struct LockListEntry: Decodable, Sendable, Equatable {
     public let heldBy: String?
     public let holderKind: String?
     public let holderRunId: String?
+    /// The owner the holder named, or `nil` (#3562).
+    public let owner: String?
     public let acquiredAt: String?
     public let leaseExpiresAt: String?
 
@@ -203,6 +223,7 @@ public struct LockListEntry: Decodable, Sendable, Equatable {
         heldBy: String? = nil,
         holderKind: String? = nil,
         holderRunId: String? = nil,
+        owner: String? = nil,
         acquiredAt: String? = nil,
         leaseExpiresAt: String? = nil
     ) {
@@ -210,6 +231,7 @@ public struct LockListEntry: Decodable, Sendable, Equatable {
         self.heldBy = heldBy
         self.holderKind = holderKind
         self.holderRunId = holderRunId
+        self.owner = owner
         self.acquiredAt = acquiredAt
         self.leaseExpiresAt = leaseExpiresAt
     }
@@ -231,6 +253,27 @@ public struct LockListResult: Decodable, Sendable, Equatable {
 struct LockAcquireRequest: Encodable {
     let key: String
     let ttlMs: Int
+    /// #3562 — encoded ONLY when present, so a call that names no owner puts
+    /// byte for byte the body on the wire it always did. `encodeIfPresent` is
+    /// what makes that true: an `owner: nil` would otherwise be sent as null.
+    let owner: String?
+
+    init(key: String, ttlMs: Int, owner: String? = nil) {
+        self.key = key
+        self.ttlMs = ttlMs
+        self.owner = owner
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case key, ttlMs, owner
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(key, forKey: .key)
+        try c.encode(ttlMs, forKey: .ttlMs)
+        try c.encodeIfPresent(owner, forKey: .owner)
+    }
 }
 
 /// The `{ handleId }` object `release` / `renew` nest under `handle`.

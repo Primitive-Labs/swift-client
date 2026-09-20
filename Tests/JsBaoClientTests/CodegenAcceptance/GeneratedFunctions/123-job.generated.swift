@@ -9,7 +9,7 @@ public typealias _123JobInput = JSONValue
 
 public typealias _123JobOutput = JSONValue
 
-/// Typed invoker for the `123-job` task function. Binds
+/// Typed invoker for the `123-job` function. Binds
 /// `_123JobInput` / `_123JobOutput` over the generic
 /// `FunctionsAPI` overloads. Obtain one with `_123Job(client)`.
 public struct _123JobFunction: Sendable {
@@ -17,6 +17,22 @@ public struct _123JobFunction: Sendable {
 
     public init(client: JsBaoClient) {
         self.client = client
+    }
+
+    /// Invoke the `123-job` request function and wait for its result.
+    public func invoke(
+        input: _123JobInput? = nil,
+        contextDocId: String? = nil,
+        meta: [String: Any]? = nil,
+        timeout: TimeInterval? = nil
+    ) async throws -> FunctionResult<_123JobOutput> {
+        try await client.functions.invoke(
+            "123-job",
+            input: input,
+            contextDocId: contextDocId,
+            meta: meta,
+            timeout: timeout
+        )
     }
 
     /// Start the `123-job` task function; returns the run handle.
@@ -37,15 +53,15 @@ public struct _123JobFunction: Sendable {
     }
 
     /// A run's status, with `output` bound to `_123JobOutput`.
-    public func getStatus(runId: String) async throws -> WorkflowStatus<_123JobOutput> {
+    public func getStatus(runId: String) async throws -> FunctionRunResult<_123JobOutput> {
         try await client.functions.getStatus(runId: runId)
     }
 
     /// Wait for a run to settle; `output` is bound to `_123JobOutput`.
     public func waitFor(
         runId: String,
-        options: WaitForWorkflowOptions? = nil
-    ) async throws -> WaitForResult<_123JobOutput> {
+        options: FunctionWaitOptions? = nil
+    ) async throws -> FunctionRunResult<_123JobOutput> {
         try await client.functions.waitFor(
             runId: runId,
             as: _123JobOutput.self,
@@ -59,7 +75,7 @@ public struct _123JobFunction: Sendable {
     public func terminate(
         runKey: String,
         contextDocId: String? = nil
-    ) async throws -> WorkflowStatus<_123JobOutput> {
+    ) async throws -> FunctionRunResult<_123JobOutput> {
         try await client.functions.terminate(
             FunctionRunRef(
                 functionKey: "123-job",

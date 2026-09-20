@@ -31,6 +31,16 @@ public struct JsBaoClientOptions: Sendable {
     /// without explicit app calls (#963). Mirrors js-bao's
     /// `analyticsAutoEvents` option.
     public let analyticsAutoEvents: AnalyticsAutoEventsConfig
+    /// How much room this app will give a large document, and which models are
+    /// worth it when the device cannot hold the whole thing (#3437,
+    /// behavior 34). Mirrors js-bao's `largeDocumentStorage` option.
+    ///
+    /// `nil` — the default — probes the volume the client's database is on.
+    /// Configure `capability` to override that measurement, and `models` to
+    /// say what to keep when the document does not fit: with none named, a
+    /// device that cannot take the document is refused rather than capped,
+    /// because there is nothing to cap it to.
+    public let largeDocumentStorage: LargeDocumentStorageOptions?
 
     public init(
         apiUrl: String,
@@ -48,7 +58,8 @@ public struct JsBaoClientOptions: Sendable {
         sync: SyncConfig = SyncConfig(),
         commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff(),
         autoNetwork: Bool = true,
-        analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig()
+        analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
+        largeDocumentStorage: LargeDocumentStorageOptions? = nil
     ) {
         self.apiUrl = apiUrl
         self.wsUrl = wsUrl
@@ -66,6 +77,7 @@ public struct JsBaoClientOptions: Sendable {
         self.commitRetryBackoff = commitRetryBackoff
         self.autoNetwork = autoNetwork
         self.analyticsAutoEvents = analyticsAutoEvents
+        self.largeDocumentStorage = largeDocumentStorage
     }
 }
 
@@ -305,17 +317,31 @@ public struct CreateDocumentOptions: Encodable, Sendable {
     /// Opaque metadata blob to attach at creation (≤ 4 KB). The platform
     /// round-trips it verbatim — it does not introspect the value.
     public var metadata: JSONValue?
+    /// Create a LARGE document (`2`) instead of an ordinary one (#3436).
+    ///
+    /// A large document keeps its records in a persisted table on both ends
+    /// and carries only the current epoch's changes in its Y.Doc, so it scales
+    /// to far more data than an ordinary document — at the cost of needing
+    /// persistent on-device storage (`.sqlite`, not `.memory`). Named after
+    /// the REST field, and after the JS client's `documents.create({
+    /// documentFormat: 2 })`.
+    ///
+    /// `nil` — the default — sends nothing, so an ordinary create's request
+    /// body is exactly what it was before this option existed.
+    public var documentFormat: Int?
 
     public init(
         title: String? = nil,
         tags: [String]? = nil,
         localOnly: Bool = false,
-        metadata: JSONValue? = nil
+        metadata: JSONValue? = nil,
+        documentFormat: Int? = nil
     ) {
         self.title = title
         self.tags = tags
         self.localOnly = localOnly
         self.metadata = metadata
+        self.documentFormat = documentFormat
     }
 }
 

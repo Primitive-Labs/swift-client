@@ -1,5 +1,5 @@
 import XCTest
-@testable import SwiftBaoCodegen
+@testable import swift_bao_codegen
 
 final class TomlParserTests: XCTestCase {
 

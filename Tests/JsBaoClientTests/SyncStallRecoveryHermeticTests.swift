@@ -129,6 +129,14 @@ final class SyncStallRecoveryHermeticTests: XCTestCase {
     /// finds the document claimed and cannot start a cycle — the shape a claim
     /// left behind by an earlier cycle produces in the field. The caller
     /// releases the claim with `completePendingSyncOperation`.
+    ///
+    /// Returns the `syncStep1` count AS THE CLAIM WAS TAKEN, which is the only
+    /// baseline a "nothing escapes a held claim" assertion can be measured
+    /// against: the claim is taken by polling, so a re-armed retry that fires
+    /// in the window between the watchdog's release and the poll is a frame
+    /// sent while nothing was holding anything — true of the client before
+    /// this suite's subject as much as after it. Counting from before that
+    /// window would grade that frame as an escape, which it is not.
     private func stallWithHeldClaim(
         _ client: JsBaoClient,
         _ server: LoopbackWebSocketServer,
@@ -139,10 +147,15 @@ final class SyncStallRecoveryHermeticTests: XCTestCase {
         await waitUntil(5, "the syncStep1 under test") {
             self.syncStep1Count(server, docId) >= baseline + 1
         }
+        var heldFrom = baseline
         await waitUntil(5, "the watchdog to release the claim") {
-            !client.isSynced(docId) && client.documentManager.beginPendingSyncOperation(docId)
+            guard !client.isSynced(docId),
+                  client.documentManager.beginPendingSyncOperation(docId)
+            else { return false }
+            heldFrom = self.syncStep1Count(server, docId)
+            return true
         }
-        return baseline
+        return heldFrom
     }
 
     // MARK: - The retry chain keeps going until a cycle actually starts
@@ -164,13 +177,13 @@ final class SyncStallRecoveryHermeticTests: XCTestCase {
         try await makeCommittedOpenDocument(client, docId)
         try await quiesce()
 
-        let baseline = await stallWithHeldClaim(client, server, docId)
+        let heldFrom = await stallWithHeldClaim(client, server, docId)
 
         // While the claim is held, no syncStep1 can go out — the retries are
         // being refused.
         try await Task.sleep(nanoseconds: 1_200_000_000)
         XCTAssertEqual(
-            syncStep1Count(server, docId), baseline + 1,
+            syncStep1Count(server, docId), heldFrom,
             "precondition: a held claim refuses every retry attempt"
         )
 
@@ -179,7 +192,7 @@ final class SyncStallRecoveryHermeticTests: XCTestCase {
         client.documentManager.completePendingSyncOperation(docId)
 
         await waitUntil(5, "the retry chain to re-send syncStep1 on its own") {
-            self.syncStep1Count(server, docId) >= baseline + 2
+            self.syncStep1Count(server, docId) >= heldFrom + 1
         }
     }
 

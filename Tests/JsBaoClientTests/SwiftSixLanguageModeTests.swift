@@ -291,7 +291,15 @@ final class SwiftSixLanguageModeTests: XCTestCase {
     }
 
     /// And on the box never outliving the hop: it is created and consumed
-    /// inside `onQueue`, never stored.
+    /// inside the call that hops, never stored.
+    ///
+    /// The claim is that every use is a LOCAL — not that there is exactly one
+    /// of them. It used to be an exact list of the two lines that existed when
+    /// it was written, which made it fail the moment a second hopping method
+    /// was added (#3436's `withRawConnection`, itself a local use) for a
+    /// reason with nothing to do with the safety argument. What invalidates
+    /// that argument is a use that OUTLIVES the hop — a stored property, or an
+    /// assignment to one — and that is what this grades.
     func testQueueWorkIsNotStored() throws {
         let code = try ClientSourceText.code("Storage/SQLiteStorageProvider.swift")
         let uses = code
@@ -299,10 +307,23 @@ final class SwiftSixLanguageModeTests: XCTestCase {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { $0.contains("QueueWork") }
 
-        XCTAssertEqual(
-            uses.sorted(),
-            ["let work = QueueWork(run: work)", "private struct QueueWork<Output>: @unchecked Sendable {"],
-            "QueueWork must only be declared and used as a local inside onQueue — found: \(uses)"
+        XCTAssertFalse(uses.isEmpty, "the box is gone — has the hop changed shape?")
+        XCTAssertTrue(
+            uses.contains { $0.hasPrefix("private struct QueueWork<Output>: @unchecked Sendable") },
+            "the declaration must stay private and keep its written safety argument"
+        )
+        for use in uses {
+            if use.hasPrefix("private struct QueueWork") { continue }
+            if use.hasPrefix("//") || use.hasPrefix("///") || use.hasPrefix("*") { continue }
+            XCTAssertTrue(
+                use.hasPrefix("let work = QueueWork"),
+                "QueueWork must only be created as a local inside the method that hops; "
+                    + "a stored one would outlive the hop and void the claim — found: \(use)"
+            )
+        }
+        XCTAssertFalse(
+            code.contains("var work: QueueWork") || code.contains("self.work = QueueWork"),
+            "the box must never be stored on the provider"
         )
     }
 

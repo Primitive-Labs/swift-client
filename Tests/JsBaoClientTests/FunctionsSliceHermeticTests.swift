@@ -4,9 +4,10 @@ import XCTest
 /// The task run's `slice` block on the status envelope — #3388.
 ///
 /// `GET /workflows/runs/{runId}/status` carries `slice` beside `status` and
-/// `run` for a task run that has a record (#3381). The JS client publishes it
-/// as `WorkflowStatusResult.slice?`; these pin the same block, field for
-/// field, on the Swift result.
+/// `run` for a task run that has a record (#3381) — the route path is the
+/// wire's, not a statement about which client surface owns the block. These
+/// pin it field for field on the FUNCTIONS result, typed and untyped, and
+/// name no workflow type: that surface is being retired.
 ///
 /// Server-free: every method runs over a `RecordingTransport`, so what is
 /// asserted is the decode of exactly the bytes the route sends.
@@ -14,11 +15,7 @@ final class FunctionsSliceHermeticTests: XCTestCase {
 
     private func makeApi(json: String, status: Int = 200) -> (FunctionsAPI, RecordingTransport) {
         let transport = RecordingTransport(status: status, json: json)
-        return (FunctionsAPI(transport: transport, workflows: WorkflowsAPI(transport: transport)), transport)
-    }
-
-    private func makeWorkflows(json: String) -> WorkflowsAPI {
-        WorkflowsAPI(transport: RecordingTransport(status: 200, json: json))
+        return (FunctionsAPI(transport: transport), transport)
     }
 
     /// A settled task run, as the route answers it: the seven fields of the
@@ -81,23 +78,11 @@ final class FunctionsSliceHermeticTests: XCTestCase {
     func testTypedGetStatusForwardsTheSameSliceBlock() async throws {
         let (api, _) = makeApi(json: Self.settledTaskRun)
 
-        let typed: WorkflowStatus<One> = try await api.getStatus(runId: "run-1")
+        let typed: FunctionRunResult<One> = try await api.getStatus(runId: "run-1")
 
         XCTAssertEqual(typed.output, One(one: 1))
         XCTAssertEqual(typed.slice?.sliceId, "slice-abc")
         XCTAssertEqual(typed.slice?.refreshCount, 0)
-    }
-
-    /// A function run IS a run row: the same block rides the workflow status
-    /// routes the run can also be read through.
-    func testWorkflowsGetStatusCarriesTheBlockTypedAndUntyped() async throws {
-        let untyped = try await makeWorkflows(json: Self.settledTaskRun)
-            .getStatus(workflowKey: "fn", runKey: "rk-1")
-        XCTAssertEqual(untyped.slice?.sliceId, "slice-abc")
-
-        let typed: WorkflowStatus<One> = try await makeWorkflows(json: Self.settledTaskRun)
-            .getStatus(workflowKey: "fn", runKey: "rk-1")
-        XCTAssertEqual(typed.slice, untyped.slice)
     }
 
     // MARK: - Edge cases
@@ -203,5 +188,128 @@ final class FunctionsSliceHermeticTests: XCTestCase {
         XCTAssertNil(slice.settledStatus)
         XCTAssertNil(slice.lastRefreshAt)
         XCTAssertEqual(slice.refreshCount, 0)
+    }
+
+    // MARK: - #3566 — what reset this run, on the same block
+
+    /// A run a platform deploy reset twice and the engine then COMPLETED.
+    ///
+    /// This is the case the whole field exists for: the run succeeded, so
+    /// there is no failure and no `errorCode` anywhere — the count on this
+    /// block is the only place the two teardowns are visible from a client.
+    private static let resetTaskRun = """
+    {"status":{"status":"completed","output":{"one":1}},
+     "run":{"runId":"run-r","runKey":"rk-r","status":"completed"},
+     "slice":{"sliceId":"slice-xyz","startedAt":1757000600000,
+              "ceilingAt":1757043800000,"settledAt":1757000900000,
+              "settledStatus":"completed","lastRefreshAt":null,"refreshCount":0,
+              "resets":2,"lastResetAt":1757000500000,
+              "lastResetCause":"code-updated"}}
+    """
+
+    func testGetStatusCarriesTheResetCountInstantAndCause() async throws {
+        let (api, _) = makeApi(json: Self.resetTaskRun)
+
+        let status = try await api.getStatus(runId: "run-r")
+        let slice = try XCTUnwrap(status.slice)
+
+        XCTAssertEqual(status.status, "completed")
+        XCTAssertEqual(slice.resets, 2)
+        XCTAssertEqual(slice.lastResetAt, 1_757_000_500_000)
+        XCTAssertEqual(slice.lastResetCause, "code-updated")
+    }
+
+    /// The reset trio rides the typed overload too: the typed read is the
+    /// same read with `output` bound, so it must carry the block the untyped
+    /// read carries rather than dropping it on the way through.
+    func testTheResetFieldsRideTheTypedOverloadToo() async throws {
+        let (untypedApi, _) = makeApi(json: Self.resetTaskRun)
+        let untyped = try await untypedApi.getStatus(runId: "run-r")
+
+        let (typedApi, _) = makeApi(json: Self.resetTaskRun)
+        let typed: FunctionRunResult<One> = try await typedApi.getStatus(runId: "run-r")
+
+        XCTAssertEqual(typed.slice, untyped.slice)
+        XCTAssertEqual(typed.slice?.resets, 2)
+        XCTAssertEqual(typed.slice?.lastResetAt, 1_757_000_500_000)
+        XCTAssertEqual(typed.slice?.lastResetCause, "code-updated")
+    }
+
+    /// A settled run that was never reset still carries the count, at zero,
+    /// with both `lastReset*` fields null — the block's own shape, where every
+    /// key is present and an absent value is `null`.
+    func testARunThatWasNeverResetReadsZeroWithNullLastReset() async throws {
+        let (api, _) = makeApi(json: """
+        {"status":{"status":"completed"},
+         "run":{"runId":"run-z","runKey":"rk-z","status":"completed"},
+         "slice":{"sliceId":"slice-z","startedAt":1757000000000,
+                  "refreshCount":0,"resets":0,"lastResetAt":null,
+                  "lastResetCause":null}}
+        """)
+
+        let status = try await api.getStatus(runId: "run-z")
+        let slice = try XCTUnwrap(status.slice)
+
+        XCTAssertEqual(slice.resets, 0)
+        XCTAssertNil(slice.lastResetAt)
+        XCTAssertNil(slice.lastResetCause)
+    }
+
+    /// Edge E8, first half: a server that predates #3566 sends no `resets` at
+    /// all. That reads `0` and keeps the rest of the record — the same
+    /// tolerance `refreshCount` has.
+    func testAnAbsentOrNullResetCountReadsZeroAndKeepsTheBlock() async throws {
+        for tail in ["", #","resets":null"#, #","resets":null,"lastResetAt":null,"lastResetCause":null"#] {
+            let (api, _) = makeApi(json: """
+            {"status":{"status":"running"},
+             "run":{"runId":"run-8","runKey":"rk-8","status":"running"},
+             "slice":{"sliceId":"slice-mno","startedAt":1757000000000,
+                      "refreshCount":1\(tail)}}
+            """)
+
+            let status = try await api.getStatus(runId: "run-8")
+            let slice = try XCTUnwrap(status.slice)
+
+            XCTAssertEqual(slice.sliceId, "slice-mno")
+            XCTAssertEqual(slice.refreshCount, 1)
+            XCTAssertEqual(slice.resets, 0, "resets tail \(tail)")
+            XCTAssertNil(slice.lastResetAt)
+            XCTAssertNil(slice.lastResetCause)
+        }
+    }
+
+    /// Edge E8, second half: a count the client cannot read THROWS, which
+    /// drops the whole block. A fabricated `0` would read to the caller as
+    /// "the platform never reset this run", which is exactly the telemetry the
+    /// client does not have.
+    func testAMalformedResetFieldDropsTheBlockRatherThanInventingZero() async throws {
+        let malformedFields = [
+            #""resets":"two""#,
+            #""resets":{"count":2}"#,
+            #""lastResetAt":"soon""#,
+            #""lastResetCause":7"#,
+        ]
+        for field in malformedFields {
+            let (api, _) = makeApi(json: """
+            {"status":{"status":"completed"},
+             "run":{"runId":"run-9","runKey":"rk-9","status":"completed"},
+             "slice":{"sliceId":"slice-abc",\(field)}}
+            """)
+
+            let status = try await api.getStatus(runId: "run-9")
+
+            XCTAssertEqual(status.status, "completed", "slice \(field) must not break the read")
+            XCTAssertNil(status.slice, "slice \(field) is not a record the client can publish")
+        }
+    }
+
+    /// The memberwise initializer stays usable without naming the new fields,
+    /// so code that built one before this child still compiles (principle 5).
+    func testTheInitializerDefaultsTheNewFields() {
+        let slice = FunctionRunSlice(sliceId: "slice-init")
+
+        XCTAssertEqual(slice.resets, 0)
+        XCTAssertNil(slice.lastResetAt)
+        XCTAssertNil(slice.lastResetCause)
     }
 }

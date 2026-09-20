@@ -399,15 +399,60 @@ final class TestContext: @unchecked Sendable {
 
     // MARK: - Private HTTP Helpers
 
+    /// Mint a test JWT, waiting out the membership the caller just wrote.
+    ///
+    /// `createTestUser` adds the member and mints in the next breath, and the
+    /// mint route answers the question with its own point read of `AppUser`
+    /// (`src/admin-api.ts`). Under load that read can still be the state
+    /// before the add, and the setup dies with
+    /// `HTTP 400 … User is not a member of this app` — a failure in a helper,
+    /// reported against whichever suite happened to call it. It is not
+    /// hypothetical: #3183 hit it as a non-ok `add-by-email`, it failed
+    /// `InvitationTests` on 2026-09-16 and `InterleavedTests` on 2026-09-17,
+    /// and on 2026-09-17 it failed `LifecycleTests` — inside a full-package
+    /// run, where the two seconds this used to wait were not enough. Each time
+    /// it passed alone, and each time it cost a checkpoint replay.
+    ///
+    /// `createTestApp` makes it likelier than the doc above suggests: every app
+    /// names the same super-admin email, so the OWNER is one long-lived user
+    /// reused across apps and it is the new app's membership row, not the user,
+    /// that the mint is waiting for.
+    ///
+    /// So the wait is bounded and narrow: only that refusal is retried, only
+    /// for ten seconds — enough for the load a whole-package run puts on the
+    /// dev server, which is where this last bit — and the server's own error is
+    /// what surfaces if the membership never appears. A user who genuinely is
+    /// not a member still fails, with the same message, and the wait it sat
+    /// through is named so the next reader can tell the two apart.
+    private static let mintMembershipWait: TimeInterval = 10
+    private static let mintRetryInterval: TimeInterval = 0.2
+
     private func mintTestJwt(appId: String, userId: String, role: String) async throws -> String {
-        let result = try await adminPost(
-            "/admin/api/apps/\(appId)/users/\(userId)/mint-test-jwt",
-            body: ["role": role]
-        )
-        guard let token = result["token"] as? String else {
-            throw TestSetupError("Failed to mint JWT: missing token in response \(result)")
+        var lastError: Error?
+        let attempts = Int(Self.mintMembershipWait / Self.mintRetryInterval)
+        for _ in 0..<attempts {
+            do {
+                let result = try await adminPost(
+                    "/admin/api/apps/\(appId)/users/\(userId)/mint-test-jwt",
+                    body: ["role": role]
+                )
+                guard let token = result["token"] as? String else {
+                    throw TestSetupError("Failed to mint JWT: missing token in response \(result)")
+                }
+                return token
+            } catch let error as TestSetupError
+                where error.message.contains("User is not a member of this app") {
+                lastError = error
+                try await Task.sleep(
+                    nanoseconds: UInt64(Self.mintRetryInterval * 1_000_000_000)
+                )
+            }
         }
-        return token
+        throw TestSetupError(
+            "Failed to mint a JWT for \(userId) in \(appId) after "
+                + "\(Int(Self.mintMembershipWait))s of waiting for the membership: "
+                + "\((lastError as? TestSetupError)?.message ?? "no answer")"
+        )
     }
 
     /// Mint a server-signed refresh token for an existing app user via the
@@ -448,8 +493,14 @@ final class TestContext: @unchecked Sendable {
         try await adminRequest(method: "PUT", path: "/admin/api/apps/\(appId)", body: fields)
     }
 
+    /// #3449 — internal rather than private, so a suite can reach an admin
+    /// route this context has no bespoke helper for. `createTestApp`,
+    /// `createTestUser` and `pushFunction` cover the routes suites have needed
+    /// so far; a failed DSL durable run needs a published workflow, and adding
+    /// a one-caller `createWorkflow` helper here would be a second door to the
+    /// same admin API.
     @discardableResult
-    private func adminPost(_ path: String, body: [String: Any]) async throws -> [String: Any] {
+    func adminPost(_ path: String, body: [String: Any]) async throws -> [String: Any] {
         try await adminRequest(method: "POST", path: path, body: body)
     }
 

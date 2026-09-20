@@ -21,7 +21,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
     private static let noInput: JSONValue? = nil
 
     private func makeApi(_ transport: RecordingTransport) -> FunctionsAPI {
-        FunctionsAPI(transport: transport, workflows: WorkflowsAPI(transport: transport))
+        FunctionsAPI(transport: transport)
     }
 
     private func makeApi(json: String, status: Int = 200) -> (FunctionsAPI, RecordingTransport) {
@@ -314,7 +314,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
 
     // MARK: - Behavior 6: start
 
-    func testStartPostsTheSameRouteWithRunKeyAndNoTimeoutMsAndDecodesTheStartEnvelope() async throws {
+    func testStartPostsTheStartRouteWithRunKeyAndNoTimeoutMsAndDecodesTheStartEnvelope() async throws {
         let (api, transport) = makeApi(json: Self.startEnvelope)
         let started = try await api.start(
             "order-sync",
@@ -325,8 +325,10 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         )
         let call = try XCTUnwrap(transport.lastCall)
         XCTAssertEqual(call.method, .post)
-        XCTAssertEqual(call.path, "/functions/order-sync")
+        // #3482 — the ROUTE is the runtime selector: `start` posts to `/start`.
+        XCTAssertEqual(call.path, "/functions/order-sync/start")
         let body = try XCTUnwrap(call.jsonBody)
+        XCTAssertNil(body["mode"], "the body field is deprecated; the route says it")
         XCTAssertEqual(body["rootInput"], ["orderId": "o-1"])
         XCTAssertEqual(body["runKey"], "order-o-1")
         XCTAssertEqual(body["contextDocId"], "doc-1")
@@ -350,7 +352,13 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(replayed.output?["doubled"]?.numberValue, 42)
     }
 
-    // MARK: - Behavior 7: the mode check
+    // MARK: - Behavior 7: the envelope-shape backstop (#3482 retarget)
+    //
+    // These refused the wrong verb on a LOCKED version. There are no locks —
+    // the route says which runtime a call means and every function takes both
+    // — so what they pin now is the backstop against a server that PREDATES
+    // the routes, where one route's body field decided what it answered
+    // (D3482-008). A current server cannot produce either shape.
 
     func testInvokeOnAStartEnvelopeThrowsFunctionModeMismatchWithTheRunId() async throws {
         let (api, _) = makeApi(json: Self.startEnvelope)
@@ -395,7 +403,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(status.output?["doubled"]?.numberValue, 42)
         XCTAssertEqual(status.run?.runKey, "rk-1")
 
-        let typed: WorkflowStatus<[String: Int]> = try await api.getStatus(runId: "run/1")
+        let typed: FunctionRunResult<[String: Int]> = try await api.getStatus(runId: "run/1")
         XCTAssertEqual(typed.output, ["doubled": 42])
     }
 
@@ -431,7 +439,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         _ = try await api.terminate(FunctionRunRef(functionKey: "order-sync", runKey: "rk-2"))
         XCTAssertEqual(transport.lastCall?.path, "/workflows/order-sync/instances/rk-2/terminate")
 
-        let typed: WorkflowStatus<[String: Int]> = try await api.terminate(
+        let typed: FunctionRunResult<[String: Int]> = try await api.terminate(
             FunctionRunRef(functionKey: "order-sync", runKey: "rk-2")
         )
         XCTAssertEqual(typed.status, "terminated")

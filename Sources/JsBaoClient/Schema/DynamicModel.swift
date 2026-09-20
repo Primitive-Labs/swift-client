@@ -97,6 +97,32 @@ public final class DynamicModel: @unchecked Sendable {
     public var inspectionTableName: String {
         BaoModelQueryEngine.sanitizeTableName(schema.name)
     }
+    /// The store this model's records live in when the document is a LARGE
+    /// one (#3436). `nil` — the ordinary case — means the records are nested
+    /// Y.Maps in `doc`, and every path below reads and writes them directly.
+    ///
+    /// Guarded by `observerLock`, and written once by `bindFormat2` before the
+    /// member is handed to anyone.
+    private var format2Storage: Format2ModelDelegate?
+
+    /// The large-document delegate, or `nil` for an ordinary document.
+    var format2: Format2ModelDelegate? { observerLock.withLock { format2Storage } }
+
+    /// Point this member at a large document's record store. Called by the
+    /// client right after `connect`, for a document the open resolved as
+    /// format 2.
+    func bindFormat2(_ binding: Format2DocumentBinding) {
+        let delegate = Format2ModelDelegate(binding: binding, schema: schema)
+        observerLock.withLock { format2Storage = delegate }
+        // A large document's records are flat overlay keys, not nested Y.Maps,
+        // so the root-map and per-record observers that carry a peer's edit to
+        // `subscribe` on an ordinary document never fire here. The fold is what
+        // knows a remote change landed, so it is what tells them.
+        binding.onFolded(model: schema.name) { [weak self] in
+            self?.notifyListeners()
+        }
+    }
+
     /// Doc-level `observe_update_v1` handle, kept so `deinit` can cancel it.
     /// Guarded by `observerLock` like the other subscription handles — it was
     /// previously assigned in `init` and cancelled in `deinit` with no lock at
@@ -294,6 +320,24 @@ public final class DynamicModel: @unchecked Sendable {
     ///   all-or-nothing must track and undo manually.
     @discardableResult
     public func transact<T>(_ body: () throws -> T) throws -> T {
+        // #3436 — a large document's writes do not go through a yrs
+        // transaction opened here, and opening one would be fatal rather than
+        // merely useless: the format-2 write path reads the overlay and
+        // publishes into it through `transactSync`, which traps by
+        // `dispatchPrecondition` when it is already on the document's own
+        // transaction queue. So a perfectly ordinary
+        // `model.transact { try model.create(…) }` would kill the process.
+        //
+        // Nothing is lost by running the body directly. What `transact` buys a
+        // format-1 model — one commit, uniqueness that sees the batch, one
+        // notification — a large document already has per write: each write is
+        // its own serialized operation that checks uniqueness against the
+        // merged view and commits before it publishes. The one property that
+        // does NOT carry over is batching, and yrs does not roll back either,
+        // so neither layout ever offered all-or-nothing.
+        if format2 != nil {
+            return try body()
+        }
         // Nested transact on the same doc: reuse the outer tx, no new
         // commit. A transact on a *different* doc opens its own.
         if activeTx != nil {
@@ -572,6 +616,25 @@ public final class DynamicModel: @unchecked Sendable {
         values: [String: PrimitiveValue],
         changedFields: Set<String>? = nil
     ) throws -> PrimitiveRecord {
+        // #3436 — a large document has no nested record maps, so the
+        // insert-vs-update decision is read from the merged view and the write
+        // goes through the record store. This is the path the GENERATED models
+        // take (`CodegenAPI.save(in:)` → `MultiDocModel.save` → here), so it
+        // has to route exactly as `create`/`update` do — a save that fell
+        // through to `applyWriteInternal` would write format-1 nested maps into
+        // a format-2 overlay, leaving no merged row and no pending op.
+        //
+        // `isUpdate: nil` — the decision is made INSIDE the document's
+        // operation, against the merged view, so it cannot race a concurrent
+        // local write. That is what the nested-map path below gets for free
+        // from reading the record map inside its own transaction.
+        if let format2 {
+            try applyWriteFormat2(
+                format2, id: id, values: values,
+                isUpdate: nil, changedFields: changedFields
+            )
+            return PrimitiveRecord(modelName: schema.name, id: id, model: self)
+        }
         try withThrowingTx { [self] txn in
             let root = txn.transactionGetOrInsertMap(name: self.schema.name)
             let isUpdate = root.getMap(tx: txn, key: id) != nil
@@ -621,6 +684,19 @@ public final class DynamicModel: @unchecked Sendable {
                 field: fieldName, modelName: schema.name,
                 limit: maxLen, member: member
             )
+        }
+        // #3436 — a large document keeps its members in the store's member
+        // index, not in a nested Y.Map, so the lookup below would report
+        // `notFound` for a record this document holds and can read. One member
+        // is a `patch` carrying one stringset delta: the same CRDT-friendly
+        // union as the nested map's single `insert`, because an overlay member
+        // key is per member.
+        if let format2 {
+            try format2.addMember(
+                id: id, field: fieldName, member: member, maxCount: desc.maxCount
+            )
+            notifyListenersAfterWrite()
+            return
         }
         try withThrowingTx { tx in
             guard let root = tx.transactionGetOrInsertMap(name: schema.name)
@@ -680,6 +756,13 @@ public final class DynamicModel: @unchecked Sendable {
                 code: .invalidArgument,
                 message: "Field `\(fieldName)` is type `\(desc.type)`, not stringset"
             )
+        }
+        // The large-document half, for the same reason as the add above.
+        if let format2 {
+            guard try format2.removeMember(id: id, field: fieldName, member: member)
+            else { return }
+            notifyListenersAfterWrite()
+            return
         }
         try withThrowingTx { tx in
             guard let root = tx.transactionGetOrInsertMap(name: schema.name)
@@ -798,55 +881,64 @@ public final class DynamicModel: @unchecked Sendable {
         var resolved: Result<(id: String, wasCreated: Bool), Error> =
             .success((id: "", wasCreated: false))
 
-        withTx { [self] txn in
-            let indexMap = txn.transactionGetOrInsertMap(
-                name: UniqueIndex.mapName(
-                    modelName: self.schema.name,
-                    constraintName: constraint.name
+        // #3436 — a large document keeps no `_uniqueIdx_*` map: the write path
+        // checks uniqueness against the merged view, because an index map
+        // cannot hold a document of this size. Reading one here would find it
+        // empty for EVERY value, take the insert path, and then be refused by
+        // that same merged-view check — so upserting an existing value threw a
+        // uniqueness violation instead of updating the record it names.
+        let resolveExisting: () -> String? = { [self] in
+            if let format2 {
+                return try? format2.findId(fields: [field], values: [fieldValue])
+            }
+            return withTx { txn in
+                let indexMap = txn.transactionGetOrInsertMap(
+                    name: UniqueIndex.mapName(
+                        modelName: self.schema.name,
+                        constraintName: constraint.name
+                    )
                 )
-            )
-            let existing: String? = {
                 guard let raw = try? indexMap.get(tx: txn, key: key),
                       let s = PrimitiveValue.decodeJsonString(raw) else { return nil }
                 return s
-            }()
-
-            if let existingId = existing {
-                // Merge path. JS `save({ upsertOn })` matches by the unique
-                // field and updates the existing record — the existing id
-                // wins. JS throws its upsertOn-conflict error ONLY when the
-                // caller pinned an explicit id that differs from the match
-                // (`_constructorProvidedId && this.id !== existingId`); an
-                // auto-generated id is silently discarded. We mirror that
-                // exactly via the `explicitId` provenance flag.
-                if explicitId, let supplied = id, supplied != existingId {
-                    resolved = .failure(
-                        UpsertError.explicitIdConflict(
-                            supplied: supplied, existing: existingId
-                        )
-                    )
-                } else {
-                    resolved = .success((id: existingId, wasCreated: false))
-                }
-            } else {
-                // Insert path. Resolve the id: caller-supplied > schema
-                // default generator > fallback ULID.
-                let newId: String
-                if let supplied = id {
-                    newId = supplied
-                } else if let suppliedId = values["id"]?.asId
-                          ?? values["id"]?.asString {
-                    newId = suppliedId
-                } else if let def = self.schema.fields["id"]?.default,
-                          case let .function(name) = def,
-                          let gen = PrimitiveSchemaRegistry.shared.resolve(name),
-                          let generated = gen().asString {
-                    newId = generated
-                } else {
-                    newId = PrimitiveSchemaRegistry.generateULID()
-                }
-                resolved = .success((id: newId, wasCreated: true))
             }
+        }
+
+        if let existingId = resolveExisting() {
+            // Merge path. JS `save({ upsertOn })` matches by the unique
+            // field and updates the existing record — the existing id
+            // wins. JS throws its upsertOn-conflict error ONLY when the
+            // caller pinned an explicit id that differs from the match
+            // (`_constructorProvidedId && this.id !== existingId`); an
+            // auto-generated id is silently discarded. We mirror that
+            // exactly via the `explicitId` provenance flag.
+            if explicitId, let supplied = id, supplied != existingId {
+                resolved = .failure(
+                    UpsertError.explicitIdConflict(
+                        supplied: supplied, existing: existingId
+                    )
+                )
+            } else {
+                resolved = .success((id: existingId, wasCreated: false))
+            }
+        } else {
+            // Insert path. Resolve the id: caller-supplied > schema
+            // default generator > fallback ULID.
+            let newId: String
+            if let supplied = id {
+                newId = supplied
+            } else if let suppliedId = values["id"]?.asId
+                      ?? values["id"]?.asString {
+                newId = suppliedId
+            } else if let def = self.schema.fields["id"]?.default,
+                      case let .function(name) = def,
+                      let gen = PrimitiveSchemaRegistry.shared.resolve(name),
+                      let generated = gen().asString {
+                newId = generated
+            } else {
+                newId = PrimitiveSchemaRegistry.generateULID()
+            }
+            resolved = .success((id: newId, wasCreated: true))
         }
 
         let outcome = try resolved.get()
@@ -873,6 +965,13 @@ public final class DynamicModel: @unchecked Sendable {
     // MARK: - Read
 
     public func find(id: String) -> PrimitiveRecord? {
+        // #3436 — a large document's records are in its store, not in nested
+        // maps. A fold that is known broken refuses here rather than handing
+        // back a handle onto rows that are wrong.
+        if let format2 {
+            guard (try? format2.exists(id: id)) == true else { return nil }
+            return PrimitiveRecord(modelName: schema.name, id: id, model: self)
+        }
         let exists = withTx { [self] txn in
             let root = txn.transactionGetMap(name: self.schema.name)
             return root?.getMap(tx: txn, key: id) != nil
@@ -881,6 +980,11 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     public func findAll() -> [PrimitiveRecord] {
+        if let format2 {
+            return ((try? format2.allIds()) ?? []).map {
+                PrimitiveRecord(modelName: schema.name, id: $0, model: self)
+            }
+        }
         return withTx { [self] txn in
             guard let root = txn.transactionGetMap(name: self.schema.name) else { return [] }
             let collector = KeyCollector()
@@ -899,6 +1003,9 @@ public final class DynamicModel: @unchecked Sendable {
     /// the root-map observer. We drain that queue before reading so
     /// callers always see the latest state.
     public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [[String: JSONValue]] {
+        // #3436 — a large document's records are not in this engine's mirror;
+        // they are in the query tables its own store projects into.
+        if let format2 { return try format2.query(filter: filter, options: options) }
         awaitObserverDrain()
         return try queryEngine.query(
             modelName: schema.name, filter: filter, options: options,
@@ -926,12 +1033,7 @@ public final class DynamicModel: @unchecked Sendable {
         options: QueryOptions? = nil,
         include: [Include]
     ) throws -> [[String: JSONValue]] {
-        awaitObserverDrain()
-        var rows = try queryEngine.query(
-            modelName: schema.name, filter: filter, options: options,
-            scopedToDocId: docId,
-            stringsetFields: stringsetFieldNames
-        )
+        var rows = try query(filter, options: options)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
         return rows
     }
@@ -946,12 +1048,7 @@ public final class DynamicModel: @unchecked Sendable {
         options: QueryOptions? = nil,
         include: [Include]
     ) throws -> PagedQueryResult<PrimitiveRow> {
-        awaitObserverDrain()
-        let base = try queryEngine.queryPaged(
-            modelName: schema.name, filter: filter, options: options,
-            scopedToDocId: docId,
-            stringsetFields: stringsetFieldNames
-        )
+        let base = try format2Paged(filter: filter, options: options)
         // Unwrap → resolve includes (which mutates the rows in place) → rewrap.
         var rows = base.data.map(\.raw)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
@@ -971,6 +1068,14 @@ public final class DynamicModel: @unchecked Sendable {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
     ) throws -> PagedQueryResult<PrimitiveRow> {
+        try format2Paged(filter: filter, options: options)
+    }
+
+    /// One page, from whichever store holds this document's records.
+    private func format2Paged(
+        filter: DocumentFilter?, options: QueryOptions?
+    ) throws -> PagedQueryResult<PrimitiveRow> {
+        if let format2 { return try format2.queryPaged(filter: filter, options: options) }
         awaitObserverDrain()
         return try queryEngine.queryPaged(
             modelName: schema.name, filter: filter, options: options,
@@ -980,6 +1085,7 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     public func count(_ filter: DocumentFilter? = nil) throws -> Int {
+        if let format2 { return try format2.count(filter: filter) }
         awaitObserverDrain()
         return try queryEngine.count(
             modelName: schema.name, filter: filter, scopedToDocId: docId,
@@ -988,6 +1094,7 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
+        if let format2 { return try format2.aggregate(options) }
         awaitObserverDrain()
         return try queryEngine.aggregate(
             modelName: schema.name, options: options, scopedToDocId: docId,
@@ -1089,7 +1196,26 @@ public final class DynamicModel: @unchecked Sendable {
 
     /// Look up the existing record id for a precomputed constraint key
     /// inside this doc, or `nil`. Used by the cross-doc search.
-    func existingRecordId(constraintName name: String, key: String) -> String? {
+    ///
+    /// - Parameter orderedValues: the constraint's values in field order. A
+    ///   large document has no `_uniqueIdx_*` map to look a KEY up in — it asks
+    ///   the merged view for the row holding those values (#3436) — so a caller
+    ///   that wants an answer from one has to pass them. Without them a large
+    ///   document answers `nil`, which is "no owner here".
+    func existingRecordId(
+        constraintName name: String,
+        key: String,
+        orderedValues: [PrimitiveValue]? = nil
+    ) -> String? {
+        if let format2 {
+            guard let orderedValues,
+                  let constraint = schema.resolvedUniqueConstraints
+                    .first(where: { $0.name == name })
+            else { return nil }
+            return try? format2.findId(
+                fields: constraint.fields, values: orderedValues
+            )
+        }
         var existingId: String?
         withTx { [self] txn in
             let indexMap = txn.transactionGetOrInsertMap(
@@ -1196,7 +1322,10 @@ public final class DynamicModel: @unchecked Sendable {
             id, data: data, modelName: schema.name
         )
 
-        let existingId = existingRecordId(constraintName: name, key: key)
+        let existingId = existingRecordId(
+            constraintName: name, key: key,
+            orderedValues: constraint.fields.compactMap { data[$0] }
+        )
 
         switch mode {
         case .mustExist where existingId == nil:
@@ -1367,6 +1496,17 @@ public final class DynamicModel: @unchecked Sendable {
             )
         }
 
+        // #3436 — a large document keeps no `_uniqueIdx_*` map: the merged view
+        // answers the uniqueness question, which is also what its write path
+        // checks against. Looking in the index map would miss every record the
+        // format-2 path ever wrote.
+        if let format2 {
+            guard let id = try format2.findId(
+                fields: constraint.fields, values: values
+            ) else { return nil }
+            return find(id: id)
+        }
+
         // Pair positional values with field names to reuse the
         // canonical key builder.
         var valueDict: [String: PrimitiveValue] = [:]
@@ -1395,6 +1535,18 @@ public final class DynamicModel: @unchecked Sendable {
     // MARK: - Delete
 
     public func delete(id: String) {
+        if let format2 {
+            // The tombstone is a write like any other: it commits with a
+            // pending op and then publishes, so the server learns of it.
+            //
+            // This verb cannot throw, so a refusal past the offline window has
+            // no caller to reach: `quietly` reports it as
+            // `DocumentWriteRefusedEvent` and logs one line (#3437,
+            // behavior 2a). Every other error is swallowed as `try?` did.
+            format2.quietly(recordId: id) { try format2.delete(id: id) }
+            notifyListenersAfterWrite()
+            return
+        }
         withTx { [self] txn in
             // Clean up the unique indexes first so their entries drop
             // along with the record — otherwise a subsequent create
@@ -1438,6 +1590,16 @@ public final class DynamicModel: @unchecked Sendable {
         isUpdate: Bool,
         changedFields: Set<String>? = nil
     ) throws {
+        // #3436 — a large document has no nested record maps to write into.
+        // The same save, decided the same way, commits to the record store and
+        // publishes overlay keys instead.
+        if let format2 {
+            try applyWriteFormat2(
+                format2, id: id, values: newValues,
+                isUpdate: isUpdate, changedFields: changedFields
+            )
+            return
+        }
         try withThrowingTx { [self] txn in
             try self.applyWriteInternal(
                 id: id,
@@ -1477,7 +1639,6 @@ public final class DynamicModel: @unchecked Sendable {
             )
         }
 
-        var newValues = values
         let root = txn.transactionGetOrInsertMap(name: self.schema.name)
 
         // Read existing record (if any) WITHOUT creating it —
@@ -1488,6 +1649,140 @@ public final class DynamicModel: @unchecked Sendable {
             self.snapshotFromMap(rec: $0, tx: txn)
         } ?? [:]
 
+        // Everything from here to the dirty check is about the RECORD, not
+        // about the layout it is stored in — narrowing, auto-stamps,
+        // defaults, validation, bounds — so a large document's write path
+        // runs exactly the same code (#3436).
+        guard let prepared = try preparedWrite(
+            id: id, values: values, isUpdate: isUpdate,
+            changedFields: changedFields, oldData: oldData
+        ) else { return }
+        let dataToSave = prepared.dataToSave
+        let newValues = prepared.changes
+
+        // Validation passed — now it's safe to materialize the nested
+        // record map.
+        let rec = existing ?? root.insertMap(tx: txn, key: id)
+
+        // Pre-flight: enforce every resolved unique constraint.
+        for constraint in self.schema.resolvedUniqueConstraints {
+            guard let newKey = UniqueIndex.buildKey(
+                fields: constraint.fields,
+                values: dataToSave
+            ) else { continue } // null-values → not enforced
+            let indexMap = txn.transactionGetOrInsertMap(
+                name: UniqueIndex.mapName(
+                    modelName: self.schema.name,
+                    constraintName: constraint.name
+                )
+            )
+            if let existing = try? indexMap.get(tx: txn, key: newKey),
+               let owner = PrimitiveValue.decodeJsonString(existing),
+               owner != id {
+                throw UniqueConstraintViolationError(
+                    modelName: self.schema.name,
+                    constraintName: constraint.name,
+                    fields: constraint.fields,
+                    attemptedRecordId: id,
+                    existingRecordId: owner
+                )
+            }
+        }
+
+        // Apply id (only needed on create; idempotent on update).
+        rec.insert(tx: txn, key: "id",
+                   value: PrimitiveValue.jsonEncodeString(id))
+
+        // Write the requested field changes. (If this is a create we
+        // also need to write any defaulted fields from dataToSave that
+        // weren't in newValues.)
+        var toWrite = newValues
+        if !isUpdate {
+            for (k, v) in dataToSave where toWrite[k] == nil {
+                toWrite[k] = v
+            }
+        }
+        for (fieldName, value) in toWrite where fieldName != "id" {
+            self.writeValue(rec, fieldName: fieldName, value: value, tx: txn)
+        }
+
+        // Reconcile unique-index entries:
+        //   - for each constraint, delete the old key if it changed
+        //   - set the new key → this.id
+        for constraint in self.schema.resolvedUniqueConstraints {
+            let indexMap = txn.transactionGetOrInsertMap(
+                name: UniqueIndex.mapName(
+                    modelName: self.schema.name,
+                    constraintName: constraint.name
+                )
+            )
+            let oldKey = UniqueIndex.buildKey(
+                fields: constraint.fields,
+                values: oldData
+            )
+            let newKey = UniqueIndex.buildKey(
+                fields: constraint.fields,
+                values: dataToSave
+            )
+            if let oldKey, oldKey != newKey {
+                _ = try? indexMap.remove(tx: txn, key: oldKey)
+            }
+            if let newKey {
+                indexMap.insert(
+                    tx: txn,
+                    key: newKey,
+                    value: PrimitiveValue.jsonEncodeString(id)
+                )
+            }
+        }
+
+        // --- SQLite mirror: direct incremental write --------------
+        // Keeps the mirror synchronously consistent with the Y.Map
+        // after every local write. The root-map observer will ALSO
+        // fire asynchronously (same commit → queued re-upsert), but
+        // that's idempotent. This direct call is what makes queries
+        // immediately after a write see the new state without waiting
+        // for the observer queue to drain.
+        //
+        // For new records we also install the per-record observer
+        // here so future field changes reach SQLite via the observer
+        // pipeline too.
+        if !isUpdate {
+            self.installRecordObserverUnlocked(id: id, rootMap: root, tx: txn)
+        }
+        self.upsertSqliteRow(id: id, rootMap: root, tx: txn)
+        // applyWriteInternal always runs inside the write transaction —
+        // the notification is queued and delivered by the transaction
+        // wrapper after the yrs commit (#1116).
+        self.notifyListenersAfterWrite()
+    }
+
+    /// What a write resolves to, before anything is stored.
+    struct PreparedWrite {
+        /// The record's whole post-write state: what was persisted, plus the
+        /// caller's changes, plus stamps and defaults.
+        let dataToSave: [String: PrimitiveValue]
+        /// Just the fields this write actually writes.
+        let changes: [String: PrimitiveValue]
+    }
+
+    /// Narrow, stamp, default, validate — everything a write decides about a
+    /// RECORD, with no reference to how the record is stored.
+    ///
+    /// Shared by the nested-map path and a large document's store path
+    /// (#3436): the two layouts differ in where a record lives, not in what a
+    /// save means, and a second copy of this would be a second answer to
+    /// "does this save pass validation".
+    ///
+    /// - Returns: `nil` when the dirty check finds nothing to do.
+    private func preparedWrite(
+        id: String,
+        values: [String: PrimitiveValue],
+        isUpdate: Bool,
+        changedFields: Set<String>?,
+        oldData: [String: PrimitiveValue]
+    ) throws -> PreparedWrite? {
+        var newValues = values
         // Stage 1 of js-bao's two-stage narrowing — `_localChanges` (#2459).
         // Keep only the fields the caller actually assigned. `nil` means the
         // caller supplied no tracking information, so every supplied value
@@ -1650,104 +1945,135 @@ public final class DynamicModel: @unchecked Sendable {
         // pure no-op update of an `auto_stamp = "create"`-only model
         // stays clean (create doesn't fire on update) and is skipped.
         if isUpdate, dataToSave == oldData {
-            return
+            return nil
         }
 
-        // Validation passed — now it's safe to materialize the nested
-        // record map.
-        let rec = existing ?? root.insertMap(tx: txn, key: id)
 
-        // Pre-flight: enforce every resolved unique constraint.
-        for constraint in self.schema.resolvedUniqueConstraints {
-            guard let newKey = UniqueIndex.buildKey(
-                fields: constraint.fields,
-                values: dataToSave
-            ) else { continue } // null-values → not enforced
-            let indexMap = txn.transactionGetOrInsertMap(
-                name: UniqueIndex.mapName(
-                    modelName: self.schema.name,
-                    constraintName: constraint.name
-                )
+        return PreparedWrite(dataToSave: dataToSave, changes: newValues)
+    }
+
+
+    // MARK: - Large documents (#3436)
+
+    /// The same save, against a large document's record store.
+    ///
+    /// Everything about the RECORD — narrowing, stamps, defaults, required
+    /// fields, stringset bounds, the dirty check — is decided by
+    /// `preparedWrite`, exactly as the nested-map path decides it. What
+    /// differs is where the result goes: one serialized operation that commits
+    /// the merged row and the pending op together and only then publishes the
+    /// overlay keys that send it (decision 3436-SO-01).
+    ///
+    /// The WHOLE of it runs under the document's operation lock, not just the
+    /// commit: reading the record's prior state, resolving the write, and
+    /// checking uniqueness against the merged view are all decisions about a
+    /// view another write can move. Serializing only the commit would let two
+    /// concurrent creates each find the same unique value free and then commit
+    /// one after the other — and the derived query tables carry ordinary
+    /// indexes, so nothing downstream would reject the second. The nested-map
+    /// path gets the same property from its single yrs transaction.
+    ///
+    /// - Parameter isUpdate: `nil` for `save`, which has no answer of its own:
+    ///   the insert-vs-update decision is read from the merged view INSIDE the
+    ///   operation, so it cannot race a concurrent local write.
+    private func applyWriteFormat2(
+        _ delegate: Format2ModelDelegate,
+        id: String,
+        values: [String: PrimitiveValue],
+        isUpdate requestedIsUpdate: Bool?,
+        changedFields: Set<String>?
+    ) throws {
+        guard !id.isEmpty else {
+            throw FieldValidationError.requiredFieldMissing(
+                field: "id", modelName: schema.name
             )
-            if let existing = try? indexMap.get(tx: txn, key: newKey),
-               let owner = PrimitiveValue.decodeJsonString(existing),
-               owner != id {
+        }
+        // Folds that have already landed are settled BEFORE the lock is taken.
+        // Inside the operation a fold cannot run — it wants this same lock — so
+        // a read in there answers from whatever the store held when the
+        // operation began; settling first is what makes that the current merged
+        // view rather than one an arrived update has already moved past.
+        delegate.binding.settleFolds()
+        let wrote = try delegate.binding.writePath.withOperation { () throws -> Bool in
+            let isUpdate = try requestedIsUpdate ?? delegate.exists(id: id)
+            let oldData = try format2CurrentValues(delegate, id: id)
+            guard let prepared = try preparedWrite(
+                id: id, values: values, isUpdate: isUpdate,
+                changedFields: changedFields, oldData: oldData
+            ) else { return false }
+
+            // Uniqueness against the MERGED VIEW, which is the whole document —
+            // not against a `_uniqueIdx_*` map, which a large document does not
+            // have and could not hold at this scale anyway. A constraint whose
+            // fields are not all present is not enforced, matching js-bao's null
+            // semantics and the nested-map path's `buildKey` returning nil.
+            for constraint in schema.resolvedUniqueConstraints {
+                let values = constraint.fields.compactMap { prepared.dataToSave[$0] }
+                guard values.count == constraint.fields.count else { continue }
+                guard let owner = try delegate.findId(
+                    fields: constraint.fields, values: values
+                ), owner != id else { continue }
                 throw UniqueConstraintViolationError(
-                    modelName: self.schema.name,
+                    modelName: schema.name,
                     constraintName: constraint.name,
                     fields: constraint.fields,
                     attemptedRecordId: id,
                     existingRecordId: owner
                 )
             }
+
+            // A create writes every field it resolved, defaults included; an
+            // update writes only what changed. Same split as the nested-map path.
+            var toWrite = prepared.changes
+            if !isUpdate {
+                for (name, value) in prepared.dataToSave where toWrite[name] == nil {
+                    toWrite[name] = value
+                }
+            }
+            try delegate.write(id: id, values: toWrite, isUpdate: isUpdate)
+
+            // The model's declaration, published into the overlay exactly as
+            // the nested-map path publishes it at save-time and as the JS
+            // format-2 save does (`BaseModel`, after its write transaction and
+            // inside the same operation).
+            //
+            // It is not decoration on a large document, it is how the server
+            // learns the model exists: the projector records `_meta_<model>`
+            // from the update's diff into `_format2_schema`, which is the only
+            // durable declaration a later epoch — and a snapshot build — has to
+            // read. Without it a model first authored by this client has no
+            // stringset fields and no constraints on the server, and a base cut
+            // from it cannot restore its stringsets on a cold load.
+            //
+            // After the write, so a failed commit publishes nothing at all; and
+            // cache-guarded, so it costs one root-map read per model per
+            // session after the first.
+            SchemaSync.syncModelMeta(doc: self.doc, schema: self.schema)
+            return true
         }
+        guard wrote else { return }
+        // Outside the operation: a listener is application code, and running it
+        // under the document's lock would let it deadlock against its own reads.
+        notifyListenersAfterWrite()
+    }
 
-        // Apply id (only needed on create; idempotent on update).
-        rec.insert(tx: txn, key: "id",
-                   value: PrimitiveValue.jsonEncodeString(id))
-
-        // Write the requested field changes. (If this is a create we
-        // also need to write any defaulted fields from dataToSave that
-        // weren't in newValues.)
-        var toWrite = newValues
-        if !isUpdate {
-            for (k, v) in dataToSave where toWrite[k] == nil {
-                toWrite[k] = v
+    /// A record's persisted state, read out of the merged view with the same
+    /// decoding `snapshotFromMap` uses on a nested map.
+    private func format2CurrentValues(
+        _ delegate: Format2ModelDelegate, id: String
+    ) throws -> [String: PrimitiveValue] {
+        guard try delegate.exists(id: id) else { return [:] }
+        var out: [String: PrimitiveValue] = [:]
+        for (fieldName, desc) in schema.fields {
+            if desc.type == .stringset {
+                let members = try delegate.members(id: id, field: fieldName)
+                if !members.isEmpty { out[fieldName] = .stringset(Set(members)) }
+            } else if let raw = try delegate.readRaw(id: id, field: fieldName),
+                      let value = PrimitiveValue.decode(yrsString: raw, as: desc.type) {
+                out[fieldName] = value
             }
         }
-        for (fieldName, value) in toWrite where fieldName != "id" {
-            self.writeValue(rec, fieldName: fieldName, value: value, tx: txn)
-        }
-
-        // Reconcile unique-index entries:
-        //   - for each constraint, delete the old key if it changed
-        //   - set the new key → this.id
-        for constraint in self.schema.resolvedUniqueConstraints {
-            let indexMap = txn.transactionGetOrInsertMap(
-                name: UniqueIndex.mapName(
-                    modelName: self.schema.name,
-                    constraintName: constraint.name
-                )
-            )
-            let oldKey = UniqueIndex.buildKey(
-                fields: constraint.fields,
-                values: oldData
-            )
-            let newKey = UniqueIndex.buildKey(
-                fields: constraint.fields,
-                values: dataToSave
-            )
-            if let oldKey, oldKey != newKey {
-                _ = try? indexMap.remove(tx: txn, key: oldKey)
-            }
-            if let newKey {
-                indexMap.insert(
-                    tx: txn,
-                    key: newKey,
-                    value: PrimitiveValue.jsonEncodeString(id)
-                )
-            }
-        }
-
-        // --- SQLite mirror: direct incremental write --------------
-        // Keeps the mirror synchronously consistent with the Y.Map
-        // after every local write. The root-map observer will ALSO
-        // fire asynchronously (same commit → queued re-upsert), but
-        // that's idempotent. This direct call is what makes queries
-        // immediately after a write see the new state without waiting
-        // for the observer queue to drain.
-        //
-        // For new records we also install the per-record observer
-        // here so future field changes reach SQLite via the observer
-        // pipeline too.
-        if !isUpdate {
-            self.installRecordObserverUnlocked(id: id, rootMap: root, tx: txn)
-        }
-        self.upsertSqliteRow(id: id, rootMap: root, tx: txn)
-        // applyWriteInternal always runs inside the write transaction —
-        // the notification is queued and delivered by the transaction
-        // wrapper after the yrs commit (#1116).
-        self.notifyListenersAfterWrite()
+        return out
     }
 
     /// Snapshot a record's fields WITHOUT opening a new transaction.
@@ -1821,6 +2147,12 @@ public final class DynamicModel: @unchecked Sendable {
     /// Read a stringset field by iterating its nested Y.Map. Returns nil
     /// if the field doesn't exist OR isn't a Y.Map.
     private func readStringSet(recordId: String, field: String) -> PrimitiveValue? {
+        if let format2 {
+            guard let members = try? format2.members(id: recordId, field: field),
+                  !members.isEmpty
+            else { return nil }
+            return .stringset(Set(members))
+        }
         return withTx { [self] txn in
             guard let root = txn.transactionGetMap(name: self.schema.name),
                   let rec  = root.getMap(tx: txn, key: recordId),
@@ -1832,6 +2164,7 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     internal func readRaw(recordId: String, field: String) -> String? {
+        if let format2 { return try? format2.readRaw(id: recordId, field: field) }
         return withTx { [self] txn in
             guard let root = txn.transactionGetMap(name: self.schema.name),
                   let rec  = root.getMap(tx: txn, key: recordId) else { return nil }
@@ -1840,6 +2173,12 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     internal func writeField(recordId: String, field: String, value: PrimitiveValue) {
+        if let format2 {
+            format2.quietly(recordId: recordId) {
+                try applyWrite(id: recordId, values: [field: value], isUpdate: true)
+            }
+            return
+        }
         withTx { [self] txn in
             guard let root = txn.transactionGetMap(name: self.schema.name) else { return }
             let rec = root.getOrInsertMap(tx: txn, key: recordId)
@@ -1847,7 +2186,39 @@ public final class DynamicModel: @unchecked Sendable {
         }
     }
 
+    /// Assign one field from a `PrimitiveRecord` subscript, which cannot throw.
+    ///
+    /// Routed through the throwing `update` so unique constraints are
+    /// enforced, exactly as the subscript did before — a violation leaves the
+    /// record untouched and callers that need the error use
+    /// `DynamicModel.update(id:values:)` directly. On a LARGE document a
+    /// refusal past the offline window reaches the app as
+    /// `DocumentWriteRefusedEvent` rather than vanishing (#3437, behavior 2a);
+    /// an ordinary document's path is unchanged.
+    internal func assignFieldFromRecord(
+        recordId: String, field: String, value: PrimitiveValue
+    ) {
+        guard let format2 else {
+            try? update(id: recordId, values: [field: value])
+            return
+        }
+        format2.quietly(recordId: recordId) {
+            try update(id: recordId, values: [field: value])
+        }
+    }
+
     internal func clearField(recordId: String, field: String) {
+        if let format2 {
+            // An explicit unset, through the write path: the overlay holds a
+            // null for the key and the pending op records it, so the server
+            // and every peer learn the field was cleared. Non-throwing, so a
+            // window refusal reaches the app as an event (#3437, behavior 2a).
+            format2.quietly(recordId: recordId) {
+                try format2.clearField(id: recordId, field: field)
+            }
+            notifyListenersAfterWrite()
+            return
+        }
         withTx { [self] txn in
             guard let root = txn.transactionGetMap(name: self.schema.name),
                   let rec  = root.getMap(tx: txn, key: recordId) else { return }
@@ -1856,6 +2227,7 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     internal func fieldNames(recordId: String) -> Set<String> {
+        if let format2 { return (try? format2.fieldNames(id: recordId)) ?? [] }
         return withTx { [self] txn in
             guard let root = txn.transactionGetMap(name: self.schema.name),
                   let rec  = root.getMap(tx: txn, key: recordId) else { return [] }

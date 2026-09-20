@@ -13,26 +13,28 @@ import Foundation
 /// `terminate`. The client-apply trio stays on `workflows`, where both
 /// clients keep it — a function run never enters `apply_pending`.
 ///
-/// `terminate` and the run-id status fetch delegate to `WorkflowsAPI` with the
-/// function key in the workflow-key slot: that IS the alias, not a second
-/// protocol. `waitFor` is the one method that cannot delegate — a function run
-/// broadcasts no `workflowStatus` frame, so it polls.
+/// #3565 — the three control methods post the run routes THEMSELVES and
+/// answer `FunctionRunStatus` / `FunctionRunResult<Output>`. Polling those
+/// routes stays an implementation choice; it used to reach the caller as
+/// vocabulary — a `skipReason` and a `run.workflowId` the server can never set
+/// for a function, and a missing run reported as a missing WORKFLOW run. This
+/// class references no workflow type and holds no `WorkflowsAPI`.
+///
+/// `waitFor` polls rather than waiting on a frame: a function run broadcasts
+/// no `workflowStatus`, so a listener would have nothing to wake it.
 public final class FunctionsAPI: @unchecked Sendable {
     private let transport: any Transport
-    private let workflows: WorkflowsAPI
     private let logger: Logger?
 
-    /// Designated initializer — the typed transport spine. `workflows` is the
-    /// sibling sub-API the control routes delegate to.
-    public convenience init(transport: any Transport, workflows: WorkflowsAPI) {
-        self.init(transport: transport, workflows: workflows, logger: nil)
+    /// Designated initializer — the typed transport spine.
+    public convenience init(transport: any Transport) {
+        self.init(transport: transport, logger: nil)
     }
 
     /// In-module initializer — same as the public one plus the internal
     /// logger. `logger` has no default so the two stay unambiguous.
-    init(transport: any Transport, workflows: WorkflowsAPI, logger: Logger?) {
+    init(transport: any Transport, logger: Logger?) {
         self.transport = transport
-        self.workflows = workflows
         self.logger = logger
     }
 
@@ -160,64 +162,75 @@ public final class FunctionsAPI: @unchecked Sendable {
 
     // MARK: - getStatus / waitFor (by run id)
 
-    /// The current status of a function run, by run id. Same route and same
-    /// flattened envelope as `workflows.getStatus` — a function run IS a run
-    /// row. Throws `.invalidArgument` for an empty `runId`.
+    /// The current status of a function run, by run id.
+    ///
+    /// GETs the run-status route itself and answers the FUNCTION shape: one
+    /// structured ``FunctionRunError`` with the platform's `code` on it, a run
+    /// block carrying only fields a function row has, and none of the workflow
+    /// DSL's vocabulary. Throws `.invalidArgument` for an empty `runId`.
+    ///
+    /// A run id that is not this app's, or does not exist, throws `.notFound`
+    /// with `Function run <id> not found`. Every other refusal — a 403 from
+    /// the access gate, a 5xx — propagates as it arrived.
     ///
     /// A task run that has a slice record also carries `slice` (#3388): its
     /// refresh count, the current slice's 12-hour ceiling and how the slice
-    /// settled. `nil` for a request invocation and for a DSL run — see
-    /// `WorkflowSliceInfo`.
-    public func getStatus(runId: String) async throws -> WorkflowStatusResult {
+    /// settled. `nil` for a request invocation and for a DSL run.
+    public func getStatus(runId: String) async throws -> FunctionRunStatus {
         guard !runId.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "runId is required for functions.getStatus")
         }
-        return try await workflows.getStatusByRunId(runId: runId)
+        let encoded = URLEncoding.encodeComponent(runId)
+        do {
+            return try await transport.request(
+                method: .get,
+                path: "/workflows/runs/\(encoded)/status"
+            )
+        } catch {
+            // The status route has no other 404: there is one thing it cannot
+            // find.
+            if FunctionRunStatus.isNotFound(error) {
+                throw JsBaoError(code: .notFound, message: "Function run \(runId) not found")
+            }
+            throw error
+        }
     }
 
     /// Typed `getStatus`: `output` decoded into `Output`.
-    public func getStatus<Output: Decodable & Sendable>(runId: String) async throws -> WorkflowStatus<Output> {
+    public func getStatus<Output: Decodable & Sendable>(
+        runId: String
+    ) async throws -> FunctionRunResult<Output> {
         let untyped = try await getStatus(runId: runId)
-        return WorkflowStatus(
-            status: untyped.status,
-            output: try Self.decodeTypedOutput(untyped.output),
-            error: untyped.error,
-            run: untyped.run,
-            skipReason: untyped.skipReason,
-            // #3388 — the task slice record, at parity with the JS client's
-            // `WorkflowStatusResult.slice?`. Typing the output must not cost
-            // a caller the refresh count or the ceiling beside it.
-            slice: untyped.slice
-        )
+        return try Self.typed(untyped)
     }
 
     /// Wait for a function run to reach a terminal state.
     ///
-    /// POLLS, where `workflows.waitFor` waits on a `workflowStatus` frame. A
-    /// function run broadcasts nothing over the socket, so a delegate to the
-    /// workflow method would reconcile once, see `running`, and wait out its
-    /// whole timeout with nothing left to wake it. The interval starts at
-    /// 0.4 s and doubles to 5 s, the last sleep is clamped to what is left of
-    /// the budget, and one poll is taken at the deadline itself before the
-    /// wait throws `.workflowWaitTimeout` — giving up as soon as the next
-    /// interval would overshoot gave up to a whole interval back. The default
-    /// timeout is 15 minutes; 0 or a negative value disables it.
+    /// POLLS, where a workflow wait listens for a frame: a function run
+    /// broadcasts nothing over the socket, so a listener would reconcile once,
+    /// see `running`, and wait out its whole timeout with nothing left to wake
+    /// it. The interval starts at 0.4 s and doubles to 5 s, the last sleep is
+    /// clamped to what is left of the budget, and one poll is taken at the
+    /// deadline itself before the wait throws `.workflowWaitTimeout`. The
+    /// default timeout is 15 minutes; 0 or a negative value disables it.
     ///
-    /// Terminal: `completed`, `failed`, `terminated`, `skipped`,
-    /// `apply_pending`, `apply_claimed`. A failed run RESOLVES with
-    /// `status == "failed"`; it does not throw. A 404 and a run reporting
-    /// `missing` throw `.notFound` (a `missing` run never reaches a terminal
-    /// state — the same reading `workflows.waitFor` takes). A transient error
-    /// between polls is retried, not surfaced. A run whose record already
-    /// reads terminal while the status block still reports the execution
-    /// (the finalization window) is re-checked on the short timer
-    /// `workflows.waitFor` uses and settles from the record after the bounded
-    /// re-check. Cancelling the surrounding `Task` throws `CancellationError`
-    /// promptly and stops polling.
+    /// SETTLES on exactly `completed`, `failed` and `terminated` — the three
+    /// ``FunctionRunStatus/isTerminal`` names. A failed run RESOLVES with
+    /// `status == "failed"` and its `error`; it does not throw. A 404 and a
+    /// run reporting `missing` throw `.notFound` in function words. A read
+    /// reporting one of the DSL-only states (reachable only by handing this
+    /// method a DSL run id, which is not refused) throws `.invalidArgument`
+    /// naming the status, rather than settling on a value outside the type's
+    /// own terminal set or spinning to the deadline. A transient error between
+    /// polls is retried, not surfaced. A run whose record already reads
+    /// terminal while the status block still reports the execution (the
+    /// finalization window) is re-checked on a short timer and settles from the
+    /// record after the bounded re-check. Cancelling the surrounding `Task`
+    /// throws `CancellationError` promptly and stops polling.
     public func waitFor(
         runId: String,
-        options: WaitForWorkflowOptions? = nil
-    ) async throws -> WaitForWorkflowResult {
+        options: FunctionWaitOptions? = nil
+    ) async throws -> FunctionRunStatus {
         guard !runId.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "runId is required for functions.waitFor")
         }
@@ -229,28 +242,32 @@ public final class FunctionsAPI: @unchecked Sendable {
         var delay = Self.waitMinInterval
         while true {
             try Task.checkCancellation()
-            let status: WorkflowStatusResult?
+            var status: FunctionRunStatus? = nil
             do {
                 status = try await getStatus(runId: runId)
             } catch {
-                // A 404 means the run is unknown or not readable by this
-                // caller — fail now. Anything else is transient: the next
-                // poll, or the timeout, still covers the wait.
-                if WorkflowsAPI.isNotFound(error) {
-                    throw JsBaoError(code: .notFound, message: "Workflow run \(runId) not found")
-                }
+                // `getStatus` already reworded the 404, and a run that is not
+                // there will not appear — fail now. Anything else is
+                // transient: the next poll, or the deadline, still covers it.
+                if let jsBao = error as? JsBaoError, jsBao.code == .notFound { throw jsBao }
                 if error is CancellationError { throw error }
                 logger?.debug("[functions.waitFor] poll failed; retrying", [
                     "runId": runId, "error": String(describing: error),
                 ])
-                status = nil
             }
             if let status {
-                if let terminal = WorkflowsAPI.terminalFromReconcile(status) { return terminal }
+                if status.isTerminal { return status }
                 if status.status == "missing" {
                     throw JsBaoError(
                         code: .notFound,
-                        message: "Workflow run \(runId) is no longer resolvable (status: missing)"
+                        message: "Function run \(runId) is no longer resolvable (status: missing)"
+                    )
+                }
+                if !FunctionRunStatus.statusValues.contains(status.status) {
+                    throw JsBaoError(
+                        code: .invalidArgument,
+                        message: "functions.waitFor: run \(runId) reported status "
+                            + "\"\(status.status)\", which is not a function run status"
                     )
                 }
                 if let settled = try await recheckFinalizationWindow(
@@ -262,10 +279,11 @@ public final class FunctionsAPI: @unchecked Sendable {
             let remaining = deadline.map { $0.timeIntervalSince(now()) }
             if let remaining, remaining <= 0 {
                 // Same code the workflow wait raises: it is the same fact about
-                // the same kind of run.
+                // the same kind of run, and the intent settles that error codes
+                // rename in phase 7. The MESSAGE is function-worded.
                 throw JsBaoError(
                     code: .workflowWaitTimeout,
-                    message: "functions.waitFor timed out after \(timeoutMs)ms waiting for run \(runId)"
+                    message: "functions.waitFor timed out after \(timeoutMs)ms waiting for function run \(runId)"
                 )
             }
             let sleepFor = remaining.map { Swift.min(delay, $0) } ?? delay
@@ -278,38 +296,76 @@ public final class FunctionsAPI: @unchecked Sendable {
     public func waitFor<Output: Decodable & Sendable>(
         runId: String,
         as outputType: Output.Type,
-        options: WaitForWorkflowOptions? = nil
-    ) async throws -> WaitForResult<Output> {
+        options: FunctionWaitOptions? = nil
+    ) async throws -> FunctionRunResult<Output> {
         let base = try await waitFor(runId: runId, options: options)
-        return WaitForResult(
-            status: base.status,
-            output: try Self.decodeTypedOutput(base.output),
-            error: base.error,
-            skipReason: base.skipReason
-        )
+        return try Self.typed(base)
     }
 
-    // MARK: - terminate (the alias)
+    // MARK: - terminate
 
-    /// Terminate a running function run. The function key goes in the
-    /// workflow-key slot: the request is `workflows.terminate`'s, byte for
-    /// byte, and so is the answer.
-    public func terminate(_ ref: FunctionRunRef) async throws -> WorkflowStatusResult {
-        try await workflows.terminate(
-            workflowKey: ref.functionKey,
-            runKey: ref.runKey,
-            contextDocId: ref.contextDocId
-        )
+    /// Terminate a running function run.
+    ///
+    /// POSTs the instance route itself rather than delegating: the workflow
+    /// method mints `workflowKey is required for workflows.terminate` for an
+    /// empty key and rewords nothing, so a function caller met the workflow
+    /// vocabulary on every refusal.
+    ///
+    /// A 404 from this route means THREE different things — no row, no
+    /// instance id, and any exception out of the engine's own `terminate()`.
+    /// The body is how they are told apart (D3565-013): the first two are a
+    /// function-worded `.notFound`; the third is `.unavailable` carrying the
+    /// engine's diagnostic verbatim, because a live run the engine could not
+    /// stop is not a run that does not exist, and discarding what the engine
+    /// said would leave a caller with nothing to act on.
+    @discardableResult
+    public func terminate(_ ref: FunctionRunRef) async throws -> FunctionRunStatus {
+        guard !ref.functionKey.isEmpty else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "functionKey is required for functions.terminate"
+            )
+        }
+        guard !ref.runKey.isEmpty else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "runKey is required for functions.terminate"
+            )
+        }
+        let encodedKey = URLEncoding.encodeComponent(ref.functionKey)
+        let encodedRunKey = URLEncoding.encodeComponent(ref.runKey)
+        var query = URLQuery()
+        query.appendIfPresent("contextDocId", ref.contextDocId)
+        let path =
+            "/workflows/\(encodedKey)/instances/\(encodedRunKey)/terminate\(query.queryString)"
+        do {
+            return try await transport.request(method: .post, path: path)
+        } catch {
+            guard FunctionRunStatus.isNotFound(error) else { throw error }
+            let body = (error as? HttpError)?.body
+            switch FunctionTerminateClassifier.classify(body: body) {
+            case .engineFailure(let diagnostic):
+                throw JsBaoError(
+                    code: .unavailable,
+                    message: "Function run \(ref.runKey) of function \(ref.functionKey) "
+                        + "could not be terminated: \(diagnostic)"
+                )
+            case .notFound:
+                throw JsBaoError(
+                    code: .notFound,
+                    message: "Function run \(ref.runKey) of function \(ref.functionKey) not found"
+                )
+            }
+        }
     }
 
     /// Typed `terminate`: a terminated run can carry partial output, decoded
     /// into `Output`.
-    public func terminate<Output: Decodable & Sendable>(_ ref: FunctionRunRef) async throws -> WorkflowStatus<Output> {
-        try await workflows.terminate(
-            workflowKey: ref.functionKey,
-            runKey: ref.runKey,
-            contextDocId: ref.contextDocId
-        )
+    public func terminate<Output: Decodable & Sendable>(
+        _ ref: FunctionRunRef
+    ) async throws -> FunctionRunResult<Output> {
+        let untyped: FunctionRunStatus = try await terminate(ref)
+        return try Self.typed(untyped)
     }
 
     // MARK: - The one route, and the mode check
@@ -322,11 +378,10 @@ public final class FunctionsAPI: @unchecked Sendable {
         meta: [String: Any]?,
         timeout: TimeInterval?
     ) async throws -> FunctionInvokeResult {
-        // #3454 — the RUNNER this call means. The default mode is `any`, which
-        // takes either, so a body that says nothing would be handed the
-        // request runner whatever verb the caller typed. `invoke` means the
-        // request runner; saying so is what makes the choice the caller's.
-        var payload: [String: Any] = ["mode": "request"]
+        // #3482 — no `mode`. The ROUTE is the runtime selector: this one runs
+        // the function inside the request. The body field it replaced is
+        // deprecated compatibility for clients published before the change.
+        var payload: [String: Any] = [:]
         if let rootInput { payload["rootInput"] = rootInput }
         if let contextDocId { payload["contextDocId"] = contextDocId }
         if let meta { payload["meta"] = meta }
@@ -334,12 +389,13 @@ public final class FunctionsAPI: @unchecked Sendable {
         if let timeout, timeout > 0 {
             payload["timeoutMs"] = timeout.wholeMilliseconds
         }
-        let envelope = try await post(functionKey: functionKey, payload: payload)
+        let envelope = try await post(functionKey: functionKey, payload: payload, runtime: .request)
 
-        // The route is one route and the MODE decides what it answers. A task
-        // function answers the start envelope, which has no `output` and no
-        // terminal `status` — everything this method's return type promises.
-        // Say so, in the mode words the config key and the docs use.
+        // The BACKSTOP, for a server that predates the route (#3482,
+        // D3482-008). Against such a deployment this path is one route whose
+        // body field decides what it answers, so it can still hand back the
+        // start envelope — which has no `output` and no terminal `status`,
+        // everything this method's return type promises. Say so.
         if let runId = envelope.runId, envelope.runKey != nil {
             throw JsBaoError(
                 code: .functionModeMismatch,
@@ -366,16 +422,19 @@ public final class FunctionsAPI: @unchecked Sendable {
         contextDocId: String?,
         meta: [String: Any]?
     ) async throws -> FunctionStartResult {
-        // #3454 — the mirror of `invoke`: `start` means the TASK runner.
-        var payload: [String: Any] = ["mode": "task"]
+        // #3482 — the mirror of `invoke`: the ROUTE says this call means the
+        // task runtime, so the body names nothing.
+        var payload: [String: Any] = [:]
         if let rootInput { payload["rootInput"] = rootInput }
         if let runKey { payload["runKey"] = runKey }
         if let contextDocId { payload["contextDocId"] = contextDocId }
         if let meta { payload["meta"] = meta }
-        let envelope = try await post(functionKey: functionKey, payload: payload)
+        let envelope = try await post(functionKey: functionKey, payload: payload, runtime: .task)
 
-        // The mirror of the check in `invoke`: a request function ran and
-        // answered with its RESULT, so there is no run id to poll.
+        // The mirror of `invoke`'s backstop, and the same reason (#3482):
+        // against a server that predates this route the call would have run
+        // the function inside the request and answered with its RESULT, so
+        // there is no run id to poll.
         guard let runId = envelope.runId, let runKey = envelope.runKey else {
             throw JsBaoError(
                 code: .functionModeMismatch,
@@ -398,39 +457,34 @@ public final class FunctionsAPI: @unchecked Sendable {
         )
     }
 
-    /// `POST /functions/{key}`, the body serialized directly from the `Any`
-    /// graph so opaque caller data (`rootInput`, `meta`) reaches the wire as
-    /// spelled. The answer is decoded into the union of both envelopes; the
-    /// callers above decide which one they were handed.
-    private func post(functionKey: String, payload: [String: Any]) async throws -> FunctionRouteEnvelope {
-        let encodedKey = URLEncoding.encodeComponent(functionKey)
-        let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
-        do {
-            return try await transport.request(
-                method: .post,
-                path: "/functions/\(encodedKey)",
-                bodyData: bodyData
-            )
-        } catch let error as HttpError where error.serverCode == Self.modeMismatchCode {
-            // #3454, DSO3454-002 — now that the call states a runner, a LOCK's
-            // other door is refused by the SERVER, with a 409. Every 409
-            // reaches here as an `HttpError`, so without this the public error
-            // on a wrong verb would silently have changed from
-            // `JsBaoError(.functionModeMismatch)` — which is what this client
-            // has always thrown, and what applications catch — into a
-            // transport error. EXACTLY this one code is translated; every
-            // other conflict stays what it was.
-            throw JsBaoError(
-                code: .functionModeMismatch,
-                message: error.serverMessage
-                    ?? "Function '\(functionKey)': this call asked for a runner the function's mode does not allow.",
-                details: ["functionKey": .string(functionKey)]
-            )
-        }
+    /// Which runtime a call means — #3482. The ROUTE says it: `invoke` posts
+    /// to `functions/{key}` and runs the function inside the request, `start`
+    /// posts to `functions/{key}/start` and runs it as a task. There is no
+    /// body field for it on a current server.
+    private enum CallRuntime {
+        case request
+        case task
+
+        var pathSuffix: String { self == .task ? "/start" : "" }
     }
 
-    /// The server's stable code for the wrong verb on a locked function.
-    private static let modeMismatchCode = "FUNCTION_MODE_MISMATCH"
+    /// The function route, the body serialized directly from the `Any` graph
+    /// so opaque caller data (`rootInput`, `meta`) reaches the wire as
+    /// spelled. The answer is decoded into the union of both envelopes; the
+    /// callers above decide which one they were handed.
+    private func post(
+        functionKey: String,
+        payload: [String: Any],
+        runtime: CallRuntime
+    ) async throws -> FunctionRouteEnvelope {
+        let encodedKey = URLEncoding.encodeComponent(functionKey)
+        let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
+        return try await transport.request(
+            method: .post,
+            path: "/functions/\(encodedKey)\(runtime.pathSuffix)",
+            bodyData: bodyData
+        )
+    }
 
     /// Encode a typed input into the JSON value it produces — any JSON type,
     /// not just an object — for the `rootInput` slot. `nil` means "no
@@ -456,47 +510,76 @@ public final class FunctionsAPI: @unchecked Sendable {
         return try JSONCoding.decode(Output.self, from: any)
     }
 
-    /// The finalization window: the run record already reads terminal while
-    /// the status block still reports the execution in flight, because the
-    /// server withholds `completed` until the output is published. Re-check on
-    /// the short timer `workflows.waitFor` uses; settle from the record after
-    /// the bounded re-check rather than polling on. Returns `nil` when the
-    /// first response is not in the window.
+    /// The typed twin of an untyped read — one place, so the three typed
+    /// overloads cannot disagree about what typing an output costs a caller.
+    private static func typed<Output: Decodable & Sendable>(
+        _ untyped: FunctionRunStatus
+    ) throws -> FunctionRunResult<Output> {
+        FunctionRunResult(
+            status: untyped.status,
+            output: try Self.decodeTypedOutput(untyped.output),
+            outputTruncated: untyped.outputTruncated,
+            error: untyped.error,
+            run: untyped.run,
+            slice: untyped.slice
+        )
+    }
+
+    /// How long the finalization re-check waits between fetches, and how many
+    /// times it retries before settling from the run record (#2348). The same
+    /// window the workflow wait uses; spelled here because this class names no
+    /// workflow type.
+    static let finalizeRecheckIntervalMs: UInt64 = 1000
+    static let finalizeMaxRechecks = 30
+
+    /// Is this read inside the finalization window — the run RECORD already
+    /// terminal while the status block still reports the execution, because
+    /// the server withholds `completed` until the output is published?
+    /// Answers the record's terminal status, or `nil` when it is not.
+    static func finalizingTerminalStatus(_ res: FunctionRunStatus) -> String? {
+        guard !res.isTerminal else { return nil }
+        guard let stored = res.run?.status else { return nil }
+        return FunctionRunStatus.terminalStatuses.contains(stored) ? stored : nil
+    }
+
+    /// The finalization window: re-check on the short timer, and settle from
+    /// the record after the bounded re-check rather than polling on. Returns
+    /// `nil` when the first response is not in the window.
     private func recheckFinalizationWindow(
         runId: String,
-        first: WorkflowStatusResult,
+        first: FunctionRunStatus,
         deadline: Date?,
         timeoutMs: Int
-    ) async throws -> WaitForWorkflowResult? {
+    ) async throws -> FunctionRunStatus? {
         var res = first
         var attempts = 0
-        while let stored = WorkflowsAPI.finalizingTerminalStatus(res) {
-            if attempts >= WorkflowsAPI.finalizeMaxRechecks {
-                return WaitForWorkflowResult(
+        while let stored = Self.finalizingTerminalStatus(res) {
+            if attempts >= Self.finalizeMaxRechecks {
+                return FunctionRunStatus(
                     status: stored,
                     output: res.output,
+                    outputTruncated: res.outputTruncated,
                     error: res.error,
-                    skipReason: res.skipReason
+                    run: res.run,
+                    slice: res.slice
                 )
             }
             attempts += 1
             if let deadline, deadline.timeIntervalSince(now()) <= 0 {
                 throw JsBaoError(
                     code: .workflowWaitTimeout,
-                    message: "functions.waitFor timed out after \(timeoutMs)ms waiting for run \(runId)"
+                    message: "functions.waitFor timed out after \(timeoutMs)ms waiting for function run \(runId)"
                 )
             }
-            try await sleep(TimeInterval(WorkflowsAPI.finalizeRecheckIntervalMs) / 1000)
+            try await sleep(TimeInterval(Self.finalizeRecheckIntervalMs) / 1000)
             do {
                 res = try await getStatus(runId: runId)
             } catch {
-                if WorkflowsAPI.isNotFound(error) {
-                    throw JsBaoError(code: .notFound, message: "Workflow run \(runId) not found")
-                }
+                if let jsBao = error as? JsBaoError, jsBao.code == .notFound { throw jsBao }
                 if error is CancellationError { throw error }
                 continue
             }
-            if let terminal = WorkflowsAPI.terminalFromReconcile(res) { return terminal }
+            if res.isTerminal { return res }
         }
         return nil
     }

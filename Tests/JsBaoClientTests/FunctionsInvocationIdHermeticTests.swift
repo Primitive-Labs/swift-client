@@ -28,7 +28,7 @@ final class FunctionsInvocationIdHermeticTests: XCTestCase {
 
     private func makeApi(json: String, status: Int = 200) -> FunctionsAPI {
         let transport = RecordingTransport(status: status, json: json)
-        return FunctionsAPI(transport: transport, workflows: WorkflowsAPI(transport: transport))
+        return FunctionsAPI(transport: transport)
     }
 
     private struct Sum: Decodable, Sendable, Equatable {

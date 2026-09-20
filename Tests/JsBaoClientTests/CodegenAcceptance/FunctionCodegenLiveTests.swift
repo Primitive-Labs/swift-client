@@ -91,7 +91,7 @@ final class FunctionCodegenLiveTests: XCTestCase {
         XCTAssertFalse(started.runId.isEmpty)
 
         let settled = try await sweep.waitFor(
-            runId: started.runId, options: WaitForWorkflowOptions(timeout: 60)
+            runId: started.runId, options: FunctionWaitOptions(timeout: 60)
         )
         XCTAssertEqual(settled.status, "completed", "\(String(describing: settled.error))")
         XCTAssertEqual(settled.output?.swept, 3)

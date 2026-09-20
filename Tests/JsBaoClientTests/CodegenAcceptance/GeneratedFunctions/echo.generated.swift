@@ -9,7 +9,7 @@ public typealias EchoInput = JSONValue
 
 public typealias EchoOutput = JSONValue
 
-/// Typed invoker for the `echo` any function. Binds
+/// Typed invoker for the `echo` function. Binds
 /// `EchoInput` / `EchoOutput` over the generic
 /// `FunctionsAPI` overloads. Obtain one with `echo(client)`.
 public struct EchoFunction: Sendable {
@@ -53,15 +53,15 @@ public struct EchoFunction: Sendable {
     }
 
     /// A run's status, with `output` bound to `EchoOutput`.
-    public func getStatus(runId: String) async throws -> WorkflowStatus<EchoOutput> {
+    public func getStatus(runId: String) async throws -> FunctionRunResult<EchoOutput> {
         try await client.functions.getStatus(runId: runId)
     }
 
     /// Wait for a run to settle; `output` is bound to `EchoOutput`.
     public func waitFor(
         runId: String,
-        options: WaitForWorkflowOptions? = nil
-    ) async throws -> WaitForResult<EchoOutput> {
+        options: FunctionWaitOptions? = nil
+    ) async throws -> FunctionRunResult<EchoOutput> {
         try await client.functions.waitFor(
             runId: runId,
             as: EchoOutput.self,
@@ -75,7 +75,7 @@ public struct EchoFunction: Sendable {
     public func terminate(
         runKey: String,
         contextDocId: String? = nil
-    ) async throws -> WorkflowStatus<EchoOutput> {
+    ) async throws -> FunctionRunResult<EchoOutput> {
         try await client.functions.terminate(
             FunctionRunRef(
                 functionKey: "echo",

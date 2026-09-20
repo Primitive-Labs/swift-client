@@ -180,16 +180,22 @@ final class WsAuthRecovery: @unchecked Sendable {
     /// `handshakeCompletedAtClose` is the flag as sampled at close delivery
     /// (see `handshakeCompletedAtClose()`); when nil, the live flag is used —
     /// acceptable only for callers that cannot race a new connect attempt.
+    ///
+    /// `deliberateClose` is the transport's notice that this client closed the
+    /// socket itself (`forceReconnect`). A deliberate close is never evidence
+    /// about the token, and the reconnect it belongs to is already under way.
     func handleClose(
         code: Int?,
         reason: String?,
         handshakeCompletedAtClose: Bool? = nil,
+        deliberateClose: Bool = false,
         host: any WsAuthRecoveryHost
     ) async {
         await recover(
             code: code,
             statusText: reason,
             handshakeCompletedAtClose: handshakeCompletedAtClose,
+            deliberateClose: deliberateClose,
             host: host
         )
     }
@@ -206,10 +212,18 @@ final class WsAuthRecovery: @unchecked Sendable {
         code: Int?,
         hasToken: Bool,
         shouldConnect: Bool,
-        handshakeCompletedAtClose: Bool?
+        handshakeCompletedAtClose: Bool?,
+        deliberateClose: Bool
     ) -> Decision {
         lock.withLock {
             if recoveryInFlight { return .skip("recovery already in flight") }
+            // Judged before anything about the close's shape: a socket this
+            // client closed says nothing about its token, whether or not the
+            // handshake had completed. The handshake flag alone could not carry
+            // this — a rebuild that lands on a connection still opening (the
+            // receive-limit raise a first large document forces, #3436) reads
+            // exactly like the server refusing the upgrade (#3437).
+            if deliberateClose { return .skip("a close this client made itself") }
             if let code, Self.terminalAuthCloseCodes.contains(code) {
                 // A refresh cannot help these closes (see the constant's doc);
                 // the transport's normal reconnect — which since #2660 runs on
@@ -255,6 +269,7 @@ final class WsAuthRecovery: @unchecked Sendable {
         code: Int?,
         statusText: String?,
         handshakeCompletedAtClose: Bool?,
+        deliberateClose: Bool,
         host: any WsAuthRecoveryHost
     ) async {
         let hasToken = host.wsAuthRecoveryHasToken()
@@ -264,7 +279,8 @@ final class WsAuthRecovery: @unchecked Sendable {
             code: code,
             hasToken: hasToken,
             shouldConnect: shouldConnect,
-            handshakeCompletedAtClose: handshakeCompletedAtClose
+            handshakeCompletedAtClose: handshakeCompletedAtClose,
+            deliberateClose: deliberateClose
         ) {
         case .skip(let why):
             logger.debug("[WS Auth] skipping recovery:", why)

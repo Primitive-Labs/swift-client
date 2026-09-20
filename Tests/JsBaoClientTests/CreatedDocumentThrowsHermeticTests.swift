@@ -352,12 +352,15 @@ final class CreatedDocumentThrowsHermeticTests: XCTestCase {
             client.documentManager.encodeStateVectorBase64(emptyDocId)
         )
 
+        // #3559 made the responder `async`: an oversize diff is uploaded
+        // rather than sent inline, and the upload is I/O.
+        let built = await client.documentManager.syncStep2ResponseForServerSyncStep1(
+            documentId: documentId,
+            serverDocHash: String(repeating: "0", count: 64),
+            serverStateVectorBase64: emptyStateVector
+        )
         let response = try XCTUnwrap(
-            client.documentManager.syncStep2ResponseForServerSyncStep1(
-                documentId: documentId,
-                serverDocHash: String(repeating: "0", count: 64),
-                serverStateVectorBase64: emptyStateVector
-            ),
+            built,
             "the committed document owes the server the state written before the commit"
         )
         let decoded = try XCTUnwrap(

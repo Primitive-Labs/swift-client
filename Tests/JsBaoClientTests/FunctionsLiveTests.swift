@@ -184,7 +184,7 @@ final class FunctionsLiveTests: XCTestCase {
 
         let settled = try await client.functions.waitFor(
             runId: started.runId, as: Doubled.self,
-            options: WaitForWorkflowOptions(timeout: 60)
+            options: FunctionWaitOptions(timeout: 60)
         )
         XCTAssertEqual(settled.status, "completed")
         XCTAssertEqual(settled.output, Doubled(doubled: 42))
@@ -201,16 +201,37 @@ final class FunctionsLiveTests: XCTestCase {
         XCTAssertEqual(second.existing, true)
 
         // Terminate on a running task answers a terminal status under the
-        // function key — that is the alias. Started fresh so it is still
-        // inside its nap when the terminate lands.
+        // function key. Started fresh so it is still inside its nap when the
+        // terminate lands.
+        //
+        // #3565 — a DISJUNCTION by design: Cloudflare's LOCAL Workflows engine
+        // answers "Not implemented yet" to `instance.terminate()`, while a
+        // deployed one stops the run. Either is a correct outcome; what is NOT
+        // correct — and what this child fixes — is reporting a run that EXISTS
+        // as not found, and throwing the engine's diagnostic away with it.
         let running = try await client.functions.start(functionKey, input: ["n": 2], contextDocId: docId)
-        let stopped = try await client.functions.terminate(
-            FunctionRunRef(functionKey: functionKey, runKey: running.runKey, contextDocId: docId)
+        let ref = FunctionRunRef(
+            functionKey: functionKey, runKey: running.runKey, contextDocId: docId
         )
-        XCTAssertTrue(
-            WaitForWorkflowResult.terminalStatuses.contains(stopped.status),
-            "terminate must answer a terminal status, got \(stopped.status)"
-        )
+        do {
+            let stopped = try await client.functions.terminate(ref)
+            XCTAssertTrue(
+                stopped.isTerminal,
+                "terminate must answer a terminal status, got \(stopped.status)"
+            )
+        } catch let error as JsBaoError {
+            XCTAssertEqual(
+                error.code, .unavailable,
+                "a run that exists is never a not-found, got \(error.code): \(error.message)"
+            )
+            XCTAssertTrue(
+                error.message.hasPrefix(
+                    "Function run \(running.runKey) of function \(functionKey) "
+                        + "could not be terminated: "
+                ),
+                "the engine's diagnostic rides the function-worded prefix, got \(error.message)"
+            )
+        }
     }
 
     // MARK: - #3388: the task run's slice block, live
@@ -244,7 +265,7 @@ final class FunctionsLiveTests: XCTestCase {
             functionKey, input: nil as JSONValue?, contextDocId: docId
         )
         let settled = try await client.functions.waitFor(
-            runId: started.runId, options: WaitForWorkflowOptions(timeout: 120)
+            runId: started.runId, options: FunctionWaitOptions(timeout: 120)
         )
         XCTAssertEqual(settled.status, "completed", "\(String(describing: settled.error))")
 
@@ -273,7 +294,7 @@ final class FunctionsLiveTests: XCTestCase {
 
         // The typed overload reads the same record: binding `output` to a type
         // must not cost the caller the block beside it.
-        let typed: WorkflowStatus<One> = try await client.functions.getStatus(runId: started.runId)
+        let typed: FunctionRunResult<One> = try await client.functions.getStatus(runId: started.runId)
         XCTAssertEqual(typed.slice, slice)
     }
 
@@ -320,7 +341,7 @@ final class FunctionsLiveTests: XCTestCase {
         )
         XCTAssertFalse(started.runId.isEmpty)
         let settled = try await client.functions.waitFor(
-            runId: started.runId, options: WaitForWorkflowOptions(timeout: 120)
+            runId: started.runId, options: FunctionWaitOptions(timeout: 120)
         )
         XCTAssertEqual(settled.status, "completed")
 
@@ -331,28 +352,56 @@ final class FunctionsLiveTests: XCTestCase {
         XCTAssertEqual(result.status, "completed")
     }
 
-    // MARK: - Behavior 15: the mode check on a LOCK, live
+    // MARK: - #3482: there is no lock, and the ROUTE is the runtime
 
-    func testInvokeOnATaskAndStartOnARequestFunctionThrowFunctionModeMismatch() async throws {
-        // #3454 — both subjects are LOCKS, spelled out: the refusal is what a
-        // lock's OTHER door earns, and an `any` function has no other door.
-        // The server refuses it now (the call states its runner), so what this
-        // pins is that the public error type did not move with it.
+    /// Both doors answer on every version a row can hold.
+    ///
+    /// Retargeted (#3482). This was
+    /// `testInvokeOnATaskAndStartOnARequestFunctionThrowFunctionModeMismatch`,
+    /// and it asserted that a LOCK's other door throws `.functionModeMismatch`.
+    /// That refusal is gone: a function's config says nothing about how it runs,
+    /// the caller picks the runtime at each call, and the ROUTE is how a Swift
+    /// caller says which one it means — `invoke` posts to `functions/{key}` and
+    /// runs the function inside the request, `start` posts to
+    /// `functions/{key}/start` and runs it as a task.
+    ///
+    /// The subjects are the same two versions, pushed with the same two now
+    /// retired keys, so "the other door throws" becomes "the other door
+    /// answers": four door-and-version pairs asserted where there were two
+    /// refusals. `.functionModeMismatch` stays DECLARED as the backstop against
+    /// a server older than this child (D3482-008) — a claim about the public
+    /// error type, pinned hermetically rather than against a server that no
+    /// longer sends it.
+    func testBothVerbsReachAVersionStoredWithEitherRetiredLock() async throws {
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
+
+        // Pushed with the retired `mode = "task"`. INVOKE runs it inside the
+        // request, and its `step.sleep` really waits there, because the request
+        // budget covers 1.5 s (#3454's request-runtime `step`).
         let task = key("mode-task")
         try await ctx.pushFunction(
             appId: testApp.appId, functionKey: task, bundle: Self.sleeper, mode: "task"
         )
-        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
-        do {
-            _ = try await client.functions.invoke(
-                task, input: nil as JSONValue?, contextDocId: docId, timeout: generousTimeout
-            ) as FunctionResult<JSONValue>
-            XCTFail("invoke on a task function must throw")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertTrue(error.message.contains("task function"), error.message)
-        }
+        let invoked: FunctionResult<Doubled> = try await client.functions.invoke(
+            task, input: ["n": 3], contextDocId: docId, timeout: generousTimeout
+        )
+        XCTAssertEqual(invoked.status, "completed")
+        XCTAssertEqual(invoked.output, Doubled(doubled: 6))
 
+        // …and the same version still starts a task run.
+        let startedTask = try await client.functions.start(
+            task, input: ["n": 4], contextDocId: docId
+        )
+        XCTAssertFalse(startedTask.runId.isEmpty)
+        let settledTask = try await client.functions.waitFor(
+            runId: startedTask.runId, as: Doubled.self,
+            options: FunctionWaitOptions(timeout: 120)
+        )
+        XCTAssertEqual(settledTask.status, "completed")
+        XCTAssertEqual(settledTask.output, Doubled(doubled: 8))
+
+        // Pushed with the retired `mode = "request"`: START takes it, because
+        // the route is the runtime and no stored key refuses a door.
         let request = key("mode-request")
         try await ctx.pushFunction(
             appId: testApp.appId,
@@ -360,14 +409,19 @@ final class FunctionsLiveTests: XCTestCase {
             bundle: "export default async function () { return { ok: true }; }",
             mode: "request"
         )
-        do {
-            _ = try await client.functions.start(
-                request, input: nil as JSONValue?, contextDocId: docId
-            )
-            XCTFail("start on a request function must throw")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertTrue(error.message.contains("request function"), error.message)
-        }
+        let started = try await client.functions.start(
+            request, input: nil as JSONValue?, contextDocId: docId
+        )
+        XCTAssertFalse(started.runId.isEmpty)
+        let settled = try await client.functions.waitFor(
+            runId: started.runId, options: FunctionWaitOptions(timeout: 120)
+        )
+        XCTAssertEqual(settled.status, "completed")
+
+        // …and invoking it still answers inside the call.
+        let result: FunctionResult<JSONValue> = try await client.functions.invoke(
+            request, input: nil as JSONValue?, contextDocId: docId, timeout: generousTimeout
+        )
+        XCTAssertEqual(result.status, "completed")
     }
 }

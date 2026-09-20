@@ -97,7 +97,7 @@ public enum SettleOutput: Codable, Equatable, Sendable {
     }
 }
 
-/// Typed invoker for the `settle` request function. Binds
+/// Typed invoker for the `settle` function. Binds
 /// `SettleInput` / `SettleOutput` over the generic
 /// `FunctionsAPI` overloads. Obtain one with `settle(client)`.
 public struct SettleFunction: Sendable {
@@ -120,6 +120,56 @@ public struct SettleFunction: Sendable {
             contextDocId: contextDocId,
             meta: meta,
             timeout: timeout
+        )
+    }
+
+    /// Start the `settle` task function; returns the run handle.
+    @discardableResult
+    public func start(
+        input: SettleInput,
+        runKey: String? = nil,
+        contextDocId: String? = nil,
+        meta: [String: Any]? = nil
+    ) async throws -> FunctionStartResult {
+        try await client.functions.start(
+            "settle",
+            input: input,
+            runKey: runKey,
+            contextDocId: contextDocId,
+            meta: meta
+        )
+    }
+
+    /// A run's status, with `output` bound to `SettleOutput`.
+    public func getStatus(runId: String) async throws -> FunctionRunResult<SettleOutput> {
+        try await client.functions.getStatus(runId: runId)
+    }
+
+    /// Wait for a run to settle; `output` is bound to `SettleOutput`.
+    public func waitFor(
+        runId: String,
+        options: FunctionWaitOptions? = nil
+    ) async throws -> FunctionRunResult<SettleOutput> {
+        try await client.functions.waitFor(
+            runId: runId,
+            as: SettleOutput.self,
+            options: options
+        )
+    }
+
+    /// Terminate a run; `output` is bound to `SettleOutput` (a terminated
+    /// run can carry partial output). The function key is pinned.
+    @discardableResult
+    public func terminate(
+        runKey: String,
+        contextDocId: String? = nil
+    ) async throws -> FunctionRunResult<SettleOutput> {
+        try await client.functions.terminate(
+            FunctionRunRef(
+                functionKey: "settle",
+                runKey: runKey,
+                contextDocId: contextDocId
+            )
         )
     }
 }

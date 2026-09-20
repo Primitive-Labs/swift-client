@@ -200,37 +200,56 @@ final class MergeUpdatesTests: XCTestCase {
         XCTAssertEqual(readString(replica, root: "Todo", record: "rec1", key: "note"), "\"n\"")
     }
 
-    // MARK: - Merge budget (#2587 review)
+    // MARK: - Merge budget — removed (#3559)
+    //
+    // The budget capped one merged frame at 102400 bytes for exactly one
+    // reason, written where it stood: Swift's outbound path had no R2 upload
+    // flow, so a merged frame past that size could only go out inline. #3559
+    // gave it one, switching at the same size the JS client does on both
+    // outbound paths, so the cap went with the gap it existed for and a flush
+    // merges the whole queue as `flushLocalUpdates` does.
+    //
+    // What the cap used to be checked for is now checked where the behavior
+    // lives: `OversizeOutboundUpdateHermeticTests` drives a flush of three
+    // 50 KB writes and pins that it drains as ONE frame, offloaded because the
+    // merge is oversize. The merge itself — that nothing is lost by merging —
+    // is the replay assertions above, which are unchanged.
 
-    /// A flush merges only as much of the queue as fits one frame, so batching
-    /// can't manufacture an over-`MAX_UPDATE_SIZE` frame that the outbound path
-    /// has no R2 flow for — and that, once rejected, would be re-merged
-    /// identically on every following pass.
-    func testMergeBudgetStopsBeforeExceedingMaxUpdateSize() {
-        let chunk = [UInt8](repeating: 0, count: 40_000)
-        let queued = [[UInt8]](repeating: chunk, count: 5)
+    /// A merge of the whole queue is still a correct merge, past the size the
+    /// old budget would have split at. This is the claim the budget tests used
+    /// to make about a PREFIX, made about the whole queue.
+    func testWholeQueueMergesCorrectlyPastTheOldBudget() throws {
+        let doc = YDocument()
+        let sink = UpdateSink()
+        let subscription = doc.observeUpdate { sink.append($0) }
+        defer { _ = subscription }
 
-        let prefix = JsBaoClient.mergeBudgetPrefix(queued)
+        // Five ~40 KB writes: 200 KB queued, which the old budget would have
+        // drained as three passes.
+        let chunk = String(repeating: "x", count: 40_000)
+        for index in 0..<5 {
+            doc.transactSync { txn in
+                let root = txn.transactionGetOrInsertMap(name: "Todo")
+                let rec = root.getOrInsertMap(tx: txn, key: "rec\(index)")
+                _ = rec.tryUpdate(tx: txn, key: "body", value: "\"\(chunk)\"")
+            }
+        }
 
-        XCTAssertEqual(prefix.count, 2, "40KB x 2 fits the 100KB budget; a third does not")
-        XCTAssertLessThanOrEqual(
-            prefix.reduce(0) { $0 + $1.count }, JsBaoClient.maxMergedUpdateBytes
-        )
-    }
+        let batch = sink.all
+        XCTAssertEqual(batch.count, 5)
+        XCTAssertGreaterThan(batch.reduce(0) { $0 + $1.count }, 102_400)
 
-    /// A single update already over the budget still goes out on its own —
-    /// batching must not strand it (that was the behavior before batching).
-    func testMergeBudgetAlwaysTakesAtLeastOneUpdate() {
-        let huge = [UInt8](repeating: 0, count: JsBaoClient.maxMergedUpdateBytes * 2)
-        let prefix = JsBaoClient.mergeBudgetPrefix([huge, [1, 2, 3]])
-        XCTAssertEqual(prefix.count, 1)
-        XCTAssertEqual(prefix[0].count, huge.count)
-    }
+        let merged = manager().mergeUpdates(batch)
+        let replica = YDocument()
+        replica.transactSync { txn in try? txn.transactionApplyUpdate(update: merged) }
 
-    /// The common case: a burst of small updates merges whole.
-    func testMergeBudgetTakesWholeQueueWhenSmall() {
-        let queued: [[UInt8]] = (0..<12).map { _ in [UInt8](repeating: 7, count: 200) }
-        XCTAssertEqual(JsBaoClient.mergeBudgetPrefix(queued).count, 12)
+        for index in 0..<5 {
+            XCTAssertEqual(
+                readString(replica, root: "Todo", record: "rec\(index)", key: "body"),
+                "\"\(chunk)\"",
+                "merging the whole queue lost record rec\(index)"
+            )
+        }
     }
 
     /// A single queued update must pass through untouched.

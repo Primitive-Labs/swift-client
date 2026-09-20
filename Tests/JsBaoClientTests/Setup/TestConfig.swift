@@ -48,6 +48,17 @@ struct TestConfig {
         ProcessInfo.processInfo.environment["TEST_GLOBAL_ADMIN_APP_ID"] ?? "global-admin-app"
     }()
 
+    /// The shared secret the dev server's local-only `/__test__/…` routes
+    /// take in `X-Test-Auth` (#3436, phase B).
+    ///
+    /// Those routes are how a suite makes a real room do in seconds what it
+    /// would otherwise take a real workload minutes to provoke: seal an epoch,
+    /// run the builder's alarm, read the snapshot ledger. They exist only on a
+    /// local server, and the token never leaves the test target.
+    static let testAdminToken: String = {
+        ProcessInfo.processInfo.environment["TEST_ADMIN_TOKEN"] ?? "local-test-secret"
+    }()
+
     static let timeouts = (
         websocketConnect: TimeInterval(5),
         websocketSync: TimeInterval(10),

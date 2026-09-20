@@ -171,6 +171,18 @@ public enum JsBaoEvent: String, Sendable {
     case syncPerf
     case workflowStarted
     case documentSyncStateChanged
+    /// How a large document's base snapshot load is going (#3436). Mirrors the
+    /// JS client's `document:snapshot-load`.
+    case documentSnapshotLoad = "document:snapshot-load"
+    /// A local mutation on a large document was refused and the verb that made
+    /// it cannot throw (#3437). The only channel `delete(id:)` and the record
+    /// field setters have.
+    case documentWriteRefused = "document:write-refused"
+    /// A large document that was away replayed what it wrote offline and some
+    /// of it did not simply apply (#3437, behavior 20). The JS client's
+    /// `documentOfflineWritesResolved`, by that name: an app that subscribes on
+    /// both clients subscribes to one string.
+    case documentOfflineWritesResolved
 
     // ── Cache lifecycle (parity with JS KvCache) ──────────────────
     /// Fires after a successful network refresh of a cached entry.
@@ -776,6 +788,123 @@ public struct ConnectionErrorEvent: Sendable {
 public struct DocumentOpenedEvent: Sendable {
     public let documentId: String
     public init(documentId: String) { self.documentId = documentId }
+}
+
+/// A local mutation on a large document that was refused, reported through
+/// the one channel a non-throwing verb has (#3437, behavior 2a).
+///
+/// `DynamicModel.delete(id:)` is declared without `throws`, as are a
+/// `PrimitiveRecord` field assignment and an explicit clear: they swallow the
+/// write path's error, so before this there was no way for an application to
+/// tell a refused mutation from a completed one. Adding a throwing form of
+/// those verbs would break every existing caller, so the event is the
+/// compatible channel and the throwing verbs keep throwing.
+///
+/// Only ever emitted for a LARGE document: an ordinary document has no
+/// offline window and no refusal to report.
+public struct DocumentWriteRefusedEvent: Sendable {
+    public let documentId: String
+    public let model: String
+    public let recordId: String
+    /// Why, typed — `DOCUMENT_OFFLINE_WINDOW_EXPIRED` and its details today.
+    public let error: JsBaoError
+
+    public init(
+        documentId: String, model: String, recordId: String, error: JsBaoError
+    ) {
+        self.documentId = documentId
+        self.model = model
+        self.recordId = recordId
+        self.error = error
+    }
+}
+
+/// What a large document's offline writes were judged to be (#3437,
+/// behavior 20).
+///
+/// Fired when a large document that was away replays what it wrote offline and
+/// some of it did not simply apply: a write the online side clearly beat is
+/// DROPPED, and one whose order cannot be established is applied but reported.
+/// SILENCE means every offline write replayed cleanly — the event carries
+/// notices or it is not sent.
+///
+/// Field for field the JS client's `documentOfflineWritesResolved` payload, so
+/// an application that handles one handles the other.
+public struct DocumentOfflineWritesResolvedEvent: Sendable, Equatable {
+    public let documentId: String
+    /// The epoch the writes were replayed onto.
+    public let epoch: Int
+    public let notices: [OfflineReplayNotice]
+
+    public init(documentId: String, epoch: Int, notices: [OfflineReplayNotice]) {
+        self.documentId = documentId
+        self.epoch = epoch
+        self.notices = notices
+    }
+}
+
+/// How a large document's base snapshot load is going (#3436, behavior 24).
+///
+/// A cold open of a large document streams however many megabytes its base
+/// carries before the document can answer anything, so a load that reported
+/// only at the end would be indistinguishable to an application from a hang.
+/// Mirrors the JS client's `document:snapshot-load` payload field for field.
+public struct DocumentSnapshotLoadEvent: Sendable, Equatable {
+
+    public enum Phase: String, Sendable {
+        /// The manifest is in and the chunk count is known.
+        case started
+        /// One chunk landed.
+        case progress
+        /// Every chunk of one model landed: it is QUERYABLE now, not merely
+        /// downloaded.
+        case model
+        /// The whole base is in and the document has joined its epoch.
+        case loaded
+    }
+
+    public let documentId: String
+    public let phase: Phase
+    /// What this load IS. Always `"load"` on Swift: a base is installed
+    /// WHOLE, whether it is a cold start, a reload after a chain that could
+    /// not be applied, or a rebuild past a bulk load.
+    ///
+    /// The JS client also reports `"converge"`, which replaces only the ranges
+    /// a bulk load touched. Swift does not: the intent's rule for this client
+    /// is a reload from the latest snapshot, never range replacement (#3437).
+    /// Applying the sealed chain above a whole reload is the ordinary cold
+    /// path, not a range replacement, so it keeps this mode too.
+    public let mode: String
+    /// The epoch the snapshot is a base for.
+    public let epoch: Int
+    public let rows: Int
+    public let totalRows: Int
+    public let chunks: Int
+    public let totalChunks: Int
+    /// The model the event concerns, when it concerns one.
+    public let model: String?
+
+    public init(
+        documentId: String,
+        phase: Phase,
+        mode: String = "load",
+        epoch: Int,
+        rows: Int,
+        totalRows: Int,
+        chunks: Int,
+        totalChunks: Int,
+        model: String? = nil
+    ) {
+        self.documentId = documentId
+        self.phase = phase
+        self.mode = mode
+        self.epoch = epoch
+        self.rows = rows
+        self.totalRows = totalRows
+        self.chunks = chunks
+        self.totalChunks = totalChunks
+        self.model = model
+    }
 }
 
 public struct DocumentCreateCommitFailedEvent: Sendable {

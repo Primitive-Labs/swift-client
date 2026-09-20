@@ -291,6 +291,30 @@ extension DocumentSyncStateChangedEvent: JsBaoEventPayload {
     // and use the stream for subsequent changes.
 }
 
+extension DocumentSnapshotLoadEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentSnapshotLoad }
+    // Deliberately not replayable, for the reason
+    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
+    // key and this payload is scoped to a DOCUMENT, so a replay would hand
+    // back whichever document last loaded a base.
+}
+
+extension DocumentWriteRefusedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentWriteRefused }
+    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
+    // is not: retention is one slot per event key and this payload is scoped
+    // to a DOCUMENT and a RECORD, so a replay would hand back whichever write
+    // was refused last, frequently not the one the consumer cares about.
+}
+
+extension DocumentOfflineWritesResolvedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentOfflineWritesResolved }
+    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
+    // is not: retention is one slot per event key and this payload is scoped
+    // to a DOCUMENT and one replay of it, so a replay would hand back
+    // whichever document last resolved its offline writes.
+}
+
 extension SyncEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .sync }
 }
@@ -414,6 +438,9 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     PendingCreateFailedEvent.self,
     DocumentMetadataChangedEvent.self,
     DocumentSyncStateChangedEvent.self,
+    DocumentSnapshotLoadEvent.self,
+    DocumentWriteRefusedEvent.self,
+    DocumentOfflineWritesResolvedEvent.self,
     SyncEvent.self,
     SyncPerfEvent.self,
     AwarenessEvent.self,
@@ -460,4 +487,14 @@ let swiftOnlyJsBaoEventKeys: Set<String> = [
     // but the JS map covers only the client's own events, not the cache's.
     "cacheUpdated",
     "cacheUpdateFailed",
+    // A local mutation past a large document's offline window, refused
+    // through a verb that cannot throw (#3437, behavior 2a, finding
+    // 3437-SO-08). Swift-only by construction, not by drift: every JS
+    // mutation verb is async and THROWS `DocumentOfflineWindowError`, so the
+    // JS client needs no event to report the same refusal. Swift's
+    // `DynamicModel.delete(id:)` and the `PrimitiveRecord` field setters are
+    // declared without `throws`, and adding a throwing form would break every
+    // existing caller — so this is the compatible channel for them. Whether
+    // the ORM should gain throwing forms is recorded for the reflection.
+    "document:write-refused",
 ]

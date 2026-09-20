@@ -250,12 +250,17 @@ final class OutboundFilterAndSyncStep1ParityTests: XCTestCase {
             client.documentManager.isSynced(documentId),
             "a docHash that matches the server's means there is nothing to send — the document is already in sync"
         )
-        XCTAssertNil(
-            client.documentManager.syncStep2ResponseForServerSyncStep1(
+        // #3559 made the responder `async`: an oversize diff is uploaded
+        // rather than sent inline, and the upload is I/O. Nothing else about
+        // this case changed.
+        let hashMatchResponse = await client.documentManager
+            .syncStep2ResponseForServerSyncStep1(
                 documentId: documentId,
                 serverDocHash: docHash,
                 serverStateVectorBase64: stateVector
-            ),
+            )
+        XCTAssertNil(
+            hashMatchResponse,
             "no syncStep2 may go on the wire when the hashes match"
         )
     }
@@ -280,12 +285,14 @@ final class OutboundFilterAndSyncStep1ParityTests: XCTestCase {
             client.documentManager.isSynced(documentId),
             "a read-only document cannot push its diff, so the sync ends locally and the document is marked synced"
         )
-        XCTAssertNil(
-            client.documentManager.syncStep2ResponseForServerSyncStep1(
+        let readOnlyResponse = await client.documentManager
+            .syncStep2ResponseForServerSyncStep1(
                 documentId: documentId,
                 serverDocHash: String(repeating: "0", count: 64),
                 serverStateVectorBase64: stateVector
-            ),
+            )
+        XCTAssertNil(
+            readOnlyResponse,
             "no syncStep2 may go on the wire for a read-only document"
         )
     }
@@ -310,7 +317,7 @@ final class OutboundFilterAndSyncStep1ParityTests: XCTestCase {
             "a writable document with a differing hash owes the server a diff — only syncComplete may mark it synced"
         )
 
-        let response = client.documentManager.syncStep2ResponseForServerSyncStep1(
+        let response = await client.documentManager.syncStep2ResponseForServerSyncStep1(
             documentId: documentId,
             serverDocHash: String(repeating: "0", count: 64),
             serverStateVectorBase64: stateVector
@@ -367,7 +374,7 @@ final class OutboundFilterAndSyncStep1ParityTests: XCTestCase {
 
         let stateVector = try await emptyStateVector(client)
 
-        let response = client.documentManager.syncStep2ResponseForServerSyncStep1(
+        let response = await client.documentManager.syncStep2ResponseForServerSyncStep1(
             documentId: documentId,
             serverDocHash: nil,
             serverStateVectorBase64: stateVector

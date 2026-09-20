@@ -148,8 +148,11 @@ final class FunctionCodegenAcceptanceHermeticTests: XCTestCase {
         let started = try await orderSweep(client).start(input: nil)
         XCTAssertEqual(started.runId, "run-1")
 
-        let call = try functionCall(server, path: "/functions/order-sweep")
+        // #3482 — `start` posts to the START route; the route is the runtime
+        // selector, and there is no body field for it.
+        let call = try functionCall(server, path: "/functions/order-sweep/start")
         XCTAssertEqual(call.method, "POST")
+        XCTAssertNil(try XCTUnwrap(call.jsonBody)["mode"])
         let body = try XCTUnwrap(call.jsonBody)
         XCTAssertNil(body["rootInput"], "an absent optional input omits rootInput")
         XCTAssertNil(body["runKey"])
@@ -196,7 +199,7 @@ final class FunctionCodegenAcceptanceHermeticTests: XCTestCase {
             "order-sweep", input: nil as JSONValue?
         )
         XCTAssertEqual(started.runKey, "rk-1")
-        XCTAssertNotNil(try functionCall(server, path: "/functions/order-sweep").jsonBody)
+        XCTAssertNotNil(try functionCall(server, path: "/functions/order-sweep/start").jsonBody)
     }
 
     // MARK: - Behavior 15: the untyped entry points are gone
@@ -237,11 +240,11 @@ private func _functionInvokerBindingsCompile(_ client: JsBaoClient) async throws
         contextDocId: "doc",
         meta: ["source": "compile"]
     )
-    let status: WorkflowStatus<OrderSweepOutput> = try await sweep.getStatus(runId: startResult.runId)
+    let status: FunctionRunResult<OrderSweepOutput> = try await sweep.getStatus(runId: startResult.runId)
     _ = status.output?.swept
-    let settled: WaitForResult<OrderSweepOutput> = try await sweep.waitFor(runId: startResult.runId)
+    let settled: FunctionRunResult<OrderSweepOutput> = try await sweep.waitFor(runId: startResult.runId)
     _ = settled.output?.swept
-    let ended: WorkflowStatus<OrderSweepOutput> = try await sweep.terminate(runKey: "rk")
+    let ended: FunctionRunResult<OrderSweepOutput> = try await sweep.terminate(runKey: "rk")
     _ = ended.output?.swept
 
     // A schema-less function reaches `JSONValue` through the alias, and takes
@@ -252,7 +255,7 @@ private func _functionInvokerBindingsCompile(_ client: JsBaoClient) async throws
     // A digit-leading key: the mangled factory, type and struct all exist.
     let job = _123Job(client)
     let jobStart: FunctionStartResult = try await job.start(input: _123JobInput.string("go"))
-    _ = try await job.waitFor(runId: jobStart.runId) as WaitForResult<_123JobOutput>
+    _ = try await job.waitFor(runId: jobStart.runId) as FunctionRunResult<_123JobOutput>
 
     // A nullable root input is REQUIRED and never double-optional: both a
     // value and `nil` type-check at the call site.

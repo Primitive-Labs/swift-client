@@ -312,16 +312,19 @@ public struct QueryTranslator {
     ///     CASE on whether the member is present.
     ///
     /// Output stays flat `[[String: JSONValue]]` rows (Swift's idiom) rather
-    /// than js-bao's nested map. `scopedToDocId`, when set, scopes the
-    /// query to one document — woven into the WHERE here (not spliced by
-    /// the caller) so its bind param lands after any JOIN params.
+    /// than js-bao's nested map. `scopedToDocIds`, when set, scopes the
+    /// query to those documents — woven into the WHERE here (not spliced by
+    /// the caller) so its bind params land after any JOIN params. An empty
+    /// list is a scope that admits nothing, not one that admits everything:
+    /// it is what a model with no connected document of the kind being read
+    /// asks for (#3436).
     public static func buildAggregation(
         tableName: String,
         options: AggregateOptions,
         stringsetFields: Set<String> = [],
         stringFields: Set<String>? = nil,
         fieldTypes: [String: String]? = nil,
-        scopedToDocId: String? = nil
+        scopedToDocIds: [String]? = nil
     ) throws -> (String, [Any]) {
         var regularFields: [String] = []
         var facetFields: [String] = []
@@ -354,7 +357,7 @@ public struct QueryTranslator {
                     tableName: tableName, facetField: facetFields[0],
                     options: options, stringsetFields: stringsetFields,
                     stringFields: stringFields, fieldTypes: fieldTypes,
-                    scopedToDocId: scopedToDocId
+                    scopedToDocIds: scopedToDocIds
                 )
             }
             // 2+ pure facet fields: unsupported shape (js-bao 400s here). Return
@@ -376,8 +379,18 @@ public struct QueryTranslator {
             tableName: tableName, regularFields: regularFields,
             memberships: memberships, options: options,
             stringsetFields: stringsetFields, stringFields: stringFields,
-            fieldTypes: fieldTypes, scopedToDocId: scopedToDocId
+            fieldTypes: fieldTypes, scopedToDocIds: scopedToDocIds
         )
+    }
+
+    /// The `_meta_doc_id` predicate for a scope of `ids`. An EMPTY scope
+    /// admits nothing (`IN ()` is not valid SQL, so it is spelled as a false
+    /// predicate): a read scoped to no document answers with no rows, which is
+    /// what a model whose documents of that kind have all been closed means.
+    static func docScopeClause(_ table: String, _ ids: [String]) -> String {
+        guard !ids.isEmpty else { return "0" }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ", ")
+        return "\(table).\"_meta_doc_id\" IN (\(placeholders))"
     }
 
     /// Warn-level logger for recoverable-but-degraded aggregate shapes
@@ -396,7 +409,7 @@ public struct QueryTranslator {
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
         fieldTypes: [String: String]?,
-        scopedToDocId: String?
+        scopedToDocIds: [String]?
     ) throws -> (String, [Any]) {
         let t = quoted(tableName)
         var params: [Any] = []
@@ -442,7 +455,7 @@ public struct QueryTranslator {
 
         // WHERE: doc-scope predicate (param after the JOIN params) then filter.
         var whereParts: [String] = []
-        if scopedToDocId != nil { whereParts.append("\(t).\"_meta_doc_id\" = ?") }
+        if let ids = scopedToDocIds { whereParts.append(docScopeClause(t, ids)) }
         var filterParts: (String, [Any])? = nil
         if let filter = options.filter, !filter.isEmpty {
             filterParts = try translate(
@@ -451,7 +464,7 @@ public struct QueryTranslator {
                 tableName: tableName
             )
         }
-        if let docId = scopedToDocId { params.append(docId) }
+        if let ids = scopedToDocIds { params.append(contentsOf: ids) }
         if let (clause, fParams) = filterParts {
             whereParts.append(clause)
             params.append(contentsOf: fParams)
@@ -474,7 +487,7 @@ public struct QueryTranslator {
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
         fieldTypes: [String: String]?,
-        scopedToDocId: String?
+        scopedToDocIds: [String]?
     ) throws -> (String, [Any]) {
         let t = quoted(tableName)
         let junction = quoted("\(tableName)__\(facetField)")
@@ -488,7 +501,7 @@ public struct QueryTranslator {
             + " AND \(junction).\"_meta_doc_id\" = \(t).\"_meta_doc_id\""
 
         var whereParts: [String] = []
-        if scopedToDocId != nil { whereParts.append("\(t).\"_meta_doc_id\" = ?") }
+        if let ids = scopedToDocIds { whereParts.append(docScopeClause(t, ids)) }
         var filterParts: (String, [Any])? = nil
         if let filter = options.filter, !filter.isEmpty {
             filterParts = try translate(
@@ -497,7 +510,7 @@ public struct QueryTranslator {
                 tableName: tableName
             )
         }
-        if let docId = scopedToDocId { params.append(docId) }
+        if let ids = scopedToDocIds { params.append(contentsOf: ids) }
         if let (clause, fParams) = filterParts {
             whereParts.append(clause)
             params.append(contentsOf: fParams)

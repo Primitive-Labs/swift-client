@@ -89,7 +89,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
     }
 
     private func makeApi(_ transport: ScriptedStatusTransport) -> (FunctionsAPI, FakeClock) {
-        let api = FunctionsAPI(transport: transport, workflows: WorkflowsAPI(transport: transport))
+        let api = FunctionsAPI(transport: transport)
         let clock = FakeClock()
         clock.install(on: api)
         return (api, clock)
@@ -104,7 +104,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         )
         let (api, clock) = makeApi(transport)
 
-        let result = try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 30))
+        let result = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 30))
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(result.output?["doubled"]?.numberValue, 42)
         XCTAssertEqual(transport.polls.count, 3, "three polls: queued, running, completed")
@@ -112,22 +112,42 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         XCTAssertEqual(clock.sleeps, [0.4, 0.8], "no sleep after the terminal poll")
     }
 
-    func testWaitForResolvesRatherThanThrowsForFailedAndSkipped() async throws {
+    func testWaitForResolvesRatherThanThrowsForAFailedRun() async throws {
         let failedTransport = ScriptedStatusTransport(
             [.status("failed", error: "nope")], tail: .status("failed", error: "nope")
         )
         let failed = try await makeApi(failedTransport).0.waitFor(runId: "r1")
         XCTAssertEqual(failed.status, "failed")
         XCTAssertTrue(failed.isFailure)
-        XCTAssertEqual(failed.error, "nope")
+        XCTAssertEqual(failed.error?.message, "nope")
+    }
 
-        let skippedTransport = ScriptedStatusTransport(
-            [.status("skipped", skipReason: "LOCK_CONTENTION")],
-            tail: .status("skipped", skipReason: "LOCK_CONTENTION")
-        )
-        let skipped = try await makeApi(skippedTransport).0.waitFor(runId: "r1")
-        XCTAssertEqual(skipped.status, "skipped")
-        XCTAssertEqual(skipped.skipReason, "LOCK_CONTENTION")
+    /// #3565, D3565-005 — `skipped` is a DSL-only state. A function run never
+    /// enters it, and the only way to see one on this surface is to hand it a
+    /// DSL run id, which is not refused (the route is shared by design). The
+    /// wait NAMES it rather than settling on a value outside its own terminal
+    /// set or spinning to the deadline — and stops polling.
+    func testWaitForRefusesADslOnlyStatusByName() async throws {
+        for dslOnly in ["skipped", "apply_pending", "apply_claimed"] {
+            let transport = ScriptedStatusTransport(
+                [.status(dslOnly)], tail: .status(dslOnly)
+            )
+            let (api, _) = makeApi(transport)
+            do {
+                _ = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 30))
+                XCTFail("\(dslOnly) must not settle a function wait")
+            } catch let error as JsBaoError {
+                XCTAssertEqual(error.code, .invalidArgument, dslOnly)
+                XCTAssertTrue(
+                    error.message.contains("\"\(dslOnly)\""),
+                    "the refusal names the status it saw, got \(error.message)"
+                )
+                XCTAssertTrue(
+                    error.message.contains("not a function run status"), dslOnly
+                )
+            }
+            XCTAssertEqual(transport.polls.count, 1, "no further poll after \(dslOnly)")
+        }
     }
 
     private struct Doubled: Decodable, Sendable, Equatable { let doubled: Int }
@@ -160,7 +180,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         let transport = ScriptedStatusTransport([], tail: .status("running"))
         let (api, clock) = makeApi(transport)
         do {
-            _ = try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 1))
+            _ = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 1))
             XCTFail("a run that never settles must time out")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .workflowWaitTimeout)
@@ -178,7 +198,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         let transport = ScriptedStatusTransport([], tail: .status("running"))
         let (api, clock) = makeApi(transport)
         do {
-            _ = try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 30))
+            _ = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 30))
             XCTFail("must time out")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .workflowWaitTimeout)
@@ -200,7 +220,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         let (api, clock) = makeApi(transport)
         // 200 polls at the saturated 5 s interval is ~16 minutes of fake time,
         // past the 15-minute default; with 0 there is no budget to run out.
-        let result = try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 0))
+        let result = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 0))
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(transport.polls.count, 201)
         XCTAssertEqual(clock.sleeps.count, 200)
@@ -244,7 +264,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
             tail: .status("completed")
         )
         let (api, clock) = makeApi(transport)
-        let result = try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 5))
+        let result = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 5))
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(transport.polls.count, 3, "the 503 is retried on the next poll, not surfaced")
         XCTAssertEqual(clock.sleeps, [0.4, 0.8], "the backoff keeps going across the failed poll")
@@ -262,7 +282,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
             [], tail: .status("running", output: nil, runStatus: "completed")
         )
         let (api, clock) = makeApi(transport)
-        let result = try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 120))
+        let result = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 120))
         XCTAssertEqual(result.status, "completed")
         // The first poll saw the window, then the bounded re-checks, then the record won.
         XCTAssertEqual(transport.polls.count, 1 + WorkflowsAPI.finalizeMaxRechecks)
@@ -281,7 +301,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
             tail: .status("completed", output: ["ok": true])
         )
         let (api, clock) = makeApi(transport)
-        let result = try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 10))
+        let result = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 10))
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(result.output?["ok"]?.boolValue, true)
         XCTAssertEqual(transport.polls.count, 2)
@@ -292,12 +312,12 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
     /// `CancellationError` promptly and the polling stops.
     func testWaitForCancelledThroughTaskCancelThrowsCancellationErrorPromptlyAndStopsPolling() async throws {
         let transport = ScriptedStatusTransport([], tail: .status("running"))
-        let api = FunctionsAPI(transport: transport, workflows: WorkflowsAPI(transport: transport))
+        let api = FunctionsAPI(transport: transport)
         // A real sleep, shortened so the loop is visibly polling; it still
         // throws `CancellationError` when the task is cancelled.
         api.sleepForTest = { _ in try await Task.sleep(nanoseconds: 30_000_000) }
 
-        let waiter = Task { try await api.waitFor(runId: "r1", options: WaitForWorkflowOptions(timeout: 0)) }
+        let waiter = Task { try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 0)) }
         try await eventually(timeout: 5, description: "the wait to be polling") {
             transport.polls.count >= 2
         }

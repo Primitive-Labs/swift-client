@@ -96,6 +96,10 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// `documents.getLinkAccess(documentId:)` — the document GET is gated on
     /// content access and would fail.
     public let linkAccess: DocumentLinkAccessLevel?
+    /// `2` for a large document, `1` for an ordinary one, `nil` when the
+    /// server did not say (#3436) — which is every document described before
+    /// large documents existed, so absent decodes rather than throwing.
+    public let documentFormat: Int?
 
     private enum CodingKeys: String, CodingKey {
         case documentId, title, createdBy, createdAt
@@ -103,6 +107,7 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         case permission
         case grantedAt, tags, thumbnailBlobId, metadata
         case accessSource, linkAccess
+        case documentFormat
     }
 
     public init(from decoder: Decoder) throws {
@@ -118,6 +123,7 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         tags = try c.decodeIfPresent([String].self, forKey: .tags)
         thumbnailBlobId = try c.decodeIfPresent(String.self, forKey: .thumbnailBlobId)
         metadata = try c.decodeIfPresent(JSONValue.self, forKey: .metadata)
+        documentFormat = try c.decodeIfPresent(Int.self, forKey: .documentFormat)
         accessSource = try c.decodeIfPresent(DocumentAccessSource.self, forKey: .accessSource)
         linkAccess = try c.decodeIfPresent(DocumentLinkAccessLevel.self, forKey: .linkAccess)
     }

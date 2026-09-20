@@ -317,6 +317,16 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// server POST body instead of dropping it. Mirrors js-bao's
     /// `LocalMetadataEntry.docMetadata` (#673).
     public var docMetadata: JSONValue?
+    /// The document's format, once this client knows it (#3436): `2` for a
+    /// large document, `1` for an ordinary one.
+    ///
+    /// `nil` is "not known yet" — a document this client has never completed a
+    /// handshake for — and it is a THIRD state, not a synonym for 1. The
+    /// socket's receive limit is raised for anything that is not known to be
+    /// format 1, because a first open learns the format from `epoch.info`,
+    /// which is the very frame the limit protects. A row written before this
+    /// field existed decodes with it absent, which is the same state.
+    public var documentFormat: Int?
 
     // The fields below mirror js-bao's `LocalMetadataEntry`
     // (`src/client/internal/documentManager.ts`) so offline listings can

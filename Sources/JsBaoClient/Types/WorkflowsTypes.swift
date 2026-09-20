@@ -169,109 +169,14 @@ public struct StartWorkflowResult: Decodable, Sendable, Equatable {
 
 // MARK: Task slice record
 
-/// The task slice's record on a function run (#3381). Mirrors the JS client's
-/// `WorkflowStatusResult.slice?` field for field.
+/// The task slice's record, under the workflow surface's old name.
 ///
-/// A task run executes as a series of SLICES: the engine runs the handler until
-/// it returns or hibernates, and each wake is a new slice with its own
-/// credential. `refreshCount` is how many times that credential was refreshed
-/// through the gateway instead of yielding, and `ceilingAt` is the 12-hour bound
-/// on THIS slice, measured from its own start — a run that hibernates and wakes
-/// continues in another slice, with a fresh ceiling. It is the same block
-/// `primitive functions runs` prints as its `REFRESHES` column.
-///
-/// ADDITIVE, and present only for a task run that HAS a record: a request
-/// invocation and a DSL workflow run carry no `slice` key at all, and read
-/// `nil` here. Timestamps are epoch milliseconds (what the route sends), not
-/// the ISO-8601 strings a run record carries — the slice record is the
-/// platform's own bookkeeping, and the client passes its numbers through
-/// verbatim rather than reformatting them.
-public struct WorkflowSliceInfo: Decodable, Sendable, Equatable {
-    /// Id of the slice record. The one field the server always fills.
-    public let sliceId: String
-    /// When this slice started, epoch ms. `nil` when the record does not
-    /// carry it.
-    public let startedAt: Int?
-    /// The 12-hour bound THIS slice ends at, epoch ms — `startedAt` plus the
-    /// slice maximum, not a deadline for the run, which can continue in a
-    /// later slice with a ceiling of its own.
-    public let ceilingAt: Int?
-    /// When THIS slice settled, epoch ms; `nil` while the slice is open. A
-    /// settled slice is not a finished run: a slice that yielded settles here
-    /// and the run continues in the next slice, so a caller watching a run
-    /// still reads `status`, never this field.
-    public let settledAt: Int?
-    /// How THIS slice settled (`"completed"`, `"failed"`, `"cpu-yield"`, …);
-    /// `nil` while the slice is open. `"cpu-yield"` is the slice that gave up
-    /// its CPU budget for the run to carry on in another one. A plain
-    /// `String` for the same reason every other status on this surface is
-    /// one: a server-added spelling must never turn a status read into a
-    /// decode failure.
-    public let settledStatus: String?
-    /// When the credential was last refreshed, epoch ms; `nil` for a slice
-    /// that never refreshed.
-    public let lastRefreshAt: Int?
-    /// How many times the credential was refreshed through the gateway
-    /// instead of yielding. `0` for a run short enough never to need one.
-    public let refreshCount: Int
-
-    private enum CodingKeys: String, CodingKey {
-        case sliceId, startedAt, ceilingAt, settledAt, settledStatus
-        case lastRefreshAt, refreshCount
-    }
-
-    public init(
-        sliceId: String,
-        startedAt: Int? = nil,
-        ceilingAt: Int? = nil,
-        settledAt: Int? = nil,
-        settledStatus: String? = nil,
-        lastRefreshAt: Int? = nil,
-        refreshCount: Int = 0
-    ) {
-        self.sliceId = sliceId
-        self.startedAt = startedAt
-        self.ceilingAt = ceilingAt
-        self.settledAt = settledAt
-        self.settledStatus = settledStatus
-        self.lastRefreshAt = lastRefreshAt
-        self.refreshCount = refreshCount
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        // `sliceId` is what makes this a record: a block without one is not a
-        // slice, and throwing here is what the status decode reads as "no
-        // record" (see `WorkflowStatusResult.slice`).
-        sliceId = try c.decode(String.self, forKey: .sliceId)
-        startedAt = try Self.epochMillis(c, .startedAt)
-        ceilingAt = try Self.epochMillis(c, .ceilingAt)
-        settledAt = try Self.epochMillis(c, .settledAt)
-        settledStatus = try c.decodeIfPresent(String.self, forKey: .settledStatus)
-        lastRefreshAt = try Self.epochMillis(c, .lastRefreshAt)
-        // Absent and `null` alike read 0 — the server always sends the count,
-        // so this is tolerance for a payload that predates it. A value that is
-        // not a number THROWS, which drops the whole block: a fabricated `0`
-        // would read as "this run never refreshed", which is telemetry the
-        // client does not have.
-        refreshCount = try c.decodeIfPresent(Int.self, forKey: .refreshCount) ?? 0
-    }
-
-    /// One epoch-millisecond field: absent and `null` alike read `nil`, and a
-    /// number arrives as `Double` first so a non-integral value is taken
-    /// rather than refused. A value that is not a number throws, and the block
-    /// it belongs to is dropped rather than published with a hole in it.
-    private static func epochMillis(
-        _ container: KeyedDecodingContainer<CodingKeys>,
-        _ key: CodingKeys
-    ) throws -> Int? {
-        guard let raw = try container.decodeIfPresent(Double.self, forKey: key),
-              raw.isFinite else { return nil }
-        // `Int(exactly:)` rather than `Int(_:)`: a value outside `Int`'s range
-        // would TRAP, and no timestamp is worth crashing a status read for.
-        return Int(exactly: raw.rounded())
-    }
-}
+/// The struct itself now lives on the FUNCTIONS surface as
+/// ``FunctionRunSlice`` — only a function run has a slice record, and the
+/// workflow surface is being retired, so the owner is the surface that
+/// outlives it. This alias is what the workflow types still read through;
+/// deleting them deletes this line and nothing else.
+public typealias WorkflowSliceInfo = FunctionRunSlice
 
 // MARK: Status / terminate
 
@@ -291,12 +196,72 @@ public struct WorkflowSliceInfo: Decodable, Sendable, Equatable {
 /// `String` rather than a closed enum so a future server-added state can never
 /// turn a status read into a decode failure — same reasoning as every other
 /// Swift workflow status field.
+/// Why a run failed, structured — #3449.
+///
+/// The status routes answer `status.error` as an object for every failed
+/// durable run, DSL or function: `{ name: "WorkflowError", message }` where
+/// the platform built it, and the thrown error's own name beside its message
+/// where Cloudflare recorded it. `name` is NOT the platform's error code — a
+/// refusal leads its MESSAGE with the code (`OUTPUT_SCHEMA_VIOLATION: …`) and
+/// reports `name` as `Error`, and the deployed engine drops the name
+/// altogether. Read `message`; `name` is a hint.
+///
+/// Field for field with the JS client's `WorkflowRunError`.
+public struct WorkflowRunError: Decodable, Sendable, Equatable {
+    /// The error's own name, when the wire carried one.
+    public let name: String?
+    /// What went wrong. A failed run the client publishes is one it can
+    /// describe, so this is never absent.
+    public let message: String
+    /// Whatever else the wire object carried, key for key.
+    ///
+    /// Always a JSON OBJECT when present. A wire `details` is one of those
+    /// remaining keys like any other, so an error sending `details: ["x"]`
+    /// reads here as `details` containing `{"details": ["x"]}` — the array is
+    /// kept where it was rather than promoted over the map it lives in. `nil`
+    /// when the object carried nothing besides `name` and `message`.
+    public let details: JSONValue?
+
+    public init(name: String?, message: String, details: JSONValue? = nil) {
+        self.name = name
+        self.message = message
+        self.details = details
+    }
+
+    /// Read a raw `status.error` value, or `nil` when there is none to
+    /// publish.
+    ///
+    /// A wrapper over ``RunErrorEnvelope/read(_:)``, which owns the parsing
+    /// and the rule behind it: never throws, never fails the read around it,
+    /// and treats anything it cannot vouch for as "no error the client can
+    /// describe". The parser sits on the functions surface because this one
+    /// is being retired — when it goes, this wrapper goes with it and the
+    /// parser stays.
+    static func read(_ value: JSONValue?) -> WorkflowRunError? {
+        guard let base = RunErrorEnvelope.read(value) else { return nil }
+        return WorkflowRunError(
+            name: base.name,
+            message: base.message,
+            details: base.details
+        )
+    }
+}
+
 public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
     /// The server's canonical run status. See the type doc for the vocabulary.
     public let status: String
     /// Final output of the run, when present. Opaque blob.
     public let output: JSONValue?
+    /// The failure's MESSAGE, whichever form the server sent (#3449).
+    ///
+    /// Still `String?`, so every call site that printed it keeps compiling —
+    /// and starts receiving a value where it used to get a throw. The string
+    /// form arrives verbatim; the object form reads its `message`. See
+    /// {@link failure} for the structured value.
     public let error: String?
+    /// The same failure, structured (#3449). `nil` for a run that has not
+    /// failed, and for a value the client could not read.
+    public let failure: WorkflowRunError?
     /// #2636 — why the run did not run, when `status == "skipped"`. The server
     /// sends it next to the status and on the run record; either satisfies it.
     public let skipReason: String?
@@ -311,15 +276,19 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         case status, output, error, run, skipReason, slice
     }
 
-    /// The Cloudflare workflow status object the server nests under `status`:
-    /// `{ status, output, error }`. JS's `getWorkflowStatus` reads
-    /// `rawStatus.status` / `.output` / `.error` off this object and flattens
-    /// them onto the result — we mirror that flattening at decode time.
-    private struct CFWorkflowStatus: Decodable {
-        let status: String?
-        let output: JSONValue?
-        let error: String?
-        let skipReason: String?
+    /// The keys of the Cloudflare workflow status object the server nests
+    /// under `status`: `{ status, output, error, skipReason }`. JS's
+    /// `getWorkflowStatus` reads them off that object and flattens them onto
+    /// the result — we mirror that flattening at decode time.
+    ///
+    /// #3449 — decoded FIELD BY FIELD through a nested container rather than
+    /// as one `try?`-wrapped struct. As one struct, an `error` that did not
+    /// match its declared type made the whole block `nil`, the decoder fell
+    /// into the bare-string branch below, and re-reading `status` as a String
+    /// threw `typeMismatch` on the dictionary — a surprise in ONE field cost
+    /// the caller the entire response. Field by field, it cannot.
+    private enum CFStatusKeys: String, CodingKey {
+        case status, output, error, skipReason
     }
 
     /// Memberwise init, for constructing a result directly (tests, callers
@@ -334,7 +303,11 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         skipReason: String? = nil,
         // Trailing with a default so every pre-#3388 memberwise call still
         // compiles: the block is additive here exactly as it is on the wire.
-        slice: WorkflowSliceInfo? = nil
+        slice: WorkflowSliceInfo? = nil,
+        // #3449, same rule. A caller assembling a result from a message alone
+        // gets the structured value derived from it rather than nothing, so
+        // the two fields cannot silently disagree.
+        failure: WorkflowRunError? = nil
     ) {
         self.status = status
         self.output = output
@@ -342,6 +315,8 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         self.run = run
         self.skipReason = skipReason
         self.slice = slice
+        self.failure =
+            failure ?? error.map { WorkflowRunError(name: nil, message: $0, details: nil) }
     }
 
     public init(from decoder: Decoder) throws {
@@ -353,17 +328,41 @@ public struct WorkflowStatusResult: Decodable, Sendable, Equatable {
         // We do the same. Defensive fallback: tolerate `status` arriving as a
         // bare string (direct construction / already-flattened payloads), and
         // top-level `output`/`error` for the same reason.
+        //
+        // #3449 — the raw `error` is read as a JSON VALUE at both levels,
+        // because it is one: an object for every failed durable run, `null`
+        // on a read that has not failed, and a string on the older form.
         var nestedSkipReason: String? = nil
-        if let cf = (try? c.decodeIfPresent(CFWorkflowStatus.self, forKey: .status)) ?? nil {
-            status = cf.status ?? ""
-            output = try cf.output ?? c.decodeIfPresent(JSONValue.self, forKey: .output)
-            error = try cf.error ?? c.decodeIfPresent(String.self, forKey: .error)
-            nestedSkipReason = cf.skipReason
+        var rawError: JSONValue? = nil
+        if let nested = try? c.nestedContainer(keyedBy: CFStatusKeys.self, forKey: .status) {
+            // Field by field, each tolerant of its OWN surprise and of nothing
+            // else: a `status` that is not a string reads `""`, and neither it
+            // nor a surprising `error` can cost the caller the rest of the
+            // response. Each `try?` is annotated with the optional type it
+            // produces, so the fallbacks below are live rather than dead.
+            let nestedStatus: String? =
+                try? nested.decodeIfPresent(String.self, forKey: .status)
+            status = nestedStatus ?? ""
+            let nestedOutput: JSONValue? =
+                try? nested.decodeIfPresent(JSONValue.self, forKey: .output)
+            output = try nestedOutput ?? c.decodeIfPresent(JSONValue.self, forKey: .output)
+            let nestedError: JSONValue? =
+                try? nested.decodeIfPresent(JSONValue.self, forKey: .error)
+            rawError =
+                try nestedError ?? c.decodeIfPresent(JSONValue.self, forKey: .error)
+            nestedSkipReason =
+                try? nested.decodeIfPresent(String.self, forKey: .skipReason)
         } else {
             status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
             output = try c.decodeIfPresent(JSONValue.self, forKey: .output)
-            error = try c.decodeIfPresent(String.self, forKey: .error)
+            rawError = try c.decodeIfPresent(JSONValue.self, forKey: .error)
         }
+        // One rule for both branches, and the same one the JS client's
+        // `readWorkflowRunError` applies: an already-flattened payload's
+        // top-level `error` object decodes exactly as a nested one does.
+        let readFailure = WorkflowRunError.read(rawError)
+        failure = readFailure
+        error = readFailure?.message
         run = try c.decodeIfPresent(WorkflowRunInfo.self, forKey: .run)
         // #2636 — the reason rides next to the status and on the run record.
         let topLevelSkipReason = try c.decodeIfPresent(
@@ -667,7 +666,11 @@ public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
     public let status: String
     /// Final output decoded into `Output` when present; `nil` otherwise.
     public let output: Output?
+    /// The failure's message, forwarded from the untyped result (#3449).
     public let error: String?
+    /// The structured failure, forwarded from the untyped result (#3449).
+    /// Typing the `output` blob must not cost a caller the reason it failed.
+    public let failure: WorkflowRunError?
     /// #2636 — why the run did not run, when `status == "skipped"`. Forwarded
     /// from the untyped result, which reads it from wherever the server put it
     /// (next to the status, or on the run record).
@@ -683,7 +686,8 @@ public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
         error: String?,
         run: WorkflowRunInfo?,
         skipReason: String? = nil,
-        slice: WorkflowSliceInfo? = nil
+        slice: WorkflowSliceInfo? = nil,
+        failure: WorkflowRunError? = nil
     ) {
         self.status = status
         self.output = output
@@ -691,6 +695,8 @@ public struct WorkflowStatus<Output: Decodable & Sendable>: Sendable {
         self.run = run
         self.skipReason = skipReason
         self.slice = slice
+        self.failure =
+            failure ?? error.map { WorkflowRunError(name: nil, message: $0, details: nil) }
     }
 }
 
@@ -733,6 +739,11 @@ public struct WaitForWorkflowResult: Sendable {
     public let output: JSONValue?
     /// Error message when `status == "failed"`.
     public let error: String?
+    /// The structured failure, when `status == "failed"` (#3449). Carried by
+    /// every path that settles a wait — the poll, the finalization re-check,
+    /// and the terminal `workflowStatus` frame — so a caller reporting a
+    /// failure does not have to know which one settled it.
+    public let failure: WorkflowRunError?
     /// #2636 — why the run did not run, when `status == "skipped"`
     /// (`"LOCK_CONTENTION"`). `nil` for every other status.
     public let skipReason: String?
@@ -741,12 +752,17 @@ public struct WaitForWorkflowResult: Sendable {
         status: String,
         output: JSONValue?,
         error: String?,
-        skipReason: String? = nil
+        skipReason: String? = nil,
+        failure: WorkflowRunError? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.skipReason = skipReason
+        // The frame path carries a STRING error, so a caller (and that path)
+        // gets the structured value derived from it rather than nothing.
+        self.failure =
+            failure ?? error.map { WorkflowRunError(name: nil, message: $0, details: nil) }
     }
 
     /// `true` for any terminal-for-waiting status. Always `true` on a resolved
@@ -781,6 +797,8 @@ public struct WaitForResult<Output: Decodable & Sendable>: Sendable {
     public let output: Output?
     /// Error message when `status == "failed"`.
     public let error: String?
+    /// The structured failure, forwarded from the untyped result (#3449).
+    public let failure: WorkflowRunError?
     /// #2636 — why the run did not run, when `status == "skipped"`.
     public let skipReason: String?
 
@@ -788,12 +806,15 @@ public struct WaitForResult<Output: Decodable & Sendable>: Sendable {
         status: String,
         output: Output?,
         error: String?,
-        skipReason: String? = nil
+        skipReason: String? = nil,
+        failure: WorkflowRunError? = nil
     ) {
         self.status = status
         self.output = output
         self.error = error
         self.skipReason = skipReason
+        self.failure =
+            failure ?? error.map { WorkflowRunError(name: nil, message: $0, details: nil) }
     }
 
     /// See `WaitForWorkflowResult.isTerminal`.

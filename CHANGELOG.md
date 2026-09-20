@@ -20,6 +20,302 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### A slice says how often the platform reset the run: `resets`, `lastResetAt`, `lastResetCause` (#3566)
+
+**Additive.** A platform deploy resets the engine's Durable Object under every
+executing slice, and an isolate eviction does the same. The engine re-runs the
+interrupted step as a further attempt, so a run that was reset and then
+finished reads `completed` with no failure and no error code — the reset left
+no trace a caller could see. `FunctionRunSlice` (and the workflow surface's
+`WorkflowSliceInfo`, its alias) now carries three fields that record it:
+
+- `resets` (`Int`) — how many of this run's slices the platform tore down and
+  restarted. `0` for a run nothing reset, and for a server that predates the
+  field: the server defaults all three columns in one place, so a task run
+  started before they existed reads a zero count rather than losing the whole
+  slice block.
+- `lastResetAt` (`Int?`) — when the most recent reset was counted, epoch ms;
+  `nil` until there is one.
+- `lastResetCause` (`String?`) — `"code-updated"` when the platform build
+  changed underneath the run, `"evicted"` when the runtime said the isolate
+  was reset, `"unknown"` when the platform saw a teardown it could not
+  attribute. A plain `String`, so a server-added spelling never turns a status
+  read into a decode failure.
+
+The same block reaches the status route, the admin runs list and the admin
+single-run read, so what the client decodes is what `primitive functions runs`
+prints.
+
+### Breaking: `client.functions` answers a function-native run status (#3565)
+
+`functions.getStatus`, `functions.waitFor` and `functions.terminate` answered
+the WORKFLOW status types, so a caller polling a function run read a
+`skipReason` and a `run.workflowId` the server can never set for a function,
+and a missing run reported itself as a missing WORKFLOW run. They now answer
+`FunctionRunStatus` and, on the typed overloads, `FunctionRunResult<Output>`.
+`FunctionsAPI` holds no `WorkflowsAPI` and posts the two control routes itself.
+
+Nothing on `client.workflows` moves, and no route or published schema moves.
+There is no compatibility shim: reading this file is the whole mitigation for
+a break on this package (see the note above), and a deprecated overload would
+be a second way to say one thing.
+
+| Before | Now |
+|---|---|
+| `status.failure?.message` | `status.error?.message` |
+| `status.failure?.details?["code"]` | `status.error?.code` |
+| `status.failure?.name` | `status.error?.name` — **absent** for a failure read off the persisted row (the platform keeps only the message there and labels it `WorkflowError`, which this client drops) |
+| `status.error` (the message as a `String?`) | `status.error` IS the structured `FunctionRunError` |
+| `status.skipReason` | gone — a function run never declares a lock |
+| `status.run?.workflowId` / `workflowKey` / `revisionId` / `failedStepId` / `failedStepKind` / `failedStepErrorTitle` | gone — the server never set them for a function row |
+| `WorkflowStatusResult` / `WorkflowStatus<Output>` | `FunctionRunStatus` / `FunctionRunResult<Output>` |
+| `WaitForWorkflowResult` / `WaitForResult<Output>` | `FunctionRunStatus` / `FunctionRunResult<Output>` |
+| `WaitForWorkflowOptions(timeout:)` | `FunctionWaitOptions(timeout:)` |
+| `FunctionsAPI(transport:workflows:)` | `FunctionsAPI(transport:)` |
+| `WaitForWorkflowResult.terminalStatuses.contains(status)` | `status.isTerminal` |
+
+New and additive on the same type: `run?.functionId`, `functionKey`,
+`executionPrincipal`, `parentFunctionKey`, `parentRunId`, `nestDepth`,
+`errorCode`; `outputTruncated`; `slice` as `FunctionRunSlice`.
+
+`waitFor` settles on exactly `completed`, `failed` and `terminated`. A run
+reporting `missing` throws `.notFound`; a run reporting one of the DSL-only
+states — reachable only by handing the method a DSL run id, which is not
+refused — throws `.invalidArgument` naming the status. Every message these
+three methods mint is function-worded; the thrown CODES are unchanged.
+
+`terminate` now tells two 404s apart. A run it cannot find is `.notFound`
+naming the function key and the run key; a run that EXISTS and that the engine
+could not stop is `.unavailable`, carrying the engine's own diagnostic verbatim
+after the message. Only the second means "try again".
+
+The generated per-key Swift invokers answer `FunctionRunResult<<Key>Output>`
+from `getStatus`, `waitFor` and `terminate`, and take
+`FunctionWaitOptions? = nil`. Re-run `primitive functions codegen`.
+
+### Fixed: a session could be left signed in to a socket that would not open (#3437)
+
+A reconnect the client asked for itself is no longer read as the server
+refusing its token. The socket rebuild that a raised receive limit forces
+(#3436 — `URLSessionWebSocketTask.maximumMessageSize` is only honoured before a
+task is resumed) could land on a connection whose handshake had not completed
+yet, which looks exactly like a rejected upgrade. The auth recovery then
+refreshed a token nobody had rejected, and a client holding a fixed token — one
+constructed with a JWT, or one that hydrated a persisted JWT with no refresh
+token beside it — got a 401 and stopped reconnecting altogether.
+
+Nothing to change in an app: the transport now tells the recovery policy which
+closes are its own, and a close this client made is skipped whatever the
+handshake state. A close the SERVER makes is judged exactly as before.
+
+### Large documents reload from a base, cross a bulk load, and fit the device (#3437, phase C)
+
+**Additive on every signature.** Phases A and B made a rotation a non-event.
+This closes the three states that were still a dead end.
+
+- **A refused chain reloads instead of stopping.** When the sealed chain
+  between this client and the room cannot be trusted and the room has a base
+  past everything this client has crossed, the document is rebuilt from it: the
+  merged view AND its query tables are discarded, the base is loaded whole, and
+  every sealed overlay from the base's epoch through the room's is applied
+  above it. A base announced while the room kept rotating is short of the
+  document without them. Only with no base on offer is the document stopped,
+  and a later `snapshot.ready` is the retry.
+- **A dropped delete asks for a base rather than half-applying.** When a
+  replay's resolution would drop a delete, the record has to be there again —
+  which a merged view the delete has already been folded into cannot manage. The
+  judgement says so, nothing is forgotten, and the reload is what carries the
+  verdict out.
+- **A bulk load is followed, not refused.** A seal carrying `baseDiscontinuity`
+  is recorded durably before the move; the move defers its carry and withholds
+  the owed sequences, so nothing gets acknowledged before anything has judged
+  it. Reads keep answering and local writes keep committing meanwhile. When the
+  base the ingest produced is announced the document rebuilds from it and judges
+  the deferred writes by PRESENCE — the only fact a replaced range leaves —
+  surfacing each as a `bulkIngest` notice on the usual event. A relaunch in
+  between keeps those writes off the overlay until the rebuild has judged them.
+- **The device's room is measured before the first chunk.** A base load reads
+  the capacity the system will give important data on the volume the client's
+  database is on and plans against it: everything fits (or nothing is reported)
+  → whole; not everything but your configured models do → those, with a log line
+  naming what was left behind; not even those → `.format2StorageUnavailable`
+  with reason `over-quota`, before a byte is fetched. The cap is durable across
+  a relaunch and across a reload, and a model this device does not hold refuses
+  every read by name rather than answering from a fragment.
+- `JsBaoClientOptions.largeDocumentStorage` (`LargeDocumentStorageOptions`)
+  mirrors js-bao's option: `capability` overrides the probe, `models` names what
+  is worth keeping. Both optional; an app that configures neither gets the
+  probe and a refusal where a cap had nothing to cap to.
+- `Format2QueryProjection` marks and rows are now taken with the merged view
+  when it is discarded, so `query`, `count`, `aggregate` and the stringset index
+  can no longer show a record the replacement base does not carry after
+  `find(id:)` reports it gone.
+
+Still owed and recorded under principle 11: Swift ingest and inspection verbs,
+and web-admin views. An operator drives a bulk load and inspects snapshot
+builds from the CLI.
+
+### Large documents catch up over the sealed chain and judge what was written offline (#3437, phase B)
+
+**Additive on every signature.** Phase A made a rotation a non-event for a
+client that was CONNECTED. This does the same for one that was away.
+
+- **A client behind the room catches up instead of stopping.** The overlays
+  sealed between the epoch it holds and the one the room is on are applied
+  oldest first — bounded, rotation-sized artifacts, no base over the wire —
+  and then the document moves. A cold client whose base was cut below the
+  room's epoch applies the same chain above the base. A chain that cannot be
+  trusted (a gap, a pruned archive) or cannot be read twice still stops the
+  document, with `details.plan` naming why.
+- **Nothing the room sends for its current epoch reaches a held overlay.**
+  While a document is behind the room its inbound frames are dropped and its
+  outbound queue is held: the overlay belongs to an epoch the room has
+  archived, and the move reads this client's owed values off it. The frames
+  come back with the fresh overlay's resync; the writes commit locally as
+  before.
+- **An offline write is judged, not replayed blind.** A returning client's
+  unacknowledged writes are weighed against the sealed overlays it just
+  applied: clearly older than the online write they raced, they are DROPPED;
+  ambiguous, they stand and are reported; onto a record deleted meanwhile,
+  dropped whatever the clock says; with no chain to check, kept as
+  `unverifiable`. Nothing is dropped on a clock with no measured server
+  offset.
+- `DocumentOfflineWritesResolvedEvent` (`documentOfflineWritesResolved`, the
+  JS client's own key) carries what did not simply apply — `documentId`,
+  `epoch` and `notices`. Silence means every offline write replayed cleanly:
+  the event carries notices or it is not sent.
+- While a judgement is owed those sequences are withheld from every claim, so
+  the room cannot acknowledge a write whose content no frame carries; and the
+  debt is durable, so a relaunch in that window keeps the writes off the
+  overlay until the chain has been re-read and judged.
+
+### Large documents follow a seal, replay a relaunch's writes, and go read-only past the offline window (#3437, phase A)
+
+**Additive on every signature, with two behaviours an existing app can
+notice** — both listed below. A large document used to STOP the moment its
+room rotated: reads kept answering, the pending log was kept, but writes were
+refused with `FORMAT2_RELOAD_REQUIRED` until the next open reloaded from a
+covering base. It follows the rotation now.
+
+- **A seal is followed, not a stop.** The client moves onto a fresh epoch
+  overlay carrying exactly the writes the server has not acknowledged, and
+  goes on writing. An acknowledged write does not travel: it is already in the
+  server's records table and in this client's merged view, and re-sending it
+  would re-seed the new epoch, which is what rotation exists to prevent.
+- **A relaunch replays what the previous instance owed.** The client id is
+  minted per `JsBaoClient` instance, so the previous instance's unacknowledged
+  writes were invisible to the next one — never carried, never replayed, never
+  acknowledged. They are adopted at the bind now, classified key by key
+  against what the overlay held when they were written, and the ones still
+  owed are put back and claimed on the join.
+- **Past the offline write window a document is READ-ONLY.** The window is the
+  server's number, delivered on `epoch.info` and persisted locally: 7 days by
+  default, clamped to 1–14 — the same range overlay retention prunes archives
+  by, which is what an offline write is replayed across. (#3436 stored 30 days
+  unclamped, so a Swift app went on accepting writes for three weeks after the
+  server could no longer place them.) Reads keep answering, and a sync
+  restores writes at once.
+- `JsBaoErrorCode.documentOfflineWindowExpired`
+  (`DOCUMENT_OFFLINE_WINDOW_EXPIRED`, the JS client's own string).
+  `Model.create`, `update`, `save`, `addStringsetMember` and
+  `removeStringsetMember` throw it, with `lastSyncAt`, `windowDays` and
+  `overdueMs` in `details`.
+- `DocumentWriteRefusedEvent` (`document:write-refused`), the channel for the
+  mutations that CANNOT throw.
+
+**Two behaviours to know about before you take this update:**
+
+1. **The `YDocument` an app holds for a large document is replaced at a
+   rotation.** For a large document that handle IS the current epoch's
+   overlay, not the document, so following a seal means putting a fresh one in
+   its place. Writes on a handle kept from before a move are not forwarded.
+   Read a large document's records through the model facade (`Note.find(id:)`,
+   `Note.query(...)`), which follows the replacement; the raw handle is not a
+   stable way to reach them.
+2. **A non-throwing mutation past the offline window now does nothing.**
+   `Model.delete(id:)`, a `PrimitiveRecord` field assignment
+   (`record["title"] = .string("x")`) and an explicit clear
+   (`record["title"] = nil`) are declared without `throws` and cannot report a
+   refusal, so they emit `DocumentWriteRefusedEvent` and log one warn line
+   instead. Before this there was no refusal at all. Subscribe if your app
+   needs to know:
+
+   ```swift
+   subscription = client.observeOnMainActor(DocumentWriteRefusedEvent.self) { event in
+       // event.error.code == .documentOfflineWindowExpired
+       banner.show("\(event.model) \(event.recordId) was not saved: \(event.error.message)")
+   }
+   ```
+
+Still owed by the rest of #3437: applying the sealed overlay chain for a
+client behind the room, recency-aware offline replay and its
+`DocumentOfflineWritesResolvedEvent`, the `baseDiscontinuity` reload, and the
+on-device storage cap. Still deferred under principle 11: Swift ingest and
+inspection verbs, and web-admin views, which stay CLI-only.
+
+### Large documents open on Swift (#3436)
+
+**Additive.** A large document (`documentFormat: 2`) could not be opened from
+Swift at all: the client did not declare the formats it reads, so a room
+hosting one closed the socket with `CLIENT_UPGRADE_REQUIRED` (4426) and the
+client reconnected forever. It now opens one, holds it, writes to it and
+streams in its base snapshot. An ordinary document is untouched: a client that
+never opens a large document builds none of this — no record store, no
+observer, no extra table in its database.
+
+See [`docs/large-documents.md`](docs/large-documents.md) for the whole surface.
+In brief:
+
+- `CreateDocumentOptions.documentFormat` and `DocumentInfo.documentFormat`.
+- Every `syncStep1` declares `formats: [1, 2]` and `manifestVersion: 3`; a 4426
+  close emits `ConnectionErrorEvent(messageType: "syncStep1")`, fails the
+  waiting `openDocument` with `.clientUpgradeRequired`, and is never
+  reconnected on.
+- A large document's records live in the client's SQLite store, with the same
+  overlay fold the server and the JS client use — held to them by a parity
+  check that runs both implementations over the same input.
+- The resumable, digest-checked cold load of a base snapshot, reported through
+  the new `DocumentSnapshotLoadEvent` (`document:snapshot-load`).
+- Nine new `JsBaoErrorCode` cases, spelled as the JS client spells them:
+  `clientUpgradeRequired`, `format2StorageUnavailable`, `format2ReloadRequired`,
+  `format2QueryScope`, `format2ModelNotHydrated`, `format2FoldBroken`,
+  `snapshotManifestInvalid`, `snapshotManifestUnsupported`,
+  `format2SnapshotLoadIncomplete`.
+- A large document needs `.sqlite` storage: opening one on a `.memory` client
+  throws `.format2StorageUnavailable` before any frame goes out.
+
+Deferred to #3437, whose phase A has since landed the epoch handoff for a
+CONNECTED client, pending-op adoption and the read-only window (see the entry
+above): what remains there is the sealed chain for a client BEHIND the room,
+offline replay, the `baseDiscontinuity` reload and the device storage cap.
+Deferred under principle 11: Swift ingest and inspection verbs, which stay
+CLI-only.
+
+### `WorkflowStatusResult` carries the task run's slice block: `WorkflowSliceInfo` (#3388)
+
+**Additive.** `functions.getStatus`, `workflows.getStatus` and both clients'
+`terminate` now decode a `slice` field alongside `status` and `run`: the
+current slice's id, when it started and settled, how it settled, and the
+credential-refresh bookkeeping `primitive functions runs` already showed as
+its `REFRESHES` column.
+
+- `WorkflowStatusResult.slice` and the typed `WorkflowStatus<Output>.slice`,
+  both `WorkflowSliceInfo?`. `nil` for a request invocation and for a DSL
+  workflow run — neither carries a `slice` key on the wire — not "this run
+  never refreshed".
+- `WorkflowSliceInfo`: `sliceId` (the one field the server always fills),
+  `startedAt`, `ceilingAt` (this slice's own 12-hour bound, not a deadline for
+  the run — a run that hibernates and wakes continues in a later slice with a
+  fresh ceiling), `settledAt`, `settledStatus` (`"completed"` / `"failed"` /
+  `"cpu-yield"` / … as a plain `String`, so a server-added spelling never
+  turns a status read into a decode failure), `lastRefreshAt`, `refreshCount`.
+  Timestamps are epoch milliseconds, matching the route rather than the
+  ISO-8601 strings a run record carries.
+- A `slice` block this client cannot read — the wrong shape, a non-numeric
+  timestamp — is dropped rather than invented: the field reads `nil`, the
+  rest of the status decodes normally, and no zero refresh count is
+  fabricated.
+
 ### A stalled document keeps retrying, and the app hears about it (#3390)
 
 **Additive.** A document whose `syncComplete` never arrived could stop
@@ -72,15 +368,18 @@ start a task and poll its run, join a channel, and receive direct messages.
 
 - `client.functions` (`FunctionsAPI`) mirrors JS `client.functions`:
   `invoke` (request functions), `start` (task functions), `getStatus`,
-  `waitFor`, `terminate`, each with an untyped and a typed `Encodable` /
-  `Decodable` overload. A settled invocation never throws — read `status`
-  (`completed` / `failed` / `timeout`); only a platform refusal throws, as an
-  `HttpError` carrying the server's `errorCode` on `serverCode`. `waitFor`
-  polls with a 0.4 s→5 s backoff and a 15-minute default timeout. The typed
-  `input` is sent as whatever JSON value it encodes to — object, array or
-  scalar — so a function whose schema declares a non-object root receives
-  exactly that. Calling `invoke` on a task function, or `start` on a request
-  function, throws `JsBaoError(.functionModeMismatch)`.
+  `waitFor`, `terminate`. `invoke` and `start` shipped here with an untyped
+  and a typed `Encodable` / `Decodable` overload each, for lack of anything
+  yet to bind the typed one to; #3344 below removes the untyped overload once
+  codegen supplies that binding. A settled invocation never throws — read
+  `status` (`completed` / `failed` / `timeout`); only a platform refusal
+  throws, as an `HttpError` carrying the server's `errorCode` on
+  `serverCode`. `waitFor` polls with a 0.4 s→5 s backoff and a 15-minute
+  default timeout. The typed `input` is sent as whatever JSON value it
+  encodes to — object, array or scalar — so a function whose schema declares
+  a non-object root receives exactly that. Calling `invoke` on a task
+  function, or `start` on a request function, throws
+  `JsBaoError(.functionModeMismatch)`.
 - `subscribeToChannel(_:grant:)` / `unsubscribeFromChannel(_:)` join and leave
   a channel a function authorized; frames arrive as the new `.channelMessage`
   and `.directMessage` events, and a reconnect re-presents held grants (a
@@ -92,8 +391,43 @@ start a task and poll its run, join a channel, and receive direct messages.
   `FunctionInvokeLimits`, `FunctionRunRef` and `ChannelSubscription` types.
 
 Generated per-key Swift types for a function's declared schema are not part of
-this change — they bind over the generic `invoke<Input, Output>` /
-`start<Input>` overloads shipped here and land in #3344.
+this change; see #3344 below.
+
+### `client.functions` is typed-only: `invoke` and `start` lose their untyped overload (#3344)
+
+**Breaking.** #3278 above shipped `invoke` and `start` each with an untyped
+`[String: Any]` overload beside the typed `Encodable` / `Decodable` one, for
+lack of anything yet to bind the typed overload to. `primitive functions
+codegen --lang swift` now generates that binding, and the untyped overload —
+the only way to call either method without a generated type — is gone with
+the reason for it.
+
+| Before | Now |
+|---|---|
+| `client.functions.invoke(key, input: ["name": "Ada"])` | A generated per-key invoker, or the typed generic with the witness below |
+| `client.functions.start(key, input: [...])` | Same |
+
+**Action required.** Regenerate: `primitive functions codegen --lang swift`
+emits one `<key>.generated.swift` per `functions/<key>.toml` under
+`functions/generated/` — `<Key>Input` / `<Key>Output` as `Codable` types from
+the declared schemas (a function with no declared schema gets `typealias
+<Key>Input = JSONValue` rather than an empty struct), and a `<Key>Function`
+reached through a `<key>(client)` factory, bound over the generic overloads
+this entry leaves. The Swift app template already runs it from
+`scripts/codegen.sh` on every build path.
+
+- A caller with a generated type calls the per-key invoker:
+  `greet(client).invoke(input: GreetInput(name: "Ada"))`,
+  `orderSync(client).start(input: nil, contextDocId: docId)`. The invoker
+  binds that function's own `<Key>Input` / `<Key>Output`, so a wrong input
+  shape is a compile error instead of a `400`. The verb set is not narrowed
+  by mode: since #3482 made the ROUTE the runtime selector, every invoker
+  carries `invoke` plus the four task verbs, and calling the one the
+  function's mode does not support still throws
+  `JsBaoError(.functionModeMismatch)` at runtime.
+- A caller with no declared schema, or one that is genuinely dynamic, names
+  the witness instead: `client.functions.invoke(key, input: nil as
+  JSONValue?)` bound `as FunctionResult<JSONValue>`; `start` the same way.
 
 ### `documents.create` no longer opens the document (#3200)
 

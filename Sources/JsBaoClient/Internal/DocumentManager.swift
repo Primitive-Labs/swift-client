@@ -217,6 +217,69 @@ public final class DocumentManager: @unchecked Sendable {
     /// app force-quit between rounds) were lost on restart.
     private var persistDebounceTasks: [String: Task<Void, Never>] = [:]
 
+    /// How many times a document's open Y.Doc has been REPLACED (#3437,
+    /// behavior 9, finding 3437-SO-06).
+    ///
+    /// Only an epoch move bumps this, and only a LARGE document has epoch
+    /// moves, so for an ordinary document it is zero for the document's whole
+    /// life and every read of it answers the same. It is the fence between an
+    /// in-flight persist and the swap: `persistDocumentToLocal` encodes the
+    /// bytes and saves them several suspension points later, so a persist of
+    /// the OLD overlay can otherwise land after the fresh one was saved —
+    /// restarting the client with a SEALED overlay under the NEW epoch mark
+    /// and resending it whole into the new epoch. The bytes carry the
+    /// generation they were encoded under, and a save whose generation has
+    /// moved writes nothing.
+    private var persistGeneration: [String: Int] = [:]
+
+    /// Whose turn it is to run the fence-and-save, per document (#3437,
+    /// finding 3437-REVIEW-006).
+    ///
+    /// The generation check alone is a read-then-act: it is taken under the
+    /// lock, the lock is given back, and the save is enqueued afterwards. A
+    /// stale persist preempted between the two passes the check, watches the
+    /// swap bump the generation and save the fresh overlay, and then enqueues
+    /// its own old-epoch bytes on top — the very corruption the fence exists
+    /// to prevent, through a window the fence does not cover. One turn per
+    /// document closes it: a stale persist either takes its turn before the
+    /// swap, and the swap's save lands after it, or takes it afterwards and
+    /// finds its generation moved.
+    ///
+    /// Empty for every document until one has a persist in flight, and the
+    /// uncontended path is one lock hold — an ordinary document never queues.
+    private var persistTurnHeld: Set<String> = []
+    private var persistTurnWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    /// Wait for this document's fence-and-save turn.
+    private func acquirePersistTurn(_ documentId: String) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let granted: Bool = lock.withLock {
+                if persistTurnHeld.contains(documentId) {
+                    persistTurnWaiters[documentId, default: []].append(continuation)
+                    return false
+                }
+                persistTurnHeld.insert(documentId)
+                return true
+            }
+            if granted { continuation.resume() }
+        }
+    }
+
+    /// Hand it to whoever is next, in the order they asked.
+    private func releasePersistTurn(_ documentId: String) {
+        let next: CheckedContinuation<Void, Never>? = lock.withLock {
+            guard var waiting = persistTurnWaiters[documentId], !waiting.isEmpty else {
+                persistTurnHeld.remove(documentId)
+                persistTurnWaiters.removeValue(forKey: documentId)
+                return nil
+            }
+            let first = waiting.removeFirst()
+            persistTurnWaiters[documentId] = waiting
+            return first
+        }
+        next?.resume()
+    }
+
     /// How long to wait after the last update before flushing the
     /// YDoc state to SQLite. Trades a small window of crash-loss risk
     /// (250ms of in-memory edits) against I/O thrashing during bursty
@@ -230,7 +293,83 @@ public final class DocumentManager: @unchecked Sendable {
     var userId: String = ""
     weak var emitter: EventEmitter?
     var sendWebSocketMessage: ((String) async throws -> Void)?
+    /// Offload one outbound payload too large to travel inline (#3559), and
+    /// answer the `uploadId` the frame names it by — `nil` when it could not
+    /// be uploaded, which leaves the update queued rather than sending a frame
+    /// the server cannot resolve.
+    ///
+    /// Wired by `JsBaoClient`, which owns the socket the URL request travels
+    /// and the HTTP stack the PUT runs on. `nil` in a manager driven without
+    /// one; such a manager has no R2 path, and an oversize frame is then not
+    /// sent at all, which is what the JS client does when its own upload
+    /// fails.
+    var uploadLargeUpdate: ((String, [UInt8]) async -> String?)?
+
+    /// The size at which an outbound payload stops travelling inline and is
+    /// uploaded instead — the server's default `MAX_UPDATE_SIZE` (#3559).
+    ///
+    /// The SAME number the JS client switches at (`this.env.MAX_UPDATE_SIZE`,
+    /// `src/client/JsBaoClient.ts`), applied on BOTH outbound paths, so one
+    /// write yields the same frame and the same stored result from either
+    /// client at any size. Strictly greater-than, as JS is: a payload exactly
+    /// at the threshold is inline.
+    static let maxInlineUpdateBytes = 102_400
     var onLocalUpdate: ((String, [UInt8]) -> Void)?
+    /// The local sequences a large document's next outbound `update` frame
+    /// carries (#3436). `nil` — and a `nil` return — is an ordinary document,
+    /// whose frame is left exactly as it was.
+    ///
+    /// The claim is CONSUMED by the call, so every answer has to be settled
+    /// through `settleOutboundUpdate` below. The `Int` is how many QUEUED
+    /// UPDATES this frame merges: a flush sends the prefix of the queue that
+    /// fits one frame, so the claim is over those updates and not over
+    /// everything enqueued.
+    var stampOutboundUpdate: ((String, Int) -> Format2Coordinator.OutboundClaim?)?
+    /// How a claim taken by `stampOutboundUpdate` ends.
+    enum OutboundSettlement {
+        /// The socket accepted the frame.
+        case sent
+        /// The frame never went out, and its content is still queued: the span
+        /// goes back, or the sequences it carried are claimed by nothing and
+        /// the server's contiguous mark stops below them for ever.
+        case failed
+        /// The frame never went out AND its content is gone with it — the
+        /// document's epoch moved while the payload was being uploaded, so the
+        /// queue this claim came off was discarded and the writes were carried
+        /// onto the fresh overlay afresh (#3559). The span is dropped, not
+        /// restored: see `Format2Coordinator.discardClaim`.
+        case stale
+    }
+    /// Settle that claim. A claim is consumed when it is made, so every exit
+    /// from the send path owes exactly one of these.
+    var settleOutboundUpdate: (
+        (String, Format2Coordinator.OutboundClaim?, OutboundSettlement) -> Void
+    )?
+    /// Which generation of a document's outbound queue the frame now being
+    /// built belongs to (#3559).
+    ///
+    /// Captured with the claim and checked again before the frame is
+    /// dispatched, because an upload puts a whole network round trip between
+    /// the two. `nil` — and an unchanged answer — is an ordinary document,
+    /// which has no epochs to move between.
+    var outboundGeneration: ((String) -> Int)?
+    /// Drop a large document's own tables and rows, once an eviction has
+    /// actually taken the document's Yjs persistence and metadata (#3436,
+    /// decision 3436-SO-06). Wired by `JsBaoClient`; `nil` in a manager driven
+    /// without one, which has no format-2 storage to purge either.
+    var purgeFormat2Data: ((String) async -> Void)?
+    /// Whether an inbound `syncStep2`/`update` frame may be applied to this
+    /// document's open Y.Doc (#3437, behavior 17).
+    ///
+    /// `nil` — and a `true` answer — applies the frame exactly as before, which
+    /// is every format-1 document and every large document that is not behind
+    /// the room. A LARGE document whose overlay belongs to an epoch the room
+    /// has archived answers `false`: the room's current epoch must not be
+    /// merged into that overlay, because the epoch move's carry reads each owed
+    /// record's value off it and a Yjs merge of two independent epoch documents
+    /// can let a peer's value win the key first (finding 3437-SO-01). Nothing
+    /// is lost — the fresh overlay's resync re-delivers the current epoch.
+    var acceptsInboundFrame: ((String) -> Bool)?
     var fetchDocumentInfo: ((String) async throws -> DocumentInfo)?
     var createRemoteDocument: (([String: Any]) async throws -> [String: Any])?
     /// Fires once a `pendingCreate` document exists server-side. The
@@ -961,6 +1100,15 @@ public final class DocumentManager: @unchecked Sendable {
             "type": "syncStep1",
             "documentId": documentId,
             "stateVector": base64,
+            // #3436 — the formats this client can read, and the highest
+            // snapshot-manifest shape it understands. Both go on EVERY
+            // document, exactly as the JS client's `sendSyncStep1` does: the
+            // client cannot know a document's format before the handshake
+            // answers, and a room hosting a large document refuses a frame
+            // that does not declare `2` (close 4426) rather than let an old
+            // client mistake an epoch overlay for the whole document.
+            "formats": Format2Transport.formats,
+            "manifestVersion": Format2Transport.manifestVersion,
         ]
         // Mirror JS `sendSyncStep1`'s `docHash` (SHA-256 hex over the full
         // encoded state - the server's `calculateDocHash` algorithm). When it
@@ -1162,22 +1310,38 @@ public final class DocumentManager: @unchecked Sendable {
         documentId: String,
         serverDocHash: String?,
         serverStateVectorBase64: String
-    ) -> String? {
+    ) async -> String? {
+        guard owesSyncStep2Diff(documentId: documentId, serverDocHash: serverDocHash) else {
+            return nil
+        }
+        return await buildSyncStep2Response(
+            documentId: documentId,
+            serverStateVectorBase64: serverStateVectorBase64
+        )
+    }
+
+    /// The DECISION half of the answer above, and the whole of the answer in
+    /// the two cases that send nothing: `false` means this `syncStep1` has been
+    /// answered — locally, by marking the document synced — and `true` means a
+    /// diff is owed and has still to be built.
+    ///
+    /// Synchronous, and separable from the build for that reason: nothing in it
+    /// is I/O, while building the diff can mean uploading it. The `syncStep1`
+    /// handler runs this on the socket's receive loop and hands only the build
+    /// to the document's outbound lane (#3559), so a document that owes nothing
+    /// is still marked synced in the frame's own turn — an application parked
+    /// on `.sync` must not wait on an unrelated queue for it.
+    func owesSyncStep2Diff(documentId: String, serverDocHash: String?) -> Bool {
         guard lock.withLock({ openDocs[documentId] != nil }) else {
             logger.warn("Received syncStep1 for a document that is not open:", documentId)
-            return nil
+            return false
         }
 
         let readOnly = isReadOnly(documentId)
         let localHash = getContentDocHash(documentId: documentId)
         let hashesMatch = serverDocHash != nil && localHash != nil && serverDocHash == localHash
 
-        if !hashesMatch && !readOnly {
-            return buildSyncStep2Response(
-                documentId: documentId,
-                serverStateVectorBase64: serverStateVectorBase64
-            )
-        }
+        if !hashesMatch && !readOnly { return true }
 
         logger.debug(
             "Answering syncStep1 without a diff for",
@@ -1185,7 +1349,7 @@ public final class DocumentManager: @unchecked Sendable {
             readOnly ? "(read-only)" : "(hash match)"
         )
         markSyncedLocally(documentId)
-        return nil
+        return false
     }
 
     /// Mark a document synced without a server round-trip — the cases where
@@ -1213,8 +1377,20 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Build a syncStep2 response message given the server's state vector.
     /// This sends the client's diff back to the server so it gets any data we have that it doesn't.
-    public func buildSyncStep2Response(documentId: String, serverStateVectorBase64: String) -> String? {
+    /// `async` since #3559: a diff over `MAX_UPDATE_SIZE` is uploaded and named
+    /// by its `uploadId` rather than sent inline, which is what the JS client's
+    /// `sendFormat2SyncStep2` has always done. The outbound size decision has
+    /// to be the same on both paths, and the upload is I/O.
+    public func buildSyncStep2Response(
+        documentId: String,
+        serverStateVectorBase64: String
+    ) async -> String? {
         guard let doc = lock.withLock({ openDocs[documentId] }) else { return nil }
+        // #3559 — which epoch generation the diff below is computed against.
+        // An oversize diff is uploaded before it is answered, and a move
+        // landing in that window replaces the open document: the bytes then
+        // describe an overlay the room has archived.
+        let generation = outboundGeneration?(documentId)
 
         guard let svData = Data(base64Encoded: serverStateVectorBase64) else { return nil }
         let serverSV = [UInt8](svData)
@@ -1231,12 +1407,37 @@ public final class DocumentManager: @unchecked Sendable {
 
         guard !clientUpdate.isEmpty else { return nil }
 
-        let updateB64 = Data(clientUpdate).base64EncodedString()
-        let message: [String: Any] = [
+        var message: [String: Any] = [
             "type": "syncStep2",
             "documentId": documentId,
-            "update": updateB64,
         ]
+        if clientUpdate.count > Self.maxInlineUpdateBytes {
+            // A diff that cannot be offloaded is not sent: answering with a
+            // frame the server cannot resolve would end the sync cycle with
+            // the client's state never having reached it. The room re-asks on
+            // the next syncStep1.
+            guard let upload = uploadLargeUpdate,
+                  let uploadId = await upload(documentId, clientUpdate) else {
+                logger.warn(
+                    "Could not offload an oversize syncStep2 diff for doc:", documentId,
+                    "bytes:", clientUpdate.count
+                )
+                return nil
+            }
+            // And the epoch did not move under it while it went up (#3559).
+            // The room's own `syncStep1` follows every move, so the answer this
+            // one no longer stands for is owed afresh rather than lost.
+            if let generation, outboundGeneration?(documentId) != generation {
+                logger.warn(
+                    "Dropping an uploaded syncStep2 diff for doc:", documentId,
+                    "— its epoch moved while the payload was in flight"
+                )
+                return nil
+            }
+            message["uploadId"] = uploadId
+        } else {
+            message["update"] = Data(clientUpdate).base64EncodedString()
+        }
 
         guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
@@ -1270,6 +1471,15 @@ public final class DocumentManager: @unchecked Sendable {
     func handleRemoteUpdate(documentId: String, updateData: Data) {
         let doc: YDocument? = lock.withLock { openDocs[documentId] }
         guard let doc else { return }
+        // A LARGE document behind the room holds an overlay for an epoch the
+        // room has archived, and this frame is the room's CURRENT epoch
+        // (#3437, behavior 17). Dropped rather than applied: the epoch move's
+        // carry reads its owed values off that overlay, and merging two
+        // independent epoch documents can let a peer's value win a key before
+        // the carry gets to it. The fresh overlay's resync re-delivers this.
+        // `nil` and `true` both apply as before, so nothing about an ordinary
+        // document changes here.
+        if let gate = acceptsInboundFrame, !gate(documentId) { return }
 
         let updateBytes = [UInt8](updateData)
         let applyStartMs = Self.nowMs()
@@ -1398,26 +1608,112 @@ public final class DocumentManager: @unchecked Sendable {
     /// handed to the socket, `false` when there is no socket wired or the send
     /// threw (e.g. the connection is down). Callers use this to decide whether
     /// the doc's outbound edits have actually drained.
+    /// - Parameter mergedUpdateCount: how many queued updates `update` merges.
+    ///   A large document's frame claims the local sequences of exactly those
+    ///   updates; claiming the whole queue would get a write the flush left
+    ///   behind acknowledged as delivered (#3436).
+    /// - Parameter claiming: a claim the CALLER has already taken, for a frame
+    ///   it built rather than the queue — the whole-overlay answer to an
+    ///   `epoch.resync` (#3436). The frame is otherwise identical, which is
+    ///   why it is built here rather than a second time at the caller.
     @discardableResult
-    public func sendLocalUpdate(documentId: String, update: [UInt8]) async -> Bool {
-        let base64 = Data(update).base64EncodedString()
-        let message: [String: Any] = [
+    public func sendLocalUpdate(
+        documentId: String,
+        update: [UInt8],
+        mergedUpdateCount: Int = 1,
+        claiming: Format2Coordinator.OutboundClaim? = nil
+    ) async -> Bool {
+        // #3436 — a large document's frame also says which of this client's
+        // local sequences it carries, so the server can answer a contiguous
+        // acknowledgement and the client can prune what it no longer owes. The
+        // names are the JS client's. An ordinary document's frame is untouched.
+        //
+        // Taken BEFORE the payload is resolved: the claim is consumed the
+        // moment it is made, so every exit below — including an offload that
+        // fails — has to settle it.
+        let claimed = claiming ?? stampOutboundUpdate?(documentId, mergedUpdateCount)
+        // #3559 — and which epoch generation that claim, and the bytes it
+        // stands for, belong to. Read at the same moment for the same reason:
+        // an offload puts a `getUploadUrl` round trip and a PUT between this
+        // line and the send below, and an epoch move landing in that window
+        // makes both stale.
+        let generation = outboundGeneration?(documentId)
+
+        var message: [String: Any] = [
             "type": "update",
             "documentId": documentId,
-            "update": base64,
         ]
+        // #3559 — over `MAX_UPDATE_SIZE` the payload is uploaded and named by
+        // its `uploadId` instead of travelling inline, which is what the JS
+        // client has always done (`transmitLocalUpdate`). One write now yields
+        // the same frame from either client at any size.
+        //
+        // An offload that fails sends NOTHING: a frame the server cannot
+        // resolve is worse than no frame, and `false` leaves the update in the
+        // queue for the next pass, exactly as JS's `return false` does.
+        if update.count > Self.maxInlineUpdateBytes {
+            guard let upload = uploadLargeUpdate else {
+                logger.warn(
+                    "No upload path for an oversize update on doc:", documentId,
+                    "bytes:", update.count
+                )
+                settleOutboundUpdate?(documentId, claimed, .failed)
+                return false
+            }
+            guard let uploadId = await upload(documentId, update) else {
+                settleOutboundUpdate?(documentId, claimed, .failed)
+                return false
+            }
+            // The room sealed this document's epoch while those bytes were
+            // going up (#3559). They are a delta against the overlay it has now
+            // archived, so sending them is the very thing the move's discard of
+            // the outbound queue exists to prevent: the room cannot integrate
+            // the delta, it PARKS it, and every later update from this
+            // connection is answered with a resync request instead of an
+            // acknowledgement. The move carried this write's content onto the
+            // fresh overlay, and the frame that really carries it is the
+            // resync answer the move sends — so this one is dropped whole,
+            // claim included.
+            if let generation, outboundGeneration?(documentId) != generation {
+                logger.warn(
+                    "Dropping an uploaded update for doc:", documentId,
+                    "— its epoch moved while the payload was in flight"
+                )
+                settleOutboundUpdate?(documentId, claimed, .stale)
+                return false
+            }
+            message["uploadId"] = uploadId
+        } else {
+            message["update"] = Data(update).base64EncodedString()
+        }
+        if let stamps = claimed?.stamps {
+            message["seq"] = stamps.seq
+            message["seqFrom"] = stamps.seqFrom
+            message["ackedSeq"] = stamps.ackedSeq
+            logger.debug(
+                "[format2] outbound update for", documentId, "—", update.count,
+                "byte(s), merging", mergedUpdateCount, "update(s), claiming",
+                stamps.seqFrom, "..", stamps.seq, "over acked", stamps.ackedSeq
+            )
+        }
 
         guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
+            settleOutboundUpdate?(documentId, claimed, .failed)
             return false
         }
 
-        guard let send = sendWebSocketMessage else { return false }
+        guard let send = sendWebSocketMessage else {
+            settleOutboundUpdate?(documentId, claimed, .failed)
+            return false
+        }
         do {
             try await send(jsonString)
+            settleOutboundUpdate?(documentId, claimed, .sent)
             return true
         } catch {
             logger.warn("Failed to send update for doc:", documentId, error.localizedDescription)
+            settleOutboundUpdate?(documentId, claimed, .failed)
             return false
         }
     }
@@ -1572,6 +1868,37 @@ public final class DocumentManager: @unchecked Sendable {
             metadataIndex[documentId] = entry
             noteMetadataTouchLocked(documentId)
         }
+    }
+
+    /// The format of `documentId`, as this client last learned it (#3436), or
+    /// `nil` when no handshake has ever answered for it.
+    public func documentFormat(_ documentId: String) -> Int? {
+        lock.withLock { metadataIndex[documentId]?.documentFormat }
+    }
+
+    /// Record the format a completed handshake established.
+    ///
+    /// Written once and then left alone: a document's format is fixed at
+    /// creation, so a second answer can only be noise — and re-persisting the
+    /// row on every handshake would spend a storage write per sync on every
+    /// document this client opens. A row for a document this client has never
+    /// heard of is not invented either; the format belongs to a document, and
+    /// there is nothing here to attach it to.
+    ///
+    /// The `nil`-means-unknown state is what makes this worth persisting at
+    /// all: the socket's receive limit is raised for anything not locally
+    /// known to be format 1, so a client whose documents all answer 1 keeps
+    /// Foundation's default from its second session onwards.
+    public func noteDocumentFormat(_ documentId: String, _ format: Int) {
+        let entry: LocalMetadataEntry? = lock.withLock {
+            guard var existing = metadataIndex[documentId] else { return nil }
+            guard existing.documentFormat == nil else { return nil }
+            existing.documentFormat = format
+            metadataIndex[documentId] = existing
+            return existing
+        }
+        guard let entry else { return }
+        Task { _ = try? await putMetadataTracked(entry) }
     }
 
     /// Record that the server just confirmed this document, so a reconciliation
@@ -2044,11 +2371,17 @@ public final class DocumentManager: @unchecked Sendable {
         title: String?,
         localOnly: Bool,
         tags: [String]? = nil,
-        docMetadata: JSONValue? = nil
+        docMetadata: JSONValue? = nil,
+        documentFormat: Int? = nil
     ) async throws -> LocalMetadataEntry {
         var metadata = LocalMetadataEntry(documentId: documentId)
         metadata.title = title
         metadata.tags = tags
+        // #3436 — the format the caller asked for, recorded before the commit
+        // that will ask the server for it. The next open reads this row to
+        // decide what to bind and how large a frame the socket must accept,
+        // and it has to be able to do so without a round trip.
+        metadata.documentFormat = documentFormat
         metadata.pendingCreate = !localOnly
         metadata.localOnly = localOnly
         metadata.createdAt = ISO8601DateFormatter().string(from: Date())
@@ -2261,6 +2594,13 @@ public final class DocumentManager: @unchecked Sendable {
             // server on commit instead of being dropped (#673).
             if let docMetadata = metadata?.docMetadata {
                 body["metadata"] = docMetadata.toAny()
+            }
+            // #3436 — only when the caller asked for one, so an ordinary
+            // create's body is byte for byte what it was before large
+            // documents existed. The server decides a document's format at
+            // creation and never again.
+            if let documentFormat = metadata?.documentFormat {
+                body["documentFormat"] = documentFormat
             }
 
             guard let createRemote = createRemoteDocument else {
@@ -2698,6 +3038,16 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         try? await offlineStore?.deleteMetadata(appId: appId, userId: userId, documentId: documentId)
+        // #3436, decision 3436-SO-06 — the Yjs snapshot and the metadata row
+        // are not all a large document keeps: its records, its member index,
+        // its epoch mark, its projected query rows and the writes the server
+        // has not acknowledged live in tables of their own. This is the ONE
+        // place every eviction passes through — `documents.evict`, an evicting
+        // close, a retention sweep, and a document the server says is gone —
+        // and it runs only where the eviction actually happened, so a stale
+        // candidate abandoned above leaves the store alone. A no-op for an
+        // ordinary document and for a client with no large-document tables.
+        await purgeFormat2Data?(documentId)
         return true
     }
 
@@ -2933,6 +3283,72 @@ public final class DocumentManager: @unchecked Sendable {
     /// production code.
     var onMarkUnsyncedForTest: ((String, Bool) -> Void)?
 
+    // MARK: - Replacing an open document (#3437, behavior 9)
+
+    /// Put a FRESH Y.Doc in place of the one this document is open on.
+    ///
+    /// For a LARGE document the open Y.Doc IS the current epoch's overlay, so
+    /// following a seal means replacing it — with the owed writes already
+    /// carried onto `document` by the caller. There is no equivalent for an
+    /// ordinary document and nothing calls this for one.
+    ///
+    /// The order is the point:
+    ///
+    /// 1. bump the persist generation, so every persist that encoded the OLD
+    ///    document's bytes is already stale before anything else moves;
+    /// 2. swap `openDocs`, its `YProtocol` and its update subscription under
+    ///    one lock hold, so no reader can see a half-swapped trio;
+    /// 3. cancel the pending debounce — it would persist the document that is
+    ///    no longer open;
+    /// 4. cancel the displaced subscription OUTSIDE the lock, the same rule
+    ///    `registerUpdateObserver` follows;
+    /// 5. persist the fresh overlay and AWAIT it.
+    ///
+    /// Step 5 is awaited rather than scheduled because the caller moves the
+    /// epoch mark after this returns. A crash in between then restarts with
+    /// the FRESH overlay under the OLD mark, which the next handshake's
+    /// catch-up repairs idempotently; the reverse order would restart with the
+    /// SEALED overlay under the NEW mark and resend it whole into the new
+    /// epoch (finding 3437-R05).
+    func replaceOpenDocument(documentId: String, with document: YDocument) async {
+        let displaced: YSubscription? = lock.withLock {
+            guard openDocs[documentId] != nil else { return nil }
+            persistGeneration[documentId] = (persistGeneration[documentId] ?? 0) + 1
+            openDocs[documentId] = document
+            syncProtocols[documentId] = YProtocol(document: document)
+            persistDebounceTasks.removeValue(forKey: documentId)?.cancel()
+            return updateSubscriptions.removeValue(forKey: documentId)
+        }
+        // A document that is not open has nothing to replace: the caller's
+        // move raced a close, and the close owns the outcome.
+        guard lock.withLock({ openDocs[documentId] === document }) else {
+            logger.debug(
+                "replaceOpenDocument: no open document for", documentId, "— dropped"
+            )
+            return
+        }
+        // Outside the lock, deliberately: cancelling a subscription runs
+        // yswift's teardown, and the old document's observer may be mid-callback
+        // on another thread waiting for this same lock.
+        displaced?.cancel()
+
+        // The fresh document forwards its own updates and schedules its own
+        // persists from here on.
+        registerUpdateObserver(documentId: documentId, doc: document)
+        logger.debug(
+            "replaceOpenDocument: swapped", documentId,
+            "to a fresh overlay at generation",
+            lock.withLock { persistGeneration[documentId] ?? 0 }
+        )
+        await persistDocumentToLocal(documentId: documentId)
+    }
+
+    /// The document's persist generation, for the guard that asserts an
+    /// ordinary document never has one bumped. Internal; tests only.
+    func persistGenerationForTest(_ documentId: String) -> Int {
+        lock.withLock { persistGeneration[documentId] ?? 0 }
+    }
+
     // MARK: - Persistence
 
     /// Schedule a debounced `persistDocumentToLocal` call. Cancels any
@@ -3001,7 +3417,8 @@ public final class DocumentManager: @unchecked Sendable {
         documentId: String,
         replayingStorageReady: Bool = false
     ) async {
-        let (doc, suspended, restoring) = lock.withLock { () -> (YDocument?, Bool, Bool) in
+        let (doc, suspended, restoring, generation) = lock.withLock {
+            () -> (YDocument?, Bool, Bool, Int) in
             let held = openRestoreInFlight.contains(documentId)
             // Recorded in the same hold that reads the flag, so an open
             // finishing in between cannot leave the request behind an already
@@ -3011,7 +3428,10 @@ public final class DocumentManager: @unchecked Sendable {
             return (
                 openDocs[documentId],
                 persistenceSuspended.contains(documentId),
-                held
+                held,
+                // Captured WITH the document, so the bytes encoded below and
+                // the generation they belong to cannot disagree.
+                persistGeneration[documentId] ?? 0
             )
         }
         guard let doc else { return }
@@ -3046,6 +3466,12 @@ public final class DocumentManager: @unchecked Sendable {
             defer { txn.free() }
             return txn.transactionEncodeStateAsUpdate()
         }
+
+        // Test seam for the interleaving finding 3437-SO-06 named: the bytes
+        // are encoded HERE and saved several suspension points later, so a
+        // persist of a document an epoch move has already replaced can land
+        // after the fresh overlay was saved. Never set in production code.
+        if let hook = onPersistEncodedForTest { await hook(documentId) }
 
         // Resolve persistence lazily. `openDocument` wires `docPersistence`
         // up-front, but only if `offlineStore.getStorageProvider()` was
@@ -3121,6 +3547,38 @@ public final class DocumentManager: @unchecked Sendable {
             }
             return
         }
+
+        // The fence (#3437, behavior 9, finding 3437-SO-06). Re-read under the
+        // lock immediately before the save: these bytes were encoded before
+        // two suspension points, and an epoch move in that window has already
+        // replaced this document AND persisted its fresh overlay. Saving now
+        // would put the SEALED overlay back under the new epoch mark, and the
+        // next open would resend it whole into the new epoch — the corruption
+        // the re-seeding rotation exists to prevent.
+        //
+        // Zero for every format-1 document, for the document's whole life, so
+        // an ordinary document's persist is byte-identical to what it was.
+        // One at a time per document, so the check below and the save it
+        // guards cannot be interleaved by another persist of the same document
+        // (finding 3437-REVIEW-006). Without the turn a stale persist can pass
+        // the check, be preempted while the swap saves the fresh overlay, and
+        // then write its old-epoch bytes on top.
+        await acquirePersistTurn(documentId)
+        defer { releasePersistTurn(documentId) }
+
+        let current = lock.withLock { persistGeneration[documentId] ?? 0 }
+        guard current == generation else {
+            logger.log(
+                "persistDocumentToLocal: stale persist skipped after an epoch move",
+                documentId, "(encoded at generation \(generation), now \(current))"
+            )
+            return
+        }
+
+        // The window the generation check on its own leaves: it has passed,
+        // and the save is still ahead. The turn taken above is what keeps a
+        // swap's own persist out of it (finding 3437-REVIEW-006).
+        if let hook = onPersistFencedForTest { await hook(documentId) }
 
         do {
             try await persistence.saveDocument(data: Data(state))
@@ -3271,6 +3729,19 @@ public final class DocumentManager: @unchecked Sendable {
     /// path, between the provider read that came back nil and the latch that
     /// decides enqueue-or-retry. Internal; never set in production code.
     var onPersistProviderMissingForTest: (@Sendable () async -> Void)?
+
+    /// Test seam awaited inside `persistDocumentToLocal` immediately after the
+    /// document's bytes are encoded and before they are saved, so a test can
+    /// hold an OLD-generation persist across an epoch move and prove the fence
+    /// (#3437, behavior 9, finding 3437-SO-06). Never set in production code.
+    var onPersistEncodedForTest: (@Sendable (String) async -> Void)?
+
+    /// The twin of the seam above, on the far side of the fence: awaited after
+    /// the generation check has PASSED and before the save it guards, so a test
+    /// can hold a persist in the window the check cannot cover and prove the
+    /// turn closes it (#3437, finding 3437-REVIEW-006). Never set in
+    /// production code.
+    var onPersistFencedForTest: (@Sendable (String) async -> Void)?
 
     /// The metadata twin of the seam above: awaited inside the skipped-write
     /// path, between the put that found no provider and the latch. What it
