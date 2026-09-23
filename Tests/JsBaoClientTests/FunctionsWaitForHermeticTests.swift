@@ -230,6 +230,13 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
 
     // MARK: - Behavior 11: not-found and transient errors
 
+    /// #3661 retargeted the poll-count half of this, and nothing else. The
+    /// wait still ends in `.notFound` for a run id that resolves to nothing —
+    /// that claim is untouched — but the FIRST 404 no longer ends it: a poll
+    /// issued a second after a start can be answered by a replica that has not
+    /// caught up with a committed run row, and calling a live run missing is
+    /// the defect. The grace is bounded and pinned in
+    /// `FunctionsWaitNotFound3661HermeticTests`.
     func testWaitForThrowsNotFoundOnA404() async throws {
         let transport = ScriptedStatusTransport(
             [.http(404, body: #"{"error":"Workflow run not found"}"#)],
@@ -241,7 +248,9 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .notFound)
         }
-        XCTAssertEqual(transport.polls.count, 1, "a 404 is final, not polled again")
+        XCTAssertGreaterThan(
+            transport.polls.count, 1, "the stale-read grace is spent before a 404 is final"
+        )
     }
 
     /// A run reporting `missing` will never reach a terminal state, so the

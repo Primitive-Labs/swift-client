@@ -119,7 +119,13 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
         let context = NWConnection.ContentContext(
             identifier: "loopback-push", metadata: [metadata]
         )
-        var delivered = false
+        // Network.framework runs the completion on its own queue, so the flag
+        // it sets needs an owner that serialises access rather than a captured
+        // local `var` ("mutation of captured var 'delivered' in
+        // concurrently-executing code"). The semaphore below does make each
+        // send's completion happen-before the next iteration, but that is an
+        // argument about this loop, not one the compiler can check.
+        let delivered = LockedBox(false)
         for connection in targets {
             let done = DispatchSemaphore(value: 0)
             connection.send(
@@ -127,13 +133,13 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
                 contentContext: context,
                 isComplete: true,
                 completion: .contentProcessed { error in
-                    if error == nil { delivered = true }
+                    if error == nil { delivered.value = true }
                     done.signal()
                 }
             )
             _ = done.wait(timeout: .now() + timeout)
         }
-        return delivered
+        return delivered.value
     }
 
     func stop() {

@@ -210,10 +210,18 @@ public struct HttpError: Error, Sendable {
     public let status: Int
     public let message: String
     public let body: String?
-    /// Machine-readable error code parsed from the JSON body's `"code"`
-    /// field (e.g. `"INVITATION_REQUIRED"`). Mirrors js-bao's
-    /// `AuthError.code`. Use `authCode` to get a typed `AuthCode` when
+    /// The stable, machine-readable cause parsed from the JSON body's
+    /// `"code"` field (e.g. `"INVITATION_REQUIRED"`). Mirrors js-bao's
+    /// `JsBaoApiError.code`. Use `authCode` to get a typed `AuthCode` when
     /// the value matches a known case.
+    ///
+    /// Every 4xx/5xx response the platform produces carries one: the
+    /// handler's own code where it has one, otherwise a status-derived
+    /// default (`NOT_FOUND`, `ACCESS_DENIED`, `UNAUTHENTICATED`,
+    /// `INTERNAL_ERROR`, …). Branch and localize on this; `message` and
+    /// `serverMessage` may change without notice. `nil` means the response
+    /// did NOT come from the platform's error path — an older server, or an
+    /// intermediary that answered on its own (a proxy's HTML error page).
     public let serverCode: String?
     /// Human-readable message parsed from the body's `"error"`,
     /// `"message"`, or nested `"details.error"` field. Falls back to
@@ -346,6 +354,31 @@ public extension HttpError {
     static func isCredentialBearingPath(_ path: String) -> Bool {
         let lowered = path.lowercased()
         return lowered.contains("/auth/") || lowered.contains("/passkey/")
+    }
+}
+
+// MARK: - Raw-bytes transfers
+
+extension HttpError {
+    /// The error for a refused RAW-BYTES transfer (#3403).
+    ///
+    /// Blob and avatar transfers read bytes rather than JSON, so they never
+    /// reach the parse `HttpClient` applies to every failure on the typed
+    /// spine. Each used to throw a fixed message with `serverCode == nil`,
+    /// which left an app branching on the cause with nothing to branch on for
+    /// a whole family of refusals the server had named. The bytes of a refused
+    /// transfer ARE the error envelope: the human message stays exactly what
+    /// the call site passes, and only the server's parsed cause is added.
+    static func fromBytes(status: Int, message: String, body: Data?) -> HttpError {
+        let text = body.flatMap { String(data: $0, encoding: .utf8) }
+        let parsed = HttpError.parseBody(text)
+        return HttpError(
+            status: status,
+            message: message,
+            body: text,
+            serverCode: parsed.code,
+            serverMessage: parsed.message
+        )
     }
 }
 

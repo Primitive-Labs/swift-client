@@ -3271,12 +3271,17 @@ public final class JsBaoClient: @unchecked Sendable {
 
         // The fast-fail checks answer "can this open ever reach the server?",
         // which is only a question for a document this call is opening. A
-        // document that is ALREADY open has been through them, and JS never
-        // re-asks either: its `openDocument` returns on
-        // `hasOpenDoc` before `waitForAvailability` runs. Failing a live
-        // document's re-open would report an unreachable server for a document
-        // the caller is already holding. `.coalesced` is a genuine new open —
-        // the checks run for it, only the teardown above does not.
+        // document that is ALREADY open has been through them (or was created
+        // locally), and failing a live document's re-open would report an
+        // unreachable server for a document the caller is already holding.
+        // `.coalesced` is a genuine new open — the checks run for it, only the
+        // teardown above does not.
+        //
+        // The WAIT itself is not skipped here, and never was: an `.existing`
+        // document with an empty ydoc still blocks on the network below. That
+        // is the whole of #3023 on the JS side, where the already-open path
+        // used to return before `waitForAvailability` ran; JS now waits on
+        // both paths, and only the fast-fail differs between the two clients.
         if needsNetworkWait && !options.deferNetworkSync && origin != .existing {
             try await checkAvailabilityPreconditions(documentId: documentId, options: options)
         }
@@ -3551,23 +3556,6 @@ public final class JsBaoClient: @unchecked Sendable {
         let documentId: String
     }
 
-    /// Close a document.
-    ///
-    /// Mirrors js-bao's `closeDocument` (`src/client/JsBaoClient.ts`):
-    ///
-    /// 1. Queued outbound updates are flushed first. Before #2668 they were
-    ///    dropped with their debounce timer, so an edit made just before close
-    ///    only reached the server via the next open's diff — and was lost for
-    ///    good when the document was evicted in the same call.
-    /// 2. `options.evictLocal` is honoured only once the server confirms it has
-    ///    the writes (a short `checkStateVector` poll). An unconfirmed document
-    ///    keeps its local data instead.
-    /// 3. An `unsubscribe` frame goes out, so the server stops streaming
-    ///    updates for a document this client no longer holds open.
-    ///
-    /// Returns `{ evicted }` — `true` only when the local data was actually
-    /// evicted, matching js-bao's return shape. `documents.close` forwards it.
-    @discardableResult
     /// Drop the outbound updates queued for a document whose epoch has moved
     /// (#3437, behavior 10).
     ///
@@ -3596,6 +3584,27 @@ public final class JsBaoClient: @unchecked Sendable {
         )
     }
 
+    /// Close a document.
+    ///
+    /// Mirrors js-bao's `closeDocument` (`src/client/JsBaoClient.ts`):
+    ///
+    /// 1. Queued outbound updates are flushed first. Before #2668 they were
+    ///    dropped with their debounce timer, so an edit made just before close
+    ///    only reached the server via the next open's diff — and was lost for
+    ///    good when the document was evicted in the same call.
+    /// 2. `options.evictLocal` is honoured only once the server confirms it has
+    ///    the writes (a short `checkStateVector` poll). An unconfirmed document
+    ///    keeps its local data instead.
+    /// 3. An `unsubscribe` frame goes out, so the server stops streaming
+    ///    updates for a document this client no longer holds open.
+    ///
+    /// Returns `{ evicted }` — `true` only when the local data was actually
+    /// evicted, matching js-bao's return shape. `documents.close` forwards it.
+    ///
+    /// The attribute below belongs to THIS declaration: most callers close a
+    /// document without reading the flag back. Anything inserted between the
+    /// two would take the attribute with it (#3588).
+    @discardableResult
     public func closeDocument(
         _ documentId: String,
         options: CloseDocumentOptions = CloseDocumentOptions()
@@ -7808,8 +7817,25 @@ public final class DocumentContext: @unchecked Sendable {
         return try await client.openDocument(documentId, options: options)
     }
 
-    public func close(options: CloseDocumentOptions = CloseDocumentOptions()) async {
-        await client?.closeDocument(documentId, options: options)
+    /// Close this document. Forwards to `client.closeDocument(_:options:)` and
+    /// reports what it decided.
+    ///
+    /// The result matters because the eviction is conditional: an
+    /// `options.evictLocal` close keeps the local data, and reports
+    /// `evicted: false`, while the server is still missing this client's
+    /// writes (#961, #2668). Returning `Void` here made a skipped eviction
+    /// unobservable through the handle (#3589) — `client.closeDocument` and
+    /// `DocumentsAPI.close` both propagate the verdict, and this is the third
+    /// Swift path to the same call.
+    ///
+    /// With the client gone there is nothing to close and nothing was
+    /// evicted, which is the nil handling `DocumentsAPI.close` already uses.
+    @discardableResult
+    public func close(
+        options: CloseDocumentOptions = CloseDocumentOptions()
+    ) async -> CloseDocumentResult {
+        guard let client else { return CloseDocumentResult(evicted: false) }
+        return await client.closeDocument(documentId, options: options)
     }
 
     /// The open `YDocument`, or `nil` when the document is not open.

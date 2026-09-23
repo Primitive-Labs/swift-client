@@ -45,6 +45,17 @@ public final class FunctionsAPI: @unchecked Sendable {
     static let waitMaxInterval: TimeInterval = 5
     static let waitDefaultTimeout: TimeInterval = 15 * 60
 
+    /// How long a wait keeps polling a run id the platform reports NO ROW for
+    /// — #3661, and the JS client's `FUNCTION_WAIT_NOT_FOUND_GRACE_MS`.
+    ///
+    /// Bounds one thing only: an eventually consistent read that has not
+    /// caught up with a committed row. That is a phenomenon of a replica, not
+    /// of a run, so it is measured in seconds; three of them is several polls'
+    /// worth of it and short enough that a mistyped run id still fails while
+    /// the caller is watching. A run the platform CAN see and cannot probe is
+    /// not bounded by this — it is bounded by the caller's own timeout.
+    static let waitNotFoundGrace: TimeInterval = 3
+
     /// Test seams: the clock the deadline is measured on and the sleep the
     /// schedule waits with. A hermetic test installs a fake clock that a fake
     /// sleep advances, so the schedule's arithmetic (doubling, saturation, the
@@ -188,9 +199,26 @@ public final class FunctionsAPI: @unchecked Sendable {
             )
         } catch {
             // The status route has no other 404: there is one thing it cannot
-            // find.
+            // find. WHICH of its two 404s it was travels on `details.reason`
+            // for the wait to branch on (#3661); the code and the message do
+            // not move.
             if FunctionRunStatus.isNotFound(error) {
-                throw JsBaoError(code: .notFound, message: "Function run \(runId) not found")
+                let classified = FunctionRunStatusClassifier.classify(
+                    body: (error as? HttpError)?.body
+                )
+                var details: [String: JSONValue] = ["runId": .string(runId)]
+                switch classified {
+                case .noRun:
+                    details["reason"] = .string("no-run")
+                case let .instanceUnseen(diagnostic):
+                    details["reason"] = .string("instance-unseen")
+                    if !diagnostic.isEmpty { details["diagnostic"] = .string(diagnostic) }
+                }
+                throw JsBaoError(
+                    code: .notFound,
+                    message: "Function run \(runId) not found",
+                    details: details
+                )
             }
             throw error
         }
@@ -216,8 +244,21 @@ public final class FunctionsAPI: @unchecked Sendable {
     ///
     /// SETTLES on exactly `completed`, `failed` and `terminated` — the three
     /// ``FunctionRunStatus/isTerminal`` names. A failed run RESOLVES with
-    /// `status == "failed"` and its `error`; it does not throw. A 404 and a
-    /// run reporting `missing` throw `.notFound` in function words. A read
+    /// `status == "failed"` and its `error`; it does not throw.
+    ///
+    /// A NOT-FOUND IS RETRIED, and how far depends on which one the platform
+    /// reported, so a run id `start` has just returned is safe to wait on: it
+    /// is not reported missing while the run is starting or running. A run
+    /// that EXISTS, has not settled, and whose instance the platform cannot
+    /// see yet — what a run between its creation and its first execution looks
+    /// like — is polled to your own timeout. A run id that resolves to nothing
+    /// is retried for ``waitNotFoundGrace`` (a poll issued a second after a
+    /// start can be answered by a replica that has not caught up with it) and
+    /// no longer. Either way the wait ends in `.notFound` with the same
+    /// message the first refusal would have thrown, and a wait whose timeout
+    /// runs out while its last read was a not-found reports that `.notFound`
+    /// rather than `.workflowWaitTimeout`. A run reporting `missing` in a 200
+    /// body throws `.notFound` in function words. A read
     /// reporting one of the DSL-only states (reachable only by handing this
     /// method a DSL run id, which is not refused) throws `.invalidArgument`
     /// naming the status, rather than settling on a value outside the type's
@@ -239,17 +280,36 @@ public final class FunctionsAPI: @unchecked Sendable {
         let deadline: Date? = unbounded ? nil : now().addingTimeInterval(timeout)
         let timeoutMs = timeout.wholeMilliseconds
 
+        // #3661 — the stale-read window, measured from the START of the wait
+        // rather than from each 404: a run id that has never resolved in three
+        // seconds of polling is not a row a replica is late with. The
+        // classification itself is `FunctionRunStatusClassifier`, and the
+        // instance-unseen branch is the server's deliberate answer inside the
+        // launch grace, where it writes nothing on purpose — so the fix could
+        // never be to change what the route says.
+        let notFoundDeadline = now().addingTimeInterval(Self.waitNotFoundGrace)
+
         var delay = Self.waitMinInterval
+        /// The last poll's not-found, cleared by any read that succeeded.
+        var notFound: JsBaoError? = nil
         while true {
             try Task.checkCancellation()
             var status: FunctionRunStatus? = nil
+            notFound = nil
             do {
                 status = try await getStatus(runId: runId)
             } catch {
-                // `getStatus` already reworded the 404, and a run that is not
-                // there will not appear — fail now. Anything else is
-                // transient: the next poll, or the deadline, still covers it.
-                if let jsBao = error as? JsBaoError, jsBao.code == .notFound { throw jsBao }
+                // `getStatus` already reworded the 404 and said which one it
+                // was. An unseen instance is a row that exists, so the wait
+                // keeps its own deadline; an unresolved run id gets the
+                // stale-read grace and then this throws it, unchanged, as it
+                // always did. Anything else is transient: the next poll, or
+                // the deadline, still covers it.
+                if let jsBao = error as? JsBaoError, jsBao.code == .notFound {
+                    let unseen = jsBao.details?["reason"]?.stringValue == "instance-unseen"
+                    if !unseen, now() >= notFoundDeadline { throw jsBao }
+                    notFound = jsBao
+                }
                 if error is CancellationError { throw error }
                 logger?.debug("[functions.waitFor] poll failed; retrying", [
                     "runId": runId, "error": String(describing: error),
@@ -278,6 +338,11 @@ public final class FunctionsAPI: @unchecked Sendable {
             }
             let remaining = deadline.map { $0.timeIntervalSince(now()) }
             if let remaining, remaining <= 0 {
+                // #3661 — a caller whose every poll was a not-found is told
+                // THAT. The budget ran out downstream of it, and "timed out
+                // waiting" would send them to look at a run the platform never
+                // showed them.
+                if let notFound { throw notFound }
                 // Same code the workflow wait raises: it is the same fact about
                 // the same kind of run, and the intent settles that error codes
                 // rename in phase 7. The MESSAGE is function-worded.
@@ -286,7 +351,15 @@ public final class FunctionsAPI: @unchecked Sendable {
                     message: "functions.waitFor timed out after \(timeoutMs)ms waiting for function run \(runId)"
                 )
             }
-            let sleepFor = remaining.map { Swift.min(delay, $0) } ?? delay
+            // The stale-read grace is clamped the way the deadline is, and for
+            // the same reason: a run id that resolves to nothing is refused at
+            // the end of the grace rather than at the end of whichever backoff
+            // interval straddles it.
+            var graceLeft: TimeInterval? = nil
+            if let notFound, notFound.details?["reason"]?.stringValue != "instance-unseen" {
+                graceLeft = Swift.max(0, notFoundDeadline.timeIntervalSince(now()))
+            }
+            let sleepFor = [remaining, graceLeft].compactMap { $0 }.reduce(delay, Swift.min)
             try await sleep(sleepFor)
             delay = Swift.min(delay * 2, Self.waitMaxInterval)
         }

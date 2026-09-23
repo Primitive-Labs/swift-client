@@ -217,7 +217,7 @@ final class Format2EpochMoveHermeticTests: XCTestCase {
         )
         XCTAssertEqual(pending.baseEpoch, 2)
         XCTAssertEqual(
-            try fixture.model.find(id: "after")?["title"], .string("new epoch"),
+            fixture.model.find(id: "after")?["title"], .string("new epoch"),
             "the merged view answers through the rebound observer"
         )
     }

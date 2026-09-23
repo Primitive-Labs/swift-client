@@ -891,16 +891,16 @@ public final class DynamicModel: @unchecked Sendable {
             if let format2 {
                 return try? format2.findId(fields: [field], values: [fieldValue])
             }
+            // Only a readable owner is a match: an index entry with no
+            // record behind it is a miss, not a record to merge into —
+            // and a readable row the index does not name is the record
+            // to merge into (#3252 — see `readableOwner`).
             return withTx { txn in
-                let indexMap = txn.transactionGetOrInsertMap(
-                    name: UniqueIndex.mapName(
-                        modelName: self.schema.name,
-                        constraintName: constraint.name
-                    )
+                let root = txn.transactionGetOrInsertMap(name: self.schema.name)
+                return self.readableOwner(
+                    of: key, values: values, constraint: constraint,
+                    rootMap: root, tx: txn
                 )
-                guard let raw = try? indexMap.get(tx: txn, key: key),
-                      let s = PrimitiveValue.decodeJsonString(raw) else { return nil }
-                return s
             }
         }
 
@@ -1201,35 +1201,132 @@ public final class DynamicModel: @unchecked Sendable {
     ///   large document has no `_uniqueIdx_*` map to look a KEY up in — it asks
     ///   the merged view for the row holding those values (#3436) — so a caller
     ///   that wants an answer from one has to pass them. Without them a large
-    ///   document answers `nil`, which is "no owner here".
+    ///   document answers `nil`, which is "no owner here". On the nested-map
+    ///   path the same values feed the mirror fallback in `readableOwner`
+    ///   (#3252); without them only the index entry is vetted.
     func existingRecordId(
         constraintName name: String,
         key: String,
         orderedValues: [PrimitiveValue]? = nil
     ) -> String? {
+        guard let constraint = schema.resolvedUniqueConstraints
+            .first(where: { $0.name == name })
+        else { return nil }
         if let format2 {
-            guard let orderedValues,
-                  let constraint = schema.resolvedUniqueConstraints
-                    .first(where: { $0.name == name })
-            else { return nil }
+            guard let orderedValues else { return nil }
             return try? format2.findId(
                 fields: constraint.fields, values: orderedValues
             )
         }
-        var existingId: String?
-        withTx { [self] txn in
-            let indexMap = txn.transactionGetOrInsertMap(
-                name: UniqueIndex.mapName(
-                    modelName: self.schema.name,
-                    constraintName: name
-                )
-            )
-            if let raw = try? indexMap.get(tx: txn, key: key),
-               let decoded = PrimitiveValue.decodeJsonString(raw) {
-                existingId = decoded
-            }
+        var values: [String: PrimitiveValue] = [:]
+        if let orderedValues {
+            for (f, v) in zip(constraint.fields, orderedValues) { values[f] = v }
         }
-        return existingId
+        // Outside a write transaction, let the mirror catch up first so
+        // the fallback sees what `query` would (draining inside an open
+        // transaction would deadlock — see `awaitObserverDrain`).
+        if activeTx == nil { awaitObserverDrain() }
+        return withTx { [self] txn in
+            let root = txn.transactionGetOrInsertMap(name: self.schema.name)
+            return self.readableOwner(
+                of: key, values: values, constraint: constraint,
+                rootMap: root, tx: txn
+            )
+        }
+    }
+
+    /// The record that readably owns `key` under `constraint`, or `nil`.
+    ///
+    /// The `_uniqueIdx_*` map is a cache over the records, not the record
+    /// store, and the two can disagree (#3252): a replica can hold an index
+    /// entry for a record whose structs have not landed yet, or an entry a
+    /// field change or delete left behind. The app then sees a `query` that
+    /// returns no row for the key and a save refused for that same row —
+    /// the index knew a row nothing else could read.
+    ///
+    /// So an entry counts only when its owner is readable: the record map
+    /// exists under that id, and the key built from the record's stored
+    /// fields is `key`. Anything else is a stale entry, and every lookup
+    /// that decides between "collides" and "free" — the save pre-flight,
+    /// `upsert(on:)`, `upsertByUnique` and the cross-document search —
+    /// treats it as a miss, so the write that follows lands and rewrites
+    /// the entry to the record that really holds the key.
+    ///
+    /// A miss is not yet "free", though. The row store can hold a record
+    /// the index does not name — a stale entry pointing elsewhere, or a
+    /// record written before index maintenance — and `query` returns that
+    /// row. Taking the miss at face value would let a duplicate in that the
+    /// next reconciliation resolves by deleting one of the two. So on a miss
+    /// the mirror behind `query` is asked for the constraint `values` (the
+    /// same fallback js-bao's `save()` runs on an index miss), and a row it
+    /// lists counts only when it is readable in `tx` by the same rule as an
+    /// index entry — the mirror can lag a remote change, and the record
+    /// store, not the mirror, decides. `excluding` skips the record being
+    /// written, so an update that keeps its own key is not its own conflict.
+    ///
+    /// Nested-map documents only: a large document has no `_uniqueIdx_*`
+    /// map and checks uniqueness against its merged view (#3436), so the
+    /// rule does not apply there.
+    ///
+    /// Reads inside the caller's transaction so the decision is made
+    /// against the same state the write commits.
+    private func readableOwner(
+        of key: String,
+        values: [String: PrimitiveValue],
+        constraint: ConstraintDescriptor,
+        rootMap: YrsMap,
+        tx: YrsTransaction,
+        excluding excludedId: String? = nil
+    ) -> String? {
+        let indexMap = tx.transactionGetOrInsertMap(
+            name: UniqueIndex.mapName(
+                modelName: schema.name, constraintName: constraint.name
+            )
+        )
+        if let raw = try? indexMap.get(tx: tx, key: key),
+           let owner = PrimitiveValue.decodeJsonString(raw),
+           holds(key, recordId: owner, constraint: constraint, rootMap: rootMap, tx: tx) {
+            return owner
+        }
+
+        // Index miss (or stale entry): the mirror `query` reads decides.
+        var filter: DocumentFilter = [:]
+        for field in constraint.fields {
+            guard let value = values[field],
+                  let sql = sqliteRepresentation(of: value)
+            else { return nil }
+            filter[field] = sql
+        }
+        guard let rows = try? queryEngine.query(
+            modelName: schema.name, filter: filter,
+            scopedToDocId: docId, stringsetFields: stringsetFieldNames
+        ) else { return nil }
+        for row in rows {
+            guard let candidate = row["id"]?.stringValue,
+                  candidate != excludedId,
+                  holds(key, recordId: candidate, constraint: constraint,
+                        rootMap: rootMap, tx: tx)
+            else { continue }
+            return candidate
+        }
+        return nil
+    }
+
+    /// Whether the record under `recordId` is readable in `tx` and the key
+    /// its stored fields build under `constraint` is `key`.
+    private func holds(
+        _ key: String,
+        recordId: String,
+        constraint: ConstraintDescriptor,
+        rootMap: YrsMap,
+        tx: YrsTransaction
+    ) -> Bool {
+        guard let rec = rootMap.getMap(tx: tx, key: recordId) else { return false }
+        let held = UniqueIndex.buildKey(
+            fields: constraint.fields,
+            values: snapshotFromMap(rec: rec, tx: tx)
+        )
+        return held == key
     }
 
     /// Merge `data` into the existing record `existingId` in this doc.
@@ -1515,20 +1612,12 @@ public final class DynamicModel: @unchecked Sendable {
             fields: constraint.fields, values: valueDict
         ) else { return nil }
 
-        let recordId: String? = withTx { [self] txn in
-            let indexMap = txn.transactionGetOrInsertMap(
-                name: UniqueIndex.mapName(
-                    modelName: self.schema.name,
-                    constraintName: name
-                )
-            )
-            guard let raw = try? indexMap.get(tx: txn, key: key),
-                  let decoded = PrimitiveValue.decodeJsonString(raw)
-            else { return nil }
-            return decoded
-        }
-
-        guard let id = recordId else { return nil }
+        // A stale entry — no record behind it, or one holding another
+        // value — is a miss here too, and a readable row the index does
+        // not name is still found (#3252, `readableOwner`).
+        guard let id = existingRecordId(
+            constraintName: name, key: key, orderedValues: values
+        ) else { return nil }
         return find(id: id)
     }
 
@@ -1665,20 +1754,28 @@ public final class DynamicModel: @unchecked Sendable {
         let rec = existing ?? root.insertMap(tx: txn, key: id)
 
         // Pre-flight: enforce every resolved unique constraint.
+        //
+        // Only a readable owner collides (#3252): an index entry whose
+        // record the document does not hold — or holds under another key —
+        // is stale, and the write below rewrites it. A readable row the
+        // index does not name still collides — the mirror fallback in
+        // `readableOwner` finds it, so a stale entry cannot let a duplicate
+        // in past a row `query` returns. A query and the constraint must
+        // see the same rows, so before the violation is thrown the owner's
+        // mirror row is written again: whatever put the mirror out of step
+        // with the record store, the id the error carries is a row `query`
+        // and `find` return.
         for constraint in self.schema.resolvedUniqueConstraints {
             guard let newKey = UniqueIndex.buildKey(
                 fields: constraint.fields,
                 values: dataToSave
             ) else { continue } // null-values → not enforced
-            let indexMap = txn.transactionGetOrInsertMap(
-                name: UniqueIndex.mapName(
-                    modelName: self.schema.name,
-                    constraintName: constraint.name
-                )
-            )
-            if let existing = try? indexMap.get(tx: txn, key: newKey),
-               let owner = PrimitiveValue.decodeJsonString(existing),
+            if let owner = self.readableOwner(
+                   of: newKey, values: dataToSave, constraint: constraint,
+                   rootMap: root, tx: txn, excluding: id
+               ),
                owner != id {
+                self.upsertSqliteRow(id: owner, rootMap: root, tx: txn)
                 throw UniqueConstraintViolationError(
                     modelName: self.schema.name,
                     constraintName: constraint.name,
@@ -1926,6 +2023,35 @@ public final class DynamicModel: @unchecked Sendable {
                     )
                 }
             }
+        }
+
+        // A finite number the yrs FFI cannot be made to store exactly
+        // (#3456). The FFI parses every scalar write as JSON, and its float
+        // branch is not correctly rounded, so above `2^64` there are doubles
+        // no literal reaches — see `PrimitiveValue.exactFloatLiteral`. Saving
+        // a neighbor instead would silently change a value the caller's own
+        // type system accepted AND leave the unique-index key, which is built
+        // from the caller's value, describing something the record does not
+        // hold. So the write is refused, by the error the issue's Expected
+        // behavior asks for: a Swift error naming the field, not a process
+        // abort and not a silent edit.
+        //
+        // Runs with the other pre-write validation, before the record map is
+        // materialized, so a refused save leaves no partial record. Checked
+        // on exactly the values this save will write — every resolved field
+        // on an insert, the narrowed changes on an update — so an update of
+        // one field is never rejected for another field's stored value.
+        for (fname, value) in (isUpdate ? newValues : dataToSave) {
+            guard case let .number(n) = value, n.isFinite else { continue }
+            guard PrimitiveValue.encodeNumberForYrs(n) == nil else { continue }
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "Field `\(fname)` on model `\(self.schema.name)`: "
+                    + "\(PrimitiveValue.encodeNumber(n) ?? "\(n)") cannot be stored "
+                    + "exactly — the CRDT's JSON number parser has no literal for "
+                    + "this Double. Round the value, or declare the field as "
+                    + "`string` to keep every digit."
+            )
         }
 
         // Dirty-check short-circuit — mirrors js-bao `BaseModel.save`,

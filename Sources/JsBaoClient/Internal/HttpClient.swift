@@ -551,7 +551,21 @@ public final class HttpClient: @unchecked Sendable {
                 urlRequest = try buildURLRequest(method: method, path: path, body: body, options: options)
                 (responseData, response) = try await NetworkSession.data(for: urlRequest, using: session)
             case .invalid:
-                throw HttpError(status: 401, message: "Invalid credentials")
+                // #3403 — the session really is over, but the ORIGINAL 401
+                // said why. Building the error from nothing discarded the
+                // server's `code`, so the most common auth failure an app
+                // sees reached it with `serverCode == nil`. The message text
+                // stays `"Invalid credentials"` (existing suites pin it);
+                // only `body` and the parsed server fields are added.
+                let originalBody = String(data: responseData, encoding: .utf8)
+                let parsed = HttpError.parseBody(originalBody)
+                throw HttpError(
+                    status: 401,
+                    message: "Invalid credentials",
+                    body: originalBody,
+                    serverCode: parsed.code,
+                    serverMessage: parsed.message
+                )
             case .network(let underlying):
                 // A refresh that failed for transport reasons is NOT a
                 // credential problem: rethrow it as the retryable

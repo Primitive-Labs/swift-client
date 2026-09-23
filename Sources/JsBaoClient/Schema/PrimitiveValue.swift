@@ -104,7 +104,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
             // nil for non-finite values (NaN, ±Infinity) — the runtime
             // skips the field on write rather than crashing the
             // Rust FFI with invalid JSON.
-            return PrimitiveValue.encodeNumber(n)
+            return PrimitiveValue.encodeNumberForYrs(n)
         case let .boolean(b):
             return b ? "true" : "false"
         case let .id(s):
@@ -265,6 +265,126 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         guard n.isFinite else { return nil }
         return jsNumberString(n)
     }
+
+    /// `encodeNumber`, adjusted for the one place the JS string is not a
+    /// legal input: the yrs FFI (#3456).
+    ///
+    /// `YrsMap.insert` / `tryUpdate` parse their `value` with
+    /// `Any::from_json(...).unwrap()` (yniffi `lib/src/map.rs`), and a
+    /// BARE INTEGER LITERAL — no decimal point, no exponent — takes that
+    /// parser's INTEGER branch, which mishandles the same number a JS
+    /// client writes as a float in two different ways.
+    ///
+    /// Past `i64::MAX` the parse FAILS and the `unwrap` aborts the
+    /// process — `EXC_CRASH (SIGABRT)` from inside the CRDT write, with
+    /// nothing for the app to catch (`Value 13000000000000000000 out of
+    /// range for i64`). ECMA-262 prints full digits up to 1e21, so
+    /// roughly half of `UInt64.random(in: 1...UInt64.max)` lands there.
+    ///
+    /// Below it the parse succeeds and lands the WRONG TYPE.
+    /// `Any::try_from(u64)` / `Any::from(i64)` (`yrs/src/any.rs`) answer
+    /// `Any::Number(f64)` only up to `F64_MAX_SAFE_INTEGER`, `2^53 - 1`;
+    /// above that they answer `Any::BigInt(i64)`, which yrs encodes as
+    /// lib0 type 122 and yjs's `readAny` decodes as a JS `bigint`.
+    /// Nothing downstream expects one — `JSON.stringify` throws on a
+    /// BigInt and no `typeof value === "number"` check sees it — while a
+    /// JS client writing the same number sends a float64, type 123.
+    ///
+    /// So the boundary is `Number.MAX_SAFE_INTEGER`, not `Int64.max`:
+    /// above it the literal has to carry a decimal point or an exponent so
+    /// the parser takes its float branch and the value lands as the
+    /// `Any::Number(f64)` a JS client produces. Every other value —
+    /// fractional, already exponential (`1e+21` and up), or integral within
+    /// the safe band — is returned untouched, so ordinary numbers keep
+    /// their exact js-bao bytes, and the bare literal is exact there
+    /// anyway.
+    ///
+    /// WHICH float literal is not a free choice, because the parser's float
+    /// branch is not correctly rounded. It reads the digits into a `u64`
+    /// significand and then computes `significand as f64 * 10^exponent`, so
+    /// a significand past `2^53` is rounded BEFORE the scaling and the
+    /// result can miss the double the caller handed us. Simply appending
+    /// `.0` to the js-bao digits does exactly that — `70338045433163640.0`
+    /// comes back as `70338045433163632`, a silent 1-ulp change to an
+    /// already-representable value, and the unique-index key (built from
+    /// the caller's value, `encodeNumber`) no longer describes what was
+    /// stored. So `exactFloatLiteral` picks a literal the parser's own
+    /// arithmetic turns back into this exact double, and returns nil when
+    /// no literal does.
+    ///
+    /// `encodeNumber` itself is deliberately NOT adjusted: it is the
+    /// js-bao `String(value)` twin that builds unique-index KEYS, and a
+    /// Y.Map key is never parsed as JSON. Giving those keys an exponent
+    /// would stop them colliding with the entries a JS client writes.
+    ///
+    /// - Returns: the literal, or `nil` for a value that must not be
+    ///   written — a non-finite number (skipped on write, #1117) or, past
+    ///   `2^64`, one of the rare doubles this parser cannot be made to
+    ///   reproduce. `DynamicModel` rejects the latter with a
+    ///   field-naming error before it mutates anything.
+    static func encodeNumberForYrs(_ n: Double) -> String? {
+        guard let s = encodeNumber(n) else { return nil }
+        if s.contains(".") || s.contains("e") || s.contains("E") { return s }
+        if abs(n) <= maxSafeInteger { return s }
+        return exactFloatLiteral(for: n)
+    }
+
+    /// The shortest `<significand>e<exponent>` literal that yrs' JSON
+    /// parser turns back into exactly `n`, or nil when there is none.
+    ///
+    /// The parser (serde_json's `f64_from_parts`, reached through
+    /// `Any::from_json`) accumulates the literal's digits into a `u64` and
+    /// then evaluates `Double(significand) * 10^exponent` in f64 — one
+    /// table lookup, one multiply. `candidate * power == magnitude` below
+    /// is that same expression, so a candidate that passes it is one the
+    /// parser reproduces bit for bit:
+    ///
+    ///   - `10^exponent` for `exponent <= 22` is exactly representable, so
+    ///     the multiply is the only rounding, and it is correctly rounded;
+    ///   - the significand is written as the digits of an integral double
+    ///     below `2^64`, which is what the parser's `u64` holds, so
+    ///     `Double(significand)` gives that double back unchanged.
+    ///
+    /// Descending `exponent` yields the shortest significand that works —
+    /// `13e18` rather than `13000000000000000000e0` — which keeps the
+    /// literal close to the digits js-bao would print.
+    ///
+    /// Every double in `(2^53, 2^64)` is covered by `exponent = 0`, where
+    /// the significand is the value's own exact integer form: that is the
+    /// whole band the report is about, including every `UInt64`. Above
+    /// `2^64` the significand no longer fits and the search can come up
+    /// empty (about 1 value in 1500 there) — no JSON literal reaches those
+    /// doubles through this parser, so the encoder refuses rather than
+    /// storing a neighbor.
+    static func exactFloatLiteral(for n: Double) -> String? {
+        let magnitude = abs(n)
+        let sign = n < 0 ? "-" : ""
+        for exponent in stride(from: exactPowersOfTen.count - 1, through: 0, by: -1) {
+            let power = exactPowersOfTen[exponent]
+            let candidate = (magnitude / power).rounded()
+            guard candidate >= 1, candidate < twoToThe64 else { continue }
+            guard candidate * power == magnitude else { continue }
+            return "\(sign)\(UInt64(candidate))e\(exponent)"
+        }
+        return nil
+    }
+
+    /// JS's `Number.MAX_SAFE_INTEGER` (`2^53 - 1`), which is also yrs'
+    /// `F64_MAX_SAFE_INTEGER` — the largest integer literal the yrs JSON
+    /// parser still turns into an `Any::Number`.
+    private static let maxSafeInteger = 9_007_199_254_740_991.0
+
+    /// The ceiling on a `u64` significand: `Double(UInt64(x))` is exact
+    /// for an integral `x` strictly below this.
+    private static let twoToThe64 = 18_446_744_073_709_551_616.0
+
+    /// `10^0 … 10^22` — every power of ten a Double holds exactly, which
+    /// is also the range in which the parser's scaling step introduces no
+    /// error of its own.
+    private static let exactPowersOfTen: [Double] = [
+        1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ]
 
     /// ECMA-262 `Number::toString(x, 10)` for a finite Double.
     ///

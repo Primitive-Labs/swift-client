@@ -101,10 +101,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
             options: RequestOptions(customHeaders: headers)
         )
         guard (200..<300).contains(status) else {
-            throw HttpError(
-                status: status, message: "Blob upload failed",
-                body: String(data: body, encoding: .utf8)
-            )
+            throw HttpError.fromBytes(status: status, message: "Blob upload failed", body: body)
         }
         return try JSONCoding.decodeData(BucketBlobInfo.self, from: body)
     }
@@ -149,10 +146,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         let path = "/blob-buckets/\(escaped)/blobs/\(escapedBlob)"
         let (body, status) = try await transport.requestData(method: .get, path: path)
         guard (200..<300).contains(status) else {
-            throw HttpError(
-                status: status, message: "Blob download failed",
-                body: String(data: body, encoding: .utf8)
-            )
+            throw HttpError.fromBytes(status: status, message: "Blob download failed", body: body)
         }
         return body
     }

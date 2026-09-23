@@ -123,8 +123,13 @@ final class SwiftSixLanguageModeTests: XCTestCase {
     /// its mode is at least a conscious edit here.
     func testEveryDeclaredTargetIsCoveredByThePackagePin() throws {
         let manifest = ClientSourceText.stripComments(try Self.manifest())
+        // `swift-bao-codegen` is the executable target #3560 renamed it to; the
+        // product and the test target keep the upper-camel spelling. The list
+        // is deliberately literal — that is what makes adding a target a
+        // conscious edit here — so a rename has to be carried into it, and this
+        // one was not, which is what left the pin red on `main`.
         for target in [
-            "JsBaoClient", "SwiftBaoCodegen", "JsBaoCodegenPlugin",
+            "JsBaoClient", "swift-bao-codegen", "JsBaoCodegenPlugin",
             "JsBaoClientTests", "SwiftBaoCodegenTests", "E2EMiniApp",
         ] {
             XCTAssertTrue(

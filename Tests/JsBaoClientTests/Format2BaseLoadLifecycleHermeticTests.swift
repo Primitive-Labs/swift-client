@@ -48,7 +48,9 @@ final class Format2BaseLoadLifecycleHermeticTests: XCTestCase {
     func testALoadOvertakenByASealReleasesNothing() async throws {
         let coordinator = try await makeCoordinator()
         let documentId = "overtaken-\(UUID().uuidString.prefix(8))"
-        let binding = try coordinator.bind(
+        // Bound for the coordinator's sake; this test reads the coordinator's
+        // decisions, not the binding — the same as its sibling below.
+        _ = try coordinator.bind(
             documentId: documentId, models: ["Note"], document: YDocument()
         )
 

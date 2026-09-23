@@ -207,7 +207,37 @@ final class Format2EpochMoveLiveTests: XCTestCase {
     /// The whole of S1 on a real room: the client stays CONNECTED across the
     /// seal, follows it with no reload, its pending write reaches the server
     /// exactly once, and a later write is acknowledged on the new epoch.
+    ///
+    /// Held: the outbound queue is held across the rotation, which makes
+    /// "pending AT the seal" a fact rather than a coin flip, so this row
+    /// grades the CARRY every time it runs.
     func testAConnectedClientFollowsASealAndItsPendingWriteLandsOnce() async throws {
+        try await followASeal(holdingTheOutboundQueue: true)
+    }
+
+    /// S1 again with nothing held — the race as a user runs it (#3628).
+    ///
+    /// The debounce and the seal's round trip are the same order of magnitude,
+    /// so left to itself the delta is already on the wire about a third of the
+    /// time, and the room receives it AFTER it has sealed. Both ways must end
+    /// here: whichever way the race falls, the write is acknowledged, exactly
+    /// once, and the document stays live.
+    ///
+    /// That is new. The room used to read `hasUnintegratedStructs` over the
+    /// WHOLE document, and Yjs never drops a delta it could not integrate, so
+    /// one late frame had the room answer EVERY later frame from that
+    /// connection with a resync request instead of an acknowledgement until
+    /// the Durable Object was evicted — reproduced here at 25 answered
+    /// resyncs a second, with the write that provoked it still pending when
+    /// the row gave up. The hold above was this suite's way around it. #3628
+    /// attributes the parked structs to the frame that produced them, so the
+    /// workaround is no longer what makes S1 pass; the row above keeps it for
+    /// the coverage it buys, and this one runs without it.
+    func testAConnectedClientFollowsASealWithItsOutboundQueueUnheld() async throws {
+        try await followASeal(holdingTheOutboundQueue: false)
+    }
+
+    private func followASeal(holdingTheOutboundQueue holdQueue: Bool) async throws {
         let author = await makeClient(databasePath: directory + "/author.sqlite")
         let binding = try await createAndOpen(author)
         let note = try model(author)
@@ -225,32 +255,26 @@ final class Format2EpochMoveLiveTests: XCTestCase {
         // Now a write that is still owed when the epoch is sealed. The socket
         // is deliberately left up: this is the CONNECTED case.
         //
-        // The outbound queue is held across the rotation, which is what makes
-        // "pending AT the seal" a fact rather than a coin flip: the debounce
-        // and the seal's round trip are the same order of magnitude, so left to
-        // itself the delta is already on the wire about a third of the time.
-        // This is the client's own mechanism and the move's own release — from
-        // the moment `handleEpochSeal` reads the frame the document is held
-        // exactly like this and the move lets everything go
+        // The hold is the client's own mechanism and the move's own release —
+        // from the moment `handleEpochSeal` reads the frame the document is
+        // held exactly like this and the move lets everything go
         // (`Format2EpochMoveHermeticTests` pins both); taking it one beat
-        // earlier is what makes this row grade the carry every time it runs.
-        //
-        // The case that leaves out is not this client's to fix, and is recorded
-        // for the parent: a delta the room receives AFTER it has sealed is one
-        // the client sent before it could know, and the room parks the structs
-        // it cannot integrate and then answers EVERY later frame from that
-        // connection with a resync request instead of an acknowledgement, for
-        // ever — reproduced here at 25 answered resyncs a second, with the
-        // write that provoked it still pending when the row gave up.
-        author.format2?.hold.hold(documentId, reason: "the seal this row is about")
+        // earlier is what makes the held row grade the carry every time.
+        // Unheld, the delta races the seal and may reach the room after it,
+        // which is the case #3628 made survivable.
+        if holdQueue {
+            author.format2?.hold.hold(documentId, reason: "the seal this row is about")
+        }
         _ = try note.create(id: "pending", values: [
             "title": .string("owed at the seal"), "views": .number(2),
         ])
-        XCTAssertEqual(
-            try binding.store.pendingOps().map(\.seq), [2],
-            "owed, and — since the queue is held — owed with nothing of it on "
-                + "the wire: what reaches the room is the carry"
-        )
+        if holdQueue {
+            XCTAssertEqual(
+                try binding.store.pendingOps().map(\.seq), [2],
+                "owed, and — since the queue is held — owed with nothing of it on "
+                    + "the wire: what reaches the room is the carry"
+            )
+        }
         _ = try await testRoute("seal-epoch", body: ["reason": "swift-move-test"])
 
         // The client follows it: the mark moves, and nothing is stopped.
@@ -264,9 +288,10 @@ final class Format2EpochMoveLiveTests: XCTestCase {
         )
         XCTAssertFalse(author.format2?.hold.isHeld(documentId) ?? true)
 
-        // The owed write is acknowledged on the NEW epoch.
+        // The owed write is acknowledged on the NEW epoch — carried there by
+        // the move, or re-stated after a resync the room asked for.
         try await eventuallyOn(
-            author, timeout: 30, "the carried write to be acknowledged"
+            author, timeout: 30, "the owed write to be acknowledged"
         ) {
             try binding.store.pendingOps().isEmpty
         }

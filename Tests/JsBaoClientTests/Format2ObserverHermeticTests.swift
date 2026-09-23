@@ -173,7 +173,7 @@ final class Format2ObserverHermeticTests: XCTestCase {
         let peer = OverlayDocument()
         // Not a create: only the tombstone-clearing marker, which a re-create
         // writes and which carries no content of its own.
-        peer.map(for: "Note")  // register the map on the peer side
+        _ = peer.map(for: "Note")  // register the map on the peer side
         _ = peer.applyRawEntries(
             [(OverlayKeys.markerKey(recordId: "ghost", marker: OverlayKeys.markerDeleted), .bool(false))],
             model: "Note"

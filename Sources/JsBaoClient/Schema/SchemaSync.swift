@@ -254,10 +254,19 @@ public enum SchemaSync {
     /// since they can't be JSON-encoded — yrs FFI parses every
     /// scalar as JSON and would panic. Schema-default validation
     /// keeps this path from seeing non-finite inputs in practice.
+    ///
+    /// Goes through `encodeNumberForYrs`, like every other write the FFI
+    /// parses: a `default` past `2^53` needs a float literal the parser
+    /// turns back into exactly this Double — the bare integer form is one
+    /// it reads as an `i64`, and past `2^63` aborts on (#3456). The rare
+    /// double that has no such literal is skipped like a non-finite one:
+    /// this path publishes metadata and has no caller to throw to, and a
+    /// default stored as a neighbor of itself would be worse than an
+    /// absent one.
     private static func setScalar(
         _ map: YrsMap, key: String, value: Double, tx: YrsTransaction
     ) {
-        guard let encoded = PrimitiveValue.encodeNumber(value) else { return }
+        guard let encoded = PrimitiveValue.encodeNumberForYrs(value) else { return }
         setEncodedIfChanged(map, key: key, encoded: encoded, tx: tx)
     }
 

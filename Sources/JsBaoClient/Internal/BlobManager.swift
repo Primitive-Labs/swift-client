@@ -200,7 +200,15 @@ public actor BlobManager {
         )
 
         guard status >= 200 && status < 300 else {
-            throw HttpError(status: status, message: "Blob upload failed", body: String(data: responseData, encoding: .utf8))
+            // #3403 — the raw-bytes paths do not go through the JSON spine, so
+            // the parse `HttpClient` applies to every other failure is applied
+            // here too. The message is unchanged; only the server's own cause
+            // is added, where before `serverCode` was always nil.
+            throw HttpError.fromBytes(
+                status: status,
+                message: "Blob upload failed",
+                body: responseData
+            )
         }
 
         let result = BlobUploadResult(
@@ -410,7 +418,14 @@ public actor BlobManager {
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw HttpError(status: status, message: "Blob download failed")
+            // #3403 — this one discarded the body outright, so a refusal the
+            // server named reached the app as a bare status. The bytes of a
+            // failed download ARE the error envelope.
+            throw HttpError.fromBytes(
+                status: status,
+                message: "Blob download failed",
+                body: data
+            )
         }
 
         // Cache in memory

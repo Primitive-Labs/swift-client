@@ -20,6 +20,78 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Fixed: `functions.waitFor` no longer calls a live run missing (#3661)
+
+`waitFor(runId:)` called straight after `functions.start` could throw
+`.notFound` — `Function run <id> not found` — within a second, for a run that
+was `running` and went on to complete. The wait ended on the first 404, and the
+run-status route answers 404 both for a run id that names no run and for a
+live, unsettled run whose instance the platform cannot see yet, which is what a
+run that has just started looks like.
+
+The wait now tells the two apart by the body the route sent. A run the platform
+can see and cannot probe is polled to your own `FunctionWaitOptions.timeout`,
+and a run id that resolves to nothing is retried for three seconds — long
+enough for an eventually consistent read to catch up with a run that has just
+been created — before the same `.notFound` it always threw. A wait that ends
+while its last read was a not-found reports that `.notFound` rather than
+`.workflowWaitTimeout`; a run that is merely slow still raises the timeout.
+
+`functions.getStatus` is unchanged: one read, reporting what it read. Its
+thrown `JsBaoError` now carries `details["reason"]` — `"instance-unseen"` or
+`"no-run"` — beside the unchanged code and message, and
+`FunctionRunStatusClassifier` is the same reading as a public type.
+
+### A unique constraint fires only for a row the query can read (#3252)
+
+**Behavior change, no API change.** The `_uniqueIdx_*` maps are a cache over
+the records, not the record store, and on a fresh replica the two can disagree:
+an index entry can name a record whose structs have not landed yet, or one a
+field change or delete left behind. `Model.query()` then returned no row for a
+value while `save(in:)` was refused with `UniqueConstraintViolationError` for
+exactly that value — the index knew a row nothing else could read.
+
+An index entry now counts only when its owner is *readable*: the record exists
+in the document and its stored fields still build the claimed key. A stale
+entry is a miss for `save(in:)`, `create`, `update`, `save(in:upsertOn:)`,
+`upsertByUnique` (including the cross-document search behind the generated
+`upsertByUnique(in:)`) and `findByUnique`; the write lands and rewrites the
+entry to the record that holds the value. When the constraint does fire, the
+record the error cites is one `query` on the constraint field and `find` return
+— the violation path writes that row to the query mirror again before throwing.
+
+The reverse holds too: a row `query` returns for the value is a match even
+when the index does not name it — a stale entry pointing elsewhere, or a
+record written before index maintenance. Every lookup above falls back to the
+query mirror on an index miss (as js-bao's `save()` already did) and accepts a
+mirror row only if the record store still holds it with that value, so a stale
+entry cannot let a duplicate in beside a readable row, and `upsertByUnique` /
+`save(in:upsertOn:)` merge into that row rather than inserting beside it.
+
+Unchanged: a readable owner still refuses the write, and two records that end
+up holding one value after a merge are still reconciled to the larger id.
+
+### `DocumentContext.close` reports whether the local data was evicted (#3589)
+
+**Additive, source-compatible.** `DocumentContext.close(options:)` returned
+`Void` and discarded the `CloseDocumentResult` its own callee produced, so a
+caller holding a per-document handle could not tell an `evictLocal: true`
+close that kept the local data from one that evicted it. It now returns
+`CloseDocumentResult`, forwarding whatever `client.closeDocument` decided —
+`evicted: false` while the server is still missing this client's writes
+(#961, #2668), and `evicted: false` when the handle's client is already gone,
+the nil handling `DocumentsAPI.close` uses. The method is
+`@discardableResult`, so an existing `await ctx.close()` keeps compiling
+unchanged and takes no `[#no-usage]` warning. The two Swift paths beside it —
+`client.closeDocument` and `documents.close` — already reported this; the
+handle was the one that did not.
+
+`client.closeDocument` itself got its `@discardableResult` back in the same
+change. The attribute had been separated from its declaration by a helper
+inserted between them (#3437), so it bound to that `Void` helper instead and
+every caller ignoring the close result took a `[#no-usage]` warning. Nothing
+about the method changed; discarding its result is legal again.
+
 ### A slice says how often the platform reset the run: `resets`, `lastResetAt`, `lastResetCause` (#3566)
 
 **Additive.** A platform deploy resets the engine's Durable Object under every
@@ -92,6 +164,55 @@ after the message. Only the second means "try again".
 The generated per-key Swift invokers answer `FunctionRunResult<<Key>Output>`
 from `getStatus`, `waitFor` and `terminate`, and take
 `FunctionWaitOptions? = nil`. Re-run `primitive functions codegen`.
+
+### Fixed: a `number` field past 2^53 reached the CRDT wrong, and past 2^63 aborted the process (#3456)
+
+Saving a record whose `number` field held a finite `Double` at or above `2^63`
+— any `UInt64` in the top half of its range, so roughly half of
+`UInt64.random(in: 1...UInt64.max)` — crashed the app with `EXC_CRASH
+(SIGABRT)` and a Rust panic inside the CRDT write. There was no Swift error to
+catch: the abort came from `Any::from_json(...).unwrap()` in yniffi, whose
+parser reads a bare integer literal as an `i64` and rejects anything past its
+range (`Value 13000000000000000000 out of range for i64`). ECMA-262 prints full
+digits up to 1e21, so the whole band `[2^63, 1e21)` arrived as such a literal.
+
+The band just below had a quieter version of the same defect. `Any::try_from`
+turns an integer literal into an `Any::Number(f64)` only up to
+`F64_MAX_SAFE_INTEGER` (`2^53 - 1`) and into an `Any::BigInt(i64)` above it,
+which yrs encodes as lib0 type 122 and yjs's `readAny` decodes as a JS
+`bigint`. Every Swift write of an integer in `(2^53, 2^63)` therefore reached
+JS clients and the server's document projection as a `bigint` — a type nothing
+there expects, since `JSON.stringify` throws on one and no
+`typeof value === "number"` check matches it — where a JS client writing the
+same number sends a float64.
+
+Nothing to change in an app. The encoder now sends every bare integer literal
+above `Number.MAX_SAFE_INTEGER` in `<significand>e<exponent>` form —
+`13000000000000000000` goes as `13e18` — which takes the parser's float branch,
+and the value lands as the same `f64` a JS client writing that number produces.
+Integers within the safe band, fractional values and values from `1e+21` up
+keep their exact previous bytes, as do the unique-index keys — those are Y.Map
+keys, never parsed as JSON, and they stay byte-identical to js-bao's
+`String(value)` so a Swift-written index entry still collides with a JS-written
+one. Non-finite values (`NaN`, `±Infinity`) are still skipped on write,
+unchanged.
+
+The significand is chosen, not just printed, because that float branch is not
+correctly rounded: it reads the digits into a `u64` and computes
+`significand as f64 * 10^exponent`, so a significand past `2^53` is rounded
+before the scaling. The obvious encoding — the JS digits with `.0` appended —
+lands on the wrong `Double` for a minority of the band
+(`70338045433163640.0` stores `70338045433163632`), which would both change a
+value the app never wrote and leave the unique-index key, built from the value
+the app DID write, describing something the record does not hold. The encoder
+instead picks the shortest significand the parser's own arithmetic reproduces
+exactly, so a saved number reads back bit for bit.
+
+Above `2^64` about one `Double` in 1500 is out of that parser's reach
+altogether. Saving one now throws a `JsBaoError` (`.invalidArgument`) naming
+the field, before anything is written — the alternative the issue asks for,
+instead of the process abort it used to be. Round the value, or store exact
+integers past `2^53` in a `string` field, as you would in JS.
 
 ### Fixed: a session could be left signed in to a socket that would not open (#3437)
 

@@ -576,10 +576,7 @@ public final class MeAPI: @unchecked Sendable {
             options: RequestOptions(customHeaders: ["Content-Type": contentType.rawValue])
         )
         guard (200..<300).contains(status) else {
-            throw HttpError(
-                status: status, message: "Avatar upload failed",
-                body: String(data: body, encoding: .utf8)
-            )
+            throw HttpError.fromBytes(status: status, message: "Avatar upload failed", body: body)
         }
         await clearCache()
         return try JSONCoding.decodeData(AvatarUploadResult.self, from: body)

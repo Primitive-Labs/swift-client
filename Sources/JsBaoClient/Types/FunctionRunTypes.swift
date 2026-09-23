@@ -599,6 +599,57 @@ public enum FunctionTerminateClassifier {
     }
 }
 
+// MARK: - The run-status route's two different 404s (#3661)
+
+/// What a run-status 404 actually said.
+///
+/// `GET /workflows/runs/{runId}/status` answers 404 for two unrelated facts,
+/// and folding them together is what made `functions.waitFor` report a live
+/// run missing:
+///
+///  - the run id resolved to no row. The reads behind that are eventually
+///    consistent, so a poll a second after a start can miss a committed row.
+///  - `status: "missing"`: the row IS there and is not settled, and the
+///    platform cannot see its instance. Inside the launch grace that is the
+///    deliberate answer for a run between its row write and its instance, and
+///    the route writes nothing for it.
+public enum FunctionRunStatusNotFound: Sendable, Equatable {
+    case noRun
+    case instanceUnseen(diagnostic: String)
+}
+
+/// The classifier, and the sentence that means "no row" under a `missing`.
+public enum FunctionRunStatusClassifier {
+    /// `statusByRunId` answers its own absent-row 404 through the plain error
+    /// envelope, so it never carries `status: "missing"`; the workflowKey /
+    /// runKey status route spells the same fact this way, and a client pointed
+    /// at either must read it the same way.
+    public static let absentRowSentence = "Workflow run not found"
+
+    /// Classify a run-status 404 by its body text.
+    ///
+    /// A body the classifier cannot read is `noRun`, matching
+    /// ``FunctionTerminateClassifier/classify(body:)``'s reading of silence:
+    /// the unbounded wait the other branch earns must be granted on something
+    /// the route actually said. Read through `JSONValue` for the same reason
+    /// that one is — `TransportSpineTests` holds the untyped-dictionary count
+    /// outside the transport surface to a ceiling.
+    public static func classify(body: String?) -> FunctionRunStatusNotFound {
+        guard
+            let body,
+            let data = body.data(using: .utf8),
+            let parsed = try? JSONDecoder().decode(JSONValue.self, from: data),
+            let object = parsed.objectValue
+        else { return .noRun }
+        // Strictly the string. The error envelope carries a NUMERIC `status`
+        // (404), which must never be read as the instance report.
+        guard object["status"]?.stringValue == "missing" else { return .noRun }
+        let diagnostic = object["error"]?.stringValue ?? ""
+        if diagnostic == absentRowSentence { return .noRun }
+        return .instanceUnseen(diagnostic: diagnostic)
+    }
+}
+
 // MARK: - The one "is this a 404?" reading, for the function surface
 
 extension FunctionRunStatus {
