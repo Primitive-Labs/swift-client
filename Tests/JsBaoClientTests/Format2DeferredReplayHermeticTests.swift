@@ -22,9 +22,10 @@ import YSwift
 /// - the durable note (finding 3437-SO-03). The move persists the fresh overlay
 ///   and advances the mark BEFORE the judgement has run, so a restart in that
 ///   window would restore the owed writes by #3431's key rule alone and publish
-///   an outdated one, with recency never consulted. The JS client has the same
-///   window and holds its deferral in memory; Swift writes `_deferred_replay`
-///   in the same transaction as the mark.
+///   an outdated one, with recency never consulted. Swift writes
+///   `_deferred_replay` in the same transaction as the mark; the JS client does
+///   the same since #3755, keyed by client as well as document because its tabs
+///   share one record store.
 final class Format2DeferredReplayHermeticTests: XCTestCase {
 
     private var directories: [String] = []

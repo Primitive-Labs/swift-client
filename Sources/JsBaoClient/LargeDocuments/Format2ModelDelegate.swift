@@ -369,19 +369,20 @@ final class Format2ModelDelegate: @unchecked Sendable {
     /// from a completed one, and a delete that did nothing looks exactly like
     /// a delete that worked.
     ///
-    /// Only the WINDOW refusal is reported. Every other error keeps the
-    /// handling #3436 left it: a stopped document's delete is still a quiet
-    /// no-op, because this is the window's channel and not a second reporting
-    /// path for everything that can go wrong on a mutation.
+    /// SWALLOWS ONLY, since #3758. The window refusal is reported by the write
+    /// path's gate, which is the one place every door runs through — throwing
+    /// or not — so a second report here would be a second copy of one rule,
+    /// and a second chance for the doors to disagree about it. `recordId` is
+    /// kept because the caller reads as a pair with the mutation it wraps.
+    ///
+    /// Every other error keeps the handling #3436 left it: a stopped
+    /// document's delete is still a quiet no-op, because the channel is the
+    /// window's and not a second reporting path for everything that can go
+    /// wrong on a mutation.
     func quietly(recordId: String, _ body: () throws -> Void) {
+        _ = recordId
         do {
             try body()
-        } catch let error as JsBaoError
-            where error.code == .documentOfflineWindowExpired
-        {
-            binding.reportWriteRefused(
-                model: modelName, recordId: recordId, error: error
-            )
         } catch {
             // As before: `try?`'s behavior, kept deliberately.
         }

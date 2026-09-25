@@ -47,6 +47,15 @@ _ = try notes?.create(id: "n1", values: ["title": .string("first")])
 local metadata row and to the commit the client posts. `DocumentInfo
 .documentFormat` reports what a document is.
 
+`documentFormat: 2` **cannot be combined with `localOnly: true`**. A large
+document's records live in a store the server's room opens, which a local-only
+document never reaches, so the combination is not a document that syncs late —
+it is one that can never work. The create throws
+`JsBaoError(code: .localOnlyUnsupportedOption)` before any local state is
+written: no metadata row, no pending create, no classification, no event. The
+JavaScript client refuses it at create with the same code,
+`LOCAL_ONLY_UNSUPPORTED_OPTION`.
+
 ## What the client does behind that
 
 - **It declares what it reads.** Every `syncStep1` carries `formats: [1, 2]` and
@@ -293,12 +302,22 @@ writes that will be resolved by guesswork:
 - the window is the server's number, delivered on `epoch.info` and persisted
   locally — 7 days by default, clamped to 1–14, the same range retention prunes
   archives by;
-- `Model.create`, `update`, `save`, `addStringsetMember` and
-  `removeStringsetMember` throw
+- **every refused write raises `DocumentWriteRefusedEvent`**
+  (`document:write-refused`), carrying `documentId`, `model`, `recordId` and
+  `error` — whichever door made it, and whether or not that door can throw.
+  This is the same event, under the same name, the JavaScript client emits, so
+  an app running both handles the refusal once;
+- `Model.create`, `update`, `save`, `upsert`, `addStringsetMember` and
+  `removeStringsetMember` ALSO throw
   `JsBaoError(code: .documentOfflineWindowExpired)` with `lastSyncAt`,
-  `windowDays` and `overdueMs` in `details`;
+  `windowDays` and `overdueMs` in `details` — the throw stays the call site's
+  signal where there is a call site;
 - `Model.delete(id:)` and the `PrimitiveRecord` field setters cannot throw, so
-  they write nothing and emit `DocumentWriteRefusedEvent` instead;
+  they write nothing and have only the event;
+- the event is delivered **outside the document's operation lock**, after the
+  outermost operation has released it, so a handler may read any document —
+  including the refusing one — without deadlocking against the write it is
+  being told about;
 - `find` and `query` keep answering, and a sync restores writes at once;
 - a refused write leaves nothing behind — no merged row, no pending op, no
   projected row, nothing on the wire — so the refusal cannot itself become a
@@ -437,6 +456,7 @@ cheap. Two calls remove a large document's local data:
 | `.snapshotManifestUnsupported` | a base manifest is newer than this client |
 | `.format2SnapshotLoadIncomplete` | a load could not be made complete |
 | `.documentOfflineWindowExpired` | a local write past the offline window |
+| `.localOnlyUnsupportedOption` | `documentFormat: 2` asked for with `localOnly: true` |
 
 They are the JS client's codes, spelled the same way on the wire.
 

@@ -319,6 +319,196 @@ final class Format2DocsHermeticTests: XCTestCase {
         }
     }
 
+    // MARK: - #3759 — the combination that can never work
+
+    /// A refusal an app meets at `createDocument` has to be findable from the
+    /// page that document kind is described on — and it has to say that JS
+    /// refuses it too, because the whole point of the change is that the two
+    /// clients now answer one question the same way.
+    func testThePageSaysALargeDocumentCannotBeLocalOnly() throws {
+        let page = try read("docs/large-documents.md")
+        for name in ["localOnlyUnsupportedOption", "LOCAL_ONLY_UNSUPPORTED_OPTION", "localOnly"] {
+            XCTAssertTrue(
+                page.contains(name),
+                "docs/large-documents.md does not mention `\(name)`"
+            )
+        }
+        // The rule is stated where a reader creating one will be: the section
+        // is sliced from its own heading to the next, never by a character
+        // window (eight guards in this project have paid for one of those).
+        let opening = try XCTUnwrap(
+            section("## Opening one", of: page),
+            "the page has no \"Opening one\" section"
+        )
+        XCTAssertTrue(
+            opening.contains("localOnly"),
+            "the \"Opening one\" section does not say what `localOnly` does here"
+        )
+        XCTAssertTrue(
+            opening.contains("LOCAL_ONLY_UNSUPPORTED_OPTION"),
+            "nor name the code the combination is refused with"
+        )
+        XCTAssertTrue(
+            opening.lowercased().contains("javascript")
+                || opening.lowercased().contains("js client"),
+            "nor say that the JavaScript client refuses it with the same code"
+        )
+        // And the code is in the table, where an app looking a thrown code up
+        // will go.
+        let table = try XCTUnwrap(
+            section("## The typed errors", of: page),
+            "the page has no \"The typed errors\" section"
+        )
+        XCTAssertTrue(
+            table.contains(
+                "| `.\(String(describing: JsBaoErrorCode.localOnlyUnsupportedOption))` |"
+            ),
+            "the typed-errors table has no row for the local-only refusal"
+        )
+    }
+
+    func testTheChangelogRecordsThatACreateWhichUsedToSucceedNowThrows() throws {
+        let changelog = try read("CHANGELOG.md")
+        let unreleased = try XCTUnwrap(
+            changelog.range(of: "## Unreleased").map { String(changelog[$0.lowerBound...]) }
+        )
+        // Anchored on the entry's OWN heading, as the #3436 pin below is: an
+        // entry that merely cites #3759 in its prose must not take the slice.
+        let lines = unreleased.split(separator: "\n", omittingEmptySubsequences: false)
+        let start = try XCTUnwrap(
+            lines.firstIndex(where: { $0.hasPrefix("### ") && $0.contains("#3759") }),
+            "the changelog has no #3759 entry in the Unreleased section"
+        )
+        let end = lines[lines.index(after: start)...]
+            .firstIndex(where: { $0.hasPrefix("### ") }) ?? lines.endIndex
+        let entry = lines[start..<end].joined(separator: "\n")
+        // The package ships by branch, so the changelog IS the migration note:
+        // a create that used to succeed now throws, and the entry has to say so
+        // with the combination and the code in it by name.
+        for claim in ["localOnly", "documentFormat: 2", "LOCAL_ONLY_UNSUPPORTED_OPTION"] {
+            XCTAssertTrue(
+                entry.contains(claim),
+                "the #3759 changelog entry does not mention `\(claim)`"
+            )
+        }
+    }
+
+    /// A `## ` section of a markdown page, from its own heading to the next
+    /// one — never a fixed number of characters after a landmark.
+    private func section(_ heading: String, of page: String) -> String? {
+        guard let start = page.range(of: heading) else { return nil }
+        let rest = page[start.upperBound...]
+        guard let next = rest.range(of: "\n## ") else { return String(page[start.lowerBound...]) }
+        return String(page[start.lowerBound..<next.lowerBound])
+    }
+
+    // MARK: - #3758 — one contract for a refused offline write
+
+    /// Behavior 21 — the page states the ONE rule, for both clients.
+    ///
+    /// It used to describe a split — the throwing verbs throw, the
+    /// non-throwing ones emit — which was the documentation half of the same
+    /// asymmetry the issue is about. Every refused write is reported now, and
+    /// the page has to say so, including that the report arrives outside the
+    /// document's lock so a handler may read.
+    func testThePageStatesOneRuleForEveryRefusedWrite() throws {
+        let page = try read("docs/large-documents.md")
+        let section = try XCTUnwrap(
+            page.range(of: "## The offline write window").map { start in
+                let rest = page[start.lowerBound...]
+                guard let next = rest.range(of: "\n## ", range: rest.index(rest.startIndex, offsetBy: 1)..<rest.endIndex)
+                else { return String(rest) }
+                return String(rest[..<next.lowerBound])
+            },
+            "the page has no offline-write-window section"
+        )
+        // The throwing verbs throw AND emit.
+        XCTAssertTrue(
+            section.contains("DocumentWriteRefusedEvent"),
+            "the window section does not name the event"
+        )
+        XCTAssertTrue(
+            section.contains("document:write-refused"),
+            "the window section does not name the event's string"
+        )
+        for verb in ["create", "update", "save", "delete"] {
+            XCTAssertTrue(
+                section.contains(verb),
+                "the window section does not name `\(verb)`"
+            )
+        }
+        // And the delivery rule a handler depends on.
+        XCTAssertTrue(
+            section.lowercased().contains("outside")
+                && section.lowercased().contains("lock"),
+            "the window section does not say the report arrives outside the "
+            + "document's lock, which is what lets a handler read"
+        )
+        // The rule is stated as covering every refused write, not only the
+        // verbs that cannot throw.
+        XCTAssertTrue(
+            section.lowercased().contains("every refused write"),
+            "the window section does not state the rule for every door"
+        )
+    }
+
+    /// Behavior 21 — and the changelog, which for a package that ships by
+    /// branch IS the migration note: a Swift app subscribing today starts
+    /// hearing about writes it already caught.
+    func testTheChangelogRecordsTheWidenedRefusalChannel() throws {
+        let changelog = try read("CHANGELOG.md")
+        let unreleased = try XCTUnwrap(
+            changelog.range(of: "## Unreleased").map { String(changelog[$0.lowerBound...]) }
+        )
+        let entry = try XCTUnwrap(
+            unreleased.range(of: "#3758").map { String(unreleased[$0.lowerBound...]) },
+            "the changelog has no #3758 entry in the Unreleased section"
+        )
+        // The verbs by the names this client actually gives them: an app
+        // reading the entry has to recognise what it calls.
+        for claim in [
+            "DocumentWriteRefusedEvent", "create", "addStringsetMember",
+        ] {
+            XCTAssertTrue(
+                entry.contains(claim),
+                "the #3758 changelog entry does not mention `\(claim)`"
+            )
+        }
+    }
+
+    /// Behavior 17 — the docstrings say what the event now means.
+    ///
+    /// The event's own doc comment and the `JsBaoEvent` case's both described
+    /// it as the channel the non-throwing verbs have. Leaving that in place
+    /// would leave the API documenting the behavior it used to have.
+    func testTheEventDocstringsSayEveryRefusedWrite() throws {
+        let events = try read("Sources/JsBaoClient/Types/Events.swift")
+
+        // The enum case's comment, read from the case backwards to the
+        // previous case rather than by a character window.
+        let caseAt = try XCTUnwrap(
+            events.range(of: "case documentWriteRefused =")
+        )
+        let before = String(events[..<caseAt.lowerBound])
+        let comment = String(before[(before.range(
+            of: "case documentSnapshotLoad", options: .backwards
+        )?.upperBound ?? before.startIndex)...])
+        XCTAssertTrue(
+            comment.lowercased().contains("every refused write"),
+            "the `documentWriteRefused` case still describes the old split"
+        )
+
+        // And the payload struct's.
+        let structAt = try XCTUnwrap(
+            events.range(of: "public struct DocumentWriteRefusedEvent")
+        )
+        let docComment = String(events[..<structAt.lowerBound].suffix(1600))
+        XCTAssertTrue(
+            docComment.lowercased().contains("every refused write"),
+            "`DocumentWriteRefusedEvent`'s doc comment still describes the old split"
+        )
+    }
+
     // MARK: - The changelog
 
     func testTheChangelogHasAnUnreleasedEntryForThisChange() throws {

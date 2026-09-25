@@ -487,14 +487,10 @@ let swiftOnlyJsBaoEventKeys: Set<String> = [
     // but the JS map covers only the client's own events, not the cache's.
     "cacheUpdated",
     "cacheUpdateFailed",
-    // A local mutation past a large document's offline window, refused
-    // through a verb that cannot throw (#3437, behavior 2a, finding
-    // 3437-SO-08). Swift-only by construction, not by drift: every JS
-    // mutation verb is async and THROWS `DocumentOfflineWindowError`, so the
-    // JS client needs no event to report the same refusal. Swift's
-    // `DynamicModel.delete(id:)` and the `PrimitiveRecord` field setters are
-    // declared without `throws`, and adding a throwing form would break every
-    // existing caller — so this is the compatible channel for them. Whether
-    // the ORM should gain throwing forms is recorded for the reflection.
-    "document:write-refused",
+    // `document:write-refused` was listed here as Swift-only until #3758.
+    // The reasoning was that every JS mutation verb throws, so the JS client
+    // needed no event — but that left an app running both clients handling one
+    // rule two ways, and gave a JS app no channel to handle the refusal on at
+    // all. Both clients now raise it for EVERY refused write, so it belongs in
+    // the JS `JsBaoEvents` map and not on this list.
 ]

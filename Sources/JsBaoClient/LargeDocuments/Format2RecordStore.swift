@@ -107,9 +107,17 @@ public final class Format2RecordStore: @unchecked Sendable {
             CREATE INDEX IF NOT EXISTS idx_\(members)_tfv \
             ON \(members)(_type, field, value)
             """,
+            // `_record_id` DIRECTLY after `_type` (#3688). The fold's
+            // per-record member delete — every `_replace`, every tombstone —
+            // and the coverage delete both key on that pair; the retired
+            // `(_type, field, _record_id)` shape left the planner narrowing on
+            // `_type` alone, a walk of the model's whole member table per
+            // record. The old name is dropped in `initialize()`, not here, so
+            // this list stays creation-only and the object-name pin still
+            // parses it.
             """
-            CREATE INDEX IF NOT EXISTS idx_\(members)_tfr \
-            ON \(members)(_type, field, _record_id)
+            CREATE INDEX IF NOT EXISTS idx_\(members)_trf \
+            ON \(members)(_type, _record_id, field)
             """,
             """
             CREATE TABLE IF NOT EXISTS _epoch (
@@ -206,6 +214,14 @@ public final class Format2RecordStore: @unchecked Sendable {
             for statement in Self.clientDDL(documentId: docId) {
                 try connection.executeScript(statement)
             }
+            // #3688 — the member index `_record_id` moved forward in. Created
+            // under a NEW name above (an `IF NOT EXISTS` under the old one is a
+            // silent no-op on a database that already has it), so the old one
+            // is dropped here. Per document, so another document's index is
+            // never touched, and a no-op on a database that never had it.
+            try connection.executeScript(
+                "DROP INDEX IF EXISTS idx_\(tables.stringSetIndex)_tfr"
+            )
             try connection.execute(
                 "INSERT OR IGNORE INTO _epoch (doc_id, epoch, acked_seq) VALUES (?, 0, 0)",
                 [.text(docId)]

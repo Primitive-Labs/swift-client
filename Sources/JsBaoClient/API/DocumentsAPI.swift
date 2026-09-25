@@ -89,7 +89,14 @@ public final class DocumentsAPI: @unchecked Sendable {
     public func create(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> CreateDocumentResult {
         guard let client else {
             // No client to route through (tests / isolated construction):
-            // fall back to the direct server POST.
+            // fall back to the direct server POST. This door touches no local
+            // state, so the manager's guard never runs for it — and the server
+            // does not read `localOnly` at all, so without this line a caller
+            // asking for a local-only large document here would get a server
+            // document that is not local-only, silently. One rule, every door.
+            try assertDocumentFormatAllowsLocalOnly(
+                documentFormat: options.documentFormat, localOnly: options.localOnly
+            )
             return try await transport.request(method: .post, path: "/documents", body: options)
         }
 

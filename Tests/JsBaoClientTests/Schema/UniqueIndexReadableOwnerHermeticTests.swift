@@ -429,4 +429,54 @@ final class UniqueIndexReadableOwnerHermeticTests: XCTestCase {
                        "the row the constraint cited is the row the query returns")
         XCTAssertEqual(model.find(id: "r1")?["name"], .string("B"))
     }
+
+    // MARK: - #3120: the acceptance check is not JS-only
+
+    /// #3120 (carried from #3095): a plain field patch of the row that
+    /// *survived* a duplicate race, while the entry for its key names the
+    /// removed loser. The Swift client failed this on the same document the
+    /// JS client did, so the repro is pinned on both platforms; the patch
+    /// lands and the entry is rewritten to the survivor.
+    func testPatchOfSurvivingRowBehindAGhostEntryLands() throws {
+        let (doc, model) = makeModel()
+        _ = try model.create(id: "r1", values: [
+            "mainDocumentId": .id("doc-B"), "name": .string("one"),
+        ])
+        writeStaleIndexEntry(doc: doc, key: "doc-B", owner: "removed-loser")
+
+        XCTAssertNoThrow(try model.update(id: "r1", values: ["name": .string("two")]))
+
+        XCTAssertEqual(indexOwner(doc: doc, key: "doc-B"), "r1",
+                       "the write heals the entry onto the row that holds the key")
+        XCTAssertEqual(model.find(id: "r1")?["name"], .string("two"))
+    }
+
+    /// #3120: deleting an id the document no longer holds a record for
+    /// clears every entry naming that id — including one filed under a key
+    /// the record never held, which no key-derived cleanup can reach. This
+    /// is the repair `primitive documents records delete` performs
+    /// server-side, and the reason the key becomes writable again.
+    func testDeletingAVanishedRecordClearsEveryEntryNamingIt() throws {
+        let (doc, model) = makeModel()
+        _ = try model.create(id: "r1", values: [
+            "mainDocumentId": .id("doc-B"), "name": .string("one"),
+        ])
+        writeStaleIndexEntry(doc: doc, key: "doc-drifted", owner: "r1")
+        // The record goes; both entries still name it.
+        doc.transactSync { [schema] txn in
+            let root = txn.transactionGetOrInsertMap(name: schema.name)
+            _ = try? root.remove(tx: txn, key: "r1")
+        }
+        XCTAssertNil(model.find(id: "r1"), "precondition: the record is gone")
+        XCTAssertEqual(indexOwner(doc: doc, key: "doc-B"), "r1")
+
+        model.delete(id: "r1")
+
+        XCTAssertNil(indexOwner(doc: doc, key: "doc-B"))
+        XCTAssertNil(indexOwner(doc: doc, key: "doc-drifted"))
+        XCTAssertNoThrow(
+            try model.create(id: "r2", values: ["mainDocumentId": .id("doc-B")])
+        )
+        XCTAssertEqual(indexOwner(doc: doc, key: "doc-B"), "r2")
+    }
 }

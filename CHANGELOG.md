@@ -20,6 +20,62 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### `DocumentWriteRefusedEvent` now fires for EVERY refused write (#3758)
+
+Past a large document's offline write window, the verbs that cannot throw —
+`delete(id:)`, a `PrimitiveRecord` field setter, an explicit clear — emitted
+`DocumentWriteRefusedEvent` and the ones that can throw were silent on that
+channel. The JavaScript client, where every verb throws, had no such channel
+at all, so one rule had two designs and an app running both clients handled
+the refusal twice.
+
+One rule now, on both clients: **every** local write the window refuses raises
+`DocumentWriteRefusedEvent` (`document:write-refused`), and a verb that can
+throw throws the same error as well.
+
+- `create`, `update`, `save`, `upsert`, `addStringsetMember` and
+  `removeStringsetMember` now raise the event in addition to throwing
+  `JsBaoError(.documentOfflineWindowExpired)`. **An app already subscribed to
+  `DocumentWriteRefusedEvent` will start hearing about writes it also catches
+  at the call site** — that is the one behaviour an existing app can notice.
+  The payload, the error and the thrown code are unchanged.
+- The refusal is captured at the write path's gate, the single boundary every
+  door runs through, so it is reported exactly once per refused write.
+  `Format2ModelDelegate.quietly` no longer reports; it only swallows.
+- The event is delivered after the document's outermost operation has released
+  its lock, never under it, so a handler may read any document — including the
+  refusing one. Subscribers run synchronously inside `emit`, so before this a
+  report delivered at the gate would have run application code under the
+  document's lock.
+
+Ordinary (format 1) documents are unchanged: they have no offline window and
+raise nothing.
+
+### Fixed: a large document can no longer be created local-only (#3759)
+
+`createDocument(CreateDocumentOptions(localOnly: true, documentFormat: 2))`
+used to succeed. It wrote a local metadata row naming both, never committed
+it, and the failure surfaced later at open — far from the call that caused it.
+A large document's records live in a store the server's room opens, which a
+local-only document never reaches, so the combination is not a document that
+syncs late: it is one that can never work.
+
+**A create that used to succeed now throws.** The combination raises
+`JsBaoError(code: .localOnlyUnsupportedOption)` — `LOCAL_ONLY_UNSUPPORTED_OPTION`
+on the wire, the code and the message the JavaScript client has always used —
+before any local state is written: no metadata row, no pending create, no
+local-only classification, no `DocumentMetadataChangedEvent`. Every door
+refuses it the same way: `client.createDocument`, `client.documents.create`,
+`DocumentManager.createLocalDocument`, and `DocumentsAPI.create` constructed
+without an owning client, which used to post the option to a server that does
+not read it.
+
+If you have an app passing both, drop `localOnly` to keep the large document
+or drop `documentFormat` to keep the local-only one. Everything else is
+unchanged: `localOnly: true` on its own, `localOnly: true` with
+`documentFormat: 1`, and `documentFormat: 2` on a document that syncs all
+create exactly as before. See `docs/large-documents.md`.
+
 ### Fixed: `functions.waitFor` no longer calls a live run missing (#3661)
 
 `waitFor(runId:)` called straight after `functions.start` could throw

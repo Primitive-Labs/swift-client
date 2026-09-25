@@ -57,19 +57,26 @@ public struct ExecutePromptResult: Decodable, Sendable, Equatable {
         /// neither headline number says how much of the decode was
         /// deliberation. `nil` when the provider reports none.
         public let reasoningTokens: Double?
+        /// #3626 — what this call cost, in USD, as the provider reported it.
+        /// A decisions model's whole case is economic, so a result reporting
+        /// tokens and not price would leave the one number the decision turns
+        /// on unreadable. `nil` when the provider reports none.
+        public let cost: Double?
 
         public init(
             durationMs: Double,
             inputTokens: Double? = nil,
             outputTokens: Double? = nil,
             totalTokens: Double? = nil,
-            reasoningTokens: Double? = nil
+            reasoningTokens: Double? = nil,
+            cost: Double? = nil
         ) {
             self.durationMs = durationMs
             self.inputTokens = inputTokens
             self.outputTokens = outputTokens
             self.totalTokens = totalTokens
             self.reasoningTokens = reasoningTokens
+            self.cost = cost
         }
     }
 

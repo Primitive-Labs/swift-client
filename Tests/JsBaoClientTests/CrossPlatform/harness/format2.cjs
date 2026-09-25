@@ -98,10 +98,13 @@ async function readStdin() {
 }
 
 /**
- * The `OverlaySql` shape `projectOverlayEntry` and `Format2RecordStore` want,
- * over a better-sqlite3 handle. `exec` returns an iterable of rows for a
+ * The `Format2StoreSql` shape `projectOverlayEntry` and `Format2RecordStore`
+ * want, over a better-sqlite3 handle. `exec` returns an iterable of rows for a
  * SELECT and an empty array otherwise — which is exactly Cloudflare's
- * `SqlStorage.exec` contract as those modules use it.
+ * `SqlStorage.exec` contract as those modules use it — and `transaction` runs a
+ * set of statements as one commit, which is what the store's atomic writes are
+ * (the epoch mark and the judgement it owes, a local write's row and its
+ * pending op).
  */
 function sqlHost(db) {
   return {
@@ -110,6 +113,12 @@ function sqlHost(db) {
       if (statement.reader) return statement.all(...bindings);
       statement.run(...bindings);
       return [];
+    },
+    transaction(fn) {
+      // Nested calls reuse the open transaction rather than failing on a
+      // nested BEGIN, as every other host of this store does.
+      if (db.inTransaction) return fn();
+      return db.transaction(fn)();
     },
   };
 }

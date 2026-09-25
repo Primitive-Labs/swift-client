@@ -71,6 +71,36 @@ final class Format2RecordStoreHermeticTests: XCTestCase {
                 mine[name],
                 "Swift created no object named \(name); it created \(mine.keys.sorted())"
             )
+            if name == "_deferred_replay" {
+                // The ONE object the two clients deliberately disagree about
+                // (#3755, decision D1). js-bao keys the note by
+                // `(doc_id, client_id)` because its tabs share one record
+                // store and sequence spaces are per client (#3431): a note
+                // keyed by document alone would be overwritten by the second
+                // tab, and a restarted tab would read a live sibling's
+                // `through_seq` against its own sequences. Swift has one
+                // client per instance and keeps Swift's key.
+                //
+                // So the COLUMNS are compared and the key is not. Adding
+                // `client_id` to Swift's table is filed rather than done here:
+                // it is a Swift source change with no Swift behavior behind it
+                // yet.
+                XCTAssertEqual(
+                    Self.columnTypes(Self.normalize(actual)),
+                    Self.columnTypes(Self.normalize(expected))
+                        .filter { $0.key != "client_id" },
+                    "the deferred-replay note's columns differ by more than its key"
+                )
+                XCTAssertTrue(
+                    Self.normalize(expected).contains("PRIMARY KEY (doc_id, client_id)"),
+                    "js-bao's note is expected to be keyed by document AND client"
+                )
+                XCTAssertTrue(
+                    Self.normalize(actual).contains("doc_id TEXT PRIMARY KEY"),
+                    "Swift's note is expected to be keyed by document alone"
+                )
+                continue
+            }
             XCTAssertEqual(
                 Self.normalize(actual), Self.normalize(expected),
                 "SQL differs for \(name)"
@@ -83,16 +113,12 @@ final class Format2RecordStoreHermeticTests: XCTestCase {
         // `kv_store` is the storage provider's own table, and its presence is
         // the point — the record store shares the provider's one connection
         // rather than opening a second handle on the same WAL file.
-        // `_deferred_replay` is the judgement an epoch move owes and has not
-        // run (#3437, finding 3437-SO-03): the JS client holds that debt IN
-        // MEMORY (`format2HoldReplay`), so a restart between the move and the
-        // judgement restores the owed writes there by the key rule alone and
-        // publishes one recency would have dropped. Swift closes that window
-        // durably; the JS half is recorded for the reflection, so this table
-        // is a deliberate divergence and not drift.
+        // `_deferred_replay` is no longer among them: js-bao carries the same
+        // table since #3755, so the judgement an epoch move owes is durable on
+        // both clients and the two differ only by the key compared above.
         let extra = Set(mine.keys).subtracting(theirs.compactMap { $0["name"] as? String })
         XCTAssertEqual(
-            extra, ["_query_projection", "kv_store", "_deferred_replay"],
+            extra, ["_query_projection", "kv_store"],
             "Swift added schema objects js-bao does not have"
         )
     }
@@ -390,6 +416,103 @@ final class Format2RecordStoreHermeticTests: XCTestCase {
         )
     }
 
+    // MARK: - #3688 — the per-record member delete's index
+
+    /// The vehicle, before anything is asked of it: `EXPLAIN QUERY PLAN` is an
+    /// ordinary statement through the same `query` path every case here uses,
+    /// but no Swift suite has run one before, so it is smoked first.
+    func testExplainQueryPlanAnswersThroughTheStoreConnection() async throws {
+        let provider = try await makeProvider()
+        let store = Format2RecordStore(
+            host: provider, documentId: "doc1", clientId: "harness-client"
+        )
+        try store.initialize()
+
+        let plan = try provider.withConnection { connection in
+            try connection.query(
+                "EXPLAIN QUERY PLAN SELECT _id FROM \(store.tableNames.records) WHERE _type = ?",
+                [.text("Note")]
+            )
+        }
+        XCTAssertFalse(plan.isEmpty, "EXPLAIN QUERY PLAN returned no rows")
+        XCTAssertNotNil(plan.first?["detail"].stringValue, "no `detail` column")
+    }
+
+    /// The fold's own member delete, explained through the store's connection.
+    func testTheFoldsMemberDeletePlansThroughTheRecordIdIndex() async throws {
+        let provider = try await makeProvider()
+        let store = Format2RecordStore(
+            host: provider, documentId: "doc1", clientId: "harness-client"
+        )
+        try store.initialize()
+        let members = store.tableNames.stringSetIndex
+        let statement = OverlayFold.Statements(tables: store.tableNames).deleteAllMembers
+
+        let detail = try provider.withConnection { connection in
+            try connection.query(
+                "EXPLAIN QUERY PLAN \(statement)", [.text("Note"), .text("r1")]
+            )
+        }
+        .compactMap { $0["detail"].stringValue }
+        .joined(separator: " | ")
+
+        // Name and `SEARCH`, not an exact string: the wording is a property of
+        // the SQLite the device links (edge E8).
+        XCTAssertTrue(detail.contains("SEARCH"), detail)
+        XCTAssertTrue(detail.contains("idx_\(members)_trf"), detail)
+    }
+
+    /// A database the previous build wrote picks the new index up on open.
+    func testInitializeReplacesTheRetiredMemberIndex() async throws {
+        let provider = try await makeProvider()
+        let store = Format2RecordStore(
+            host: provider, documentId: "doc1", clientId: "harness-client"
+        )
+        let other = Format2RecordStore(
+            host: provider, documentId: "doc2", clientId: "harness-client"
+        )
+        try store.initialize()
+        try other.initialize()
+        let members = store.tableNames.stringSetIndex
+        let otherMembers = other.tableNames.stringSetIndex
+
+        // What the build before this one left on disk, for both documents.
+        try provider.withConnection { connection in
+            for table in [members, otherMembers] {
+                try connection.executeScript("DROP INDEX IF EXISTS idx_\(table)_trf")
+                try connection.executeScript(
+                    "CREATE INDEX IF NOT EXISTS idx_\(table)_tfr "
+                        + "ON \(table)(_type, field, _record_id)"
+                )
+            }
+        }
+        XCTAssertNotNil(try store.schemaObjects()["idx_\(members)_tfr"])
+
+        try store.initialize()
+
+        XCTAssertNotNil(
+            try store.schemaObjects()["idx_\(members)_trf"],
+            "the new index was not created"
+        )
+        XCTAssertNil(
+            try store.schemaObjects()["idx_\(members)_tfr"],
+            "the retired index survived the open"
+        )
+        // The name is per document: opening one never drops another's.
+        XCTAssertNotNil(
+            try store.schemaObjects()["idx_\(otherMembers)_tfr"],
+            "another document's index was dropped"
+        )
+
+        // Idempotent: a second open changes nothing.
+        let after = try store.schemaObjects()
+        try store.initialize()
+        XCTAssertEqual(
+            Set(try store.schemaObjects().keys), Set(after.keys),
+            "a second initialize changed the schema"
+        )
+    }
+
     // MARK: - Helpers
 
     /// A scripted sequence covering every fold shape that has been a source of
@@ -549,5 +672,31 @@ final class Format2RecordStoreHermeticTests: XCTestCase {
         sql.components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+    }
+
+    /// Column name → declared type, from a normalized `CREATE TABLE`.
+    ///
+    /// Used where two clients keep one table under different KEYS and the claim
+    /// is about its columns: comparing the whole statement would fail on the
+    /// key, and comparing nothing would let a column drift unnoticed.
+    private static func columnTypes(_ sql: String) -> [String: String] {
+        guard
+            let open = sql.firstIndex(of: "("),
+            let close = sql.lastIndex(of: ")")
+        else { return [:] }
+        var types: [String: String] = [:]
+        for part in sql[sql.index(after: open)..<close].components(separatedBy: ",") {
+            let words = part
+                .components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+            guard words.count >= 2 else { continue }
+            // A table constraint rather than a column: `PRIMARY KEY (...)`,
+            // `UNIQUE(...)`. Those live in the key claim, not here.
+            if words[0].uppercased() == "PRIMARY" || words[0].uppercased() == "UNIQUE" {
+                continue
+            }
+            types[words[0]] = words[1].uppercased()
+        }
+        return types
     }
 }

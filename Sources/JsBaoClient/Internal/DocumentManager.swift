@@ -2374,6 +2374,16 @@ public final class DocumentManager: @unchecked Sendable {
         docMetadata: JSONValue? = nil,
         documentFormat: Int? = nil
     ) async throws -> LocalMetadataEntry {
+        // The one combination that can never work, refused before anything
+        // moves: no entry built, no lock taken, no classification registered,
+        // no row persisted, no event emitted. This is the only writer of a
+        // create's local state, so guarding it here covers
+        // `JsBaoClient.createDocument`, `documents.create` with a wired client
+        // and every direct caller at once.
+        try assertDocumentFormatAllowsLocalOnly(
+            documentFormat: documentFormat, localOnly: localOnly
+        )
+
         var metadata = LocalMetadataEntry(documentId: documentId)
         metadata.title = title
         metadata.tags = tags

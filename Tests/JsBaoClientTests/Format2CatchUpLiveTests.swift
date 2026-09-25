@@ -503,7 +503,9 @@ final class Format2CatchUpLiveTests: XCTestCase {
             DocumentWriteRefusedEvent.self
         ) { event in refusals.withValue { $0.append(event) } }
 
-        // A throwing door.
+        // A throwing door: it throws AND reports (#3758). One rule on both
+        // clients — the event is every refused write's channel, so an app
+        // handles the refusal once rather than at each call site.
         XCTAssertThrowsError(
             try note.create(id: "refused", values: ["title": .string("past the window")])
         ) { error in
@@ -512,13 +514,17 @@ final class Format2CatchUpLiveTests: XCTestCase {
                 "a create past the window throws the typed error"
             )
         }
-        // And a non-throwing one, which reports through the event instead.
+        // And a non-throwing one, which has only the event.
         note.delete(id: "before")
-        XCTAssertEqual(refusals.value.count, 1, "refusals: \(refusals.value)")
-        XCTAssertEqual(refusals.value.first?.recordId, "before")
+        XCTAssertEqual(refusals.value.count, 2, "refusals: \(refusals.value)")
         XCTAssertEqual(
-            refusals.value.first?.error.code, .documentOfflineWindowExpired
+            refusals.value.map { $0.recordId }, ["refused", "before"],
+            "each refusal names its own record, in the order they were made"
         )
+        for refusal in refusals.value {
+            XCTAssertEqual(refusal.error.code, .documentOfflineWindowExpired)
+            XCTAssertEqual(refusal.documentId, binding.documentId)
+        }
         XCTAssertNotNil(
             note.find(id: "before"),
             "a refused delete leaves the record where it was"

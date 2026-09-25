@@ -597,12 +597,21 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// the lock (the lock guards `db`, and we're operating on read
     /// queries through `executeQuery` inside `getColumnNames` which
     /// runs under the caller's lock already).
+    ///
+    /// `sortFields`, when given, names the fields cursors are minted from. Any
+    /// of them an inclusion projection omits is additionally selected under the
+    /// internal `_cursor:` alias (#3228) so the cursor carries the row's real
+    /// value rather than a false null; `queryPaged` strips those columns from
+    /// the rows it returns, so response shapes are unchanged. The fields that
+    /// got that treatment come back alongside the column list, so the callers
+    /// fold and strip exactly the columns this SELECT added.
     private func buildSelectColumnList(
         tableName: String,
         projection: [String: Int]?,
-        stringsetFields: Set<String>
-    ) throws -> String {
-        guard let projection, !projection.isEmpty else { return "*" }
+        stringsetFields: Set<String>,
+        sortFields: [String] = []
+    ) throws -> (columns: String, aliasedSortFields: [String]) {
+        guard let projection, !projection.isEmpty else { return ("*", []) }
         // Validate: no mixed include + exclude. js-bao THROWS here
         // (DocumentQueryTranslator.ts: InvalidOperatorError "Cannot mix
         // inclusion and exclusion in projection"); a precondition crash
@@ -649,7 +658,21 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         _ = stringsetFields // stringsets don't appear in SELECT either way
 
         // Deterministic column order for readable SQL.
-        return selected.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
+        var columns = selected.sorted().map { "\"\($0)\"" }
+
+        // A sort field the projection leaves out, selected internally so the
+        // cursor can carry its real value (#3228). Stringsets have no
+        // main-table column, so they are skipped the way the projection is.
+        var aliased: [String] = []
+        for field in sortFields.sorted() where !selected.contains(field) {
+            guard tableCols.contains(field) else { continue }
+            guard !stringsetFields.contains(field) else { continue }
+            aliased.append(field)
+            columns.append(
+                "\"\(field)\" AS \"\(CursorManager.sortValueAlias(field))\""
+            )
+        }
+        return (columns.joined(separator: ", "), aliased)
     }
 
     /// After a main-table SELECT, fill each row's stringset fields
@@ -822,10 +845,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // instead of being swallowed into `[]`, matching js-bao, which
         // throws on the same bad input.
         let tableName = sanitizedTableName(modelName)
+        var aliasedSortFields: [String] = []
         var rows: [[String: JSONValue]] = try {
             lock.lock()
             defer { lock.unlock() }
-            let (sql, params) = try buildSelectSQL(
+            let built = try buildSelectSQL(
                 tableName: tableName,
                 modelName: modelName,
                 filter: filter,
@@ -833,14 +857,22 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 scopedToDocId: scopedToDocId,
                 stringsetFields: stringsetFields
             )
-            return try executeQuery(sql, params: params)
+            aliasedSortFields = built.aliasedSortFields
+            return try executeQuery(built.sql, params: built.params)
         }()
         populateStringsets(
             rows: &rows, modelName: modelName,
             stringsetFields: stringsetFields,
             projection: options?.projection
         )
-        return rows
+        // The unpaginated read mints no cursors, so the internal sort-value
+        // aliases (#3228) are of no use to it — strip them so its rows carry
+        // exactly the columns the projection asked for, as before.
+        return rows.map {
+            CursorManager.stripSortValueAliases(
+                $0, aliasedSortFields: aliasedSortFields
+            )
+        }
     }
 
     /// Paginated variant of `query`. Returns a `PaginatedResult` with
@@ -876,10 +908,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         queryOptionsWithOverLimit.limit = limit.map { $0 + 1 }
         // Scope the lock to just the base SELECT. Stringset population
         // reacquires the lock (see `query()`).
+        var aliasedSortFields: [String] = []
         var rows: [[String: JSONValue]] = try {
             lock.lock()
             defer { lock.unlock() }
-            let (sql, params) = try buildSelectSQL(
+            let built = try buildSelectSQL(
                 tableName: tableName,
                 modelName: modelName,
                 filter: filter,
@@ -887,7 +920,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 scopedToDocId: scopedToDocId,
                 stringsetFields: stringsetFields
             )
-            return try executeQuery(sql, params: params)
+            aliasedSortFields = built.aliasedSortFields
+            return try executeQuery(built.sql, params: built.params)
         }()
         populateStringsets(
             rows: &rows, modelName: modelName,
@@ -903,13 +937,23 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             return false
         }()
         let isFirstPage = options?.cursor == nil
+        // Minted from the rows as they came back, including any sort value the
+        // SELECT carried under an internal alias for a field the projection
+        // omits (#3228); the aliases are stripped immediately afterwards so the
+        // rows the caller sees are unchanged.
         let (next, prev) = try CursorManager.generateResultCursors(
             rows: rows,
             sortFields: resolved.fields,
             direction: options?.direction ?? .forward,
             hasMore: hasMore,
-            isFirstPage: isFirstPage
+            isFirstPage: isFirstPage,
+            aliasedSortFields: aliasedSortFields
         )
+        rows = rows.map {
+            CursorManager.stripSortValueAliases(
+                $0, aliasedSortFields: aliasedSortFields
+            )
+        }
         // D8 (#1607) — backward pages are fetched nearest-to-cursor first
         // (`buildSelectSQL` reverses each ORDER BY direction for backward),
         // so return them in declared order: callers always see the page in
@@ -979,17 +1023,21 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         options: QueryOptions?,
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = []
-    ) throws -> (String, [Any]) {
+    ) throws -> (sql: String, params: [Any], aliasedSortFields: [String]) {
         // Projection: build an explicit column list when the caller
         // specified one. Stringset fields don't live on the main
         // table — include-mode skips them here (they're populated
         // post-query by `populateStringsets`). The existing columns
         // path below looks at table schema to fold in id and
         // _meta_doc_id even when the caller doesn't list them.
-        let selectList = try buildSelectColumnList(
+        // The sort fields go with it so a field an inclusion projection omits is
+        // still selected internally for cursor minting (#3228); which ones got
+        // that treatment is reported back to the caller.
+        let (selectList, aliasedSortFields) = try buildSelectColumnList(
             tableName: tableName,
             projection: options?.projection,
-            stringsetFields: stringsetFields
+            stringsetFields: stringsetFields,
+            sortFields: resolveSort(options: options).fields
         )
         var sql = "SELECT \(selectList) FROM \"\(tableName)\""
         var params: [Any] = []
@@ -1062,7 +1110,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // engine emits LIMIT without OFFSET and callers page with
         // `cursor` + `direction`.
         sql += " \(QueryTranslator.buildLimitOffset(limit: options?.limit, offset: nil))"
-        return (sql, params)
+        return (sql, params, aliasedSortFields)
     }
 
     /// Count records matching a filter. `scopedToDocId` restricts to

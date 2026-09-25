@@ -57,6 +57,56 @@ public final class Format2WritePath: @unchecked Sendable {
     /// is the fold queue, which is synchronous too.
     private let operationLock = NSRecursiveLock()
 
+    /// Told when this document refused a local write because it is past its
+    /// offline window (#3758). Set by `Format2DocumentBinding` at bind.
+    ///
+    /// The report lives HERE, at the gate, because this is the one place every
+    /// door runs through — the throwing model verbs, the member verbs, and the
+    /// ones that cannot throw. Reporting from each caller's catch instead
+    /// would be six copies of one rule.
+    var onWindowRefused: (@Sendable (DocumentWriteRefusedEvent) -> Void)?
+
+    /// Where refusals wait while the calling thread still holds an operation
+    /// on this document.
+    ///
+    /// The callback is application code: `EventEmitter` delivers callback
+    /// subscribers synchronously inside `emit`, and a `nextEvent` predicate
+    /// runs inline in that callback, so a handler reading a document whose
+    /// folds are queued behind another operation's held lock could deadlock
+    /// two concurrent refusals (3758-SO-01). The model already runs its own
+    /// listeners after releasing the lock for the same reason, and today's
+    /// report — through `quietly` — arrives after the operation has unwound.
+    /// So the event is parked here and delivered by the outermost
+    /// `withOperation` exit, AFTER the unlock, whether the body returned or
+    /// threw.
+    ///
+    /// A LIST, not one slot: an operation body that catches a refusal and
+    /// writes again can refuse twice, and each refused write is owed its own
+    /// report. Holding the last one only would report one write and silently
+    /// drop the other (finding 3758-C01).
+    private let parkedRefusalKey: String
+
+    /// The refusals one thread is holding, in the order they were refused.
+    ///
+    /// A class so the gate can append to what is already parked without
+    /// putting a fresh value back through the thread dictionary on every
+    /// refusal.
+    private final class ParkedRefusals {
+        var events: [DocumentWriteRefusedEvent] = []
+    }
+
+    /// Whether the CALLING thread is holding a refusal that has not been
+    /// delivered yet. For the tests that assert the timing; nothing in the
+    /// client branches on it.
+    var hasParkedRefusal: Bool { parkedRefusalCount > 0 }
+
+    /// How many refusals the CALLING thread is holding undelivered. For the
+    /// tests; nothing in the client branches on it.
+    var parkedRefusalCount: Int {
+        (Thread.current.threadDictionary[parkedRefusalKey] as? ParkedRefusals)?
+            .events.count ?? 0
+    }
+
     /// Where this document's operation depth is recorded for the CALLING
     /// thread. The lock says "somebody is inside an operation"; this says
     /// "*you* are", which is what a read has to know before it waits on the
@@ -73,6 +123,8 @@ public final class Format2WritePath: @unchecked Sendable {
         self._observer = observer
         self.operationDepthKey =
             "format2.operation.\(store.documentId).\(ObjectIdentifier(store).hashValue)"
+        self.parkedRefusalKey =
+            "format2.refusal.\(store.documentId).\(ObjectIdentifier(store).hashValue)"
     }
 
     /// Commit and publish one mutation.
@@ -96,7 +148,11 @@ public final class Format2WritePath: @unchecked Sendable {
         // commit boundary below is the one that MATTERS — every door runs
         // through it — but a document that is read-only should not have to
         // queue behind a fold to be told so.
-        try assertWithinOfflineWindow()
+        //
+        // Refusing HERE means the commit gate is never reached, so exactly one
+        // report is made per refused write however this door was entered
+        // (#3758, edge E1).
+        try assertWithinOfflineWindow(model: model, recordId: mutation.id)
         return try withOperation {
             try commitInsideOperation(
                 model: model, mutation: mutation, fields: fields, at: now
@@ -116,13 +172,52 @@ public final class Format2WritePath: @unchecked Sendable {
     /// server-corrected one a pending op is stamped with: the mark it is
     /// compared against was written from the same uncorrected clock, and
     /// mixing the two would offset the boundary by the measured skew.
-    func assertWithinOfflineWindow(at now: Int? = nil) throws {
+    /// - Parameters:
+    ///   - model: the model the refused write is on, for the report.
+    ///   - recordId: the record it is on, for the report.
+    func assertWithinOfflineWindow(
+        model: String, recordId: String, at now: Int? = nil
+    ) throws {
         let at = now ?? Int(Date().timeIntervalSince1970 * 1000)
         let status = store.offlineWindowStatus(now: at)
         guard !status.writable else { return }
-        throw Format2OfflineWindow.expired(
+        let error = Format2OfflineWindow.expired(
             documentId: store.documentId, status: status
         )
+        // #3758 — reported for EVERY refused write, whether or not this door
+        // can throw. Parked while an operation is held, because the callback
+        // runs application code on this thread and must never do so under the
+        // document's lock (3758-SO-01).
+        let event = DocumentWriteRefusedEvent(
+            documentId: store.documentId,
+            model: model,
+            recordId: recordId,
+            error: error
+        )
+        if isInsideOperation {
+            let dictionary = Thread.current.threadDictionary
+            let parked =
+                (dictionary[parkedRefusalKey] as? ParkedRefusals) ?? ParkedRefusals()
+            parked.events.append(event)
+            dictionary[parkedRefusalKey] = parked
+        } else {
+            onWindowRefused?(event)
+        }
+        throw error
+    }
+
+    /// Hand back every refusal the calling thread has parked, in the order
+    /// they were refused, and clear the slot.
+    ///
+    /// Cleared BEFORE the callbacks run, so a handler that itself writes to
+    /// this document and is refused parks a fresh event rather than finding
+    /// the ones being delivered (edge E10).
+    private func takeParkedRefusals() -> [DocumentWriteRefusedEvent] {
+        let dictionary = Thread.current.threadDictionary
+        guard let parked = dictionary[parkedRefusalKey] as? ParkedRefusals
+        else { return [] }
+        dictionary.removeObject(forKey: parkedRefusalKey)
+        return parked.events
     }
 
     // MARK: - Stopped
@@ -162,6 +257,18 @@ public final class Format2WritePath: @unchecked Sendable {
                 dictionary[operationDepthKey] = depth
             }
             operationLock.unlock()
+            // AFTER the unlock, and only on the OUTERMOST exit: every refusal
+            // parked by the gate is delivered here, so the callback — which
+            // is application code and may read any document — never runs
+            // under this document's operation lock (#3758, 3758-SO-01).
+            // On the way out of a body that threw as well: the write was
+            // refused either way, and a later error does not unrefuse it.
+            // Every one of them, in the order they were refused: a body that
+            // caught one refusal and wrote again owes a report for each
+            // (finding 3758-C01).
+            if depth == 0 {
+                for event in takeParkedRefusals() { onWindowRefused?(event) }
+            }
         }
         return try body()
     }
@@ -214,7 +321,7 @@ public final class Format2WritePath: @unchecked Sendable {
         // write that replays later. Here rather than in `write` alone because
         // `addMember` and `removeMember` reach this boundary directly
         // (finding 3437-SO-07); every door this document has runs through it.
-        try assertWithinOfflineWindow()
+        try assertWithinOfflineWindow(model: model, recordId: mutation.id)
 
         // (1) What the overlay held for the keys this write is about to touch.
         // Taken before the commit and before the publish, so it describes the

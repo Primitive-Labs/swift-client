@@ -174,9 +174,11 @@ public enum JsBaoEvent: String, Sendable {
     /// How a large document's base snapshot load is going (#3436). Mirrors the
     /// JS client's `document:snapshot-load`.
     case documentSnapshotLoad = "document:snapshot-load"
-    /// A local mutation on a large document was refused and the verb that made
-    /// it cannot throw (#3437). The only channel `delete(id:)` and the record
-    /// field setters have.
+    /// Every refused write on a large document past its offline window
+    /// (#3758). Raised for EVERY door — `create`, `update`, `save`, `upsert`,
+    /// the string-set verbs, `delete(id:)` and the record field setters — and
+    /// the doors that can throw throw the same error as well. The JS client's
+    /// `document:write-refused`, by that name.
     case documentWriteRefused = "document:write-refused"
     /// A large document that was away replayed what it wrote offline and some
     /// of it did not simply apply (#3437, behavior 20). The JS client's
@@ -793,12 +795,17 @@ public struct DocumentOpenedEvent: Sendable {
 /// A local mutation on a large document that was refused, reported through
 /// the one channel a non-throwing verb has (#3437, behavior 2a).
 ///
-/// `DynamicModel.delete(id:)` is declared without `throws`, as are a
-/// `PrimitiveRecord` field assignment and an explicit clear: they swallow the
-/// write path's error, so before this there was no way for an application to
-/// tell a refused mutation from a completed one. Adding a throwing form of
-/// those verbs would break every existing caller, so the event is the
-/// compatible channel and the throwing verbs keep throwing.
+/// Raised for EVERY refused write, not only for the verbs that cannot throw
+/// (#3758). `DynamicModel.delete(id:)` is declared without `throws`, as are a
+/// `PrimitiveRecord` field assignment and an explicit clear, so for those the
+/// event is the only channel there is; `create`, `update`, `save`, `upsert`,
+/// `addMember` and `removeMember` throw the same error AND raise this, so an
+/// app handles the refusal once instead of at each call site. It is one rule
+/// with the JS client, where the same event fires under the same name.
+///
+/// Delivered after the document's operation lock has been released, so a
+/// handler may read any document — including the refusing one — without
+/// deadlocking against the write it is being told about.
 ///
 /// Only ever emitted for a LARGE document: an ordinary document has no
 /// offline window and no refusal to report.

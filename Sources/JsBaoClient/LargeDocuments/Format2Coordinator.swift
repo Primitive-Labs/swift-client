@@ -144,6 +144,13 @@ public final class Format2Coordinator: @unchecked Sendable {
         binding.onWriteRefused = { [weak self] event in
             self?.onWriteRefused?(event)
         }
+        // The report is the GATE's (#3758): `Format2WritePath` is the one
+        // place every door runs through, so it is what knows a write was
+        // refused — and it delivers the event once the document's operation
+        // lock is released, never under it.
+        binding.writePath.onWindowRefused = { [weak binding] event in
+            binding?.reportWriteRefused(event)
+        }
         binding.withholdOwed = { [weak self] through in
             self?.outbound.withhold(documentId, upTo: through)
         }
@@ -2909,14 +2916,12 @@ public final class Format2DocumentBinding: @unchecked Sendable {
     /// The log line is the operator's half (principle 8): an application that
     /// subscribes to nothing still leaves a trace of why its write did not
     /// happen.
-    func reportWriteRefused(model: String, recordId: String, error: JsBaoError) {
+    func reportWriteRefused(_ event: DocumentWriteRefusedEvent) {
         logger?.warn(
             "[format2] write refused: past the offline window —", documentId,
-            model, recordId, error.code.rawValue
+            event.model, event.recordId, event.error.code.rawValue
         )
-        onWriteRefused?(DocumentWriteRefusedEvent(
-            documentId: documentId, model: model, recordId: recordId, error: error
-        ))
+        onWriteRefused?(event)
     }
 
     /// Whether the document is stopped pending a reload from a covering base.
