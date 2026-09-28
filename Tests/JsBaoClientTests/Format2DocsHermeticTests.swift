@@ -319,6 +319,66 @@ final class Format2DocsHermeticTests: XCTestCase {
         }
     }
 
+    // MARK: - #3757 — the alias create options
+
+    /// The page names both alias option types and the two rules an app cannot
+    /// infer from the option's presence: that a stated format is CHECKED
+    /// against an existing binding, and that a body key the route does not read
+    /// is refused rather than ignored.
+    func testThePageDocumentsTheAliasCreateOptions() throws {
+        let page = try read("docs/large-documents.md")
+        let names = [
+            "CreateWithAliasOptions",
+            "GetOrCreateWithAliasOptions",
+            "DOCUMENT_FORMAT_MISMATCH",
+            "VALIDATION_FAILED",
+        ]
+        for name in names {
+            XCTAssertTrue(
+                page.contains(name),
+                "docs/large-documents.md does not mention `\(name)`"
+            )
+        }
+    }
+
+    func testTheChangelogRecordsTheAliasCreateOptions() throws {
+        let changelog = try read("CHANGELOG.md")
+        let unreleased = try XCTUnwrap(
+            changelog.range(of: "## Unreleased").map { String(changelog[$0.lowerBound...]) }
+        )
+        // Anchored on the entry's OWN heading, per #3437's lesson: a later entry
+        // that merely cites #3757 in its prose would otherwise take the slice.
+        let heading = try XCTUnwrap(
+            unreleased
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .first(where: { $0.hasPrefix("### ") && $0.contains("#3757") }),
+            "the changelog has no #3757 entry in the Unreleased section"
+        )
+        XCTAssertFalse(heading.isEmpty)
+        let entry = try XCTUnwrap(
+            unreleased.range(of: String(heading)).map { String(unreleased[$0.lowerBound...]) }
+        )
+        let end = entry.range(of: "\n### ", range: entry.index(entry.startIndex, offsetBy: 4)..<entry.endIndex)
+        let body = end.map { String(entry[..<$0.lowerBound]) } ?? entry
+        // This package ships by branch, so the changelog IS the migration note:
+        // the encoding change an existing app can notice has to be named.
+        for claim in [
+            "CreateWithAliasOptions",
+            "GetOrCreateWithAliasOptions",
+            "documentFormat",
+            "tags",
+            "metadata",
+            "localOnly",
+            "DOCUMENT_FORMAT_MISMATCH",
+            "VALIDATION_FAILED",
+        ] {
+            XCTAssertTrue(
+                body.contains(claim),
+                "the #3757 changelog entry does not mention `\(claim)`"
+            )
+        }
+    }
+
     // MARK: - #3759 — the combination that can never work
 
     /// A refusal an app meets at `createDocument` has to be findable from the

@@ -208,7 +208,7 @@ public final class MeAPI: @unchecked Sendable {
             id: { $0.document.documentId },
             project: { LocalFirstListing.sharedDocument(from: $0) }
         )
-        return SharedDocumentListResult(items: merged, cursor: page.cursor)
+        return SharedDocumentListResult(items: merged, nextCursor: page.nextCursor)
     }
 
     /// List documents the current user owns (live owner, not creator —

@@ -88,6 +88,8 @@ const {
   offlineReplayRecordKey,
   planSnapshotHydration,
   estimateMaterializedBytes,
+  encodeFoldedState,
+  readStateVector,
 } = require("js-bao/node");
 const { encodeSnapshotChunk } = require("js-bao/cloudflare/do");
 
@@ -314,6 +316,18 @@ async function handle(request) {
       const dump = dumpStore(db, request.docId);
       db.close();
       return dump;
+    }
+
+    // #3782 — the folded-state mark's canonical text, and the state vector
+    // of an overlay as the JS client reads it: what Swift's column and
+    // `OverlayDocument.stateVector()` are held to.
+    case "encode-folded-state":
+      return { text: encodeFoldedState(request.state) };
+
+    case "state-vector": {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(request.update, "base64"));
+      return { vector: readStateVector(doc) };
     }
 
     case "compare-ids":

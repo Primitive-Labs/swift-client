@@ -185,6 +185,15 @@ public enum JsBaoEvent: String, Sendable {
     /// `documentOfflineWritesResolved`, by that name: an app that subscribes on
     /// both clients subscribes to one string.
     case documentOfflineWritesResolved
+    // Appended for the reason `JsBaoErrorCode.documentFormatMismatch` is: a case
+    // inserted into an enum shifts every later ordinal, and a stale incremental
+    // test build then reads each one as its neighbour (#3436's hazard).
+    /// The platform refused a document because the format this client believed
+    /// it had is not the format the platform resolved (#3764). The document is
+    /// closed when this arrives, with its store intact; an open that was waiting
+    /// on the network throws the same error as well. The JS client's
+    /// `document:format-mismatch`, by that name.
+    case documentFormatMismatch = "document:format-mismatch"
 
     // ── Cache lifecycle (parity with JS KvCache) ──────────────────
     /// Fires after a successful network refresh of a cached entry.
@@ -822,6 +831,38 @@ public struct DocumentWriteRefusedEvent: Sendable {
         self.documentId = documentId
         self.model = model
         self.recordId = recordId
+        self.error = error
+    }
+}
+
+/// The platform and this client disagree about a document's format (#3764).
+///
+/// Fired when the room refuses a document because the format this client
+/// declared is not the one the platform resolved. The document is CLOSED when
+/// this arrives — its rows and its unacknowledged writes are kept, nothing is
+/// evicted — because a refusal has to stop the document whether or not an open
+/// was waiting on it (decision D7). An open that WAS waiting throws the same
+/// error as well.
+///
+/// Diagnose from `declared` and `actual` before acting: the server also logs
+/// `Document format disagreement` naming its own pinned format. Evicting the
+/// document clears this client's belief, which repairs a stale row and HIDES a
+/// mis-pinned document.
+///
+/// Field for field the JS client's `document:format-mismatch` payload.
+public struct DocumentFormatMismatchEvent: Sendable {
+    public let documentId: String
+    /// What this client believed, from its own local metadata row.
+    public let declared: Int
+    /// What the platform resolved for the document.
+    public let actual: Int
+    /// The very error a waiting `openDocument` throws.
+    public let error: JsBaoError
+
+    public init(documentId: String, declared: Int, actual: Int, error: JsBaoError) {
+        self.documentId = documentId
+        self.declared = declared
+        self.actual = actual
         self.error = error
     }
 }

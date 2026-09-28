@@ -43,8 +43,6 @@ public final class JsBaoClient: @unchecked Sendable {
     public let collections: CollectionsAPI
     public let databases: DatabasesAPI
     public let session: SessionAPI
-    public let llm: LlmAPI
-    public let gemini: GeminiAPI
     public let groups: GroupsAPI
     public let ruleSets: RuleSetsAPI
     public let groupTypeConfigs: GroupTypeConfigsAPI
@@ -79,6 +77,23 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `links.appBaseURL` to your app's public web base URL to enable
     /// the `shareURL(...)` builders.
     public let links: LinksAPI
+
+    // MARK: Retiring direct LLM / Gemini sub-APIs
+    //
+    // Deprecated to mirror the JS client's `@deprecated` on `client.llm` /
+    // `client.gemini`. Non-deprecated internal storage plus a deprecated
+    // public accessor — the same shape `DatabaseInfo.celContext` uses — so the
+    // client's own references never emit a deprecated-declaration warning.
+
+    let _llm: LlmAPI
+    let _gemini: GeminiAPI
+
+    /// Sub-API for LLM (large language model) operations.
+    @available(*, deprecated, message: "The direct LLM client API is deprecated and will be removed in a future major release. Run a managed prompt from a server function instead: `ctx.prompts.run` (see the Server Functions guide).")
+    public var llm: LlmAPI { _llm }
+    /// Sub-API for Gemini model operations.
+    @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Run a managed prompt from a server function instead: `ctx.prompts.run` (see the Server Functions guide).")
+    public var gemini: GeminiAPI { _gemini }
 
     // The five that cannot be `let`: private storage, non-optional accessor.
 
@@ -206,6 +221,19 @@ public final class JsBaoClient: @unchecked Sendable {
         static let restored = "connectivityRestored"
     }
     private var subscribedDocuments: Set<String> = []
+
+    /// Documents the platform has REFUSED on this connection because the format
+    /// this client declared is not the one it resolved (#3764).
+    ///
+    /// Guarded by `lock`, beside the other per-document session state. A refused
+    /// document is torn down once — a second frame for it is not a second
+    /// teardown — and sends no further handshake while the mark stands; closing
+    /// it drops the mark, so a corrected open declares afresh.
+    ///
+    /// The error is kept with the id, as the JS client's map keeps it, so a
+    /// reopen can be answered with the disagreement it was refused for rather
+    /// than with a fresh one nobody asked the platform about.
+    private var formatRefusedDocuments: [String: JsBaoError] = [:]
 
     /// Documents that have already reported a syncStep1 skipped for a
     /// disconnected transport, so the report is one line per document per
@@ -662,14 +690,14 @@ public final class JsBaoClient: @unchecked Sendable {
         // instant the LLM/Gemini call site logged it. Handing the raw event to
         // the actor instead would have stamped it whenever the unstructured
         // task happened to run (#2244).
-        self.llm = LlmAPI(
+        self._llm = LlmAPI(
             transport: httpClient,
             logAnalytics: { [analyticsQueue] event in
                 let prepared = analyticsQueue.prepared(event)
                 Task { await analyticsQueue.logEvent(prepared) }
             }
         )
-        self.gemini = GeminiAPI(
+        self._gemini = GeminiAPI(
             transport: httpClient,
             logAnalytics: { [analyticsQueue] event in
                 let prepared = analyticsQueue.prepared(event)
@@ -1699,6 +1727,11 @@ public final class JsBaoClient: @unchecked Sendable {
         // document the server reports gone all reach it without coming through
         // this method. See `DocumentManager.purgeFormat2Data`.
         await documentManager.evictLocalData(documentId: documentId)
+        // #3764 — the eviction took the row the refused belief was read from,
+        // which is the recovery the docs prescribe for a client whose row is
+        // confirmed stale. Left standing, the mark would answer that reopen with
+        // the old disagreement and never ask the platform at all.
+        clearFormatRefusal(documentId, reason: "evicted")
     }
 
     /// Storage for the active retention policy. Applied immediately
@@ -3151,6 +3184,14 @@ public final class JsBaoClient: @unchecked Sendable {
         _ documentId: String,
         options: OpenDocumentOptions = OpenDocumentOptions()
     ) async throws -> YDocument {
+        // #3764 — the platform refused this document on this connection because
+        // of the format this client opened it as, and nothing will handshake for
+        // it until the mark is cleared by a close or an eviction. Answering the
+        // refusal here is the honest answer AND the documented one: an open that
+        // proceeded would wait out its availability budget and report a network
+        // timeout instead of the disagreement. JS rejects at the same point.
+        if let refusal = formatRefusal(documentId) { throw refusal }
+
         // #3436 — what kind of document is this, and can this client hold it?
         // Deliberately the FIRST thing the open does: the socket's receive
         // limit has to be raised while there is still time (the frame that
@@ -3296,6 +3337,19 @@ public final class JsBaoClient: @unchecked Sendable {
         // later client-driven sync triggers — the post-commit re-sync for a
         // pending create — honor the caller's choice too.
         if options.enableNetworkSync && !options.deferNetworkSync && networkingAllowed() {
+            // #3764, D9 — the refusal callback is registered BEFORE anything can
+            // put a handshake on the wire. `startNetworkSync` suspends inside
+            // `wsManager.send`, and `AwaitingOpenRegistry.fail` notifies only
+            // what is already registered and retains nothing — so a refusal
+            // answered in that window used to reach nobody, and the caller was
+            // told `NETWORK_TIMEOUT` about a room that had answered at once.
+            // `EarlyRefusal` holds the answer until the wait below attaches to
+            // it, and hands it over immediately when it does.
+            let early = EarlyRefusal()
+            let earlyToken = awaitingOpens.register(documentId: documentId) { error in
+                early.fail(error)
+            }
+            defer { awaitingOpens.withdraw(earlyToken) }
             await startNetworkSync(documentId: documentId)
             if needsNetworkWait && !documentManager.isSynced(documentId) {
                 let syncDocId = documentId
@@ -3325,13 +3379,15 @@ public final class JsBaoClient: @unchecked Sendable {
                     // arrive to settle the wait the ordinary way and the
                     // caller would be told `NETWORK_TIMEOUT` half a minute
                     // later about a server that answered at once.
-                    let refusalToken = self.awaitingOpens.register(
-                        documentId: syncDocId
-                    ) { error in
+                    // #3764, D9 — attached rather than registered here: the
+                    // registration happened before the send, so a refusal
+                    // answered while it was suspended is delivered the moment
+                    // this wait exists.
+                    early.attach { error in
                         if wait.claim() { cont.resume(throwing: error) }
                     }
                     wait.set(onSettled: { [weak self] in
-                        self?.awaitingOpens.withdraw(refusalToken)
+                        self?.awaitingOpens.withdraw(earlyToken)
                     })
 
                     wait.set(self.eventEmitter.subscribe(SyncEvent.self) { event in
@@ -3715,6 +3771,11 @@ public final class JsBaoClient: @unchecked Sendable {
             || documentManager.retainLocalSetting(documentId) == false
 
         await documentManager.closeDocument(documentId: documentId, options: effectiveOptions)
+        // #3764 — a document this app has closed no longer holds the belief the
+        // platform refused, so its next open declares afresh and the platform
+        // answers it. The refusal's own teardown closes through the MANAGER, so
+        // the mark it has just set is not cleared by its own close.
+        clearFormatRefusal(documentId, reason: evicted ? "evicted" : "closed")
         return CloseDocumentResult(evicted: evicted)
     }
 
@@ -3988,6 +4049,19 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     func startNetworkSync(documentId: String, explicit: Bool) async {
+        // #3764 — the platform refused this document on this connection because
+        // of the format this client opened it as, and the mark stands until the
+        // document is closed or evicted. Declining HERE is what makes the mark
+        // mean anything: this is the one place a `syncStep1` leaves, so the
+        // refusal reaches the watchdog's retries, the availability loop and the
+        // connect sweep without each of them having to know about it. JS gates
+        // its own `sendSyncStep1` the same way.
+        if isFormatRefused(documentId) {
+            logger.debug(
+                "[#3764] not handshaking a refused document on this connection:", documentId
+            )
+            return
+        }
         if explicit {
             documentManager.setStartNetworkMode(documentId, .immediate)
             // An explicit call is the caller taking over the timing, so it
@@ -4646,6 +4720,11 @@ public final class JsBaoClient: @unchecked Sendable {
         await documentManager.evictAllLocalData()
         await kvCache.clearAll()
         await blobManager.clearCache()
+        // #3764 — the same rule one level up: a wipe takes the rows every
+        // refused belief was read from.
+        for documentId in lock.withLock({ Array(formatRefusedDocuments.keys) }) {
+            clearFormatRefusal(documentId, reason: "evicted (all)")
+        }
     }
 
     /// Get offline info for a document
@@ -6112,9 +6191,158 @@ public final class JsBaoClient: @unchecked Sendable {
         return .object(fields)
     }
 
+    /// One format named on a refusal frame's typed detail (#3764).
+    ///
+    /// Read strictly, the way the room reads a declaration: only the number 2 is
+    /// the large format, and anything else — an absent field, a string, a
+    /// fraction — is the legacy one. The frame is the room's own and always
+    /// carries both, so this is the boundary being a boundary rather than a case
+    /// anybody expects to hit.
+    private func declaredFormatIn(_ detail: JSONValue?, field: String) -> Int {
+        guard case .object(let fields)? = detail,
+              case .number(let value)? = fields[field]
+        else { return 1 }
+        return value == 2 ? 2 : 1
+    }
+
     /// Fail every `openDocument` still waiting on `documentId`.
     func failAwaitingOpen(_ documentId: String, error: JsBaoError) {
         awaitingOpens.fail(documentId: documentId, error: error)
+    }
+
+    /// Whether the platform has refused this document on this connection (#3764).
+    func isFormatRefused(_ documentId: String) -> Bool {
+        lock.withLock { formatRefusedDocuments[documentId] != nil }
+    }
+
+    /// The refusal standing against this document on this connection, if any.
+    func formatRefusal(_ documentId: String) -> JsBaoError? {
+        lock.withLock { formatRefusedDocuments[documentId] }
+    }
+
+    /// Drop a format refusal, naming why it no longer applies (#3764).
+    ///
+    /// The mark is per open cycle, not per client: a document this app has
+    /// closed no longer holds the belief that was refused, and an eviction has
+    /// taken the row that carried it — which is the recovery the docs prescribe
+    /// for a client whose row is confirmed stale. Kept for the life of the
+    /// client instead, the mark would refuse every later handshake for the
+    /// document and turn a second genuine refusal into a silent no-op, leaving
+    /// the reopened document bound with no event and nothing told.
+    ///
+    /// Not cleared by a change to the recorded format, as the JS client's is:
+    /// `DocumentManager.noteDocumentFormat` only ever fills a `nil`, so nothing
+    /// on this client rewrites a format a row already names.
+    func clearFormatRefusal(_ documentId: String, reason: String) {
+        let removed = lock.withLock {
+            formatRefusedDocuments.removeValue(forKey: documentId) != nil
+        }
+        guard removed else { return }
+        logger.log("[#3764] format refusal cleared for", documentId, "—", reason)
+    }
+
+    /// Refuse ONE document because the platform and this client disagree about
+    /// its format — #3764, decision D7.
+    ///
+    /// A document-scoped teardown, not a waiter failer: an open waiting on the
+    /// network is failed, and a document already open with nothing waiting is
+    /// closed under the app anyway. Leaving it bound would leave it reading and
+    /// writing a layout the platform refuses to serve this client.
+    ///
+    /// What it does NOT do: close the connection (D1 — the socket's other
+    /// documents are none of this document's business, and no close code is
+    /// involved, so neither reconnect policy changes) or take any local data.
+    /// The store, the rows and the unacknowledged writes are kept, so a
+    /// corrected open publishes what this client wrote.
+    func refuseDocumentFormat(
+        _ documentId: String, declared: Int, actual: Int, message: String
+    ) async {
+        let error = JsBaoError(
+            code: .documentFormatMismatch,
+            message: message,
+            details: [
+                "documentId": .string(documentId),
+                "declared": .number(Double(declared)),
+                "actual": .number(Double(actual)),
+            ]
+        )
+
+        // The refusal is CLAIMED before any waiting open is released. Failing the
+        // wait resumes the open's task, and its abort path removes the document
+        // it had registered — concurrently, since nothing here is actor-isolated.
+        // Checked after that, "is it held?" could read the open's own abort and
+        // skip the mark and the event, and the next open would retry a
+        // disagreement this client had already been told about.
+        let firstRefusal: Bool = lock.withLock {
+            guard documentManager.getDocument(documentId) != nil else { return false }
+            guard formatRefusedDocuments[documentId] == nil else { return false }
+            formatRefusedDocuments[documentId] = error
+            return true
+        }
+        guard firstRefusal else {
+            // An open WAITING on this document is failed whether or not the
+            // document is still held: the wait is the caller's, and it has to
+            // be told.
+            failAwaitingOpen(documentId, error: error)
+            // E6 — a document this client does not hold has nothing to tear
+            // down; E12 — a second frame for the same document is not a second
+            // teardown.
+            logger.debug(
+                "[#3764] format refusal not acted on (not held, or already refused):",
+                documentId
+            )
+            return
+        }
+
+        logger.error(
+            "[#3764] Document format disagreement: the platform serves",
+            documentId, "as format", actual, "and this client opened it as", declared
+        )
+
+        // Nothing may keep re-syncing a document the room refuses.
+        clearSyncWatchdog(documentId)
+        // The queued frames are DROPPED rather than flushed: every one of them
+        // was built against the overlay of a document the room will not serve
+        // this client, and the durable pending log is what carries those writes
+        // to the open that agrees.
+        discardQueuedOutboundUpdates(documentId: documentId)
+        format2State.coordinator?.unbind(documentId: documentId)
+        disconnectFromSharedModels(documentId: documentId)
+        // A document opened with `retainLocal: false` evicts at close, and
+        // `CloseDocumentOptions()` does not stop it: that setting says "do not
+        // keep this on the device", which is a statement about a document the
+        // platform serves, not about one it has just refused. Downgraded here —
+        // the same lever the client's own close uses when the server has not
+        // confirmed the writes — so the store, the rows and the unacknowledged
+        // writes survive, which is what this teardown promises.
+        documentManager.preserveLocalOnClose(documentId)
+        // Through the MANAGER rather than this client's own `closeDocument`:
+        // that one flushes the outbound queue first, which is exactly what must
+        // not happen, and evicts nothing either way.
+        await documentManager.closeDocument(
+            documentId: documentId, options: CloseDocumentOptions()
+        )
+        // Only now is the waiting open released: the preserving close above has
+        // already run, so the open's own abort finds nothing left to remove and
+        // cannot race it.
+        failAwaitingOpen(documentId, error: error)
+
+        eventEmitter.emit(ConnectionErrorEvent(
+            message: message,
+            documentId: documentId,
+            messageType: "syncStep1",
+            detail: .object([
+                "code": .string(JsBaoErrorCode.documentFormatMismatch.rawValue),
+                "declared": .number(Double(declared)),
+                "actual": .number(Double(actual)),
+            ])
+        ))
+        eventEmitter.emit(DocumentFormatMismatchEvent(
+            documentId: documentId,
+            declared: declared,
+            actual: actual,
+            error: error
+        ))
     }
 
     func handleWebSocketMessage(_ text: String) async {
@@ -6155,6 +6383,32 @@ public final class JsBaoClient: @unchecked Sendable {
                     details: ["channel": .string(channel)]
                 )))
             }
+
+        case "error" where json["code"] as? String
+                == JsBaoErrorCode.documentFormatMismatch.rawValue && roomId != nil:
+            // #3764 — the platform and this client disagree about ONE document's
+            // format. A document-scoped teardown (D7), and no close: the
+            // connection's other documents are untouched (D1). Routed AHEAD of
+            // the generic arm below, because the teardown owns this frame's
+            // notification: it emits the one `ConnectionErrorEvent` for a
+            // document it tore down, and none for a document this client no
+            // longer holds (E6), as the JS client does.
+            let documentId = roomId ?? ""
+            // Read off the TYPED detail `errorFrameDetail` builds, rather than
+            // casting the frame again: one decoding of one field, not two.
+            let detail = errorFrameDetail(
+                detail: json["detail"], code: json["code"] as? String
+            )
+            let declared = declaredFormatIn(detail, field: "declared")
+            let actual = declaredFormatIn(detail, field: "actual")
+            await refuseDocumentFormat(
+                documentId,
+                declared: declared,
+                actual: actual,
+                message: json["message"] as? String
+                    ?? "Document \(documentId) is format \(actual); this client "
+                        + "opened it as format \(declared)."
+            )
 
         case "error":
             // Server-side rejection of something this client sent (bad frame,
@@ -7207,6 +7461,25 @@ public final class JsBaoClient: @unchecked Sendable {
                 return
 
             case .next(let batch):
+                // #3764 — a document the platform has REFUSED on this
+                // connection sends nothing at all. Dropped rather than held,
+                // like the local-only arm below: every batch is a delta against
+                // a layout the room will not serve this client, and the durable
+                // pending log is what carries those writes to the open that
+                // agrees. The teardown drops the queue before it awaits
+                // anything, so this is for a write made while that close was
+                // still in flight — the last point before the bytes reach the
+                // socket, which is where the rule has to hold whatever the order
+                // of the teardown's own steps.
+                if isFormatRefused(documentId) {
+                    logger.debug(
+                        "[#3764] dropping queued updates for a refused document", documentId
+                    )
+                    discardQueuedOutboundUpdates(documentId: documentId)
+                    format2State.coordinator?.forgetQueuedUpdates(documentId: documentId)
+                    continue
+                }
+
                 // #3436 — a large document whose `epoch.info` has not been
                 // answered, or which is stopped pending a reload, may not put
                 // local state on the wire: the server would take it as the

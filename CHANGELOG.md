@@ -20,6 +20,120 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### The alias creates take `documentFormat`, `tags` and `metadata` (#3757)
+
+`CreateWithAliasOptions` carried only `title` and `alias`, and
+`GetOrCreateWithAliasOptions` only `alias`, `title` and `tags` — so a Swift app
+that creates every document as a large document could not make a tagged large
+document behind an alias in one call. Doing it by hand (resolve the alias, create,
+write the tags) reopens the race the idempotent route exists to close.
+
+- `CreateWithAliasOptions` gains `tags`, `metadata` and `documentFormat`;
+  `GetOrCreateWithAliasOptions` gains `documentFormat` and `metadata`. Every new
+  parameter is defaulted, so **existing initializer calls compile unchanged**,
+  and each is encoded only when set — an empty `tags` is not sent as a key, which
+  matches the JS client.
+- `CreateWithAliasResult` and `GetOrCreateWithAliasResult` gain
+  `documentFormat`, `tags` and `metadata`, all optional. A response that carries
+  none of them still decodes, as every response before this one did.
+- On `getOrCreateWithAlias` a stated `documentFormat` is also a statement about
+  the document the alias already names: a stored format that differs fails with
+  `HttpError.serverCode == "DOCUMENT_FORMAT_MISMATCH"` and creates nothing, one
+  that agrees is echoed. State no format and an existing binding is answered
+  exactly as before. A new server code needs no enum case — branch on
+  `serverCode`.
+- **`CreateDocumentOptions` no longer encodes `localOnly`.** It is a client-side
+  flag the server never read, and the wired create path never sent it; only the
+  isolated `DocumentsAPI.create` fallback did, because the property is a
+  non-optional `Bool`. All three server create routes now refuse a top-level body
+  key they do not read (`VALIDATION_FAILED`), so that body would have been
+  refused for a flag that meant nothing to the server. The property itself is
+  unchanged and `documents.open`'s local-only rules read it as before; only the
+  encoding moved. If you build a `POST /documents` body by hand, send only keys
+  the route reads.
+- See `docs/large-documents.md` for the copyable alias create.
+
+### A document the platform serves in another format is refused, not mis-served (#3764)
+
+The client records a document's format on its local row at create time and binds
+by it; the platform resolves the format independently. Neither side told the
+other, so a believed-large document served ordinary frames recorded
+`noteHandshakeWithoutEpochInfo` and carried on — the app saw a document that
+looked empty, with nothing to search the code for.
+
+- **`syncStep1` carries `documentFormat`** when the local row names one, beside
+  `formats` and `manifestVersion`. Absent when nothing knows, in which case the
+  handshake is byte for byte what it was.
+- **`JsBaoErrorCode.documentFormatMismatch`** (`DOCUMENT_FORMAT_MISMATCH`, the
+  JavaScript client's string) is thrown by a waiting `openDocument`, with
+  `documentId`, `declared` and `actual` in `details`. The socket is NOT closed —
+  unlike `clientUpgradeRequired`, this refusal is about one document — so the
+  reconnect policy is untouched and no close code is involved.
+- **`DocumentFormatMismatchEvent`** (`document:format-mismatch`, the JavaScript
+  client's event by that name) carries `documentId`, `declared`, `actual` and the
+  error, whether or not an open was waiting. A document with no open waiting is
+  CLOSED under the app when it fires, with its store, its rows and its
+  unacknowledged writes intact.
+- **Diagnose before you act.** Read `declared`, `actual` and the server's
+  `Document format disagreement` line. Evicting the document clears a stale local
+  row and HIDES a format the platform has mis-pinned, whose next open would then
+  declare nothing.
+
+The refusal lasts one open cycle. While it stands the document sends no
+handshake and no queued update, and `openDocument` throws the same error rather
+than waiting out its availability budget for a handshake this client will not
+send; `closeDocument` and `documents.evict` end the refusal, and the next open
+asks the platform afresh. The teardown evicts nothing whichever route it takes —
+including for a document opened with `retainLocal: false`, which evicts at close
+every other way it can be closed.
+
+The behaviour an existing app can notice: an `openDocument` that used to be
+served a document in the wrong shape now throws, and a document already open can
+be closed under the app. Both are the point — the alternative is reading the
+wrong document silently.
+
+### `AggregateOptions` takes `documents` (#3760)
+
+`query` and `count` have always taken a several-document scope; `aggregate`
+did not, so a model with members in both an ordinary and a large document
+could be refused with `FORMAT2_QUERY_SCOPE` and had no way to be scoped —
+and the documents page told you to use a `QueryOptions(documents:)` that
+`aggregate` does not take.
+
+- `AggregateOptions.documents: [String]?`, appended last in the struct and its
+  `init` with a default of `nil`, so every existing call site compiles
+  unchanged. It means what `QueryOptions.documents` means: a list, with an
+  explicit empty list matching nothing.
+- On a model bound to ONE document the option NARROWS rather than replaces.
+  `BaoModelQueryEngine.aggregate` combines it with `scopedToDocId` as `query`
+  and `count` combine theirs, instead of selecting between them: a member of
+  document A asked for `[B]` now answers no groups, where before it answered
+  B's rows while the same option on `query` answered none.
+- The format-2 delegate narrows by the caller's value instead of overwriting
+  it, for `query`, `queryPaged` and `aggregate` alike. A read on a member of A
+  that named another document was answered with A's rows; it answers nothing
+  now. Apps that passed `documents` to a member bound to one document — rather
+  than to the shared `MultiDocModel` facade, which is what the option is for —
+  will see that change.
+
+### Reopening a large document no longer folds its whole overlay (#3782)
+
+A large document bound at open caught every registered model up by folding
+its WHOLE current-epoch overlay into the local store, on every open — for a
+document that has never rotated, the document. The store now keeps
+`_epoch.folded_state`, the overlay's state vector at the last fold and the
+models it covered, in the form the JavaScript client writes, and every fold
+stamps it in its own transaction.
+
+- An open whose overlay is unchanged since the last fold folds nothing, and
+  registering the models it covers folds nothing either. A model the stamp
+  never covered is caught up on its own; an overlay that moved (the window a
+  crash can leave between the document's persist and its fold) is caught up
+  whole, as before.
+- An existing database gains the column on its first open with this build
+  and keeps every row; that first open folds the whole overlay once.
+- Nothing an app calls changed.
+
 ### `DocumentWriteRefusedEvent` now fires for EVERY refused write (#3758)
 
 Past a large document's offline write window, the verbs that cannot throw —

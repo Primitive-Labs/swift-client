@@ -1110,6 +1110,16 @@ public final class DocumentManager: @unchecked Sendable {
             "formats": Format2Transport.formats,
             "manifestVersion": Format2Transport.manifestVersion,
         ]
+        // #3764 — the format this client BELIEVES this document has, from its
+        // own local row. AFTER `formats` and `manifestVersion`, which say what
+        // it CAN read: this says what it thinks it is reading, and the room
+        // refuses a disagreement rather than serving the wrong document. Absent
+        // when the row names none — a first open of somebody else's document —
+        // and such a client is served exactly as it was before this field
+        // existed.
+        if let believed = documentFormat(documentId), believed == 1 || believed == 2 {
+            message["documentFormat"] = believed
+        }
         // Mirror JS `sendSyncStep1`'s `docHash` (SHA-256 hex over the full
         // encoded state - the server's `calculateDocHash` algorithm). When it
         // matches the server's hash, the server skips the diff/R2 cycle and

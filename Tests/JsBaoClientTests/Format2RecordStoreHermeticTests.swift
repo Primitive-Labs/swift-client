@@ -67,6 +67,30 @@ final class Format2RecordStoreHermeticTests: XCTestCase {
         for object in theirs {
             let name = try XCTUnwrap(object["name"] as? String)
             let expected = try XCTUnwrap(object["sql"] as? String, name)
+            if name == "_legacy_adopted" {
+                // js-bao ONLY, and by construction (#3760). It is the ledger of
+                // which writes have been taken over from a PRE-AMENDMENT OPFS
+                // pool — the browser used to give every large document its own
+                // pool, and a client that ships after the 2026-09-24 amendment
+                // names a pool by scope alone, so the old one's unacknowledged
+                // writes have to be adopted once and never twice.
+                //
+                // Swift has nothing to adopt from: it has kept every large
+                // document of a client in ONE file-backed store since #3436,
+                // under one persisted name per document that no re-keying
+                // moved, so there is no second database its writes could be
+                // stranded in. A table with no Swift behavior behind it would
+                // be dead schema.
+                //
+                // Asserted as an ABSENCE rather than skipped, so a Swift client
+                // that ever grows one has to come back here and say why.
+                XCTAssertNil(
+                    mine[name],
+                    "Swift has no pre-amendment pool to adopt from, so it is "
+                        + "expected to carry no adoption ledger"
+                )
+                continue
+            }
             let actual = try XCTUnwrap(
                 mine[name],
                 "Swift created no object named \(name); it created \(mine.keys.sorted())"

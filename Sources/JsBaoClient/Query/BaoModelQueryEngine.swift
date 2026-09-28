@@ -1170,6 +1170,16 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// `count(documents:)` and `QueryOptions.documents`: an empty list matches
     /// nothing. #3436 reads it for a model whose large documents are the ones
     /// connected, where the scope is "these documents", not "this one".
+    ///
+    /// The caller's own `options.documents` (#3760) is INTERSECTED with the
+    /// parameter, which is the facade's idea of the scope, and the result is
+    /// combined with `scopedToDocId` the same way — see {@link aggregateScope}.
+    /// Preferring the caller's list over the facade's was the defect finding
+    /// 3760-REVIEW-05 names: the facade's list is the routed scope, narrowed to
+    /// the documents that are CONNECTED, and these query tables also hold the
+    /// rows of large documents that are closed (#3756 keeps them), so a request
+    /// naming a closed document answered from it where `query` — which narrows
+    /// the same request — answered nothing.
     public func aggregate(
         modelName: String,
         options: AggregateOptions,
@@ -1190,9 +1200,47 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             stringsetFields: stringsetFields,
             stringFields: stringFieldsByModel[modelName],
             fieldTypes: fieldTypeNamesByModel[modelName],
-            scopedToDocIds: documents ?? scopedToDocId.map { [$0] }
+            scopedToDocIds: Self.aggregateScope(
+                boundTo: scopedToDocId,
+                documents: Self.narrow(options.documents, to: documents)
+            )
         )
         return try executeQuery(sql, params: params)
+    }
+
+    /// Two document scopes as one: neither may widen the other (finding
+    /// 3760-REVIEW-05).
+    ///
+    /// `nil` is "unscoped", so it never narrows; an empty list matches nothing,
+    /// which an intersection preserves. Order is the caller's, so a scope built
+    /// from the requested list keeps reading in the order it was asked for.
+    static func narrow(_ requested: [String]?, to allowed: [String]?) -> [String]? {
+        switch (requested, allowed) {
+        case (nil, nil): return nil
+        case let (requested?, nil): return requested
+        case let (nil, allowed?): return allowed
+        case let (requested?, allowed?): return requested.filter(allowed.contains)
+        }
+    }
+
+    /// The documents an aggregation may read: the bound document AND the
+    /// requested scope, never one or the other (finding 3760-R6).
+    ///
+    /// `query` and `count` add two WHERE clauses and let SQL do the AND;
+    /// `buildAggregation` takes one list, so the AND is the intersection —
+    /// the same answer by construction. An empty result is an empty list,
+    /// which `docScopeClause` emits as a false predicate.
+    static func aggregateScope(
+        boundTo scopedToDocId: String?,
+        documents: [String]?
+    ) -> [String]? {
+        switch (scopedToDocId, documents) {
+        case (nil, nil): return nil
+        case let (bound?, nil): return [bound]
+        case let (nil, requested?): return requested
+        case let (bound?, requested?):
+            return requested.contains(bound) ? [bound] : []
+        }
     }
 
     // MARK: - Raw SQL Helpers

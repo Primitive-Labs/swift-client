@@ -83,6 +83,27 @@ public struct ExecutePromptResult: Decodable, Sendable, Equatable {
     public let success: Bool
     public let output: String
     public let error: String?
+    /// #3663 — the upstream provider's own HTTP status, on a failure where the
+    /// call reached the provider and it answered. It does not depend on which
+    /// provider the prompt's configuration names, and it is what a retry
+    /// decision is made on without parsing `error`: retry on 408, 429, 502,
+    /// 503 and 504; any other 4xx will fail the same way next time.
+    ///
+    /// `nil` on success, and `nil` on a failure where no provider answer was
+    /// observed — an unset provider key, an oversized payload, a completion
+    /// that came back empty — so a number here is always the provider's own.
+    public let upstreamStatus: Int?
+    /// #3663 — the code naming the failure, when the failure has one.
+    ///
+    /// `"PROMPT_UPSTREAM_TIMEOUT"` when the provider itself ran out of time,
+    /// which is the one failure of the model call that carries a code. `nil`
+    /// on success and on every other provider failure, so `error` with no
+    /// `errorCode` still means "the call failed for some other reason".
+    ///
+    /// Typed as a plain `String` rather than an enum so a code the platform
+    /// adds later still decodes: the function path's envelope already carries
+    /// the `PROMPT_OUTPUT_*` family (#3330) in this field's place.
+    public let errorCode: String?
     public let metrics: Metrics
     /// Opaque provider response. Mirrors JS's `rawResponse: any`; inspect
     /// via `JSONValue` accessors / subscripts.
@@ -93,6 +114,8 @@ public struct ExecutePromptResult: Decodable, Sendable, Equatable {
         success: Bool,
         output: String,
         error: String? = nil,
+        upstreamStatus: Int? = nil,
+        errorCode: String? = nil,
         metrics: Metrics,
         rawResponse: JSONValue? = nil,
         configId: String
@@ -100,6 +123,8 @@ public struct ExecutePromptResult: Decodable, Sendable, Equatable {
         self.success = success
         self.output = output
         self.error = error
+        self.upstreamStatus = upstreamStatus
+        self.errorCode = errorCode
         self.metrics = metrics
         self.rawResponse = rawResponse
         self.configId = configId

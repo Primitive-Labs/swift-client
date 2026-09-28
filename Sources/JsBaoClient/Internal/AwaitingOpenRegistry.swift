@@ -44,3 +44,38 @@ final class AwaitingOpenRegistry: @unchecked Sendable {
         for fail in doomed { fail(error) }
     }
 }
+
+/// A refusal that may arrive before the wait that has to hear it (#3764, D9).
+///
+/// `openDocument` suspends inside `wsManager.send` while its handshake goes out,
+/// and the room can answer before the availability wait exists. The registry
+/// notifies only what is registered and retains nothing, so the callback is
+/// registered before the send and points here: this holds the answer until the
+/// wait attaches, and hands it over at once when it does.
+final class EarlyRefusal: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var error: JsBaoError?
+    private var deliver: ((JsBaoError) -> Void)?
+
+    /// The refusal arrived. Delivered now when a wait is attached, kept if not.
+    func fail(_ error: JsBaoError) {
+        let sink: ((JsBaoError) -> Void)? = lock.withLock {
+            if let deliver = self.deliver { return deliver }
+            self.error = error
+            return nil
+        }
+        sink?(error)
+    }
+
+    /// The wait exists. Answers a refusal that has already arrived.
+    func attach(_ deliver: @escaping (JsBaoError) -> Void) {
+        let pending: JsBaoError? = lock.withLock {
+            self.deliver = deliver
+            let held = self.error
+            self.error = nil
+            return held
+        }
+        if let pending { deliver(pending) }
+    }
+}

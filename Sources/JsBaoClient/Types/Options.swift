@@ -343,6 +343,30 @@ public struct CreateDocumentOptions: Encodable, Sendable {
         self.metadata = metadata
         self.documentFormat = documentFormat
     }
+
+    // `localOnly` is a CLIENT-side flag and is deliberately NOT encoded (#3757).
+    //
+    // The server has never read it. The wired create path
+    // (`JsBaoClient.createDocument` → `DocumentManager.commitOfflineCreate`)
+    // builds its own body and never sent it; only the isolated
+    // `DocumentsAPI.create` fallback — used when no client is wired — posts these
+    // options as the body, and because `localOnly` is a non-optional `Bool` it
+    // always put `"localOnly": false` on the wire. Under the stray-key refusal
+    // the three create routes now answer 400 `VALIDATION_FAILED` for a key they
+    // do not read, so that body would be refused for a flag that never meant
+    // anything to the server. The property itself is untouched: `documents.open`'s
+    // local-only rules read it exactly as before.
+    private enum CodingKeys: String, CodingKey {
+        case title, tags, metadata, documentFormat
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(tags, forKey: .tags)
+        try container.encodeIfPresent(metadata, forKey: .metadata)
+        try container.encodeIfPresent(documentFormat, forKey: .documentFormat)
+    }
 }
 
 public struct CloseDocumentOptions: Sendable {
@@ -417,8 +441,11 @@ public struct PaginatedResult<T: Sendable>: Sendable {
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
-    public let cursor: String?
+    /// Deprecated alias of `nextCursor` kept for one deprecation window
+    /// (#1316, #1982). Computed from `nextCursor` so the type's own
+    /// initializers never reference the deprecated declaration.
+    @available(*, deprecated, message: "Use nextCursor.")
+    public var cursor: String? { nextCursor }
 
     public init(
         items: [T],
@@ -429,7 +456,6 @@ public struct PaginatedResult<T: Sendable>: Sendable {
         self.items = items
         let next = nextCursor ?? cursor
         self.nextCursor = next
-        self.cursor = next
         self.hasMore = hasMore ?? (next != nil)
     }
 }

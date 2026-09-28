@@ -216,6 +216,41 @@ public final class OverlayDocument {
         if let failure { throw failure }
     }
 
+    /// This overlay's state vector, as `clientId → clock` with the client ids
+    /// as decimal strings (#3782) — the shape the folded-state mark stores on
+    /// both clients.
+    ///
+    /// yrs hands the vector over lib0-encoded: a varUint count, then that many
+    /// varUint `(client, clock)` pairs. Decoded here rather than compared as
+    /// bytes, because the encoder walks its client map in no fixed order, so
+    /// the same vector can encode to different bytes.
+    public func stateVector() -> [String: Int] {
+        let bytes = document.transactSync { transaction in
+            transaction.transactionStateVector()
+        }
+        var position = 0
+        func readVarUint() -> UInt64? {
+            var value: UInt64 = 0
+            var shift: UInt64 = 0
+            while position < bytes.count {
+                let byte = bytes[position]
+                position += 1
+                value |= UInt64(byte & 0x7F) << shift
+                if byte & 0x80 == 0 { return value }
+                shift += 7
+                if shift > 63 { return nil }
+            }
+            return nil
+        }
+        var vector: [String: Int] = [:]
+        guard let count = readVarUint() else { return vector }
+        for _ in 0..<count {
+            guard let client = readVarUint(), let clock = readVarUint() else { break }
+            vector[String(client)] = Int(clock)
+        }
+        return vector
+    }
+
     /// This overlay's whole state as one Yjs update.
     public func encodeStateAsUpdate() -> [UInt8] {
         document.transactSync { transaction in

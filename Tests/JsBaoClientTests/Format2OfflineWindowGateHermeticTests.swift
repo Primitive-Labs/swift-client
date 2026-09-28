@@ -434,8 +434,8 @@ final class Format2OfflineWindowGateHermeticTests: XCTestCase {
             }
             // Reading the REFUSING document and a second one, from inside the
             // handler. Under the lock either could block for ever.
-            let here = (try? fixture.model.find(id: "n1")) ?? nil
-            let there = (try? otherModel.find(id: "o1")) ?? nil
+            let here = fixture.model.find(id: "n1")
+            let there = otherModel.find(id: "o1")
             readBack.withValue {
                 $0[event.recordId] = here != nil && there != nil
             }

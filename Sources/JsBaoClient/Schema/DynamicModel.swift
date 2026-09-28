@@ -1096,6 +1096,10 @@ public final class DynamicModel: @unchecked Sendable {
     public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         if let format2 { return try format2.aggregate(options) }
         awaitObserverDrain()
+        // `options.documents` reaches the engine through `options`, which
+        // ANDs it with `scopedToDocId`: on a shared engine this member must
+        // never answer another document's rows for a scope it was handed
+        // (finding 3760-R6).
         return try queryEngine.aggregate(
             modelName: schema.name, options: options, scopedToDocId: docId,
             stringsetFields: stringsetFieldNames

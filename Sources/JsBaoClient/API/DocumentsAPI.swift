@@ -583,8 +583,28 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Sends `POST /documents/:documentId/validate-access` — the same route
     /// js-bao uses (`documentsApi.ts` `validateAccess`). There is no
     /// `/documents/:documentId/access` route on the server (#2358).
-    public func validateAccess(documentId: String) async throws -> DocumentAccessResult {
-        try await transport.request(method: .post, path: "/documents/\(documentId)/validate-access")
+    ///
+    /// Passing `userId` asks about THAT user instead of the caller (#3658):
+    /// the answer is what the document routes would enforce for them, across
+    /// direct grants, group grants (collection membership included) and
+    /// "anyone with the link" access. An app owner or admin may name anyone;
+    /// a member may name only themselves. Passing nothing keeps the call
+    /// exactly as it was, body and all.
+    public func validateAccess(
+        documentId: String,
+        userId: String? = nil
+    ) async throws -> DocumentAccessResult {
+        guard let userId else {
+            return try await transport.request(
+                method: .post,
+                path: "/documents/\(documentId)/validate-access"
+            )
+        }
+        return try await transport.request(
+            method: .post,
+            path: "/documents/\(documentId)/validate-access",
+            body: ValidateAccessSubjectParams(userId: userId)
+        )
     }
 
     // MARK: - Invitations
@@ -1092,7 +1112,9 @@ public final class DocumentsAPI: @unchecked Sendable {
                 userId: userId
             ),
             title: options.title,
-            tags: (options.tags?.isEmpty == false) ? options.tags : nil
+            tags: (options.tags?.isEmpty == false) ? options.tags : nil,
+            documentFormat: options.documentFormat,
+            metadata: options.metadata
         )
 
         return try await transport.request(
@@ -1603,9 +1625,10 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
 // MARK: - Request / response shims
 
-/// Body of `POST /documents/get-or-create-with-alias`. `userId` / `title` /
-/// `tags` are omitted when `nil`, matching the conditional inserts the untyped
-/// dictionary body used.
+/// Body of `POST /documents/get-or-create-with-alias`. Every optional is
+/// omitted when `nil`, matching the conditional inserts the untyped dictionary
+/// body used — and required now that the route REFUSES a top-level key it does
+/// not read (#3757), so a key sent as `null` is still a key.
 private struct GetOrCreateWithAliasBody: Encodable, Sendable {
     struct Alias: Encodable, Sendable {
         let scope: String
@@ -1616,6 +1639,8 @@ private struct GetOrCreateWithAliasBody: Encodable, Sendable {
     let alias: Alias
     let title: String?
     let tags: [String]?
+    let documentFormat: Int?
+    let metadata: JSONValue?
 }
 
 /// Body of `PUT /document-aliases/:scope/:key`.

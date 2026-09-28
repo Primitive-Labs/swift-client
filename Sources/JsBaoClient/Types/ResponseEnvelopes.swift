@@ -95,7 +95,7 @@ struct DocumentListEnvelope: Decodable, Sendable {
         }
         let page = try DocumentListPage(from: decoder)
         items = page.items
-        cursor = page.cursor
+        cursor = page.nextCursor
         isBareArray = false
         hasMore = page.hasMore
         let keys = try decoder.container(keyedBy: CodingKeys.self)

@@ -127,7 +127,8 @@ public final class Format2RecordStore: @unchecked Sendable {
               last_sync_at INTEGER,
               window_days INTEGER,
               clock_offset INTEGER,
-              hydrated_models TEXT
+              hydrated_models TEXT,
+              folded_state TEXT
             )
             """,
             """
@@ -222,6 +223,17 @@ public final class Format2RecordStore: @unchecked Sendable {
             try connection.executeScript(
                 "DROP INDEX IF EXISTS idx_\(tables.stringSetIndex)_tfr"
             )
+            // #3782 — a database written before the folded-state mark existed
+            // has `_epoch` without it, and `CREATE TABLE IF NOT EXISTS` leaves
+            // such a table as it found it. NULL is what that database knows
+            // about its folds: nothing, so its next bind catches up whole and
+            // stamps. Guarded, so it runs once per file (#3688's precedent for
+            // a post-DDL step in this method).
+            let epochColumns = try connection.query("PRAGMA table_info(_epoch)", [])
+                .compactMap { $0["name"].stringValue }
+            if !epochColumns.isEmpty, !epochColumns.contains("folded_state") {
+                try connection.executeScript("ALTER TABLE _epoch ADD COLUMN folded_state TEXT")
+            }
             try connection.execute(
                 "INSERT OR IGNORE INTO _epoch (doc_id, epoch, acked_seq) VALUES (?, 0, 0)",
                 [.text(docId)]
@@ -256,11 +268,18 @@ public final class Format2RecordStore: @unchecked Sendable {
         } else {
             encoded = .null
         }
+        let changed = try hydrationScope() != models
         try withConnection { connection in
-            try connection.execute(
-                "UPDATE _epoch SET hydrated_models = ? WHERE doc_id = ?",
-                [encoded, .text(docId)]
-            )
+            try connection.transaction {
+                // #3782 — the folded state names the models it vouches for; a
+                // scope that changes which models this device holds changes
+                // what a fold of the overlay writes, so nothing is known.
+                if changed { try clearFoldedState() }
+                try connection.execute(
+                    "UPDATE _epoch SET hydrated_models = ? WHERE doc_id = ?",
+                    [encoded, .text(docId)]
+                )
+            }
         }
         scopeLock.withLock {
             scope = models
@@ -813,9 +832,84 @@ public final class Format2RecordStore: @unchecked Sendable {
 
     public func setEpoch(_ epoch: Int) throws {
         try withConnection { connection in
+            try connection.transaction {
+                // #3782 — another epoch is another Y.Doc, with client ids of
+                // its own; a vector measured against the old one says nothing
+                // about the new one.
+                if try self.epoch() != epoch { try clearFoldedState() }
+                try connection.execute(
+                    "UPDATE _epoch SET epoch = ? WHERE doc_id = ?",
+                    [.integer(Int64(epoch)), .text(docId)]
+                )
+            }
+        }
+    }
+
+    // MARK: - What the store last folded (#3782)
+
+    /// The overlay state the merged view was last folded from, or `nil` when
+    /// nothing is known — a database written before this, or one whose rows
+    /// were just replaced from another source.
+    ///
+    /// What it vouches for: for every model in `models`, every overlay item of
+    /// that model's map below `vector` has been folded into the records AND
+    /// projected into the query tables (the fold projects in the same
+    /// transaction on this client).
+    public func foldedState() throws -> FoldedState? {
+        try withConnection { connection in
+            FoldedState.decode(
+                try connection.query(
+                    "SELECT folded_state FROM _epoch WHERE doc_id = ?", [.text(docId)]
+                ).first?["folded_state"].stringValue
+            )
+        }
+    }
+
+    /// Record that a fold certified `state`. Called INSIDE the transaction of
+    /// the fold it vouches for.
+    ///
+    /// Merged per client by MAX with the models unioned, but only while the
+    /// overlay that folded, at `docState`, is at or ahead of the stored vector
+    /// on every client (the guard the JS client applies). A store that knows
+    /// nothing is stamped only by a fold of whole model maps (`whole`): an
+    /// incremental fold wrote its own keys and says nothing about the rest.
+    ///
+    /// - Returns: whether the state was written.
+    @discardableResult
+    public func noteFoldedState(
+        _ state: FoldedState, docState: [String: Int], whole: Bool
+    ) throws -> Bool {
+        try withConnection { connection in
+            let held = try foldedState()
+            if held == nil && !whole { return false }
+            if let held, !FoldedState.isAtOrAhead(docState, of: held.vector) { return false }
+            let merged = held.map { $0.merged(with: state) } ?? state
             try connection.execute(
-                "UPDATE _epoch SET epoch = ? WHERE doc_id = ?",
-                [.integer(Int64(epoch)), .text(docId)]
+                "UPDATE _epoch SET folded_state = ? WHERE doc_id = ?",
+                [.text(merged.encoded()), .text(docId)]
+            )
+            return true
+        }
+    }
+
+    /// Write `state` as it is, dropping whatever was stored. For a fold that
+    /// knows exactly which models it certifies through its vector, when the
+    /// max-merge would carry a model it did not fold forward (finding
+    /// 3782-C04). Called inside the fold's transaction.
+    func replaceFoldedState(_ state: FoldedState) throws {
+        try withConnection { connection in
+            try connection.execute(
+                "UPDATE _epoch SET folded_state = ? WHERE doc_id = ?",
+                [.text(state.encoded()), .text(docId)]
+            )
+        }
+    }
+
+    /// Nothing is known about what the merged view was folded from.
+    public func clearFoldedState() throws {
+        try withConnection { connection in
+            try connection.execute(
+                "UPDATE _epoch SET folded_state = NULL WHERE doc_id = ?", [.text(docId)]
             )
         }
     }
@@ -1046,6 +1140,9 @@ public final class Format2RecordStore: @unchecked Sendable {
         try withConnection { connection in
             try connection.transaction {
                 if try chunkIsComplete(buildId: buildId, ordinal: ordinal) { return 0 }
+                // #3782 — base rows replace what the overlay fold wrote; the
+                // load's closing catch-up stamps the store again.
+                try clearFoldedState()
                 var applied = 0
                 if try isHydrated(model) {
                     for entry in entries {
@@ -1231,6 +1328,8 @@ public final class Format2RecordStore: @unchecked Sendable {
                 try connection.execute(
                     "DELETE FROM _query_projection WHERE doc_id = ?", [.text(docId)]
                 )
+                // #3782 — nothing is folded any more.
+                try clearFoldedState()
             }
         }
     }

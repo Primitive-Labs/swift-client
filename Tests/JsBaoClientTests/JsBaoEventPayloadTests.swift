@@ -53,6 +53,10 @@ final class JsBaoEventPayloadTests: XCTestCase {
                 code: .documentOfflineWindowExpired, message: "past the window"
             )
         ),
+        DocumentFormatMismatchEvent(
+            documentId: "d1", declared: 1, actual: 2,
+            error: JsBaoError(code: .documentFormatMismatch, message: "format 2")
+        ),
         DocumentOfflineWritesResolvedEvent(
             documentId: "d1", epoch: 5,
             notices: [

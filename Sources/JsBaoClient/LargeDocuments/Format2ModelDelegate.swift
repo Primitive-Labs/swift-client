@@ -59,6 +59,20 @@ final class Format2ModelDelegate: @unchecked Sendable {
     /// The documents this read may answer from: this one.
     private var scope: [String] { [binding.documentId] }
 
+    /// This document, NARROWED by what the caller asked for (#3760).
+    ///
+    /// The query tables hold every large document of the store, so this
+    /// delegate's own document is the ceiling — a member of A must never
+    /// answer B's rows. Within that, `documents` means what it means
+    /// everywhere else: naming another document narrows to nothing, and an
+    /// explicit empty list matches nothing. Before #3760 the caller's value
+    /// was simply overwritten here, so a read asking for B was answered with
+    /// A's rows; now the two disagree loudly (empty) rather than quietly.
+    private func scope(narrowedTo requested: [String]?) -> [String] {
+        guard let requested else { return scope }
+        return requested.contains(binding.documentId) ? scope : []
+    }
+
     /// Refuse a filtered read this model cannot answer.
     ///
     /// The rows live in the query tables and a fold keeps them current; if the
@@ -107,7 +121,7 @@ final class Format2ModelDelegate: @unchecked Sendable {
         try requireProjection()
         return try binding.projection.engine.query(
             modelName: modelName, filter: filter,
-            options: Self.scoped(options, to: scope),
+            options: Self.scoped(options, to: scope(narrowedTo: options?.documents)),
             stringsetFields: stringSetFieldSet
         )
     }
@@ -118,7 +132,7 @@ final class Format2ModelDelegate: @unchecked Sendable {
         try requireProjection()
         return try binding.projection.engine.queryPaged(
             modelName: modelName, filter: filter,
-            options: Self.scoped(options, to: scope),
+            options: Self.scoped(options, to: scope(narrowedTo: options?.documents)),
             stringsetFields: stringSetFieldSet
         )
     }
@@ -133,9 +147,11 @@ final class Format2ModelDelegate: @unchecked Sendable {
 
     func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
         try requireProjection()
+        var narrowed = options
+        narrowed.documents = scope(narrowedTo: options.documents)
         return try binding.projection.engine.aggregate(
-            modelName: modelName, options: options,
-            stringsetFields: stringSetFieldSet, documents: scope
+            modelName: modelName, options: narrowed,
+            stringsetFields: stringSetFieldSet, documents: narrowed.documents
         )
     }
 

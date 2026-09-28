@@ -46,6 +46,11 @@ public final class Format2Observer: @unchecked Sendable {
     /// made. What tells a late registration whether it owes one.
     private var caughtUp: Set<String> = []
     private var brokenBy: Error?
+    /// How many folds this observer has committed, drains and catch-ups alike,
+    /// and the models the last catch-up covered (#3782). Diagnostic: what a
+    /// bind that folded nothing is told apart by.
+    private var _foldCount = 0
+    private var _lastCatchUpModels: [String]?
 
     /// `internal`: the observer is wired by the document binding, never
     /// constructed by an app, and `Logger` is not public surface.
@@ -196,10 +201,18 @@ public final class Format2Observer: @unchecked Sendable {
         // observer itself is discarded with the old overlay at the move.
         if remoteFoldsSuspended { return [] }
 
-        let batch: [String: Set<ByteKey>] = lock.withLock {
+        // #3782 — the vector this drain certifies is read BEFORE the keys are
+        // taken: a transaction committing in between leaves its keys for the
+        // next drain and its items above this vector, so the stamp never
+        // vouches for an item whose key was not taken.
+        let vector = overlay.stateVector()
+        // Every key captured before the vector was read is taken below, so
+        // every registered model a catch-up (or the bind's stamp) covered is
+        // folded through it — and only those (finding 3782-C04).
+        let (batch, certified): ([String: Set<ByteKey>], [String]) = lock.withLock {
             let all = touched
             touched.removeAll()
-            return all
+            return (all, Array(caughtUp.intersection(subscriptions.keys)))
         }
         guard !batch.isEmpty else { return [] }
 
@@ -209,11 +222,15 @@ public final class Format2Observer: @unchecked Sendable {
                     guard let keys = batch[model] else { continue }
                     try fold(model: model, keys: keys)
                 }
+                // Inside the fold's own transaction: the stamp and the rows it
+                // vouches for commit together or not at all.
+                try stamp(FoldedState(vector: vector, models: certified), whole: false)
             }
         } catch {
             markBroken(error)
             throw Self.foldBroken(error)
         }
+        lock.withLock { _foldCount += 1 }
         return batch.keys.sorted()
     }
 
@@ -240,6 +257,24 @@ public final class Format2Observer: @unchecked Sendable {
         // during the catch-up for the next drain — folding it twice is
         // idempotent, folding it never is a permanently stale row.
         lock.withLock { for model in targets { touched.removeValue(forKey: model) } }
+        // #3782 — read before any value is: what lands during the catch-up is
+        // above this vector, and is the next drain's to fold and vouch for.
+        let vector = overlay.stateVector()
+        // What this catch-up certifies through `vector`: its own models, and
+        // every other caught-up model with no captured key still waiting — a
+        // key taken before the read is folded, one still pending is not
+        // (finding 3782-C04). A broken observer lost the failed batch's keys,
+        // so it vouches for nothing but what it folds here.
+        let certified: [String] = lock.withLock {
+            var models = Set(targets)
+            if brokenBy == nil {
+                let pending = Set(touched.keys).subtracting(targets)
+                models.formUnion(
+                    caughtUp.intersection(subscriptions.keys).subtracting(pending)
+                )
+            }
+            return Array(models)
+        }
         do {
             try store.transaction {
                 for model in targets {
@@ -249,12 +284,19 @@ public final class Format2Observer: @unchecked Sendable {
                         try store.applyRemote(model: model, entry: entry)
                     }
                 }
+                // Whole model maps were folded: the stamp may be the first
+                // thing to vouch for these models, in the fold's transaction.
+                try stamp(FoldedState(vector: vector, models: certified), whole: true)
             }
         } catch {
             markBroken(error)
             throw Self.foldBroken(error)
         }
-        lock.withLock { caughtUp.formUnion(targets) }
+        lock.withLock {
+            caughtUp.formUnion(targets)
+            _foldCount += 1
+            _lastCatchUpModels = targets.sorted()
+        }
         // The fold-broken state is the DOCUMENT's, so only a catch-up that
         // covered every registered model repaired it. A partial one — the
         // catch-up a model registered after the bind runs — folded its own
@@ -275,6 +317,59 @@ public final class Format2Observer: @unchecked Sendable {
     public func catchUpIfNeeded(model: String) throws {
         guard lock.withLock({ !caughtUp.contains(model) }) else { return }
         try catchUp(models: [model])
+    }
+
+    /// Record that `models` need no catch-up: the store's folded state already
+    /// covers them at this overlay's vector (#3782). What lets a bind that
+    /// folded nothing stay that way through each model's registration.
+    public func markCaughtUp(_ models: [String]) {
+        lock.withLock { caughtUp.formUnion(models) }
+    }
+
+    /// Whether a catch-up — or a bind that found nothing to fold — has
+    /// covered `model`.
+    public func hasCaughtUp(_ model: String) -> Bool {
+        lock.withLock { caughtUp.contains(model) }
+    }
+
+    /// Folds committed so far, drains and catch-ups alike (#3782).
+    var foldCount: Int { lock.withLock { _foldCount } }
+
+    /// The models the last catch-up folded whole, or `nil` when none has run.
+    var lastCatchUpModels: [String]? { lock.withLock { _lastCatchUpModels } }
+
+    /// Stamp what a fold that has just written its rows certifies. Inside
+    /// the fold's transaction.
+    ///
+    /// - An overlay behind the stored vector on any client has just folded
+    ///   older values under keys the stamp vouches for newer ones of: nothing
+    ///   is certified any more, and the next bind folds the whole overlay
+    ///   (finding 3782-C05). The rows are already written, so the stamp goes
+    ///   with them rather than staying to vouch for them.
+    /// - A merge that would carry a model this fold did not certify to a newer
+    ///   vector is replaced by exactly what it certified (finding 3782-C04).
+    /// - Otherwise the store's own merge, under its guard.
+    private func stamp(_ offered: FoldedState, whole: Bool) throws {
+        let docState = overlay.stateVector()
+        if let held = try store.foldedState() {
+            guard FoldedState.isAtOrAhead(docState, of: held.vector) else {
+                try store.clearFoldedState()
+                logger?.warn(
+                    "[format2]", store.documentId,
+                    "— folded from an overlay behind the store; the next open folds the whole overlay"
+                )
+                return
+            }
+            if !held.mergeKeepsEveryModel(offered) {
+                if offered.models.isEmpty {
+                    try store.clearFoldedState()
+                } else {
+                    try store.replaceFoldedState(offered)
+                }
+                return
+            }
+        }
+        try store.noteFoldedState(offered, docState: docState, whole: whole)
     }
 
     private func fold(model: String, keys: Set<ByteKey>) throws {

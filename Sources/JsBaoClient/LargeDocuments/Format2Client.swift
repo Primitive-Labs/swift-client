@@ -320,10 +320,11 @@ extension JsBaoClient {
         // relaunched client restores the epoch's overlay from disk, and a
         // document bound only when `epoch.info` arrived has already taken a
         // `syncStep2`. The observer sees changes from here on and knows
-        // nothing about what is already there, so the bind folds the whole
-        // overlay once. Idempotent: an overlay already folded produces the
-        // rows it produced before.
-        try binding.writePath.withOperation { try binding.observer.catchUp() }
+        // nothing about what is already there, so the bind folds what the
+        // store does not hold (#3782): nothing when the overlay is the one the
+        // store last folded, the whole overlay when nothing is known or it
+        // moved. Idempotent either way.
+        try binding.writePath.withOperation { try binding.catchUpAtBind() }
         // Then the writes a PREVIOUS instance of this client left owed (#3437,
         // behaviors 4 and 6). Swift mints its client id per instance and never
         // persists it, so those rows are invisible to this one until they are

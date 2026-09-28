@@ -623,10 +623,20 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// table. Group by `_meta_doc_id` to get per-doc rollups; omit
     /// grouping for a single global rollup.
     public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
-        // `AggregateOptions` carries no document scope, so there is nothing to
-        // narrow by: every connected member is in scope, which is the question
-        // the caller asked.
-        if let (projection, scope) = try format2Route(nil) {
+        // Routed on the documents the caller ASKED for (#3760), exactly as
+        // `query` and `count` are: a read scoped to one kind is answerable
+        // however many documents of the other kind happen to be open, and a
+        // read that names an ordinary document beside a large one is the mix
+        // no single statement can serve.
+        //
+        // `scope` is that request narrowed to this model's CONNECTED large
+        // members, and the engine intersects it with `options.documents` — so a
+        // request naming a document this model no longer holds answers nothing
+        // from it, which is what `query` answers for the same request. The query
+        // tables keep a closed document's rows (#3756), so the narrowing is what
+        // stands between the two reads agreeing and not.
+        let requested = QueryOptions(documents: options.documents)
+        if let (projection, scope) = try format2Route(requested) {
             return try projection.engine.aggregate(
                 modelName: schema.name, options: options,
                 stringsetFields: stringsetFieldNames, documents: scope

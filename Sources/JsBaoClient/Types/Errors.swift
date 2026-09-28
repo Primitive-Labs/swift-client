@@ -114,6 +114,20 @@ public enum JsBaoErrorCode: String, Sendable {
     /// sync restores writes. `details` carry `lastSyncAt`, `windowDays` and
     /// `overdueMs`. The JS client's own code string.
     case documentOfflineWindowExpired = "DOCUMENT_OFFLINE_WINDOW_EXPIRED"
+    // Appended rather than filed beside `clientUpgradeRequired`, which is where
+    // it belongs by subject: a case INSERTED into this enum shifts every later
+    // case's ordinal, and SwiftPM does not recompile a test object whose library
+    // signatures moved underneath it — so a stale incremental build reads every
+    // code after the insertion point as its neighbour (#3436's linker hazard,
+    // sixty tests' worth of it). At the end, nothing that already exists moves.
+    /// This client opened a document as one format and the platform resolved the
+    /// other (#3764). The document is NOT served: a format-2 client fed ordinary
+    /// sync frames, or a format-1 client fed `epoch.info`, is a client silently
+    /// reading the wrong document. Unlike `clientUpgradeRequired` the connection
+    /// is not closed — the disagreement is about one document — and the document
+    /// is closed under the app with its store intact. `details` carry
+    /// `documentId`, `declared` and `actual`. The JS client's code, verbatim.
+    case documentFormatMismatch = "DOCUMENT_FORMAT_MISMATCH"
 }
 
 /// Main error type for the JsBao client library

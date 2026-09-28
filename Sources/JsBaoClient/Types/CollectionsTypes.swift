@@ -45,7 +45,7 @@ public struct CollectionInfo: Decodable, Sendable, Equatable {
     /// collections not bound to any context. Immutable after create.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `CollectionInfo.contextId`.
-    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
+    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
     public let contextId: String?
     public let documentCount: Int
     public let createdAt: String
@@ -150,10 +150,10 @@ public struct CreateCollectionParams: Encodable, Sendable {
     /// `collection.contextId`. Must not contain `"#"`. Immutable after create.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `CreateCollectionParams.contextId`.
-    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
+    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
     public var contextId: String? = nil
     /// Create-time resource metadata to stamp on the new collection, keyed by
-    /// category name → that category's values (issue #1420). Each entry is
+    /// category name → that category's values. Each entry is
     /// schema-validated but the category `writeRule` is waived — creation
     /// authority covers the initial stamp. At most 10 categories; any invalid
     /// entry fails the whole create.
@@ -183,7 +183,7 @@ public struct CreateCollectionParams: Encodable, Sendable {
     /// `CreateCollectionParams(…, contextId:)` call sites receive the
     /// deprecation warning. `contextId` has no default here so it does not
     /// collide with the non-deprecated initializer when omitted.
-    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420): define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
+    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
     public init(
         name: String,
         description: String? = nil,

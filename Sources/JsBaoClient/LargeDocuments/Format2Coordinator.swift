@@ -3122,6 +3122,48 @@ public final class Format2DocumentBinding: @unchecked Sendable {
         for notify in listeners { notify() }
     }
 
+    // MARK: - The bind's catch-up (#3782)
+
+    /// Fold what this document's overlay holds that the store does not.
+    ///
+    /// The bind used to fold every registered model's WHOLE overlay, on every
+    /// open. Now it asks the store what it last folded:
+    ///
+    /// - the overlay's vector equals the stored one and every registered model
+    ///   is covered — nothing is folded, and the observer is told those models
+    ///   are caught up, so a registration folds nothing either;
+    /// - the vector is equal but some models were never covered — each of
+    ///   those is caught up on its own;
+    /// - nothing is known, the vectors differ, or the fold is broken — the
+    ///   whole catch-up, as before. That is also the repair of a crash between
+    ///   the Y.Doc's persist and its fold's commit, which leaves the overlay
+    ///   ahead of the stamp.
+    ///
+    /// A document whose local row says format 2 binds at open, before any
+    /// frame from the room, so what arrives after this is the observer's to
+    /// fold incrementally. Call it under the document's operation lock.
+    @discardableResult
+    func catchUpAtBind() throws -> Format2BindCatchUp {
+        let models = observer.registeredModels()
+        if !observer.isFoldBroken,
+           let stored = try store.foldedState(),
+           stored.vector == overlay.stateVector() {
+            let uncovered = models.filter { !stored.models.contains($0) }
+            observer.markCaughtUp(models.filter { stored.models.contains($0) })
+            if uncovered.isEmpty {
+                logger?.debug(
+                    "[format2]", documentId,
+                    "— the overlay is unchanged since the last fold; the bind folds nothing"
+                )
+                return .skipped
+            }
+            try observer.catchUp(models: uncovered)
+            return .partial(uncovered)
+        }
+        try observer.catchUp()
+        return .whole(models)
+    }
+
     // MARK: - Model registration
 
     /// Take `schema` into this document: watch its overlay map, fold whatever

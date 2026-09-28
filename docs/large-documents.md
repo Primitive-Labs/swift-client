@@ -56,6 +56,46 @@ written: no metadata row, no pending create, no classification, no event. The
 JavaScript client refuses it at create with the same code,
 `LOCAL_ONLY_UNSUPPORTED_OPTION`.
 
+### Behind an alias
+
+The two alias creates carry the same option, and the same `tags` and `metadata`,
+so a singleton document — "this user's ledger" — can be a tagged large document
+made in one call. `CreateWithAliasOptions` fails if the alias is already bound;
+`GetOrCreateWithAliasOptions` is idempotent.
+
+```swift
+let result = try await client.documents.getOrCreateWithAlias(
+    options: GetOrCreateWithAliasOptions(
+        alias: AliasRef(scope: .user, aliasKey: "ledger"),
+        title: "Ledger",
+        tags: ["ledger"],
+        documentFormat: 2
+    )
+)
+// `created` is true on the call that made it, false on every later one.
+// `documentFormat` is 2 either way; `tags` and `metadata` are echoed only by
+// the call that applied them.
+let documentId = result.documentId
+```
+
+Each option applies **when the call creates the document**. On
+`getOrCreateWithAlias` a stated `documentFormat` is read twice over: it is also a
+statement about the document the alias already names, so a stored format that
+differs fails with server code `DOCUMENT_FORMAT_MISMATCH` (`HttpError
+.serverCode`) and creates nothing, while one that agrees is echoed back. State no
+format and an existing binding is answered as it always has been. An alias whose
+document has since been deleted fails `Document not found` rather than answering
+a success that names no format.
+
+One thing to know if you build a request body by hand: all three create routes —
+`POST /documents`, `create-with-alias` and `get-or-create-with-alias` — now
+**refuse** a top-level key they do not read, with server code
+`VALIDATION_FAILED` and a `details` entry naming it. The typed options above send
+only keys the routes read, so this reaches you only through a hand-built body.
+For the same reason `CreateDocumentOptions` no longer encodes `localOnly`: it is
+a client-side flag the server never read, and sending it would now be refused.
+The property is unchanged — only what goes on the wire.
+
 ## What the client does behind that
 
 - **It declares what it reads.** Every `syncStep1` carries `formats: [1, 2]` and
@@ -66,6 +106,19 @@ JavaScript client refuses it at create with the same code,
   `JsBaoError(code: .clientUpgradeRequired)` from the waiting `openDocument`,
   and it does **not** reconnect on 4426 — the refusal is of this client build,
   not of this moment.
+- **It declares what it believes this document IS.** Every `syncStep1` also
+  carries `documentFormat` when the local row names one — `1` or `2`, absent
+  when nothing knows — and the room refuses a disagreement rather than serving
+  the document in the wrong shape. That refusal is **not** the one above: it is
+  about ONE document, so the socket stays up and every other document on it
+  keeps syncing. A waiting `openDocument` throws
+  `JsBaoError(code: .documentFormatMismatch)` with `documentId`, `declared` and
+  `actual` in `details`; a document with no open waiting is closed under the app
+  with its store and its unacknowledged writes intact. Either way
+  `DocumentFormatMismatchEvent` (`document:format-mismatch`) carries the same
+  fields. Read `declared` and `actual` and the server's
+  `Document format disagreement` line before acting: evicting the document
+  clears a stale local row, and HIDES a format the platform has mis-pinned.
 - **It raises the socket's receive limit.** `epoch.info` grows with the sealed
   chain, so it is the frame most likely to exceed Foundation's 1 MiB default,
   and `URLSessionWebSocketTask` fails the *receive* rather than the handler on
@@ -115,7 +168,12 @@ Two rules are worth knowing:
   large document at once cannot answer an unscoped `query`/`count`/`aggregate`
   — the rows live in different engines — and refuses with
   `JsBaoError(code: .format2QueryScope)`. Scope the read to the documents you
-  mean. With members of one kind only, nothing changes.
+  mean: `query` and `count` take `QueryOptions(documents:)` and `aggregate`
+  takes `AggregateOptions(documents:)` (#3760), which means the same thing — a
+  list of documents, with an explicit empty list matching nothing. On a model
+  bound to ONE document the option narrows rather than replaces, exactly as it
+  does on `query`: naming another document answers nothing rather than that
+  document's rows. With members of one kind only, nothing changes.
 
 ## The cold load
 
@@ -422,6 +480,26 @@ than answering from a fragment.
 
 A resumed load does not pay twice for chunks it has already committed.
 
+## Reopening one
+
+A document this client has held before is bound when it is opened, before any
+frame from the room, over the overlay the client persisted. The bind no longer
+folds that whole overlay every time. The store keeps the overlay's state vector
+at the last fold, and the models that fold covered, beside the epoch mark
+(`_epoch.folded_state`, in the same form the JavaScript client writes), and
+every fold stamps it in its own transaction. When the overlay is unchanged
+since the last fold and every registered model is covered, the bind folds
+nothing, and registering those models folds nothing either; a model the stamp
+never covered is caught up on its own. When nothing is known — a first open,
+a store whose rows came from a base load — or the overlay moved since the last
+fold (the window a crash can leave between the document's persist and its
+fold), the bind folds the whole overlay once, as it always did, and stamps it.
+Everything that arrives afterwards is folded incrementally as it lands.
+
+An existing database is migrated in place on its first open with this build:
+the column is added and every row is kept, and that first open folds the whole
+overlay once.
+
 ## When the local view cannot be trusted
 
 If a fold of an arriving update fails — a SQL error, a disk error — the merged
@@ -457,6 +535,7 @@ cheap. Two calls remove a large document's local data:
 | `.format2SnapshotLoadIncomplete` | a load could not be made complete |
 | `.documentOfflineWindowExpired` | a local write past the offline window |
 | `.localOnlyUnsupportedOption` | `documentFormat: 2` asked for with `localOnly: true` |
+| `.documentFormatMismatch` | this client opened one document as the wrong format |
 
 They are the JS client's codes, spelled the same way on the wire.
 
