@@ -1,5 +1,5 @@
 import XCTest
-@testable import SwiftBaoCodegen
+@testable import swift_bao_codegen
 
 /// The generated read facade must not drop a row on the floor (#2825).
 ///

@@ -413,7 +413,12 @@ final class OfflineTests: XCTestCase {
             map1.updateValue("Alice", forKey: "name", transaction: txn)
             map1.updateValue("alice@test.com", forKey: "email", transaction: txn)
         }
-        try await delay(2) // Allow sync
+        // The server has our write, so the evict guard lets the eviction
+        // through. `closeDocument` polls `checkStateVector` for only 500 ms and
+        // keeps the local data when the server has not confirmed by then, so a
+        // fixed delay here was a load-dependent race against that guard (the
+        // same wait `PersistenceTests` takes before its evicting close).
+        try await client.waitForWriteConfirmation(documentId: docId)
 
         // Close with eviction
         await client.closeDocument(docId, options: CloseDocumentOptions(evictLocal: true))

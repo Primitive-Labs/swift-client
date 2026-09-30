@@ -19,8 +19,11 @@ public struct DocumentBlobListResult: Decodable, Sendable {
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
-    public let cursor: String?
+    /// Deprecated alias of `nextCursor` kept for one deprecation window
+    /// (#1316, #1982). Computed from `nextCursor` so the type's own
+    /// initializers never reference the deprecated declaration.
+    @available(*, deprecated, message: "Use nextCursor.")
+    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
         case items, cursor, nextCursor, hasMore
@@ -35,7 +38,6 @@ public struct DocumentBlobListResult: Decodable, Sendable {
         self.items = items
         let next = nextCursor ?? cursor
         self.nextCursor = next
-        self.cursor = next
         self.hasMore = hasMore ?? (next != nil)
     }
 
@@ -46,7 +48,6 @@ public struct DocumentBlobListResult: Decodable, Sendable {
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
             ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
-        cursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
 }

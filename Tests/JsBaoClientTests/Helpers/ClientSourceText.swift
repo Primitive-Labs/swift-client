@@ -51,11 +51,29 @@ enum ClientSourceText {
         try String(contentsOf: packageRoot.appendingPathComponent(relativePath), encoding: .utf8)
     }
 
-    /// A file relative to the repository root, one level above the package.
-    static func repoFile(_ relativePath: String) throws -> String {
+    /// The directory one level above the package. In the monorepo that is the
+    /// repository root; in the published SwiftPM mirror it is wherever the
+    /// standalone checkout happens to sit.
+    static var repoRoot: URL {
         var repo = packageRoot
         repo.deleteLastPathComponent()
-        return try String(contentsOf: repo.appendingPathComponent(relativePath), encoding: .utf8)
+        return repo
+    }
+
+    /// A file relative to the repository root, one level above the package.
+    static func repoFile(_ relativePath: String) throws -> String {
+        try String(contentsOf: repoRoot.appendingPathComponent(relativePath), encoding: .utf8)
+    }
+
+    /// Whether this package is being tested inside the monorepo rather than in
+    /// the standalone SwiftPM mirror. `scripts/publish-swift-packages.sh` syncs
+    /// `swift-client/` *with* its tests but nothing above it, so a check that
+    /// reads a repo-root file has nothing to read there. Tests that make such a
+    /// claim skip when this is false — see `TransportSpineTests`' app-layer
+    /// scan for the same shape. The marker is the pnpm workspace manifest: it
+    /// is the monorepo's root by definition and is never published.
+    static var isMonorepoCheckout: Bool {
+        FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("pnpm-workspace.yaml").path)
     }
 
     /// Every `.swift` file under `Sources/JsBaoClient`, verbatim.

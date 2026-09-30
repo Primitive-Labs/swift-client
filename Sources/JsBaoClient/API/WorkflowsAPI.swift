@@ -339,7 +339,11 @@ public final class WorkflowsAPI: @unchecked Sendable {
             error: untyped.error,
             run: untyped.run,
             // #2636 — same reason as the typed run-sync result above.
-            skipReason: untyped.skipReason
+            skipReason: untyped.skipReason,
+            // #3388 — the slice block rides the typed read too.
+            slice: untyped.slice,
+            // #3449 — and so does the structured failure.
+            failure: untyped.failure
         )
     }
 
@@ -364,7 +368,11 @@ public final class WorkflowsAPI: @unchecked Sendable {
             output: try Self.decodeTypedOutput(untyped.output),
             error: untyped.error,
             run: untyped.run,
-            skipReason: untyped.skipReason
+            skipReason: untyped.skipReason,
+            // #3388 — the slice block rides the typed read too.
+            slice: untyped.slice,
+            // #3449 — and so does the structured failure.
+            failure: untyped.failure
         )
     }
 
@@ -693,7 +701,12 @@ public final class WorkflowsAPI: @unchecked Sendable {
                         // #2636 — an elided run's frame carries the reason
                         // instead of an error, so the event path reports the
                         // same shape the reconcile path does.
-                        skipReason: event.skipReason
+                        skipReason: event.skipReason,
+                        // #3449 — the frame carries a STRING error where the
+                        // poll carries an object, so the two settle paths
+                        // reported different things about the same failed run.
+                        // Built by the one rule, they no longer do.
+                        failure: WorkflowRunError.read(event.error.map(JSONValue.string))
                     )))
                 }
 
@@ -750,7 +763,12 @@ public final class WorkflowsAPI: @unchecked Sendable {
             status: base.status,
             output: try Self.decodeTypedOutput(base.output),
             error: base.error,
-            skipReason: base.skipReason
+            skipReason: base.skipReason,
+            // #3449 — forwarded from the untyped wait. Without it the
+            // initializer rebuilds a message-only failure out of `error`, so
+            // typing the output would quietly cost the caller the name and
+            // the details the untyped wait had already decoded.
+            failure: base.failure
         )
     }
 
@@ -808,7 +826,9 @@ public final class WorkflowsAPI: @unchecked Sendable {
                     status: stored,
                     output: res.output,
                     error: res.error,
-                    skipReason: res.skipReason
+                    skipReason: res.skipReason,
+                    // #3449 — forwarded from the LAST read inside the window.
+                    failure: res.failure
                 )
             }
             attempts += 1
@@ -857,7 +877,9 @@ public final class WorkflowsAPI: @unchecked Sendable {
             status: res.status,
             output: res.output,
             error: res.error,
-            skipReason: res.skipReason
+            skipReason: res.skipReason,
+            // #3449 — the structured failure the status read already decoded.
+            failure: res.failure
         )
     }
 

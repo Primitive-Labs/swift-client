@@ -41,8 +41,32 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// persisted or sent over the wire.
     public static let legacyDefaultDocId = "__legacy_default__"
 
-    private var db: OpaquePointer?
+    /// Where this engine's statements run.
+    ///
+    /// Two backings, and the difference is the whole of #3436's behavior 13.
+    private enum Backing {
+        /// The in-memory mirror this engine has always been: its own handle,
+        /// serialized by `lock`, rebuilt from the Y.Maps every session.
+        case owned(OpaquePointer?)
+        /// The storage provider's OWN connection, on its own serial queue —
+        /// the file-backed tables a large document's rows are projected into
+        /// (#3436, decision 3436-SO-05). Never a second handle on the same
+        /// file: that is the `SQLITE_BUSY` class `setupStorage`'s comment
+        /// records. A statement issued while the record store holds a
+        /// transaction is part of THAT transaction, which is what lets a
+        /// projected row commit with its merged row.
+        case host(any Format2SqlHost)
+    }
+
+    private let backing: Backing
     private let lock = NSLock()
+
+    /// Whether this engine writes to a storage provider's own database rather
+    /// than to a private in-memory mirror.
+    internal var isHostBacked: Bool {
+        if case .host = backing { return true }
+        return false
+    }
 
     /// Test-only counter: incremented on every successful single-row
     /// write (`upsertRecord` / `deleteRecord`). Tests assert that a
@@ -95,24 +119,91 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
     public init() {
         var db: OpaquePointer?
+        self.logger = nil
         // Use in-memory SQLite for query indexing (separate from persistence)
         if sqlite3_open(":memory:", &db) == SQLITE_OK {
-            self.db = db
+            self.backing = .owned(db)
             // Enable WAL for concurrent reads.
-            execute("PRAGMA journal_mode=WAL")
+            try? execute("PRAGMA journal_mode=WAL")
             // NORMAL is a good balance: skips fsync on every commit (fast)
             // but still syncs at WAL checkpoints (durable enough). OFF
             // disables fsync entirely and risks file-level corruption on
             // a crash, which is rarely a worthwhile trade for user data.
-            execute("PRAGMA synchronous=NORMAL")
+            try? execute("PRAGMA synchronous=NORMAL")
+        } else {
+            self.backing = .owned(nil)
         }
     }
 
+    /// An engine over a storage provider's own connection (#3436).
+    ///
+    /// The tables are the same tables, in the provider's database file rather
+    /// than in memory, so the rows survive the session — which is what makes
+    /// reopening a large document cheap — and every statement is serialized
+    /// with the record store's and the key-value store's on the provider's
+    /// queue. No PRAGMA is issued here: the connection belongs to the
+    /// provider, which has already configured it.
+    ///
+    /// **Lock order.** A read takes `lock` and then enters the provider's
+    /// queue. Nothing that runs ON that queue may take `lock` — the projection
+    /// writes (`Format2QueryProjection`) deliberately do not, which is what
+    /// keeps the two from closing a cycle.
+    public convenience init(host: any Format2SqlHost) {
+        self.init(host: host, logger: nil)
+    }
+
+    internal init(host: any Format2SqlHost, logger: Logger?) {
+        self.backing = .host(host)
+        self.logger = logger
+    }
+
     deinit {
-        if let db {
+        if case .owned(let db) = backing, let db {
             sqlite3_close(db)
         }
     }
+
+    // MARK: - Where the statements run
+
+    /// Run `body` with the handle this engine's statements go to.
+    ///
+    /// In host mode this enters the provider's serial queue for the duration
+    /// of the call: the handle is the provider's and is only valid there.
+    private func withHandle<T>(_ body: (OpaquePointer?) throws -> T) throws -> T {
+        switch backing {
+        case .owned(let db):
+            return try body(db)
+        case .host(let host):
+            return try host.withConnection { connection in
+                guard let handle = connection.rawHandle else {
+                    throw Format2SqlError.notInitialized
+                }
+                return try body(handle)
+            }
+        }
+    }
+
+    /// Run `body`, reporting a failure rather than propagating it.
+    ///
+    /// The mirror's own writes are best-effort and always have been: they are
+    /// rebuilt from the Y.Maps on the next open, and their callers
+    /// (`upsertRecord` from an observer callback, `deleteRecord` from a record
+    /// removal) have nowhere to return an error to. What changed in #3436 is
+    /// that a failure is now REPORTED instead of discarded, and that the
+    /// projection path — where a lost write is durable and would leave `query`
+    /// disagreeing with `find` for good — does not come through here at all.
+    private func reportingFailure(_ what: String, _ body: () throws -> Void) {
+        do {
+            try body()
+        } catch {
+            logger?.warn("[query-engine]", what, "failed:", error.localizedDescription)
+        }
+    }
+
+    /// Where a swallowed SQL failure is reported. `let`, so the
+    /// `@unchecked Sendable` argument above still holds with it; `nil` in
+    /// every pre-#3436 construction.
+    private let logger: Logger?
 
     // MARK: - Table Management
 
@@ -199,29 +290,31 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         }
 
         let sql = "CREATE TABLE IF NOT EXISTS \"\(tableName)\" (\(columns.joined(separator: ", ")))"
-        execute(sql)
+        reportingFailure("the table for \(modelName)") {
+            try execute(sql)
 
-        if withDocIdColumn {
-            execute("CREATE INDEX IF NOT EXISTS \"idx_\(tableName)__meta_doc_id\" ON \"\(tableName)\"(\"_meta_doc_id\")")
-        }
-        for field in fields where field.name != "id" && !stringsetFields.contains(field.name) {
-            if let allowed = indexedFields, !allowed.contains(field.name) {
-                continue
+            if withDocIdColumn {
+                try execute("CREATE INDEX IF NOT EXISTS \"idx_\(tableName)__meta_doc_id\" ON \"\(tableName)\"(\"_meta_doc_id\")")
             }
-            execute("CREATE INDEX IF NOT EXISTS \"idx_\(tableName)_\(field.name)\" ON \"\(tableName)\"(\"\(field.name)\")")
-        }
+            for field in fields where field.name != "id" && !stringsetFields.contains(field.name) {
+                if let allowed = indexedFields, !allowed.contains(field.name) {
+                    continue
+                }
+                try execute("CREATE INDEX IF NOT EXISTS \"idx_\(tableName)_\(field.name)\" ON \"\(tableName)\"(\"\(field.name)\")")
+            }
 
-        // Junction tables for stringset fields. Double-underscore
-        // delimiter (diverging from js-bao's single underscore) so
-        // `(users, posts_tags)` and `(users_posts, tags)` don't
-        // collapse to the same junction name. Collision detection
-        // below catches the remaining edge cases.
-        for field in fields where stringsetFields.contains(field.name) {
-            ensureJunctionTable(
-                modelName: modelName,
-                fieldName: field.name,
-                withDocIdColumn: withDocIdColumn
-            )
+            // Junction tables for stringset fields. Double-underscore
+            // delimiter (diverging from js-bao's single underscore) so
+            // `(users, posts_tags)` and `(users_posts, tags)` don't
+            // collapse to the same junction name. Collision detection
+            // below catches the remaining edge cases.
+            for field in fields where stringsetFields.contains(field.name) {
+                try ensureJunctionTable(
+                    modelName: modelName,
+                    fieldName: field.name,
+                    withDocIdColumn: withDocIdColumn
+                )
+            }
         }
     }
 
@@ -238,7 +331,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         modelName: String,
         fieldName: String,
         withDocIdColumn: Bool
-    ) {
+    ) throws {
         let junctionName = junctionTableName(
             modelName: modelName, fieldName: fieldName
         )
@@ -276,7 +369,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             : "PRIMARY KEY (\"parent_id\", \"value\")"
         columns.append(pk)
 
-        execute("CREATE TABLE IF NOT EXISTS \"\(junctionName)\" (\(columns.joined(separator: ", ")))")
+        try execute("CREATE TABLE IF NOT EXISTS \"\(junctionName)\" (\(columns.joined(separator: ", ")))")
     }
 
     /// Composed junction-table name.  Double underscore separator to
@@ -289,7 +382,9 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     public func rawQuery(_ sql: String, params: [Any] = []) -> [[String: JSONValue]] {
         lock.lock()
         defer { lock.unlock() }
-        return executeQuery(sql, params: params)
+        var rows: [[String: JSONValue]] = []
+        reportingFailure("a raw query") { rows = try executeQuery(sql, params: params) }
+        return rows
     }
 
     // MARK: - Data Sync
@@ -302,29 +397,30 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
         let tableName = sanitizedTableName(modelName)
 
-        // Clear existing data
-        execute("DELETE FROM \"\(tableName)\"")
+        reportingFailure("the bulk sync of \(modelName)") {
+            // Clear existing data
+            try execute("DELETE FROM \"\(tableName)\"")
 
-        guard !records.isEmpty else { return }
+            guard !records.isEmpty else { return }
 
-        // Get column names from the table
-        let columnNames = getColumnNames(tableName)
-        guard !columnNames.isEmpty else { return }
+            // Get column names from the table
+            let columnNames = try getColumnNames(tableName)
+            guard !columnNames.isEmpty else { return }
 
-        let placeholders = columnNames.map { _ in "?" }.joined(separator: ",")
-        let quotedCols = columnNames.map { "\"\($0)\"" }.joined(separator: ",")
-        let sql = "INSERT OR REPLACE INTO \"\(tableName)\" (\(quotedCols)) VALUES (\(placeholders))"
+            let placeholders = columnNames.map { _ in "?" }.joined(separator: ",")
+            let quotedCols = columnNames.map { "\"\($0)\"" }.joined(separator: ",")
+            let sql = "INSERT OR REPLACE INTO \"\(tableName)\" (\(quotedCols)) VALUES (\(placeholders))"
 
-        guard let stmt = prepare(sql) else { return }
-
-        for record in records {
-            sqlite3_reset(stmt)
-            for (idx, col) in columnNames.enumerated() {
-                bindValue(stmt, index: Int32(idx + 1), value: record[col])
+            try withStatement(sql) { stmt in
+                for record in records {
+                    sqlite3_reset(stmt)
+                    for (idx, col) in columnNames.enumerated() {
+                        bindValue(stmt, index: Int32(idx + 1), value: record[col])
+                    }
+                    sqlite3_step(stmt)
+                }
             }
-            sqlite3_step(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     /// Insert or update a single record. Called per-record from
@@ -350,36 +446,37 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         defer { lock.unlock() }
 
         let tableName = sanitizedTableName(modelName)
-        let columnNames = getColumnNames(tableName)
-        if !columnNames.isEmpty {
-            let quotedCols = columnNames.map { "\"\($0)\"" }.joined(separator: ",")
-            let placeholders = columnNames.map { _ in "?" }.joined(separator: ",")
-            let sql = "INSERT OR REPLACE INTO \"\(tableName)\" (\(quotedCols)) VALUES (\(placeholders))"
+        reportingFailure("the row for \(modelName)") {
+            let columnNames = try getColumnNames(tableName)
+            if !columnNames.isEmpty {
+                let quotedCols = columnNames.map { "\"\($0)\"" }.joined(separator: ",")
+                let placeholders = columnNames.map { _ in "?" }.joined(separator: ",")
+                let sql = "INSERT OR REPLACE INTO \"\(tableName)\" (\(quotedCols)) VALUES (\(placeholders))"
 
-            if let stmt = prepare(sql) {
-                for (idx, col) in columnNames.enumerated() {
-                    bindValue(stmt, index: Int32(idx + 1), value: record[col])
+                try withStatement(sql) { stmt in
+                    for (idx, col) in columnNames.enumerated() {
+                        bindValue(stmt, index: Int32(idx + 1), value: record[col])
+                    }
+                    sqlite3_step(stmt)
+                    _rowWriteCount += 1
                 }
-                sqlite3_step(stmt)
-                sqlite3_finalize(stmt)
-                _rowWriteCount += 1
             }
-        }
 
-        // Junction-table writes. Replace-all semantics per parent:
-        // we clear the parent's existing members before inserting the
-        // new ones. Scoped by `_meta_doc_id` when the main row carries
-        // one — otherwise scoped only by `parent_id`.
-        let parentId = record["id"]?.stringValue ?? ""
-        let docId = record["_meta_doc_id"]?.stringValue
-        for (fieldName, members) in stringsets {
-            writeJunction(
-                modelName: modelName,
-                fieldName: fieldName,
-                parentId: parentId,
-                docId: docId,
-                members: members
-            )
+            // Junction-table writes. Replace-all semantics per parent:
+            // we clear the parent's existing members before inserting the
+            // new ones. Scoped by `_meta_doc_id` when the main row carries
+            // one — otherwise scoped only by `parent_id`.
+            let parentId = record["id"]?.stringValue ?? ""
+            let docId = record["_meta_doc_id"]?.stringValue
+            for (fieldName, members) in stringsets {
+                try writeJunction(
+                    modelName: modelName,
+                    fieldName: fieldName,
+                    parentId: parentId,
+                    docId: docId,
+                    members: members
+                )
+            }
         }
     }
 
@@ -391,7 +488,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         parentId: String,
         docId: String?,
         members: [String]
-    ) {
+    ) throws {
         let junction = junctionTableName(
             modelName: modelName, fieldName: fieldName
         )
@@ -402,13 +499,12 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         if docId != nil {
             deleteSQL += " AND \"_meta_doc_id\" = ?"
         }
-        if let stmt = prepare(deleteSQL) {
+        try withStatement(deleteSQL) { stmt in
             sqlite3_bind_text(stmt, 1, (parentId as NSString).utf8String, -1, nil)
             if let docId {
                 sqlite3_bind_text(stmt, 2, (docId as NSString).utf8String, -1, nil)
             }
             sqlite3_step(stmt)
-            sqlite3_finalize(stmt)
         }
 
         guard !members.isEmpty else { return }
@@ -423,21 +519,21 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             placeholders = "?, ?"
         }
         let insertSQL = "INSERT OR IGNORE INTO \"\(junction)\" (\(colList)) VALUES (\(placeholders))"
-        guard let stmt = prepare(insertSQL) else { return }
-        for member in members {
-            sqlite3_reset(stmt)
-            var idx: Int32 = 1
-            if let docId {
-                sqlite3_bind_text(stmt, idx, (docId as NSString).utf8String, -1, nil)
+        try withStatement(insertSQL) { stmt in
+            for member in members {
+                sqlite3_reset(stmt)
+                var idx: Int32 = 1
+                if let docId {
+                    sqlite3_bind_text(stmt, idx, (docId as NSString).utf8String, -1, nil)
+                    idx += 1
+                }
+                sqlite3_bind_text(stmt, idx, (parentId as NSString).utf8String, -1, nil)
                 idx += 1
+                sqlite3_bind_text(stmt, idx, (member as NSString).utf8String, -1, nil)
+                sqlite3_step(stmt)
+                _rowWriteCount += 1
             }
-            sqlite3_bind_text(stmt, idx, (parentId as NSString).utf8String, -1, nil)
-            idx += 1
-            sqlite3_bind_text(stmt, idx, (member as NSString).utf8String, -1, nil)
-            sqlite3_step(stmt)
-            _rowWriteCount += 1
         }
-        sqlite3_finalize(stmt)
     }
 
     /// Delete a record by ID. When `scopedToDocId` is supplied, only
@@ -452,29 +548,31 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        // Junction rows first so a partially-failed delete doesn't
-        // leave stringset orphans pointing at a gone parent row.
-        for field in stringsetFields {
-            writeJunction(
-                modelName: modelName, fieldName: field,
-                parentId: id, docId: scopedToDocId,
-                members: [] // empty → pure DELETE, no INSERT
-            )
-        }
+        reportingFailure("the delete of \(modelName)/\(id)") {
+            // Junction rows first so a partially-failed delete doesn't
+            // leave stringset orphans pointing at a gone parent row.
+            for field in stringsetFields {
+                try writeJunction(
+                    modelName: modelName, fieldName: field,
+                    parentId: id, docId: scopedToDocId,
+                    members: [] // empty → pure DELETE, no INSERT
+                )
+            }
 
-        let tableName = sanitizedTableName(modelName)
-        var sql = "DELETE FROM \"\(tableName)\" WHERE \"id\" = ?"
-        if scopedToDocId != nil {
-            sql += " AND \"_meta_doc_id\" = ?"
+            let tableName = sanitizedTableName(modelName)
+            var sql = "DELETE FROM \"\(tableName)\" WHERE \"id\" = ?"
+            if scopedToDocId != nil {
+                sql += " AND \"_meta_doc_id\" = ?"
+            }
+            try withStatement(sql) { stmt in
+                sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
+                if let docId = scopedToDocId {
+                    sqlite3_bind_text(stmt, 2, (docId as NSString).utf8String, -1, nil)
+                }
+                sqlite3_step(stmt)
+                _rowWriteCount += 1
+            }
         }
-        guard let stmt = prepare(sql) else { return }
-        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
-        if let docId = scopedToDocId {
-            sqlite3_bind_text(stmt, 2, (docId as NSString).utf8String, -1, nil)
-        }
-        sqlite3_step(stmt)
-        sqlite3_finalize(stmt)
-        _rowWriteCount += 1
     }
 
     /// Sweep every junction row belonging to one docId across the
@@ -499,12 +597,21 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// the lock (the lock guards `db`, and we're operating on read
     /// queries through `executeQuery` inside `getColumnNames` which
     /// runs under the caller's lock already).
+    ///
+    /// `sortFields`, when given, names the fields cursors are minted from. Any
+    /// of them an inclusion projection omits is additionally selected under the
+    /// internal `_cursor:` alias (#3228) so the cursor carries the row's real
+    /// value rather than a false null; `queryPaged` strips those columns from
+    /// the rows it returns, so response shapes are unchanged. The fields that
+    /// got that treatment come back alongside the column list, so the callers
+    /// fold and strip exactly the columns this SELECT added.
     private func buildSelectColumnList(
         tableName: String,
         projection: [String: Int]?,
-        stringsetFields: Set<String>
-    ) throws -> String {
-        guard let projection, !projection.isEmpty else { return "*" }
+        stringsetFields: Set<String>,
+        sortFields: [String] = []
+    ) throws -> (columns: String, aliasedSortFields: [String]) {
+        guard let projection, !projection.isEmpty else { return ("*", []) }
         // Validate: no mixed include + exclude. js-bao THROWS here
         // (DocumentQueryTranslator.ts: InvalidOperatorError "Cannot mix
         // inclusion and exclusion in projection"); a precondition crash
@@ -522,7 +629,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // Column names actually present on the table. Caller already
         // holds `lock` (the deadlock we had earlier was from a second
         // `lock.lock()` here).
-        let tableCols = Set(getColumnNames(tableName))
+        let tableCols = Set(try getColumnNames(tableName))
 
         let isIncludeMode = values.contains(1)
         var selected: Set<String> = []
@@ -551,7 +658,21 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         _ = stringsetFields // stringsets don't appear in SELECT either way
 
         // Deterministic column order for readable SQL.
-        return selected.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
+        var columns = selected.sorted().map { "\"\($0)\"" }
+
+        // A sort field the projection leaves out, selected internally so the
+        // cursor can carry its real value (#3228). Stringsets have no
+        // main-table column, so they are skipped the way the projection is.
+        var aliased: [String] = []
+        for field in sortFields.sorted() where !selected.contains(field) {
+            guard tableCols.contains(field) else { continue }
+            guard !stringsetFields.contains(field) else { continue }
+            aliased.append(field)
+            columns.append(
+                "\"\(field)\" AS \"\(CursorManager.sortValueAlias(field))\""
+            )
+        }
+        return (columns.joined(separator: ", "), aliased)
     }
 
     /// After a main-table SELECT, fill each row's stringset fields
@@ -646,7 +767,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
         // Check junction schema for `_meta_doc_id` column — if absent,
         // we're in single-doc mode and query by parent_id alone.
-        let junctionCols = Set(getColumnNames(junction))
+        let junctionCols = Set((try? getColumnNames(junction)) ?? [])
         let hasDocId = junctionCols.contains("_meta_doc_id")
 
         // Build one SELECT per batch. Chunk IN-list if very large to
@@ -662,7 +783,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
             let selectList = hasDocId ? "\"_meta_doc_id\", \"parent_id\", \"value\"" : "\"parent_id\", \"value\""
             let sql = "SELECT \(selectList) FROM \"\(junction)\" WHERE \"parent_id\" IN (\(placeholders))"
-            let resultRows = executeQuery(sql, params: chunk)
+            let resultRows = (try? executeQuery(sql, params: chunk)) ?? []
             for r in resultRows {
                 let doc = r["_meta_doc_id"]?.stringValue ?? ""
                 guard let p = r["parent_id"]?.stringValue,
@@ -691,10 +812,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 modelName: modelName, fieldName: field
             )
             let sql = "DELETE FROM \"\(junction)\" WHERE \"_meta_doc_id\" = ?"
-            if let stmt = prepare(sql) {
-                sqlite3_bind_text(stmt, 1, (scopedToDocId as NSString).utf8String, -1, nil)
-                sqlite3_step(stmt)
-                sqlite3_finalize(stmt)
+            reportingFailure("the stringset sweep of \(modelName)") {
+                try withStatement(sql) { stmt in
+                    sqlite3_bind_text(stmt, 1, (scopedToDocId as NSString).utf8String, -1, nil)
+                    sqlite3_step(stmt)
+                }
             }
         }
     }
@@ -723,10 +845,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // instead of being swallowed into `[]`, matching js-bao, which
         // throws on the same bad input.
         let tableName = sanitizedTableName(modelName)
+        var aliasedSortFields: [String] = []
         var rows: [[String: JSONValue]] = try {
             lock.lock()
             defer { lock.unlock() }
-            let (sql, params) = try buildSelectSQL(
+            let built = try buildSelectSQL(
                 tableName: tableName,
                 modelName: modelName,
                 filter: filter,
@@ -734,14 +857,22 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 scopedToDocId: scopedToDocId,
                 stringsetFields: stringsetFields
             )
-            return executeQuery(sql, params: params)
+            aliasedSortFields = built.aliasedSortFields
+            return try executeQuery(built.sql, params: built.params)
         }()
         populateStringsets(
             rows: &rows, modelName: modelName,
             stringsetFields: stringsetFields,
             projection: options?.projection
         )
-        return rows
+        // The unpaginated read mints no cursors, so the internal sort-value
+        // aliases (#3228) are of no use to it — strip them so its rows carry
+        // exactly the columns the projection asked for, as before.
+        return rows.map {
+            CursorManager.stripSortValueAliases(
+                $0, aliasedSortFields: aliasedSortFields
+            )
+        }
     }
 
     /// Paginated variant of `query`. Returns a `PaginatedResult` with
@@ -777,10 +908,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         queryOptionsWithOverLimit.limit = limit.map { $0 + 1 }
         // Scope the lock to just the base SELECT. Stringset population
         // reacquires the lock (see `query()`).
+        var aliasedSortFields: [String] = []
         var rows: [[String: JSONValue]] = try {
             lock.lock()
             defer { lock.unlock() }
-            let (sql, params) = try buildSelectSQL(
+            let built = try buildSelectSQL(
                 tableName: tableName,
                 modelName: modelName,
                 filter: filter,
@@ -788,7 +920,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 scopedToDocId: scopedToDocId,
                 stringsetFields: stringsetFields
             )
-            return executeQuery(sql, params: params)
+            aliasedSortFields = built.aliasedSortFields
+            return try executeQuery(built.sql, params: built.params)
         }()
         populateStringsets(
             rows: &rows, modelName: modelName,
@@ -804,13 +937,23 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             return false
         }()
         let isFirstPage = options?.cursor == nil
+        // Minted from the rows as they came back, including any sort value the
+        // SELECT carried under an internal alias for a field the projection
+        // omits (#3228); the aliases are stripped immediately afterwards so the
+        // rows the caller sees are unchanged.
         let (next, prev) = try CursorManager.generateResultCursors(
             rows: rows,
             sortFields: resolved.fields,
             direction: options?.direction ?? .forward,
             hasMore: hasMore,
-            isFirstPage: isFirstPage
+            isFirstPage: isFirstPage,
+            aliasedSortFields: aliasedSortFields
         )
+        rows = rows.map {
+            CursorManager.stripSortValueAliases(
+                $0, aliasedSortFields: aliasedSortFields
+            )
+        }
         // D8 (#1607) — backward pages are fetched nearest-to-cursor first
         // (`buildSelectSQL` reverses each ORDER BY direction for backward),
         // so return them in declared order: callers always see the page in
@@ -880,17 +1023,21 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         options: QueryOptions?,
         scopedToDocId: String? = nil,
         stringsetFields: Set<String> = []
-    ) throws -> (String, [Any]) {
+    ) throws -> (sql: String, params: [Any], aliasedSortFields: [String]) {
         // Projection: build an explicit column list when the caller
         // specified one. Stringset fields don't live on the main
         // table — include-mode skips them here (they're populated
         // post-query by `populateStringsets`). The existing columns
         // path below looks at table schema to fold in id and
         // _meta_doc_id even when the caller doesn't list them.
-        let selectList = try buildSelectColumnList(
+        // The sort fields go with it so a field an inclusion projection omits is
+        // still selected internally for cursor minting (#3228); which ones got
+        // that treatment is reported back to the caller.
+        let (selectList, aliasedSortFields) = try buildSelectColumnList(
             tableName: tableName,
             projection: options?.projection,
-            stringsetFields: stringsetFields
+            stringsetFields: stringsetFields,
+            sortFields: resolveSort(options: options).fields
         )
         var sql = "SELECT \(selectList) FROM \"\(tableName)\""
         var params: [Any] = []
@@ -963,7 +1110,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         // engine emits LIMIT without OFFSET and callers page with
         // `cursor` + `direction`.
         sql += " \(QueryTranslator.buildLimitOffset(limit: options?.limit, offset: nil))"
-        return (sql, params)
+        return (sql, params, aliasedSortFields)
     }
 
     /// Count records matching a filter. `scopedToDocId` restricts to
@@ -1010,7 +1157,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             sql += " WHERE \(whereParts.joined(separator: " AND "))"
         }
 
-        let results = executeQuery(sql, params: params)
+        let results = try executeQuery(sql, params: params)
         return results.first?["COUNT(*)"]?.numberValue.map { Int($0) } ?? 0
     }
 
@@ -1018,11 +1165,27 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// underlying SELECT to rows from the named doc; omit to run
     /// across every doc that's written into this engine — that's
     /// how cross-doc aggregate works on a shared store.
+    ///
+    /// `documents` is the several-document form of the same scope, mirroring
+    /// `count(documents:)` and `QueryOptions.documents`: an empty list matches
+    /// nothing. #3436 reads it for a model whose large documents are the ones
+    /// connected, where the scope is "these documents", not "this one".
+    ///
+    /// The caller's own `options.documents` (#3760) is INTERSECTED with the
+    /// parameter, which is the facade's idea of the scope, and the result is
+    /// combined with `scopedToDocId` the same way — see {@link aggregateScope}.
+    /// Preferring the caller's list over the facade's was the defect finding
+    /// 3760-REVIEW-05 names: the facade's list is the routed scope, narrowed to
+    /// the documents that are CONNECTED, and these query tables also hold the
+    /// rows of large documents that are closed (#3756 keeps them), so a request
+    /// naming a closed document answered from it where `query` — which narrows
+    /// the same request — answered nothing.
     public func aggregate(
         modelName: String,
         options: AggregateOptions,
         scopedToDocId: String? = nil,
-        stringsetFields: Set<String> = []
+        stringsetFields: Set<String> = [],
+        documents: [String]? = nil
     ) throws -> [[String: JSONValue]] {
         lock.lock()
         defer { lock.unlock() }
@@ -1037,27 +1200,101 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             stringsetFields: stringsetFields,
             stringFields: stringFieldsByModel[modelName],
             fieldTypes: fieldTypeNamesByModel[modelName],
-            scopedToDocId: scopedToDocId
+            scopedToDocIds: Self.aggregateScope(
+                boundTo: scopedToDocId,
+                documents: Self.narrow(options.documents, to: documents)
+            )
         )
-        return executeQuery(sql, params: params)
+        return try executeQuery(sql, params: params)
+    }
+
+    /// Two document scopes as one: neither may widen the other (finding
+    /// 3760-REVIEW-05).
+    ///
+    /// `nil` is "unscoped", so it never narrows; an empty list matches nothing,
+    /// which an intersection preserves. Order is the caller's, so a scope built
+    /// from the requested list keeps reading in the order it was asked for.
+    static func narrow(_ requested: [String]?, to allowed: [String]?) -> [String]? {
+        switch (requested, allowed) {
+        case (nil, nil): return nil
+        case let (requested?, nil): return requested
+        case let (nil, allowed?): return allowed
+        case let (requested?, allowed?): return requested.filter(allowed.contains)
+        }
+    }
+
+    /// The documents an aggregation may read: the bound document AND the
+    /// requested scope, never one or the other (finding 3760-R6).
+    ///
+    /// `query` and `count` add two WHERE clauses and let SQL do the AND;
+    /// `buildAggregation` takes one list, so the AND is the intersection —
+    /// the same answer by construction. An empty result is an empty list,
+    /// which `docScopeClause` emits as a false predicate.
+    static func aggregateScope(
+        boundTo scopedToDocId: String?,
+        documents: [String]?
+    ) -> [String]? {
+        switch (scopedToDocId, documents) {
+        case (nil, nil): return nil
+        case let (bound?, nil): return [bound]
+        case let (nil, requested?): return requested
+        case let (bound?, requested?):
+            return requested.contains(bound) ? [bound] : []
+        }
     }
 
     // MARK: - Raw SQL Helpers
 
-    private func execute(_ sql: String) {
-        sqlite3_exec(db, sql, nil, nil, nil)
+    /// Run a statement for effect. A failure THROWS — the result of
+    /// `sqlite3_exec` used to be discarded, which is the defect decision
+    /// 3436-SO-05 names: a projection write that failed silently leaves
+    /// `query` disagreeing with `find`, durably.
+    private func execute(_ sql: String) throws {
+        try withHandle { db in
+            var errorPointer: UnsafeMutablePointer<CChar>?
+            let rc = sqlite3_exec(db, sql, nil, nil, &errorPointer)
+            let message = errorPointer.map { String(cString: $0) }
+                ?? Self.lastError(db)
+            if errorPointer != nil { sqlite3_free(errorPointer) }
+            guard rc == SQLITE_OK else {
+                throw Format2SqlError.executionFailed(sql: sql, message: message)
+            }
+        }
     }
 
-    private func prepare(_ sql: String) -> OpaquePointer? {
+    /// Prepare a statement on `db`, or throw naming it.
+    private func prepare(_ db: OpaquePointer?, _ sql: String) throws -> OpaquePointer {
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
-            return nil
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            sqlite3_finalize(stmt)
+            throw Format2SqlError.prepareFailed(sql: sql, message: Self.lastError(db))
         }
         return stmt
     }
 
-    private func executeQuery(_ sql: String, params: [Any]) -> [[String: JSONValue]] {
-        guard let stmt = prepare(sql) else { return [] }
+    /// Prepare, run and finalize one statement, with the handle in hand.
+    private func withStatement<T>(
+        _ sql: String, _ body: (OpaquePointer) throws -> T
+    ) throws -> T {
+        try withHandle { db in
+            let stmt = try prepare(db, sql)
+            defer { sqlite3_finalize(stmt) }
+            return try body(stmt)
+        }
+    }
+
+    private static func lastError(_ db: OpaquePointer?) -> String {
+        guard let db, let message = sqlite3_errmsg(db) else { return "unknown error" }
+        return String(cString: message)
+    }
+
+    private func executeQuery(_ sql: String, params: [Any]) throws -> [[String: JSONValue]] {
+        try withStatement(sql) { stmt in try readRows(sql, stmt, params) }
+    }
+
+    private func readRows(
+        _ sql: String, _ stmt: OpaquePointer, _ params: [Any]
+    ) throws -> [[String: JSONValue]] {
 
         for (idx, param) in params.enumerated() {
             bindValue(stmt, index: Int32(idx + 1), value: param)
@@ -1066,7 +1303,14 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         var results: [[String: JSONValue]] = []
         let colCount = sqlite3_column_count(stmt)
 
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else {
+                throw Format2SqlError.executionFailed(
+                    sql: sql, message: "sqlite3_step returned \(rc)"
+                )
+            }
             var row: [String: JSONValue] = [:]
             for i in 0..<colCount {
                 let name = String(cString: sqlite3_column_name(stmt, i))
@@ -1096,7 +1340,6 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             results.append(row)
         }
 
-        sqlite3_finalize(stmt)
         return results
     }
 
@@ -1143,17 +1386,16 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         }
     }
 
-    private func getColumnNames(_ tableName: String) -> [String] {
-        var names: [String] = []
-        let sql = "PRAGMA table_info(\"\(tableName)\")"
-        guard let stmt = prepare(sql) else { return names }
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let cStr = sqlite3_column_text(stmt, 1) {
-                names.append(String(cString: cStr))
+    private func getColumnNames(_ tableName: String) throws -> [String] {
+        try withStatement("PRAGMA table_info(\"\(tableName)\")") { stmt in
+            var names: [String] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let cStr = sqlite3_column_text(stmt, 1) {
+                    names.append(String(cString: cStr))
+                }
             }
+            return names
         }
-        sqlite3_finalize(stmt)
-        return names
     }
 
     private func sanitizedTableName(_ name: String) -> String {

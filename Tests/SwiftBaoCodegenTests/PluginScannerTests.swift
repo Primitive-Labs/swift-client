@@ -1,5 +1,5 @@
 import XCTest
-@testable import SwiftBaoCodegen
+@testable import swift_bao_codegen
 
 /// Robustness tests for the SwiftPM build-tool plugin's hand-rolled
 /// mini-TOML scanner.

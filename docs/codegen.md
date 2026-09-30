@@ -1367,6 +1367,66 @@ Pinned at the encoder level in
 [`CodegenEdgeCaseTests.testNumber_NaN_encoderRefusesNonFinite`](../Tests/JsBaoClientTests/Schema/CodegenEdgeCaseTests.swift)
 and `testNumber_infinity_encoderRefusesNonFinite`.
 
+### Numbers past 2^53 travel in exponent form on the wire
+
+A `number` field is a `Double`, and any finite one saves. But the
+literal the CRDT receives is not always the one JS would print.
+
+`YrsMap.insert` parses its value with `Any::from_json(...)` in yniffi,
+and a bare integer literal — no decimal point, no exponent — takes
+that parser's integer branch, which mishandles two bands. Past
+`i64::MAX` the parse fails outright. Between `2^53` and `i64::MAX` it
+succeeds but produces an `Any::BigInt`, which yrs puts on the wire as
+lib0 type 122 and yjs decodes as a JS `bigint` — a type nothing
+downstream expects, since `JSON.stringify` throws on a BigInt and no
+`typeof value === "number"` check matches one. A JS client writing the
+same number sends a float64 instead.
+
+So `encodedForYrs()` rewrites every bare integer literal above
+`Number.MAX_SAFE_INTEGER` (`2^53 - 1`, i.e. `9007199254740991`) into
+`<significand>e<exponent>` form — `13000000000000000000` goes as
+`13e18` — which takes the parser's float branch; the stored value is
+the `f64` a JS client writing that number produces, so a doc
+round-trips and reads back identically on both clients. Everything
+else — fractions, `1e+21` and up, and every integer within the safe
+band — is byte-identical to JS.
+
+The significand is not a free choice, because that float branch is not
+correctly rounded: it reads the digits into a `u64` and computes
+`significand as f64 * 10^exponent`, so a significand past `2^53` is
+rounded before the scaling. (Appending `.0` to the JS digits, the
+obvious encoding, hits exactly that: `70338045433163640.0` comes back
+as `70338045433163632`.) The encoder therefore picks the shortest
+significand the parser's own arithmetic turns back into the `Double`
+you handed it, so a saved number reads back bit for bit and the
+unique-index key still describes what was stored.
+
+This matters only if you read the raw Y.Map string yourself:
+`PrimitiveValue.decode(yrsString:as: .number)` and the generated
+`init?(record:)` both parse either form. Note that yrs re-serializes
+an `f64` in exponential form, so reading back what you wrote as
+`13000000000000000000` gives `1.3e+19`.
+
+Above `2^64` there is a rare `Double` — about one in 1500 of them —
+that no JSON literal reaches through this parser, because no `u64`
+significand scaled by an exactly-representable power of ten lands on
+it. Saving one throws a `JsBaoError` (`.invalidArgument`) naming the
+field, before anything is written, rather than storing a neighbouring
+value: an approximate save would also leave the unique index keyed by
+a number the record does not hold. Round the value, or store exact
+integers past `2^53` in a `string` field, exactly as you would in JS.
+A schema `default` in that state is skipped, like a non-finite one —
+that path publishes metadata and has no caller to throw to.
+
+The unique-index keys are NOT adjusted — a Y.Map key is never parsed
+as JSON, and `UniqueConstraintEnforcement` keeps js-bao's
+`String(value)` bytes so a Swift-written index entry collides with a
+JS-written one for the same number.
+
+Pinned in
+[`NumberPastInt64HermeticTests`](../Tests/JsBaoClientTests/Schema/NumberPastInt64HermeticTests.swift)
+(#3456).
+
 ## Testing
 
 The codegen has two test suites in this repo, plus an on-device

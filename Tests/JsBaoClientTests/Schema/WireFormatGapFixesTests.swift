@@ -28,8 +28,9 @@ final class WireFormatGapFixesTests: XCTestCase {
         ]
     )
 
-    /// Three rows: assignee="alice", assignee="bob", assignee=NULL.
-    /// The NULL row is the gap-A/B probe.
+    /// Three rows: assignee="alice" (a), assignee="bob" (b), assignee=NULL (c).
+    /// The NULL row is the gap-A/B probe — since #3166 it is MATCHED by the
+    /// negative operators rather than excluded.
     private func seededAssignees() throws -> DynamicModel {
         SchemaSync.clearCache()
         let doc = YDocument()
@@ -76,33 +77,32 @@ final class WireFormatGapFixesTests: XCTestCase {
         return model
     }
 
-    // MARK: - A. `$ne` excludes NULL rows
+    // MARK: - A. `$ne` includes NULL rows (#3166)
 
-    func test_A_ne_excludes_null_rows() throws {
+    func test_A_ne_includes_null_rows() throws {
         let model = try seededAssignees()
         let rows = try model.query(["assignee": ["$ne": "alice"]])
-        let assignees = rows.compactMap { $0["assignee"]?.stringValue }
+        let ids = rows.compactMap { $0["id"]?.stringValue }.sorted()
         XCTAssertEqual(
-            assignees, ["bob"],
-            "$ne should match js-bao: exclude NULL rows. " +
-            "QueryTranslator.swift `$ne` previously OR'd `IS NULL`, " +
-            "which silently included missing values."
+            ids, ["b", "c"],
+            "$ne matches js-bao since #3166: a row that never wrote the " +
+            "field is not equal to any value, so the NULL row is included. " +
+            "Gap A originally removed the OR-NULL wing to match the JS " +
+            "client; both sides now follow MongoDB instead."
         )
-        XCTAssertEqual(rows.count, 1)
     }
 
-    // MARK: - B. `$nin` excludes NULL rows
+    // MARK: - B. `$nin` includes NULL rows (#3166)
 
-    func test_B_nin_excludes_null_rows() throws {
+    func test_B_nin_includes_null_rows() throws {
         let model = try seededAssignees()
         let rows = try model.query(["assignee": ["$nin": ["alice"]]])
-        let assignees = rows.compactMap { $0["assignee"]?.stringValue }
+        let ids = rows.compactMap { $0["id"]?.stringValue }.sorted()
         XCTAssertEqual(
-            assignees, ["bob"],
-            "$nin should match js-bao: exclude NULL rows. Same " +
-            "OR-NULL wing bug as `$ne`."
+            ids, ["b", "c"],
+            "$nin matches js-bao since #3166 — same absent-field semantics " +
+            "as `$ne`."
         )
-        XCTAssertEqual(rows.count, 1)
     }
 
     // MARK: - C/D/E. Substring ops on a non-string field now THROW (#1119)

@@ -43,6 +43,29 @@ final class JsBaoEventPayloadTests: XCTestCase {
         PendingCreateFailedEvent(documentId: "d1", error: "nope"),
         DocumentMetadataChangedEvent(documentId: "d1", action: "updated", source: "server"),
         DocumentSyncStateChangedEvent(documentId: "d1", state: "synced"),
+        DocumentSnapshotLoadEvent(
+            documentId: "d1", phase: .progress, epoch: 5,
+            rows: 10, totalRows: 40, chunks: 1, totalChunks: 4, model: "Note"
+        ),
+        DocumentWriteRefusedEvent(
+            documentId: "d1", model: "Note", recordId: "r1",
+            error: JsBaoError(
+                code: .documentOfflineWindowExpired, message: "past the window"
+            )
+        ),
+        DocumentFormatMismatchEvent(
+            documentId: "d1", declared: 1, actual: 2,
+            error: JsBaoError(code: .documentFormatMismatch, message: "format 2")
+        ),
+        DocumentOfflineWritesResolvedEvent(
+            documentId: "d1", epoch: 5,
+            notices: [
+                OfflineReplayNotice(
+                    model: "Note", recordId: "r1", field: "title", op: .patch,
+                    outcome: .dropped, reason: .outdated, epoch: 4, ts: 1
+                )
+            ]
+        ),
         SyncEvent(documentId: "d1", synced: true),
         SyncPerfEvent(documentId: "d1", timings: ["totalMs": 5]),
         AwarenessEvent(documentId: "d1", added: ["1"], updated: [], removed: []),
@@ -53,10 +76,12 @@ final class JsBaoEventPayloadTests: XCTestCase {
         GenericErrorEvent(scope: "ws", message: "boom"),
         MeUpdatedEvent(value: ["name": "Ada"]),
         MeUpdateFailedEvent(reason: "conflict"),
-        InvitationEvent(action: "created", invitationId: "i1", documentId: "d1", permission: "reader"),
         NotificationEvent(notificationId: "n1", title: "t", body: "b", createdAt: "2026-01-01"),
         WorkflowStatusEvent(workflowKey: "w", workflowId: "wid", runKey: "rk", runId: "rid", status: "completed"),
         WorkflowStartedEvent(workflowKey: "w", runId: "rid"),
+        ChannelMessageEvent(channel: "orders:1", payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
+        ChannelSubscribeFailedEvent(channel: "orders:1", message: "refused"),
+        DirectMessageEvent(payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
         blobProgress,
         blobCompleted,
         blobFailed,

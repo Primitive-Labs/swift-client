@@ -146,8 +146,8 @@ final class PendingSyncOperationTests: XCTestCase {
 
     /// A normal open records `immediate`; an unrecorded document keeps the
     /// pre-existing behavior; and the latest open's intent wins, which is what
-    /// makes the deferred case above work at all — a locally-created document
-    /// is already open by the time the caller opens it.
+    /// makes the deferred case above work at all — the caller can reopen a
+    /// document it has already opened and hand the timing over.
     func testOpenRecordsTheModeAndDefaultsToImmediate() async throws {
         let mgr = makeManager()
         let docId = newDocId()

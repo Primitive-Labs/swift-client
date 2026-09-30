@@ -42,8 +42,9 @@ func readCommand() -> [String: Any]? {
     }
     guard let data = line.data(using: .utf8),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        // `emitError` returns `Never` (it exits), so this branch needs no
+        // `return` — one here would be dead code (#3314).
         emitError("invalid JSON on stdin: \(line)")
-        return nil
     }
     return obj
 }
@@ -64,8 +65,8 @@ func emitError(_ message: String) -> Never {
 func decodeDoc(_ base64: String) -> YDocument {
     let doc = YDocument()
     guard let bytes = Data(base64Encoded: base64) else {
+        // `emitError` exits, so the empty `doc` is never returned from here.
         emitError("doc field is not valid base64")
-        return doc
     }
     doc.transactSync { txn in
         _ = try? txn.transactionApplyUpdate(update: Array(bytes))

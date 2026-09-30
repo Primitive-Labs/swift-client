@@ -5,10 +5,11 @@ import XCTest
 /// (consolidated from #2272).
 ///
 /// Phase D3 of #1993 gave nine analytics members an `Async` twin and a
-/// deprecation, but three entry points were rewired to the actor as
-/// fire-and-forget with neither: `AnalyticsContext.logEvent` and the
-/// `logAnalytics` closures handed to `LlmAPI` / `GeminiAPI`. This suite covers
-/// the twin, the fallback, and the closures' call-site timestamp.
+/// deprecation, but `AnalyticsContext.logEvent` was rewired to the actor as
+/// fire-and-forget with neither. This suite covers the twin, the fallback, and
+/// the call-site timestamp `prepared(_:)` keeps. (#3857 removed the direct
+/// LLM / Gemini sub-APIs, the client accessors that handed out a context, and
+/// the closures they were given; `AnalyticsContext` itself stays.)
 ///
 /// Server-free: the client is built with `autoNetwork: false` against an
 /// unreachable URL, and nothing here connects.
@@ -40,15 +41,23 @@ final class AnalyticsContextAsyncTwinTests: XCTestCase {
 
     /// `await ctx.logEventAsync(...)` returns with the event already through
     /// `ingest` — the property the synchronous member cannot offer, and the
-    /// reason the deprecation window exists.
-    func testLogEventAsyncReturnsOnlyAfterTheEventIsBuffered() async throws {
-        let client = makeClient()
-        defer { Task { await client.destroy() } }
+    /// reason the deprecation window exists. A context built over the queue
+    /// is what an app hands its own feature code.
+    func testContextLogEventAsyncReturnsOnlyAfterTheEventIsBuffered() async throws {
+        let queue = AnalyticsQueue(logger: Logger(level: .none, scope: "2244-test"))
         let box = EventBox()
-        await client.analyticsQueue.setOnEventLogged { box.append($0) }
+        await queue.setOnEventLogged { box.append($0) }
+        let context = AnalyticsContext(
+            logEvent: { _ in XCTFail("the async twin must not take the synchronous path") },
+            logEventAsync: { event in
+                await queue.logEvent(AnalyticsEventInput(
+                    action: event["action"]?.stringValue ?? "",
+                    feature: event["feature"]?.stringValue ?? ""
+                ))
+            }
+        )
 
-        let context = try XCTUnwrap(client.llmAnalyticsContext)
-        await context.logEventAsync(["action": "awaited", "feature": "llm"])
+        await context.logEventAsync(["action": "awaited", "feature": "app"])
 
         XCTAssertEqual(
             box.count, 1,
@@ -57,18 +66,22 @@ final class AnalyticsContextAsyncTwinTests: XCTestCase {
         XCTAssertEqual(box.all.first?["action"]?.stringValue, "awaited")
     }
 
-    /// The Gemini handle is the same shape — both accessors hand out the
-    /// context built by `makeAnalyticsContext()`.
-    func testGeminiContextHasTheSameTwin() async throws {
+    /// The client's own analytics surface has the same property: its
+    /// `logEventAsync` returns once the event is buffered on the client's
+    /// queue. This is the path app code logs through now that the direct
+    /// LLM / Gemini accessors are gone (#3857).
+    func testClientAnalyticsLogEventAsyncReturnsOnlyAfterTheEventIsBuffered() async throws {
         let client = makeClient()
         defer { Task { await client.destroy() } }
         let box = EventBox()
         await client.analyticsQueue.setOnEventLogged { box.append($0) }
 
-        let context = try XCTUnwrap(client.geminiAnalyticsContext)
-        await context.logEventAsync(["action": "gemini-awaited"])
+        await client.analytics.logEventAsync(
+            AnalyticsEventInput(action: "client-awaited", feature: "app")
+        )
 
         XCTAssertEqual(box.count, 1)
+        XCTAssertEqual(box.all.first?["action"]?.stringValue, "client-awaited")
     }
 
     /// An event that is not JSON-representable is dropped by `prepared(_:)` on
@@ -77,8 +90,7 @@ final class AnalyticsContextAsyncTwinTests: XCTestCase {
     /// Since #2367 the context's own closures take `[String: JSONValue]`, so an
     /// unrepresentable value cannot reach them at all. The untyped
     /// `[String: Any]` boundary the drop path guards is
-    /// `AnalyticsQueue.prepared(_:)`, which the client's context closures still
-    /// call, so the check is made there.
+    /// `AnalyticsQueue.prepared(_:)`, so the check is made there.
     func testUnrepresentableEventIsDroppedRatherThanBuffered() async throws {
         let queue = AnalyticsQueue(logger: Logger(level: .none, scope: "2367-test"))
         let box = EventBox()
@@ -179,7 +191,7 @@ final class AnalyticsContextAsyncTwinTests: XCTestCase {
         XCTAssertTrue(trailingClosure.isEnabled(), "the trailing-closure form still binds to logEvent")
     }
 
-    // MARK: - Behavior 13: the LLM / Gemini closures stamp at the call site
+    // MARK: - Behavior 13: a prepared event keeps its call-site timestamp
 
     /// The defect this fixes: an event handed straight to the actor is stamped
     /// whenever the unstructured task runs, while one lowered with `prepared(_:)`
@@ -224,23 +236,6 @@ final class AnalyticsContextAsyncTwinTests: XCTestCase {
             actorAt.timeIntervalSince(preparedAt), 1.0,
             "the un-prepared row is stamped when the actor ingests it — the behavior being fixed"
         )
-    }
-
-    /// And the client's LLM / Gemini wiring takes that fixed path: `prepared`
-    /// is called before the `Task`, not inside it.
-    func testLlmAndGeminiClosuresPrepareBeforeHandingOver() throws {
-        let source = try ClientSourceText.code("JsBaoClient.swift")
-        for api in ["llm = LlmAPI(", "gemini = GeminiAPI("] {
-            let region = try ClientSourceText.slice(source, from: api, to: "        )")
-            XCTAssertTrue(
-                region.contains("let prepared = analyticsQueue.prepared(event)"),
-                "\(api) must lower the event on the caller's thread"
-            )
-            XCTAssertTrue(
-                region.contains("Task { await analyticsQueue.logEvent(prepared) }"),
-                "\(api) must hand the prepared row to the actor"
-            )
-        }
     }
 }
 

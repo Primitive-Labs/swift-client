@@ -112,7 +112,9 @@ public struct RequestOptions: Sendable {
 public final class HttpClient: @unchecked Sendable {
     private let config: HttpClientConfig
     private let logger: Logger
-    private let session: URLSession
+    /// Module-internal rather than private so the cache settings `init` forces
+    /// on it are assertable under `@testable import` (#3170).
+    let session: URLSession
 
     public init(config: HttpClientConfig) {
         self.config = config
@@ -121,6 +123,15 @@ public final class HttpClient: @unchecked Sendable {
         let sessionConfig = config.sessionConfiguration ?? URLSessionConfiguration.default
         sessionConfig.httpCookieAcceptPolicy = .always
         sessionConfig.httpShouldSetCookies = true
+        // Never cache an authenticated response. `URLCache` keys entries by
+        // URL alone — it ignores `Authorization` — and the default cache is
+        // disk-backed on iOS, so a stored response is readable by a request
+        // carrying a different token or none, and outlives the app run
+        // unencrypted (#3170). Forced on an app-supplied configuration too:
+        // that override is what protects apps running against workers older
+        // than the server's `Cache-Control: no-store`.
+        sessionConfig.urlCache = nil
+        sessionConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: sessionConfig)
     }
 
@@ -260,6 +271,14 @@ public final class HttpClient: @unchecked Sendable {
     /// (`src/client/internal/authController.ts`); this set is the port of that
     /// behavior (#2658).
     ///
+    /// The native Sign in with Apple callback (`/auth/apple/callback`) belongs
+    /// to the same family as the native Google one (`/auth/oauth/callback`): a
+    /// signed-out client posts a single-use identity token to it. Its absence
+    /// made the two provider paths disagree — the server's own rejection code
+    /// (`ADDED_TO_WAITLIST`, `APPLE_IDENTITY_INVALID`, …) was replaced by
+    /// `HttpError(401, "Invalid credentials")`, and a sign-in attempt made with
+    /// no session emitted `authFailed` (#3084).
+    ///
     /// Authenticated passkey management (`/passkey/register/*`,
     /// `/passkey/list`, `/passkey/{id}`) is deliberately absent: those requests
     /// do carry a bearer token, so an expired one should still refresh.
@@ -274,6 +293,7 @@ public final class HttpClient: @unchecked Sendable {
         "/oauth-config",
         "/oauth/callback",
         "/auth/oauth/callback",
+        "/auth/apple/callback",
     ]
 
     /// Whether `path` is exempt from the refresh interceptor. The query string
@@ -466,6 +486,10 @@ public final class HttpClient: @unchecked Sendable {
         }
 
         var urlRequest = URLRequest(url: url)
+        // The no-cache contract travels with the request as well as the
+        // session, so a request handed to any other session still refuses to
+        // read or write a cached response (#3170).
+        urlRequest.cachePolicy = .reloadIgnoringLocalCacheData
         let upperMethod = method.uppercased()
         urlRequest.httpMethod = upperMethod
 
@@ -527,7 +551,21 @@ public final class HttpClient: @unchecked Sendable {
                 urlRequest = try buildURLRequest(method: method, path: path, body: body, options: options)
                 (responseData, response) = try await NetworkSession.data(for: urlRequest, using: session)
             case .invalid:
-                throw HttpError(status: 401, message: "Invalid credentials")
+                // #3403 — the session really is over, but the ORIGINAL 401
+                // said why. Building the error from nothing discarded the
+                // server's `code`, so the most common auth failure an app
+                // sees reached it with `serverCode == nil`. The message text
+                // stays `"Invalid credentials"` (existing suites pin it);
+                // only `body` and the parsed server fields are added.
+                let originalBody = String(data: responseData, encoding: .utf8)
+                let parsed = HttpError.parseBody(originalBody)
+                throw HttpError(
+                    status: 401,
+                    message: "Invalid credentials",
+                    body: originalBody,
+                    serverCode: parsed.code,
+                    serverMessage: parsed.message
+                )
             case .network(let underlying):
                 // A refresh that failed for transport reasons is NOT a
                 // credential problem: rethrow it as the retryable

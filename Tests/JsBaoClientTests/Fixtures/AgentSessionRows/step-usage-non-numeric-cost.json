@@ -1,0 +1,21 @@
+{
+  "model": "PrimitiveStep",
+  "row": {
+    "id": "01K6STEP00000000000000000000",
+    "turnId": "turn_1",
+    "seq": 1,
+    "kind": "model_call",
+    "status": "completed",
+    "startedAt": "2026-09-28T12:00:00.000Z",
+    "inputTokens": 10,
+    "outputTokens": 2,
+    "cost": "bad"
+  },
+  "expect": {
+    "inputTokens": 10,
+    "outputTokens": 2,
+    "cost": {
+      "$absent": true
+    }
+  }
+}

@@ -124,13 +124,23 @@ public enum JsBaoEvent: String, Sendable {
     case blobsQueueDrained = "blobs:queue-drained"
     case permission
     case meUpdated
-    case invitation
     /// Live mirror of a durable in-app notification (#779 / #1601). Payload:
     /// `NotificationEvent`. Emitted when the signed-in user receives an in-app
     /// notification while connected. Mirrors the JS client's `notification`
     /// event; fetch older rows via `client.notifications.list()`.
     case notification
     case workflowStatus
+    /// A message a server function published to a channel this client joined
+    /// (#3278). Payload: `ChannelMessageEvent`. Mirrors JS `channelMessage`.
+    case channelMessage
+    /// A channel subscribe the server refused when nothing was waiting on it
+    /// — the reconnect re-issue of an expired grant (#3278). Payload:
+    /// `ChannelSubscribeFailedEvent`. Mirrors JS `channelSubscribeFailed`.
+    case channelSubscribeFailed
+    /// A message a server function sent straight to this user or connection
+    /// with `ctx.users.send` / `ctx.connections.send` (#3278). Payload:
+    /// `DirectMessageEvent`. Mirrors JS `directMessage`.
+    case directMessage
     case documentMetadataChanged
     case pendingCreateFailed
     case authRefreshDeferred = "auth-refresh-deferred"
@@ -161,6 +171,29 @@ public enum JsBaoEvent: String, Sendable {
     case syncPerf
     case workflowStarted
     case documentSyncStateChanged
+    /// How a large document's base snapshot load is going (#3436). Mirrors the
+    /// JS client's `document:snapshot-load`.
+    case documentSnapshotLoad = "document:snapshot-load"
+    /// Every refused write on a large document past its offline window
+    /// (#3758). Raised for EVERY door — `create`, `update`, `save`, `upsert`,
+    /// the string-set verbs, `delete(id:)` and the record field setters — and
+    /// the doors that can throw throw the same error as well. The JS client's
+    /// `document:write-refused`, by that name.
+    case documentWriteRefused = "document:write-refused"
+    /// A large document that was away replayed what it wrote offline and some
+    /// of it did not simply apply (#3437, behavior 20). The JS client's
+    /// `documentOfflineWritesResolved`, by that name: an app that subscribes on
+    /// both clients subscribes to one string.
+    case documentOfflineWritesResolved
+    // Appended for the reason `JsBaoErrorCode.documentFormatMismatch` is: a case
+    // inserted into an enum shifts every later ordinal, and a stale incremental
+    // test build then reads each one as its neighbour (#3436's hazard).
+    /// The platform refused a document because the format this client believed
+    /// it had is not the format the platform resolved (#3764). The document is
+    /// closed when this arrives, with its store intact; an open that was waiting
+    /// on the network throws the same error as well. The JS client's
+    /// `document:format-mismatch`, by that name.
+    case documentFormatMismatch = "document:format-mismatch"
 
     // ── Cache lifecycle (parity with JS KvCache) ──────────────────
     /// Fires after a successful network refresh of a cached entry.
@@ -570,98 +603,6 @@ public struct WorkflowStatusEvent: @unchecked Sendable {
     }
 }
 
-/// Real-time notification that a document invitation has changed state.
-///
-/// Payload for `.invitation`
-/// (`for await e in client.stream(for: InvitationEvent.self)`).
-/// Mirrors the JS client's `InvitationEvent` (`src/client/JsBaoClient.ts`)
-/// field-for-field, including optionality.
-///
-/// **Important:** events are targeted — most actions are delivered to only
-/// one side of the invitation (inviter _or_ invitee, not both). Consumers
-/// should `switch` on `action` and handle every value, with a `default`
-/// branch for forward-compatibility (new action values may be added without
-/// a breaking change). See {@link InvitationEvent.action} on the JS side for
-/// the full targeting matrix:
-///
-/// - `"created"`   — invitee only. A new invitation was sent to them.
-/// - `"updated"`   — invitee only. An existing pending invitation changed.
-/// - `"cancelled"` — invitee only. The inviter/admin cancelled it.
-/// - `"declined"`  — both invitee and inviter. The invitee declined.
-/// - `"accepted"`  — inviter only. The invitee accepted; `acceptedBy`
-///                   carries the accepting user's `userId`.
-public struct InvitationEvent: Sendable, Equatable {
-    /// Nested document summary carried on the event. Mirrors the JS
-    /// `InvitationEvent.document` object field-for-field; every field is
-    /// optional, matching JS.
-    public struct Document: Sendable, Equatable {
-        public let documentId: String?
-        public let title: String?
-        public let tags: [String]?
-        public let createdAt: String?
-        public let lastModified: String?
-        public let createdBy: String?
-
-        public init(
-            documentId: String? = nil,
-            title: String? = nil,
-            tags: [String]? = nil,
-            createdAt: String? = nil,
-            lastModified: String? = nil,
-            createdBy: String? = nil
-        ) {
-            self.documentId = documentId
-            self.title = title
-            self.tags = tags
-            self.createdAt = createdAt
-            self.lastModified = lastModified
-            self.createdBy = createdBy
-        }
-    }
-
-    /// The lifecycle transition that just occurred. JS types this as a
-    /// closed union (`"created" | "updated" | "cancelled" | "declined" |
-    /// "accepted"`) but documents that new values may appear; Swift keeps
-    /// it as the raw `String` so an unknown server value is delivered
-    /// rather than dropped. Compare against the literals above.
-    public let action: String
-    public let invitationId: String
-    public let documentId: String
-    public let permission: String
-    public let title: String?
-    public let invitedBy: String?
-    public let invitedAt: String?
-    public let expiresAt: String?
-    /// UserId of the invitee who accepted. Populated only when
-    /// `action == "accepted"` (matches JS).
-    public let acceptedBy: String?
-    public let document: Document?
-
-    public init(
-        action: String,
-        invitationId: String,
-        documentId: String,
-        permission: String,
-        title: String? = nil,
-        invitedBy: String? = nil,
-        invitedAt: String? = nil,
-        expiresAt: String? = nil,
-        acceptedBy: String? = nil,
-        document: Document? = nil
-    ) {
-        self.action = action
-        self.invitationId = invitationId
-        self.documentId = documentId
-        self.permission = permission
-        self.title = title
-        self.invitedBy = invitedBy
-        self.invitedAt = invitedAt
-        self.expiresAt = expiresAt
-        self.acceptedBy = acceptedBy
-        self.document = document
-    }
-}
-
 /// Payload for `.notification`
 /// (`for await e in client.stream(for: NotificationEvent.self)`).
 ///
@@ -697,6 +638,72 @@ public struct NotificationEvent: Sendable, Equatable {
         self.deepLink = deepLink
         self.sourceRef = sourceRef
         self.createdAt = createdAt
+    }
+}
+
+/// Payload of `.directMessage`: a frame a server function sent straight to
+/// this user or this connection (`ctx.users.send` / `ctx.connections.send`).
+/// Mirrors the JS `DirectMessageEvent` (`src/client/JsBaoClient.ts`).
+///
+/// A LIVE frame with no durable record behind it: a client that was offline
+/// when the function ran does not receive it later. `functionKey` is the
+/// frame's only attribution — a function running in system mode acts for
+/// nobody, so there is no user to name. No subscription is involved: the
+/// frame arrives on the app socket and needs no grant. `payload` is the
+/// function's own value, passed through unread; `nil` when absent or JSON
+/// `null`.
+public struct DirectMessageEvent: Sendable, Equatable {
+    public let payload: JSONValue?
+    public let functionKey: String
+    /// When the platform sent it, ISO 8601.
+    public let sentAt: String
+
+    public init(payload: JSONValue?, functionKey: String, sentAt: String) {
+        self.payload = payload
+        self.functionKey = functionKey
+        self.sentAt = sentAt
+    }
+}
+
+/// Payload of `.channelMessage`: a message a server function published to a
+/// channel this client holds a live membership in — `channel` says which.
+/// Mirrors the JS `ChannelMessageEvent`. Like `DirectMessageEvent` it is a
+/// live frame with no durable record behind it, and `functionKey` is its
+/// only attribution.
+public struct ChannelMessageEvent: Sendable, Equatable {
+    public let channel: String
+    public let payload: JSONValue?
+    public let functionKey: String
+    /// When the platform sent it, ISO 8601.
+    public let sentAt: String
+
+    public init(channel: String, payload: JSONValue?, functionKey: String, sentAt: String) {
+        self.channel = channel
+        self.payload = payload
+        self.functionKey = functionKey
+        self.sentAt = sentAt
+    }
+}
+
+/// Payload of `.channelSubscribeFailed`: a channel subscribe the server
+/// refused when nothing was waiting on it. Mirrors the JS
+/// `ChannelSubscribeFailedEvent`.
+///
+/// The case this exists for is RECONNECT: after the socket comes back the
+/// client presents each held grant again, and a grant that expired while the
+/// connection was down is refused with no pending call to reject. The
+/// registration for that channel — and only that channel — is dropped, and
+/// this is how an app hears about it, so it can ask its authorizing function
+/// for a fresh grant and subscribe again. A refusal that answers a
+/// `subscribeToChannel` call throws from that call instead, so a failure is
+/// never announced twice. `message` is the server's uniform refusal.
+public struct ChannelSubscribeFailedEvent: Sendable, Equatable {
+    public let channel: String
+    public let message: String
+
+    public init(channel: String, message: String) {
+        self.channel = channel
+        self.message = message
     }
 }
 
@@ -792,6 +799,160 @@ public struct ConnectionErrorEvent: Sendable {
 public struct DocumentOpenedEvent: Sendable {
     public let documentId: String
     public init(documentId: String) { self.documentId = documentId }
+}
+
+/// A local mutation on a large document that was refused, reported through
+/// the one channel a non-throwing verb has (#3437, behavior 2a).
+///
+/// Raised for EVERY refused write, not only for the verbs that cannot throw
+/// (#3758). `DynamicModel.delete(id:)` is declared without `throws`, as are a
+/// `PrimitiveRecord` field assignment and an explicit clear, so for those the
+/// event is the only channel there is; `create`, `update`, `save`, `upsert`,
+/// `addMember` and `removeMember` throw the same error AND raise this, so an
+/// app handles the refusal once instead of at each call site. It is one rule
+/// with the JS client, where the same event fires under the same name.
+///
+/// Delivered after the document's operation lock has been released, so a
+/// handler may read any document — including the refusing one — without
+/// deadlocking against the write it is being told about.
+///
+/// Only ever emitted for a LARGE document: an ordinary document has no
+/// offline window and no refusal to report.
+public struct DocumentWriteRefusedEvent: Sendable {
+    public let documentId: String
+    public let model: String
+    public let recordId: String
+    /// Why, typed — `DOCUMENT_OFFLINE_WINDOW_EXPIRED` and its details today.
+    public let error: JsBaoError
+
+    public init(
+        documentId: String, model: String, recordId: String, error: JsBaoError
+    ) {
+        self.documentId = documentId
+        self.model = model
+        self.recordId = recordId
+        self.error = error
+    }
+}
+
+/// The platform and this client disagree about a document's format (#3764).
+///
+/// Fired when the room refuses a document because the format this client
+/// declared is not the one the platform resolved. The document is CLOSED when
+/// this arrives — its rows and its unacknowledged writes are kept, nothing is
+/// evicted — because a refusal has to stop the document whether or not an open
+/// was waiting on it (decision D7). An open that WAS waiting throws the same
+/// error as well.
+///
+/// Diagnose from `declared` and `actual` before acting: the server also logs
+/// `Document format disagreement` naming its own pinned format. Evicting the
+/// document clears this client's belief, which repairs a stale row and HIDES a
+/// mis-pinned document.
+///
+/// Field for field the JS client's `document:format-mismatch` payload.
+public struct DocumentFormatMismatchEvent: Sendable {
+    public let documentId: String
+    /// What this client believed, from its own local metadata row.
+    public let declared: Int
+    /// What the platform resolved for the document.
+    public let actual: Int
+    /// The very error a waiting `openDocument` throws.
+    public let error: JsBaoError
+
+    public init(documentId: String, declared: Int, actual: Int, error: JsBaoError) {
+        self.documentId = documentId
+        self.declared = declared
+        self.actual = actual
+        self.error = error
+    }
+}
+
+/// What a large document's offline writes were judged to be (#3437,
+/// behavior 20).
+///
+/// Fired when a large document that was away replays what it wrote offline and
+/// some of it did not simply apply: a write the online side clearly beat is
+/// DROPPED, and one whose order cannot be established is applied but reported.
+/// SILENCE means every offline write replayed cleanly — the event carries
+/// notices or it is not sent.
+///
+/// Field for field the JS client's `documentOfflineWritesResolved` payload, so
+/// an application that handles one handles the other.
+public struct DocumentOfflineWritesResolvedEvent: Sendable, Equatable {
+    public let documentId: String
+    /// The epoch the writes were replayed onto.
+    public let epoch: Int
+    public let notices: [OfflineReplayNotice]
+
+    public init(documentId: String, epoch: Int, notices: [OfflineReplayNotice]) {
+        self.documentId = documentId
+        self.epoch = epoch
+        self.notices = notices
+    }
+}
+
+/// How a large document's base snapshot load is going (#3436, behavior 24).
+///
+/// A cold open of a large document streams however many megabytes its base
+/// carries before the document can answer anything, so a load that reported
+/// only at the end would be indistinguishable to an application from a hang.
+/// Mirrors the JS client's `document:snapshot-load` payload field for field.
+public struct DocumentSnapshotLoadEvent: Sendable, Equatable {
+
+    public enum Phase: String, Sendable {
+        /// The manifest is in and the chunk count is known.
+        case started
+        /// One chunk landed.
+        case progress
+        /// Every chunk of one model landed: it is QUERYABLE now, not merely
+        /// downloaded.
+        case model
+        /// The whole base is in and the document has joined its epoch.
+        case loaded
+    }
+
+    public let documentId: String
+    public let phase: Phase
+    /// What this load IS. Always `"load"` on Swift: a base is installed
+    /// WHOLE, whether it is a cold start, a reload after a chain that could
+    /// not be applied, or a rebuild past a bulk load.
+    ///
+    /// The JS client also reports `"converge"`, which replaces only the ranges
+    /// a bulk load touched. Swift does not: the intent's rule for this client
+    /// is a reload from the latest snapshot, never range replacement (#3437).
+    /// Applying the sealed chain above a whole reload is the ordinary cold
+    /// path, not a range replacement, so it keeps this mode too.
+    public let mode: String
+    /// The epoch the snapshot is a base for.
+    public let epoch: Int
+    public let rows: Int
+    public let totalRows: Int
+    public let chunks: Int
+    public let totalChunks: Int
+    /// The model the event concerns, when it concerns one.
+    public let model: String?
+
+    public init(
+        documentId: String,
+        phase: Phase,
+        mode: String = "load",
+        epoch: Int,
+        rows: Int,
+        totalRows: Int,
+        chunks: Int,
+        totalChunks: Int,
+        model: String? = nil
+    ) {
+        self.documentId = documentId
+        self.phase = phase
+        self.mode = mode
+        self.epoch = epoch
+        self.rows = rows
+        self.totalRows = totalRows
+        self.chunks = chunks
+        self.totalChunks = totalChunks
+        self.model = model
+    }
 }
 
 public struct DocumentCreateCommitFailedEvent: Sendable {
@@ -923,6 +1084,13 @@ public struct WorkflowStartedEvent: Sendable {
 /// `.remoteUpdate` event (#1120): a `"synced"` change is emitted each time a
 /// remote Yjs update lands for an open document, so reload-on-remote-write
 /// loaders can subscribe here instead of `.remoteUpdate`.
+///
+/// `"error"` is emitted when an open document misses the sync handshake budget
+/// (`SyncConfig.handshakeTimeout`) — the client keeps retrying at a capped
+/// backoff, but what the app is rendering has stopped converging, so it can
+/// tell the user instead of showing stale state as if it were current (#3390).
+/// A document that recovers reports `"synced"` once, so the app can clear the
+/// warning it surfaced.
 public struct DocumentSyncStateChangedEvent: Sendable {
     public let documentId: String
     public let state: String // "syncing" | "synced" | "stale" | "error"
@@ -970,11 +1138,10 @@ public struct CacheUpdateFailedEvent: Sendable {
 
 // MARK: - Analytics context (P2)
 
-/// Bundle returned by `client.llmAnalyticsContext` /
-/// `geminiAnalyticsContext`. Lets feature code log structured
-/// analytics events without holding a direct reference to the client.
-/// Matches js-bao's shape — `logEvent(event)` plus an `isEnabled`
-/// guard for callers that want to skip work when analytics is off.
+/// A logger handle an app builds and hands its own feature code, so that code
+/// can log structured analytics events without holding a direct reference to
+/// the client — `logEvent(event)` plus an `isEnabled` guard for callers that
+/// want to skip work when analytics is off.
 public final class AnalyticsContext: Sendable {
     private let logger: @Sendable ([String: JSONValue]) -> Void
     private let asyncLogger: (@Sendable ([String: JSONValue]) async -> Void)?

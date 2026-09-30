@@ -274,9 +274,14 @@ final class JsBaoClientTests: XCTestCase {
         XCTAssertEqual(metadata["pendingCreate"], .bool(false))
         XCTAssertNotNil(metadata["createdAt"]?.stringValue, "createdAt must be stamped at create time")
 
-        // The doc itself is not in the return value (JS parity) but is
-        // already open and reachable via getDoc.
-        XCTAssertNotNil(client.getDoc(docId), "Created doc must be open and fetchable via getDoc")
+        // The document itself is not in the return value and is NOT open:
+        // create is metadata-only, as in JS (#3200). Opening is explicit, and
+        // only then is the YDocument reachable through `getDoc`.
+        XCTAssertNil(client.getDoc(docId), "create must leave the document closed")
+        _ = try await client.openDocument(
+            docId, options: OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: false)
+        )
+        XCTAssertNotNil(client.getDoc(docId), "an opened document is fetchable via getDoc")
     }
 
     // MARK: - Document Listing

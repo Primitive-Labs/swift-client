@@ -564,6 +564,9 @@ final class ApiParityTests: XCTestCase {
 
     // MARK: - DatabasesAPI new methods
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func test_databases_getCelContext_GET() async throws {
         let r = CallRecorder()
         let api = DatabasesAPI(transport: r)
@@ -573,6 +576,9 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/databases/db1/metadata")
     }
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func test_databases_updateCelContext_PATCH() async throws {
         let r = CallRecorder()
         let api = DatabasesAPI(transport: r)

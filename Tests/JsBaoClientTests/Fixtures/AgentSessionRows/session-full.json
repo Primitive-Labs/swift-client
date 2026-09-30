@@ -1,0 +1,92 @@
+{
+  "model": "PrimitiveSession",
+  "row": {
+    "id": "01K6SESSION0000000000000000",
+    "schemaVersion": 1,
+    "agentKey": "support",
+    "status": "awaiting_answer",
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "configId": "cfg_main",
+    "activeTurnId": "turn_1",
+    "activeTurnInitiatorUserId": "u_owner",
+    "activeTurnStartedAt": "2026-09-28T12:00:00.000Z",
+    "activeTurnMessageIds": [
+      "m_1",
+      "m_2"
+    ],
+    "queue": "[{\"userId\":\"u_2\",\"messageIds\":[\"m_3\"]},{\"userId\":\"u_3\",\"messageIds\":[\"m_4\",\"m_5\"]}]",
+    "title": "Refund help",
+    "scope": "tickets/42",
+    "variables": "{\"plan\":\"pro\",\"account\":{\"id\":\"acct_1\",\"flags\":{\"beta\":true}},\"recent\":[\"a\",null,3]}",
+    "viewerUserIds": [
+      "u_3",
+      "u_4"
+    ],
+    "participantUserIds": [
+      "u_2"
+    ],
+    "ownerUserId": "u_owner",
+    "modifiedAt": "2026-09-28T12:00:00.000Z"
+  },
+  "expect": {
+    "id": "01K6SESSION0000000000000000",
+    "schemaVersion": 1,
+    "agentKey": "support",
+    "configId": "cfg_main",
+    "status": "awaiting_answer",
+    "activeTurnId": "turn_1",
+    "activeTurnInitiatorUserId": "u_owner",
+    "activeTurnStartedAt": "2026-09-28T12:00:00.000Z",
+    "activeTurnMessageIds": [
+      "m_1",
+      "m_2"
+    ],
+    "queue": [
+      {
+        "userId": "u_2",
+        "messageIds": [
+          "m_3"
+        ]
+      },
+      {
+        "userId": "u_3",
+        "messageIds": [
+          "m_4",
+          "m_5"
+        ]
+      }
+    ],
+    "title": "Refund help",
+    "scope": "tickets/42",
+    "variables": {
+      "plan": "pro",
+      "account": {
+        "id": "acct_1",
+        "flags": {
+          "beta": true
+        }
+      },
+      "recent": [
+        "a",
+        null,
+        3
+      ]
+    },
+    "viewerUserIds": [
+      "u_3",
+      "u_4"
+    ],
+    "participantUserIds": [
+      "u_2"
+    ],
+    "ownerUserId": "u_owner",
+    "lastErrorCode": {
+      "$absent": true
+    },
+    "lastErrorMessage": {
+      "$absent": true
+    },
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "modifiedAt": "2026-09-28T12:00:00.000Z"
+  }
+}

@@ -91,7 +91,7 @@ final class WsAuthFramesTests: XCTestCase {
         let client = makeClient()
         defer { Task { await client.destroy() } }
 
-        let deferred = try await collectEvents(
+        let deferred = await collectEvents(
             from: client.eventEmitter, event: AuthRefreshDeferredEvent.self
         ) {
             await deliver(["type": "auth_required", "reason": "token_expired"], to: client)
@@ -107,7 +107,7 @@ final class WsAuthFramesTests: XCTestCase {
         let client = makeClient()
         defer { Task { await client.destroy() } }
 
-        let deferred = try await collectEvents(
+        let deferred = await collectEvents(
             from: client.eventEmitter, event: AuthRefreshDeferredEvent.self
         ) {
             await deliver(["type": "auth_failed", "message": "Invalid token"], to: client)
@@ -124,7 +124,7 @@ final class WsAuthFramesTests: XCTestCase {
         let client = makeClient()
         defer { Task { await client.destroy() } }
 
-        let deferred = try await collectEvents(
+        let deferred = await collectEvents(
             from: client.eventEmitter, event: AuthRefreshDeferredEvent.self
         ) {
             async let first: Void = deliverFrame(
@@ -151,7 +151,7 @@ final class WsAuthFramesTests: XCTestCase {
         let client = makeClient()
         defer { Task { await client.destroy() } }
 
-        let deferred = try await collectEvents(
+        let deferred = await collectEvents(
             from: client.eventEmitter, event: AuthRefreshDeferredEvent.self
         ) {
             for _ in 0..<6 {
@@ -172,7 +172,7 @@ final class WsAuthFramesTests: XCTestCase {
             await deliver(["type": "auth_failed", "message": "Invalid token"], to: client)
         }
 
-        let afterReconnect = try await collectEvents(
+        let afterReconnect = await collectEvents(
             from: client.eventEmitter, event: AuthRefreshDeferredEvent.self
         ) {
             client.webSocketManagerOnConnected()
@@ -188,7 +188,7 @@ final class WsAuthFramesTests: XCTestCase {
         let client = makeClient()
         defer { Task { await client.destroy() } }
 
-        let events = try await collectEvents(
+        let events = await collectEvents(
             from: client.eventEmitter, event: AuthSuccessEvent.self
         ) {
             await deliver(["type": "auth_success"], to: client)

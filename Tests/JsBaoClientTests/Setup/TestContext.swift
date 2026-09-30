@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import JsBaoClient
 
@@ -18,9 +19,9 @@ struct TestUser {
 
 /// Manages test lifecycle: creates apps, users, documents via the server's admin API.
 ///
-/// Requires TEST_SUPERADMIN_JWT environment variable to be set with a valid super-admin
-/// JWT. Get one by running the JS tests first (which set up the superuser in DynamoDB),
-/// then mint a JWT via the admin API.
+/// Authenticates as the super-admin `TestConfig.superAdminJwt()` resolves: a
+/// `TEST_SUPERADMIN_JWT`, an email-only token for `TEST_SUPERADMIN_EMAIL`, or an
+/// admin the local dev server provisions for the suite.
 ///
 /// `@unchecked Sendable`: the harness is shared by concurrent tasks in several
 /// tests (a `TaskGroup` creating documents in parallel, for instance). Its three
@@ -55,13 +56,10 @@ final class TestContext: @unchecked Sendable {
     // MARK: - Initialization
 
     func initialize() async throws {
-        // Get super-admin JWT from environment
-        guard let jwt = TestConfig.superAdminJwt, !jwt.isEmpty else {
-            throw TestSetupError(
-                "TEST_SUPERADMIN_JWT environment variable is required. "
-                + "Set it to a valid super-admin JWT for the dev server."
-            )
-        }
+        // The suite's super-admin token: TEST_SUPERADMIN_JWT, else an
+        // email-only token for TEST_SUPERADMIN_EMAIL, else an admin the local
+        // server provisions (TestConfig.resolveSuperAdminJwt, #3885).
+        let jwt = try await TestConfig.superAdminJwt()
         self.superuserJWT = jwt
 
         // Extract the admin email from the JWT payload so we can use it as initialAdminEmail
@@ -299,6 +297,81 @@ final class TestContext: @unchecked Sendable {
         return workflowId
     }
 
+    // MARK: - Server functions (#3278)
+
+    /// What `pushFunction` created: the function header and the config
+    /// version the bundle went into.
+    struct PushedFunction {
+        let functionId: String
+        let functionKey: String
+        let configId: String?
+    }
+
+    /// Push a server function through the admin family, the way the JS
+    /// `pushTestFunction` helper (`tests/helpers/server-function-helper.ts`)
+    /// does: `POST /admin/api/apps/{appId}/functions` creates the header, then
+    /// `POST .../functions/{id}/configs` pushes one config version carrying
+    /// the base64 TOML, sources and bundle plus the bundle's SHA-256
+    /// `contentHash`. `bundle` is ESM whose default export is the handler.
+    ///
+    /// `durable: true` makes it a task function (`mode = "task"`); the default
+    /// is a request function. `inputSchema` / `outputSchema` are the JSON
+    /// schemas the server validates against, when the case is about them.
+    @discardableResult
+    func pushFunction(
+        appId: String,
+        functionKey: String,
+        bundle: String,
+        access: String = "true",
+        durable: Bool = false,
+        /// #3454 — `"request"`, `"task"` or `"any"`. Absent leaves the
+        /// pre-#3454 shape: the `durable` boolean alone, which is a LOCK
+        /// either way. An `any` push sends no `durable`, because a boolean
+        /// beside `mode = "any"` is the disagreement the server refuses.
+        mode: String? = nil,
+        inputSchema: [String: Any]? = nil,
+        outputSchema: [String: Any]? = nil
+    ) async throws -> PushedFunction {
+        let base = "/admin/api/apps/\(appId)/functions"
+        var header: [String: Any] = [
+            "functionKey": functionKey,
+            "access": access,
+        ]
+        if let inputSchema { header["inputSchema"] = inputSchema }
+        if let outputSchema { header["outputSchema"] = outputSchema }
+        let created = try await adminPost(base, body: header)
+        guard let functionId = created["functionId"] as? String else {
+            throw TestSetupError("Failed to create function \(functionKey): \(created)")
+        }
+
+        let entry = "functions/\(functionKey).ts"
+        var toml = "[function]\nkey = \"\(functionKey)\"\n"
+        if let mode, mode != "any" { toml += "mode = \"\(mode)\"\n" }
+        let bundleData = Data(bundle.utf8)
+        let contentHash = SHA256.hash(data: bundleData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        var config: [String: Any] = [
+            "entry": entry,
+            "toml": Data(toml.utf8).base64EncodedString(),
+            "sources": [["path": entry, "content": bundleData.base64EncodedString()]],
+            "bundle": bundleData.base64EncodedString(),
+            "contentHash": contentHash,
+        ]
+        if let mode {
+            config["mode"] = mode
+            if mode != "any" { config["durable"] = mode == "task" }
+        } else {
+            config["durable"] = durable
+        }
+        let pushed = try await adminPost("\(base)/\(functionId)/configs", body: config)
+        return PushedFunction(
+            functionId: functionId,
+            functionKey: functionKey,
+            configId: pushed["configId"] as? String
+        )
+    }
+
     // MARK: - App settings
 
     /// PATCH-style update of app-level settings via the admin API
@@ -323,15 +396,60 @@ final class TestContext: @unchecked Sendable {
 
     // MARK: - Private HTTP Helpers
 
+    /// Mint a test JWT, waiting out the membership the caller just wrote.
+    ///
+    /// `createTestUser` adds the member and mints in the next breath, and the
+    /// mint route answers the question with its own point read of `AppUser`
+    /// (`src/admin-api.ts`). Under load that read can still be the state
+    /// before the add, and the setup dies with
+    /// `HTTP 400 … User is not a member of this app` — a failure in a helper,
+    /// reported against whichever suite happened to call it. It is not
+    /// hypothetical: #3183 hit it as a non-ok `add-by-email`, it failed
+    /// `InvitationTests` on 2026-09-16 and `InterleavedTests` on 2026-09-17,
+    /// and on 2026-09-17 it failed `LifecycleTests` — inside a full-package
+    /// run, where the two seconds this used to wait were not enough. Each time
+    /// it passed alone, and each time it cost a checkpoint replay.
+    ///
+    /// `createTestApp` makes it likelier than the doc above suggests: every app
+    /// names the same super-admin email, so the OWNER is one long-lived user
+    /// reused across apps and it is the new app's membership row, not the user,
+    /// that the mint is waiting for.
+    ///
+    /// So the wait is bounded and narrow: only that refusal is retried, only
+    /// for ten seconds — enough for the load a whole-package run puts on the
+    /// dev server, which is where this last bit — and the server's own error is
+    /// what surfaces if the membership never appears. A user who genuinely is
+    /// not a member still fails, with the same message, and the wait it sat
+    /// through is named so the next reader can tell the two apart.
+    private static let mintMembershipWait: TimeInterval = 10
+    private static let mintRetryInterval: TimeInterval = 0.2
+
     private func mintTestJwt(appId: String, userId: String, role: String) async throws -> String {
-        let result = try await adminPost(
-            "/admin/api/apps/\(appId)/users/\(userId)/mint-test-jwt",
-            body: ["role": role]
-        )
-        guard let token = result["token"] as? String else {
-            throw TestSetupError("Failed to mint JWT: missing token in response \(result)")
+        var lastError: Error?
+        let attempts = Int(Self.mintMembershipWait / Self.mintRetryInterval)
+        for _ in 0..<attempts {
+            do {
+                let result = try await adminPost(
+                    "/admin/api/apps/\(appId)/users/\(userId)/mint-test-jwt",
+                    body: ["role": role]
+                )
+                guard let token = result["token"] as? String else {
+                    throw TestSetupError("Failed to mint JWT: missing token in response \(result)")
+                }
+                return token
+            } catch let error as TestSetupError
+                where error.message.contains("User is not a member of this app") {
+                lastError = error
+                try await Task.sleep(
+                    nanoseconds: UInt64(Self.mintRetryInterval * 1_000_000_000)
+                )
+            }
         }
-        return token
+        throw TestSetupError(
+            "Failed to mint a JWT for \(userId) in \(appId) after "
+                + "\(Int(Self.mintMembershipWait))s of waiting for the membership: "
+                + "\((lastError as? TestSetupError)?.message ?? "no answer")"
+        )
     }
 
     /// Mint a server-signed refresh token for an existing app user via the
@@ -372,8 +490,14 @@ final class TestContext: @unchecked Sendable {
         try await adminRequest(method: "PUT", path: "/admin/api/apps/\(appId)", body: fields)
     }
 
+    /// #3449 — internal rather than private, so a suite can reach an admin
+    /// route this context has no bespoke helper for. `createTestApp`,
+    /// `createTestUser` and `pushFunction` cover the routes suites have needed
+    /// so far; a failed DSL durable run needs a published workflow, and adding
+    /// a one-caller `createWorkflow` helper here would be a second door to the
+    /// same admin API.
     @discardableResult
-    private func adminPost(_ path: String, body: [String: Any]) async throws -> [String: Any] {
+    func adminPost(_ path: String, body: [String: Any]) async throws -> [String: Any] {
         try await adminRequest(method: "POST", path: path, body: body)
     }
 

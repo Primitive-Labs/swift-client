@@ -16,7 +16,6 @@ public enum JsBaoErrorCode: String, Sendable {
     case listUnavailableOffline = "LIST_UNAVAILABLE_OFFLINE"
     case unavailable = "UNAVAILABLE"
     case websocketNotConnected = "WEBSOCKET_NOT_CONNECTED"
-    case geminiError = "GEMINI_ERROR"
     case integrationNotFound = "INTEGRATION_NOT_FOUND"
     case integrationSecretMissing = "INTEGRATION_SECRET_MISSING"
     case integrationRequestInvalid = "INTEGRATION_REQUEST_INVALID"
@@ -48,6 +47,86 @@ public enum JsBaoErrorCode: String, Sendable {
     /// it is waiting for. Mirrors JS `waitForAvailability`'s
     /// `NETWORK_REQUIRES_AUTOSTART` (#2667, parity C8).
     case networkRequiresAutostart = "NETWORK_REQUIRES_AUTOSTART"
+    /// DEPRECATED (#3482): the backstop against a server that predates the
+    /// runtime routes, removed by phase 7.
+    ///
+    /// A function's config no longer says anything about how it runs — the
+    /// caller picks the runtime at each call, `functions.invoke` posts to the
+    /// route that runs it inside the request and `functions.start` to the one
+    /// that runs it as a task — so against a current server neither verb can
+    /// be "the wrong one" and this is unreachable. Against an OLDER
+    /// deployment, where one route's body field decided what it answered, it
+    /// is still thrown when the envelope is the other shape. Mirrors the JS
+    /// client's `FUNCTION_MODE_MISMATCH` (#3278). `details` carry
+    /// `functionKey` plus `runId` (the run was started) or `status` (the
+    /// function ran).
+    case functionModeMismatch = "FUNCTION_MODE_MISMATCH"
+    /// `subscribeToChannel` did not get its channel's ack: the server's
+    /// uniform refusal, the 20 s ack timeout, the channel was left while the
+    /// join was in flight, or the socket closed while joining (#3278).
+    /// `details` carry `channel`; the message is the server's refusal text
+    /// when there was one.
+    case channelSubscribeFailed = "CHANNEL_SUBSCRIBE_FAILED"
+
+    // MARK: - Large documents (format 2, #3436)
+    //
+    // Raw values are the JS client's strings verbatim. A Swift app and a JS
+    // app hitting the same condition report the same code, which is what
+    // makes a shared runbook possible (principle 11).
+
+    /// The room refused this client build: the document is a large document
+    /// and the client either did not declare format 2 or declared a manifest
+    /// version below the document's base. Followed by close 4426, which the
+    /// reconnect policy does not act on. `details` carry `documentId`.
+    case clientUpgradeRequired = "CLIENT_UPGRADE_REQUIRED"
+    /// A large document was opened on storage that cannot host its record
+    /// store. `details` carry `reason`: `not-persistent` (an in-memory
+    /// provider) or `over-quota`.
+    case format2StorageUnavailable = "FORMAT2_STORAGE_UNAVAILABLE"
+    /// The document's local state cannot be advanced to the room's epoch
+    /// in place — it has to be reloaded from a covering base. Reads keep
+    /// answering from the local merged view; writes and outbound frames are
+    /// held. `details` carry `plan`.
+    case format2ReloadRequired = "FORMAT2_RELOAD_REQUIRED"
+    /// An unscoped query on a model whose connected documents are of both
+    /// kinds. The two kinds' rows live in different query engines, so there is
+    /// no one table to answer from; scope the query to documents of one kind.
+    case format2QueryScope = "FORMAT2_QUERY_SCOPE"
+    /// A model was read on a large document whose rows have not been loaded.
+    case format2ModelNotHydrated = "FORMAT2_MODEL_NOT_HYDRATED"
+    /// A fold of the epoch overlay into the merged view failed, so the merged
+    /// row is wrong and later updates cannot be trusted over it. Sticky: every
+    /// read and write on the document is refused until a rebind's whole-overlay
+    /// catch-up repairs it. `details` carry `error`.
+    case format2FoldBroken = "FORMAT2_FOLD_BROKEN"
+    /// A snapshot manifest is malformed. `details` carry `reason`.
+    case snapshotManifestInvalid = "SNAPSHOT_MANIFEST_INVALID"
+    /// A snapshot manifest is well formed but written in a shape this client
+    /// does not read. `details` carry `version`.
+    case snapshotManifestUnsupported = "SNAPSHOT_MANIFEST_UNSUPPORTED"
+    /// A cold load ran out of repair passes with chunks still missing.
+    /// `details` carry `missing`.
+    case format2SnapshotLoadIncomplete = "FORMAT2_SNAPSHOT_LOAD_INCOMPLETE"
+    /// A local write on a large document that has not synced for longer than
+    /// its offline write window, so the server can no longer reconcile a write
+    /// made against the epoch this client holds. Reads keep answering, and a
+    /// sync restores writes. `details` carry `lastSyncAt`, `windowDays` and
+    /// `overdueMs`. The JS client's own code string.
+    case documentOfflineWindowExpired = "DOCUMENT_OFFLINE_WINDOW_EXPIRED"
+    // Appended rather than filed beside `clientUpgradeRequired`, which is where
+    // it belongs by subject: a case INSERTED into this enum shifts every later
+    // case's ordinal, and SwiftPM does not recompile a test object whose library
+    // signatures moved underneath it — so a stale incremental build reads every
+    // code after the insertion point as its neighbour (#3436's linker hazard,
+    // sixty tests' worth of it). At the end, nothing that already exists moves.
+    /// This client opened a document as one format and the platform resolved the
+    /// other (#3764). The document is NOT served: a format-2 client fed ordinary
+    /// sync frames, or a format-1 client fed `epoch.info`, is a client silently
+    /// reading the wrong document. Unlike `clientUpgradeRequired` the connection
+    /// is not closed — the disagreement is about one document — and the document
+    /// is closed under the app with its store intact. `details` carry
+    /// `documentId`, `declared` and `actual`. The JS client's code, verbatim.
+    case documentFormatMismatch = "DOCUMENT_FORMAT_MISMATCH"
 }
 
 /// Main error type for the JsBao client library
@@ -99,7 +178,24 @@ public enum AuthCode: String, Sendable {
     /// (#3024) — the app asked for a relying party that isn't the
     /// server's, rather than the server failing to work out which one.
     case passkeyRpNotConfigured = "PASSKEY_RP_NOT_CONFIGURED"
+    /// The passkey provider returned a credential it had not verified the
+    /// user for, while the ceremony required verification (#3027). Ask the
+    /// user to try again and complete Face ID / their passcode — a generic
+    /// sign-in failure gives them nothing to act on.
+    case passkeyUserVerificationFailed = "PASSKEY_USER_VERIFICATION_FAILED"
     case magicLinkNotEnabled = "MAGIC_LINK_NOT_ENABLED"
+    /// Native Sign in with Apple (`POST /auth/apple/callback`, #3084). The
+    /// callback is a Swift-only surface — the JS client has no Apple path —
+    /// so these mirror `AUTH_CODES` in `src/auth/auth-codes.ts` directly.
+    /// `APPLE_IDENTITY_INVALID` (401) is the signature/claims/nonce
+    /// rejection, `APPLE_IDENTITY_UNKNOWN` (401) means no user carries this
+    /// Apple `sub` and Apple withheld the email, `APPLE_REQUEST_INVALID`
+    /// (400) is a malformed body, and `APPLE_AUTH_NOT_CONFIGURED` (501)
+    /// means the app has no `appleAudiences` or has Apple sign-in off.
+    case appleIdentityInvalid = "APPLE_IDENTITY_INVALID"
+    case appleIdentityUnknown = "APPLE_IDENTITY_UNKNOWN"
+    case appleRequestInvalid = "APPLE_REQUEST_INVALID"
+    case appleAuthNotConfigured = "APPLE_AUTH_NOT_CONFIGURED"
     case waitlistEntryUpdated = "WAITLIST_ENTRY_UPDATED"
     case inviteTokenInvalid = "INVITE_TOKEN_INVALID"
     case inviteTokenExpired = "INVITE_TOKEN_EXPIRED"
@@ -127,10 +223,18 @@ public struct HttpError: Error, Sendable {
     public let status: Int
     public let message: String
     public let body: String?
-    /// Machine-readable error code parsed from the JSON body's `"code"`
-    /// field (e.g. `"INVITATION_REQUIRED"`). Mirrors js-bao's
-    /// `AuthError.code`. Use `authCode` to get a typed `AuthCode` when
+    /// The stable, machine-readable cause parsed from the JSON body's
+    /// `"code"` field (e.g. `"INVITATION_REQUIRED"`). Mirrors js-bao's
+    /// `JsBaoApiError.code`. Use `authCode` to get a typed `AuthCode` when
     /// the value matches a known case.
+    ///
+    /// Every 4xx/5xx response the platform produces carries one: the
+    /// handler's own code where it has one, otherwise a status-derived
+    /// default (`NOT_FOUND`, `ACCESS_DENIED`, `UNAUTHENTICATED`,
+    /// `INTERNAL_ERROR`, …). Branch and localize on this; `message` and
+    /// `serverMessage` may change without notice. `nil` means the response
+    /// did NOT come from the platform's error path — an older server, or an
+    /// intermediary that answered on its own (a proxy's HTML error page).
     public let serverCode: String?
     /// Human-readable message parsed from the body's `"error"`,
     /// `"message"`, or nested `"details.error"` field. Falls back to
@@ -263,6 +367,31 @@ public extension HttpError {
     static func isCredentialBearingPath(_ path: String) -> Bool {
         let lowered = path.lowercased()
         return lowered.contains("/auth/") || lowered.contains("/passkey/")
+    }
+}
+
+// MARK: - Raw-bytes transfers
+
+extension HttpError {
+    /// The error for a refused RAW-BYTES transfer (#3403).
+    ///
+    /// Blob and avatar transfers read bytes rather than JSON, so they never
+    /// reach the parse `HttpClient` applies to every failure on the typed
+    /// spine. Each used to throw a fixed message with `serverCode == nil`,
+    /// which left an app branching on the cause with nothing to branch on for
+    /// a whole family of refusals the server had named. The bytes of a refused
+    /// transfer ARE the error envelope: the human message stays exactly what
+    /// the call site passes, and only the server's parsed cause is added.
+    static func fromBytes(status: Int, message: String, body: Data?) -> HttpError {
+        let text = body.flatMap { String(data: $0, encoding: .utf8) }
+        let parsed = HttpError.parseBody(text)
+        return HttpError(
+            status: status,
+            message: message,
+            body: text,
+            serverCode: parsed.code,
+            serverMessage: parsed.message
+        )
     }
 }
 
@@ -408,9 +537,30 @@ extension JsBaoNetworkError {
 /// anywhere else re-introduces the raw-`URLError` leak this exists to close —
 /// `TransportSpineTests` asserts that it doesn't happen.
 enum NetworkSession {
+    /// The session every default-parameter call runs on: `URLSessionConfiguration
+    /// .default` with caching disabled and nothing else changed.
+    ///
+    /// It replaces `URLSession.shared`, which uses `URLCache.shared` —
+    /// disk-backed on iOS and keyed by URL alone, ignoring `Authorization`.
+    /// An authenticated response stored there is readable by a request
+    /// carrying a different token or none, and survives app restarts
+    /// unencrypted (#3170). The paths that ride this default are the client's
+    /// most sensitive: blob bytes, the OAuth code exchange's access token, the
+    /// refresh proxy, and oversized document updates.
+    ///
+    /// Built from `.default` rather than `.ephemeral` on purpose: the
+    /// refresh-proxy flow keeps its refresh cookie in `HTTPCookieStorage
+    /// .shared`, which an ephemeral configuration would replace with its own.
+    static let uncached: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
+
     static func data(
         for request: URLRequest,
-        using session: URLSession = .shared
+        using session: URLSession = NetworkSession.uncached
     ) async throws -> (Data, URLResponse) {
         do {
             return try await session.data(for: request)
@@ -421,7 +571,7 @@ enum NetworkSession {
 
     static func data(
         from url: URL,
-        using session: URLSession = .shared
+        using session: URLSession = NetworkSession.uncached
     ) async throws -> (Data, URLResponse) {
         do {
             return try await session.data(from: url)

@@ -561,6 +561,7 @@ final class SubscriptionHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var subscription: EventSubscription?
     private var timeoutTask: Task<Void, Never>?
+    private var onSettled: (@Sendable () -> Void)?
     private var settled = false
 
     /// Store the event subscription, cancelling it straight away if the wait has
@@ -595,20 +596,38 @@ final class SubscriptionHolder: @unchecked Sendable {
     /// Both handles are claimed under the lock and cancelled outside it, so a
     /// cancel closure that re-enters the emitter cannot deadlock and the stored
     /// fields are never read concurrently with `set`.
+    /// Store a teardown closure run once, however the wait settles.
+    ///
+    /// For state a wait registers OUTSIDE itself and must withdraw whichever
+    /// way it ends — the `openDocument` refusal registration (#3436). Runs
+    /// immediately when the wait has already settled, so a late registration
+    /// cannot leave the entry behind.
+    func set(onSettled: @escaping @Sendable () -> Void) {
+        let alreadySettled = lock.withLock { () -> Bool in
+            guard !settled else { return true }
+            self.onSettled = onSettled
+            return false
+        }
+        if alreadySettled { onSettled() }
+    }
+
     @discardableResult
     func claim() -> Bool {
-        let claimed = lock.withLock { () -> (EventSubscription?, Task<Void, Never>?)? in
+        let claimed = lock.withLock {
+            () -> (EventSubscription?, Task<Void, Never>?, (@Sendable () -> Void)?)? in
             guard !settled else { return nil }
             settled = true
             defer {
                 subscription = nil
                 timeoutTask = nil
+                onSettled = nil
             }
-            return (subscription, timeoutTask)
+            return (subscription, timeoutTask, onSettled)
         }
         guard let claimed else { return false }
         claimed.1?.cancel()
         claimed.0?.cancel()
+        claimed.2?()
         return true
     }
 

@@ -7,20 +7,19 @@ import XCTest
 /// with a trailing slash must NOT produce a double-slash `.../proxy//auth/refresh`
 /// URL (which strict proxy routes can 404).
 ///
-/// `refreshViaProxy` builds its request against `URLSession.shared`, so the
-/// stub is registered globally with `URLProtocol.registerClass` (rather than
-/// injected via a session configuration). It captures the requested URL and
-/// returns a valid token so the refresh completes.
+/// `refreshViaProxy` runs on the controller's own session, which is
+/// cache-disabled and therefore built from a configuration (#3170) — a session
+/// built that way ignores `URLProtocol.registerClass`, so the stub is injected
+/// through the session instead. It captures the requested URL and returns a
+/// valid token so the refresh completes.
 final class AuthControllerProxyRefreshUrlTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        URLProtocol.registerClass(ProxyRefreshCaptureURLProtocol.self)
         ProxyRefreshCaptureURLProtocol.reset()
     }
 
     override func tearDown() {
-        URLProtocol.unregisterClass(ProxyRefreshCaptureURLProtocol.self)
         ProxyRefreshCaptureURLProtocol.reset()
         super.tearDown()
     }
@@ -33,7 +32,10 @@ final class AuthControllerProxyRefreshUrlTests: XCTestCase {
             offlineStore: OfflineStore(),
             emitter: EventEmitter(),
             refreshProxy: RefreshProxyConfig(baseUrl: proxyBaseUrl),
-            persistConfig: AuthConfig()
+            persistConfig: AuthConfig(),
+            networkSession: makeStubSession(
+                protocolClass: ProxyRefreshCaptureURLProtocol.self
+            )
         )
         auth.bootstrapToken(makeTestJwt(userId: "u1-stale"))
         return auth
@@ -72,8 +74,8 @@ final class AuthControllerProxyRefreshUrlTests: XCTestCase {
 }
 
 /// Captures the URL of the proxy `POST …/auth/refresh` and returns a token so
-/// the refresh completes. Registered globally (the proxy refresh uses
-/// `URLSession.shared`).
+/// the refresh completes. Installed on the session injected into the
+/// controller.
 final class ProxyRefreshCaptureURLProtocol: URLProtocol {
     /// One `LockedBox` for the whole stub: `URLSession` builds the protocol
     /// instances, so the capture has to be static, and a `static var` is a hard

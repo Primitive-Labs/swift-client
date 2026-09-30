@@ -137,19 +137,31 @@ public struct AggregateOptions {
     public var sort: AggregateSort?
     /// Optional cap on returned groups.
     public var limit: Int?
+    /// Aggregate only these documents, with exactly the meaning `documents`
+    /// has on `QueryOptions` (#3760). `nil` applies no scope of its own; an
+    /// explicit EMPTY list matches nothing.
+    ///
+    /// On a model bound to ONE document the option NARROWS rather than
+    /// replaces: it is ANDed with the bound document exactly as `query` and
+    /// `count` AND theirs, so a member of A asked for `[B]` answers no
+    /// groups. Appended last, and defaulted, so every existing call site
+    /// compiles unchanged.
+    public var documents: [String]?
 
     public init(
         groupBy: [AggregateGroupBy] = [],
         operations: [AggregateOperation],
         filter: DocumentFilter? = nil,
         sort: AggregateSort? = nil,
-        limit: Int? = nil
+        limit: Int? = nil,
+        documents: [String]? = nil
     ) {
         self.groupBy = groupBy
         self.operations = operations
         self.filter = filter
         self.sort = sort
         self.limit = limit
+        self.documents = documents
     }
 }
 

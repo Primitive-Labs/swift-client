@@ -16,6 +16,7 @@ Known divergences from the JS client are tracked as GitHub issues (label `swift-
 
 - [`overview.md`](overview.md) — orientation: what is this client, layer diagram, key types
 - [`baomodels.md`](baomodels.md) — typed model authoring guide (`PrimitiveModel`, `TypedModel<T>`, `DynamicModel`)
+- [`large-documents.md`](large-documents.md) — opening a large document (`documentFormat: 2`), what differs, and what is deferred
 - [`architecture.md`](architecture.md) — how internals fit together
 
 ### "I'm contributing to the Swift client"
@@ -32,6 +33,7 @@ docs/
 ├── overview.md                       ← layer diagram, key types, quick start
 ├── architecture.md                   ← module map, concurrency model
 ├── baomodels.md                      ← typed model authoring
+├── large-documents.md                ← large documents (documentFormat: 2)
 ├── testing.md                        ← running the suite
 └── yswift-fork.md                    ← CRDT layer fork rationale
 ```
@@ -104,11 +106,12 @@ This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method
   `client.nextEvent(_:timeout:where:)`, which derive the event key from the
   payload type. Deprecated calls keep working — and keep their synchronous,
   in-registration-order delivery — for the whole window.
-- `.invitation` event handlers now receive `InvitationEvent`, not the raw
-  `[String: Any]` WebSocket dictionary. Existing subscribers written as
-  `client.events.on(.invitation) { (payload: [String: Any]) in ... }` will no
-  longer match the typed payload. Migrate to
-  `for await event in client.stream(for: InvitationEvent.self)`.
+- The `.invitation` event and its `InvitationEvent` payload are **removed**
+  (#2951, with the per-document invitation routes that were its only emitter).
+  There is no replacement push event — the new sharing system grants access
+  immediately, so a subscriber has nothing left to wait for. Subscriptions
+  written as `client.events.on(.invitation) { ... }` or
+  `client.stream(for: InvitationEvent.self)` no longer compile; delete them.
 - Nine events that used to be emitted as bare `[String: Any]` dictionaries are
   typed payloads now (`meUpdated`, `pendingCreateFailed`, `authRefreshDeferred`,
   the five `offlineAuth*` events, and `blobsQueueDrained`). A handler still

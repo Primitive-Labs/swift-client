@@ -212,6 +212,6 @@ final class MeOfflineFirstTests: XCTestCase {
             offlineIds.contains(myLocalDocId),
             "owned local doc must not appear in the offline shared list"
         )
-        XCTAssertNil(offlineShared.cursor, "offline cache page carries no cursor")
+        XCTAssertNil(offlineShared.nextCursor, "offline cache page carries no cursor")
     }
 }

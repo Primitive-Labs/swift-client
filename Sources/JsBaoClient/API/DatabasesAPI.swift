@@ -360,7 +360,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Update a database's CEL context dict.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.updateMetadata`.
-    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). A category has separate readRule/writeRule, so a writer no longer inherits update from read access. Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API, write its values, and read them from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated updateCelContext.")
+    @available(*, deprecated, message: "Prefer resource metadata categories. A category has separate readRule/writeRule, so a writer no longer inherits update from read access. Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API, write its values, and read them from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated updateCelContext.")
     public func updateMetadata(databaseId: String, metadata: [String: JSONValue]) async throws -> DatabaseInfo {
         try await transport.request(
             method: .patch,
@@ -372,7 +372,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Read a database's CEL context dict.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.getMetadata`.
-    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). A category has separate readRule/writeRule (read no longer implies update). Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read its values from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated getCelContext.")
+    @available(*, deprecated, message: "Prefer resource metadata categories. A category has separate readRule/writeRule (read no longer implies update). Define the category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read its values from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated getCelContext.")
     public func getMetadata(databaseId: String) async throws -> CelContextResult {
         try await transport.request(method: .get, path: "/databases/\(databaseId)/metadata")
     }
@@ -536,7 +536,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// (legacy wire name) and `celContext` (current name).
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.getCelContext`.
-    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). The metadataAccess gate that controls this read uses one CEL expression for read AND update, so read implies update. A metadata category has separate readRule/writeRule; read its values from CEL as md.self.<category>.<key>.")
+    @available(*, deprecated, message: "Prefer resource metadata categories. The metadataAccess gate that controls this read uses one CEL expression for read AND update, so read implies update. A metadata category has separate readRule/writeRule; read its values from CEL as md.self.<category>.<key>.")
     public func getCelContext(databaseId: String) async throws -> CelContextResult {
         try await transport.request(method: .get, path: "/databases/\(databaseId)/metadata")
     }
@@ -544,7 +544,7 @@ public final class DatabasesAPI: @unchecked Sendable {
     /// Merge new key-value pairs into a database's CEL context dict.
     ///
     /// Deprecated — mirrors js-bao's `@deprecated` on `databases.updateCelContext`.
-    @available(*, deprecated, message: "Prefer resource metadata categories (issue #1420). Writing here is gated by the same single metadataAccess expression that gates reads, so anyone who can read can also update. A metadata category has separate readRule/writeRule; read its values from CEL as md.self.<category>.<key>.")
+    @available(*, deprecated, message: "Prefer resource metadata categories. Writing here is gated by the same single metadataAccess expression that gates reads, so anyone who can read can also update. A metadata category has separate readRule/writeRule; read its values from CEL as md.self.<category>.<key>.")
     public func updateCelContext(
         databaseId: String,
         celContext: [String: JSONValue]

@@ -78,8 +78,6 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// surface matches the JS client's `lastModified` either way.
     public let lastModified: String
     public let permission: DocumentPermission
-    public let invitationAccepted: Bool?
-    public let upgradedFromPermission: String?
     public let grantedAt: String?
     public let tags: [String]?
     /// Optional reference to a Blob owned by this document.
@@ -98,13 +96,18 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// `documents.getLinkAccess(documentId:)` — the document GET is gated on
     /// content access and would fail.
     public let linkAccess: DocumentLinkAccessLevel?
+    /// `2` for a large document, `1` for an ordinary one, `nil` when the
+    /// server did not say (#3436) — which is every document described before
+    /// large documents existed, so absent decodes rather than throwing.
+    public let documentFormat: Int?
 
     private enum CodingKeys: String, CodingKey {
         case documentId, title, createdBy, createdAt
         case lastModified, modifiedAt
-        case permission, invitationAccepted, upgradedFromPermission
+        case permission
         case grantedAt, tags, thumbnailBlobId, metadata
         case accessSource, linkAccess
+        case documentFormat
     }
 
     public init(from decoder: Decoder) throws {
@@ -116,12 +119,11 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         lastModified = try c.decodeIfPresent(String.self, forKey: .lastModified)
             ?? c.decodeIfPresent(String.self, forKey: .modifiedAt) ?? ""
         permission = try c.decodeIfPresent(DocumentPermission.self, forKey: .permission) ?? .reader
-        invitationAccepted = try c.decodeIfPresent(Bool.self, forKey: .invitationAccepted)
-        upgradedFromPermission = try c.decodeIfPresent(String.self, forKey: .upgradedFromPermission)
         grantedAt = try c.decodeIfPresent(String.self, forKey: .grantedAt)
         tags = try c.decodeIfPresent([String].self, forKey: .tags)
         thumbnailBlobId = try c.decodeIfPresent(String.self, forKey: .thumbnailBlobId)
         metadata = try c.decodeIfPresent(JSONValue.self, forKey: .metadata)
+        documentFormat = try c.decodeIfPresent(Int.self, forKey: .documentFormat)
         accessSource = try c.decodeIfPresent(DocumentAccessSource.self, forKey: .accessSource)
         linkAccess = try c.decodeIfPresent(DocumentLinkAccessLevel.self, forKey: .linkAccess)
     }
@@ -135,8 +137,11 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
-    public let cursor: String?
+    /// Deprecated alias of `nextCursor` kept for one deprecation window
+    /// (#1316, #1982). Computed from `nextCursor` so the type's own
+    /// initializers never reference the deprecated declaration.
+    @available(*, deprecated, message: "Use nextCursor.")
+    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
         case items, documents, cursor, nextCursor, hasMore
@@ -151,7 +156,6 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
         self.items = items
         let next = nextCursor ?? cursor
         self.nextCursor = next
-        self.cursor = next
         self.hasMore = hasMore ?? (next != nil)
     }
 
@@ -163,7 +167,6 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
             ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
-        cursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
 }
@@ -243,49 +246,6 @@ public struct OpenDocumentResult: Sendable {
     }
 }
 
-// MARK: List inputs
-
-/// Options for the deprecated `documents.list(options:)`. Mirrors js-bao's
-/// `DocumentListOptions` for the fields Swift implements, so the deprecated
-/// surface lines up across platforms.
-///
-/// Deprecated alongside `documents.list` — migrate to
-/// `client.me.ownedDocuments(...)` / `client.me.sharedDocuments(...)`.
-///
-/// The five never-implemented fields (`refreshFromServer`, `localOnly`,
-/// `serverTimeoutMs`, `waitForLoad`, `returnPage`) were deprecated in #2360 and
-/// removed in #2367. `documents.list` is a blocking server fetch: the
-/// local-first behavior those fields described lives on
-/// `client.me.ownedDocuments(...)`, and the `{ items, cursor }` page shape lives
-/// on `documents.listPage(...)`.
-public struct ListDocumentsOptions: Sendable {
-    /// Include the app's root document in results (excluded by default).
-    public var includeRoot: Bool?
-
-    /// Maximum number of documents per page (enables server-side pagination).
-    public var limit: Int?
-    /// Pagination cursor from a previous response.
-    public var cursor: String?
-    /// Filter results to documents carrying this tag.
-    public var tag: String?
-    /// Sort chronologically (oldest first) instead of reverse-chronological.
-    public var forward: Bool?
-
-    public init(
-        includeRoot: Bool? = nil,
-        limit: Int? = nil,
-        cursor: String? = nil,
-        tag: String? = nil,
-        forward: Bool? = nil
-    ) {
-        self.includeRoot = includeRoot
-        self.limit = limit
-        self.cursor = cursor
-        self.tag = tag
-        self.forward = forward
-    }
-}
-
 // MARK: Create / update inputs
 //
 // `CreateDocumentOptions` lives in Options.swift (it predates this file and
@@ -293,26 +253,96 @@ public struct ListDocumentsOptions: Sendable {
 // and `Encodable` conformance there.
 
 /// Options for `createWithAlias` — title and alias are both required.
+///
+/// `tags`, `metadata` and `documentFormat` mean here exactly what they mean on
+/// `CreateDocumentOptions` (#3757): applied when the call creates the document,
+/// under the same limits, refused with the same codes. Each is `nil` by default
+/// and encoded only when set, so an ordinary create's request body is exactly
+/// what it was before they existed — which matters, because the route now
+/// REFUSES a top-level key it does not read.
 public struct CreateWithAliasOptions: Encodable, Sendable {
     public var title: String
     public var alias: AliasRef
+    /// Tags to attach at creation: at most ten, each at most 48 characters.
+    /// An empty array is not sent.
+    public var tags: [String]?
+    /// Opaque metadata blob to attach at creation (≤ 4 KB serialized UTF-8).
+    /// The platform round-trips it verbatim.
+    public var metadata: JSONValue?
+    /// Create a LARGE document (`2`) instead of an ordinary one, with the same
+    /// meaning it has on `CreateDocumentOptions.documentFormat`. The server
+    /// refuses a value outside the set, as it does for the plain create.
+    public var documentFormat: Int?
 
-    public init(title: String, alias: AliasRef) {
+    public init(
+        title: String,
+        alias: AliasRef,
+        tags: [String]? = nil,
+        metadata: JSONValue? = nil,
+        documentFormat: Int? = nil
+    ) {
         self.title = title
         self.alias = alias
+        self.tags = tags
+        self.metadata = metadata
+        self.documentFormat = documentFormat
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case title, alias, tags, metadata, documentFormat
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(title, forKey: .title)
+        try container.encode(alias, forKey: .alias)
+        // An EMPTY list is not "no tags stated" to a route that refuses an
+        // unread key, and the JS client has always dropped it, so the two
+        // clients must put the same body on the wire.
+        if let tags, !tags.isEmpty {
+            try container.encode(tags, forKey: .tags)
+        }
+        try container.encodeIfPresent(metadata, forKey: .metadata)
+        try container.encodeIfPresent(documentFormat, forKey: .documentFormat)
     }
 }
 
 /// Options for `getOrCreateWithAlias`.
+///
+/// `tags`, `metadata` and `documentFormat` apply only when this call CREATES the
+/// document; an existing binding is left untouched. `documentFormat` is read
+/// twice over on this idempotent route — see its own documentation.
 public struct GetOrCreateWithAliasOptions: Encodable, Sendable {
     public var alias: AliasRef
     public var title: String?
     public var tags: [String]?
+    /// Create a LARGE document (`2`) instead of an ordinary one.
+    ///
+    /// Applied when this call creates the document, and otherwise taken as a
+    /// statement about the document the alias already names: a stored format
+    /// that differs makes the call fail with server code
+    /// `DOCUMENT_FORMAT_MISMATCH`, because an app that asks for a large document
+    /// and is handed an ordinary one has already made the mistake this route
+    /// exists to prevent. A format that agrees is echoed back on the result.
+    ///
+    /// `nil` — the default — states nothing, so an existing binding is answered
+    /// exactly as it was before this option existed.
+    public var documentFormat: Int?
+    /// Opaque metadata blob to attach if a new document is created (≤ 4 KB).
+    public var metadata: JSONValue?
 
-    public init(alias: AliasRef, title: String? = nil, tags: [String]? = nil) {
+    public init(
+        alias: AliasRef,
+        title: String? = nil,
+        tags: [String]? = nil,
+        documentFormat: Int? = nil,
+        metadata: JSONValue? = nil
+    ) {
         self.alias = alias
         self.title = title
         self.tags = tags
+        self.documentFormat = documentFormat
+        self.metadata = metadata
     }
 }
 
@@ -440,6 +470,10 @@ public struct CancelPendingCreateOptions: Sendable {
 }
 
 /// Result of `createWithAlias`.
+///
+/// The last three are echoed only when the call applied them (#3757), which is
+/// the rule every document read follows: an absent `documentFormat` means an
+/// ordinary document.
 public struct CreateWithAliasResult: Decodable, Sendable {
     public let documentId: String
     public let title: String?
@@ -447,6 +481,12 @@ public struct CreateWithAliasResult: Decodable, Sendable {
     public let createdAt: String?
     public let modifiedAt: String?
     public let alias: DocumentAliasInfo
+    /// `2` for a large document, absent for an ordinary one.
+    public let documentFormat: Int?
+    /// Echoed when the call applied tags.
+    public let tags: [String]?
+    /// Echoed when the call applied a metadata blob.
+    public let metadata: JSONValue?
 }
 
 /// Result of `getOrCreateWithAlias`. `created` reports whether a new
@@ -459,6 +499,14 @@ public struct GetOrCreateWithAliasResult: Decodable, Sendable {
     public let modifiedAt: String?
     public let alias: DocumentAliasInfo
     public let created: Bool
+    /// `2` for a large document, absent for an ordinary one — echoed on a
+    /// create, and on an existing binding when the caller stated a format that
+    /// agreed with the stored one (#3757).
+    public let documentFormat: Int?
+    /// Echoed when this call created the document and applied tags.
+    public let tags: [String]?
+    /// Echoed when this call created the document and applied a metadata blob.
+    public let metadata: JSONValue?
 }
 
 // MARK: Permissions
@@ -672,14 +720,31 @@ public struct PermissionUpdateResult: Decodable, Sendable {
 
 // MARK: Access
 
-/// Result of `validateAccess` / the deprecated `acceptInvitation`.
+/// The optional body of `validateAccess`: the user to resolve access for.
+public struct ValidateAccessSubjectParams: Encodable, Sendable {
+    public var userId: String
+
+    public init(userId: String) {
+        self.userId = userId
+    }
+}
+
+/// Result of `validateAccess` — the caller's access, or the access of the
+/// user named by `userId` (#3658).
 public struct DocumentAccessResult: Decodable, Sendable {
     public let success: Bool
     public let hasAccess: Bool
     public let permission: DocumentPermission?
-    public let viaInvitation: Bool?
-    public let invitationAccepted: Bool?
-    public let upgradedFromPermission: String?
+    /// How the access was obtained: `"owner"`, `"grant"`, `"group"` or
+    /// `"link"`. Present whenever `hasAccess` is true.
+    public let accessSource: String?
+    /// The SUBJECT's role in the app (`"owner"`, `"admin"`, `"member"`),
+    /// present only when a `userId` was named.
+    ///
+    /// Reported beside `permission`, never folded into it: an `admin` or
+    /// `owner` with no grant may change a document's tags, and may not write
+    /// its content. Gate a content write on `permission` alone.
+    public let appRole: String?
     public let error: String?
 }
 
@@ -768,7 +833,7 @@ public struct DenyAccessRequestOptions: Encodable, Sendable {
     }
 }
 
-// MARK: Invitations (pending + legacy)
+// MARK: Invitations
 
 /// A pending (deferred) invitation scoped to a single document.
 public struct PendingInvitationEntry: Decodable, Sendable {
@@ -780,44 +845,6 @@ public struct PendingInvitationEntry: Decodable, Sendable {
     public let grantedBy: String?
 }
 
-/// A legacy per-document invitation row.
-public struct DocumentInvitation: Decodable, Sendable {
-    public let invitationId: String
-    public let documentId: String?
-    public let email: String
-    public let permission: String
-    public let invitedBy: String
-    public let invitedAt: String
-    public let expiresAt: String?
-    public let accepted: Bool
-    public let acceptedAt: String?
-}
-
-/// Response from the deprecated `sendInvitation` / `updateInvitation`.
-public struct DocumentInvitationResponse: Decodable, Sendable {
-    public let success: Bool
-    public let message: String
-    public let invitationId: String
-    public let email: String
-    public let permission: String
-    public let invitedBy: String
-    public let invitedAt: String
-    public let expiresAt: String
-}
-
-/// Optional email-notification settings for the deprecated invitation verbs.
-public struct InvitationEmailOptions: Encodable, Sendable {
-    public var sendEmail: Bool?
-    public var documentUrl: String?
-    public var note: String?
-
-    public init(sendEmail: Bool? = nil, documentUrl: String? = nil, note: String? = nil) {
-        self.sendEmail = sendEmail
-        self.documentUrl = documentUrl
-        self.note = note
-    }
-}
-
 // MARK: Small result wrappers
 
 /// `{ success }` — returned by `revokeGroupPermission`.
@@ -825,8 +852,7 @@ public struct SuccessResult: Decodable, Sendable {
     public let success: Bool
 }
 
-/// `{ success, message }` — returned by the deprecated `declineInvitation`
-/// and `deleteInvitation`.
+/// `{ success, message }` — a bare success envelope.
 public struct MessageResult: Decodable, Sendable {
     public let success: Bool
     public let message: String

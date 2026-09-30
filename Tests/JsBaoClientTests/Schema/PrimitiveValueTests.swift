@@ -100,9 +100,17 @@ final class PrimitiveValueTests: XCTestCase {
     /// Number → string must be byte-identical to JS
     /// `JSON.stringify` / `Number.prototype.toString` (#1117).
     /// Expected strings below are literal Node.js outputs.
+    ///
+    /// Asserted on `encodeNumber`, which IS that JS twin and keys the
+    /// unique indexes with it. `encodedForYrs()` agrees with it on every
+    /// value except the `(2^53, 1e21)` band, where the bare integer
+    /// literal the JS layout calls for is one the yniffi JSON parser reads
+    /// as an `i64` — a `bigint` on the wire below `2^63`, an abort above
+    /// it — see `NumberPastInt64HermeticTests` (#3456), which pins the yrs
+    /// form of that band.
     func testEncodeNumberMatchesJsToString() throws {
         func enc(_ d: Double) -> String? {
-            PrimitiveValue.number(d).encodedForYrs()
+            PrimitiveValue.encodeNumber(d)
         }
         // Large magnitudes: full digits up to 1e21, then scientific.
         XCTAssertEqual(enc(1e20), "100000000000000000000")

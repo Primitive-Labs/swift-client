@@ -28,11 +28,29 @@ protocol WebSocketManagerDelegate: AnyObject, Sendable {
     func webSocketManagerOnMessage(_ data: Data) async
     func webSocketManagerOnMessage(_ text: String) async
     func webSocketManagerOnClose(code: Int?, reason: String?)
+    /// The close about to be delivered is one the manager made itself — a
+    /// `forceReconnect()`, which closes the current task and opens a new one.
+    ///
+    /// The delegate is told BEFORE the close rather than left to infer it,
+    /// because what follows a deliberate close and what follows the server
+    /// refusing a token look identical from outside: a socket that went away
+    /// before its handshake completed. Reading the second into the first cost a
+    /// hydrated session its connection outright (#3437) — the auth recovery
+    /// refreshed a token nobody had rejected and, on the 401 a fixed-token
+    /// client gets, stopped reconnecting.
+    ///
+    /// Defaulted to a no-op, so a delegate that has no auth policy to protect —
+    /// every test double — is unaffected.
+    func webSocketManagerWillDeliverDeliberateClose()
     func webSocketManagerOnError(_ error: Error)
     func webSocketManagerOnReconnectScheduled(delayMs: Int)
     func webSocketManagerOnDisconnectInitiated()
     func webSocketManagerOnDisconnectResolved()
     func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool
+}
+
+extension WebSocketManagerDelegate {
+    func webSocketManagerWillDeliverDeliberateClose() {}
 }
 
 // MARK: - WebSocketManager
@@ -286,6 +304,59 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         maxReconnectDelayMs = ms
     }
 
+    // MARK: - Receive limit (#2477, #3436)
+
+    /// The receive limit this manager has been asked for, or `nil` while it is
+    /// still on Foundation's default (1 MiB).
+    ///
+    /// `nil` rather than `1_048_576`: "never asked" and "asked for the default"
+    /// are the same number and different facts, and only the first one is the
+    /// state the intent's "without changing the format-1 limit" describes.
+    private(set) var configuredMaximumMessageSize: Int?
+
+    /// Raise the receive limit, for every task from here on.
+    ///
+    /// NEVER LOWERS. One socket carries every document, so a format-1 document
+    /// opened after a large one would otherwise take the limit back down and
+    /// the large document's next `epoch.info` would be refused by the receive
+    /// — a failure that surfaces as a dead socket rather than as anything
+    /// naming the frame.
+    ///
+    /// **A raise on a LIVE task rebuilds the socket, and it has to.**
+    /// `URLSessionWebSocketTask.maximumMessageSize` is only honoured if it is
+    /// set before the task is resumed: measured on macOS 14, a task resumed at
+    /// the default and then raised to 16 MiB still fails a 1.2 MiB receive and
+    /// takes the connection down with it. So assigning the property to a
+    /// running task is not a smaller version of this — it does nothing, and a
+    /// client that had only ever opened ordinary documents would find its
+    /// first large one's `epoch.info` refused by the very limit this call was
+    /// made to lift. The reconnect is ordinary: the sweep re-syncs every open
+    /// document, and it happens at most once per session, on the first
+    /// document not locally known to be format 1.
+    ///
+    /// (This is why decision 3436-SO-07 raises the limit at the OPEN rather
+    /// than when a document turns out to be large: on a first open, before the
+    /// socket is up, there is no task to rebuild.)
+    func setMaximumMessageSize(_ bytes: Int) {
+        guard bytes > (configuredMaximumMessageSize ?? 0) else { return }
+        configuredMaximumMessageSize = bytes
+        logger.debug("[WSM] maximumMessageSize raised to", bytes)
+        guard let task else { return }
+        applyMaximumMessageSize(to: task)
+        logger.debug(
+            "[WSM] rebuilding the socket so the raised receive limit takes effect"
+        )
+        forceReconnect()
+    }
+
+    /// Apply the configured limit to a task. The ONE place the value reaches a
+    /// task: called by the raise above for the live socket, and by
+    /// `performConnect` for every task it creates.
+    func applyMaximumMessageSize(to task: URLSessionWebSocketTask) {
+        guard let configuredMaximumMessageSize else { return }
+        task.maximumMessageSize = configuredMaximumMessageSize
+    }
+
     var shouldConnectFlag: Bool { shouldConnect }
 
     /// Set the "should the manager hold a connection open" flag without
@@ -396,6 +467,10 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         let oldSession = session
         session = newSession
         let newTask = newSession.webSocketTask(with: request)
+        // #3436 — a reconnect must not silently drop back to Foundation's
+        // 1 MiB: the document that needed the larger limit is still open, and
+        // its `epoch.info` is the frame that would be refused.
+        applyMaximumMessageSize(to: newTask)
         task = newTask
         _connecting = true
 
@@ -651,6 +726,12 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         }
 
         delegate?.webSocketManagerOnStatusChange(.disconnected)
+        // Said before the close, and synchronously, so the delegate can sample
+        // it in its own close handler: a manual reconnect closes this task and
+        // opens the next one, and nothing the server did is on record here.
+        if manualPending {
+            delegate?.webSocketManagerWillDeliverDeliberateClose()
+        }
         delegate?.webSocketManagerOnClose(code: code, reason: reason)
 
         let closeError = WebSocketError.connectionFailed(

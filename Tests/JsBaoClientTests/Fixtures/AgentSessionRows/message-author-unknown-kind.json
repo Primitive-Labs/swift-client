@@ -1,0 +1,14 @@
+{
+  "model": "PrimitiveMessage",
+  "row": {
+    "id": "01K6MESSAGE0000000000000000",
+    "seq": 1,
+    "authorKind": "robot",
+    "authorUserId": "u_9",
+    "createdAt": "2026-09-28T12:00:00.000Z"
+  },
+  "expect": {
+    "authorKind": "unknown",
+    "authorUserId": "u_9"
+  }
+}

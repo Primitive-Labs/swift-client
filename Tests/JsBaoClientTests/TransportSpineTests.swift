@@ -311,6 +311,17 @@ final class TransportSpineTests: XCTestCase {
         let exact = "9007199254740993"
         let started = #"{"runId":"r","runKey":"k","status":"queued"}"#
 
+        // 2^53+1: the smallest integer a `Double` cannot hold, which is the
+        // whole point of the lossy half of this test. Written as a `Double`
+        // literal the compiler warns that it "becomes 9007199254740992" — the
+        // rounding is deliberate here, so the conversion is made explicit and
+        // pinned instead of being spelled as a literal that warns (#3314).
+        let lossyId = Double(Int64(9_007_199_254_740_993))
+        XCTAssertEqual(
+            String(format: "%.0f", lossyId), "9007199254740992",
+            "a `Double` rounds 2^53+1 down; if it stops doing so, this test's premise is gone"
+        )
+
         let positional = ScriptedTransport(json: started)
         _ = try await WorkflowsAPI(transport: positional).start(
             workflowKey: "k",
@@ -330,7 +341,7 @@ final class TransportSpineTests: XCTestCase {
             StartWorkflowOptions(
                 workflowKey: "k",
                 input: ["a": .number(1)],
-                meta: ["id": .number(9_007_199_254_740_993)]
+                meta: ["id": .number(lossyId)]
             )
         )
         let optionsBody = String(
@@ -471,12 +482,10 @@ final class TransportSpineTests: XCTestCase {
             "DatabaseTypeConfigsAPI.swift",
             "DocumentsAPI.swift",
             "DoDb.swift",
-            "GeminiAPI.swift",
             "GroupsAPI.swift",
             "GroupTypeConfigsAPI.swift",
             "IntegrationsAPI.swift",
             "InvitationsAPI.swift",
-            "LlmAPI.swift",
             "MeAPI.swift",
             "NotificationsAPI.swift",
             "PromptsAPI.swift",
@@ -557,6 +566,24 @@ final class TransportSpineTests: XCTestCase {
             // set is net zero on this commit: `JsBaoClient.swift` gave one back
             // (22 -> 21) below.
             "API/WorkflowsAPI.swift": (11, 2, 0),
+            // #3278 opened this at eleven because there were no per-key types
+            // to express an invocation with; #3344 generated them and closed
+            // the four sites that existed only for their absence. The untyped
+            // `invoke` / `start` entry points (`input: [String: Any]` + their
+            // `meta`) are GONE: the generated `<Key>Function` invokers are now
+            // the way a Swift app calls a function, and a dynamic caller uses
+            // the generic overloads with a `JSONValue` witness.
+            //
+            // Seven is the FLOOR, not a milestone toward zero. What remains is
+            // `meta` — caller-supplied, derived from no schema — on the two
+            // typed overloads and the two private body composers, plus the two
+            // `payload` locals and `post`'s `payload` parameter: the opaque
+            // graph composed straight to request bytes by the one
+            // `JSONSerialization` call in `post`. `[String: JSONValue]` cannot
+            // replace them, because `JSONValue.number` is `Double`
+            // (`JSONValue.swift:47`) and would round an `Int64` past 2^53 —
+            // exactly the loss this budget exists to prevent.
+            "API/FunctionsAPI.swift": (7, 1, 0),
             // JWT payload parsing (the serialization boundary the design
             // sanctions). Every HTTP response `AuthController` reads is typed.
             // Phase E (#1994) took it 12 -> 4: the eight event payloads emitted
@@ -588,15 +615,37 @@ final class TransportSpineTests: XCTestCase {
             // state, which needs the declaration and the cast on separate
             // lines. The re-review took it back 22 -> 21: the two
             // analytics-context closures each carried their own lowering cast,
-            // and both now call one `prepareAnalyticsEvent` helper that logs
-            // the encode failure instead of dropping it, so the two casts
-            // became one.
+            // and both then shared one helper that logged the encode failure
+            // instead of dropping it, so the two casts became one.
             // #2660 took the `JSONSerialization` count 5 -> 6: re-authenticating
             // an open socket sends one more outbound frame,
             // `{type:"auth", token}`, encoded the same way the other outbound
             // frames in this file are. The dictionary it encodes is
             // `[String: String]`, so the untyped-dictionary count is unchanged.
-            "JsBaoClient.swift": (21, 6, 0),
+            // #3079 took the dictionary count 21 -> 23: a scoped `syncMetadata`
+            // asks about one document (`GET /documents/{id}`) and an ids
+            // listing verifies each unconfirmed row the same way, and both read
+            // a single row off the same legacy JSON graph the whole-scope
+            // listing already read an array of — one `[String: Any]?` holding
+            // the answer plus the two casts that unwrap it. Same wire boundary,
+            // one row instead of a list, not new untyped surface.
+            // #2951 took the dictionary count 23 -> 22: the document-invitation
+            // surface left the client, and with it the one
+            // `json["document"] as? [String: Any]` cast that read the accepted
+            // document off the legacy acceptance response. Removed surface,
+            // not a new lowering.
+            // #3559 took the `JSONSerialization` count 6 -> 7: an oversize
+            // outbound payload asks the room for an upload URL
+            // (`{type:"getUploadUrl", documentId, requestId}`), which is one
+            // more OUTBOUND frame encoded the way every other outbound frame
+            // in this file is. The dictionary it encodes is `[String: String]`,
+            // so the untyped-dictionary count is unchanged — the room's answer
+            // is read off the graph `handleWebSocketMessage` already parsed.
+            // #3857 took the dictionary count 22 -> 21: the direct LLM / Gemini
+            // sub-APIs left the client, and with them the two analytics-context
+            // accessors and the helper whose one `as? [String: Any]` cast
+            // lowered their events. Removed surface, not a new lowering.
+            "JsBaoClient.swift": (21, 7, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP
@@ -620,6 +669,44 @@ final class TransportSpineTests: XCTestCase {
             // function is handed — internal shape checks on a value that is
             // already untyped, not new untyped surface.
             "Internal/KvCache.swift": (5, 4, 0),
+            // #3436 — the three format-2 WebSocket frames the coordinator
+            // handles: `epoch.info` and `update.ack` inbound, and the outbound
+            // `update` frame it stamps `seq`/`seqFrom`/`ackedSeq` onto. This is
+            // the SAME currency every arm of `handleWebSocketMessage` already
+            // speaks (`json["x"] as? T` off a parsed frame), not a new untyped
+            // surface and not an HTTP response body — decoding these two into
+            // structs while every neighbouring frame stays a dictionary would
+            // be the second pattern principle 4 warns about. No response body
+            // is read here and nothing is lowered into an `Any` graph.
+            // #3436 phase B took it 2 -> 8: `epoch.seal`/`epoch.resync` and
+            // `snapshot.ready`/`epoch.grants` are two more inbound frames, the
+            // question "does this frame ask for a resync rather than a reload"
+            // is asked of a third, and reading a frame's `sealedEpochs` array,
+            // its `download` block and its `snapshot` block is three more
+            // casts off the same graph. What is NOT untyped is the state any
+            // of it leaves behind — the sealed chain becomes
+            // `[SealedEpochChainEntry]` and the snapshot block a
+            // `SnapshotOffer` — because that outlives the frame and the next
+            // handshake has to agree with it about its shape.
+            "LargeDocuments/Format2Coordinator.swift": (8, 0, 0),
+            // #3436 — the two inbound frames the client's large-document front
+            // door routes, `epoch.info` and `update.ack`. They are handed the
+            // dictionary `handleWebSocketMessage` already parsed, and pass it
+            // to the coordinator budgeted above: the same currency, carried one
+            // call further, not a new untyped surface. No response body is read
+            // here and nothing is lowered into an `Any` graph.
+            // #3436 phase B took it 2 -> 4: the two epoch frames the router
+            // gained, `epoch.seal`/`epoch.resync` and
+            // `snapshot.ready`/`epoch.grants`, handed on to the coordinator
+            // budgeted above. The grant the cold start refreshes with is read
+            // off the typed `SnapshotOffer`, not off a dictionary.
+            // The `JSONSerialization` count went 0 -> 1 with it: a load whose
+            // signature expired asks the room to re-mint it, which is one more
+            // OUTBOUND frame (`{type: "epoch.grants", documentId}`), encoded
+            // the way every other outbound frame in this client is. The
+            // dictionary it encodes is `[String: String]`, so it does not
+            // count against the untyped total.
+            "LargeDocuments/Format2Client.swift": (4, 1, 0),
         ]
         let sources = sourcesDirectory
 

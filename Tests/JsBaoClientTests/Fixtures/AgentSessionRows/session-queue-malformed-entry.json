@@ -1,0 +1,27 @@
+{
+  "model": "PrimitiveSession",
+  "row": {
+    "id": "01K6SESSION0000000000000000",
+    "schemaVersion": 1,
+    "agentKey": "support",
+    "status": "idle",
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "queue": "[{\"userId\":\"u_2\",\"messageIds\":[\"m_3\"]},{\"messageIds\":[\"m_4\"]},{\"userId\":\"u_5\",\"messageIds\":\"m_6\"},{\"userId\":7,\"messageIds\":[]},{\"userId\":\"u_6\",\"messageIds\":[\"m_7\",8]}]"
+  },
+  "expect": {
+    "queue": [
+      {
+        "userId": "u_2",
+        "messageIds": [
+          "m_3"
+        ]
+      },
+      {
+        "userId": "u_6",
+        "messageIds": [
+          "m_7"
+        ]
+      }
+    ]
+  }
+}

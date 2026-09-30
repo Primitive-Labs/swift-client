@@ -143,14 +143,12 @@ public struct SharedDocument: Decodable, Sendable, Equatable {
     public let document: DocumentInfo
     /// Who granted access (the actor) — always present on shared rows.
     public let grantedBy: String
-    /// `"permission"` for accepted shares, `"invitation"` for pending legacy
-    /// `DocumentInvitation`s.
+    /// Always `"permission"`: the row is a direct, non-owner grant. #2951
+    /// removed the pending legacy invitation rows this list used to merge in.
     public let source: String?
-    /// Present when `source == "invitation"` — the pending invitation ID.
-    public let invitationId: String?
 
     private enum CodingKeys: String, CodingKey {
-        case grantedBy, source, invitationId
+        case grantedBy, source
     }
 
     public init(from decoder: Decoder) throws {
@@ -158,7 +156,6 @@ public struct SharedDocument: Decodable, Sendable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         grantedBy = try c.decodeIfPresent(String.self, forKey: .grantedBy) ?? ""
         source = try c.decodeIfPresent(String.self, forKey: .source)
-        invitationId = try c.decodeIfPresent(String.self, forKey: .invitationId)
     }
 }
 
@@ -171,8 +168,11 @@ public struct SharedDocumentListResult: Decodable, Sendable, Equatable {
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
-    public let cursor: String?
+    /// Deprecated alias of `nextCursor` kept for one deprecation window
+    /// (#1316, #1982). Computed from `nextCursor` so the type's own
+    /// initializers never reference the deprecated declaration.
+    @available(*, deprecated, message: "Use nextCursor.")
+    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
         case items, documents, cursor, nextCursor, hasMore
@@ -187,7 +187,6 @@ public struct SharedDocumentListResult: Decodable, Sendable, Equatable {
         self.items = items
         let next = nextCursor ?? cursor
         self.nextCursor = next
-        self.cursor = next
         self.hasMore = hasMore ?? (next != nil)
     }
 
@@ -199,36 +198,7 @@ public struct SharedDocumentListResult: Decodable, Sendable, Equatable {
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
             ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
-        cursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
 }
 
-// MARK: Pending invitations
-
-/// A short document summary attached to a pending-invitation row.
-/// Mirrors the nested `document` object on JS's `pendingDocumentInvitations`.
-public struct PendingInvitationDocumentSummary: Decodable, Sendable, Equatable {
-    public let documentId: String?
-    public let title: String?
-    public let tags: [String]?
-    public let createdAt: String?
-    public let lastModified: String?
-    public let createdBy: String?
-}
-
-/// A pending document invitation for the current user. Mirrors the element
-/// type of JS `me.pendingDocumentInvitations()`.
-public struct PendingDocumentInvitation: Decodable, Sendable, Equatable {
-    public let invitationId: String
-    public let documentId: String
-    public let title: String?
-    public let email: String
-    /// `"owner"`, `"read-write"`, or `"reader"`.
-    public let permission: String
-    public let invitedAt: String
-    public let invitedBy: String
-    public let expiresAt: String?
-    public let accepted: Bool
-    public let document: PendingInvitationDocumentSummary?
-}

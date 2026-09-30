@@ -1,0 +1,24 @@
+{
+  "model": "PrimitiveSession",
+  "row": {
+    "id": "01K6SESSION0000000000000000",
+    "schemaVersion": 1,
+    "agentKey": "support",
+    "status": "failed",
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "lastErrorCode": "AGENT_ROUND_TRUNCATED",
+    "lastErrorMessage": "The model stopped at its output limit."
+  },
+  "expect": {
+    "status": "failed",
+    "lastErrorCode": "AGENT_ROUND_TRUNCATED",
+    "lastErrorMessage": "The model stopped at its output limit.",
+    "activeTurnId": {
+      "$absent": true
+    },
+    "configId": {
+      "$absent": true
+    },
+    "activeTurnMessageIds": []
+  }
+}

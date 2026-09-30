@@ -202,25 +202,46 @@ final class URLConstructionParityTests: XCTestCase {
     /// No options → bare `/documents`, no trailing `?`.
     func test_syncMetadataPath_noOptions_isBare() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(documentId: nil, payloadType: nil),
+            JsBaoClient.syncMetadataPath(payloadType: nil),
             "/documents"
         )
     }
 
-    /// `payloadType` was previously appended unescaped; both values now route
-    /// through `URLQuery`. Order preserved (documentId, payloadType).
-    func test_syncMetadataPath_bothValues_areEncoded() {
+    /// `payloadType` was previously appended unescaped; it now routes through
+    /// `URLQuery`.
+    func test_syncMetadataPath_payloadType_isEncoded() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(documentId: "a+b", payloadType: "full/ids"),
-            "/documents?documentId=a%2Bb&payloadType=full%2Fids"
+            JsBaoClient.syncMetadataPath(payloadType: "full/ids"),
+            "/documents?payloadType=full%2Fids"
         )
     }
 
     /// Plain values stay byte-identical.
     func test_syncMetadataPath_plainValues_areByteIdentical() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(documentId: "01ARZ3NDEKTSV4RRFFQ69G5FAV", payloadType: "full"),
-            "/documents?documentId=01ARZ3NDEKTSV4RRFFQ69G5FAV&payloadType=full"
+            JsBaoClient.syncMetadataPath(payloadType: "full"),
+            "/documents?payloadType=full"
+        )
+    }
+
+    // MARK: - JsBaoClient.syncMetadata — single document
+
+    /// A scoped sync asks about its document by path, the way js-bao does
+    /// (`GET /documents/${documentId}`) — the listing query never carried a
+    /// document id to the server (#3079).
+    func test_documentMetadataPath_plainId_isByteIdentical() {
+        XCTAssertEqual(
+            JsBaoClient.documentMetadataPath(documentId: "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "/documents/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        )
+    }
+
+    /// The id is one path segment: a reserved character in it is escaped
+    /// rather than splitting the path.
+    func test_documentMetadataPath_reservedCharacters_areEncoded() {
+        XCTAssertEqual(
+            JsBaoClient.documentMetadataPath(documentId: "a+b/c"),
+            "/documents/a%2Bb%2Fc"
         )
     }
 }

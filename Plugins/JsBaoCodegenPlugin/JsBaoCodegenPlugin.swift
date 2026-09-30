@@ -52,12 +52,14 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
     ) async throws -> [Command] {
         guard let target = target as? SourceModuleTarget else { return [] }
 
-        // Look up by the executable *target* name (matches the plugin's
-        // `dependencies: ["SwiftBaoCodegen"]` in `Package.swift`). The
-        // product name `swift-bao-codegen` doesn't resolve here because
-        // SwiftPM only allows tools that appear in the plugin's
-        // dependency list.
-        let tool = try context.tool(named: "SwiftBaoCodegen")
+        // The tool's target name and executable product name are the same
+        // string (#3560), which is what makes this lookup work under both
+        // build systems: `native` resolves an in-package tool dep as a
+        // product, while `swiftbuild` (SwiftPM's default from Swift 6.4 /
+        // Xcode 27) paths the tool by product name but schedules the build
+        // by target name. Keep this in step with `dependencies:` on the
+        // plugin target in `Package.swift`.
+        let tool = try context.tool(named: "swift-bao-codegen")
         let outputDir = context.pluginWorkDirectoryURL.appending(path: "GeneratedModels")
 
         // A `bao-codegen.json` naming the schema replaces the scan entirely

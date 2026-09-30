@@ -94,7 +94,7 @@ final class InternalVisibilityTests: XCTestCase {
         )
     }
 
-    // MARK: - Behavior 2 — the 14 conformance methods are internal
+    // MARK: - Behavior 2 — every conformance method is internal
 
     func testDelegateConformanceMethodsAreNotPublic() throws {
         let source = ClientSourceText.stripComments(
@@ -106,10 +106,31 @@ final class InternalVisibilityTests: XCTestCase {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { $0.contains("func webSocketManager") }
 
+        // Anchored on the protocol rather than on a number (#3437). The count
+        // was 13 when this was written and the section heading already said 14;
+        // a literal that every added delegate method has to be talked out of
+        // is not a guard, and the claim underneath it — the client implements
+        // the protocol, and none of those methods is public — is true whatever
+        // the protocol grows to. A scan that matched nothing still fails, which
+        // is what the literal was really protecting.
+        let protocolBody = try ClientSourceText.slice(
+            ClientSourceText.stripComments(
+                try ClientSourceText.clientSource("Internal/WebSocketManager.swift")
+            ),
+            from: "protocol WebSocketManagerDelegate: AnyObject, Sendable {",
+            to: "extension WebSocketManagerDelegate {"
+        )
+        let protocolMethods = protocolBody
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.hasPrefix("func webSocketManager") }
+            .count
+
+        XCTAssertGreaterThan(protocolMethods, 0, "the delegate protocol moved — re-anchor this test")
         XCTAssertEqual(
-            declarations.count, 13,
-            "expected the 13 WebSocketManagerDelegate conformance methods in "
-                + "JsBaoClient.swift — found \(declarations.count); re-anchor this test"
+            declarations.count, protocolMethods,
+            "expected JsBaoClient.swift to implement every WebSocketManagerDelegate method "
+                + "the protocol declares (\(protocolMethods)) — found \(declarations.count)"
         )
 
         let publicOnes = declarations.filter { $0.hasPrefix("public ") || $0.hasPrefix("open ") }

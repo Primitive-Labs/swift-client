@@ -291,6 +291,38 @@ extension DocumentSyncStateChangedEvent: JsBaoEventPayload {
     // and use the stream for subsequent changes.
 }
 
+extension DocumentSnapshotLoadEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentSnapshotLoad }
+    // Deliberately not replayable, for the reason
+    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
+    // key and this payload is scoped to a DOCUMENT, so a replay would hand
+    // back whichever document last loaded a base.
+}
+
+extension DocumentWriteRefusedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentWriteRefused }
+    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
+    // is not: retention is one slot per event key and this payload is scoped
+    // to a DOCUMENT and a RECORD, so a replay would hand back whichever write
+    // was refused last, frequently not the one the consumer cares about.
+}
+
+extension DocumentFormatMismatchEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentFormatMismatch }
+    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
+    // is not: retention is one slot per event key and this payload is scoped to
+    // a DOCUMENT, so a replay would hand back whichever document was last
+    // refused.
+}
+
+extension DocumentOfflineWritesResolvedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentOfflineWritesResolved }
+    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
+    // is not: retention is one slot per event key and this payload is scoped
+    // to a DOCUMENT and one replay of it, so a replay would hand back
+    // whichever document last resolved its offline writes.
+}
+
 extension SyncEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .sync }
 }
@@ -328,10 +360,6 @@ extension MeUpdateFailedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .meUpdateFailed }
 }
 
-extension InvitationEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .invitation }
-}
-
 extension NotificationEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .notification }
 }
@@ -342,6 +370,18 @@ extension WorkflowStatusEvent: JsBaoEventPayload {
 
 extension WorkflowStartedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .workflowStarted }
+}
+
+extension ChannelMessageEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .channelMessage }
+}
+
+extension ChannelSubscribeFailedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .channelSubscribeFailed }
+}
+
+extension DirectMessageEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .directMessage }
 }
 
 extension BlobUploadProgressEvent: JsBaoEventPayload {
@@ -406,6 +446,10 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     PendingCreateFailedEvent.self,
     DocumentMetadataChangedEvent.self,
     DocumentSyncStateChangedEvent.self,
+    DocumentSnapshotLoadEvent.self,
+    DocumentWriteRefusedEvent.self,
+    DocumentFormatMismatchEvent.self,
+    DocumentOfflineWritesResolvedEvent.self,
     SyncEvent.self,
     SyncPerfEvent.self,
     AwarenessEvent.self,
@@ -416,10 +460,12 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     GenericErrorEvent.self,
     MeUpdatedEvent.self,
     MeUpdateFailedEvent.self,
-    InvitationEvent.self,
     NotificationEvent.self,
     WorkflowStatusEvent.self,
     WorkflowStartedEvent.self,
+    ChannelMessageEvent.self,
+    ChannelSubscribeFailedEvent.self,
+    DirectMessageEvent.self,
     BlobUploadProgressEvent.self,
     BlobUploadCompletedEvent.self,
     BlobUploadFailedEvent.self,
@@ -450,4 +496,10 @@ let swiftOnlyJsBaoEventKeys: Set<String> = [
     // but the JS map covers only the client's own events, not the cache's.
     "cacheUpdated",
     "cacheUpdateFailed",
+    // `document:write-refused` was listed here as Swift-only until #3758.
+    // The reasoning was that every JS mutation verb throws, so the JS client
+    // needed no event — but that left an app running both clients handling one
+    // rule two ways, and gave a JS app no channel to handle the refusal on at
+    // all. Both clients now raise it for EVERY refused write, so it belongs in
+    // the JS `JsBaoEvents` map and not on this list.
 ]

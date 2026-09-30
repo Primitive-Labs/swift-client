@@ -18,6 +18,9 @@ enum CodegenError: Error, CustomStringConvertible {
     case enumOnNonStringField(model: String, field: String, typeName: String)
     case malformedEnum(model: String, field: String, reason: String)
     case unknownKey(context: String, key: String, allowed: [String])
+    /// A unique constraint on a stringset field (#3719); `message` is the
+    /// sentence js-bao and `TomlSchemaLoader` answer.
+    case uniqueOnStringset(message: String)
 
     var description: String {
         switch self {
@@ -53,6 +56,8 @@ enum CodegenError: Error, CustomStringConvertible {
             return "Model `\(model)` field `\(field)`: `enum` \(reason)"
         case let .unknownKey(context, key, allowed):
             return "\(context): unknown key `\(key)`. Allowed: \(allowed.joined(separator: ", "))"
+        case let .uniqueOnStringset(message):
+            return message
         }
     }
 }
@@ -202,6 +207,11 @@ enum TomlParser {
             modelName: name, table: table, fieldNames: Set(fields.keys),
             strict: strict
         )
+        if let message = uniqueStringsetViolation(
+            modelName: name, fields: fields, constraints: constraints
+        ) {
+            throw CodegenError.uniqueOnStringset(message: message)
+        }
         let swiftName = try resolveSwiftName(
             modelName: name, table: table, suffix: swiftNameSuffix
         )
@@ -213,6 +223,30 @@ enum TomlParser {
             uniqueConstraints: constraints,
             relationships: []
         )
+    }
+
+    /// The #3719 rule over the parsed shapes: the first unique constraint on
+    /// a stringset field, as the sentence `PrimitiveSchema
+    /// .uniqueStringsetViolation` (and js-bao) answers, or `nil`. Same order:
+    /// the field form over fields sorted by name, then compound constraints
+    /// sorted by name, each by its first stringset member.
+    static func uniqueStringsetViolation(
+        modelName: String,
+        fields: [String: ParsedField],
+        constraints: [ParsedUniqueConstraint]
+    ) -> String? {
+        let reason = "A unique constraint applies to scalar fields only."
+        for (fieldName, field) in fields.sorted(by: { $0.key < $1.key })
+        where field.unique && field.type == .stringset {
+            return "Model \"\(modelName)\": field \"\(fieldName)\" is a stringset and cannot be unique. \(reason)"
+        }
+        for c in constraints.sorted(by: { $0.name < $1.name }) {
+            guard let field = c.fields.first(where: { fields[$0]?.type == .stringset }) else {
+                continue
+            }
+            return "Model \"\(modelName)\": unique constraint \"\(c.name)\" names the stringset field \"\(field)\", which cannot be unique. \(reason)"
+        }
+        return nil
     }
 
     private static func resolveSwiftName(

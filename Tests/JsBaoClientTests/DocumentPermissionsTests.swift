@@ -138,4 +138,41 @@ final class DocumentPermissionsTests: XCTestCase {
         XCTAssertTrue(after.hasAccess, "Member with a grant must have access")
         XCTAssertEqual(after.permission, .readWrite)
     }
+
+    /// The owner asks about somebody else (#3658): the answer is the
+    /// SUBJECT's, and it carries where the level came from and the subject's
+    /// role in the app.
+    func testValidateAccessForANamedSubject() async throws {
+        let ownerClient = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
+        defer { Task { await ownerClient.destroy() } }
+
+        let docId = try await ctx.createDocument(
+            appId: testApp.appId,
+            jwt: testApp.ownerJWT,
+            title: "Validate Access Subject"
+        )
+        let subject = try await ctx.createTestUser(appId: testApp.appId, role: "member")
+        try await ctx.grantPermission(
+            appId: testApp.appId,
+            documentId: docId,
+            userId: subject.userId,
+            permission: "reader",
+            jwt: testApp.ownerJWT
+        )
+
+        let answer = try await ownerClient.documents.validateAccess(
+            documentId: docId,
+            userId: subject.userId
+        )
+        XCTAssertTrue(answer.hasAccess)
+        XCTAssertEqual(answer.permission, .reader)
+        XCTAssertEqual(answer.accessSource, "grant")
+        XCTAssertEqual(answer.appRole, "member")
+
+        // The caller form is unchanged: the owner's own access to the
+        // document, with no role reported.
+        let own = try await ownerClient.documents.validateAccess(documentId: docId)
+        XCTAssertEqual(own.permission, .owner)
+        XCTAssertNil(own.appRole)
+    }
 }

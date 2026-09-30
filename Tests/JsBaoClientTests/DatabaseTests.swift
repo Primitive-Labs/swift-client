@@ -34,6 +34,9 @@ final class DatabaseTests: XCTestCase {
 
     // MARK: - Metadata
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testSetMetadataKeys() async throws {
         let result = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
             "color": "blue",
@@ -47,6 +50,9 @@ final class DatabaseTests: XCTestCase {
         XCTAssertEqual(metadata?["active"]?.boolValue, true)
     }
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testMergeWithExistingMetadata() async throws {
         _ = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
             "color": "blue",
@@ -63,6 +69,9 @@ final class DatabaseTests: XCTestCase {
         XCTAssertEqual(metadata?["label"]?.stringValue, "hello")
     }
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testRemoveKeysSetToNull() async throws {
         _ = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
             "color": "blue",
@@ -78,6 +87,9 @@ final class DatabaseTests: XCTestCase {
         XCTAssertEqual(metadata?["count"]?.numberValue, 42)
     }
 
+    /// `@available(*, deprecated)` on the test suppresses the intended
+    /// call-site deprecation warning we are deliberately exercising.
+    @available(*, deprecated)
     func testReflectMetadataInGet() async throws {
         _ = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
             "color": "red",

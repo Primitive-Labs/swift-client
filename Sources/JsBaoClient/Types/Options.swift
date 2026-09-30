@@ -31,6 +31,16 @@ public struct JsBaoClientOptions: Sendable {
     /// without explicit app calls (#963). Mirrors js-bao's
     /// `analyticsAutoEvents` option.
     public let analyticsAutoEvents: AnalyticsAutoEventsConfig
+    /// How much room this app will give a large document, and which models are
+    /// worth it when the device cannot hold the whole thing (#3437,
+    /// behavior 34). Mirrors js-bao's `largeDocumentStorage` option.
+    ///
+    /// `nil` — the default — probes the volume the client's database is on.
+    /// Configure `capability` to override that measurement, and `models` to
+    /// say what to keep when the document does not fit: with none named, a
+    /// device that cannot take the document is refused rather than capped,
+    /// because there is nothing to cap it to.
+    public let largeDocumentStorage: LargeDocumentStorageOptions?
 
     public init(
         apiUrl: String,
@@ -48,7 +58,8 @@ public struct JsBaoClientOptions: Sendable {
         sync: SyncConfig = SyncConfig(),
         commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff(),
         autoNetwork: Bool = true,
-        analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig()
+        analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
+        largeDocumentStorage: LargeDocumentStorageOptions? = nil
     ) {
         self.apiUrl = apiUrl
         self.wsUrl = wsUrl
@@ -66,6 +77,7 @@ public struct JsBaoClientOptions: Sendable {
         self.commitRetryBackoff = commitRetryBackoff
         self.autoNetwork = autoNetwork
         self.analyticsAutoEvents = analyticsAutoEvents
+        self.largeDocumentStorage = largeDocumentStorage
     }
 }
 
@@ -305,17 +317,55 @@ public struct CreateDocumentOptions: Encodable, Sendable {
     /// Opaque metadata blob to attach at creation (≤ 4 KB). The platform
     /// round-trips it verbatim — it does not introspect the value.
     public var metadata: JSONValue?
+    /// Create a LARGE document (`2`) instead of an ordinary one (#3436).
+    ///
+    /// A large document keeps its records in a persisted table on both ends
+    /// and carries only the current epoch's changes in its Y.Doc, so it scales
+    /// to far more data than an ordinary document — at the cost of needing
+    /// persistent on-device storage (`.sqlite`, not `.memory`). Named after
+    /// the REST field, and after the JS client's `documents.create({
+    /// documentFormat: 2 })`.
+    ///
+    /// `nil` — the default — sends nothing, so an ordinary create's request
+    /// body is exactly what it was before this option existed.
+    public var documentFormat: Int?
 
     public init(
         title: String? = nil,
         tags: [String]? = nil,
         localOnly: Bool = false,
-        metadata: JSONValue? = nil
+        metadata: JSONValue? = nil,
+        documentFormat: Int? = nil
     ) {
         self.title = title
         self.tags = tags
         self.localOnly = localOnly
         self.metadata = metadata
+        self.documentFormat = documentFormat
+    }
+
+    // `localOnly` is a CLIENT-side flag and is deliberately NOT encoded (#3757).
+    //
+    // The server has never read it. The wired create path
+    // (`JsBaoClient.createDocument` → `DocumentManager.commitOfflineCreate`)
+    // builds its own body and never sent it; only the isolated
+    // `DocumentsAPI.create` fallback — used when no client is wired — posts these
+    // options as the body, and because `localOnly` is a non-optional `Bool` it
+    // always put `"localOnly": false` on the wire. Under the stray-key refusal
+    // the three create routes now answer 400 `VALIDATION_FAILED` for a key they
+    // do not read, so that body would be refused for a flag that never meant
+    // anything to the server. The property itself is untouched: `documents.open`'s
+    // local-only rules read it exactly as before.
+    private enum CodingKeys: String, CodingKey {
+        case title, tags, metadata, documentFormat
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(tags, forKey: .tags)
+        try container.encodeIfPresent(metadata, forKey: .metadata)
+        try container.encodeIfPresent(documentFormat, forKey: .documentFormat)
     }
 }
 
@@ -391,8 +441,11 @@ public struct PaginatedResult<T: Sendable>: Sendable {
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window (#1316).
-    public let cursor: String?
+    /// Deprecated alias of `nextCursor` kept for one deprecation window
+    /// (#1316, #1982). Computed from `nextCursor` so the type's own
+    /// initializers never reference the deprecated declaration.
+    @available(*, deprecated, message: "Use nextCursor.")
+    public var cursor: String? { nextCursor }
 
     public init(
         items: [T],
@@ -403,7 +456,6 @@ public struct PaginatedResult<T: Sendable>: Sendable {
         self.items = items
         let next = nextCursor ?? cursor
         self.nextCursor = next
-        self.cursor = next
         self.hasMore = hasMore ?? (next != nil)
     }
 }
@@ -490,23 +542,29 @@ public struct SyncMetadataOptions: Sendable {
     /// Restrict the sync to a single document. `nil` syncs all open
     /// docs (default).
     public var documentId: String?
-    /// `"ids"` (default) syncs only the doc ID list; `"full"` syncs
-    /// every doc's full metadata blob. js-bao name parity.
+    /// `"full"` (default) syncs every doc's full metadata blob; `"ids"` syncs
+    /// only the doc ID list. js-bao name parity.
     public var payloadType: String?
     /// When true, the sync runs without blocking the caller.
     public var background: Bool?
-    /// Whether the server's listing replaces the local index rather than
-    /// merely merging into it: local documents absent from the response are
-    /// evicted and a `deleted` metadata event is emitted for each (pending
-    /// creates and local-only documents are exempt). This is how a document
-    /// whose access was revoked while this client was offline leaves the
-    /// device.
+    /// Whether the server's answer replaces the local index rather than merely
+    /// merging into it: local documents the server no longer has are evicted
+    /// and a `deleted` metadata event is emitted for each (pending creates and
+    /// local-only documents are exempt). This is how a document whose access
+    /// was revoked while this client was offline leaves the device.
     ///
     /// Mirrors js-bao's `SyncMetadataOptions.authoritative`, **including its
-    /// default**: a full-listing sync is authoritative unless you set this to
-    /// `false`. A single-document sync (`documentId`) and an ids-only payload
-    /// (`payloadType: "ids"`) are never authoritative — neither carries enough
-    /// to prove a document is gone.
+    /// default**: every sync evicts unless you set this to `false`.
+    ///
+    /// What counts as "the server no longer has it" depends on the scope. A
+    /// whole-scope listing evicts the documents it does not mention. A
+    /// single-document sync (`documentId`) is authoritative for its target row
+    /// alone — it says nothing about the other documents — and evicts it when
+    /// the server answers the fetch with 404 or 403. An ids-only payload
+    /// (`payloadType: "ids"`) carries too little to prove a document is gone,
+    /// so it *defers* its evictions rather than skipping them: each row the
+    /// listing did not mention is checked against the server, and only a 404 /
+    /// 403 removes it.
     public var authoritative: Bool?
     public init(
         documentId: String? = nil,

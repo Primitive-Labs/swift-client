@@ -161,12 +161,18 @@ public enum TomlSchemaLoader {
             fieldNames: Set(fields.keys),
             strict: strict
         )
-        return PrimitiveSchema(
+        let schema = PrimitiveSchema(
             name: name,
             fields: fields,
             constraints: constraints,
             relationships: [:]
         )
+        // #3719 — a unique constraint on a stringset field is refused here,
+        // with js-bao's sentence: no writer can key it consistently.
+        if let violation = schema.uniqueStringsetViolation {
+            throw TomlSchemaLoaderError.uniqueOnStringset(message: violation.message)
+        }
+        return schema
     }
 
     // MARK: - Fields
@@ -512,6 +518,9 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
     )
     case unknownKey(context: String, key: String, allowed: [String])
     case invalidAutoStamp(model: String, field: String, value: String)
+    /// A unique constraint on a stringset field (#3719); `message` is the
+    /// sentence js-bao's loader answers.
+    case uniqueOnStringset(message: String)
 
     public var description: String {
         switch self {
@@ -547,6 +556,8 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
             return "\(context): unknown key `\(key)`. Allowed: \(allowed.joined(separator: ", "))"
         case let .invalidAutoStamp(model, field, value):
             return "Model `\(model)` field `\(field)` has invalid auto_stamp value `\(value)` — must be one of: create, update, both"
+        case let .uniqueOnStringset(message):
+            return message
         }
     }
 }

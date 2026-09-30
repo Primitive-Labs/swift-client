@@ -122,7 +122,7 @@ final class ApiParityRound2Tests: XCTestCase {
         let api = MeAPI(transport: r)
 
         let page = try await api.ownedDocumentsPage(limit: 1)
-        XCTAssertEqual(page.cursor, "next-page")
+        XCTAssertEqual(page.nextCursor, "next-page")
         XCTAssertEqual(page.items.map { $0.documentId }, ["d1"])
     }
 

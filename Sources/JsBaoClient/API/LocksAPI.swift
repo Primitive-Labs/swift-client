@@ -63,11 +63,15 @@ public final class LocksAPI: @unchecked Sendable {
     /// One non-blocking attempt at the server endpoint. Returns the raw
     /// response so both `tryAcquire` and the blocking `acquire` loop can read
     /// the contention detail.
-    private func acquireOnce(key: String, ttlMs: Int) async throws -> LockAcquireResponse {
+    private func acquireOnce(
+        key: String,
+        ttlMs: Int,
+        owner: String? = nil
+    ) async throws -> LockAcquireResponse {
         try await transport.request(
             method: .post,
             path: "/locks/acquire",
-            body: LockAcquireRequest(key: key, ttlMs: ttlMs)
+            body: LockAcquireRequest(key: key, ttlMs: ttlMs, owner: owner)
         )
     }
 
@@ -77,8 +81,21 @@ public final class LocksAPI: @unchecked Sendable {
     ///
     /// Unlike the blocking `acquire`, a rate-limit 429 is **not** swallowed
     /// here — it surfaces to the caller as an `HttpError`.
-    public func tryAcquire(key: String, ttl: TimeInterval) async throws -> LockHandle? {
-        let res = try await acquireOnce(key: key, ttlMs: ttl.wholeMilliseconds)
+    /// - Parameter owner: Who is taking this lease — a string you choose
+    ///   (#3562), at most 256 characters. Presenting the owner that ALREADY
+    ///   holds the key, from the same caller and the same kind of caller,
+    ///   re-takes the lease: a FRESH handle and a fresh lease, with the
+    ///   previous handle fenced out. Name the run, or the work a run key
+    ///   coalesces — never a static string. Omit it and the lock is strictly
+    ///   non-reentrant, exactly as before.
+    public func tryAcquire(
+        key: String,
+        ttl: TimeInterval,
+        owner: String? = nil
+    ) async throws -> LockHandle? {
+        let res = try await acquireOnce(
+            key: key, ttlMs: ttl.wholeMilliseconds, owner: owner
+        )
         return res.acquired ? res.handle : nil
     }
 
@@ -96,14 +113,22 @@ public final class LocksAPI: @unchecked Sendable {
     ///   - timeout: How long to wait for the lock before throwing. Saturates
     ///     at ``TimeInterval/maxWholeMilliseconds`` (~292 years), so
     ///     `.infinity` means "wait indefinitely" rather than trapping.
-    public func acquire(key: String, ttl: TimeInterval, timeout: TimeInterval) async throws -> LockHandle {
+    ///   - owner: See `tryAcquire(key:ttl:owner:)`. Presented on every poll,
+    ///     so a blocking acquire that wins on its third attempt is the same
+    ///     holder its first attempt was.
+    public func acquire(
+        key: String,
+        ttl: TimeInterval,
+        timeout: TimeInterval,
+        owner: String? = nil
+    ) async throws -> LockHandle {
         let ttlMs = ttl.wholeMilliseconds
         let timeoutMs = timeout.wholeMilliseconds
         let deadline = Self.deadline(timeoutMs: timeoutMs)
         while true {
             var base = Self.defaultRetryAfterMs
             do {
-                let res = try await acquireOnce(key: key, ttlMs: ttlMs)
+                let res = try await acquireOnce(key: key, ttlMs: ttlMs, owner: owner)
                 if res.acquired, let handle = res.handle { return handle }
                 if let retryAfterMs = res.retryAfterMs, retryAfterMs > 0 {
                     base = retryAfterMs

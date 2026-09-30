@@ -208,7 +208,7 @@ public final class MeAPI: @unchecked Sendable {
             id: { $0.document.documentId },
             project: { LocalFirstListing.sharedDocument(from: $0) }
         )
-        return SharedDocumentListResult(items: merged, cursor: page.cursor)
+        return SharedDocumentListResult(items: merged, nextCursor: page.nextCursor)
     }
 
     /// List documents the current user owns (live owner, not creator —
@@ -529,11 +529,6 @@ public final class MeAPI: @unchecked Sendable {
         await task?.value
     }
 
-    /// Lists pending document invitations for the current user.
-    public func pendingDocumentInvitations() async throws -> [PendingDocumentInvitation] {
-        try await transport.request(method: .get, path: "/me/document-invitations")
-    }
-
     /// Update the current user's profile (name and/or external avatar URL).
     /// Mirrors js-bao's `me.update(params)` → `UserProfile`. Pass
     /// `avatarUrl: .clear` to remove the current avatar (JS `avatarUrl: null`).
@@ -581,10 +576,7 @@ public final class MeAPI: @unchecked Sendable {
             options: RequestOptions(customHeaders: ["Content-Type": contentType.rawValue])
         )
         guard (200..<300).contains(status) else {
-            throw HttpError(
-                status: status, message: "Avatar upload failed",
-                body: String(data: body, encoding: .utf8)
-            )
+            throw HttpError.fromBytes(status: status, message: "Avatar upload failed", body: body)
         }
         await clearCache()
         return try JSONCoding.decodeData(AvatarUploadResult.self, from: body)

@@ -9,7 +9,7 @@ The Swift client mirrors the JS client's layered design but uses platform-native
 ```
 ┌─────────────────────────────────────────────────┐
 │                  JsBaoClient                     │  Public API surface
-│   (documents, databases, llm, me, events, …)    │
+│  (documents, databases, prompts, me, events, …) │
 ├──────────┬──────────┬───────────┬───────────────┤
 │  Auth    │ Document │ WebSocket │    HTTP       │  Internal layer
 │Controller│ Manager  │  Manager  │   Client      │
@@ -26,7 +26,7 @@ The Swift client mirrors the JS client's layered design but uses platform-native
 
 ### `JsBaoClient.swift` — Coordination Hub
 
-The main class wires everything together and exposes the public API. It owns instances of every internal component and forwards calls to them. All sub-APIs (`documents`, `databases`, `llm`, `me`, etc.) are lazy properties that share the underlying `HttpClient`.
+The main class wires everything together and exposes the public API. It owns instances of every internal component and forwards calls to them. All sub-APIs (`documents`, `databases`, `prompts`, `me`, etc.) are lazy properties that share the underlying `HttpClient`.
 
 ### `Internal/`
 
@@ -47,7 +47,7 @@ The main class wires everything together and exposes the public API. It owns ins
 
 Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource:
 
-`CollectionsAPI`, `DatabasesAPI`, `DocumentsAPI`, `GeminiAPI`, `GroupsAPI`, `GroupTypeConfigsAPI`, `IntegrationsAPI`, `LlmAPI`, `MeAPI`, `PromptsAPI`, `RuleSetsAPI`, `SessionAPI`, `UsersAPI`
+`CollectionsAPI`, `DatabasesAPI`, `DocumentsAPI`, `GroupsAPI`, `GroupTypeConfigsAPI`, `IntegrationsAPI`, `MeAPI`, `PromptsAPI`, `RuleSetsAPI`, `SessionAPI`, `UsersAPI`
 
 ### `Storage/`
 

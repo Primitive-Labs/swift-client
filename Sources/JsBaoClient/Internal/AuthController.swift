@@ -170,6 +170,13 @@ public final class AuthController: @unchecked Sendable {
     // `await`.
     private var _transport: (any Transport)?
 
+    // The session the refresh-proxy calls run on. It defaults to the
+    // cache-disabled session every other HTTP path in the client uses (#3170),
+    // and is injectable because a session built from a configuration ignores
+    // `URLProtocol.registerClass` — the server-free proxy tests hand in a
+    // session whose configuration carries their stub.
+    private let networkSession: URLSession
+
     // Internal: takes the module-internal `Logger` (#2363).
     init(
         appId: String,
@@ -178,7 +185,8 @@ public final class AuthController: @unchecked Sendable {
         offlineStore: OfflineStore,
         emitter: EventEmitter,
         refreshProxy: RefreshProxyConfig?,
-        persistConfig: AuthConfig
+        persistConfig: AuthConfig,
+        networkSession: URLSession = NetworkSession.uncached
     ) {
         self.appId = appId
         self.apiUrl = apiUrl
@@ -187,6 +195,7 @@ public final class AuthController: @unchecked Sendable {
         self.emitter = emitter
         self.refreshProxy = refreshProxy
         self.persistConfig = persistConfig
+        self.networkSession = networkSession
         self.keychainHelper = KeychainHelper(service: "com.primitive.\(appId).offline")
     }
 
@@ -2211,7 +2220,7 @@ public final class AuthController: @unchecked Sendable {
         }
         request.httpBody = try JSONCoding.encodeData(body)
 
-        let (data, response) = try await NetworkSession.data(for: request)
+        let (data, response) = try await NetworkSession.data(for: request, using: networkSession)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw JsBaoError(code: .unavailable, message: "Invalid response")
         }
@@ -2242,7 +2251,7 @@ public final class AuthController: @unchecked Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        let (data, response) = try await NetworkSession.data(for: request)
+        let (data, response) = try await NetworkSession.data(for: request, using: networkSession)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw JsBaoError(code: .unavailable, message: "Invalid response")
         }
@@ -2313,7 +2322,7 @@ public final class AuthController: @unchecked Sendable {
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             }
             do {
-                _ = try await NetworkSession.data(for: request)
+                _ = try await NetworkSession.data(for: request, using: networkSession)
             } catch {
                 logger.debug("Best-effort server logout failed:", error.localizedDescription)
             }

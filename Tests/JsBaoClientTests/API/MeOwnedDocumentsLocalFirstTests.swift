@@ -201,7 +201,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
         )
 
         XCTAssertEqual(page.items.count, 2)
-        XCTAssertNil(page.cursor)
+        XCTAssertNil(page.nextCursor)
     }
 
     // MARK: - Behavior 7: offline
@@ -376,7 +376,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
 
     /// The `__ROOT_TAG__` sentinel filters the root even when the token
     /// carries no `rootDocId` claim (standalone construction), matching
-    /// `DocumentsAPI.filterOutRoot`.
+    /// `LocalFirstListing.rootDocumentTag`.
     func testRootTagFiltersWithoutKnownRootDocId() async throws {
         let store = MetadataStore([
             Self.ownedEntry("local1"),
@@ -453,7 +453,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
             transport.lastCall?.path.contains("limit=1") ?? false,
             "the requested page size reaches the query string"
         )
-        XCTAssertEqual(page.cursor, "next-cursor", "the server's cursor is returned, not nil")
+        XCTAssertEqual(page.nextCursor, "next-cursor", "the server's cursor is returned, not nil")
         XCTAssertTrue(
             page.items.contains { $0.documentId == "srv1" },
             "the server page's rows are present"
@@ -492,7 +492,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
             "the page is the server page — local-only rows are not appended"
         )
         XCTAssertLessThanOrEqual(page.items.count, 1, "a page never exceeds the requested limit")
-        XCTAssertEqual(page.cursor, "next-cursor")
+        XCTAssertEqual(page.nextCursor, "next-cursor")
     }
 
     /// The tag exemption belongs to the server-response filter only. js-bao

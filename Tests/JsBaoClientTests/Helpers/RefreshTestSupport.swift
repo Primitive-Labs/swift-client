@@ -20,12 +20,24 @@ import Foundation
 ///     the proxy routing.
 ///   - emitter: the emitter the controller publishes to, for suites that assert
 ///     on the events an app observes (#2723).
+/// A session whose configuration carries `protocolClass`, for the client
+/// surfaces that take a session rather than a configuration.
+func makeStubSession(protocolClass: AnyClass) -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [protocolClass]
+    return URLSession(configuration: configuration)
+}
+
 func makeWiredClients(
     initialToken: String,
     protocolClass: AnyClass = RefreshStubURLProtocol.self,
     refreshProxy: RefreshProxyConfig? = nil,
     emitter: EventEmitter = EventEmitter()
 ) -> (auth: AuthController, http: HttpClient) {
+    // The proxy calls run on the controller's own session, which is injected
+    // here so the stub answers them too: the client's sessions are built from
+    // a configuration, and such a session ignores `URLProtocol.registerClass`
+    // (#3170).
     let auth = AuthController(
         appId: "test-app",
         apiUrl: "http://stub.local",
@@ -33,7 +45,8 @@ func makeWiredClients(
         offlineStore: OfflineStore(),
         emitter: emitter,
         refreshProxy: refreshProxy,
-        persistConfig: AuthConfig()
+        persistConfig: AuthConfig(),
+        networkSession: makeStubSession(protocolClass: protocolClass)
     )
 
     let stubConfig = URLSessionConfiguration.ephemeral
@@ -81,6 +94,10 @@ final class RefreshStubURLProtocol: URLProtocol {
         var refreshDelay: TimeInterval = 0
         var refreshStatus = 200
         var refreshFailsAtTransport = false
+        /// The body the stub answers a non-refresh 401 with. Defaults to the
+        /// bare legacy shape; #3403 suites script the real server envelope so
+        /// the client's own 401 handling can be asserted against it.
+        var unauthorizedBody: [String: String] = ["error": "unauthorized"]
     }
 
     private static let script = LockedBox(Script())
@@ -103,6 +120,12 @@ final class RefreshStubURLProtocol: URLProtocol {
             refreshStatus: 401,
             refreshFailsAtTransport: refreshFailsAtTransport
         )
+    }
+
+    /// Script the body a non-refresh 401 answers with (#3403). Everything
+    /// else keeps the current script.
+    static func configure(unauthorizedBody: [String: String]) {
+        script.withValue { $0.unauthorizedBody = unauthorizedBody }
     }
 
     static func reset() {
@@ -151,7 +174,7 @@ final class RefreshStubURLProtocol: URLProtocol {
             Self.script.withValue { $0.sawAuthorizedRetry = true }
             respond(status: 200, json: ["userId": "u1"])
         } else {
-            respond(status: 401, json: ["error": "unauthorized"])
+            respond(status: 401, json: Self.script.value.unauthorizedBody)
         }
     }
 

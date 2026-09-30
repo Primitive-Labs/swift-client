@@ -16,6 +16,23 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     private var _isReady = false
     private var resolvedPath: String?
 
+    /// Where the database file is, once it is open.
+    ///
+    /// Read by the format-2 storage probe (#3437, behavior 33): what a large
+    /// document may keep is a property of the volume this file is on. `nil`
+    /// for an in-memory provider, which has no file and no volume.
+    public var databaseDirectory: String? {
+        // The queue is the mutex, and this may be asked from inside a call
+        // that already holds it — so the same re-entrancy check every other
+        // hopping method here makes (#3436).
+        let read = { () -> String? in
+            guard let path = self.resolvedPath, path != ":memory:" else { return nil }
+            return (path as NSString).deletingLastPathComponent
+        }
+        if DispatchQueue.getSpecific(key: Self.queueKey) == queueToken { return read() }
+        return queue.sync(execute: read)
+    }
+
     // MARK: - Init
 
     /// Create a provider that stores its database at `path`.
@@ -23,6 +40,9 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     ///   Pass `nil` to use an in-memory database (useful for tests).
     public init(path: String? = nil) {
         self.databasePath = path
+        // Tag the queue with this provider, so a nested `withRawConnection`
+        // running on it can recognize that it already holds the lock (#3436).
+        queue.setSpecific(key: Self.queueKey, value: queueToken)
     }
 
     // MARK: - StorageProvider
@@ -307,6 +327,69 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
 
             return sqlite3_step(stmt) == SQLITE_ROW
         }
+    }
+
+    // MARK: - Direct connection access (#3436)
+
+    /// Run `body` on the serial queue with this provider's own connection.
+    ///
+    /// A large document's records are real SQL tables, not `kv_store` rows —
+    /// a 2 GB document read one JSON blob at a time is not a document — so
+    /// the format-2 layer needs the handle itself. It reuses THIS connection
+    /// and THIS queue deliberately: `JsBaoClient.setupStorage` records that a
+    /// second handle on the same WAL file produced `SQLITE_BUSY` under
+    /// concurrent auth and data writes, and serializing on one queue is what
+    /// removes the second writer rather than retrying around it.
+    ///
+    /// `internal` to the module and reached through ``Format2SqlHost``, so the
+    /// public ``StorageProvider`` surface is unchanged and no app can take a
+    /// raw handle out of the provider.
+    func withRawConnection<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+        try withoutActuallyEscaping(body) { body in
+            let work = QueueWork { () throws -> T in
+                guard self._isReady, let db = self.db else {
+                    throw Format2SqlError.notInitialized
+                }
+                return try body(db)
+            }
+            // RE-ENTRANT, and it has to be. The queue is the mutex, so being
+            // on it already means this call holds it — and the format-2 layer
+            // genuinely nests: a fold runs inside `transaction`, which is
+            // itself inside this call, and each `applyRemote` asks for the
+            // connection again. A plain `queue.sync` from the queue's own
+            // thread deadlocks (it traps under the test runner), so the
+            // nested call runs inline on the lock it already owns.
+            if DispatchQueue.getSpecific(key: Self.queueKey) == queueToken {
+                return try work.run()
+            }
+            return try queue.sync { try work.run() }
+        }
+    }
+
+    /// Identifies THIS provider's queue from code running on it, so a nested
+    /// `withRawConnection` can tell "I already hold this lock" from "another
+    /// provider's queue happens to be running me".
+    private static let queueKey = DispatchSpecificKey<UUID>()
+
+    /// A token rather than `self`: a queue holds its specific values
+    /// strongly, so tagging the queue with the provider would be a retain
+    /// cycle the provider never escapes.
+    private let queueToken = UUID()
+
+    /// The one `Format2SqlConnection` handed to every `withConnection` caller.
+    ///
+    /// One instance, not one per call, because the transaction DEPTH lives on
+    /// it: a fold nested inside a `transaction` has to reuse the open
+    /// transaction, and a fresh connection per call would reset the counter
+    /// and issue a second `BEGIN IMMEDIATE` that SQLite refuses.
+    private var format2Connection: SQLiteFormat2Connection?
+
+    /// Must be called on `queue`.
+    func format2ConnectionOnQueue(_ db: OpaquePointer) -> SQLiteFormat2Connection {
+        if let existing = format2Connection, existing.owns(db) { return existing }
+        let created = SQLiteFormat2Connection(db: db)
+        format2Connection = created
+        return created
     }
 
     // MARK: - Private helpers

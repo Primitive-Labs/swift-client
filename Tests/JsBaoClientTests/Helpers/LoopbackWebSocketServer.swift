@@ -100,6 +100,48 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
         }
     }
 
+    /// Push one text frame to every connected client.
+    ///
+    /// The drain above only reads; this is the other direction, and #3436
+    /// needs it: the claim that a client's receive limit was raised in time is
+    /// only testable against a frame big enough to have failed without it, and
+    /// `URLSessionWebSocketTask` fails an oversized message at the RECEIVE —
+    /// nothing reaches the handler to observe.
+    ///
+    /// - Returns: `false` when the frame reached no client at all. A client
+    ///   that has since gone away is not a failure — a test that made the
+    ///   client reconnect still has a live connection in the list.
+    @discardableResult
+    func push(_ text: String, timeout: TimeInterval = 10) -> Bool {
+        let targets = lock.withLock { connections }
+        guard !targets.isEmpty else { return false }
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
+        let context = NWConnection.ContentContext(
+            identifier: "loopback-push", metadata: [metadata]
+        )
+        // Network.framework runs the completion on its own queue, so the flag
+        // it sets needs an owner that serialises access rather than a captured
+        // local `var` ("mutation of captured var 'delivered' in
+        // concurrently-executing code"). The semaphore below does make each
+        // send's completion happen-before the next iteration, but that is an
+        // argument about this loop, not one the compiler can check.
+        let delivered = LockedBox(false)
+        for connection in targets {
+            let done = DispatchSemaphore(value: 0)
+            connection.send(
+                content: Data(text.utf8),
+                contentContext: context,
+                isComplete: true,
+                completion: .contentProcessed { error in
+                    if error == nil { delivered.value = true }
+                    done.signal()
+                }
+            )
+            _ = done.wait(timeout: .now() + timeout)
+        }
+        return delivered.value
+    }
+
     func stop() {
         listener.cancel()
         lock.withLock {

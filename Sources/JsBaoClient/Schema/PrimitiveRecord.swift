@@ -47,7 +47,7 @@ public final class PrimitiveRecord: Sendable {
             // untouched; callers that need the error surface should
             // use `DynamicModel.update(id:values:)` directly.
             if let v = newValue {
-                try? model.update(id: id, values: [field: v])
+                model.assignFieldFromRecord(recordId: id, field: field, value: v)
             } else {
                 model.clearField(recordId: id, field: field)
             }

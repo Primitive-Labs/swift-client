@@ -26,22 +26,32 @@ let package = Package(
         // `TomlSchemaLoader` accepts) into one Swift file per model. Use
         // standalone, or via the SwiftPM plugin below to run on every
         // `swift build`.
+        //
+        // THE PRODUCT NAME AND ITS TARGET NAME MUST MATCH, and there must be
+        // exactly ONE executable product for the target (#3560). Swift 6.4 /
+        // Xcode 27 made `swiftbuild` SwiftPM's default build system, and it
+        // resolves a plugin's tool to a path under `Products/<Config>/` named
+        // after the PRODUCT while scheduling the build by TARGET. When the two
+        // names differed — the target was `SwiftBaoCodegen`, the product
+        // `swift-bao-codegen` — swiftbuild looked for
+        // `Products/Debug/swift-bao-codegen` and built nothing under any name,
+        // so every cross-package consumer (the template, and so every app
+        // scaffolded from it) failed with "Build input file cannot be found".
+        //
+        // A second `.executable` product aliasing the same target used to sit
+        // here so an IN-PACKAGE consumer's `dependencies: ["SwiftBaoCodegen"]`
+        // could resolve as a product under the `native` build system. Name
+        // identity makes it redundant — the bare string now matches both the
+        // target and the product — and its presence is what gave swiftbuild
+        // two products for one target. Do not reintroduce it: it fixes
+        // nothing on `native` and breaks `swiftbuild`.
+        //
+        // Upstream hit the same wall and resolved it the same way:
+        // swiftlang/swift-java#733, fixed in swiftlang/swift-java#740 by
+        // renaming the tool target to match its product.
         .executable(
             name: "swift-bao-codegen",
-            targets: ["SwiftBaoCodegen"]
-        ),
-        // Alias product mirroring the target name. Lets the
-        // codegen plugin's `dependencies: ["SwiftBaoCodegen"]`
-        // resolve when consumed BY A TARGET IN THE SAME PACKAGE
-        // (e.g. the `E2EMiniApp` cross-language test mini-app).
-        // Without this alias, in-package consumers fail with
-        // "no product named SwiftBaoCodegen". Cross-package
-        // consumers (the demo apps) work either way — they
-        // resolve the plugin's tool dependency through the
-        // package graph by target name.
-        .executable(
-            name: "SwiftBaoCodegen",
-            targets: ["SwiftBaoCodegen"]
+            targets: ["swift-bao-codegen"]
         ),
         // SwiftPM build tool plugin. Consumers add this to their target
         // and SwiftPM runs `swift-bao-codegen` automatically on every
@@ -81,7 +91,7 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "SwiftBaoCodegen",
+            name: "swift-bao-codegen",
             dependencies: [
                 .product(name: "TOMLKit", package: "TOMLKit"),
             ],
@@ -90,14 +100,16 @@ let package = Package(
         .plugin(
             name: "JsBaoCodegenPlugin",
             capability: .buildTool(),
-            // Reference the executable PRODUCT (not the target) so
-            // the plugin's tool dep resolves identically whether
-            // the plugin is consumed in-package (e.g. `E2EMiniApp`
-            // in this Package.swift) or cross-package (the demo
-            // app's Package.swift). With `["SwiftBaoCodegen"]` —
-            // the target name — SwiftPM rejects in-package
-            // consumers with "no product named SwiftBaoCodegen".
-            dependencies: ["SwiftBaoCodegen"],
+            // One bare string that is BOTH the target name and the
+            // executable product name (#3560), so the tool dep resolves
+            // identically in-package (`E2EMiniApp` below) and
+            // cross-package (the template), under `native` and under
+            // `swiftbuild`. Native resolves an in-package plugin tool dep
+            // as a product; swiftbuild paths it by product and schedules it
+            // by target. Only name identity satisfies both — see the
+            // product declaration above for what each build system did
+            // when the names differed.
+            dependencies: ["swift-bao-codegen"],
             path: "Plugins/JsBaoCodegenPlugin"
         ),
         .testTarget(
@@ -108,12 +120,13 @@ let package = Package(
             // target's path tree but compiles as its own executable
             // target (`E2EMiniApp`) — exclude here so SwiftPM
             // doesn't pull the same Swift sources into both target
-            // compilations.
-            exclude: ["CrossPlatform/E2E"]
+            // compilations. The session-row fixtures (#3802) are JSON the
+            // JS and Swift suites both read by path, not bundle resources.
+            exclude: ["CrossPlatform/E2E", "Fixtures/AgentSessionRows"]
         ),
         .testTarget(
             name: "SwiftBaoCodegenTests",
-            dependencies: ["SwiftBaoCodegen"],
+            dependencies: ["swift-bao-codegen"],
             path: "Tests/SwiftBaoCodegenTests"
         ),
         // Cross-language E2E mini-app: a tiny CLI driven by JSON on

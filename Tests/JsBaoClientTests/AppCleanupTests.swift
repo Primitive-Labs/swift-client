@@ -33,7 +33,15 @@ final class AppCleanupTests: XCTestCase {
         // live dev server — fails both times with the documented
         // `Timeout waiting for sync on <docId>` (~42s each), so the JS-side
         // bug is still unfixed and the skip stays.
-        throw XCTSkip(
+        //
+        // Spelled `XCTSkipIf(true, …)` rather than `throw XCTSkip(…)`: the
+        // preserved body is the whole point of the skip, and after a bare
+        // `throw` the compiler reports every line of it as unreachable
+        // (#3314). This raises the same skip and leaves the body reachable
+        // code, so it is read as such — flip the condition to `false` to
+        // re-enable.
+        try XCTSkipIf(
+            true,
             "Blocked on the JS-side create-then-open sync bug " +
             "(tests/client/app-cleanup.test.ts \"TODO: Fix sync issues\"). " +
             "Re-verified still failing 2026-06-10 under #1058. " +

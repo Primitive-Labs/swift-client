@@ -345,6 +345,78 @@ final class LocalOnlyOutboundHermeticTests: XCTestCase {
         )
     }
 
+    func testWriteDuringTheOpenOfAStoredLocalOnlyDocumentIsNotTransmitted() async throws {
+        // The open installs the update observer before it can know what the
+        // document is: the stored row is read several awaits later (#3200). So a
+        // write made during the open — from a `DocumentOpenedEvent` handler
+        // here, as a caller the already-open fast path handed the document to
+        // could equally make — is forwarded while `isLocalOnly` still answers
+        // false out of ignorance. The classification hold has to cover the open
+        // itself, or #2691's guarantee has a hole the size of it.
+        let client = makeClient(appId: "local-only-outbound-open-window")
+        defer { Task { await client.destroy() } }
+        let sink = FrameSink()
+        client.documentManager.sendWebSocketMessage = { sink.append($0) }
+
+        // Let the startup bind finish: its own release would otherwise clear
+        // the hold this test is about.
+        _ = await client.waitForStorageReady()
+
+        let documentId = "local-only-open-window-doc"
+        // A row written straight to storage, so this session's metadata index
+        // knows nothing about it — the state a relaunch is in before
+        // `loadLocalMetadata` has reached this document.
+        let store = try XCTUnwrap(client.documentManager.offlineStore)
+        try await store.putMetadata(
+            appId: client.documentManager.appId,
+            userId: client.documentManager.userId,
+            record: LocalMetadataEntry(
+                documentId: documentId,
+                pendingCreate: false,
+                localOnly: true
+            )
+        )
+        XCTAssertFalse(
+            client.documentManager.isLocalOnly(documentId),
+            "precondition: nothing in memory knows this document is local-only yet"
+        )
+
+        let sub = client.eventEmitter.subscribe(DocumentOpenedEvent.self) { [weak client] event in
+            guard event.documentId == documentId, let doc = client?.getDoc(documentId) else { return }
+            let notes: YMap<String> = doc.getOrCreateMap(named: "notes")
+            doc.transactSync { txn in
+                notes.updateValue("stays here", forKey: "secret", transaction: txn)
+            }
+            // This handler runs inside the open, on its thread. Parking here
+            // hands the zero-debounce flush — which runs elsewhere — its chance
+            // to send before the open reaches the stored row. Shorter than the
+            // 250ms persist debounce on purpose: that persist writes a metadata
+            // row of its own, and the point of this test is the row the open
+            // reads.
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        defer { sub.cancel() }
+
+        _ = try await client.openDocument(
+            documentId,
+            options: OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: false)
+        )
+        await settle()
+
+        XCTAssertTrue(
+            sink.all.isEmpty,
+            "a local-only document's content must stay off the wire through its own open; sent: \(sink.all)"
+        )
+        XCTAssertTrue(
+            client.documentManager.isLocalOnly(documentId),
+            "the open pins local-only-ness from the stored row it read"
+        )
+        XCTAssertFalse(
+            client.documentManager.isLocalOnlyClassificationPending(documentId),
+            "and the hold it took for the open is released, not left for `loadLocalMetadata`"
+        )
+    }
+
     func testHeldUpdateForOrdinaryDocumentTransmitsOnceClassificationArrives() async throws {
         // The control for the hold: a document that turns out to be ordinary
         // must not have its edit stranded by it.
@@ -368,6 +440,50 @@ final class LocalOnlyOutboundHermeticTests: XCTestCase {
         XCTAssertFalse(
             sink.all.isEmpty,
             "an ordinary document's held edit must reach the socket once the classification lands"
+        )
+    }
+
+    func testClassificationLandingInsideTheHoldStillDeliversTheHeldUpdate() async throws {
+        // The release and the hold can cross: the flush reads "pending", and
+        // before it gives the document up the classification lands and its
+        // release asks for a drain — which finds the document still owned and
+        // can do nothing but leave a request behind. A hold that then released
+        // over that request stranded the batch: the release was the last thing
+        // that would have carried it, and an ordinary document's edit would sit
+        // queued until some later edit or reconnect happened to flush it.
+        let client = makeClient(appId: "local-only-outbound-hold-race")
+        defer { Task { await client.destroy() } }
+        let sink = FrameSink()
+        client.documentManager.sendWebSocketMessage = { sink.append($0) }
+
+        _ = await client.waitForStorageReady()
+
+        let documentId = "unclassified-hold-race-doc"
+        client.documentManager.markLocalOnlyClassificationPendingForTest(documentId)
+
+        let fired = LockedBox<Bool>(false)
+        client.onOutboundClassificationHoldForTest = { [weak client] id in
+            guard id == documentId else { return }
+            // One shot: the retry this drives must not re-enter the hook.
+            let alreadyFired: Bool = fired.withValue { was in
+                let previous = was
+                was = true
+                return previous
+            }
+            guard !alreadyFired, let client else { return }
+            client.releaseHeldOutboundClassifications()
+            // Long enough for the release's flush task to reach the owned
+            // document and record its request — the interleaving under test.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        client.queueOutboundUpdate(documentId: documentId, update: [1, 2, 3])
+        await settle()
+
+        XCTAssertTrue(fired.value, "precondition: the flush really held this document")
+        XCTAssertFalse(
+            sink.all.isEmpty,
+            "a classification landing inside the hold must still deliver the batch; sent: \(sink.all)"
         )
     }
 

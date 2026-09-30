@@ -262,35 +262,6 @@ final class InvitationTests: XCTestCase {
         XCTAssertEqual(docInfo.permission, .readWrite)
     }
 
-    // MARK: - MeAPI pending invitations
-
-    /// Ported from JS: pending invitations via MeAPI. `me/document-invitations`
-    /// reads the legacy `DocumentInvitation` rows, and the share flow no longer
-    /// writes any: an email that resolves to an app user gets a live permission
-    /// row instead. So the grant lands and the recipient's pending list stays
-    /// empty for this document.
-    func testShareToExistingUserLeavesNoPendingInvitation() async throws {
-        _ = try await ownerClient.documents.updatePermissions(
-            documentId: documentId,
-            params: .email(invitedUser.email, permission: "reader")
-        )
-
-        try await delay(1)
-
-        let entry = try await permissionEntry(
-            client: ownerClient,
-            documentId: documentId,
-            email: invitedUser.email
-        )
-        XCTAssertEqual(entry?.permission, .reader, "The share should be a live permission")
-
-        let pending = try await memberClient.me.pendingDocumentInvitations()
-        XCTAssertFalse(
-            pending.contains { $0.documentId == documentId },
-            "A share to an existing app user must not create a pending invitation"
-        )
-    }
-
     // MARK: - Sharing with an address that has no account yet
 
     /// Ported from JS: "should list document invitations" (with verification).

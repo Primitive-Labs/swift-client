@@ -132,6 +132,22 @@ final class CloseEvictLifecycleTests: XCTestCase {
 
         await client.closeDocument(documentId)
 
+        // `closeDocument` returns when the client has SENT both frames; the
+        // loopback server records them when it RECEIVES them, and the two are
+        // not the same instant. Reading the recording synchronously made this
+        // case fail under load with no frames at all — a race in the reading,
+        // not in the flushing. Wait, bounded, for the last frame the close
+        // produces; the assertions below are unchanged, order included, so a
+        // genuinely dropped frame still fails once the bound is spent.
+        let frameDeadline = Date().addingTimeInterval(5)
+        while Date() < frameDeadline {
+            let seen = server.receivedFrames
+            if seen.contains(where: { $0.contains("\"unsubscribe\"") && $0.contains(documentId) }) {
+                break
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+
         let updateIndex = server.receivedFrames.firstIndex {
             $0.contains("\"update\"") && $0.contains(documentId)
         }

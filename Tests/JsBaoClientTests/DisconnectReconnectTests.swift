@@ -148,14 +148,20 @@ final class DisconnectReconnectTests: XCTestCase {
     // to the real `test*` name and gated with `XCTSkip` so the suite reports
     // a documented skip the operator can grep for.
     func testDocumentsRemainOpenAfterDisconnect() async throws {
-        throw XCTSkip(
+        // `XCTSkipIf(true, …)` rather than `throw XCTSkip(…)`: the preserved
+        // body below is the point of the skip, and after a bare `throw` the
+        // compiler reports all of it as unreachable (#3314). The skip raised
+        // is the same one; flipping the condition to `false` re-enables the
+        // test as-is.
+        try XCTSkipIf(
+            true,
             "Disabled until YSwift FFI use-after-free on post-disconnect " +
             "transactSync is fixed. Re-enable when the Rust FFI layer no " +
             "longer signal-traps on a torn-down provider read."
         )
-        // The body below is intentionally unreachable but preserved so the
-        // assertions don't bit-rot — when the FFI fix lands, delete the
-        // XCTSkip and the test runs as-is.
+        // The body below does not run under that skip but is preserved so the
+        // assertions don't bit-rot — when the FFI fix lands, flip the
+        // condition and the test runs as-is.
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Remain Open Test")
 
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)

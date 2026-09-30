@@ -36,8 +36,11 @@ final class YDocumentDeadlockTests: XCTestCase {
         defer { txn.free() }
 
         map.insert(tx: txn, key: "note", value: "\"hello\"")
+        // `get` already yields a `String`, so `try?` makes it `String?` — the
+        // `as? String` this used to carry cast an optional to its own wrapped
+        // type and did nothing (#3314).
         let raw = try? map.get(tx: txn, key: "note")
-        XCTAssertEqual(raw as? String, "\"hello\"")
+        XCTAssertEqual(raw, "\"hello\"")
     }
 
     /// Regression marker: asserts that calling `getMap` from INSIDE an open
@@ -162,7 +165,9 @@ final class YDocumentDeadlockTests: XCTestCase {
             defer { txn.free() }
 
             if let raw = try? map.get(tx: txn, key: "note") {
-                readNote = raw as? String
+                // `raw` is already a `String` here; the `as? String` this used
+                // to carry always succeeded (#3314).
+                readNote = raw
             }
         }
 
