@@ -1,0 +1,16 @@
+{
+  "model": "PrimitiveSession",
+  "row": {
+    "id": "01K6SESSION0000000000000000",
+    "schemaVersion": 1,
+    "agentKey": "support",
+    "status": "idle",
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "variables": "[1,2]",
+    "queue": "{\"userId\":\"u_2\",\"messageIds\":[\"m_3\"]}"
+  },
+  "expect": {
+    "variables": {},
+    "queue": []
+  }
+}

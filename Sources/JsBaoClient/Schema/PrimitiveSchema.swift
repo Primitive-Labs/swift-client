@@ -238,20 +238,60 @@ public struct PrimitiveSchema: Equatable, Sendable {
     /// `_meta_*._constraints` (single-field uniques live on the field
     /// itself as `unique = true`). But both are enforced at write time
     /// via `_uniqueIdx_{modelName}_{constraintName}` indexes.
+    ///
+    /// A constraint over a stringset field is never resolved (#3719): no
+    /// writer can build that key consistently, so one recorded by an older
+    /// client is ignored rather than enforced.
     public var resolvedUniqueConstraints: [ConstraintDescriptor] {
         var out: [ConstraintDescriptor] = []
         // Synthetic single-field constraints for each `unique: true` field.
         // Sorted to keep constraint-name generation deterministic.
-        for (fieldName, desc) in fields.sorted(by: { $0.key < $1.key }) where desc.unique {
+        for (fieldName, desc) in fields.sorted(by: { $0.key < $1.key })
+        where desc.unique && desc.type != .stringset {
             out.append(ConstraintDescriptor(
                 name: "\(name)_\(fieldName)_unique",
                 fields: [fieldName]
             ))
         }
         // Explicit compound constraints.
-        for c in constraints.values.sorted(by: { $0.name < $1.name }) {
+        for c in constraints.values.sorted(by: { $0.name < $1.name })
+        where !c.fields.contains(where: { fields[$0]?.type == .stringset }) {
             out.append(c)
         }
         return out
+    }
+
+    /// The first unique constraint this schema declares over a stringset
+    /// field, with the sentence js-bao's `uniqueStringsetMessage` answers —
+    /// or `nil` when it declares none (#3719).
+    ///
+    /// The one rule the three Swift declaration boundaries share: the TOML
+    /// loader throws it, and `DynamicModel` refuses a write for it before any
+    /// `_meta_` is recorded (the public initializer cannot throw, because
+    /// `SchemaDiscovery` builds schemas with it on the read path). The field
+    /// form comes first (fields sorted by name, as `resolvedUniqueConstraints`
+    /// orders them), then compound constraints sorted by name, each reported by
+    /// its first stringset member in the constraint's own field order.
+    public var uniqueStringsetViolation: (message: String, field: String, constraint: String)? {
+        let reason = "A unique constraint applies to scalar fields only."
+        for (fieldName, desc) in fields.sorted(by: { $0.key < $1.key })
+        where desc.unique && desc.type == .stringset {
+            return (
+                message: "Model \"\(name)\": field \"\(fieldName)\" is a stringset and cannot be unique. \(reason)",
+                field: fieldName,
+                constraint: "\(name)_\(fieldName)_unique"
+            )
+        }
+        for c in constraints.values.sorted(by: { $0.name < $1.name }) {
+            guard let field = c.fields.first(where: { fields[$0]?.type == .stringset }) else {
+                continue
+            }
+            return (
+                message: "Model \"\(name)\": unique constraint \"\(c.name)\" names the stringset field \"\(field)\", which cannot be unique. \(reason)",
+                field: field,
+                constraint: c.name
+            )
+        }
+        return nil
     }
 }

@@ -19,9 +19,9 @@ struct TestUser {
 
 /// Manages test lifecycle: creates apps, users, documents via the server's admin API.
 ///
-/// Requires TEST_SUPERADMIN_JWT environment variable to be set with a valid super-admin
-/// JWT. Get one by running the JS tests first (which set up the superuser in DynamoDB),
-/// then mint a JWT via the admin API.
+/// Authenticates as the super-admin `TestConfig.superAdminJwt()` resolves: a
+/// `TEST_SUPERADMIN_JWT`, an email-only token for `TEST_SUPERADMIN_EMAIL`, or an
+/// admin the local dev server provisions for the suite.
 ///
 /// `@unchecked Sendable`: the harness is shared by concurrent tasks in several
 /// tests (a `TaskGroup` creating documents in parallel, for instance). Its three
@@ -56,13 +56,10 @@ final class TestContext: @unchecked Sendable {
     // MARK: - Initialization
 
     func initialize() async throws {
-        // Get super-admin JWT from environment
-        guard let jwt = TestConfig.superAdminJwt, !jwt.isEmpty else {
-            throw TestSetupError(
-                "TEST_SUPERADMIN_JWT environment variable is required. "
-                + "Set it to a valid super-admin JWT for the dev server."
-            )
-        }
+        // The suite's super-admin token: TEST_SUPERADMIN_JWT, else an
+        // email-only token for TEST_SUPERADMIN_EMAIL, else an admin the local
+        // server provisions (TestConfig.resolveSuperAdminJwt, #3885).
+        let jwt = try await TestConfig.superAdminJwt()
         self.superuserJWT = jwt
 
         // Extract the admin email from the JWT payload so we can use it as initialAdminEmail

@@ -1138,11 +1138,10 @@ public struct CacheUpdateFailedEvent: Sendable {
 
 // MARK: - Analytics context (P2)
 
-/// Bundle returned by `client.llmAnalyticsContext` /
-/// `geminiAnalyticsContext`. Lets feature code log structured
-/// analytics events without holding a direct reference to the client.
-/// Matches js-bao's shape — `logEvent(event)` plus an `isEnabled`
-/// guard for callers that want to skip work when analytics is off.
+/// A logger handle an app builds and hands its own feature code, so that code
+/// can log structured analytics events without holding a direct reference to
+/// the client — `logEvent(event)` plus an `isEnabled` guard for callers that
+/// want to skip work when analytics is off.
 public final class AnalyticsContext: Sendable {
     private let logger: @Sendable ([String: JSONValue]) -> Void
     private let asyncLogger: (@Sendable ([String: JSONValue]) async -> Void)?

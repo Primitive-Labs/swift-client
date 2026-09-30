@@ -1,0 +1,35 @@
+{
+  "model": "PrimitiveStep",
+  "row": {
+    "id": "01K6STEP00000000000000000000",
+    "turnId": "turn_1",
+    "seq": 2,
+    "kind": "tool_call",
+    "status": "failed",
+    "startedAt": "2026-09-28T12:00:00.000Z",
+    "callId": "call_01K6CALL0000000000000000000",
+    "toolName": "record_expense",
+    "functionName": "record-expense",
+    "functionVersion": "3",
+    "errorCode": "FUNCTION_FAILED",
+    "errorMessage": "The function threw."
+  },
+  "expect": {
+    "seq": 2,
+    "kind": "tool_call",
+    "status": "failed",
+    "callId": "call_01K6CALL0000000000000000000",
+    "toolName": "record_expense",
+    "functionName": "record-expense",
+    "functionVersion": "3",
+    "errorCode": "FUNCTION_FAILED",
+    "errorMessage": "The function threw.",
+    "inputTokens": {
+      "$absent": true
+    },
+    "cost": {
+      "$absent": true
+    },
+    "historyMessageIds": []
+  }
+}

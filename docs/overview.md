@@ -11,7 +11,7 @@ A native Swift SDK that gives an iOS or macOS app the same capabilities the JS c
 - **Offline-first persistence** so writes don't get lost without a connection
 - **Authentication** (JWT + refresh, OAuth, magic-link, OTP)
 - **Blob storage** (images, files) per-document
-- **REST API surface** for everything else (workflows, server functions, LLM, prompts, groups, etc.)
+- **REST API surface** for everything else (workflows, server functions, prompts, groups, etc.)
 - **Server functions** via `client.functions` (invoke a request function, start a task and poll its run, terminate it) plus channel subscribe and direct-message delivery (`subscribeToChannel`, the `channelMessage` / `directMessage` events)
 
 It runs on iOS 16+ and macOS 13+. It doesn't run on Linux/Windows — Apple-platform only.
@@ -21,7 +21,7 @@ It runs on iOS 16+ and macOS 13+. It doesn't run on Linux/Windows — Apple-plat
 ```
 ┌─────────────────────────────────────────────────┐
 │                  JsBaoClient                     │  Public API surface
-│   (documents, databases, llm, me, events, …)    │
+│  (documents, databases, prompts, me, events, …) │
 ├──────────┬──────────┬───────────┬───────────────┤
 │  Auth    │ Document │ WebSocket │    HTTP       │  Internal layer
 │Controller│ Manager  │  Manager  │   Client      │

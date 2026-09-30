@@ -62,6 +62,10 @@ import Yniffi
 /// invariant, not a compiler-checked one.
 public final class DynamicModel: @unchecked Sendable {
     public let schema: PrimitiveSchema
+    /// #3719 — the sentence every write of this model is refused with when its
+    /// schema declares a unique constraint on a stringset field; `nil`
+    /// otherwise. Computed once: the schema is immutable.
+    private let uniqueStringsetRefusal: String?
     internal let doc: YDocument
 
     /// Identifier for this doc within a shared SQLite store. Defaults
@@ -447,6 +451,7 @@ public final class DynamicModel: @unchecked Sendable {
     ) {
         self.doc = doc
         self.schema = schema
+        self.uniqueStringsetRefusal = schema.uniqueStringsetViolation?.message
         self.docId = docId
         observerDrainQueue.setSpecific(key: drainQueueKey, value: true)
 
@@ -616,6 +621,7 @@ public final class DynamicModel: @unchecked Sendable {
         values: [String: PrimitiveValue],
         changedFields: Set<String>? = nil
     ) throws -> PrimitiveRecord {
+        try refuseUniqueStringsetDeclaration()
         // #3436 — a large document has no nested record maps, so the
         // insert-vs-update decision is read from the merged view and the write
         // goes through the record store. This is the path the GENERATED models
@@ -1683,6 +1689,7 @@ public final class DynamicModel: @unchecked Sendable {
         isUpdate: Bool,
         changedFields: Set<String>? = nil
     ) throws {
+        try refuseUniqueStringsetDeclaration()
         // #3436 — a large document has no nested record maps to write into.
         // The same save, decided the same way, commits to the record store and
         // publishes overlay keys instead.
@@ -1705,6 +1712,21 @@ public final class DynamicModel: @unchecked Sendable {
             // ensure the doc carries this model's `_meta_*` (op-free when
             // it already matches; #2587).
             SchemaSync.syncModelMeta(doc: self.doc, schema: self.schema, transaction: txn)
+        }
+    }
+
+    /// Refuse a write for a schema that declares a unique constraint on a
+    /// stringset field (#3719), BEFORE the transaction that would write the
+    /// record and record the declaration into `_meta_<model>`.
+    ///
+    /// The public `PrimitiveSchema` initializer cannot throw (the read path
+    /// builds schemas with it), so an author's programmatic schema is refused
+    /// here, on the first save, with the sentence js-bao answers. Reads and
+    /// queries are unaffected; a discovered schema never reaches a
+    /// `DynamicModel`.
+    private func refuseUniqueStringsetDeclaration() throws {
+        if let message = uniqueStringsetRefusal {
+            throw JsBaoError(code: .invalidArgument, message: message)
         }
     }
 

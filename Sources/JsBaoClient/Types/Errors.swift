@@ -16,7 +16,6 @@ public enum JsBaoErrorCode: String, Sendable {
     case listUnavailableOffline = "LIST_UNAVAILABLE_OFFLINE"
     case unavailable = "UNAVAILABLE"
     case websocketNotConnected = "WEBSOCKET_NOT_CONNECTED"
-    case geminiError = "GEMINI_ERROR"
     case integrationNotFound = "INTEGRATION_NOT_FOUND"
     case integrationSecretMissing = "INTEGRATION_SECRET_MISSING"
     case integrationRequestInvalid = "INTEGRATION_REQUEST_INVALID"

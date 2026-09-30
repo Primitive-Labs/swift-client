@@ -78,23 +78,6 @@ public final class JsBaoClient: @unchecked Sendable {
     /// the `shareURL(...)` builders.
     public let links: LinksAPI
 
-    // MARK: Retiring direct LLM / Gemini sub-APIs
-    //
-    // Deprecated to mirror the JS client's `@deprecated` on `client.llm` /
-    // `client.gemini`. Non-deprecated internal storage plus a deprecated
-    // public accessor — the same shape `DatabaseInfo.celContext` uses — so the
-    // client's own references never emit a deprecated-declaration warning.
-
-    let _llm: LlmAPI
-    let _gemini: GeminiAPI
-
-    /// Sub-API for LLM (large language model) operations.
-    @available(*, deprecated, message: "The direct LLM client API is deprecated and will be removed in a future major release. Run a managed prompt from a server function instead: `ctx.prompts.run` (see the Server Functions guide).")
-    public var llm: LlmAPI { _llm }
-    /// Sub-API for Gemini model operations.
-    @available(*, deprecated, message: "The direct Gemini client API is deprecated and will be removed in a future major release. Run a managed prompt from a server function instead: `ctx.prompts.run` (see the Server Functions guide).")
-    public var gemini: GeminiAPI { _gemini }
-
     // The five that cannot be `let`: private storage, non-optional accessor.
 
     /// `internal` rather than `private` so a hermetic test can put the sub-API
@@ -685,25 +668,6 @@ public final class JsBaoClient: @unchecked Sendable {
         self.cronTriggers = CronTriggersAPI(transport: httpClient)
         self.collectionTypeConfigs = CollectionTypeConfigsAPI(transport: httpClient)
         self.databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: httpClient)
-        // `prepared(_:)` runs on the calling thread — the same lowering
-        // `makeAnalyticsContext()` does — so the event's `timestamp` is the
-        // instant the LLM/Gemini call site logged it. Handing the raw event to
-        // the actor instead would have stamped it whenever the unstructured
-        // task happened to run (#2244).
-        self._llm = LlmAPI(
-            transport: httpClient,
-            logAnalytics: { [analyticsQueue] event in
-                let prepared = analyticsQueue.prepared(event)
-                Task { await analyticsQueue.logEvent(prepared) }
-            }
-        )
-        self._gemini = GeminiAPI(
-            transport: httpClient,
-            logAnalytics: { [analyticsQueue] event in
-                let prepared = analyticsQueue.prepared(event)
-                Task { await analyticsQueue.logEvent(prepared) }
-            }
-        )
         let workflows = WorkflowsAPI(
             transport: httpClient,
             getConnectionId: { [weak wsManager] in wsManager?.connectionId ?? "" },
@@ -1442,6 +1406,14 @@ public final class JsBaoClient: @unchecked Sendable {
             return model
         }
         guard newlyCreated else { return created }
+        // #3719 — registration stays non-throwing, but a schema declaring a
+        // unique constraint on a stringset field will have every write
+        // refused; say so once, when the model is first registered.
+        if let violation = schema.uniqueStringsetViolation {
+            logger.warn(
+                "Model \(schema.name): writes will be refused —", violation.message
+            )
+        }
         // Connect docs opened before this model was registered. Done
         // outside `lock` because `connect` takes the document manager's
         // lock; holding both risks a lock-ordering inversion.
@@ -1614,99 +1586,6 @@ public final class JsBaoClient: @unchecked Sendable {
             )
         }
         return client
-    }
-
-    // MARK: - Analytics context helpers (P2)
-    //
-    // js-bao exposes per-feature analytics context bundles so the LLM
-    // / Gemini call paths can log structured events. On Swift those
-    // sites just delegate to `logAnalyticsEvent` directly today; the
-    // bundles below are wrappers that match the JS shape so cross-
-    // platform code can call `client.llmAnalyticsContext?.logEvent(...)`
-    // identically.
-
-    /// Returns a logger handle for LLM analytics, or `nil` when the
-    /// auto-events config for `llm` is fully disabled. The handle has
-    /// the same shape as js-bao's: `logEvent(event)` and
-    /// `isEnabled(phase?)`.
-    public var llmAnalyticsContext: AnalyticsContext? {
-        // Auto-events config isn't a typed option on Swift yet; if it
-        // lands, swap this for the real flag-walk. For now always
-        // return a context so cross-platform callers don't no-op.
-        makeAnalyticsContext()
-    }
-
-    /// Returns a logger handle for Gemini analytics — same shape as
-    /// `llmAnalyticsContext`.
-    public var geminiAnalyticsContext: AnalyticsContext? {
-        makeAnalyticsContext()
-    }
-
-    /// The handle both analytics-context accessors hand out.
-    ///
-    /// `AnalyticsContext.logEvent` is a synchronous app-facing shape, so it
-    /// enqueues without waiting — the same contract the deprecated
-    /// `logAnalyticsEvent` has, and deprecated for the same reason beside its
-    /// `logEventAsync` twin (#2244). Both talk to the queue directly rather
-    /// than through the deprecated client method (#1993, Phase D3), and both
-    /// capture the queue strongly because the handle outlives the call and
-    /// holding the queue does not retain the client.
-    ///
-    /// Both lower the event through `prepareAnalyticsEvent` on the caller's
-    /// thread: that is where the `Any` graph stops, where the event's
-    /// `timestamp` is taken, and where a non-JSON-representable event is
-    /// dropped *and logged* rather than disappearing — on both of its two
-    /// rejection paths, the encoding and `prepared(_:)`.
-    private func makeAnalyticsContext() -> AnalyticsContext {
-        // `AnalyticsContext`'s logger closures carry the typed `[String:
-        // JSONValue]` shape (#2367); `AnalyticsQueue.prepared(_:)` is still the
-        // untyped `[String: Any]` boundary (same precedent as
-        // `AnalyticsQueue.swift:148`'s doc comment describes), so lower back to
-        // `Any` here before handing the event to the queue.
-        AnalyticsContext(
-            logEvent: { [analyticsQueue, logger] event in
-                guard let prepared = Self.prepareAnalyticsEvent(
-                    event, queue: analyticsQueue, logger: logger
-                ) else { return }
-                Task { await analyticsQueue.logEvent(prepared) }
-            },
-            logEventAsync: { [analyticsQueue, logger] event in
-                guard let prepared = Self.prepareAnalyticsEvent(
-                    event, queue: analyticsQueue, logger: logger
-                ) else { return }
-                await analyticsQueue.logEvent(prepared)
-            }
-        )
-    }
-
-    /// Lower a typed analytics event to the queue's untyped shape and prepare
-    /// it, or return `nil` after saying why it could not ship.
-    ///
-    /// The lowering can fail — `JSONEncoder` rejects a non-finite
-    /// `JSONValue.number` by default — and a `try?` there would have dropped
-    /// the event without a word, contradicting the "dropped *and logged*"
-    /// contract the accessor's doc comment states. Now both rejection paths
-    /// (encoding here, `prepared(_:)` below) are equally visible.
-    ///
-    /// `static` so the closures keep capturing only the queue and the logger,
-    /// neither of which retains the client.
-    private static func prepareAnalyticsEvent(
-        _ event: [String: JSONValue],
-        queue: AnalyticsQueue,
-        logger: Logger
-    ) -> AnalyticsQueue.PreparedEvent? {
-        let lowered: Any
-        do {
-            lowered = try JSONCoding.jsonObject(from: event)
-        } catch {
-            logger.warn("[analytics] dropping event that failed to encode:", error.localizedDescription)
-            return nil
-        }
-        guard let eventAny = lowered as? [String: Any] else {
-            logger.warn("[analytics] dropping event that did not encode to a JSON object")
-            return nil
-        }
-        return queue.prepared(eventAny)
     }
 
     // MARK: - Top-level offline-metadata browsing (gap 14)

@@ -1,0 +1,27 @@
+{
+  "model": "PrimitivePart",
+  "row": {
+    "id": "01K6PART00000000000000000000",
+    "messageId": "01K6MESSAGE0000000000000000",
+    "seq": 1,
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "kind": "event",
+    "eventKind": "order_selected",
+    "eventId": "evt_1",
+    "refersTo": "call_01K6CALL0000000000000000000",
+    "data": "{\"orderId\":\"o_1\",\"lines\":[1,2]}"
+  },
+  "expect": {
+    "kind": "event",
+    "eventKind": "order_selected",
+    "eventId": "evt_1",
+    "refersTo": "call_01K6CALL0000000000000000000",
+    "data": {
+      "orderId": "o_1",
+      "lines": [
+        1,
+        2
+      ]
+    }
+  }
+}

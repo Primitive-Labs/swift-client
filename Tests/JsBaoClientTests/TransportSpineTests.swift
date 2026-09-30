@@ -482,12 +482,10 @@ final class TransportSpineTests: XCTestCase {
             "DatabaseTypeConfigsAPI.swift",
             "DocumentsAPI.swift",
             "DoDb.swift",
-            "GeminiAPI.swift",
             "GroupsAPI.swift",
             "GroupTypeConfigsAPI.swift",
             "IntegrationsAPI.swift",
             "InvitationsAPI.swift",
-            "LlmAPI.swift",
             "MeAPI.swift",
             "NotificationsAPI.swift",
             "PromptsAPI.swift",
@@ -617,9 +615,8 @@ final class TransportSpineTests: XCTestCase {
             // state, which needs the declaration and the cast on separate
             // lines. The re-review took it back 22 -> 21: the two
             // analytics-context closures each carried their own lowering cast,
-            // and both now call one `prepareAnalyticsEvent` helper that logs
-            // the encode failure instead of dropping it, so the two casts
-            // became one.
+            // and both then shared one helper that logged the encode failure
+            // instead of dropping it, so the two casts became one.
             // #2660 took the `JSONSerialization` count 5 -> 6: re-authenticating
             // an open socket sends one more outbound frame,
             // `{type:"auth", token}`, encoded the same way the other outbound
@@ -644,7 +641,11 @@ final class TransportSpineTests: XCTestCase {
             // in this file is. The dictionary it encodes is `[String: String]`,
             // so the untyped-dictionary count is unchanged — the room's answer
             // is read off the graph `handleWebSocketMessage` already parsed.
-            "JsBaoClient.swift": (22, 7, 0),
+            // #3857 took the dictionary count 22 -> 21: the direct LLM / Gemini
+            // sub-APIs left the client, and with them the two analytics-context
+            // accessors and the helper whose one `as? [String: Any]` cast
+            // lowered their events. Removed surface, not a new lowering.
+            "JsBaoClient.swift": (21, 7, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP

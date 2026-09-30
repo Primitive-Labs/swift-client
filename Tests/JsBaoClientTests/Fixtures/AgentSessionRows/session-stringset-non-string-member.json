@@ -1,0 +1,21 @@
+{
+  "model": "PrimitiveSession",
+  "row": {
+    "id": "01K6SESSION0000000000000000",
+    "schemaVersion": 1,
+    "agentKey": "support",
+    "status": "idle",
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "viewerUserIds": [
+      "u_2",
+      7,
+      "u_3"
+    ]
+  },
+  "expect": {
+    "viewerUserIds": [
+      "u_2",
+      "u_3"
+    ]
+  }
+}

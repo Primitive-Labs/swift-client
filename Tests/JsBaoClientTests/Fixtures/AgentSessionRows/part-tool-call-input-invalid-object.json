@@ -1,0 +1,26 @@
+{
+  "model": "PrimitivePart",
+  "row": {
+    "id": "01K6PART00000000000000000000",
+    "messageId": "01K6MESSAGE0000000000000000",
+    "seq": 1,
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "kind": "tool_call",
+    "toolCallId": "call_01K6CALL0000000000000000000",
+    "toolName": "record_expense",
+    "state": "output-error",
+    "input": "{\"amount\":-5,\"currency\":\"USD\"}",
+    "errorText": "amount: must be >= 0",
+    "errorCode": "AGENT_TOOL_ARGUMENTS_INVALID"
+  },
+  "expect": {
+    "kind": "tool_call",
+    "state": "output-error",
+    "input": {
+      "amount": -5,
+      "currency": "USD"
+    },
+    "errorText": "amount: must be >= 0",
+    "errorCode": "AGENT_TOOL_ARGUMENTS_INVALID"
+  }
+}

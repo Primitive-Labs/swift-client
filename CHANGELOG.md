@@ -20,6 +20,22 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: the direct LLM and Gemini sub-APIs are removed (#3857)
+
+All LLM access goes through prompts. `client.llm` and `client.gemini` are gone,
+with `LlmAPI`, `GeminiAPI` and their types (`ChatMessage` and the `Gemini*`
+request and response types), and `JsBaoErrorCode.geminiError`. The server no
+longer serves the `llm/*` and `gemini/*` app routes they called.
+
+`client.llmAnalyticsContext` and `client.geminiAnalyticsContext` go with them:
+they existed only so those two sub-APIs could log. The public
+`AnalyticsContext` type stays, and is still constructible for your own feature
+code; `client.analytics` is unchanged.
+
+Migration: define a prompt and run it — `client.prompts` from the app, or
+`ctx.prompts.run` from a server function. A prompt carries its own access rule,
+model and analytics.
+
 ### The alias creates take `documentFormat`, `tags` and `metadata` (#3757)
 
 `CreateWithAliasOptions` carried only `title` and `alias`, and

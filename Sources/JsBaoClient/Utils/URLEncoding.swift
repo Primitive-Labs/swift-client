@@ -71,7 +71,7 @@ struct URLQuery {
     ///
     /// Keys are almost always literal constants (`cursor`, `email`, …) for which
     /// encoding is a no-op, but encoding them too keeps caller-supplied keys
-    /// (e.g. Gemini passthrough query params) safe.
+    /// safe.
     mutating func append(_ key: String, _ value: String) {
         parts.append("\(URLEncoding.encodeComponent(key))=\(URLEncoding.encodeComponent(value))")
     }

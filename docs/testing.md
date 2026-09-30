@@ -45,19 +45,31 @@ The backend integration tests require the setup below.
    cd swift-client
    cp .env.tests.example .env.tests
    ```
-   You normally **don't** need a hand-minted JWT: the suite mints its own
-   short-lived super-admin token at setup time, signed with `TEST_JWT_SECRET`
-   (default `test-jwt-secret-only-for-agents`, matching the dev server's
-   `JWT_SECRET` in the repo root `.dev.vars`). The server accepts it because
-   `AdminAuthService.validateToken` builds a virtual super-admin from a JWT
-   carrying both `adminId` and `email` when no `AdminUser` record exists.
+   You normally **don't** need to set anything: the suite resolves its
+   super-admin at setup time, in this order (`TestConfig.resolveSuperAdminJwt`):
 
-   To override with your own token instead, set `TEST_SUPERADMIN_JWT`. Mint one with:
+   1. `TEST_SUPERADMIN_JWT`, when set — used as is.
+   2. `TEST_SUPERADMIN_EMAIL`, when set — the suite signs an email-only token
+      for that existing admin; the server resolves the admin by email.
+   3. Otherwise the suite asks the local dev server's test-only
+      `POST /__test__/admin/ensure-super-admin` route (with `X-Test-Auth:
+      TEST_ADMIN_TOKEN`, default `local-test-secret`) to find or create the
+      `swift-client-tests@js-bao-wss.test` super-admin, and signs a token for
+      that row.
+
+   Tokens are signed with `TEST_JWT_SECRET` (default
+   `test-jwt-secret-only-for-agents`, matching the dev server's `JWT_SECRET` in
+   the repo root `.dev.vars`); keep the two in sync. The server refuses an admin
+   token whose `adminId` names no `AdminUser` row (#3885), so the suite can no
+   longer invent an identity; the route exists only on a local server
+   (`USE_TEST_ROUTES=true` with `ENVIRONMENT` `local` or `test`). If all three
+   fail, setup fails with a message naming the route and both variables.
+
+   To use your own token instead, set `TEST_SUPERADMIN_JWT`. It must name an
+   existing admin, e.g. mint one for a row's `adminId`:
    ```bash
-   node -e "const jwt = require('jsonwebtoken'); console.log(jwt.sign({adminId:'YOUR_ADMIN_ID',email:'you@example.com',name:'Your Name',role:'super-admin',isSuperAdmin:true,appCreationLimit:50,type:'admin',enableTestFeatures:true},'test-jwt-secret-only-for-agents',{expiresIn:'24h'}))"
+   node -e "const jwt = require('jsonwebtoken'); console.log(jwt.sign({adminId:'AN_EXISTING_ADMIN_ID',email:'you@example.com',name:'Your Name',role:'super-admin',isSuperAdmin:true,appCreationLimit:50,type:'admin',enableTestFeatures:true},'test-jwt-secret-only-for-agents',{expiresIn:'24h'}))"
    ```
-   The JWT secret (`test-jwt-secret-only-for-agents`) comes from the dev
-   server's `JWT_SECRET`; keep `TEST_JWT_SECRET` in sync with it.
 
 ## Running Tests
 
