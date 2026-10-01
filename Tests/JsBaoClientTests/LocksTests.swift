@@ -151,6 +151,47 @@ final class LocksTests: XCTestCase {
         _ = try await client.locks.release(handle)
     }
 
+    /// #3930 behavior 31 — each poll asks the server to wait, so a key released
+    /// three seconds in is won from at most two acquire calls (each call is
+    /// one `lockAcquireByUser` slot on the server), where the client-side
+    /// loop made one per `retryAfterMs`.
+    func testBlockingAcquireWaitsServerSideAndSpendsAtMostTwoAcquireCalls() async throws {
+        let key = uniqueKey("block-wait")
+        let heldHandle = try await client.locks.tryAcquire(key: key, ttl: 60)
+        let held = try XCTUnwrap(heldHandle)
+
+        let counting = CountingTransport(inner: HttpClient(config: HttpClientConfig(
+            apiUrl: TestConfig.httpUrl,
+            appId: testApp.appId,
+            getToken: { [token = testApp.ownerJWT] in token },
+            getConnectionId: { nil },
+            getGlobalAdminAppId: { TestConfig.globalAdminAppId },
+            logger: Logger(level: .error),
+            refreshAccessToken: { .invalid }
+        )))
+        let locks = LocksAPI(transport: counting)
+
+        let releaser = Task { [client] in
+            try? await Task.sleep(nanoseconds: 3_000 * 1_000_000)
+            _ = try? await client?.locks.release(held)
+        }
+        defer { releaser.cancel() }
+
+        let start = Date()
+        let handle = try await locks.acquire(key: key, ttl: 60, timeout: 10)
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertEqual(handle.key, key)
+        XCTAssertNotEqual(handle.handleId, held.handleId)
+        XCTAssertGreaterThanOrEqual(elapsed, 2.8, "acquire must have waited for the release")
+        XCTAssertLessThanOrEqual(
+            counting.count(path: "/locks/acquire"), 2,
+            "the server waits for the release, so the loop does not poll through it"
+        )
+
+        _ = try await client.locks.release(handle)
+    }
+
     func testBlockingAcquireThrowsLockTimeoutWhenTheHolderNeverReleases() async throws {
         let key = uniqueKey("block-timeout")
         let heldHandle = try await client.locks.tryAcquire(key: key, ttl: 60)
@@ -201,6 +242,29 @@ final class LocksTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// A real transport, counting the calls that pass through it (#3930).
+    final class CountingTransport: Transport, @unchecked Sendable {
+        private let inner: any Transport
+        private let lock = NSLock()
+        private var paths: [String] = []
+
+        init(inner: any Transport) { self.inner = inner }
+
+        func count(path: String) -> Int {
+            lock.withLock { paths.filter { $0 == path }.count }
+        }
+
+        func execute(
+            method: HTTPMethod,
+            path: String,
+            body: Data?,
+            options: RequestOptions?
+        ) async throws -> TransportResponse {
+            lock.withLock { paths.append(path) }
+            return try await inner.execute(method: method, path: path, body: body, options: options)
+        }
+    }
 
     private func isoDate(_ value: String) -> Date? {
         let withFractional = ISO8601DateFormatter()

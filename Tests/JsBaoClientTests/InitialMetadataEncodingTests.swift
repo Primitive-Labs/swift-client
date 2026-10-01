@@ -8,7 +8,7 @@ import XCTest
 /// category's values. These tests lock in the wire shape: the key is emitted
 /// only when the caller sets it, it carries the nested category → values
 /// object, and it is reachable from every initializer overload (including the
-/// deprecated `contextId:` / `metadata:` / `celContext:` ones).
+/// deprecated `metadata:` / `celContext:` ones).
 final class InitialMetadataEncodingTests: XCTestCase {
     private func encodedObject<T: Encodable>(_ params: T) throws -> [String: Any] {
         let data = try JSONEncoder().encode(params)
@@ -38,24 +38,6 @@ final class InitialMetadataEncodingTests: XCTestCase {
     func testCollectionParamsOmitInitialMetadataWhenUnset() throws {
         let dict = try encodedObject(CreateCollectionParams(name: "Plain"))
         XCTAssertNil(dict["initialMetadata"])
-    }
-
-    /// Behavior 2 + edge case: the deprecated `contextId:` overload also
-    /// accepts `initialMetadata`, and both keys encode side by side.
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func testCollectionParamsDeprecatedContextIdOverloadCarriesInitialMetadata() throws {
-        let dict = try encodedObject(
-            CreateCollectionParams(
-                name: "Class 42",
-                contextId: "class-42",
-                initialMetadata: ["settings": ["visibility": .string("class-only")]]
-            )
-        )
-        XCTAssertEqual(dict["contextId"] as? String, "class-42")
-        let initial = try XCTUnwrap(dict["initialMetadata"] as? [String: Any])
-        XCTAssertNotNil(initial["settings"])
     }
 
     // MARK: CreateDatabaseParams

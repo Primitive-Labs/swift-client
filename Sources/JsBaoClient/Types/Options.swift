@@ -441,22 +441,15 @@ public struct PaginatedResult<T: Sendable>: Sendable {
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     public init(
         items: [T],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 }
 

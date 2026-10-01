@@ -18,8 +18,8 @@ public struct CollectionTypeConfigInfo: Decodable, Sendable, Equatable {
     /// The declared-access manifest for this type's CEL rule set, returned
     /// parsed. `nil` when none is set. A collection rule set can read a
     /// metadata category as `md.self.<category>.<key>` only when the category
-    /// is declared here — the manifest prerequisite for migrating a
-    /// `collection.contextId` binding to a metadata category.
+    /// is declared here — the prerequisite for binding a collection to an
+    /// external entity through a metadata category.
     public let metadataManifest: DeclaredMetadataManifest?
     public let createdAt: String
     public let modifiedAt: String
@@ -53,8 +53,8 @@ public struct CreateCollectionTypeConfigParams: Encodable, Sendable {
     public var ruleSetId: String?
     /// Optional declared-access manifest that lets this type's rule set load
     /// metadata categories as `md.self.<category>.<key>`. Declaring a category
-    /// here is the prerequisite for migrating a `collection.contextId` binding
-    /// to a metadata category. Omitted from the body when `nil`.
+    /// here is the prerequisite for binding a collection to an external entity
+    /// through a metadata category. Omitted from the body when `nil`.
     public var metadataManifest: DeclaredMetadataManifest?
 
     public init(
@@ -77,8 +77,7 @@ public struct UpdateCollectionTypeConfigParams: Encodable, Sendable {
     public var ruleSetId: Updatable<String>?
     /// Replacement declared-access manifest (`.value`), `.clear` to remove it,
     /// or `nil` to leave as-is. Set this to make metadata categories reachable
-    /// from this type's rule set as `md.self.<category>.<key>` when migrating
-    /// off `collection.contextId`.
+    /// from this type's rule set as `md.self.<category>.<key>`.
     public var metadataManifest: Updatable<DeclaredMetadataManifest>?
 
     public init(

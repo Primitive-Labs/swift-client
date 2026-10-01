@@ -83,7 +83,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
     private static let serverPage = #"{"items":[{"documentId":"srv1","title":"Server Doc","permission":"owner"}]}"#
 
     /// A server page carrying a cursor — what a real paged fetch returns.
-    private static let serverPageWithCursor = #"{"items":[{"documentId":"srv1","title":"Server Doc","permission":"owner"}],"cursor":"next-cursor"}"#
+    private static let serverPageWithCursor = #"{"items":[{"documentId":"srv1","title":"Server Doc","permission":"owner"}],"hasMore":true,"nextCursor":"next-cursor"}"#
 
     /// A server page that also carries the app root (what
     /// `?includeRoot=true` returns — and what a stale server could return

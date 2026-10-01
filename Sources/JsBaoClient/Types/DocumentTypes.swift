@@ -129,43 +129,33 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     }
 }
 
-/// A page of documents with an optional pagination cursor. Decodes from
-/// either an `items` or legacy `documents` envelope key.
+/// A page of documents: `{ items, hasMore, nextCursor? }`. Pass `nextCursor`
+/// back as `cursor` to fetch the next page.
 public struct DocumentListPage: Decodable, Sendable, Equatable {
     public let items: [DocumentInfo]
     /// Continuation token for the next page (#1316).
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
-        case items, documents, cursor, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(
         items: [DocumentInfo],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        items = try c.decodeIfPresent([DocumentInfo].self, forKey: .items)
-            ?? c.decodeIfPresent([DocumentInfo].self, forKey: .documents) ?? []
-        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
+        items = try c.decodeIfPresent([DocumentInfo].self, forKey: .items) ?? []
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-            ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }

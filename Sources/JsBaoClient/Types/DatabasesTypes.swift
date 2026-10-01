@@ -774,7 +774,7 @@ public struct TypedDatabaseChangePayload<Row: Decodable & Sendable>: Sendable {
 
 // MARK: Paginated decode envelope
 //
-// `GET /databases` returns `{ items, hasMore, nextCursor?, cursor? }` (#1958 —
+// `GET /databases` returns `{ items, hasMore, nextCursor? }` (#1958 —
 // it used to return a bare array). No per-surface page type is needed:
 // `PaginatedResult<DatabaseInfo>` decodes that envelope directly through the
 // constrained `Decodable` extension in `Types/GroupsTypes.swift`, the same way

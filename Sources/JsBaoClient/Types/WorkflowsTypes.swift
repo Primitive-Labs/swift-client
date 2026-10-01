@@ -387,11 +387,6 @@ public struct ListWorkflowRunsResult: Decodable, Sendable, Equatable {
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
     /// How many runs the server examined to produce this page (#2237).
     ///
     /// A `status`-filtered listing cannot be served by the index, so the server
@@ -406,15 +401,13 @@ public struct ListWorkflowRunsResult: Decodable, Sendable, Equatable {
     public let scanned: Int?
 
     private enum CodingKeys: String, CodingKey {
-        case items, cursor, nextCursor, hasMore, scanned
+        case items, nextCursor, hasMore, scanned
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         items = try c.decodeIfPresent([WorkflowRunInfo].self, forKey: .items) ?? []
-        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-            ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
         // Optional so an older server still decodes.

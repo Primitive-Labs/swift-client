@@ -193,7 +193,7 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
         let transport = Self.walkServer(pages: [
             "": """
             {"items":[{"documentId":"doc-a","title":"On the first page","permission":"owner"}],\
-            "hasMore":true,"nextCursor":"page-2","cursor":"page-2"}
+            "hasMore":true,"nextCursor":"page-2"}
             """,
             "page-2": """
             {"items":[{"documentId":"doc-b","title":"Past the truncation point","permission":"owner"}],\

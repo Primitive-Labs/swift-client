@@ -12,8 +12,8 @@ public final class CollectionsAPI: @unchecked Sendable {
 
     // MARK: - CRUD
 
-    /// Create a new collection. `name` is required; `collectionType` and
-    /// `contextId` are immutable after create.
+    /// Create a new collection. `name` is required; `collectionType` is
+    /// immutable after create.
     public func create(params: CreateCollectionParams) async throws -> CollectionInfo {
         try await transport.request(method: .post, path: "/collections", body: params)
     }
@@ -26,7 +26,7 @@ public final class CollectionsAPI: @unchecked Sendable {
             method: .get,
             path: "/collections\(Self.queryString(options))"
         )
-        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
+        return PaginatedResult(items: page.items, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// List every collection in the app (admin-only). Non-admin callers
@@ -41,7 +41,7 @@ public final class CollectionsAPI: @unchecked Sendable {
             method: .get,
             path: "/admin/collections\(qs)"
         )
-        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
+        return PaginatedResult(items: page.items, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// Get collection info by ID. Callers without any access receive a 404
@@ -86,7 +86,7 @@ public final class CollectionsAPI: @unchecked Sendable {
             method: .get,
             path: "/collections/\(collectionId)/documents\(Self.queryString(options))"
         )
-        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
+        return PaginatedResult(items: page.items, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// List collections that contain a specific document. For non-admin
@@ -96,7 +96,7 @@ public final class CollectionsAPI: @unchecked Sendable {
             method: .get,
             path: "/documents/\(documentId)/collections\(Self.queryString(options))"
         )
-        return PaginatedResult(items: page.items, cursor: page.cursor, nextCursor: page.nextCursor, hasMore: page.hasMore)
+        return PaginatedResult(items: page.items, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     // MARK: - Access

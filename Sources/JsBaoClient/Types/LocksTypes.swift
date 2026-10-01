@@ -257,15 +257,20 @@ struct LockAcquireRequest: Encodable {
     /// byte for byte the body on the wire it always did. `encodeIfPresent` is
     /// what makes that true: an `owner: nil` would otherwise be sent as null.
     let owner: String?
+    /// #3930 — how long the server may wait for the key, in ms. Encoded ONLY
+    /// when present, for the reason `owner` is: `tryAcquire` sends none, and
+    /// its body stays byte for byte what it was.
+    let waitMs: Int?
 
-    init(key: String, ttlMs: Int, owner: String? = nil) {
+    init(key: String, ttlMs: Int, owner: String? = nil, waitMs: Int? = nil) {
         self.key = key
         self.ttlMs = ttlMs
         self.owner = owner
+        self.waitMs = waitMs
     }
 
     private enum CodingKeys: String, CodingKey {
-        case key, ttlMs, owner
+        case key, ttlMs, owner, waitMs
     }
 
     func encode(to encoder: Encoder) throws {
@@ -273,6 +278,7 @@ struct LockAcquireRequest: Encodable {
         try c.encode(key, forKey: .key)
         try c.encode(ttlMs, forKey: .ttlMs)
         try c.encodeIfPresent(owner, forKey: .owner)
+        try c.encodeIfPresent(waitMs, forKey: .waitMs)
     }
 }
 

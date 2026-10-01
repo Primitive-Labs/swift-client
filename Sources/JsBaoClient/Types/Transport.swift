@@ -83,6 +83,51 @@ public protocol Transport: Sendable {
     ) async throws -> TransportResponse
 }
 
+// MARK: - NetworkGatedTransport
+
+/// The `Transport` the client's API namespaces hold: before every request it
+/// asks the client whether networking is allowed, and when it is not it
+/// throws the client's `.offline` error without attempting the request.
+/// Mirrors the JS client's `makeRequest` gate (`offlineRequestError`).
+///
+/// The check is installed after construction (`setOfflineCheck`), because the
+/// namespaces are built in the client's `init` before `self` can be captured.
+/// Until then every request is let through.
+final class NetworkGatedTransport: Transport, @unchecked Sendable {
+    typealias OfflineCheck = @Sendable (_ method: HTTPMethod, _ path: String) -> JsBaoError?
+
+    private let base: any Transport
+    private let lock = NSLock()
+    private var offlineCheck: OfflineCheck?
+
+    init(base: any Transport) {
+        self.base = base
+    }
+
+    /// Install the check. It returns the error to throw when networking is
+    /// not allowed, and `nil` when the request may go out.
+    func setOfflineCheck(_ check: @escaping OfflineCheck) {
+        lock.withLock { offlineCheck = check }
+    }
+
+    /// Throw the `.offline` error when networking is not allowed right now.
+    func requireNetworking(method: HTTPMethod, path: String) throws {
+        if let error = lock.withLock({ offlineCheck })?(method, path) {
+            throw error
+        }
+    }
+
+    func execute(
+        method: HTTPMethod,
+        path: String,
+        body: Data?,
+        options: RequestOptions?
+    ) async throws -> TransportResponse {
+        try requireNetworking(method: method, path: path)
+        return try await base.execute(method: method, path: path, body: body, options: options)
+    }
+}
+
 // MARK: - The one private primitive
 
 private extension Transport {

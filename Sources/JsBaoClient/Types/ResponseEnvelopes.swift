@@ -49,14 +49,14 @@ struct ModelFieldsEnvelope: Decodable, Sendable {
     }
 }
 
-/// A document list: the `{ items, cursor }` (legacy `{ documents }`) page, or
-/// a bare `[DocumentInfo]` array, which carries no cursor.
+/// A document list: the `{ items, hasMore, nextCursor? }` page, or a bare
+/// `[DocumentInfo]` array, which carries no continuation.
 ///
 /// The probe between the two shapes is shape tolerance, not malformed-body
 /// tolerance: bytes that are neither still throw out of the outer decode.
 struct DocumentListEnvelope: Decodable, Sendable {
     let items: [DocumentInfo]
-    let cursor: String?
+    let nextCursor: String?
     /// True when the body was the bare array rather than the keyed envelope.
     ///
     /// The two shapes are not equally informative: the envelope says whether
@@ -71,23 +71,22 @@ struct DocumentListEnvelope: Decodable, Sendable {
     /// of a continuation cursor (`DocumentListPage`'s rule). Always `false` for
     /// the bare array, which is why `isBareArray` has to be consulted too.
     let hasMore: Bool
-    /// True when the keyed envelope actually carried an `items` (or legacy
-    /// `documents`) key.
+    /// True when the keyed envelope actually carried an `items` key.
     ///
-    /// A JSON object without either decodes to an empty page, and an empty page
+    /// A JSON object without it decodes to an empty page, and an empty page
     /// read as the whole scope evicts every cached document — so a body that
     /// never mentioned the rows it is supposed to be listing must not be read
     /// as one (#2827).
     let listsItems: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case items, documents
+        case items
     }
 
     init(from decoder: Decoder) throws {
         if let array = try? [DocumentInfo](from: decoder) {
             items = array
-            cursor = nil
+            nextCursor = nil
             isBareArray = true
             hasMore = false
             listsItems = true
@@ -95,15 +94,15 @@ struct DocumentListEnvelope: Decodable, Sendable {
         }
         let page = try DocumentListPage(from: decoder)
         items = page.items
-        cursor = page.nextCursor
+        nextCursor = page.nextCursor
         isBareArray = false
         hasMore = page.hasMore
         let keys = try decoder.container(keyedBy: CodingKeys.self)
-        listsItems = keys.contains(.items) || keys.contains(.documents)
+        listsItems = keys.contains(.items)
     }
 }
 
-/// The `{ items, hasMore, nextCursor?, cursor? }` pagination envelope, with a
+/// The `{ items, hasMore, nextCursor? }` pagination envelope, with a
 /// bare `[Element]` accepted as the pre-pagination response an older server
 /// still sends (`GET /databases` before #1958).
 ///

@@ -123,7 +123,7 @@ public enum DeclaredManifestPath: Codable, Sendable, Equatable {
 /// traversal ``paths``, and the ``secrets`` / ``vars`` keys the rules
 /// reference. A category is reachable from a rule as `md.self.<category>.<key>`
 /// only when it is declared here — this is the manifest prerequisite for
-/// migrating off `metadataAccess` / `contextId` to metadata categories.
+/// migrating off `metadataAccess` to metadata categories.
 /// Persisted JSON-stringified; the API returns it parsed.
 public struct DeclaredMetadataManifest: Codable, Sendable, Equatable {
     /// The `self` declaration: categories on the subject resource to load

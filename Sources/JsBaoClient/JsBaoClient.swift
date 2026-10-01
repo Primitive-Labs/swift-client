@@ -121,6 +121,11 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `LargeDocuments/Format2Client.swift` is one (#3436). Not public.
     let logger: Logger
     private let httpClient: HttpClient
+    /// `httpClient` behind the offline gate: every HTTP call the app makes
+    /// through the client goes through it, so a call made while networking is
+    /// not allowed throws `.offline` instead of going out. Authentication and
+    /// the blob manager keep the ungated `httpClient`, as in the JS client.
+    private let gatedTransport: NetworkGatedTransport
     /// `internal` for the same reason as `logger`: the large-document open
     /// path raises the socket's receive limit before the handshake, and the
     /// released-hold path puts kept frames back on the wire (#3436).
@@ -585,6 +590,8 @@ public final class JsBaoClient: @unchecked Sendable {
             }
         ))
         self.httpClient = httpClient
+        let gatedTransport = NetworkGatedTransport(base: httpClient)
+        self.gatedTransport = gatedTransport
 
         // Document manager
         self.documentManager = DocumentManager(logger: logger)
@@ -645,31 +652,31 @@ public final class JsBaoClient: @unchecked Sendable {
         // in phase 1 as `let`s (#2367) so the public surface carries no
         // implicitly-unwrapped optional. Every closure captures a local
         // weakly — never `self`, which is not usable yet.
-        self.collections = CollectionsAPI(transport: httpClient)
-        self.session = SessionAPI(transport: httpClient)
+        self.collections = CollectionsAPI(transport: gatedTransport)
+        self.session = SessionAPI(transport: gatedTransport)
         self.links = LinksAPI()
-        self.groups = GroupsAPI(transport: httpClient)
-        self.ruleSets = RuleSetsAPI(transport: httpClient)
-        self.groupTypeConfigs = GroupTypeConfigsAPI(transport: httpClient)
+        self.groups = GroupsAPI(transport: gatedTransport)
+        self.ruleSets = RuleSetsAPI(transport: gatedTransport)
+        self.groupTypeConfigs = GroupTypeConfigsAPI(transport: gatedTransport)
         // IntegrationsAPI needs the full HttpClientResponse to surface
         // upstream status / headers / typed error mapping (the proxy
         // envelope puts the upstream status in the body and the proxy's
         // OWN status in the response status), so it uses
         // `Transport.requestRaw`, which does not throw on a non-2xx status.
-        self.integrations = IntegrationsAPI(transport: httpClient)
-        self.prompts = PromptsAPI(transport: httpClient)
-        self.invitations = InvitationsAPI(transport: httpClient)
-        self.notifications = NotificationsAPI(transport: httpClient)
-        self.locks = LocksAPI(transport: httpClient)
-        self.resourceMetadata = ResourceMetadataAPI(transport: httpClient)
+        self.integrations = IntegrationsAPI(transport: gatedTransport)
+        self.prompts = PromptsAPI(transport: gatedTransport)
+        self.invitations = InvitationsAPI(transport: gatedTransport)
+        self.notifications = NotificationsAPI(transport: gatedTransport)
+        self.locks = LocksAPI(transport: gatedTransport)
+        self.resourceMetadata = ResourceMetadataAPI(transport: gatedTransport)
         // Blob upload/download go through `Transport.requestData`, which
         // returns the untouched response bytes.
-        self.blobBuckets = BlobBucketsAPI(transport: httpClient)
-        self.cronTriggers = CronTriggersAPI(transport: httpClient)
-        self.collectionTypeConfigs = CollectionTypeConfigsAPI(transport: httpClient)
-        self.databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: httpClient)
+        self.blobBuckets = BlobBucketsAPI(transport: gatedTransport)
+        self.cronTriggers = CronTriggersAPI(transport: gatedTransport)
+        self.collectionTypeConfigs = CollectionTypeConfigsAPI(transport: gatedTransport)
+        self.databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: gatedTransport)
         let workflows = WorkflowsAPI(
-            transport: httpClient,
+            transport: gatedTransport,
             getConnectionId: { [weak wsManager] in wsManager?.connectionId ?? "" },
             logger: logger,
             events: eventEmitter
@@ -678,7 +685,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // Server functions ride the same transport. #3565 — and nothing else:
         // the control routes are posted by that class itself and answer the
         // function-native run status, so it holds no `WorkflowsAPI`.
-        self.functions = FunctionsAPI(transport: httpClient, logger: logger)
+        self.functions = FunctionsAPI(transport: gatedTransport, logger: logger)
         // Analytics namespace — a thin facade over the shared
         // `analyticsQueue`. All five methods fan out to the same queue.
         self.analytics = AnalyticsAPI(
@@ -695,7 +702,7 @@ public final class JsBaoClient: @unchecked Sendable {
             )
         )
         self.databases = DatabasesAPI(
-            transport: httpClient,
+            transport: gatedTransport,
             subscriptionRegistry: dbSubscriptionRegistry,
             sendWSMessage: { [weak wsManager] message in
                 guard let wsManager else { return }
@@ -2372,6 +2379,20 @@ public final class JsBaoClient: @unchecked Sendable {
         lock.withLock { (networkModeStorage == .online) || (networkModeStorage == .auto && reachable) }
     }
 
+    /// The error an HTTP call throws instead of going out when networking is
+    /// not allowed — the app pinned `.offline`, or the network is unreachable
+    /// in `.auto`. `nil` while networking is allowed. Mirrors the JS client's
+    /// `offlineRequestError`, message and `details` included.
+    internal func offlineRequestError(method: HTTPMethod, path: String) -> JsBaoError? {
+        guard !networkingAllowed() else { return nil }
+        let (mode, reachable) = lock.withLock { (networkModeStorage, reachable) }
+        return JsBaoError(
+            code: .offline,
+            message: "Client is offline (networkMode=\(mode.rawValue)\(reachable ? "" : ", no network reachable"))",
+            details: ["method": .string(method.rawValue), "path": .string(path)]
+        )
+    }
+
     /// The single reporting formula shared by `networkStatus.isOnline`
     /// and the emitted `NetworkModeEvent.isOnline`, so the two always agree
     /// (JS-identical blend of mode + transport).
@@ -3862,7 +3883,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // without it still surfaces as `aliasNotFound` (what the old
         // dictionary cast did) rather than a decoding error.
         struct AliasResolution: Decodable, Sendable { let documentId: String? }
-        let result: AliasResolution? = try await httpClient.requestOptional(
+        let result: AliasResolution? = try await gatedTransport.requestOptional(
             method: .get, path: Self.aliasResolvePath(alias: alias)
         )
         guard let documentId = result?.documentId else {
@@ -4486,7 +4507,7 @@ public final class JsBaoClient: @unchecked Sendable {
         body: Body,
         options: RequestOptions? = nil
     ) async throws -> Response {
-        try await httpClient.request(method: method, path: path, body: body, options: options)
+        try await gatedTransport.request(method: method, path: path, body: body, options: options)
     }
 
     /// No request body. (A `Body?` of `nil` cannot infer `Body`, so the
@@ -4496,7 +4517,7 @@ public final class JsBaoClient: @unchecked Sendable {
         path: String,
         options: RequestOptions? = nil
     ) async throws -> Response {
-        try await httpClient.request(method: method, path: path, options: options)
+        try await gatedTransport.request(method: method, path: path, options: options)
     }
 
     /// Call an endpoint whose response shape you do not want to model, and
@@ -4522,7 +4543,7 @@ public final class JsBaoClient: @unchecked Sendable {
         body: Body,
         options: RequestOptions? = nil
     ) async throws -> JSONValue? {
-        try await httpClient.requestOptional(method: method, path: path, body: body, options: options)
+        try await gatedTransport.requestOptional(method: method, path: path, body: body, options: options)
     }
 
     /// No request body.
@@ -4531,7 +4552,7 @@ public final class JsBaoClient: @unchecked Sendable {
         path: String,
         options: RequestOptions? = nil
     ) async throws -> JSONValue? {
-        try await httpClient.requestOptional(method: method, path: path, options: options)
+        try await gatedTransport.requestOptional(method: method, path: path, options: options)
     }
 
     /// Send and receive raw bytes — file uploads and downloads.
@@ -4545,7 +4566,7 @@ public final class JsBaoClient: @unchecked Sendable {
         body: Data? = nil,
         options: RequestOptions? = nil
     ) async throws -> (Data, Int) {
-        try await httpClient.requestData(method: method, path: path, body: body, options: options)
+        try await gatedTransport.requestData(method: method, path: path, body: body, options: options)
     }
 
     // MARK: - HTTP API (deprecated `Any` surface)
@@ -4558,7 +4579,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// the graph through this one private hop rather than a public untyped
     /// entry point, which #2367 removed.
     private func legacyJSONGraph(_ method: String, _ path: String, _ data: Any? = nil) async throws -> Any? {
-        try await httpClient.request(method: method, path: path, data: data)
+        try gatedTransport.requireNetworking(method: HTTPMethod(rawValue: method) ?? .get, path: path)
+        return try await httpClient.request(method: method, path: path, data: data)
     }
 
     // MARK: - Configuration
@@ -5360,7 +5382,7 @@ public final class JsBaoClient: @unchecked Sendable {
             documentId: documentId,
             client: self,
             blobManager: blobManager,
-            transport: httpClient
+            transport: gatedTransport
         )
     }
 
@@ -5549,6 +5571,9 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         documentManager.commitRetryBackoff = options.commitRetryBackoff
         documentManager.isOnlineProvider = { [weak self] in self?.networkingAllowed() ?? false }
+        gatedTransport.setOfflineCheck { [weak self] method, path in
+            self?.offlineRequestError(method: method, path: path)
+        }
 
         // (The blob manager and the analytics queue are wired in `init` — both
         // are actors, so their collaborators are supplied at construction,
@@ -5572,12 +5597,12 @@ public final class JsBaoClient: @unchecked Sendable {
         let cacheFacade = CacheFacade(
             kvCache: kvCache,
             getNetworkMode: { [weak self] in self?.networkMode ?? .auto },
-            transport: httpClient
+            transport: gatedTransport
         )
         self._cache = cacheFacade
 
         self._documents = DocumentsAPI(
-            transport: httpClient,
+            transport: gatedTransport,
             blobManager: blobManager,
             documentManager: documentManager,
             client: self
@@ -5595,7 +5620,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // through `Transport.requestData` like every other raw-bytes call
         // site now that `MeAPI` holds the transport.
         self._me = MeAPI(
-            transport: httpClient,
+            transport: gatedTransport,
             cache: cacheFacade,
             localMetadata: { [weak self] in self?.documentManager.getMetadataIndex() ?? [:] },
             isOnline: { [weak self] in self?.networkingAllowed() ?? false },
@@ -5613,7 +5638,7 @@ public final class JsBaoClient: @unchecked Sendable {
             rootDocId: { [weak self] in self?.rootDocId },
             logger: logger
         )
-        self._users = UsersAPI(transport: httpClient, cache: cacheFacade)
+        self._users = UsersAPI(transport: gatedTransport, cache: cacheFacade)
         self._auth = AuthAPI(
             getUserId: { [weak self] in self?.authController.getUserId() },
             getToken: { [weak self] in self?.authController.getToken() },

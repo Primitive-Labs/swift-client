@@ -256,7 +256,7 @@ public final class DocumentsAPI: @unchecked Sendable {
                 }
                 // A bare array in answer to `limit` means the server ignored it.
                 guard !page.isBareArray else { return }
-                // A body that never mentioned `items` (or legacy `documents`)
+                // A body that never mentioned `items`
                 // is not a page of this scope — decoding it leaves an empty
                 // list, and an empty list read as the whole scope evicts
                 // everything.
@@ -266,7 +266,7 @@ public final class DocumentsAPI: @unchecked Sendable {
                     union.append(item)
                 }
 
-                guard let next = page.cursor, !next.isEmpty else {
+                guard let next = page.nextCursor, !next.isEmpty else {
                     // No continuation token. If the page nevertheless says more
                     // rows remain, the walk cannot ask for them and so never
                     // reached the end of the scope — an inconsistent envelope
@@ -1677,15 +1677,15 @@ private struct TagListResponse: Decodable, Sendable {
 }
 
 /// The document blob-list endpoint returns either a bare array of blobs or an
-/// `{ items, cursor }` envelope. A bare array is normalized into a result with
-/// no cursor.
+/// `{ items, hasMore, nextCursor? }` envelope. A bare array is normalized into
+/// a result with no continuation.
 private struct DocumentBlobListResponse: Decodable, Sendable {
     let result: DocumentBlobListResult
 
     init(from decoder: Decoder) throws {
         if let container = try? decoder.singleValueContainer(),
            let list = try? container.decode([BlobInfo].self) {
-            result = DocumentBlobListResult(items: list, cursor: nil)
+            result = DocumentBlobListResult(items: list, hasMore: false)
             return
         }
         result = try DocumentBlobListResult(from: decoder)

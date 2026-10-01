@@ -57,7 +57,7 @@ public final class GroupsAPI: @unchecked Sendable {
     // MARK: - Members
 
     /// Lists members of a group with optional pagination. Returns a typed
-    /// `PaginatedResult<GroupMemberInfo>` (`{ items, cursor? }`).
+    /// `PaginatedResult<GroupMemberInfo>` (`{ items, hasMore, nextCursor? }`).
     ///
     /// Pass `include: .profiles` to join each member with their basic profile
     /// in the same round trip: `userName`/`userEmail` are reliably populated

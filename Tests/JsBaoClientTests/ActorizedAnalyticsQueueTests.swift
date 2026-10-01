@@ -310,7 +310,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
     // MARK: - The typed entry point's field mapping (review of PR #2266)
 
     /// `asJSONObject()` is the only path the typed `logEvent` takes and it
-    /// re-spells all 14 fields by hand. A copy-paste slip (`row["os_name"] =
+    /// re-spells all 13 fields by hand. A copy-paste slip (`row["os_name"] =
     /// .string(os_version)`) or a dropped `if let` line would ship wrong or
     /// missing analytics dimensions on every event with the whole suite green,
     /// so every field is asserted key-by-key against a distinct value.
@@ -328,8 +328,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
             browser_name: "browser-name-value",
             browser_version: "browser-version-value",
             app_version: "app-version-value",
-            context_json: .object(["ctx": .string("ctx-value")]),
-            user_created_at_epoch_s: 1_700_000_000
+            context_json: .object(["ctx": .string("ctx-value")])
         )
 
         let row = input.asJSONObject()
@@ -347,8 +346,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
         XCTAssertEqual(row["browser_version"], .string("browser-version-value"))
         XCTAssertEqual(row["app_version"], .string("app-version-value"))
         XCTAssertEqual(row["context_json"], .object(["ctx": .string("ctx-value")]))
-        XCTAssertEqual(row["user_created_at_epoch_s"], .number(1_700_000_000))
-        XCTAssertEqual(row.count, 14, "no extra keys, and none of the 14 collapsed onto another")
+        XCTAssertEqual(row.count, 13, "no extra keys, and none of the 13 collapsed onto another")
     }
 
     /// The other half of the mapping's contract: a nil field is *dropped*, not
@@ -360,7 +358,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
                        "only the one non-nil field may appear")
     }
 
-    /// The same 14 fields on the untyped bridge, so the two spellings cannot
+    /// The same 13 fields on the untyped bridge, so the two spellings cannot
     /// drift apart. `asDictionary()` is what the deprecated `[String: Any]`
     /// callers still reach.
     func testAsDictionaryCarriesTheSameKeysAsAsJSONObject() throws {
@@ -368,7 +366,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
             action: "a", feature: "b", route: "c", plan: "d", tenant_id: "e",
             user_ulid: "f", device_type: "g", os_name: "h", os_version: "i",
             browser_name: "j", browser_version: "k", app_version: "l",
-            context_json: .object(["m": .string("n")]), user_created_at_epoch_s: 7
+            context_json: .object(["m": .string("n")])
         )
         XCTAssertEqual(
             Set(input.asDictionary().keys), Set(input.asJSONObject().keys),

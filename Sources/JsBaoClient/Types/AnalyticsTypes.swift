@@ -25,7 +25,6 @@ public struct AnalyticsEventInput: Encodable, Sendable {
     public var browser_version: String?
     public var app_version: String?
     public var context_json: JSONValue?
-    public var user_created_at_epoch_s: Int?
 
     /// Sentinel user id stamped on events logged before authentication.
     /// Mirrors JS `ANALYTICS_UNAUTHENTICATED_USER` and the value the
@@ -45,8 +44,7 @@ public struct AnalyticsEventInput: Encodable, Sendable {
         browser_name: String? = nil,
         browser_version: String? = nil,
         app_version: String? = nil,
-        context_json: JSONValue? = nil,
-        user_created_at_epoch_s: Int? = nil
+        context_json: JSONValue? = nil
     ) {
         self.action = action
         self.feature = feature
@@ -61,7 +59,6 @@ public struct AnalyticsEventInput: Encodable, Sendable {
         self.browser_version = browser_version
         self.app_version = app_version
         self.context_json = context_json
-        self.user_created_at_epoch_s = user_created_at_epoch_s
     }
 
     /// The event as the typed `[String: JSONValue]` row the `AnalyticsQueue`
@@ -85,9 +82,6 @@ public struct AnalyticsEventInput: Encodable, Sendable {
         if let browser_name { row["browser_name"] = .string(browser_name) }
         if let browser_version { row["browser_version"] = .string(browser_version) }
         if let app_version { row["app_version"] = .string(app_version) }
-        if let user_created_at_epoch_s {
-            row["user_created_at_epoch_s"] = .number(Double(user_created_at_epoch_s))
-        }
         if let context_json { row["context_json"] = context_json }
         return row
     }
@@ -112,7 +106,6 @@ public struct AnalyticsEventInput: Encodable, Sendable {
         if let browser_name { dict["browser_name"] = browser_name }
         if let browser_version { dict["browser_version"] = browser_version }
         if let app_version { dict["app_version"] = app_version }
-        if let user_created_at_epoch_s { dict["user_created_at_epoch_s"] = user_created_at_epoch_s }
         if let context_json { dict["context_json"] = context_json.toAny() }
         return dict
     }

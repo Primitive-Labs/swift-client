@@ -2,7 +2,8 @@ import XCTest
 @testable import JsBaoClient
 
 /// Live tests for create-time `initialMetadata` on the Swift client's
-/// collection- and database-create surfaces (issue #1451, parity with #1420).
+/// collection-, database- and group-create surfaces (issue #1451, parity with
+/// #1420; groups since #3983).
 ///
 /// These cover what the Swift surface owns: the parameter reaches the server on
 /// both create endpoints and the categories it names are stamped on the new
@@ -119,5 +120,42 @@ final class InitialMetadataCreateTests: XCTestCase {
 
         let list = try await client.collections.listAll()
         XCTAssertFalse(list.items.contains { $0.name == name })
+    }
+
+    /// `groups.create` stamps the named category on the new group.
+    func testGroupCreateStampsInitialMetadata() async throws {
+        try await createCategory(resourceType: "group", category: "classLink", field: "classId")
+
+        let created = try await client.groups.create(params: CreateGroupParams(
+            groupType: "class-reading-group",
+            name: "Reading group",
+            initialMetadata: ["classLink": ["classId": .string("class-A")]]
+        ))
+        XCTAssertFalse(created.groupId.isEmpty)
+
+        let stamped = try await readMetadata(
+            resourceType: "group",
+            resourceId: created.groupId,
+            category: "classLink"
+        )
+        XCTAssertEqual(stamped["classId"] as? String, "class-A")
+    }
+
+    /// An unknown category fails the whole group create — the Swift call throws
+    /// and no group is left behind.
+    func testGroupCreateWithUnknownCategoryFailsAtomically() async throws {
+        let groupId = "orphan-\(Int(Date().timeIntervalSince1970))"
+        await XCTAssertThrowsErrorAsync(
+            try await self.client.groups.create(params: CreateGroupParams(
+                groupType: "class-reading-group",
+                groupId: groupId,
+                name: "Orphan",
+                initialMetadata: ["nonexistent": ["x": .string("1")]]
+            )),
+            "create with an unknown metadata category should fail"
+        )
+
+        let list = try await client.groups.list(options: ListGroupsOptions(type: "class-reading-group"))
+        XCTAssertFalse(list.items.contains { $0.groupId == groupId })
     }
 }

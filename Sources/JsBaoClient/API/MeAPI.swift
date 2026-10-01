@@ -159,10 +159,11 @@ public final class MeAPI: @unchecked Sendable {
     /// List documents the current user has access to but doesn't own
     /// (the "shared with me" filter). Mirrors js-bao's
     /// `client.me.sharedDocuments(options)`. Returns the unified
-    /// `{ items, cursor? }` envelope as a typed `SharedDocumentListResult`.
+    /// `{ items, hasMore, nextCursor? }` envelope as a typed
+    /// `SharedDocumentListResult`.
     ///
     /// - Parameters:
-    ///   - cursor: opaque pagination cursor returned by the previous call
+    ///   - cursor: the `nextCursor` returned by the previous call
     ///   - limit: page size
     ///   - tag: filter to documents bearing this tag
     ///
@@ -188,7 +189,7 @@ public final class MeAPI: @unchecked Sendable {
         // Offline: return the local cache subset only — no server call.
         if !isOnline() {
             let items = localShared.map { LocalFirstListing.sharedDocument(from: $0) }
-            return SharedDocumentListResult(items: items, cursor: nil)
+            return SharedDocumentListResult(items: items, hasMore: false)
         }
 
         var query = URLQuery()
@@ -214,8 +215,8 @@ public final class MeAPI: @unchecked Sendable {
     /// List documents the current user owns (live owner, not creator —
     /// ownership transfer is reflected here). Mirrors js-bao's
     /// `client.me.ownedDocuments(options)`, whose default return is a flat
-    /// `DocumentInfo[]`. Accepts both a bare-array response and an
-    /// `{ items, cursor? }` envelope.
+    /// `DocumentInfo[]`. Accepts both a bare-array response and the
+    /// `{ items, hasMore, nextCursor? }` envelope.
     ///
     /// Offline-first (#938, widened in #2360): the default `waitForLoad`
     /// (`.localIfAvailableElseNetwork`) returns the local metadata cache's
@@ -245,21 +246,22 @@ public final class MeAPI: @unchecked Sendable {
         return page.items
     }
 
-    /// `me.ownedDocuments` returning the `{ items, cursor }` page envelope.
+    /// `me.ownedDocuments` returning the `{ items, hasMore, nextCursor? }` page
+    /// envelope.
     /// Mirrors js-bao's `ownedDocuments({ returnPage: true })` overload, which
     /// statically resolves to `Promise<DocumentListPage>`. Swift can't express
     /// the union return of the JS overload set, so the page form is a separate
     /// entry point. Equivalent to passing `options.returnPage = true`.
     ///
     /// The paged form never takes the local-first short-circuit: a local
-    /// answer ignores `limit` and reports `cursor == nil`, which a paginating
+    /// answer ignores `limit` and reports `nextCursor == nil`, which a paginating
     /// caller reads as "no more pages". js-bao carves the paged form out of
     /// that branch for the same reason (`documentsApi.ts:1234-1237`), so under
     /// the default `waitForLoad` this always goes to the server. The
     /// cache-only modes (`localOnly`, `refreshFromServer: false`,
     /// `waitForLoad: .local`) and the offline fallback still answer locally —
     /// they asked for the cache explicitly — returning every matching row with
-    /// `cursor == nil`, which is also what js-bao does.
+    /// `nextCursor == nil`, which is also what js-bao does.
     public func ownedDocumentsPage(
         cursor: String? = nil,
         limit: Int? = nil,
@@ -281,7 +283,7 @@ public final class MeAPI: @unchecked Sendable {
     /// declared and never read):
     ///
     /// 1. `localOnly`, `refreshFromServer == false`, or `waitForLoad == .local`
-    ///    → local cache rows only, no HTTP request, `cursor == nil`.
+    ///    → local cache rows only, no HTTP request, `nextCursor == nil`.
     /// 2. Offline → `.network` throws `.listUnavailableOffline`; any other
     ///    mode returns local cache rows.
     /// 3. Default `.localIfAvailableElseNetwork` with a non-empty local
@@ -300,7 +302,7 @@ public final class MeAPI: @unchecked Sendable {
     /// that asked to wait for the server is told the server didn't answer.
     ///
     /// `limit` / `cursor` are ignored on every local path — the local cache
-    /// isn't paginated — and the returned `cursor` is `nil` there. Because of
+    /// isn't paginated — and the returned `nextCursor` is `nil` there. Because of
     /// that, `paged` (set by `ownedDocumentsPage`) suppresses step 3: a paged
     /// caller handed a `nil` cursor reads it as "no more pages", so the paged
     /// form goes to the server rather than short-circuiting on a warm cache.
@@ -369,7 +371,7 @@ public final class MeAPI: @unchecked Sendable {
         func localPage() -> DocumentListPage {
             DocumentListPage(
                 items: localOwned.map { LocalFirstListing.documentInfo(from: $0) },
-                cursor: nil
+                hasMore: false
             )
         }
 
@@ -452,7 +454,7 @@ public final class MeAPI: @unchecked Sendable {
         // a page would push it past `limit` and repeat the same local-only
         // rows on every page a cursor walk visits.
         if paged {
-            return DocumentListPage(items: serverItems, cursor: page.cursor)
+            return DocumentListPage(items: serverItems, nextCursor: page.nextCursor, hasMore: page.hasMore)
         }
 
         // Merge: server rows win on `documentId`; append local-only owned docs
@@ -464,13 +466,13 @@ public final class MeAPI: @unchecked Sendable {
             id: { $0.documentId },
             project: { LocalFirstListing.documentInfo(from: $0) }
         )
-        return DocumentListPage(items: merged, cursor: page.cursor)
+        return DocumentListPage(items: merged, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// One `GET /me/owned-documents`, bounded by `serverTimeoutMs`.
     ///
-    /// Accepts either a bare array or an `{ items, cursor }` (legacy
-    /// `{ documents }`) envelope — matching `documents.list`. `timeoutMs <= 0`
+    /// Accepts either a bare array or the `{ items, hasMore, nextCursor? }`
+    /// envelope — matching `documents.list`. `timeoutMs <= 0`
     /// means unbounded, matching `KvCache`'s reading of the same option.
     private func fetchOwnedDocuments(
         path: String,

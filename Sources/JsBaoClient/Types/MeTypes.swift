@@ -93,7 +93,7 @@ public enum AvatarContentType: String, Sendable, Equatable, CaseIterable {
 /// - `forward` — chronological order (oldest first); sent as `forward=true`.
 ///
 /// `limit` / `cursor` are ignored on any local path (the local cache isn't
-/// paginated) and the returned `cursor` is `nil` there.
+/// paginated) and the returned `nextCursor` is `nil` there.
 ///
 /// `cursor`/`limit`/`tag` stay as positional params on `ownedDocuments(...)`
 /// (they already existed); this struct carries only the additive fields.
@@ -107,7 +107,8 @@ public struct MeOwnedDocumentsOptions: Sendable, Equatable {
 
     /// `returnPage` was deprecated in #2360 and removed in #2367 — a runtime
     /// flag can't change a return type in Swift. Call
-    /// `me.ownedDocumentsPage(...)` for the `{ items, cursor }` page.
+    /// `me.ownedDocumentsPage(...)` for the `{ items, hasMore, nextCursor? }`
+    /// page.
     ///
     /// Note for anyone comparing option values: removing its private storage
     /// changed the synthesized `Equatable` — two options differing only in
@@ -160,43 +161,32 @@ public struct SharedDocument: Decodable, Sendable, Equatable {
 }
 
 /// A page of shared documents. Mirrors JS `SharedDocumentListResult`
-/// (`{ items, cursor? }`, raw-JSON cursor). Decodes from either an `items`
-/// or legacy `documents` envelope key.
+/// (`{ items, hasMore, nextCursor? }`, raw-JSON cursor).
 public struct SharedDocumentListResult: Decodable, Sendable, Equatable {
     public let items: [SharedDocument]
     /// Continuation token for the next page (#1316).
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
-        case items, documents, cursor, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(
         items: [SharedDocument],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        items = try c.decodeIfPresent([SharedDocument].self, forKey: .items)
-            ?? c.decodeIfPresent([SharedDocument].self, forKey: .documents) ?? []
-        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
+        items = try c.decodeIfPresent([SharedDocument].self, forKey: .items) ?? []
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-            ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }

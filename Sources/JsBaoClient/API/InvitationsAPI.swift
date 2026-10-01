@@ -30,7 +30,7 @@ public final class InvitationsAPI: @unchecked Sendable {
     }
 
     /// List app-level invitations (admin/owner only). Returns a typed
-    /// `{ items, cursor }` page.
+    /// `{ items, hasMore, nextCursor? }` page.
     public func list(
         limit: Int? = nil,
         cursor: String? = nil

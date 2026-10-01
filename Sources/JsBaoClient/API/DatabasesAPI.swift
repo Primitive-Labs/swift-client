@@ -315,8 +315,8 @@ public final class DatabasesAPI: @unchecked Sendable {
         query.appendIfPresent("cursor", cursor)
         // `PaginatedResult` already conforms to `Decodable` (see the
         // constrained extension in `Types/GroupsTypes.swift`) and decodes
-        // `items`/`cursor`/`nextCursor`/`hasMore` with the `nextCursor ?? cursor`
-        // precedence, so the envelope decodes straight into the shared type —
+        // `items`/`nextCursor`/`hasMore`, so the envelope decodes straight into
+        // the shared type —
         // no per-surface page struct and re-map to drift. It is wrapped in
         // `PaginatedPageEnvelope` only to also accept the bare array a server
         // older than #1958 still returns (#2245).

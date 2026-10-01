@@ -11,8 +11,8 @@ import Foundation
 /// never wedges the key — the lease expires and the next acquirer takes over.
 /// It is a `TimeInterval` in **seconds** (renamed from `ttlMs: Int` in #2367);
 /// the request body still carries a `ttlMs` JSON key.
-/// Blocking `acquire` is a client-side poll loop over the one-shot server
-/// endpoint.
+/// Blocking `acquire` is a client-side loop over the server endpoint, each poll
+/// asking the server to wait for the key (#3930).
 ///
 /// Swift has no async `defer`, so release on both the success and the failure
 /// path — and `await` it, so the key is actually free when you return:
@@ -53,6 +53,10 @@ public final class LocksAPI: @unchecked Sendable {
     /// sleeping for minutes at a time. Mirrors JS `MAX_RATE_LIMIT_BACKOFF_MS`.
     static let maxRateLimitBackoffMs = 30_000
 
+    /// The longest one acquire call waits server-side — the server's own cap
+    /// (`LOCK_ACQUIRE_WAIT_MAX_MS`, #3930). Mirrors JS `SERVER_WAIT_MAX_MS`.
+    static let serverWaitMaxMs = 30_000
+
     /// Designated initializer — the typed transport spine.
     public init(transport: any Transport) {
         self.transport = transport
@@ -60,18 +64,20 @@ public final class LocksAPI: @unchecked Sendable {
 
     // MARK: - Acquire
 
-    /// One non-blocking attempt at the server endpoint. Returns the raw
-    /// response so both `tryAcquire` and the blocking `acquire` loop can read
-    /// the contention detail.
+    /// One attempt at the server endpoint — non-blocking, or with `waitMs` a
+    /// bounded server-side wait (#3930). Returns the raw response so both
+    /// `tryAcquire` and the blocking `acquire` loop can read the contention
+    /// detail.
     private func acquireOnce(
         key: String,
         ttlMs: Int,
-        owner: String? = nil
+        owner: String? = nil,
+        waitMs: Int? = nil
     ) async throws -> LockAcquireResponse {
         try await transport.request(
             method: .post,
             path: "/locks/acquire",
-            body: LockAcquireRequest(key: key, ttlMs: ttlMs, owner: owner)
+            body: LockAcquireRequest(key: key, ttlMs: ttlMs, owner: owner, waitMs: waitMs)
         )
     }
 
@@ -101,8 +107,11 @@ public final class LocksAPI: @unchecked Sendable {
 
     /// Block until the lock is acquired or `timeout` elapses.
     ///
-    /// Polls the acquire endpoint with jittered backoff (honoring the server's
-    /// `retryAfterMs`), then throws `JsBaoError(code: .lockTimeout)` if it never
+    /// Each poll asks the server to wait for the key (up to 30 s, #3930), so a
+    /// release is noticed within a second and a wait costs one acquire attempt
+    /// per half-minute; an early answer is followed by jittered backoff
+    /// (honoring the server's `retryAfterMs`). Throws
+    /// `JsBaoError(code: .lockTimeout)` if it never
     /// wins the key within the window. The thrown error's `details` carry the
     /// contended `key` and the timeout that elapsed — the same payload as
     /// the JS client's `LockTimeoutError`.
@@ -128,7 +137,14 @@ public final class LocksAPI: @unchecked Sendable {
         while true {
             var base = Self.defaultRetryAfterMs
             do {
-                let res = try await acquireOnce(key: key, ttlMs: ttlMs, owner: owner)
+                let remainingMs = Int((deadline.timeIntervalSince(Date()) * 1000).rounded())
+                let res = try await acquireOnce(
+                    key: key,
+                    ttlMs: ttlMs,
+                    owner: owner,
+                    // None at all once no time is left: a negative wait is a 400.
+                    waitMs: remainingMs > 0 ? min(remainingMs, Self.serverWaitMaxMs) : nil
+                )
                 if res.acquired, let handle = res.handle { return handle }
                 if let retryAfterMs = res.retryAfterMs, retryAfterMs > 0 {
                     base = retryAfterMs

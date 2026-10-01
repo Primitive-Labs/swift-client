@@ -114,11 +114,11 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertNil(r.path, "refreshFromServer: false must not issue a server request")
     }
 
-    /// `ownedDocumentsPage` returns the `{ items, cursor }` envelope, mirroring
+    /// `ownedDocumentsPage` returns the `{ items, hasMore, nextCursor? }` envelope, mirroring
     /// JS's `ownedDocuments({ returnPage: true })` overload.
     func test_me_ownedDocumentsPage_returnsCursor() async throws {
         let r = CallRecorder()
-        r.response = ["items": [["documentId": "d1"]], "cursor": "next-page"]
+        r.response = ["items": [["documentId": "d1"]], "hasMore": true, "nextCursor": "next-page"]
         let api = MeAPI(transport: r)
 
         let page = try await api.ownedDocumentsPage(limit: 1)

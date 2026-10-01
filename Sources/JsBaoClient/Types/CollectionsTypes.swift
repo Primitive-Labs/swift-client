@@ -41,12 +41,6 @@ public struct CollectionInfo: Decodable, Sendable, Equatable {
     /// Selects the `CollectionTypeConfig` (rule set). Defaults to `"default"`.
     /// Immutable after create.
     public let collectionType: String
-    /// Per-instance context identifier (e.g. a class ID). `nil` for
-    /// collections not bound to any context. Immutable after create.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `CollectionInfo.contextId`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
-    public let contextId: String?
     public let documentCount: Int
     public let createdAt: String
     public let createdBy: String
@@ -146,12 +140,6 @@ public struct CreateCollectionParams: Encodable, Sendable {
     /// Selects the rule set. Defaults to `"default"` server-side when omitted.
     /// Must not contain `"#"`. Immutable after create.
     public var collectionType: String?
-    /// Ties the collection to an external entity, exposed to CEL rules as
-    /// `collection.contextId`. Must not contain `"#"`. Immutable after create.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `CreateCollectionParams.contextId`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
-    public var contextId: String? = nil
     /// Create-time resource metadata to stamp on the new collection, keyed by
     /// category name → that category's values. Each entry is
     /// schema-validated but the category `writeRule` is waived — creation
@@ -161,12 +149,11 @@ public struct CreateCollectionParams: Encodable, Sendable {
     /// The values are staged before the collection type's `collection.create`
     /// rule runs (issue #1876), so a CEL create rule can gate on them via
     /// `md.self.<category>.<key>`. Mirrors js-bao's
-    /// `CreateCollectionParams.initialMetadata`.
+    /// `CreateCollectionParams.initialMetadata`. This is how a collection is
+    /// bound to an external entity (a class, a project): stamp a category here
+    /// and read it in rules as `md.self.<category>.<key>`.
     public var initialMetadata: [String: [String: JSONValue]]? = nil
 
-    /// Non-deprecated initializer. Set `contextId` through the deprecated
-    /// overload below so that binding a context surfaces the warning at the call
-    /// site (annotating only the stored property does not).
     public init(
         name: String,
         description: String? = nil,
@@ -176,25 +163,6 @@ public struct CreateCollectionParams: Encodable, Sendable {
         self.name = name
         self.description = description
         self.collectionType = collectionType
-        self.initialMetadata = initialMetadata
-    }
-
-    /// Deprecated overload that accepts `contextId`, so
-    /// `CreateCollectionParams(…, contextId:)` call sites receive the
-    /// deprecation warning. `contextId` has no default here so it does not
-    /// collide with the non-deprecated initializer when omitted.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API and read it from CEL as md.self.<category>.<key>. Not 1:1 — a rule set can read the category only when the collection type config's manifest (also defined via the CLI/REST) declares it. This field still works.")
-    public init(
-        name: String,
-        description: String? = nil,
-        collectionType: String? = nil,
-        contextId: String?,
-        initialMetadata: [String: [String: JSONValue]]? = nil
-    ) {
-        self.name = name
-        self.description = description
-        self.collectionType = collectionType
-        self.contextId = contextId
         self.initialMetadata = initialMetadata
     }
 }
@@ -345,27 +313,24 @@ public enum CollectionAddMemberResult: Decodable, Sendable, Equatable {
 
 // MARK: Paginated decode envelopes
 //
-// The server returns `{ items, cursor? }`. These private `*Page` types decode
+// The server returns `{ items, hasMore, nextCursor? }`. These private `*Page` types decode
 // it; the API methods map them onto the shared `PaginatedResult<T>` so the
 // return type matches every other paginated surface.
 
 struct CollectionInfoPage: Decodable {
     let items: [CollectionInfo]
-    let cursor: String?
     let nextCursor: String?
     let hasMore: Bool?
 }
 
 struct CollectionDocumentPage: Decodable {
     let items: [CollectionDocumentInfo]
-    let cursor: String?
     let nextCursor: String?
     let hasMore: Bool?
 }
 
 struct DocumentCollectionPage: Decodable {
     let items: [DocumentCollectionInfo]
-    let cursor: String?
     let nextCursor: String?
     let hasMore: Bool?
 }

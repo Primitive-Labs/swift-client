@@ -107,7 +107,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     }
 
     /// List blobs in a bucket. Cursor-paginated per R2; response shape:
-    /// `{ "items": [...], "cursor"?: String }`.
+    /// `{ "items": [...], "hasMore": Bool, "nextCursor"?: String }`.
     public func list(
         bucketIdOrKey: String,
         cursor: String? = nil,

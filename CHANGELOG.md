@@ -20,6 +20,72 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: `AnalyticsEventInput.user_created_at_epoch_s` is removed (#4003)
+
+The field was deprecated in the 2026-09-30 release. The server records when
+the user joined the app and ignored the value, so the stored property and the
+`user_created_at_epoch_s:` initializer parameter are gone, and neither
+`asJSONObject()` nor `asDictionary()` emits the key. Delete the argument from
+any `AnalyticsEventInput(...)` call.
+
+The other JS removals in this release have no Swift counterpart: `waitForSync`
+was already removed (#2367), and the rest never existed here.
+
+### Breaking: page types carry `nextCursor` only (#3985)
+
+Every list endpoint answers `{ items, hasMore, nextCursor? }`; the server no
+longer sends a `cursor` alias of `nextCursor` or a `documents` key beside
+`items`. The page types follow: the deprecated `cursor` property and the
+`cursor:` initializer parameter are gone from `PaginatedResult`,
+`DocumentListPage`, `SharedDocumentListResult`, `DocumentBlobListResult`,
+`BucketBlobListResult`, `InvitationListResult` and `ListWorkflowRunsResult`,
+and their decoders read only `items`, `hasMore` and `nextCursor`.
+`NotificationListResult` replaces `cursor` with `hasMore` and `nextCursor`.
+
+Migration: read `page.nextCursor` where you read `page.cursor`, and build
+pages with `nextCursor:`. The request parameter is still named `cursor`.
+
+### HTTP calls throw `.offline` while networking is off (#4025)
+
+An HTTP call made while the client may not use the network now throws
+`JsBaoError` with code `.offline` and does not attempt the request. That is
+the case when the app pinned `.offline`, and in `.auto` when no network is
+reachable. Before, the request went out anyway: it failed in transit with
+`JsBaoNetworkError`, or, with the mode pinned `.offline` and a network
+available, it succeeded. The JS client already behaved this way (`OFFLINE`).
+
+This covers every namespace (`client.documents`, `client.me`,
+`client.databases`, …) and `client.request`, `requestJSON` and `requestData`.
+The error's `details` carry `method` and `path`. A request that is attempted
+and fails in transit still throws `JsBaoNetworkError`. Calls in `client.auth`
+and the blob manager's queued uploads and downloads are not gated.
+
+If you catch `JsBaoNetworkError` to detect "no network", also catch
+`JsBaoError` with code `.offline`.
+
+### Breaking: collection `contextId` is removed (#3926)
+
+`CollectionInfo.contextId`, `CreateCollectionParams.contextId` and the
+deprecated `CreateCollectionParams(…, contextId:)` initializer are gone. The
+server no longer returns the field and refuses a create that sends it.
+
+Migration: bind the collection with a resource metadata category instead —
+declare the category, list it in the collection type config's
+`metadataManifest`, pass it as `initialMetadata` when you create the collection,
+and read it in rules as `md.self.<category>.<key>`. Copy the value of any
+existing collection into that category before the release that removes the
+field is deployed; the collections docs ("Migrating off `contextId`") give the
+recipe.
+
+### The blocking `locks.acquire` waits server-side (#3930)
+
+`acquire(key:ttl:timeout:owner:)` now asks the server to wait for the key on
+every poll (`waitMs`, at most 30 s and never more than the time left), so a
+release is noticed within a second and a wait costs one acquire attempt per
+half-minute rather than one per poll. The signature, the backoff after an
+early answer, the 429 handling and the `.lockTimeout` error are unchanged, and
+`tryAcquire` sends exactly the body it did. Additive: nothing to migrate.
+
 ### Breaking: the direct LLM and Gemini sub-APIs are removed (#3857)
 
 All LLM access goes through prompts. `client.llm` and `client.gemini` are gone,

@@ -209,7 +209,7 @@ final class WorkflowRunFailureBlockDecodeTests: XCTestCase {
                     "failedStepErrorTitle": null
                 }
             ],
-            "cursor": null
+            "hasMore": false
         }
         """#.utf8))
 
