@@ -1,8 +1,8 @@
 import XCTest
 @testable import JsBaoClient
 
-/// Port of tests/client/js-bao-client-database-metadata.test.ts.
-/// Tests database CRUD and metadata operations.
+/// Database CRUD and permissions against the live server. (The CEL-context
+/// metadata cases this file once ported were removed with the surface, #3991.)
 ///
 /// The timing suite (js-bao-client-database-timing.test.ts) is ported in
 /// `DatabaseOperationTimingLiveTests.swift`, not here.
@@ -20,7 +20,7 @@ final class DatabaseTests: XCTestCase {
 
         // Create a database
         let db = try await client.databases.create(params: CreateDatabaseParams(
-            title: "Metadata Test DB",
+            title: "Database Test DB",
             databaseType: "test-type"
         ))
         databaseId = db.databaseId
@@ -30,76 +30,6 @@ final class DatabaseTests: XCTestCase {
     override func tearDown() async throws {
         await client?.destroy()
         await ctx.cleanup()
-    }
-
-    // MARK: - Metadata
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func testSetMetadataKeys() async throws {
-        let result = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
-            "color": "blue",
-            "count": 42,
-            "active": true,
-        ])
-
-        let metadata = result.metadata
-        XCTAssertEqual(metadata?["color"]?.stringValue, "blue")
-        XCTAssertEqual(metadata?["count"]?.numberValue, 42)
-        XCTAssertEqual(metadata?["active"]?.boolValue, true)
-    }
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func testMergeWithExistingMetadata() async throws {
-        _ = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
-            "color": "blue",
-            "count": 42,
-        ])
-
-        let result = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
-            "label": "hello",
-        ])
-
-        let metadata = result.metadata
-        XCTAssertEqual(metadata?["color"]?.stringValue, "blue")
-        XCTAssertEqual(metadata?["count"]?.numberValue, 42)
-        XCTAssertEqual(metadata?["label"]?.stringValue, "hello")
-    }
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func testRemoveKeysSetToNull() async throws {
-        _ = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
-            "color": "blue",
-            "count": 42,
-        ])
-
-        let result = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
-            "color": .null,
-        ])
-
-        let metadata = result.metadata
-        XCTAssertNil(metadata?["color"])
-        XCTAssertEqual(metadata?["count"]?.numberValue, 42)
-    }
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func testReflectMetadataInGet() async throws {
-        _ = try await client.databases.updateMetadata(databaseId: databaseId, metadata: [
-            "color": "red",
-            "count": 7,
-        ])
-
-        let db = try await client.databases.get(databaseId: databaseId)
-        let metadata = db.metadata
-        XCTAssertEqual(metadata?["color"]?.stringValue, "red")
-        XCTAssertEqual(metadata?["count"]?.numberValue, 7)
     }
 
     // MARK: - CRUD

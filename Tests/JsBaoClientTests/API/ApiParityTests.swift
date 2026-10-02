@@ -313,7 +313,6 @@ final class ApiParityTests: XCTestCase {
         r.response = [
             "bucketId": "b1", "appId": "app1", "bucketKey": "k",
             "name": "n", "ttlTier": "permanent", "preset": "personal-uploads",
-            "accessPolicy": "personal-uploads",
             "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
             "modifiedAt": "2024-01-01T00:00:00Z",
         ]
@@ -324,7 +323,6 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.method, "POST")
         XCTAssertEqual(r.path, "/blob-buckets")
         XCTAssertEqual(bucket.preset, .personalUploads)
-        XCTAssertEqual(bucket.accessPolicy, "personal-uploads")
         let body = r.body as? [String: Any]
         XCTAssertEqual(body?["preset"] as? String, "personal-uploads")
         XCTAssertNil(body?["accessPolicy"])
@@ -337,7 +335,6 @@ final class ApiParityTests: XCTestCase {
             [
                 "bucketId": id, "appId": "app1", "bucketKey": "k-\(id)",
                 "name": "n", "ttlTier": "permanent", "preset": "authenticated",
-                "accessPolicy": "authenticated",
                 "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
                 "modifiedAt": "2024-01-01T00:00:00Z",
             ]
@@ -354,7 +351,7 @@ final class ApiParityTests: XCTestCase {
         r.response = [
             "bucketId": "b1", "appId": "app1", "bucketKey": "k",
             "name": "Renamed", "description": NSNull(), "ttlTier": "permanent",
-            "preset": "admin-only", "accessPolicy": "admin-only",
+            "preset": "admin-only",
             "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
             "modifiedAt": "2024-01-02T00:00:00Z",
         ]
@@ -563,34 +560,6 @@ final class ApiParityTests: XCTestCase {
     }
 
     // MARK: - DatabasesAPI new methods
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func test_databases_getCelContext_GET() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["databaseId": "db1", "celContext": ["tenantId": "t1"]]
-        _ = try await api.getCelContext(databaseId: "db1")
-        XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/databases/db1/metadata")
-    }
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func test_databases_updateCelContext_PATCH() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = [
-            "databaseId": "db1", "title": "DB", "createdBy": "u1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-        ]
-        _ = try await api.updateCelContext(databaseId: "db1", celContext: ["tenantId": "t1"])
-        XCTAssertEqual(r.method, "PATCH")
-        XCTAssertEqual(r.path, "/databases/db1/metadata")
-        XCTAssertEqual((r.body as? [String: Any])?["tenantId"] as? String, "t1")
-    }
 
     func test_databases_addManager_PUTsPermission() async throws {
         let r = CallRecorder()

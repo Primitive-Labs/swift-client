@@ -25,13 +25,6 @@ public enum BlobBucketTtlTier: String, Codable, Sendable {
     case permanent
 }
 
-/// Access policy for blobs in a bucket. Mirrors JS `BlobBucketAccessPolicy`.
-public enum BlobBucketAccessPolicy: String, Codable, Sendable {
-    case publicRead = "public-read"
-    case authenticated
-    case ownerOnly = "owner-only"
-}
-
 /// Named access preset for a bucket. Mirrors JS `BlobBucketPreset`.
 public enum BlobBucketPreset: String, Codable, Sendable {
     case publicAccess = "public"
@@ -52,48 +45,10 @@ public struct BlobBucketInfo: Decodable, Sendable, Equatable {
     public let description: String?
     public let ttlTier: BlobBucketTtlTier
     public let preset: BlobBucketPreset
-    /// Deprecated JS read-alias of `preset`. Kept as `String` because the
-    /// server may return preset names that are outside the legacy input enum.
-    public let accessPolicy: String
     public let ruleSetId: String?
     public let createdBy: String
     public let createdAt: String
     public let modifiedAt: String
-
-    private enum CodingKeys: String, CodingKey {
-        case bucketId, appId, bucketKey, name, description, ttlTier
-        case preset, accessPolicy, ruleSetId, createdBy, createdAt, modifiedAt
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        bucketId = try c.decode(String.self, forKey: .bucketId)
-        appId = try c.decode(String.self, forKey: .appId)
-        bucketKey = try c.decode(String.self, forKey: .bucketKey)
-        name = try c.decode(String.self, forKey: .name)
-        description = try c.decodeIfPresent(String.self, forKey: .description)
-        ttlTier = try c.decode(BlobBucketTtlTier.self, forKey: .ttlTier)
-        ruleSetId = try c.decodeIfPresent(String.self, forKey: .ruleSetId)
-        createdBy = try c.decode(String.self, forKey: .createdBy)
-        createdAt = try c.decode(String.self, forKey: .createdAt)
-        modifiedAt = try c.decode(String.self, forKey: .modifiedAt)
-
-        if let decodedPreset = try c.decodeIfPresent(BlobBucketPreset.self, forKey: .preset) {
-            preset = decodedPreset
-        } else {
-            let legacy = try c.decode(BlobBucketAccessPolicy.self, forKey: .accessPolicy)
-            preset = Self.preset(from: legacy)
-        }
-        accessPolicy = try c.decodeIfPresent(String.self, forKey: .accessPolicy) ?? preset.rawValue
-    }
-
-    private static func preset(from legacy: BlobBucketAccessPolicy) -> BlobBucketPreset {
-        switch legacy {
-        case .publicRead: return .publicAccess
-        case .authenticated: return .authenticated
-        case .ownerOnly: return .adminOnly
-        }
-    }
 }
 
 // MARK: Bucket create input
@@ -109,13 +64,10 @@ public struct CreateBlobBucketParams: Encodable, Sendable {
     public var description: String?
     /// Retention tier — controls automatic expiration.
     public var ttlTier: BlobBucketTtlTier
-    /// Named access preset. Provide this or a `ruleSetId`; legacy
-    /// `accessPolicy` remains accepted as an input alias. For custom access,
+    /// Named access preset. Provide this or a `ruleSetId`. For custom access,
     /// pass `ruleSetId` and leave `preset` nil; `.custom` is returned by the
     /// server on bucket info but is not a meaningful create input.
     public var preset: BlobBucketPreset?
-    /// Access policy for blobs in this bucket.
-    public var accessPolicy: BlobBucketAccessPolicy?
     /// Optional rule set ID for CEL-based access control.
     public var ruleSetId: String?
 
@@ -123,7 +75,6 @@ public struct CreateBlobBucketParams: Encodable, Sendable {
         bucketKey: String,
         name: String,
         ttlTier: BlobBucketTtlTier,
-        accessPolicy: BlobBucketAccessPolicy? = nil,
         preset: BlobBucketPreset? = nil,
         description: String? = nil,
         ruleSetId: String? = nil
@@ -131,7 +82,6 @@ public struct CreateBlobBucketParams: Encodable, Sendable {
         self.bucketKey = bucketKey
         self.name = name
         self.ttlTier = ttlTier
-        self.accessPolicy = accessPolicy
         self.preset = preset
         self.description = description
         self.ruleSetId = ruleSetId
@@ -146,20 +96,17 @@ public struct UpdateBlobBucketParams: Encodable, Sendable {
     /// is returned by the server on bucket info but is not a meaningful update
     /// input.
     public var preset: BlobBucketPreset?
-    public var accessPolicy: BlobBucketAccessPolicy?
     public var ruleSetId: Updatable<String>?
     public var name: String?
     public var description: Updatable<String>?
 
     public init(
         preset: BlobBucketPreset? = nil,
-        accessPolicy: BlobBucketAccessPolicy? = nil,
         ruleSetId: Updatable<String>? = nil,
         name: String? = nil,
         description: Updatable<String>? = nil
     ) {
         self.preset = preset
-        self.accessPolicy = accessPolicy
         self.ruleSetId = ruleSetId
         self.name = name
         self.description = description

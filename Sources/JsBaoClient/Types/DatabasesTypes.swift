@@ -5,51 +5,25 @@ import Foundation
 // These mirror the interfaces published by the JS client
 // (`api/databasesApi.d.ts`) so the two surfaces line up field-for-field.
 // Timestamps stay as ISO-8601 `String`s — exactly what JS exposes. Opaque,
-// platform-untouched blobs (the CEL-context dict, operation definitions,
-// query results) are typed as `JSONValue` (see JSONValue.swift).
+// platform-untouched blobs (operation definitions, query results) are typed as
+// `JSONValue` (see JSONValue.swift).
 
 // MARK: Database metadata
 
-/// Metadata for a single database. Mirrors JS `DatabaseInfo`.
+/// A single database's details. Mirrors JS `DatabaseInfo`. Per-database values
+/// live in resource metadata categories, read from CEL as
+/// `md.self.<category>.<key>`.
 public struct DatabaseInfo: Decodable, Sendable, Equatable {
     public let databaseId: String
     public let title: String
     public let databaseType: String?
-    /// Non-deprecated backing storage for `metadata`, for the same reason as
-    /// `celContextStorage` below: the decoder writes here so `init(from:)`
-    /// never references the deprecated declaration (#1815).
-    private let metadataStorage: JSONValue?
-    /// Legacy wire name for the CEL-context dict — the same dict as the
-    /// (also-deprecated) `celContext`; kept so stored CEL expressions
-    /// referencing `database.metadata.<key>` keep resolving.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `DatabaseInfo.metadata`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — a category has separate readRule/writeRule, so granting read no longer grants update — and read it from CEL as md.self.<category>.<key>. Legacy wire-name alias of the also-deprecated celContext; this field still works.")
-    public var metadata: JSONValue? { metadataStorage }
-    /// Non-deprecated backing storage for `celContext`. The decoder writes
-    /// here so `init(from:)` never references the deprecated declaration —
-    /// otherwise compiling the target emits a deprecated-declaration warning
-    /// that fails a downstream `-warnings-as-errors` build (issue #1819).
-    private let celContextStorage: JSONValue?
-
-    /// User-facing name for the CEL context dict. Values are referenced
-    /// from CEL access rules as `database.celContext.<key>` (or the legacy
-    /// `database.metadata.<key>`) and from filter JSON as
-    /// `$database.celContext.<key>`.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `DatabaseInfo.celContext`.
-    /// Backed by the non-deprecated `celContextStorage`; the accessor body
-    /// references only that storage, so reading it here does not self-trigger
-    /// the deprecation warning.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — a category has separate readRule/writeRule, so granting read no longer grants update (the metadataAccess foot-gun) — and read it from CEL as md.self.<category>.<key>. This field still works.")
-    public var celContext: JSONValue? { celContextStorage }
     public let permission: String?
     public let createdBy: String
     public let createdAt: String
     public let modifiedAt: String
 
     private enum CodingKeys: String, CodingKey {
-        case databaseId, title, databaseType, metadata, celContext
+        case databaseId, title, databaseType
         case permission, createdBy, createdAt, modifiedAt
     }
 
@@ -58,8 +32,6 @@ public struct DatabaseInfo: Decodable, Sendable, Equatable {
         databaseId = try c.decode(String.self, forKey: .databaseId)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
         databaseType = try c.decodeIfPresent(String.self, forKey: .databaseType)
-        metadataStorage = try c.decodeIfPresent(JSONValue.self, forKey: .metadata)
-        celContextStorage = try c.decodeIfPresent(JSONValue.self, forKey: .celContext)
         permission = try c.decodeIfPresent(String.self, forKey: .permission)
         createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy) ?? ""
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
@@ -69,24 +41,13 @@ public struct DatabaseInfo: Decodable, Sendable, Equatable {
 
 // MARK: Create / update inputs
 
-/// Parameters for `create`. `metadata` is the legacy alias for `celContext` —
-/// both encode to the same server field; set one or the other.
+/// Parameters for `create`.
 public struct CreateDatabaseParams: Encodable, Sendable {
     public var title: String
     public var databaseType: String
-    /// Legacy alias for `celContext` — the same encoded server field.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `CreateDatabaseParams.metadata`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — separate readRule/writeRule — and read it from CEL as md.self.<category>.<key>. This field still works; it is the same server field as the (also-deprecated) celContext.")
-    public var metadata: [String: JSONValue]? = nil
-    /// Key-value pairs attached as the database's CEL context.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on `CreateDatabaseParams.celContext`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — separate readRule/writeRule — and read it from CEL as md.self.<category>.<key>. This field still works.")
-    public var celContext: [String: JSONValue]? = nil
     /// Create-time resource metadata to stamp on the new database, keyed by
-    /// category name → that category's values. Distinct from
-    /// `celContext`: these are per-category resource-metadata rows,
+    /// category name → that category's values, e.g.
+    /// `["settings": ["teamId": .string("t-1")]]`. Each entry is
     /// schema-validated with the category `writeRule` waived — creation
     /// authority covers the initial stamp. At most 10 categories; any invalid
     /// entry fails the whole create.
@@ -95,10 +56,6 @@ public struct CreateDatabaseParams: Encodable, Sendable {
     /// Mirrors js-bao's `CreateDatabaseParams.initialMetadata`.
     public var initialMetadata: [String: [String: JSONValue]]? = nil
 
-    /// Non-deprecated initializer for the plain case (no CEL context). Bind a
-    /// CEL context through the deprecated `metadata:` or `celContext:` overloads
-    /// below so that binding it surfaces the migration warning at the call site
-    /// (annotating only the stored property does not).
     public init(
         title: String,
         databaseType: String,
@@ -106,43 +63,6 @@ public struct CreateDatabaseParams: Encodable, Sendable {
     ) {
         self.title = title
         self.databaseType = databaseType
-        self.initialMetadata = initialMetadata
-    }
-
-    /// Deprecated overload that accepts the legacy `metadata` alias, so
-    /// `CreateDatabaseParams(…, metadata:)` call sites receive the deprecation
-    /// warning. `metadata` and `celContext` encode to the same legacy server
-    /// field. `metadata` has no default here so it does not collide with the
-    /// non-deprecated initializer when omitted.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — separate readRule/writeRule — and read it from CEL as md.self.<category>.<key>. This field still works; it is the same server field as the (also-deprecated) celContext.")
-    public init(
-        title: String,
-        databaseType: String,
-        metadata: [String: JSONValue]?,
-        initialMetadata: [String: [String: JSONValue]]? = nil
-    ) {
-        self.title = title
-        self.databaseType = databaseType
-        self.metadata = metadata
-        self.initialMetadata = initialMetadata
-    }
-
-    /// Deprecated overload that accepts `celContext`, so `CreateDatabaseParams(…,
-    /// celContext:)` call sites receive the deprecation warning. `celContext`
-    /// has no default here so it does not collide with the non-deprecated
-    /// initializer when omitted.
-    @available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — separate readRule/writeRule — and read it from CEL as md.self.<category>.<key>. This field still works.")
-    public init(
-        title: String,
-        databaseType: String,
-        metadata: [String: JSONValue]? = nil,
-        celContext: [String: JSONValue]?,
-        initialMetadata: [String: [String: JSONValue]]? = nil
-    ) {
-        self.title = title
-        self.databaseType = databaseType
-        self.metadata = metadata
-        self.celContext = celContext
         self.initialMetadata = initialMetadata
     }
 }
@@ -213,21 +133,6 @@ public struct DatabaseOwnershipTransferResult: Decodable, Sendable {
     public let message: String
     public let previousOwnerId: String
     public let newOwnerId: String
-}
-
-// MARK: CEL context
-
-/// Response from `getCelContext` (and the deprecated `getMetadata`). The same
-/// dict is returned under both the legacy `metadata` key and the current
-/// `celContext` key.
-///
-/// Deprecated with the CEL-context dict it carries (#1815): the only methods
-/// that return it — `getCelContext` / `getMetadata` — are deprecated.
-@available(*, deprecated, message: "Prefer resource metadata categories: define a category via the CLI `primitive sync` (config/metadata-category-configs) or the REST metadata-categories API — a category has separate readRule/writeRule, so granting read no longer grants update (the metadataAccess foot-gun) — and read it from CEL as md.self.<category>.<key>. This type still works.")
-public struct CelContextResult: Decodable, Sendable, Equatable {
-    public let databaseId: String
-    public let metadata: JSONValue?
-    public let celContext: JSONValue?
 }
 
 // MARK: Operations

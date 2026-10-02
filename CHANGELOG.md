@@ -20,6 +20,37 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: the database CEL context is removed (#3991)
+
+The per-database `metadata`/`celContext` dict is gone. `DatabaseInfo` no
+longer has `metadata` or `celContext`; `CreateDatabaseParams` keeps only its
+plain initializer (`title`, `databaseType`, `initialMetadata`); and
+`DatabasesAPI` loses `getCelContext`, `updateCelContext`, `getMetadata` and
+`updateMetadata`, with the `CelContextResult` type. The server no longer
+serves `databases/{databaseId}/metadata`, answers `400` to a create that sends
+`metadata` or `celContext`, and refuses a rule naming `database.metadata` or
+`database.celContext` when it is saved. The CEL `database` object exposes only
+`id`.
+
+Migration: keep per-database values in a resource metadata category. Stamp
+them at create with `initialMetadata` (`["settings": ["teamId": .string("t1")]]`),
+change them at `resources/database/{databaseId}/metadata/{category}`, and read
+them from rules as `md.self.<category>.<key>`.
+
+### Breaking: blob buckets drop `accessPolicy` (#3996)
+
+A bucket's access is `preset` (or a `ruleSetId` for a custom bucket). The
+`BlobBucketAccessPolicy` enum and `BlobBucketInfo.accessPolicy` are removed,
+and the `accessPolicy:` label is gone from `CreateBlobBucketParams.init` and
+`UpdateBlobBucketParams.init`, so a call that passes it no longer compiles.
+Read `bucket.preset` and pass `preset:` with the mapped value: `.publicRead` →
+`.publicAccess`, `.authenticated` → `.authenticated`, `.ownerOnly` →
+`.adminOnly` (it always meant app admins; `.personalUploads` is the preset for
+uploader-scoped access). The server refuses a body that still carries
+`accessPolicy` with 400 `RETIRED_REQUEST_KEY`. `BlobBucketInfo` now uses
+synthesized `Decodable`, so a response from an older server that still
+carries the key still decodes.
+
 ### Breaking: `AnalyticsEventInput.user_created_at_epoch_s` is removed (#4003)
 
 The field was deprecated in the 2026-09-30 release. The server records when
