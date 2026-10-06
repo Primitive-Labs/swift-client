@@ -422,7 +422,7 @@ final class Format2EpochHandoffHermeticTests: XCTestCase {
                 )
                 XCTAssertEqual(
                     mine.entry.stringSets,
-                    ((entry["stringSets"] as? [String: [String: Bool]]) ?? [:]),
+                    ((entry["stringSets"] as? [String: [String: Bool]]) ?? [:]).mapValues(byteKeyed),
                     "\(label) stringSets"
                 )
                 XCTAssertEqual(mine.entry.replace, entry["replace"] as? Bool, label)

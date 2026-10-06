@@ -183,16 +183,20 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         return f
     }()
 
-    /// JSON-encode a string: surround with `"` and escape inner chars.
-    /// Minimal RFC 8259 coverage — `\` `"` `\n` `\r` `\t` — matching
-    /// what js-bao's JSON.stringify emits for the common-case strings
-    /// js-bao uses in `_meta_*`.
+    /// JSON-encode a string: surround with `"` and escape inner chars,
+    /// byte-for-byte as JS `JSON.stringify` does — `\"` `\\` `\b` `\f`
+    /// `\n` `\r` `\t`, and lowercase `\u00XX` for every other control
+    /// character. It must match exactly: `UniqueIndex.buildKey` builds a
+    /// compound unique key from it, and the server and the JS client look
+    /// that key up as `JSON.stringify` spells it.
     static func jsonEncodeString(_ s: String) -> String {
         var out = "\""
         for ch in s.unicodeScalars {
             switch ch {
             case "\"":  out += "\\\""
             case "\\":  out += "\\\\"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
             case "\n":  out += "\\n"
             case "\r":  out += "\\r"
             case "\t":  out += "\\t"

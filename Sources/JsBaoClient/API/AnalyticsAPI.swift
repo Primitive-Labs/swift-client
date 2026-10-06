@@ -7,25 +7,26 @@ import Foundation
 /// `setAppVersionOverride`). All calls fan out to the shared
 /// `AnalyticsQueue` the client owns; this type holds no buffer of its own.
 ///
-/// ## The synchronous members are deprecated (#1993, Phase D3)
+/// ## Every member is async and carries the Async suffix
 ///
-/// `AnalyticsQueue` is an `actor` now, so its work is `async`. Every member
-/// below therefore comes in two shapes:
+/// `AnalyticsQueue` is an `actor` (#1993, Phase D3), so each member does its
+/// work on the caller's task. Two awaited calls are ordered, and an event
+/// logged before a flush is in that flush's batch.
 ///
-/// * the original **synchronous** one, kept for the deprecation window. It
-///   hands the work to an unstructured `Task` and returns immediately, so two
-///   consecutive calls are not ordered against each other and a `flush()` may
-///   run before an event logged just before it has been buffered. That event is
-///   not lost — it goes out with the next batch — but it is not in *this* one.
-/// * the **`Async` twin**, which does the work on the caller's task. Two
-///   awaited calls are ordered, and `flushAsync()` returns only once the batch
-///   has reached the socket.
+/// `flushAsync()` awaits the send attempt and its failure handling: it returns
+/// once the batch has been handed to the socket or, when the send throws, once
+/// the events have been re-buffered and persisted. With no connection it
+/// returns at once without sending, and the events stay buffered for the next
+/// flush. A normal return means the attempt finished, not that the batch was
+/// transmitted.
 ///
-/// The twins carry a distinct name rather than being `async` overloads of the
-/// same name on purpose: Swift prefers an `async` overload in an asynchronous
-/// context, so a same-name twin turns every existing un-`await`ed call in an
-/// `async` function into a compile error — exactly the source break the
-/// deprecation window exists to avoid.
+/// The suffix is how the members arrived: Phase D3 added them as twins beside
+/// synchronous originals, which #2367 removed. The twins took a distinct name
+/// rather than being `async` overloads of the same name on purpose: Swift
+/// prefers an `async` overload in an asynchronous context, so a same-name twin
+/// would have turned every existing un-`await`ed call inside an `async`
+/// function into a compile error during the migration. The names stay as
+/// shipped; renaming now would be a second source break for no behavior change.
 public final class AnalyticsAPI: Sendable {
     private let queue: AnalyticsQueue
     /// Resolves the current user id (ULID) for `logSnapshot`. Returns

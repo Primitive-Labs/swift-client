@@ -45,8 +45,7 @@ final class GoogleClientMapHermeticTests: XCTestCase {
           "hasPasskey": true,
           "appleSignInEnabled": false,
           "hasApple": false,
-          "magicLinkEnabled": true,
-          "otpEnabled": true
+          "emailSignInEnabled": true
         }
         """.data(using: .utf8)!
     }
@@ -138,8 +137,7 @@ final class GoogleClientMapHermeticTests: XCTestCase {
           "hasPasskey": false,
           "appleSignInEnabled": false,
           "hasApple": false,
-          "magicLinkEnabled": true,
-          "otpEnabled": true
+          "emailSignInEnabled": true
         }
         """.data(using: .utf8)!
 

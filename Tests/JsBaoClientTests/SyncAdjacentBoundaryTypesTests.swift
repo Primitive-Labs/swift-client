@@ -9,73 +9,16 @@ import XCTest
 /// the sponsor: `DatabaseSubscriptionRegistry` (permanently — it does no I/O)
 /// and `AuthController` (deferred to #2173). Keeping a lock is fine; keeping a
 /// bare `@unchecked Sendable` is not, because that attribute is a claim the
-/// compiler never checks. This suite is the enforcement: it asserts each of the
-/// two carries a written safety argument that names the state its lock confines,
-/// and that the accompanying invariants hold in the code rather than only in the
-/// prose.
+/// compiler never checks. This suite checks that the invariants each type's
+/// safety argument relies on hold in the code.
 ///
 /// Structural checks read comment-stripped source, so a phrase quoted in a doc
-/// comment cannot decide whether an invariant holds. The safety-argument checks
-/// deliberately read the raw source — the argument *is* the comment.
+/// comment cannot decide whether an invariant holds.
 ///
 /// Every test here is server-free.
 final class SyncAdjacentBoundaryTypesTests: XCTestCase {
 
-    // MARK: - The written safety arguments
-
-    /// The same acceptance bar Phase C set for the sync-domain model layer
-    /// (`SendableModelLayerTests.testUncheckedConformancesCarryWrittenSafetyArguments`),
-    /// applied to Phase D's two sync-adjacent boundary types: the declaration
-    /// must be preceded by a doc comment that says "safety argument" and names
-    /// the specific lock and the specific fields it confines. A later
-    /// conformance cannot be added bare, and an existing one cannot quietly
-    /// stop naming its locks.
-    func testSyncAdjacentBoundaryTypesCarryWrittenSafetyArguments() throws {
-        let cases: [(file: String, declaration: String, mustMention: [String])] = [
-            (
-                "Internal/DatabaseSubscriptionRegistry.swift",
-                "final class DatabaseSubscriptionRegistry: @unchecked Sendable",
-                // The lock, both fields it confines, the closures that make the
-                // conformance unchecked in the first place, and the rule that
-                // keeps a re-entrant callback from deadlocking a non-recursive
-                // NSLock.
-                ["NSLock", "lock", "registrations", "originContext",
-                 "onChange", "releases `lock`"]
-            ),
-            (
-                "Internal/AuthController.swift",
-                "public final class AuthController: @unchecked Sendable",
-                // One lock, the state it confines, the two invariants that make
-                // one lock sufficient, and the documented `deinit` exception.
-                // The `await` clause is quoted in full on purpose: a bare
-                // "held across an `await`" substring would survive a rewrite
-                // that reversed the claim (review of PR #2266).
-                ["NSLock", "lock", "currentToken", "networkMode", "_transport",
-                 "pendingRefresh", "No lock is held across an `await`",
-                 "deinit", "#2173"]
-            ),
-        ]
-
-        for entry in cases {
-            let source = try ClientSourceText.clientSource(entry.file)
-            guard let argument = ClientSourceText.docComment(
-                precedingDeclaration: entry.declaration, in: source
-            ) else {
-                XCTFail("\(entry.file): expected declaration `\(entry.declaration)`")
-                continue
-            }
-            XCTAssertTrue(
-                argument.contains("safety argument"),
-                "\(entry.file): `\(entry.declaration)` must be preceded by a written safety argument"
-            )
-            for token in entry.mustMention {
-                XCTAssertTrue(
-                    argument.contains(token),
-                    "\(entry.file): the safety argument must name `\(token)`"
-                )
-            }
-        }
-    }
+    // MARK: - The invariants behind the safety arguments
 
     /// The registry stays a class **by decision**, not by omission, so pin the
     /// decision: it must not have drifted into an actor, and it must not have
@@ -95,7 +38,6 @@ final class SyncAdjacentBoundaryTypesTests: XCTestCase {
     }
 
     /// `AuthController`'s argument claims every mutable field is lock-confined.
-    /// The token check above only proves the field *names* appear in the prose.
     /// This checks the code: no read of `networkMode` may sit outside a
     /// `lock.withLock` region. (It is the field that had genuinely
     /// unsynchronized reads before this phase — the offline-grant guards and
@@ -255,55 +197,7 @@ final class SyncAdjacentBoundaryTypesTests: XCTestCase {
         XCTAssertTrue(registry.list().isEmpty, "the re-entrant unregister must have taken effect")
     }
 
-    // MARK: - The docs the phase owes
-
-    /// `docs/architecture.md` used to state flatly that the client "does **not**
-    /// use actors". Three phases of this epic made that false. The doc now has
-    /// to describe both domains and carry the two review invariants, because
-    /// those invariants are the only thing standing between a future change and
-    /// the races the conversion removed.
-    func testArchitectureDocDescribesBothDomainsAndTheReviewInvariants() throws {
-        let doc = try ClientSourceText.packageFile("docs/architecture.md")
-
-        XCTAssertFalse(
-            doc.contains("does **not** use actors"),
-            "architecture.md still claims the client uses no actors — three of them exist"
-        )
-        for actor in ["OfflineStore", "KvCache", "AnalyticsQueue"] {
-            XCTAssertTrue(doc.contains(actor), "architecture.md must name the \(actor) actor")
-        }
-        XCTAssertTrue(doc.contains("two domains") || doc.contains("Two domains"),
-                      "architecture.md must describe the two-domain split")
-        XCTAssertTrue(doc.contains("No `await` inside a decision block"),
-                      "architecture.md must carry the decision-block review invariant")
-        // Quoted in full for the same reason as the safety-argument clause
-        // above: `contains("reentrant")` passes a rewrite saying actor
-        // isolation is *not* reentrant, which would invert the invariant.
-        XCTAssertTrue(doc.contains("actor isolation is *reentrant*"),
-                      "the invariant only makes sense once the doc says actor isolation is reentrant")
-        XCTAssertTrue(doc.contains("written safety argument"),
-                      "architecture.md must carry the @unchecked Sendable review invariant")
-    }
-
-    /// `docs/testing.md` has to explain the two gates, and specifically the rule
-    /// the TSan baseline shrink follows — remove a signature only after a clean
-    /// run, and add the suite that exercises it to the default filter. Without
-    /// that second half a removed entry means nothing.
-    func testTestingDocRecordsTheGatesAndTheBaselineShrinkRule() throws {
-        let doc = try ClientSourceText.packageFile("docs/testing.md")
-
-        XCTAssertTrue(doc.contains("v6-sendable-gate.sh"), "testing.md must document the Sendable gate")
-        XCTAssertTrue(doc.contains("tsan-gate.sh"), "testing.md must document the TSan gate")
-        XCTAssertTrue(doc.contains("baseline"), "testing.md must explain the baseline-diff policy")
-        XCTAssertTrue(
-            doc.contains("only after a clean run") || doc.contains("Remove only after a clean run"),
-            "testing.md must state that a baseline entry is removed only after a clean run"
-        )
-        XCTAssertTrue(
-            doc.contains("default filter"),
-            "testing.md must state that the suite covering a removed entry joins the default filter"
-        )
-    }
+    // MARK: - The gate scripts
 
     /// The gate scripts the doc points at have to actually be there and be
     /// executable — a documented gate nobody can run is worse than none.

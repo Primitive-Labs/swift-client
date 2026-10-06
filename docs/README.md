@@ -96,27 +96,32 @@ syncSubscription = client.observeOnMainActor(SyncEvent.self) { event in
 
 This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method sets; remaining behavioral divergences are tracked as GitHub issues (label `swift-client-parity`).
 
-## Breaking changes in the current parity batch
+## The event surface
 
-- The whole untyped event surface — `client.events`, `on`, `onAny`,
-  `emit(_:_:)` and the free `waitForEvent(emitter:...)` — is **deprecated** and
-  is removed in the next major release. Migrate to
-  `client.stream(for:buffering:replayingLatest:)`,
-  `client.observeOnMainActor(_:handler:)` and
-  `client.nextEvent(_:timeout:where:)`, which derive the event key from the
-  payload type. Deprecated calls keep working — and keep their synchronous,
-  in-registration-order delivery — for the whole window.
-- The `.invitation` event and its `InvitationEvent` payload are **removed**
-  (#2951, with the per-document invitation routes that were its only emitter).
-  There is no replacement push event — the new sharing system grants access
-  immediately, so a subscriber has nothing left to wait for. Subscriptions
-  written as `client.events.on(.invitation) { ... }` or
-  `client.stream(for: InvitationEvent.self)` no longer compile; delete them.
-- Nine events that used to be emitted as bare `[String: Any]` dictionaries are
-  typed payloads now (`meUpdated`, `pendingCreateFailed`, `authRefreshDeferred`,
-  the five `offlineAuth*` events, and `blobsQueueDrained`). A handler still
-  annotated `[String: Any]` keeps receiving the pre-conversion dictionary for
-  the whole deprecation window.
+Events are delivered through typed payloads only. Each payload type names the
+one event key it is delivered under, so there is no separate event argument to
+get wrong:
+
+- `client.stream(for:buffering:replayingLatest:)` — an `AsyncStream` of one
+  payload type, for `for await` loops.
+- `client.observeOnMainActor(_:handler:)` — a callback on the main actor. Hold
+  the returned `EventSubscription` for as long as the handler should stay live.
+- `client.nextEvent(_:timeout:where:)` — one occurrence, awaited.
+
+What is no longer there:
+
+- The untyped surface — `client.events`, `on`, `onAny`, `emit(_:_:)` and the
+  free `waitForEvent(emitter:...)` — was removed in #2367. The "batched
+  breaking API cleanup (#2367)" entry in `../CHANGELOG.md` has the
+  symbol-by-symbol replacement table.
+- Every payload is a typed struct; there is no `[String: Any]` handler shape.
+  The nine events that used to be bare dictionaries (`meUpdated`,
+  `pendingCreateFailed`, `authRefreshDeferred`, the five `offlineAuth*` events
+  and `blobsQueueDrained`) are typed payloads.
+- The `.invitation` event and its `InvitationEvent` payload were removed in
+  #2951, with the per-document invitation routes that were its only emitter.
+  There is no replacement push event — the sharing system grants access
+  immediately, so a subscriber has nothing left to wait for.
 
 ## Parity policy
 

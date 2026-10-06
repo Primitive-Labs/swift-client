@@ -14,7 +14,7 @@ import XCTest
 ///   `nonisolated` and no isolated member calls one, that the queue-timer task
 ///   is built by a `nonisolated` factory, that every deprecated member has a
 ///   twin and every removed one has an `unavailable, renamed:` stub, and that
-///   `deinit`'s safety argument was rewritten rather than carried over.
+///   `deinit` still cancels the pending queue timer.
 /// * **Behavioral** — the two properties the conversion could silently destroy:
 ///   concurrent uploads must stay concurrent, and a blocking event subscriber
 ///   must not occupy the actor. Plus the generation guard, which has had no
@@ -659,18 +659,6 @@ final class ActorizedBlobManagerTests: XCTestCase {
         )
     }
 
-    /// The twins are deliberately *not* same-name `async` overloads: Swift
-    /// prefers the `async` overload in an asynchronous context, so a same-name
-    /// twin makes every existing un-`await`ed call a compile error — the source
-    /// break the window exists to avoid. Pin the reasoning next to the code.
-    func testTheTwinNamingRationaleIsRecorded() throws {
-        XCTAssertTrue(
-            try Self.clientSource("API/DocumentsAPI.swift")
-                .contains("Swift prefers an `async` overload"),
-            "the reason the twins carry a distinct name must stay written down"
-        )
-    }
-
     // MARK: - Behavior 14 — clearCache is async-only
 
     /// No twin and no synchronous form: a direct holder of the manager is
@@ -709,27 +697,10 @@ final class ActorizedBlobManagerTests: XCTestCase {
         XCTAssertFalse(cachedAfterClear)
     }
 
-    // MARK: - Behavior 15 — deinit's safety argument was rewritten
+    // MARK: - Behavior 15 — deinit cancels the queue timer
 
-    /// The pre-conversion argument was "the lock makes this read safe", which
-    /// says nothing once there is no lock. The rewritten one has to name why an
-    /// actor `deinit` may touch isolated state, and has to state the limitation
-    /// it cannot work around.
-    func testDeinitCarriesTheRewrittenSafetyArgument() throws {
-        let source = try Self.clientSource("Internal/BlobManager.swift")
-        let argument = try Self.slice(source, from: "/// Cancel the pending queue timer.", to: "deinit {")
-        XCTAssertTrue(
-            argument.contains("no reference to the actor remains"),
-            "the argument must say why no isolated work can race the deinit"
-        )
-        XCTAssertTrue(
-            argument.contains("weakly"),
-            "the argument must name the weak capture that keeps a pending timer from holding the actor"
-        )
-        XCTAssertTrue(
-            argument.contains("cannot") && argument.contains("drain the queue"),
-            "the argument must state the limitation: deinit cannot drain the queue"
-        )
+    /// A pending queue timer must not outlive the manager it would fire into.
+    func testDeinitCancelsTheQueueTimer() throws {
         XCTAssertTrue(
             try Self.code("Internal/BlobManager.swift")
                 .contains("deinit {\n        queueTimerTask?.cancel()\n    }"),

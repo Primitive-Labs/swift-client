@@ -43,7 +43,7 @@ final class HttpClientRefreshCoalescingTests: XCTestCase {
             for _ in 0..<callerCount {
                 group.addTask {
                     do {
-                        _ = try await http.request(method: "GET", path: "/me")
+                        let _: JSONValue? = try await http.requestOptional(method: .get, path: "/me")
                         return true
                     } catch {
                         return false
@@ -84,7 +84,7 @@ final class HttpClientRefreshCoalescingTests: XCTestCase {
         let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1-stale"))
 
         do {
-            _ = try await http.request(method: "GET", path: "/me")
+            let _: JSONValue? = try await http.requestOptional(method: .get, path: "/me")
             XCTFail("Expected a 401 to be thrown when the refresh is invalid")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 401, "invalid refresh must surface as HTTP 401")

@@ -32,7 +32,7 @@ final class BlobRefreshOutageTests: XCTestCase {
         let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1-stale"))
 
         do {
-            _ = try await http.request(method: "GET", path: "/me")
+            let _: JSONValue? = try await http.requestOptional(method: .get, path: "/me")
             XCTFail("the request must fail when the refresh cannot reach the server")
         } catch {
             XCTAssertNotEqual(
@@ -62,7 +62,7 @@ final class BlobRefreshOutageTests: XCTestCase {
         let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1-stale"))
 
         do {
-            _ = try await http.request(method: "GET", path: "/me")
+            let _: JSONValue? = try await http.requestOptional(method: .get, path: "/me")
             XCTFail("the request must fail when the refresh is rejected")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 401, "a rejected refresh stays an HTTP 401")

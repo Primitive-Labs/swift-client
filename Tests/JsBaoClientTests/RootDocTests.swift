@@ -117,4 +117,57 @@ final class RootDocTests: XCTestCase {
         XCTAssertTrue(client.isRootDocument(rootDocId))
         XCTAssertFalse(client.isRootDocument("not-the-root-doc"))
     }
+
+    func testLargeRootDocumentIsReportedAndOpens() async throws {
+        // #4195: an app whose `rootDocumentFormat` is 2 mints each new user's
+        // root document as a large document. The client needs no change — it
+        // learns the format from the document read — so this proves the root
+        // the server mints is reported as large and opens as one.
+        let app = try await ctx.createTestApp(name: "swift-root-format2")
+        try await ctx.updateAppSettings(
+            appId: app.appId,
+            updates: ["rootDocumentFormat": 2],
+            jwt: app.ownerJWT
+        )
+        let member = try await ctx.createTestUser(appId: app.appId)
+        let ensured = try await ctx.adminPost(
+            "/admin/api/apps/\(app.appId)/users/\(member.userId)/root-document",
+            body: [:]
+        )
+        XCTAssertEqual(ensured["documentFormat"] as? Int, 2)
+
+        let directory = NSTemporaryDirectory() + "root-format2-\(UUID().uuidString.prefix(8))"
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let memberClient = createTestClient(
+            appId: app.appId,
+            token: member.jwt,
+            storageConfig: .sqlite(directory: directory + "/root.sqlite"),
+            autoNetwork: true
+        )
+        _ = await memberClient.waitForStorageReady()
+
+        let rootDocId = try XCTUnwrap(memberClient.rootDocId)
+        XCTAssertEqual(rootDocId, ensured["rootDocId"] as? String)
+        let root = try await memberClient.documents.getRoot()
+        XCTAssertEqual(root.documentId, rootDocId)
+        XCTAssertEqual(root.documentFormat, 2, "the minted root is a large document")
+
+        try await memberClient.connect()
+        try await waitForConnection(client: memberClient, timeout: 30)
+        let opened = try await memberClient.documents.openRoot(
+            options: OpenDocumentOptions(
+                waitForLoad: .localIfAvailableElseNetwork, enableNetworkSync: true
+            )
+        )
+        XCTAssertNotNil(opened.confinedDoc)
+        // Opened as a large document: the client remembers the format it
+        // resolved for the root.
+        try await eventually(timeout: 30, description: "the root to resolve as large") {
+            memberClient.documentManager.getLocalMetadata(rootDocId)?.documentFormat == 2
+        }
+        await memberClient.destroy()
+    }
 }

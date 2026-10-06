@@ -474,26 +474,180 @@ public final class Format2RecordStore: @unchecked Sendable {
     ) throws -> String? {
         try assertHydrated(model)
         guard !fields.isEmpty else { return nil }
-        let predicates = fields
-            .map { _ in "json_extract(_data, '$.' || ?) IS ?" }
-            .joined(separator: " AND ")
-        var bindings: [Format2SqlValue] = [.text(model)]
-        for (index, field) in fields.enumerated() {
-            bindings.append(.text(field))
-            bindings.append(Format2SqlValue(json: values[index]))
-        }
+        let statement = lookupStatement(model: model, fields: fields, values: values)
         return try withConnection { connection in
-            try connection.query(
-                """
-                SELECT _id FROM \(tables.records) \
-                WHERE _type = ? AND \(predicates) ORDER BY _id LIMIT 1
-                """,
-                bindings
-            ).first?["_id"].stringValue
+            try connection.query(statement.sql, statement.bindings)
+                .first?["_id"].stringValue
         }
     }
 
-    /// The members of one record's stringset field, in rowid order.
+    /// The statement ``findIdByFields(model:fields:values:)`` runs (#3879).
+    ///
+    /// The model and the JSON paths are written as literals when every one of
+    /// them is an identifier, so the expressions are the ones
+    /// ``ensureFieldIndexes(model:fields:constraints:stringSetFields:)``
+    /// indexes and the lookup is a search; anything else keeps the bound form
+    /// — same answer, still a scan. js-bao's `fieldLookupPredicates` builds
+    /// the same clause. `IS ?` either way, so a `null` matches a stored JSON
+    /// `null` and an absent field alike.
+    public func lookupStatement(
+        model: String, fields: [String], values: [JSONValue]
+    ) -> (sql: String, bindings: [Format2SqlValue]) {
+        let literal = Self.isIdentifier(model) && fields.allSatisfy(Self.isIdentifier)
+        var predicates: [String]
+        var bindings: [Format2SqlValue] = []
+        if literal {
+            predicates = ["_type = \(Self.quoteLiteral(model))"]
+            for (index, field) in fields.enumerated() {
+                predicates.append("json_extract(_data, '$.\(field)') IS ?")
+                bindings.append(Format2SqlValue(json: values[index]))
+            }
+        } else {
+            predicates = ["_type = ?"]
+            bindings.append(.text(model))
+            for (index, field) in fields.enumerated() {
+                predicates.append("json_extract(_data, '$.' || ?) IS ?")
+                bindings.append(.text(field))
+                bindings.append(Format2SqlValue(json: values[index]))
+            }
+        }
+        return (
+            "SELECT _id FROM \(tables.records) WHERE \(predicates.joined(separator: " AND ")) "
+                + "ORDER BY _id LIMIT 1",
+            bindings
+        )
+    }
+
+    // MARK: - Lookup indexes (#3879)
+
+    /// What one ``ensureFieldIndexes(model:fields:constraints:stringSetFields:)``
+    /// call did: how many indexes it created, and what it skipped or could not
+    /// create, for the caller to log.
+    public struct FieldIndexReport: Equatable, Sendable {
+        public var created = 0
+        public var skipped: [String] = []
+        public var failed: [String] = []
+    }
+
+    /// Which lookup an index serves: one field, or one compound constraint.
+    public enum FieldIndexKind: Sendable {
+        case field
+        case constraint
+    }
+
+    /// The name of one per-document lookup index — js-bao's
+    /// `format2FieldIndexName`. The model name's length leads it, so
+    /// `Order_Line.code` and `Order.line_code` never share a name (an
+    /// underscore join would, and `IF NOT EXISTS` would keep the first).
+    public static func fieldIndexName(
+        records: String, kind: FieldIndexKind, model: String, name: String
+    ) -> String {
+        let tag = kind == .field ? "f" : "u"
+        return "idx_\(records)_\(tag)\(model.count)_\(model.lowercased())_\(name.lowercased())"
+    }
+
+    /// Build the lookup indexes for one model's declared fields.
+    ///
+    /// One partial expression index per scalar `indexed`/`unique` field and
+    /// one per compound unique constraint, each `(json_extract(…)…, _id) WHERE
+    /// _type = '<Model>'`: `_id` last is what lets the index also serve the
+    /// lookup's `ORDER BY _id LIMIT 1`, where an expression-only index loses to
+    /// the `(_type, _id)` primary key. Idempotent. A stringset field, a
+    /// constraint with a stringset component and a name outside the identifier
+    /// policy are skipped; a failed `CREATE` is reported, and the lookup keeps
+    /// working without the index. Never throws.
+    @discardableResult
+    public func ensureFieldIndexes(
+        model: String,
+        fields: [String],
+        constraints: [ConstraintDescriptor],
+        stringSetFields: Set<String> = []
+    ) -> FieldIndexReport {
+        var report = FieldIndexReport()
+        guard Self.isIdentifier(model) else {
+            report.skipped.append("\(model): the model name is not an identifier")
+            return report
+        }
+        let records = tables.records
+        var wanted: [(name: String, columns: String)] = []
+        func usable(_ field: String, _ owner: String) -> Bool {
+            if stringSetFields.contains(field) {
+                report.skipped.append("\(model).\(owner): '\(field)' is a stringset")
+                return false
+            }
+            if !Self.isIdentifier(field) {
+                report.skipped.append("\(model).\(owner): '\(field)' is not an identifier")
+                return false
+            }
+            return true
+        }
+        for field in fields where usable(field, field) {
+            wanted.append((
+                Self.fieldIndexName(records: records, kind: .field, model: model, name: field),
+                "json_extract(_data, '$.\(field)'), _id"
+            ))
+        }
+        for constraint in constraints where !constraint.fields.isEmpty {
+            guard Self.isIdentifier(constraint.name) else {
+                report.skipped.append("\(model) constraint '\(constraint.name)': not an identifier")
+                continue
+            }
+            guard constraint.fields.allSatisfy({ usable($0, constraint.name) }) else { continue }
+            wanted.append((
+                Self.fieldIndexName(
+                    records: records, kind: .constraint, model: model, name: constraint.name
+                ),
+                (constraint.fields.map { "json_extract(_data, '$.\($0)')" } + ["_id"])
+                    .joined(separator: ", ")
+            ))
+        }
+        guard !wanted.isEmpty else { return report }
+
+        do {
+            try withConnection { connection in
+                let existing = Set(
+                    try connection.query(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?",
+                        [.text(records)]
+                    ).compactMap { $0["name"].stringValue }
+                )
+                for index in wanted where !existing.contains(index.name) {
+                    do {
+                        try connection.executeScript(
+                            "CREATE INDEX IF NOT EXISTS \(index.name) ON \(records)"
+                                + "(\(index.columns)) WHERE _type = \(Self.quoteLiteral(model))"
+                        )
+                        report.created += 1
+                    } catch {
+                        report.failed.append("\(index.name): \(error)")
+                    }
+                }
+            }
+        } catch {
+            report.failed.append("\(model): \(error)")
+        }
+        return report
+    }
+
+    /// js-bao's identifier policy (`utils/sql.ts`): letter or underscore, then
+    /// letters, digits and underscores.
+    static func isIdentifier(_ name: String) -> Bool {
+        guard let first = name.unicodeScalars.first,
+              first == "_" || (first.isASCII && CharacterSet.letters.contains(first))
+        else { return false }
+        return name.unicodeScalars.allSatisfy {
+            $0 == "_" || ($0.isASCII && CharacterSet.alphanumerics.contains($0))
+        }
+    }
+
+    /// A SQL string literal, its single quotes doubled.
+    private static func quoteLiteral(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "''"))'"
+    }
+
+    /// The members of one record's stringset field, in canonical (code point)
+    /// order (#3881) — whatever order a store written before that holds its
+    /// rows or its `_data` array in.
     public func members(model: String, recordId: String, field: String) throws -> [String] {
         try withConnection { connection in
             try connection.query(
@@ -559,9 +713,11 @@ public final class Format2RecordStore: @unchecked Sendable {
             ?? OverlayRecordEntry(id: mutation.id)
 
         let fieldsJSON = try Self.encodeJSON(pending.fields.map(JSONValue.string))
-        let mutationJSON = try Self.encodeJSON(mutation.storedJSON)
+        let mutationJSON = try mutation.storedText()
         let priorJSON: Format2SqlValue = try pending.priorOverlay.map {
-            .text(try Self.encodeJSON(JSONValue.object($0)))
+            .text(try ByteKeyedJSON.object(
+                $0.map { ($0.key, try ByteKeyedJSON.fragment($0.value)) }
+            ))
         } ?? .null
 
         try withConnection { connection in
@@ -796,7 +952,7 @@ public final class Format2RecordStore: @unchecked Sendable {
                             .text(try Self.encodeJSON(
                                 entry.fields.map(JSONValue.string)
                             )),
-                            .text(try Self.encodeJSON(entry.mutation.storedJSON)),
+                            .text(try entry.mutation.storedText()),
                             .text(docId), .text(clientId), .integer(Int64(entry.seq)),
                         ]
                     )
@@ -1562,7 +1718,7 @@ public final class Format2RecordStore: @unchecked Sendable {
             try connection.query(
                 """
                 SELECT _type, _record_id, field, value FROM \(tables.stringSetIndex) \
-                ORDER BY _type, _record_id, field, rowid
+                ORDER BY _type, _record_id, field, value
                 """
             ).compactMap { row in
                 guard let type = row["_type"].stringValue,
@@ -1654,8 +1810,9 @@ public struct PendingOp: Equatable, Sendable {
     public let mutation: OverlayMutation?
     /// What the overlay held for each key this op wrote, just BEFORE the
     /// write. A key the overlay did not hold is absent, so `[:]` is a complete
-    /// answer; `nil` is "not recorded".
-    public let priorOverlay: [String: JSONValue]?
+    /// answer; `nil` is "not recorded". Keyed by bytes: two member keys of
+    /// `"é"` and `"é"` are two keys (#3881).
+    public let priorOverlay: [ByteKey: JSONValue]?
 
     public init(
         seq: Int,
@@ -1666,7 +1823,7 @@ public struct PendingOp: Equatable, Sendable {
         baseEpoch: Int,
         ts: Int,
         mutation: OverlayMutation?,
-        priorOverlay: [String: JSONValue]?
+        priorOverlay: [ByteKey: JSONValue]?
     ) {
         self.seq = seq
         self.model = model
@@ -1693,10 +1850,18 @@ public struct PendingOp: Equatable, Sendable {
             .flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
         self.baseEpoch = row["base_epoch"].intValue ?? 0
         self.ts = row["ts"].intValue ?? 0
-        self.mutation = row["mutation"].stringValue.flatMap(OverlayMutation.init(storedJSON:))
+        self.mutation = row["mutation"].stringValue.flatMap(OverlayMutation.init(storedText:))
         self.priorOverlay = row["prior_overlay"].stringValue
-            .flatMap { $0.data(using: .utf8) }
-            .flatMap { try? JSONDecoder().decode([String: JSONValue].self, from: $0) }
+            .flatMap(ByteKeyedJSON.parse)
+            .flatMap { $0 as? NSDictionary }
+            .map { object in
+                Dictionary(
+                    ByteKeyedJSON.pairs(object).compactMap { key, value in
+                        ByteKeyedJSON.value(value).map { (key, $0) }
+                    },
+                    uniquingKeysWith: { first, _ in first }
+                )
+            }
     }
 }
 
@@ -1765,7 +1930,7 @@ public struct PendingOpInput: Sendable {
     /// Pin the sequence rather than taking the next one — a replayed write
     /// keeps the sequence its sender claimed.
     public let seq: Int?
-    public let priorOverlay: [String: JSONValue]?
+    public let priorOverlay: [ByteKey: JSONValue]?
 
     public init(
         model: String,
@@ -1775,7 +1940,7 @@ public struct PendingOpInput: Sendable {
         baseEpoch: Int,
         ts: Int,
         seq: Int? = nil,
-        priorOverlay: [String: JSONValue]? = nil
+        priorOverlay: [ByteKey: JSONValue]? = nil
     ) {
         self.model = model
         self.recordId = recordId
@@ -1788,36 +1953,115 @@ public struct PendingOpInput: Sendable {
     }
 }
 
-extension OverlayMutation {
-    /// The mutation as the JSON the pending-op log stores — the same shape
-    /// `largeDocuments.ts` writes, so a log row is readable on either client.
-    var storedJSON: JSONValue {
-        var out: [String: JSONValue] = ["id": .string(id), "kind": .string(kind.rawValue)]
-        if !fields.isEmpty { out["fields"] = .object(fields) }
-        if !stringSetDeltas.isEmpty {
-            out["stringSetDeltas"] = .object(stringSetDeltas.mapValues { members in
-                JSONValue.object(members.mapValues { JSONValue.bool($0) })
-            })
+/// A JSON object whose keys are told apart by their bytes (#3881).
+///
+/// `JSONEncoder` and `JSONDecoder` key an object by `String`, so the two
+/// stringset members `"é"` and `"é"` — two members on the server, in JS and in
+/// this client's fold — become one key on the way through and the other is
+/// dropped. The pending-op log is what a crash is recovered from, so it keeps
+/// every key in both directions: the text is written key by key, and read
+/// back with `JSONSerialization`, whose `NSDictionary` compares keys
+/// literally. It is walked pair by pair and never bridged to a Swift
+/// dictionary, which is where the two would collapse again.
+enum ByteKeyedJSON {
+    /// One object, from keys and their already-encoded values, in byte order
+    /// so the same content always writes the same text.
+    static func object(_ pairs: [(ByteKey, String)]) throws -> String {
+        let members = try pairs.sorted { $0.0 < $1.0 }.map { key, value in
+            "\(try fragment(.string(key.value))):\(value)"
         }
-        return .object(out)
+        return "{\(members.joined(separator: ","))}"
     }
 
-    /// Rebuild a mutation from a stored log row.
-    init?(storedJSON text: String) {
+    /// One value as JSON text.
+    static func fragment(_ value: JSONValue) throws -> String {
+        let data = try JSONEncoder().encode(value)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw Format2SqlError.executionFailed(
+                sql: "<json encoding>", message: "value is not UTF-8"
+            )
+        }
+        return text
+    }
+
+    /// The text parsed with every object key kept; `nil` when it is not JSON.
+    static func parse(_ text: String) -> Any? {
+        text.data(using: .utf8).flatMap {
+            try? JSONSerialization.jsonObject(with: $0, options: [.fragmentsAllowed])
+        }
+    }
+
+    /// An object's pairs, one per key the text held; `[]` for a non-object.
+    static func pairs(_ value: Any?) -> [(ByteKey, Any)] {
+        guard let object = value as? NSDictionary else { return [] }
+        return object.compactMap { key, value in
+            (key as? String).map { (ByteKey($0), value) }
+        }
+    }
+
+    /// One parsed value as a ``JSONValue``, re-read through the decoder so it
+    /// comes back exactly as the rest of the log's values do.
+    static func value(_ parsed: Any) -> JSONValue? {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: parsed, options: [.fragmentsAllowed]
+        ) else { return nil }
+        return try? JSONDecoder().decode(JSONValue.self, from: data)
+    }
+}
+
+extension OverlayMutation {
+    /// The mutation as the JSON text the pending-op log stores — the same
+    /// shape `largeDocuments.ts` writes, so a log row is readable on either
+    /// client. Every member is its own key, by bytes: a clear of a set holding
+    /// `"é"` and `"é"` tombstones both, and a crash before the overlay is
+    /// persisted must replay both (#3881).
+    func storedText() throws -> String {
+        var pairs: [(ByteKey, String)] = [
+            ("id", try ByteKeyedJSON.fragment(.string(id))),
+            ("kind", try ByteKeyedJSON.fragment(.string(kind.rawValue))),
+        ]
+        if !fields.isEmpty {
+            pairs.append(("fields", try ByteKeyedJSON.fragment(.object(fields))))
+        }
+        if !stringSetDeltas.isEmpty {
+            pairs.append(("stringSetDeltas", try ByteKeyedJSON.object(
+                stringSetDeltas.map { field, members in
+                    (ByteKey(field), try ByteKeyedJSON.object(
+                        members.map { ($0.key, $0.value ? "true" : "false") }
+                    ))
+                }
+            )))
+        }
+        return try ByteKeyedJSON.object(pairs)
+    }
+
+    /// Rebuild a mutation from a stored log row, keeping every member key the
+    /// row holds — including a row written before #3881, which is read the
+    /// same way.
+    init?(storedText text: String) {
         guard let data = text.data(using: .utf8),
               let value = try? JSONDecoder().decode(JSONValue.self, from: data),
               let object = value.objectValue,
               let id = object["id"]?.stringValue,
               let kind = object["kind"]?.stringValue.flatMap(Kind.init(rawValue:))
         else { return nil }
+        let parsed = ByteKeyedJSON.parse(text) as? NSDictionary
+        var stringSetDeltas: [String: [ByteKey: Bool]] = [:]
+        for (field, members) in ByteKeyedJSON.pairs(parsed?["stringSetDeltas"]) {
+            guard members is NSDictionary else { continue }
+            var delta: [ByteKey: Bool] = [:]
+            for (member, present) in ByteKeyedJSON.pairs(members) {
+                if let present = ByteKeyedJSON.value(present)?.boolValue {
+                    delta[member] = present
+                }
+            }
+            stringSetDeltas[field.value] = delta
+        }
         self.init(
             id: id,
             kind: kind,
             fields: object["fields"]?.objectValue ?? [:],
-            stringSetDeltas: (object["stringSetDeltas"]?.objectValue ?? [:])
-                .compactMapValues { members in
-                    members.objectValue?.compactMapValues { $0.boolValue }
-                }
+            stringSetDeltas: stringSetDeltas
         )
     }
 }

@@ -71,6 +71,7 @@ public final class Format2QueryProjection: @unchecked Sendable {
     @discardableResult
     func ensureProjected(schema: PrimitiveSchema, store: Format2RecordStore) throws -> Bool {
         lock.withLock { schemas[schema.name] = schema }
+        ensureLookupIndexes(schema: schema, store: store)
         // Widen FIRST. `ensureTable` declares an index per indexed field, and
         // an index on a column the stored table does not have yet fails —
         // leaving the model without the indexes it asked for. After the widen
@@ -120,6 +121,45 @@ public final class Format2QueryProjection: @unchecked Sendable {
             "into the query tables"
         )
         return true
+    }
+
+    /// The merged view's lookup indexes for `schema` (#3879): `upsertOn` and
+    /// the unique check on save read the store's `records`, not these tables,
+    /// so they get their own — whether or not the rows below are re-copied.
+    /// Logged, never thrown: without them the lookups scan, as they did.
+    private func ensureLookupIndexes(schema: PrimitiveSchema, store: Format2RecordStore) {
+        var fields: [String] = []
+        var stringSets = Set<String>()
+        for (name, desc) in schema.fields.sorted(by: { $0.key < $1.key }) {
+            if desc.type == .stringset {
+                stringSets.insert(name)
+            } else if name != "id", desc.indexed || desc.unique {
+                // The `id` key is the row key, not a `_data` field; any other
+                // field, `id`-typed or not, is looked up in `_data`.
+                fields.append(name)
+            }
+        }
+        // A one-field constraint is served by that field's index.
+        for constraint in schema.constraints.values where constraint.fields.count == 1 {
+            let field = constraint.fields[0]
+            if field != "id", !fields.contains(field), !stringSets.contains(field) {
+                fields.append(field)
+            }
+        }
+        let constraints = schema.constraints.values
+            .filter { $0.fields.count > 1 }
+            .sorted { $0.name < $1.name }
+        guard !fields.isEmpty || !constraints.isEmpty else { return }
+        let report = store.ensureFieldIndexes(
+            model: schema.name, fields: fields, constraints: constraints,
+            stringSetFields: stringSets
+        )
+        for reason in report.skipped {
+            logger?.debug("[format2] no lookup index:", reason)
+        }
+        for reason in report.failed {
+            logger?.warn("[format2] lookup index not created; its lookups scan:", reason)
+        }
     }
 
     /// Project every model this client has connected on `store`'s document

@@ -400,6 +400,33 @@ final class AvailabilityHermeticTests: XCTestCase {
         )
     }
 
+    /// Edge case (#4191) — a zero availability budget does not fail an open
+    /// that already holds the server state: the already-synced answer is
+    /// settled before the timeout exists, so the timer cannot win the race.
+    /// Repeated because a lost race is nondeterministic.
+    func testAlreadySyncedDocumentOpensUnderAZeroAvailabilityBudget() async throws {
+        let client = makeClient()
+        let docId = newDocId("already-synced-zero-wait")
+
+        _ = try await client.openDocument(docId, options: OpenDocumentOptions(
+            waitForLoad: .local
+        ))
+        client.documentManager.applySyncState(docId, isSynced: true)
+
+        for attempt in 0..<50 {
+            do {
+                _ = try await client.openDocument(docId, options: OpenDocumentOptions(
+                    waitForLoad: .network,
+                    enableNetworkSync: true,
+                    availabilityWait: 0
+                ))
+            } catch {
+                XCTFail("attempt \(attempt): an already-synced open threw \(error)")
+                return
+            }
+        }
+    }
+
     /// A one-way flag the status callback can set from the WebSocket's own
     /// queue while the test reads it from its.
     private final class Flag: @unchecked Sendable {

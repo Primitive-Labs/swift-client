@@ -212,15 +212,19 @@ public enum PrimitiveAuthorKind: Sendable, Equatable, Hashable {
 public enum PrimitiveStepKind: Sendable, Equatable, Hashable {
     case modelCall
     case toolCall
+    case contextCall
+    case historyCall
     case unknown(String)
 
     /// The values this client knows, in the schema's order.
-    public static let known: [PrimitiveStepKind] = [.modelCall, .toolCall]
+    public static let known: [PrimitiveStepKind] = [.modelCall, .toolCall, .contextCall, .historyCall]
 
     public init(rawValue: String) {
         switch rawValue {
         case "model_call": self = .modelCall
         case "tool_call": self = .toolCall
+        case "context_call": self = .contextCall
+        case "history_call": self = .historyCall
         default: self = .unknown(rawValue)
         }
     }
@@ -229,6 +233,8 @@ public enum PrimitiveStepKind: Sendable, Equatable, Hashable {
         switch self {
         case .modelCall: return "model_call"
         case .toolCall: return "tool_call"
+        case .contextCall: return "context_call"
+        case .historyCall: return "history_call"
         case let .unknown(raw): return raw
         }
     }
@@ -878,6 +884,9 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
             "historyMessageIds": FieldDescriptor(type: .stringset),
             "errorCode": FieldDescriptor(type: .string),
             "errorMessage": FieldDescriptor(type: .string),
+            "historyMode": FieldDescriptor(type: .string),
+            "historySelection": FieldDescriptor(type: .string),
+            "providerDurationMs": FieldDescriptor(type: .number),
         ]
     )
 
@@ -905,6 +914,9 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
     public var historyMessageIds: Set<String>?
     public var errorCode: String?
     public var errorMessage: String?
+    public var historyMode: String?
+    public var historySelection: JSONValue?
+    public var providerDurationMs: Double?
 
     /// Decode a row. `nil` when a required scalar column is missing or does
     /// not read; an optional column, JSON and stringsets included, never fails a row.
@@ -940,6 +952,9 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
         self.historyMessageIds = AgentSessionJSON.members(row["historyMessageIds"])
         self.errorCode = row["errorCode"]?.stringValue
         self.errorMessage = row["errorMessage"]?.stringValue
+        self.historyMode = row["historyMode"]?.stringValue
+        self.historySelection = AgentSessionJSON.parse(row["historySelection"])
+        self.providerDurationMs = AgentSessionJSON.number(row["providerDurationMs"])
     }
 
     public init?(record: PrimitiveRecord) {
@@ -972,6 +987,9 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
         if let historyMessageIds { values["historyMessageIds"] = .stringset(historyMessageIds) }
         if let errorCode { values["errorCode"] = .string(errorCode) }
         if let errorMessage { values["errorMessage"] = .string(errorMessage) }
+        if let historyMode { values["historyMode"] = .string(historyMode) }
+        if let historySelection { values["historySelection"] = .string(AgentSessionJSON.text(historySelection)) }
+        if let providerDurationMs { values["providerDurationMs"] = .number(providerDurationMs) }
         return values
     }
 }

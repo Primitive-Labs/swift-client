@@ -56,8 +56,8 @@ extension OverlayMutation {
         let fields = (json["fields"] as? [String: Any] ?? [:])
             .mapValues { JSONValue(harness: $0) }
         let deltas = (json["stringSetDeltas"] as? [String: Any] ?? [:])
-            .compactMapValues { value -> [String: Bool]? in
-                (value as? [String: Any])?.compactMapValues { $0 as? Bool }
+            .compactMapValues { value -> [ByteKey: Bool]? in
+                (value as? [String: Any]).map { byteKeyed($0.compactMapValues { $0 as? Bool }) }
             }
         self.init(id: id, kind: kind, fields: fields, stringSetDeltas: deltas)
     }
@@ -69,8 +69,16 @@ extension OverlayMutation {
             out["fields"] = fields.mapValues(\.harnessJSON)
         }
         if !stringSetDeltas.isEmpty {
-            out["stringSetDeltas"] = stringSetDeltas.mapValues { $0 as [String: Bool] }
+            out["stringSetDeltas"] = stringSetDeltas.mapValues { members in
+                Dictionary(uniqueKeysWithValues: members.map { ($0.key.value, $0.value) })
+            }
         }
         return out
     }
+}
+
+/// A harness member map — JSON object keys, so `String` — keyed by bytes, as
+/// the overlay's member maps are (#3881).
+func byteKeyed(_ members: [String: Bool]) -> [ByteKey: Bool] {
+    Dictionary(uniqueKeysWithValues: members.map { (ByteKey($0.key), $0.value) })
 }

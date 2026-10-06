@@ -3062,11 +3062,19 @@ public final class Format2DocumentBinding: @unchecked Sendable {
         foldQueue.async { [weak self] in
             guard let self else { return }
             do {
+                let startedAt = Date()
+                let folded = try writePath.foldPendingUnderOperation()
+                if !folded.isEmpty {
+                    logger?.debug(
+                        "[format2] folded", documentId, "models:", folded.sorted(),
+                        "ms:", Int(Date().timeIntervalSince(startedAt) * 1000)
+                    )
+                }
                 // Outside the operation the fold ran under: a subscriber is
                 // application code, free to read and write the model it was
                 // told about, and running it under the document's operation
                 // lock would deadlock it against its own read.
-                notifyFolded(try writePath.foldPendingUnderOperation())
+                notifyFolded(folded)
             } catch {
                 // A failed fold is already sticky and already logged by the
                 // observer; there is no caller here to hand it to. The next
@@ -3094,6 +3102,19 @@ public final class Format2DocumentBinding: @unchecked Sendable {
         // operation began.
         guard !writePath.isInsideOperation else { return }
         foldQueue.sync {}
+    }
+
+    /// Wait, without blocking a thread, for the folds already scheduled to
+    /// finish (#4190).
+    ///
+    /// What the client's `syncComplete` handler awaits before it reports the
+    /// document synced: the cycle's `syncStep2` has been applied by then and
+    /// its keys captured, but the rows they become — and their projection,
+    /// which commits in the fold's transaction — are still on this queue.
+    func awaitScheduledFolds() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            foldQueue.async { continuation.resume() }
+        }
     }
 
     // MARK: - Telling the models a fold moved their rows

@@ -5,18 +5,16 @@ import XCTest
 ///
 /// A recurring shape in the concurrency epic (#1910, #1992, #1993, #1994) is a
 /// test that asserts something about the *source* rather than the behavior:
-/// "this decision region contains no `await`", "this `@unchecked Sendable`
-/// carries a written safety argument", "this file reaches for no
+/// "this decision region contains no `await`", "this file reaches for no
 /// `JSONSerialization`". Those properties are real invariants that the compiler
 /// does not check, and they are only checkable by reading the code.
 ///
-/// Each phase grew its own private copy of the same four helpers. This is the
-/// one copy. Two conventions it encodes, both load-bearing:
+/// Each phase grew its own private copy of the same helpers. This is the one
+/// copy. Two conventions it encodes, both load-bearing:
 ///
 ///  - **Structural checks read comment-stripped source** (`code(_:)`), so a
 ///    phrase quoted in a doc comment can never decide whether an invariant
-///    holds. Checks about the *documentation* — a safety argument, say — read
-///    the raw source instead (`clientSource(_:)`).
+///    holds. No check asserts the wording of a comment.
 ///  - **Anchored slices fail loudly** (`slice(_:from:to:)`). A region check that
 ///    silently matched an empty string when its anchors moved would pass
 ///    forever; this throws instead.
@@ -122,22 +120,6 @@ enum ClientSourceText {
             "missing anchor: \(to)"
         )
         return String(source[start.upperBound..<end.lowerBound])
-    }
-
-    /// The contiguous `///` doc-comment block immediately above `declaration`.
-    /// Scoped this way (rather than "anything earlier in the file") so a token
-    /// that happens to appear in some other type's comment can't satisfy the
-    /// check. Returns `nil` when the declaration isn't in the source at all.
-    static func docComment(precedingDeclaration declaration: String, in source: String) -> String? {
-        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard let declIndex = lines.firstIndex(where: { $0.hasPrefix(declaration) }) else { return nil }
-        var block: [String] = []
-        var i = declIndex - 1
-        while i >= 0, lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("///") {
-            block.append(lines[i])
-            i -= 1
-        }
-        return block.reversed().joined(separator: "\n")
     }
 
     /// The attribute lines (`@available`, `@discardableResult`, …) attached to

@@ -54,9 +54,12 @@ enum OverlayFold {
                 INSERT OR IGNORE INTO \(members) (_record_id, _type, field, value) \
                 VALUES (?, ?, ?, ?)
                 """
+            // `ORDER BY value` is a string set's canonical order (#3881): code
+            // point order, SQLite's `BINARY` collation, the same on every
+            // surface. Swift never sorts members itself.
             selectMembers = """
                 SELECT value FROM \(members) \
-                WHERE _type = ? AND _record_id = ? AND field = ? ORDER BY rowid
+                WHERE _type = ? AND _record_id = ? AND field = ? ORDER BY value
                 """
             mergeUpsert = """
                 INSERT INTO \(records) (_id, _type, _data)
@@ -112,16 +115,18 @@ enum OverlayFold {
 
         for field in entry.stringSets.keys.sorted() {
             let members = entry.stringSets[field] ?? [:]
+            // Byte order, so the statements run in the same order every time;
+            // the stored array's order comes from `selectMembers`.
             for member in members.keys.sorted() {
                 if members[member] == true {
                     try connection.execute(
                         statements.insertMember,
-                        [.text(id), .text(model), .text(field), .text(member)]
+                        [.text(id), .text(model), .text(field), .text(member.value)]
                     )
                 } else {
                     try connection.execute(
                         statements.deleteMember,
-                        [.text(model), .text(id), .text(field), .text(member)]
+                        [.text(model), .text(id), .text(field), .text(member.value)]
                     )
                 }
             }

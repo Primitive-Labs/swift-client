@@ -136,13 +136,16 @@ public final class OverlayDocument {
     /// holds as an explicit null is recorded as null, not left out — "the
     /// field was unset before this write" and "the overlay said nothing about
     /// it" are the two facts the adoption verdict is decided between.
-    public func priorValues(model: String, mutation: OverlayMutation) -> [String: JSONValue] {
+    ///
+    /// Keyed by bytes: the member keys of `"é"` and `"é"` are two overlay keys,
+    /// and one would overwrite the other under a `String` key (#3881).
+    public func priorValues(model: String, mutation: OverlayMutation) -> [ByteKey: JSONValue] {
         let map = self.map(for: model)
         return document.transactSync { transaction in
-            var prior: [String: JSONValue] = [:]
+            var prior: [ByteKey: JSONValue] = [:]
             for (key, _) in OverlayKeys.encode(mutation) {
                 guard map.containsKey(key, transaction: transaction) else { continue }
-                prior[key] = map.get(key: key, transaction: transaction) ?? .null
+                prior[ByteKey(key)] = map.get(key: key, transaction: transaction) ?? .null
             }
             return prior
         }

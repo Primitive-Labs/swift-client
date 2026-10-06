@@ -96,9 +96,11 @@ public struct ExecutePromptResult: Decodable, Sendable, Equatable {
     /// #3663 — the code naming the failure, when the failure has one.
     ///
     /// `"PROMPT_UPSTREAM_TIMEOUT"` when the provider itself ran out of time,
-    /// which is the one failure of the model call that carries a code. `nil`
-    /// on success and on every other provider failure, so `error` with no
-    /// `errorCode` still means "the call failed for some other reason".
+    /// and `"PROMPT_UPSTREAM_REJECTED"` when it refused the request as invalid
+    /// (`upstreamStatus` 400 — a setting the model does not support, with the
+    /// provider's message in `error`). `nil` on success and on every other
+    /// provider failure, so `error` with no `errorCode` still means "the call
+    /// failed for some other reason".
     ///
     /// Typed as a plain `String` rather than an enum so a code the platform
     /// adds later still decodes: the function path's envelope already carries

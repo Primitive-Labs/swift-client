@@ -23,7 +23,10 @@ import Yniffi
 /// Resolved constraints include both synthetic single-field (from
 /// `unique: true`) and the explicit compound constraints. Only compound
 /// go into `_meta_*._constraints`; both are enforced at runtime.
-final class UniqueConstraintEnforcementTests: XCTestCase {
+///
+/// Server-free (every case is an in-memory `YDocument`), so it is named into
+/// the `*HermeticTests` lane `swift test --filter HermeticTests` runs.
+final class UniqueConstraintEnforcementHermeticTests: XCTestCase {
 
     // MARK: - Single-field uniqueness
 
@@ -263,5 +266,75 @@ final class UniqueConstraintEnforcementTests: XCTestCase {
         // Both records omit "b" — compound key is null → no enforcement.
         XCTAssertNoThrow(try model.create(id: "r1", values: ["a": .string("x")]))
         XCTAssertNoThrow(try model.create(id: "r2", values: ["a": .string("x")]))
+    }
+
+    // MARK: - Cross-language compound keys (#3720)
+
+    /// values → key. The same rows, as literals, as
+    /// `tests/client/js-bao-unique-compound-key-3720.test.ts` asserts against
+    /// `JSON.stringify` and the shared `buildUniqueKey` the server uses. A row
+    /// that differs here is a pair the server and the JS client cannot see.
+    private static let compoundKeyFixtures: [([PrimitiveValue], String)] = [
+        ([.string("acme"), .string("billing")], #"["acme","billing"]"#),
+        ([.string("a|b"), .string("c")], #"["a|b","c"]"#),
+        ([.string("q\"uote"), .string("back\\slash")], #"["q\"uote","back\\slash"]"#),
+        ([.string("[x"), .string("y]")], #"["[x","y]"]"#),
+        ([.string("n\nl"), .string("t\tb")], #"["n\nl","t\tb"]"#),
+        ([.string("a\u{08}b"), .string("c\u{0C}d")], #"["a\bb","c\fd"]"#),
+        ([.string("\u{01}"), .string("é")], #"["\u0001","é"]"#),
+        ([.number(1), .boolean(true)], "[1,true]"),
+        ([.number(1.5), .string("x")], #"[1.5,"x"]"#),
+    ]
+
+    private static func fieldType(of value: PrimitiveValue) -> PrimitiveFieldType {
+        switch value {
+        case .number: return .number
+        case .boolean: return .boolean
+        default: return .string
+        }
+    }
+
+    func testCompoundKeyEscapesMatchJsonStringify() throws {
+        for (row, (values, expected)) in Self.compoundKeyFixtures.enumerated() {
+            let fields = ["a", "b"]
+            let byField = Dictionary(uniqueKeysWithValues: zip(fields, values))
+            XCTAssertEqual(UniqueIndex.buildKey(fields: fields, values: byField), expected,
+                           "row \(row): buildKey")
+
+            let schema = PrimitiveSchema(
+                name: "fixture_3720_\(row)",
+                fields: [
+                    "id": FieldDescriptor(type: .id),
+                    "a":  FieldDescriptor(type: Self.fieldType(of: values[0])),
+                    "b":  FieldDescriptor(type: Self.fieldType(of: values[1])),
+                ],
+                constraints: [
+                    "uq_ab": ConstraintDescriptor(name: "uq_ab", fields: fields)
+                ]
+            )
+            let doc = YDocument()
+            SchemaSync.clearCache()
+            let model = DynamicModel(doc: doc, schema: schema)
+            _ = try model.create(id: "r\(row)", values: byField)
+            let owner: String? = doc.transactSync { txn in
+                let m = txn.transactionGetMap(name: "_uniqueIdx_fixture_3720_\(row)_uq_ab")
+                return try? m?.get(tx: txn, key: expected)
+            }
+            XCTAssertEqual(owner, "\"r\(row)\"", "row \(row): the index entry DynamicModel wrote")
+        }
+    }
+
+    /// `jsonEncodeString` spells every control character as `JSON.stringify`
+    /// does, and its inverse still reads the older `\u0008` / `\u000c`
+    /// spelling it wrote before.
+    func testJsonEncodeStringControlCharacters() {
+        XCTAssertEqual(PrimitiveValue.jsonEncodeString("\u{08}"), #""\b""#)
+        XCTAssertEqual(PrimitiveValue.jsonEncodeString("\u{0C}"), #""\f""#)
+        XCTAssertEqual(PrimitiveValue.jsonEncodeString("\u{01}"), #""\u0001""#)
+        XCTAssertEqual(PrimitiveValue.jsonEncodeString("\u{1F}"), #""\u001f""#)
+        XCTAssertEqual(PrimitiveValue.jsonEncodeString("\n\r\t"), #""\n\r\t""#)
+        let all = String(String.UnicodeScalarView((0..<0x20).compactMap(Unicode.Scalar.init)))
+        XCTAssertEqual(PrimitiveValue.decodeJsonString(PrimitiveValue.jsonEncodeString(all)), all)
+        XCTAssertEqual(PrimitiveValue.decodeJsonString(#""\u0008\u000c""#), "\u{08}\u{0C}")
     }
 }

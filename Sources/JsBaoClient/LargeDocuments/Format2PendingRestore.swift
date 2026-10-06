@@ -226,7 +226,7 @@ public enum Format2PendingRestore {
         guard let mergedRow else { return .superseded }
 
         var fields: [String: JSONValue] = [:]
-        var stringSetDeltas: [String: [String: Bool]] = [:]
+        var stringSetDeltas: [String: [ByteKey: Bool]] = [:]
         var arbitrated = 0
         var survivors = 0
         var owed = 0
@@ -244,16 +244,16 @@ public enum Format2PendingRestore {
             if !carries(key, raw) { owed += 1 }
         }
         for (field, members) in mutation.stringSetDeltas.sorted(by: { $0.key < $1.key }) {
-            let held: [String]
+            let held: Set<ByteKey>
             if case .array(let values)? = mergedRow[field] {
-                held = values.compactMap { $0.stringValue }
+                held = Set(values.compactMap { $0.stringValue }.map { ByteKey($0) })
             } else {
                 held = []
             }
             for (member, present) in members.sorted(by: { $0.key < $1.key }) {
                 arbitrated += 1
                 let key = OverlayKeys.memberKey(
-                    recordId: mutation.id, field: field, member: member
+                    recordId: mutation.id, field: field, member: member.value
                 )
                 // An add survives while the member is in the row, a removal
                 // while it is not. Anything else is a later write.
@@ -296,7 +296,7 @@ public enum Format2PendingRestore {
     private static func classifyAgainstPriorOverlay(
         _ view: OverlayView,
         _ mutation: OverlayMutation,
-        _ prior: [String: JSONValue]
+        _ prior: [ByteKey: JSONValue]
     ) -> PendingRestoreVerdict {
         enum KeyVerdict { case carried, owed, lost }
 
@@ -311,7 +311,7 @@ public enum Format2PendingRestore {
                 return .owed
             }
             if sameOverlayValue(held, value) { return .carried }
-            guard let recorded = prior[key] else { return .lost }
+            guard let recorded = prior[ByteKey(key)] else { return .lost }
             return sameOverlayValue(held, recorded) ? .owed : .lost
         }
 
@@ -339,7 +339,7 @@ public enum Format2PendingRestore {
         }
 
         var fields: [String: JSONValue] = [:]
-        var stringSetDeltas: [String: [String: Bool]] = [:]
+        var stringSetDeltas: [String: [ByteKey: Bool]] = [:]
         var weighed = 0
         var survivors = 0
         var owed = 0
@@ -364,7 +364,7 @@ public enum Format2PendingRestore {
             for (member, present) in members.sorted(by: { $0.key < $1.key }) {
                 weighed += 1
                 let key = OverlayKeys.memberKey(
-                    recordId: mutation.id, field: field, member: member
+                    recordId: mutation.id, field: field, member: member.value
                 )
                 switch verdictFor(key, .bool(present)) {
                 case .lost:
@@ -402,7 +402,7 @@ public enum Format2PendingRestore {
         _ view: OverlayView,
         _ mutation: OverlayMutation,
         _ fields: [String: JSONValue],
-        _ stringSetDeltas: [String: [String: Bool]],
+        _ stringSetDeltas: [String: [ByteKey: Bool]],
         _ lost: [String]
     ) -> PendingRestoreVerdict {
         let sweeps = mutation.kind == .create

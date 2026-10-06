@@ -91,7 +91,10 @@ const {
   encodeFoldedState,
   readStateVector,
 } = require("js-bao/node");
-const { encodeSnapshotChunk } = require("js-bao/cloudflare/do");
+const {
+  encodeSnapshotChunk,
+  snapshotRowAsOverlayEntry,
+} = require("js-bao/cloudflare/do");
 
 async function readStdin() {
   const chunks = [];
@@ -147,7 +150,7 @@ function dumpStore(db, docId) {
     ),
     members: all(
       `SELECT _type, _record_id, field, value FROM ${tables.stringSetIndex} ` +
-        `ORDER BY _type, _record_id, field, rowid`
+        `ORDER BY _type, _record_id, field, value`
     ),
     pending: all(
       "SELECT doc_id, client_id, seq, model, record_id, op, fields, base_epoch, mutation, prior_overlay " +
@@ -287,6 +290,27 @@ async function handle(request) {
 
     case "fold-script":
       return runFoldScript(request.docId, request.steps);
+
+    // #3881 — snapshot rows folded the way the JS loader folds them: each row
+    // a `_replace` entry built by the shared conversion, projected into a
+    // fresh store. Rows travel as `_data` TEXT, so a member's exact bytes reach
+    // js-bao without passing through a JSON object key on the Swift side.
+    case "fold-snapshot-rows": {
+      const { db, sql } = openStore(request.docId);
+      const tables = format2TableNames(request.docId);
+      const stringSetFields = new Set(request.stringSetFields ?? []);
+      for (const row of request.rows) {
+        projectOverlayEntry(
+          sql,
+          request.model,
+          snapshotRowAsOverlayEntry(row.id, JSON.parse(row.data), stringSetFields),
+          tables
+        );
+      }
+      const dump = dumpStore(db, request.docId);
+      db.close();
+      return { records: dump.records, members: dump.members };
+    }
 
     case "write-overlay": {
       const doc = new Y.Doc();

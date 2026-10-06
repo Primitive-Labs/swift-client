@@ -219,7 +219,7 @@ final class Format2RecordStoreHermeticTests: XCTestCase {
     }
 
     /// E3 — a `_replace` that omits a stringset leaves no stale members;
-    /// with members it rebuilds in rowid order.
+    /// with members it rebuilds them, read back in canonical order (#3881).
     func testReplaceRebuildsAStringsetAndLeavesNoStaleMembers() async throws {
         let steps: [[String: Any]] = [
             [

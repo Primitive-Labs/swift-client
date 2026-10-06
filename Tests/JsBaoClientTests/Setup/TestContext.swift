@@ -179,7 +179,7 @@ final class TestContext: @unchecked Sendable {
 
     /// Sign in through the email-code path with the `+primitivetest` bypass
     /// (magic code `000000`) and return the provisioned user's id. The app
-    /// must have `otpEnabled` on and the address's base listed in
+    /// must have `emailSignInEnabled` on and the address's base listed in
     /// `testAccountBaseEmails` (both via `updateAppSettings(appId:settings:)`).
     ///
     /// Unlike `createTestUser`, which goes through admin add-by-email and gets
@@ -375,8 +375,8 @@ final class TestContext: @unchecked Sendable {
     // MARK: - App settings
 
     /// PATCH-style update of app-level settings via the admin API
-    /// (`PUT /admin/api/apps/{appId}` — e.g. `otpEnabled`,
-    /// `magicLinkEnabled`). Mirrors the JS tests' `adminHttpClient().put`.
+    /// (`PUT /admin/api/apps/{appId}` — e.g. `emailSignInEnabled`).
+    /// Mirrors the JS tests' `adminHttpClient().put`.
     func updateAppSettings(appId: String, settings: [String: Any]) async throws {
         _ = try await adminRequest(
             method: "PUT",

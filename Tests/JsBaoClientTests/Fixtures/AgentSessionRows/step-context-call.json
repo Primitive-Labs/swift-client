@@ -1,0 +1,33 @@
+{
+  "model": "PrimitiveStep",
+  "row": {
+    "id": "01K6STEP00000000000000003809",
+    "turnId": "turn_1",
+    "seq": 1,
+    "kind": "context_call",
+    "status": "failed",
+    "startedAt": "2026-10-02T12:00:00.000Z",
+    "endedAt": "2026-10-02T12:00:00.040Z",
+    "durationMs": 40,
+    "functionName": "advisor-snapshot",
+    "functionVersion": "cfg_ctx",
+    "errorCode": "AGENT_TURN_CONTEXT_FAILED",
+    "errorMessage": "The context function failed"
+  },
+  "expect": {
+    "kind": "context_call",
+    "status": "failed",
+    "functionName": "advisor-snapshot",
+    "durationMs": 40,
+    "historyMode": {
+      "$absent": true
+    },
+    "historySelection": {
+      "$absent": true
+    },
+    "providerDurationMs": {
+      "$absent": true
+    },
+    "errorCode": "AGENT_TURN_CONTEXT_FAILED"
+  }
+}

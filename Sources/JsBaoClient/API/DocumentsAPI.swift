@@ -577,6 +577,10 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     // MARK: - Access
 
+    /// How long `validateAccess` waits for a pending create to commit — the
+    /// JS client's `defaultAvailabilityWaitMs`.
+    static let pendingCreateWaitSeconds: TimeInterval = 30
+
     /// Validate the current user's access to a document. Also accepts or
     /// upgrades any pending invitation the caller has on the document.
     ///
@@ -590,10 +594,27 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// "anyone with the link" access. An app owner or admin may name anyone;
     /// a member may name only themselves. Passing nothing keeps the call
     /// exactly as it was, body and all.
+    ///
+    /// A document just made with `documents.create` exists only locally until
+    /// its create reaches the server. Both forms wait for that commit while
+    /// the client is online and then answer, so `create` followed at once by
+    /// `validateAccess` reports the creator as `.owner`. They throw
+    /// `JsBaoError` code `.pendingCreate` (`details["documentId"]` set)
+    /// instead of waiting when the network mode is `.offline`, when it
+    /// becomes `.offline` during the wait, or when the commit has not landed
+    /// within 30 seconds. A failed commit attempt does not end the wait: the
+    /// client retries it. A document the server does not hold, deleted or
+    /// never created, throws the server's 404 (`NOT_FOUND`).
     public func validateAccess(
         documentId: String,
         userId: String? = nil
     ) async throws -> DocumentAccessResult {
+        if let client, client.isPendingCreate(documentId) {
+            try await client.awaitPendingCreateCommit(
+                documentId: documentId,
+                timeout: Self.pendingCreateWaitSeconds
+            )
+        }
         guard let userId else {
             return try await transport.request(
                 method: .post,

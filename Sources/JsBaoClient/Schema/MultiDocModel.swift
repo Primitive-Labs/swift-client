@@ -669,6 +669,14 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     private var activeSubs: [UUID: ActiveSub] = [:]
     private let subscribeLock = NSLock()
 
+    /// How many `subscribe` registrations are live. Internal — lets a test
+    /// prove a failed open left no subscription behind (#3810).
+    var activeSubscriptionCount: Int {
+        subscribeLock.lock()
+        defer { subscribeLock.unlock() }
+        return activeSubs.count
+    }
+
     /// Register a callback that fires on any change in any connected
     /// doc's model. Works whether called before or after `connect`:
     /// already-connected members get the callback installed

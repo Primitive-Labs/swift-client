@@ -446,8 +446,9 @@ final class FunctionsAPIHermeticTests: XCTestCase {
     }
 
     /// The whole method set is JS's — invoke, start, getStatus, waitFor,
-    /// terminate — and nothing else. The client-apply trio stays on
-    /// `workflows`, where both clients keep it.
+    /// terminate, and the run listing's listRuns and listRunSteps (#4145) —
+    /// and nothing else. The client-apply trio stays on `workflows`, where
+    /// both clients keep it.
     func testTheFunctionsSubApiCarriesExactlyTheJsMethodSet() throws {
         let source = try ClientSourceText.code("API/FunctionsAPI.swift")
         let pattern = try NSRegularExpression(pattern: #"public func ([A-Za-z_][A-Za-z0-9_]*)"#)
@@ -456,8 +457,11 @@ final class FunctionsAPIHermeticTests: XCTestCase {
             guard let r = Range(match.range(at: 1), in: source) else { return nil }
             return String(source[r])
         })
-        XCTAssertEqual(names, ["invoke", "start", "getStatus", "waitFor", "terminate"])
-        for removed in ["claimApply", "releaseApply", "confirmApply", "runSync", "listRuns", "define"] {
+        XCTAssertEqual(
+            names,
+            ["invoke", "start", "getStatus", "waitFor", "terminate", "listRuns", "listRunSteps"]
+        )
+        for removed in ["claimApply", "releaseApply", "confirmApply", "runSync", "define"] {
             XCTAssertFalse(source.contains("func \(removed)"), "\(removed) does not belong on functions")
         }
     }

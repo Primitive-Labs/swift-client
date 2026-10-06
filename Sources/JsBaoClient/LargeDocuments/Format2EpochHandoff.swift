@@ -174,7 +174,7 @@ public enum Format2EpochHandoff {
             for (member, present) in members {
                 raw.append((
                     OverlayKeys.memberKey(
-                        recordId: entry.id, field: field, member: member
+                        recordId: entry.id, field: field, member: member.value
                     ),
                     .bool(present)
                 ))

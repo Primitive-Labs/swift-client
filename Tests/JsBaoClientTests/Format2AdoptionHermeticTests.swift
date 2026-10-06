@@ -74,7 +74,7 @@ final class Format2AdoptionHermeticTests: XCTestCase {
         op: PendingOp.Kind = .patch,
         fields: [String],
         mutation: OverlayMutation,
-        priorOverlay: [String: JSONValue]? = nil,
+        priorOverlay: [ByteKey: JSONValue]? = nil,
         baseEpoch: Int = 1,
         ts: Int = 0
     ) throws {
@@ -455,7 +455,7 @@ final class Format2AdoptionHermeticTests: XCTestCase {
                 kind: kind,
                 fields: ((encoded["fields"] as? [String: Any]) ?? [:]).mapValues(jsonValue),
                 stringSetDeltas: ((encoded["stringSetDeltas"] as? [String: [String: Bool]])
-                    ?? [:])
+                    ?? [:]).mapValues(byteKeyed)
             )
         }
         return PendingOp(
@@ -467,7 +467,9 @@ final class Format2AdoptionHermeticTests: XCTestCase {
             baseEpoch: raw["baseEpoch"] as? Int ?? 1,
             ts: raw["ts"] as? Int ?? 0,
             mutation: mutation,
-            priorOverlay: (raw["priorOverlay"] as? [String: Any])?.mapValues(jsonValue)
+            priorOverlay: (raw["priorOverlay"] as? [String: Any]).map { prior in
+                Dictionary(uniqueKeysWithValues: prior.map { (ByteKey($0.key), jsonValue($0.value)) })
+            }
         )
     }
 

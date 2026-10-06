@@ -12,7 +12,12 @@ import Foundation
 ///
 /// Storing the bytes rather than recomputing them: these keys are compared
 /// once per fold per key, on the declared hot path.
-public struct ByteKey: Hashable, Sendable, CustomStringConvertible {
+///
+/// Ordered by those bytes too, which is Unicode code point order — SQLite's
+/// `BINARY` collation, and the canonical order a string set is returned in
+/// (#3881).
+public struct ByteKey: Hashable, Comparable, Sendable, CustomStringConvertible,
+    ExpressibleByStringLiteral {
 
     /// The text itself, for the caller that has to hand it on.
     public let value: String
@@ -23,8 +28,16 @@ public struct ByteKey: Hashable, Sendable, CustomStringConvertible {
         self.bytes = Array(value.utf8)
     }
 
+    public init(stringLiteral value: String) {
+        self.init(value)
+    }
+
     public static func == (left: ByteKey, right: ByteKey) -> Bool {
         left.bytes == right.bytes
+    }
+
+    public static func < (left: ByteKey, right: ByteKey) -> Bool {
+        left.bytes.lexicographicallyPrecedes(right.bytes)
     }
 
     public func hash(into hasher: inout Hasher) { hasher.combine(bytes) }
@@ -193,7 +206,9 @@ public enum OverlayKeys {
             } else if parsed.marker == markerDeleted {
                 entry.deleted = (value == .bool(true))
             } else if let member = parsed.member, let field = parsed.field {
-                entry.stringSets[field, default: [:]][member] = (value == .bool(true))
+                // By bytes, as the record id is: `"é"` and `"é"` are two
+                // members on the server and in JS (#3881).
+                entry.stringSets[field, default: [:]][ByteKey(member)] = (value == .bool(true))
             } else if let field = parsed.field {
                 entry.fields[field] = value
             }
@@ -235,7 +250,7 @@ public enum OverlayKeys {
             let members = mutation.stringSetDeltas[field] ?? [:]
             for member in members.keys.sorted() {
                 entries.append((
-                    memberKey(recordId: mutation.id, field: field, member: member),
+                    memberKey(recordId: mutation.id, field: field, member: member.value),
                     .bool(members[member] ?? false)
                 ))
             }
@@ -250,8 +265,8 @@ public struct OverlayRecordEntry: Equatable, Sendable {
     /// Touched ordinary fields. A `.null` value is an explicit unset (RFC 7396).
     public var fields: [String: JSONValue]
     /// Touched stringset members per field: `member → true` add, `false`
-    /// tombstone.
-    public var stringSets: [String: [String: Bool]]
+    /// tombstone. Members are keyed by their bytes (#3881).
+    public var stringSets: [String: [ByteKey: Bool]]
     /// The create discarded the base row.
     public var replace: Bool
     /// The record is tombstoned.
@@ -260,7 +275,7 @@ public struct OverlayRecordEntry: Equatable, Sendable {
     public init(
         id: String,
         fields: [String: JSONValue] = [:],
-        stringSets: [String: [String: Bool]] = [:],
+        stringSets: [String: [ByteKey: Bool]] = [:],
         replace: Bool = false,
         deleted: Bool = false
     ) {
@@ -289,13 +304,14 @@ public struct OverlayMutation: Equatable, Sendable {
     /// Ordinary field values; `.null` is an explicit unset.
     public let fields: [String: JSONValue]
     /// Per-field stringset deltas: `member → true` add, `false` remove.
-    public let stringSetDeltas: [String: [String: Bool]]
+    /// Members are keyed by their bytes (#3881).
+    public let stringSetDeltas: [String: [ByteKey: Bool]]
 
     public init(
         id: String,
         kind: Kind,
         fields: [String: JSONValue] = [:],
-        stringSetDeltas: [String: [String: Bool]] = [:]
+        stringSetDeltas: [String: [ByteKey: Bool]] = [:]
     ) {
         self.id = id
         self.kind = kind

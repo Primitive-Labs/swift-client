@@ -127,6 +127,14 @@ public enum JsBaoErrorCode: String, Sendable {
     /// is closed under the app with its store intact. `details` carry
     /// `documentId`, `declared` and `actual`. The JS client's code, verbatim.
     case documentFormatMismatch = "DOCUMENT_FORMAT_MISMATCH"
+    /// An agent session view's `cancel()` found no turn to cancel: none was
+    /// named, the session row names none and `get` answers none. Nothing was
+    /// sent. The JS client's code, verbatim.
+    case agentSessionNoActiveTurn = "AGENT_SESSION_NO_ACTIVE_TURN"
+    /// Opening an agent session view found a model registered under a
+    /// platform model name with a different schema; nothing was registered or
+    /// opened. `details` carry `model`. The JS client's code, verbatim.
+    case agentSessionModelNameTaken = "AGENT_SESSION_MODEL_NAME_TAKEN"
 }
 
 /// Main error type for the JsBao client library

@@ -28,12 +28,10 @@ public final class AuthAPI: @unchecked Sendable {
     // optional only so an instance wired before the unified flow existed
     // still compiles (it throws when called unwired).
     private let _emailSignInRequest: ((_ email: String, _ redirectUri: String?) async throws -> Bool)?
-    private let _magicLinkRequest: (_ email: String, _ redirectUri: String) async throws -> Bool
     private let _magicLinkVerify: (_ token: String) async throws -> MagicLinkVerifyResult
     // Carries the optional #466 invite token through verify. When unwired,
     // `magicLinkVerify(token:inviteToken:)` falls back to the token-only path.
     private let _magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> MagicLinkVerifyResult)?
-    private let _otpRequest: (_ email: String) async throws -> Bool
     private let _otpVerify: (_ email: String, _ code: String) async throws -> OtpVerifyResult
     // Carries the optional #466 invite token through verify. When unwired,
     // `otpVerify` falls back to the email+code-only path.
@@ -89,10 +87,8 @@ public final class AuthAPI: @unchecked Sendable {
         getToken: @escaping () -> String?,
         isAuthenticated: @escaping () -> Bool,
         emailSignInRequest: ((_ email: String, _ redirectUri: String?) async throws -> Bool)? = nil,
-        magicLinkRequest: @escaping (_ email: String, _ redirectUri: String) async throws -> Bool,
         magicLinkVerify: @escaping (_ token: String) async throws -> MagicLinkVerifyResult,
         magicLinkVerifyWithInvite: ((_ token: String, _ inviteToken: String?) async throws -> MagicLinkVerifyResult)? = nil,
-        otpRequest: @escaping (_ email: String) async throws -> Bool,
         otpVerify: @escaping (_ email: String, _ code: String) async throws -> OtpVerifyResult,
         otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> OtpVerifyResult)? = nil,
         getAuthConfig: @escaping () async throws -> AuthConfigInfo,
@@ -119,10 +115,8 @@ public final class AuthAPI: @unchecked Sendable {
         self._getToken = getToken
         self._isAuthenticated = isAuthenticated
         self._emailSignInRequest = emailSignInRequest
-        self._magicLinkRequest = magicLinkRequest
         self._magicLinkVerify = magicLinkVerify
         self._magicLinkVerifyWithInvite = magicLinkVerifyWithInvite
-        self._otpRequest = otpRequest
         self._otpVerify = otpVerify
         self._otpVerifyWithInvite = otpVerifyWithInvite
         self._getAuthConfig = getAuthConfig
@@ -222,23 +216,6 @@ public final class AuthAPI: @unchecked Sendable {
 
     // MARK: - Magic link
 
-    /// - Warning: Deprecated by #2884 — `emailSignInRequest` is the one email
-    ///   entry point, and this endpoint is now an alias of it that sends the
-    ///   same email.
-    ///
-    /// Request a magic-link email. Mirrors JS
-    /// `auth.magicLinkRequest({ email, redirectUri })`. Returns the typed
-    /// `{ success }` result.
-    public func magicLinkRequest(_ params: MagicLinkRequestParams) async throws -> MagicLinkRequestResult {
-        let success = try await _magicLinkRequest(params.email, params.redirectUri)
-        return MagicLinkRequestResult(success: success)
-    }
-
-    /// Convenience overload taking the fields directly.
-    public func magicLinkRequest(email: String, redirectUri: String) async throws -> MagicLinkRequestResult {
-        try await magicLinkRequest(MagicLinkRequestParams(email: email, redirectUri: redirectUri))
-    }
-
     /// Verify a magic-link token, completing sign-in. On success the SDK has
     /// already applied the returned access token. Mirrors JS
     /// `auth.magicLinkVerify(token, { inviteToken })`.
@@ -256,13 +233,6 @@ public final class AuthAPI: @unchecked Sendable {
     }
 
     // MARK: - OTP
-
-    /// Request a one-time-passcode email. Mirrors JS
-    /// `auth.otpRequest({ email })`. Returns the typed `{ success }` result.
-    public func otpRequest(email: String) async throws -> OtpRequestResult {
-        let success = try await _otpRequest(email)
-        return OtpRequestResult(success: success)
-    }
 
     /// Verify an OTP code, completing sign-in. On success the SDK has already
     /// applied the returned access token. Mirrors JS
@@ -294,7 +264,7 @@ public final class AuthAPI: @unchecked Sendable {
     }
 
     /// Fetch the app-launch config subset (`appId`, `name`, `mode`,
-    /// `waitlistEnabled`, `googleAvailable`, `hasPasskey`, `magicLinkEnabled`).
+    /// `waitlistEnabled`, `googleAvailable`, `hasPasskey`, `emailSignInEnabled`).
     /// Mirrors JS `client.getAppConfig()` — the 7-field projection of the
     /// `/oauth-config` envelope used to decide what login UI to show before a
     /// session exists. Decodes the same `/oauth-config` payload as

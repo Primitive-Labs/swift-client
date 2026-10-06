@@ -186,7 +186,7 @@ final class AppleCallbackInterceptorHermeticTests: XCTestCase {
         AppleCallbackStubURLProtocol.refreshedToken = makeTestJwt(userId: "u1-fresh")
         let (_, http) = wire(token: makeTestJwt(userId: "u1-stale"))
 
-        let response = try await http.requestRaw(method: "GET", path: "/me")
+        let response = try await http.requestRaw(method: .get, path: "/me")
 
         XCTAssertEqual(response.status, 200)
         XCTAssertEqual(

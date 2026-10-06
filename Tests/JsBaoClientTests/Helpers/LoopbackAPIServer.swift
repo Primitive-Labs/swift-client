@@ -66,7 +66,7 @@ final class LoopbackAPIServer: @unchecked Sendable {
     private let lock = NSLock()
     private var connections: [NWConnection] = []
     private var _requests: [Request] = []
-    private let responder: @Sendable (Request) -> Response
+    private let responder: @Sendable (Request, @escaping @Sendable (Response) -> Void) -> Void
 
     /// Every request the server answered, in order.
     var requests: [Request] { lock.withLock { _requests } }
@@ -77,7 +77,20 @@ final class LoopbackAPIServer: @unchecked Sendable {
     private(set) var port: UInt16 = 0
 
     init(responder: @escaping @Sendable (Request) -> Response) throws {
-        self.responder = responder
+        self.responder = { request, respond in respond(responder(request)) }
+        listener = try NWListener(using: .tcp, on: .any)
+    }
+
+    /// A server whose responder answers when it chooses, by calling `respond`
+    /// — later, from any thread. A test holds one request's answer this way
+    /// while every other request is answered at once, which fixes the order
+    /// "request sent, something else happens, answer arrives" (#4150).
+    init(
+        deferredResponder: @escaping @Sendable (
+            Request, @escaping @Sendable (Response) -> Void
+        ) -> Void
+    ) throws {
+        self.responder = deferredResponder
         listener = try NWListener(using: .tcp, on: .any)
     }
 
@@ -138,19 +151,24 @@ final class LoopbackAPIServer: @unchecked Sendable {
             }
             self.lock.withLock { self._requests.append(request) }
 
-            let response = self.responder(request)
-            let body = Data(response.body.utf8)
-            var head = "HTTP/1.1 \(response.status) \(Self.reason(response.status))\r\n"
-            head += "Content-Type: application/json\r\n"
-            head += "Content-Length: \(body.count)\r\n"
-            head += "Connection: close\r\n\r\n"
-
-            var out = Data(head.utf8)
-            out.append(body)
-            connection.send(content: out, completion: .contentProcessed { _ in
-                connection.cancel()
-            })
+            self.responder(request) { response in
+                Self.send(response, on: connection)
+            }
         }
+    }
+
+    private static func send(_ response: Response, on connection: NWConnection) {
+        let body = Data(response.body.utf8)
+        var head = "HTTP/1.1 \(response.status) \(reason(response.status))\r\n"
+        head += "Content-Type: application/json\r\n"
+        head += "Content-Length: \(body.count)\r\n"
+        head += "Connection: close\r\n\r\n"
+
+        var out = Data(head.utf8)
+        out.append(body)
+        connection.send(content: out, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 
     /// `GET /documents/abc HTTP/1.1` → `Request(method: "GET", path: "/documents/abc")`,

@@ -20,6 +20,154 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### A large document's string sets are read sorted, and keep every spelling (#3881)
+
+A `stringset` field is a set, and a large document now returns its values in
+one order: sorted by Unicode code point (`"Z"` before `"a"`), each value once.
+The folded record and `members(model:recordId:field:)` answer that order,
+which is the order the server and the JS client return. Two values Swift
+`String` calls equal but that are spelled with different code points (`"é"`
+as one code point, or as `e` plus a combining accent) stay two values through
+an arriving update, a snapshot load and the fold, as they are everywhere else;
+removing one leaves the other. A local store written before this release reads
+sorted without being rewritten. `OverlayRecordEntry.stringSets` and
+`OverlayMutation.stringSetDeltas` key members by `ByteKey`, which now orders
+by bytes and can be written as a string literal.
+
+### `client.agents.sessions`: agent sessions from Swift (#3810)
+
+The Swift client carries the agent sessions surface the JS client has, one
+operation for one: `list`, `get`, `rename`, `delete`, `addMember`,
+`removeMember`, `send` (with file blobs and the turn-context keys `context`,
+`timezone` and `locale`), `answer`, `cancel`, `recordEvent`, and `open`, which
+answers a live `AgentSessionView`:
+
+```swift
+let view = try await client.agents.sessions.open(sessionId: sessionId)
+let stop = view.onChange { render(view.messages) }
+try await view.send(text: "Plan my week")
+```
+
+A refusal throws `HttpError` with the server's code on `serverCode`
+(`AGENT_SESSION_NOT_FOUND`, `AGENT_SESSION_PARTICIPANT_ONLY`, …). Two
+client-side codes join `JsBaoErrorCode`: `.agentSessionNoActiveTurn` and
+`.agentSessionModelNameTaken`. Read a part through its typed `content`; the AI
+SDK `uiMessages()` adapter is the JS client's only.
+
+### `me.update` accepts only `http:` and `https:` avatar URLs (#4156)
+
+`client.me.update(params:)` now throws a 400 when the avatar URL is not an
+`http:` or `https:` URL, with the message `avatarUrl must be an http or https
+URL`. A `javascript:` or `data:` URL used to be stored; it is refused and
+nothing is written. `avatarUrl: .clear` still removes the avatar, and an
+uploaded avatar (`uploadAvatar(imageData:contentType:)`) is unaffected. The
+admin and server-function profile writes apply the same rule.
+
+### Breaking: `validateAccess` no longer answers `DOCUMENT_DELETED` (#4159)
+
+`documents.validateAccess(documentId:userId:)` on a document the server does
+not hold — one that was deleted, one that never existed, or one in another
+app — now throws an `HttpError` with status 404 and `serverCode` `NOT_FOUND`,
+the answer every other document route gives. The old `DOCUMENT_DELETED` code
+is gone; an app that matched on it should match on `NOT_FOUND` (or on status
+404).
+
+`validateAccess` on a document just made with `documents.create`, whose
+create has not reached the server yet, no longer reports it missing. Online,
+the call waits for the commit and then answers, so the creator gets
+`hasAccess == true` and `permission == .owner`. Offline, when the client goes
+offline during the wait, or when the commit has not landed within 30 seconds,
+it throws `JsBaoError` with code `.pendingCreate` and
+`details["documentId"]`.
+
+A create committed over HTTP now emits `PendingCreateCommittedEvent` even when
+the document is not open, as the JS client does; before, only the WebSocket
+confirmation emitted it.
+
+### Fixed: an open that waits on the network always settles inside `availabilityWait`, and `setLogLevel` traces it (#4191)
+
+An `openDocument` that has to wait for the server (no local copy, or
+`waitForLoad: .network`) now resolves or throws `.networkTimeout` within
+`availabilityWait` of starting that wait, whatever is still in flight. The
+budget used to start only once the open's first `syncStep1` send returned, so
+an open whose send was held up neither resolved nor threw; and a
+`syncComplete` that arrived while that send was in flight was missed, leaving
+the open to wait out its whole budget for a document that had already synced.
+
+`client.setLogLevel(_:)` now changes every component logger, not only the
+client's root one, so a runtime `setLogLevel(.debug)` reaches the document,
+HTTP and documents-API lines it used to leave silent. With debug on, an open
+logs an `[open]` trace: its start, the local open (origin, local data, whether
+it waits), the network wait and its budget, each `syncStep2` download (start,
+end, byte count) and apply, and the event that resolved or failed it. A large
+document adds its handshake plan and each fold (`[format2] folded`). The
+`.networkTimeout` warning now says how far the handshake got. The
+`EventEmitter` log category is now `JsBaoClient:EventEmitter`.
+
+### List a user's function runs and a run's steps from `client.functions` (#4145)
+
+`client.functions.listRuns(options:)` answers one page of the function runs the
+signed-in user started, as `FunctionRunPage` (`items: [FunctionRunInfo]`,
+`hasMore`, `nextCursor`, `scanned`). `FunctionRunListOptions` filters by
+`functionKey`, `contextDocId` and `status` (they combine) and pages with
+`limit`, `cursor` and `forward`:
+
+```swift
+let page = try await client.functions.listRuns(
+    options: FunctionRunListOptions(contextDocId: documentId, status: "running")
+)
+```
+
+`client.functions.listRunSteps(runId:)` answers the run's recorded steps,
+oldest first, as `FunctionRunSteps` (`items: [FunctionStepRun]`). A run id that
+does not exist or that another user started throws `.notFound`; an empty one
+throws `.invalidArgument`.
+
+Both read the new `GET functions/runs` routes and reference no workflow type,
+so an app can move off the deprecated `workflows.listRuns` /
+`workflows.listStepRuns` now. An item the client cannot decode is dropped
+rather than failing the page.
+
+### Breaking: the email sign-in request aliases are removed (#3993)
+
+Email sign-in starts with one call, `auth.emailSignInRequest(email:redirectUri:)`
+(or `emailSignInRequest(_: EmailSignInRequestParams)`), which returns
+`EmailSignInRequestResult`. It sends one email carrying a 6-digit code and,
+when the redirect target is on the app's allow-list, a sign-in link; finish
+with `otpVerify` or `magicLinkVerify` as before.
+
+- Removed: `auth.magicLinkRequest`, `auth.otpRequest`, `client.magicLinkRequest`,
+  `client.otpRequest`, `MagicLinkRequestParams`, `MagicLinkRequestResult` and
+  `OtpRequestResult`. Call `auth.emailSignInRequest(email:redirectUri:)`, with
+  a `redirectUri` for an email that carries a link and without one for a
+  code-only email.
+- Removed: `AuthConfigInfo.magicLinkEnabled` and `AuthConfigInfo.otpEnabled`.
+  Read `AuthConfigInfo.emailSignInEnabled`, which now decodes from its own key
+  alone (absent reads `false`).
+- Renamed: `AppConfigInfo.magicLinkEnabled` is `AppConfigInfo.emailSignInEnabled`,
+  including the memberwise initializer's parameter.
+- Removed: the `magicLinkRequest:` and `otpRequest:` parameters of
+  `AuthAPI.init`. Wire `emailSignInRequest:` instead.
+
+The server no longer serves `POST /auth/magic-link/request` or
+`POST /auth/otp/request`, so an older client calling either method gets a 404.
+
+### `HttpClient`'s untyped `request` / `requestRaw` are removed (#4005)
+
+`HttpClient.request(method: String, path:, data: Any?) -> Any?` and
+`requestRaw(method: String, path:, data: Any?)` were the last `Any` methods on
+the public `HttpClient` class, left over when #2367 removed the client-level
+untyped entry points. No app could call them: `HttpClientConfig`'s initializer
+is internal, so an `HttpClient` exists only inside `JsBaoClient`. Document
+metadata sync and the offline-create commit now read the server's answer
+through the typed `Transport` helpers.
+
+One visible difference: a 2xx answer to `syncMetadata` or to a pending-create
+commit whose body is not JSON used to be ignored silently. It now fails the
+call with an `HttpError` (decoding failure), as it does in the JS client. A
+single-document sync that fails this way keeps the local row; only a 404 or
+403 evicts.
+
 ### Breaking: the database CEL context is removed (#3991)
 
 The per-database `metadata`/`celContext` dict is gone. `DatabaseInfo` no
@@ -50,6 +198,20 @@ uploader-scoped access). The server refuses a body that still carries
 `accessPolicy` with 400 `RETIRED_REQUEST_KEY`. `BlobBucketInfo` now uses
 synthesized `Decodable`, so a response from an older server that still
 carries the key still decodes.
+
+### A stalled task run ends with `FUNCTION_STALLED`, and its slice shows its last progress (#3766)
+
+The platform now ends a task run whose engine reports it running but which has
+shown no progress for 30 minutes past its open step's own timeout and next
+retry delay. The run reads `failed` with error code `FUNCTION_STALLED`. A
+sleep, a wait, a retry delay and a long step within its own `timeout` never
+count.
+
+`FunctionRunSlice` gains four optional properties, `nil` when unknown:
+`lastProgressAt`, the newest instant the platform saw the run do anything;
+`openStep` and `openStepStartedAt`, the step it is inside; and `parkedAt`, when
+it began waiting. The memberwise initializer takes them as trailing defaulted
+parameters, so existing calls compile unchanged.
 
 ### Breaking: `AnalyticsEventInput.user_created_at_epoch_s` is removed (#4003)
 

@@ -1957,11 +1957,22 @@ public final class DocumentManager: @unchecked Sendable {
     /// authoritative listing assembled over several round trips avoids
     /// deleting a document that entered — or was re-confirmed in — the cache
     /// while the listing was being fetched.
+    ///
+    /// `sessionEnded` is the caller's fence for an answer fetched for one
+    /// signed-in user (#4150): the merge suspends on every row's persist, so a
+    /// logout and the next sign-in can land mid-listing. It is asked in the
+    /// critical section of every row write and every eviction claim — the
+    /// session ends before the next user's state is reset, so a write that
+    /// sees it still open is one that reset will clear — and once it answers
+    /// `true` nothing more is written, evicted or announced. Each row persists
+    /// under the user it was written for, not whoever is signed in by the time
+    /// the write reaches storage.
     public func handleServerDocuments(
         _ documents: [[String: Any]],
         authoritative: Bool = false,
         retainIds: Set<String> = [],
-        evictOnly: [EvictionCandidate]? = nil
+        evictOnly: [EvictionCandidate]? = nil,
+        sessionEnded: () -> Bool = { false }
     ) async {
         var seenIds: Set<String> = []
         let nowIso = ISO8601DateFormatter().string(from: Date())
@@ -1995,18 +2006,23 @@ public final class DocumentManager: @unchecked Sendable {
                 entry.permissionCachedAt = nowIso
             }
 
-            setMetadata(documentId, entry: entry)
-            // The doc is present again; a prior delete no longer suppresses a
-            // future one.
-            lock.withLock { _ = deletedMetadataIds.remove(documentId) }
-
-            if let permStr = docData["permission"] as? String,
-               let perm = DocumentPermission(rawValue: permStr) {
-                lock.withLock { docPermissions[documentId] = perm }
+            let perm = (docData["permission"] as? String).flatMap(DocumentPermission.init(rawValue:))
+            let owner: String? = lock.withLock {
+                if sessionEnded() { return nil }
+                metadataIndex[documentId] = entry
+                noteMetadataTouchLocked(documentId)
+                // The doc is present again; a prior delete no longer suppresses
+                // a future one.
+                deletedMetadataIds.remove(documentId)
+                if let perm { docPermissions[documentId] = perm }
+                return userId
             }
+            guard let owner else { return }
 
             // Persist
-            _ = try? await putMetadataTracked(entry)
+            _ = try? await putMetadataTracked(entry, userId: owner)
+            if let hook = onServerDocumentPersistedForTest { await hook(documentId) }
+            if sessionEnded() { return }
 
             // Per-doc typed event, mirroring JS `handleServerDocuments`
             // (`src/client/internal/documentManager.ts`): action "updated",
@@ -2021,7 +2037,7 @@ public final class DocumentManager: @unchecked Sendable {
             ))
         }
 
-        guard authoritative else { return }
+        guard authoritative, !sessionEnded() else { return }
 
         // The stamps the candidates were captured with, re-checked at the
         // moment each document is evicted rather than only when the set was
@@ -2037,8 +2053,10 @@ public final class DocumentManager: @unchecked Sendable {
                 EvictionCandidate(documentId: documentId, metadataTouch: $0[documentId] ?? nil)
             }
             let evicted = await evictLocalData(
-                documentId: documentId, ifUnconfirmedSince: guardCandidate
+                documentId: documentId, ifUnconfirmedSince: guardCandidate,
+                sessionEnded: sessionEnded
             )
+            if sessionEnded() { return }
             // The server confirmed it in the meantime; nothing was deleted and
             // nothing may be announced as deleted.
             guard evicted else { continue }
@@ -2074,10 +2092,12 @@ public final class DocumentManager: @unchecked Sendable {
     ///
     /// `ifUnconfirmedSince` carries the stamp the document had when the caller
     /// decided to verify it, so a confirmation that landed while the request
-    /// was in flight abandons the eviction (see `evictLocalData`).
+    /// was in flight abandons the eviction (see `evictLocalData`), and
+    /// `sessionEnded` is the same fence `handleServerDocuments` takes.
     public func handleServerDocumentAbsent(
         _ documentId: String,
-        ifUnconfirmedSince candidate: EvictionCandidate? = nil
+        ifUnconfirmedSince candidate: EvictionCandidate? = nil,
+        sessionEnded: () -> Bool = { false }
     ) async {
         let exempt = lock.withLock {
             pendingCreates.contains(documentId)
@@ -2089,8 +2109,10 @@ public final class DocumentManager: @unchecked Sendable {
 
         let hadMetadata = getLocalMetadata(documentId) != nil
         let evicted = await evictLocalData(
-            documentId: documentId, ifUnconfirmedSince: candidate
+            documentId: documentId, ifUnconfirmedSince: candidate,
+            sessionEnded: sessionEnded
         )
+        if sessionEnded() { return }
         // A cached row that survived the eviction is one the server confirmed
         // in the meantime: nothing was deleted, so nothing may be announced as
         // deleted.
@@ -2645,6 +2667,11 @@ public final class DocumentManager: @unchecked Sendable {
             if let metaToPersist {
                 _ = try? await putMetadataTracked(metaToPersist)
             }
+            // Every settled commit signals, as in js-bao's
+            // `commitOfflineCreate`; before #4159 only the WebSocket frame
+            // did, so a create committed here with the document closed was
+            // never heard by anything waiting on it.
+            emitter?.emit(PendingCreateCommittedEvent(documentId: documentId))
             applyPostCommitPolicy(documentId)
 
             return ["created": true]
@@ -2663,6 +2690,7 @@ public final class DocumentManager: @unchecked Sendable {
                 if let metaToPersist {
                     _ = try? await putMetadataTracked(metaToPersist)
                 }
+                emitter?.emit(PendingCreateCommittedEvent(documentId: documentId))
                 applyPostCommitPolicy(documentId)
                 return ["linked": true]
             }
@@ -2992,24 +3020,32 @@ public final class DocumentManager: @unchecked Sendable {
     /// between the decision and this call abandons the eviction rather than
     /// deleting what the server just confirmed. Reports whether it evicted, so
     /// the caller knows not to announce a deletion that did not happen.
+    ///
+    /// `sessionEnded` is asked in that same critical section: a decision made
+    /// for a user who has since signed out is not applied to whoever is
+    /// signed in now (#4150). The persisted row is deleted from the store of
+    /// the user the claim was made for.
     @discardableResult
     func evictLocalData(
         documentId: String,
-        ifUnconfirmedSince candidate: EvictionCandidate?
+        ifUnconfirmedSince candidate: EvictionCandidate?,
+        sessionEnded: () -> Bool = { false }
     ) async -> Bool {
         // Asked twice: here so a stale eviction has no side effects at all, and
         // again below in the critical section that removes the row, which is
         // what makes the answer binding.
+        if sessionEnded() { return false }
         if let candidate,
            lock.withLock({ metadataTouches[documentId] != candidate.metadataTouch }) {
             return false
         }
         cancelPendingPersist(documentId: documentId)
-        let claim: (evicting: Bool, persistence: YjsSQLitePersistence?) = lock.withLock {
+        let claim: (evicting: Bool, persistence: YjsSQLitePersistence?, owner: String) = lock.withLock {
+            if sessionEnded() { return (false, nil, userId) }
             if let candidate, metadataTouches[documentId] != candidate.metadataTouch {
                 // The stamp moved: the server confirmed this document after it
                 // became a candidate, so the caller's decision is stale.
-                return (false, nil)
+                return (false, nil, userId)
             }
             metadataIndex.removeValue(forKey: documentId)
             metadataTouches.removeValue(forKey: documentId)
@@ -3031,7 +3067,7 @@ public final class DocumentManager: @unchecked Sendable {
             if openDocs[documentId] != nil {
                 persistenceSuspended.insert(documentId)
             }
-            return (true, docPersistence.removeValue(forKey: documentId))
+            return (true, docPersistence.removeValue(forKey: documentId), userId)
         }
         guard claim.evicting else { return false }
 
@@ -3057,7 +3093,7 @@ public final class DocumentManager: @unchecked Sendable {
             }
         }
 
-        try? await offlineStore?.deleteMetadata(appId: appId, userId: userId, documentId: documentId)
+        try? await offlineStore?.deleteMetadata(appId: appId, userId: claim.owner, documentId: documentId)
         // #3436, decision 3436-SO-06 — the Yjs snapshot and the metadata row
         // are not all a large document keeps: its records, its member index,
         // its epoch mark, its projected query rows and the writes the server
@@ -3637,11 +3673,17 @@ public final class DocumentManager: @unchecked Sendable {
     /// Every metadata write the manager makes goes through here, and the same
     /// enqueue-or-retry latch the skipped persist uses decides what happens to
     /// the ones storage could not take (#3200).
+    ///
+    /// `owner` pins the write to the user the row was written for; without it
+    /// the row goes to whoever is signed in when the write reaches storage.
     @discardableResult
-    private func putMetadataTracked(_ record: LocalMetadataEntry) async throws -> Bool {
+    private func putMetadataTracked(
+        _ record: LocalMetadataEntry,
+        userId owner: String? = nil
+    ) async throws -> Bool {
         guard let offlineStore else { return false }
         let wrote = try await offlineStore.putMetadataReporting(
-            appId: appId, userId: userId, record: record
+            appId: appId, userId: owner ?? userId, record: record
         )
         if wrote { return true }
 
@@ -3768,6 +3810,11 @@ public final class DocumentManager: @unchecked Sendable {
     /// makes testable is the row's fate when it is deleted in that gap.
     /// Internal; never set in production code.
     var onMetadataProviderMissingForTest: (@Sendable () async -> Void)?
+
+    /// Test seam awaited inside `handleServerDocuments` after each row's
+    /// persist, so a test can hold a merge mid-listing across a logout and the
+    /// next sign-in (#4150, finding 4150-SO-001). Never set in production code.
+    var onServerDocumentPersistedForTest: (@Sendable (String) async -> Void)?
 
     /// Drop the retry state a logout leaves behind (#2874). JS parity with
     /// `resetUserScopedState` (`documentManager.ts`), run on EVERY logout:

@@ -13,9 +13,10 @@ import Foundation
 ///   (`asJSONRows` / `asAnyRows`, which dropped a bad row silently) is gone;
 ///   the one remaining conversion is at the untyped entry point below, and it
 ///   logs what it drops.
-/// * **Everything here is async.** The synchronous public surface that has to
-///   survive the deprecation window lives on `JsBaoClient` and `AnalyticsAPI`,
-///   which stay classes — see the Fork 1 Option C note on those types.
+/// * **Everything here is async.** The public analytics surface —
+///   `client.analytics` (`AnalyticsAPI`) and the `…Async` members on
+///   `JsBaoClient` — awaits into this actor. The synchronous forms that bridged
+///   the conversion were removed in #2367.
 public actor AnalyticsQueue {
     public static let unauthenticatedUser = "UNAUTHENTICATED"
 
@@ -129,9 +130,10 @@ public actor AnalyticsQueue {
     /// The instant travels as a `Date` rather than a formatted string because
     /// `ISO8601DateFormatter` is the single most expensive step per event, and
     /// a rate-limited event never needs it — the queue formats after it has
-    /// decided to keep the event. Carrying it at all is what lets a caller on
-    /// the deprecated synchronous surface get the time it *logged* the event
-    /// rather than the time the enqueue task happened to run.
+    /// decided to keep the event. Carrying it at all is what lets a caller that
+    /// prepares an event off the actor (`prepared(_:)`, which the client's
+    /// `logAnalyticsEventAsync` uses) record the time it *logged* the event
+    /// rather than the time the actor got to it.
     public struct PreparedEvent: Sendable {
         var row: [String: JSONValue]
         var occurredAt: Date
@@ -223,9 +225,10 @@ public actor AnalyticsQueue {
     /// socket — or, on a send failure, until the events are re-buffered and
     /// persisted.
     ///
-    /// This is the behavior the deprecated synchronous `flush()` could never
-    /// offer: that one returns as soon as the send is *scheduled*, so a caller
-    /// that flushes and then tears the client down can lose the batch.
+    /// This is what the fire-and-forget `flush()` above cannot offer: it
+    /// returns as soon as the send is *scheduled*, so a caller that flushes and
+    /// then tears the client down can lose the batch. The public `flushAsync()`
+    /// and `flushAnalyticsAsync()` come through here.
     public func flushAndWait() async {
         guard let batch = takeBatch() else { return }
         let task = Task { await self.deliver(batch) }

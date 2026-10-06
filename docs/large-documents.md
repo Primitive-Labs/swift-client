@@ -313,7 +313,7 @@ What did not simply apply reaches the app as
 replayed cleanly — the event carries notices or it is not sent:
 
 ```swift
-let subscription = client.on(DocumentOfflineWritesResolvedEvent.self) { event in
+let subscription = client.observeOnMainActor(DocumentOfflineWritesResolvedEvent.self) { event in
     for notice in event.notices {
         print(notice.model, notice.recordId, notice.field ?? "-",
               notice.outcome.rawValue, notice.reason.rawValue)

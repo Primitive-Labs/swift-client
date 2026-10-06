@@ -445,18 +445,6 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
         }
     }
 
-    /// The twins are deliberately *not* same-name `async` overloads: Swift
-    /// prefers the `async` overload in an asynchronous context, so a same-name
-    /// twin makes every existing un-`await`ed call a compile error — the source
-    /// break the window exists to avoid. Pin the reasoning next to the code.
-    func testTheTwinNamingRationaleIsRecorded() throws {
-        let source = try Self.clientSource("API/AnalyticsAPI.swift")
-        XCTAssertTrue(
-            source.contains("prefers an `async` overload"),
-            "the reason the twins carry a distinct name must stay written down"
-        )
-    }
-
     // MARK: - Behavior 8 — the TSan baseline shrank
 
     /// The `AnalyticsQueue` / `flushTimer` entries were type-level, so they

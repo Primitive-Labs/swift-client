@@ -223,7 +223,7 @@ final class AuthUnauthenticatedEndpointsTests: XCTestCase {
         )
         let auth = wire(token: expiring)
 
-        _ = try await auth.magicLinkRequest(
+        _ = try await auth.emailSignInRequest(
             email: "a@b.test",
             redirectUri: "http://app.local/callback"
         )
@@ -244,7 +244,7 @@ final class AuthUnauthenticatedEndpointsTests: XCTestCase {
             protocolClass: AuthEndpointCaptureURLProtocol.self
         )
 
-        let response = try await http.requestRaw(method: "GET", path: "/me")
+        let response = try await http.requestRaw(method: .get, path: "/me")
 
         XCTAssertEqual(response.status, 200)
         XCTAssertEqual(
@@ -377,9 +377,8 @@ final class AuthEndpointCaptureURLProtocol: URLProtocol {
 
     private static func isScriptedAuthPath(_ path: String) -> Bool {
         [
-            "/auth/magic-link/request",
+            "/auth/email/request",
             "/auth/magic-link/verify",
-            "/auth/otp/request",
             "/auth/otp/verify",
             "/passkey/auth/start",
             "/passkey/auth/finish",

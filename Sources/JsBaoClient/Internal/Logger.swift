@@ -7,7 +7,10 @@ import OSLog
 /// configure logging through the public `LogLevel` (`Types/LogLevel.swift`)
 /// and never construct or call a `Logger` themselves.
 final class Logger: @unchecked Sendable {
-    private var level: LogLevel
+    /// This logger's own level, or `nil` for a scoped logger that follows the
+    /// logger it was scoped from. Guarded by `lock`.
+    private var level: LogLevel?
+    private let parent: Logger?
     private let scope: String
     private let lock = NSLock()
 
@@ -19,11 +22,24 @@ final class Logger: @unchecked Sendable {
 
     init(level: LogLevel, scope: String = "") {
         self.level = level
+        self.parent = nil
         self.scope = scope
     }
 
+    private init(parent: Logger, scope: String) {
+        self.level = nil
+        self.parent = parent
+        self.scope = scope
+    }
+
+    /// The level in force: this logger's own, or the one it follows.
+    var effectiveLevel: LogLevel {
+        if let own = lock.withLock({ level }) { return own }
+        return parent?.effectiveLevel ?? .none
+    }
+
     func shouldLog(level: LogLevel) -> Bool {
-        level >= self.level
+        level >= effectiveLevel
     }
 
     func verbose(_ args: Any...) {
@@ -52,6 +68,11 @@ final class Logger: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// A logger for one component, tagged with `childScope`.
+    ///
+    /// It follows this logger's level rather than copying it, so a runtime
+    /// `JsBaoClient.setLogLevel(_:)` reaches every component — `docMgr`,
+    /// `http`, `documents` and the rest — and not only the root.
     func forScope(scope childScope: String) -> Logger {
         let newScope: String
         if self.scope.isEmpty {
@@ -59,7 +80,7 @@ final class Logger: @unchecked Sendable {
         } else {
             newScope = "\(self.scope):\(childScope)"
         }
-        return Logger(level: self.level, scope: newScope)
+        return Logger(parent: self, scope: newScope)
     }
 
     private func log(level: LogLevel, args: [Any]) {
@@ -71,6 +92,8 @@ final class Logger: @unchecked Sendable {
 
         let output = "[\(timestamp)]\(scopeTag) \(message)"
 
+        Logger.lineForTest?(level, scope, message)
+
         lock.lock()
         print(output)
         lock.unlock()
@@ -81,6 +104,15 @@ final class Logger: @unchecked Sendable {
         Logger.osLog(scope: scope, level: level, message: message)
         #endif
     }
+
+    /// Test seam: every line that passed its logger's level check, with the
+    /// level, the scope and the message. Never set in production code.
+    static var lineForTest: (@Sendable (LogLevel, String, String) -> Void)? {
+        get { testSinkLock.withLock { _lineForTest } }
+        set { testSinkLock.withLock { _lineForTest = newValue } }
+    }
+    private static let testSinkLock = NSLock()
+    nonisolated(unsafe) private static var _lineForTest: (@Sendable (LogLevel, String, String) -> Void)?
 
     #if canImport(OSLog)
     private static let osLoggerLock = NSLock()

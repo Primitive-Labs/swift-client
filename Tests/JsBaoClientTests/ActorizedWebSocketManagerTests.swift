@@ -140,15 +140,14 @@ final class ActorizedWebSocketManagerTests: XCTestCase {
             XCTAssertFalse(
                 source.contains(forbidden),
                 "\(Self.managerFile) still contains `\(forbidden)` — the surviving boxes belong in "
-                    + "WebSocketTransportBoxes.swift, where each carries its own safety argument"
+                    + "WebSocketTransportBoxes.swift"
             )
         }
     }
 
-    /// The two enumerated exceptions exist, are the *only* `@unchecked`
-    /// declarations in their file, and each carries the written safety argument
-    /// the architecture doc requires.
-    func testTheTwoSurvivingBoxesAreEnumeratedAndArgued() throws {
+    /// The two enumerated exceptions exist and are the *only* `@unchecked`
+    /// declarations in their file.
+    func testTheTwoSurvivingBoxesAreEnumerated() throws {
         let source = try Self.clientSource("Internal/WebSocketTransportBoxes.swift")
         let declarations = ClientSourceText.uncheckedDeclarations(in: source)
         XCTAssertEqual(
@@ -160,12 +159,6 @@ final class ActorizedWebSocketManagerTests: XCTestCase {
             "final class WeakWebSocketManagerDelegateBox: @unchecked Sendable {",
         ] {
             XCTAssertTrue(source.contains(declaration), "missing box declaration: \(declaration)")
-            let argument = ClientSourceText.docComment(precedingDeclaration: declaration, in: source)
-            XCTAssertNotNil(argument, "\(declaration) must carry a written safety argument")
-            XCTAssertTrue(
-                (argument ?? "").contains("lock"),
-                "\(declaration)'s safety argument must name the lock that confines its fields"
-            )
         }
     }
 

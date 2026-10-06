@@ -871,9 +871,9 @@ public final class CacheFacade: @unchecked Sendable {
         // is already a `JSONValue` on the typed transport, which is also the
         // cache's value type — the `T` cast happens once, at the end.
         // An empty 2xx body still yields `nil` (`requestOptional`).
-        // GET/HEAD carry no body — the legacy `encodeLegacyBody` path
-        // dropped it too, so a `fetchHttp(method: "GET", body:)` still
-        // sends a bodyless GET.
+        // GET/HEAD carry no body, as `HttpClient.buildURLRequest` drops one
+        // on those verbs anyway, so a `fetchHttp(method: "GET", body:)`
+        // still sends a bodyless GET.
         let encodedBody: JSONValue? = verb.allowsBody
             ? try body.map { try JSONCoding.decode(JSONValue.self, from: $0) }
             : nil

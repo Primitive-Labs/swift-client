@@ -510,6 +510,9 @@ public final class MeAPI: @unchecked Sendable {
             defer { self.refreshLock.withLock { self.refreshInFlight = false } }
             do {
                 let page = try await self.fetchOwnedDocuments(path: path, timeoutMs: timeoutMs)
+                // Cancelled by a logout: these rows belong to the session
+                // that just ended and must not land in the local cache.
+                guard !Task.isCancelled else { return }
                 await self.syncServerDocuments(page.items)
                 // `Logger.debug` isn't autoclosure'd, so the interpolation
                 // would run at every log level without this guard.
@@ -522,6 +525,16 @@ public final class MeAPI: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Cancel the in-flight background refresh, if any, and wait for it to
+    /// end. Logout calls this before its local cleanup, so a list fetched for
+    /// the session that is ending never lands in the local cache the next
+    /// session reads.
+    func cancelBackgroundRefresh() async {
+        let task = refreshLock.withLock { backgroundRefresh }
+        task?.cancel()
+        await task?.value
     }
 
     /// Wait for the in-flight background refresh, if any. Test-only hook —

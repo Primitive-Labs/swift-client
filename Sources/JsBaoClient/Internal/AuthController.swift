@@ -1447,24 +1447,6 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - Magic Link
 
-    /// - Warning: Deprecated by #2884. `/auth/magic-link/request` is now an
-    ///   alias of the unified issuance path and sends the same email
-    ///   `emailSignInRequest` does. Call `emailSignInRequest` instead.
-    public func magicLinkRequest(email: String, redirectUri: String) async throws -> Bool {
-        let transport = try requireTransport()
-
-        let body: [String: JSONValue] = [
-            "email": .string(email),
-            "redirectUri": .string(redirectUri),
-        ]
-        let response: SuccessResponse? = try await transport.requestOptional(
-            method: .post,
-            path: "/auth/magic-link/request",
-            body: body
-        )
-        return response?.success ?? false
-    }
-
     public func magicLinkVerify(token: String, inviteToken: String? = nil) async throws -> MagicLinkVerifyResult {
         let transport = try requireTransport()
 
@@ -1506,20 +1488,6 @@ public final class AuthController: @unchecked Sendable {
     }
 
     // MARK: - OTP
-
-    /// - Warning: Deprecated by #2884. `/auth/otp/request` is now an alias of
-    ///   the unified issuance path. Call `emailSignInRequest` instead.
-    public func otpRequest(email: String) async throws -> Bool {
-        let transport = try requireTransport()
-
-        let body: [String: JSONValue] = ["email": .string(email)]
-        let response: SuccessResponse? = try await transport.requestOptional(
-            method: .post,
-            path: "/auth/otp/request",
-            body: body
-        )
-        return response?.success ?? false
-    }
 
     public func otpVerify(email: String, code: String, inviteToken: String? = nil) async throws -> OtpVerifyResult {
         let transport = try requireTransport()

@@ -11,9 +11,9 @@ public enum HTTPMethod: String, Sendable {
     case patch = "PATCH"
     case delete = "DELETE"
 
-    /// Verbs that cannot carry a request body. Matches
-    /// `HttpClient.canHaveBody`, so the typed spine and the deprecated
-    /// `Any` spine drop bodies on exactly the same verbs.
+    /// Verbs that cannot carry a request body. Matches the GET/HEAD guard in
+    /// `HttpClient.buildURLRequest`, which drops a body on those verbs
+    /// whatever the caller encoded.
     public var allowsBody: Bool { self != .get && self != .head }
 }
 
@@ -349,8 +349,7 @@ public extension Transport {
 
     /// The full response — status, headers, parsed `JSONValue?`, text —
     /// **without** throwing on a non-2xx status, for callers that inspect the
-    /// status themselves (`IntegrationsAPI`, access validation). Same name and
-    /// meaning as the existing `HttpClient.requestRaw`.
+    /// status themselves (`IntegrationsAPI`, access validation).
     func requestRaw<Body: Encodable & Sendable>(
         method: HTTPMethod,
         path: String,
@@ -401,29 +400,25 @@ public extension Transport {
     }
 }
 
-// MARK: - TransportResponse → legacy views
+// MARK: - TransportResponse → HttpClientResponse
 
 extension TransportResponse {
-    /// The loosely-typed `JSONSerialization` graph the deprecated `Any` spine
-    /// speaks, produced by the **one** classification rule the client has
-    /// always used (previously `HttpClient.fetchParsed`):
+    /// The parsed body `HttpClientResponse.data` carries, by the one
+    /// classification rule the client has always used:
     ///
-    /// * non-JSON content type → the body's UTF-8 text
-    /// * JSON content type + empty body → `nil`
-    /// * JSON content type + malformed body → the text (lenient fallback)
-    /// * otherwise → the parsed graph (fragments allowed)
-    ///
-    /// Used by the deprecated `HttpClient.request` / `requestRaw` surface.
-    /// The typed `Transport` helpers never go through it.
-    var legacyParsedJSON: Any? {
+    /// * non-JSON content type → the body's UTF-8 text as `.string` (`nil`
+    ///   when the bytes are not UTF-8)
+    /// * JSON content type + zero-byte body → `nil`
+    /// * JSON content type + a body that does not parse (malformed, or
+    ///   whitespace only) → the text as `.string`
+    /// * otherwise → the decoded value, top-level fragments included
+    var parsedJSONValue: JSONValue? {
         let contentType = header("Content-Type") ?? ""
         let text = self.text
-        guard contentType.contains("application/json") else { return text }
-        guard let text = text, !text.isEmpty else { return nil }
-        if let parsed = try? JSONSerialization.jsonObject(with: body, options: .fragmentsAllowed) {
-            return parsed
-        }
-        return text
+        guard contentType.contains("application/json") else { return text.map { .string($0) } }
+        guard let text, !text.isEmpty else { return nil }
+        if let value = try? JSONCoding.decodeData(JSONValue.self, from: body) { return value }
+        return .string(text)
     }
 
     /// The single `TransportResponse` → `HttpClientResponse` conversion, so
@@ -433,7 +428,7 @@ extension TransportResponse {
             ok: ok,
             status: status,
             headers: headers,
-            data: legacyParsedJSON.flatMap { try? JSONCoding.decode(JSONValue.self, from: $0) },
+            data: parsedJSONValue,
             text: text
         )
     }

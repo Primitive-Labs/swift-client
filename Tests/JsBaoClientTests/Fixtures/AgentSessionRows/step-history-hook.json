@@ -1,0 +1,50 @@
+{
+  "model": "PrimitiveStep",
+  "row": {
+    "id": "01K6STEP00000000000000003808",
+    "turnId": "turn_1",
+    "seq": 4,
+    "kind": "model_call",
+    "status": "completed",
+    "startedAt": "2026-10-02T12:00:00.000Z",
+    "endedAt": "2026-10-02T12:00:01.000Z",
+    "durationMs": 1000,
+    "provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4.5",
+    "configId": "cfg_main",
+    "providerDurationMs": 812,
+    "historyMode": "hook",
+    "historySelection": "[{\"messageId\":\"m_2\"},{\"text\":\"summary\"},{\"messageId\":\"m_1\"},{\"messageId\":\"m_2\"}]",
+    "historyMessageIds": [
+      "m_1",
+      "m_2"
+    ]
+  },
+  "expect": {
+    "kind": "model_call",
+    "status": "completed",
+    "providerDurationMs": 812,
+    "historyMode": "hook",
+    "historySelection": [
+      {
+        "messageId": "m_2"
+      },
+      {
+        "text": "summary"
+      },
+      {
+        "messageId": "m_1"
+      },
+      {
+        "messageId": "m_2"
+      }
+    ],
+    "historyMessageIds": [
+      "m_1",
+      "m_2"
+    ],
+    "errorCode": {
+      "$absent": true
+    }
+  }
+}

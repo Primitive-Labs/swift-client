@@ -10,8 +10,9 @@ import Foundation
 /// answers its result; a TASK function is started and answers a run id that
 /// is polled on exactly the routes a DSL workflow run is. The method set is
 /// JS's and nothing more: `invoke`, `start`, `getStatus`, `waitFor`,
-/// `terminate`. The client-apply trio stays on `workflows`, where both
-/// clients keep it — a function run never enters `apply_pending`.
+/// `terminate`, and the run listing's `listRuns` and `listRunSteps` (#4145).
+/// The client-apply trio stays on `workflows`, where both clients keep it — a
+/// function run never enters `apply_pending`.
 ///
 /// #3565 — the three control methods post the run routes THEMSELVES and
 /// answer `FunctionRunStatus` / `FunctionRunResult<Output>`. Polling those
@@ -373,6 +374,69 @@ public final class FunctionsAPI: @unchecked Sendable {
     ) async throws -> FunctionRunResult<Output> {
         let base = try await waitFor(runId: runId, options: options)
         return try Self.typed(base)
+    }
+
+    // MARK: - listRuns / listRunSteps (#4145)
+
+    /// List the function runs the signed-in user started, one page at a time.
+    ///
+    /// Only this user's runs are listed — never another user's, and never a
+    /// run a trigger started. The filters combine. The order is storage
+    /// order, not start order: without `contextDocId` the most
+    /// recently updated run comes first, and with it runs are grouped by
+    /// status, newest first within a status. Sort the page by `startedAt` when
+    /// you need start order.
+    ///
+    /// GETs `functions/runs` with the JS client's query, in its order —
+    /// `functionKey`, `contextDocId`, `status`, `limit`, `cursor`, `forward`
+    /// (sent only when `true`).
+    public func listRuns(
+        options: FunctionRunListOptions = FunctionRunListOptions()
+    ) async throws -> FunctionRunPage {
+        var query = URLQuery()
+        query.appendIfPresent("functionKey", options.functionKey)
+        query.appendIfPresent("contextDocId", options.contextDocId)
+        query.appendIfPresent("status", options.status)
+        if let limit = options.limit {
+            query.append("limit", limit)
+        }
+        query.appendIfPresent("cursor", options.cursor)
+        if options.forward == true {
+            query.append("forward", "true")
+        }
+        return try await transport.request(
+            method: .get,
+            path: "/functions/runs\(query.queryString)"
+        )
+    }
+
+    /// Every step a function run has recorded, oldest first.
+    ///
+    /// A run that has recorded no steps yet answers an empty `items`. Throws
+    /// `.invalidArgument` for an empty `runId`, and `.notFound` with
+    /// `Function run <id> not found` for a run id that does not exist or names
+    /// a run another user started.
+    public func listRunSteps(runId: String) async throws -> FunctionRunSteps {
+        guard !runId.isEmpty else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "runId is required for functions.listRunSteps"
+            )
+        }
+        let encoded = URLEncoding.encodeComponent(runId)
+        do {
+            return try await transport.request(
+                method: .get,
+                path: "/functions/runs/\(encoded)/steps"
+            )
+        } catch {
+            guard FunctionRunStatus.isNotFound(error) else { throw error }
+            throw JsBaoError(
+                code: .notFound,
+                message: "Function run \(runId) not found",
+                details: ["runId": .string(runId)]
+            )
+        }
     }
 
     // MARK: - terminate

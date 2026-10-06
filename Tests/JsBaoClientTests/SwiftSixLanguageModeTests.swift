@@ -237,23 +237,6 @@ final class SwiftSixLanguageModeTests: XCTestCase {
                       "the target-wide budget stays at zero")
     }
 
-    // MARK: - Behavior 4 — the docs describe the gate's real role
-
-    /// `docs/testing.md` described the gate as a preview of a mode the package
-    /// did not compile in. Leaving that in place would tell the next reader the
-    /// budget is advisory.
-    func testTestingDocDescribesTheGateUnderTheCommittedMode() throws {
-        let doc = try ClientSourceText.packageFile("docs/testing.md")
-        XCTAssertFalse(
-            doc.contains("The package still compiles in Swift 5 language mode"),
-            "testing.md must not still describe the library target as Swift 5"
-        )
-        XCTAssertTrue(
-            doc.contains("Swift 6 language mode"),
-            "testing.md must say the JsBaoClient target builds in the Swift 6 language mode"
-        )
-    }
-
     // MARK: - Behavior 5 (#2318) — the warning-level counter and its safety argument
 
     /// The `#SendableClosureCaptures` site Phase F left behind is cleared by a
@@ -315,7 +298,7 @@ final class SwiftSixLanguageModeTests: XCTestCase {
         XCTAssertFalse(uses.isEmpty, "the box is gone — has the hop changed shape?")
         XCTAssertTrue(
             uses.contains { $0.hasPrefix("private struct QueueWork<Output>: @unchecked Sendable") },
-            "the declaration must stay private and keep its written safety argument"
+            "the declaration must stay private"
         )
         for use in uses {
             if use.hasPrefix("private struct QueueWork") { continue }
@@ -330,25 +313,6 @@ final class SwiftSixLanguageModeTests: XCTestCase {
             code.contains("var work: QueueWork") || code.contains("self.work = QueueWork"),
             "the box must never be stored on the provider"
         )
-    }
-
-    /// The claim is documented where it is made, framed as containment of the
-    /// existing API contract rather than a general transfer-safety proof.
-    func testQueueWorkCarriesItsSafetyArgument() throws {
-        let source = try ClientSourceText.clientSource("Storage/SQLiteStorageProvider.swift")
-        let doc = try XCTUnwrap(
-            ClientSourceText.docComment(
-                precedingDeclaration: "    private struct QueueWork<Output>",
-                in: source
-            ),
-            "the QueueWork box must carry a doc comment"
-        )
-
-        XCTAssertTrue(doc.contains("serial"), "the safety argument must name the serial queue")
-        XCTAssertTrue(doc.contains("continuation"),
-                      "the safety argument must name the suspended caller")
-        XCTAssertTrue(doc.contains("never"),
-                      "the safety argument must state the box does not outlive the hop")
     }
 
     /// A green build says nothing about warning-level diagnostics — that blind

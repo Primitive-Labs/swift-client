@@ -211,6 +211,48 @@ final class TransportSpineTests: XCTestCase {
         XCTAssertEqual(response.text, "plain")
     }
 
+    /// The rest of the classification table, pinned as parity: none of these
+    /// answers changed when the `Any` graph left the conversion (#4005).
+    func testRequestRawOnWhitespaceOnlyJsonBodyCarriesTheText() async throws {
+        // Non-empty text that does not parse falls back to the text, the same
+        // branch a malformed body takes; only a zero-byte body is `nil`.
+        let transport = ScriptedTransport(json: "  ")
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertEqual(response.data, .string("  "))
+        XCTAssertEqual(response.text, "  ")
+    }
+
+    func testRequestRawOnZeroByteJsonBodyIsNil() async throws {
+        let transport = ScriptedTransport(body: Data())
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertNil(response.data)
+        XCTAssertEqual(response.text, "")
+    }
+
+    func testRequestRawOnMalformedJsonBodyCarriesTheText() async throws {
+        let transport = ScriptedTransport(json: "{not json")
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertEqual(response.data, .string("{not json"))
+    }
+
+    func testRequestRawOnNonUtf8NonJsonBodyIsNil() async throws {
+        let bytes = Data([0xFF, 0xFE])
+        XCTAssertNil(String(data: bytes, encoding: .utf8), "fixture must not be valid UTF-8")
+        let transport = ScriptedTransport(contentType: "application/octet-stream", body: bytes)
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertNil(response.data)
+        XCTAssertNil(response.text)
+    }
+
+    func testRequestRawOnTopLevelJsonFragmentDecodesIt() async throws {
+        let number = try await ScriptedTransport(json: "123").requestRaw(method: .get, path: "/n")
+        XCTAssertEqual(number.data, .number(123))
+        let null = try await ScriptedTransport(json: "null").requestRaw(method: .get, path: "/n")
+        XCTAssertEqual(null.data, .null)
+        let flag = try await ScriptedTransport(json: "true").requestRaw(method: .get, path: "/n")
+        XCTAssertEqual(flag.data, .bool(true))
+    }
+
     // MARK: - requestData raw bytes (behavior 8)
 
     func testRequestDataReturnsBytesByteForByteIncludingInvalidUtf8() async throws {
@@ -645,7 +687,12 @@ final class TransportSpineTests: XCTestCase {
             // sub-APIs left the client, and with them the two analytics-context
             // accessors and the helper whose one `as? [String: Any]` cast
             // lowered their events. Removed surface, not a new lowering.
-            "JsBaoClient.swift": (21, 7, 0),
+            // #4005 took the dictionary count 21 -> 20: the four
+            // `legacyJSONGraph` casts left with the untyped `HttpClient`
+            // surface, and `documentRow` / `documentRows` (three spellings)
+            // are the one lowering seam into `DocumentManager`'s rows until
+            // #2579 retypes them.
+            "JsBaoClient.swift": (20, 7, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP
@@ -913,20 +960,47 @@ final class TransportSpineTests: XCTestCase {
         }
     }
 
-    /// And the client does not call its own deprecated surface: the sites that
-    /// still need the loose JSON graph go through the private
-    /// `legacyJSONGraph` hop, which is why the build stays warning-free.
-    func testTheClientDoesNotCallItsOwnDeprecatedSurface() throws {
-        let code = Self.stripComments(try jsBaoClientSource).joined(separator: "\n")
+    /// And the client reads documents through the typed transport. Metadata
+    /// sync and the offline-create commit used to share a private
+    /// `legacyJSONGraph` hop onto `HttpClient`'s untyped `request`; #4005
+    /// removed both, so neither the hop nor a string-verb call on
+    /// `httpClient` may come back.
+    func testTheClientReadsDocumentsThroughTheTypedTransport() throws {
+        let lines = Self.stripComments(try jsBaoClientSource)
+        let code = lines.joined(separator: "\n")
 
         XCTAssertFalse(
             code.contains("await makeRequest(") || code.contains("await self.makeRequest("),
-            "JsBaoClient should route internal calls through legacyJSONGraph, not the deprecated makeRequest"
+            "JsBaoClient must not call the removed makeRequest"
         )
-        XCTAssertTrue(
-            code.contains("private func legacyJSONGraph("),
-            "the single internal untyped hop should still be the private legacyJSONGraph"
+        XCTAssertEqual(count("legacyJSONGraph(", in: lines), 0, "the untyped hop was removed by #4005")
+        XCTAssertEqual(
+            count("httpClient.request(method: \"", in: lines), 0,
+            "a string-verb request goes through the untyped HttpClient surface #4005 removed"
         )
+        XCTAssertEqual(
+            count("httpClient.requestRaw(method: \"", in: lines), 0,
+            "a string-verb requestRaw goes through the untyped HttpClient surface #4005 removed"
+        )
+    }
+
+    /// `requestRaw` builds its `JSONValue?` straight from the bytes. It used
+    /// to classify into a `JSONSerialization` graph first and re-decode that
+    /// (#4005).
+    func testTransportResponseClassifiesWithoutAnAnyGraph() throws {
+        let lines = try codeLines(of: sourcesDirectory.appendingPathComponent("Types/Transport.swift"))
+        XCTAssertEqual(count("legacyParsedJSON", in: lines), 0)
+        XCTAssertEqual(count("Any?", in: lines), 0)
+    }
+
+    /// `HttpClient` is public because it is the production `Transport`, so
+    /// anything it declares is module API. Its untyped `request` /
+    /// `requestRaw` and the helpers behind them were removed by #4005; no
+    /// code line may spell `Any` again.
+    func testHttpClientPublicSurfaceCarriesNoAny() throws {
+        let lines = try codeLines(of: sourcesDirectory.appendingPathComponent("Internal/HttpClient.swift"))
+        XCTAssertFalse(lines.isEmpty, "HttpClient.swift was not found")
+        XCTAssertEqual(count("Any", in: lines), 0)
     }
 
     /// `JsBaoNetworkError` (#2367) is only worth its name if `URLError` can no

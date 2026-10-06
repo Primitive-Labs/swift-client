@@ -188,7 +188,7 @@ final class Format2ModelDelegate: @unchecked Sendable {
         return Self.rawJSON(value)
     }
 
-    /// The members of a stringset field, in rowid order.
+    /// The members of a stringset field, in canonical (code point) order.
     func members(id: String, field: String) throws -> [String] {
         try binding.observer.assertWritable()
         return try binding.store.members(model: modelName, recordId: id, field: field)
@@ -232,10 +232,10 @@ final class Format2ModelDelegate: @unchecked Sendable {
     /// a patch touches only the fields it names.
     func write(id: String, values: [String: PrimitiveValue], isUpdate: Bool) throws {
         var fields: [String: JSONValue] = [:]
-        var stringSetDeltas: [String: [String: Bool]] = [:]
+        var stringSetDeltas: [String: [ByteKey: Bool]] = [:]
         for (name, value) in values where name != "id" {
             if case let .stringset(members) = value {
-                var delta: [String: Bool] = [:]
+                var delta: [ByteKey: Bool] = [:]
                 if isUpdate {
                     // A full-set assignment on a PATCH is a diff against what
                     // the merged view holds, exactly as the nested-map path
@@ -243,8 +243,8 @@ final class Format2ModelDelegate: @unchecked Sendable {
                     // added concurrently is not dropped because this caller did
                     // not name it.
                     let existing = Set(try self.members(id: id, field: name))
-                    for member in members.subtracting(existing) { delta[member] = true }
-                    for member in existing.subtracting(members) { delta[member] = false }
+                    for member in members.subtracting(existing) { delta[ByteKey(member)] = true }
+                    for member in existing.subtracting(members) { delta[ByteKey(member)] = false }
                 } else {
                     // A create REPLACES the record, and the fold drops every
                     // member the base row held before it applies these entries
@@ -252,7 +252,7 @@ final class Format2ModelDelegate: @unchecked Sendable {
                     // name every member it wants present, not only the ones that
                     // are new: a diff would leave a re-created record with the
                     // members it happened to gain and none of the ones it kept.
-                    for member in members { delta[member] = true }
+                    for member in members { delta[ByteKey(member)] = true }
                 }
                 if !delta.isEmpty { stringSetDeltas[name] = delta }
             } else if let json = Self.jsonValue(value) {
@@ -287,7 +287,9 @@ final class Format2ModelDelegate: @unchecked Sendable {
                 id: id,
                 kind: .patch,
                 stringSetDeltas: [
-                    field: Dictionary(uniqueKeysWithValues: existing.map { ($0, false) }),
+                    field: Dictionary(
+                        existing.map { (ByteKey($0), false) }, uniquingKeysWith: { first, _ in first }
+                    ),
                 ]
             ),
             fields: [field]
@@ -325,7 +327,7 @@ final class Format2ModelDelegate: @unchecked Sendable {
             try binding.writePath.commitInsideOperation(
                 model: modelName,
                 mutation: OverlayMutation(
-                    id: id, kind: .patch, stringSetDeltas: [field: [member: true]]
+                    id: id, kind: .patch, stringSetDeltas: [field: [ByteKey(member): true]]
                 ),
                 fields: [field]
             )
@@ -347,7 +349,7 @@ final class Format2ModelDelegate: @unchecked Sendable {
             try binding.writePath.commitInsideOperation(
                 model: modelName,
                 mutation: OverlayMutation(
-                    id: id, kind: .patch, stringSetDeltas: [field: [member: false]]
+                    id: id, kind: .patch, stringSetDeltas: [field: [ByteKey(member): false]]
                 ),
                 fields: [field]
             )

@@ -172,9 +172,7 @@ final class AuthOtpInviteTokenTests: XCTestCase {
             getUserId: { nil },
             getToken: { nil },
             isAuthenticated: { false },
-            magicLinkRequest: { _, _ in true },
             magicLinkVerify: { _ in magicLinkResult },
-            otpRequest: { _ in true },
             otpVerify: { email, code in
                 capture.plainCalls.append((email, code))
                 return otpResult

@@ -37,7 +37,7 @@ final class DocumentPermissionsNamelessUserTests: XCTestCase {
         let baseEmail = "perms-nameless-\(suffix)@test.local"
         try await ctx.updateAppSettings(
             appId: testApp.appId,
-            settings: ["otpEnabled": true, "testAccountBaseEmails": [baseEmail]]
+            settings: ["emailSignInEnabled": true, "testAccountBaseEmails": [baseEmail]]
         )
 
         // A user with a name: add-by-email writes the local part as one.

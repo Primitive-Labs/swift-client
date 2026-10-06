@@ -498,19 +498,9 @@ final class Format2ObserverHermeticTests: XCTestCase {
         }
     }
 
-    /// Records, with stringset arrays compared as SETS.
-    ///
-    /// Everything else is compared exactly. The one thing that cannot be is a
-    /// stringset's ORDER within one update: the JS fold inserts members in the
-    /// order `groupOverlayEntries` met their keys, which on this path is the
-    /// order Yjs enumerates the model map — and Yjs does not specify one, so
-    /// two updates carrying the same members come back in different orders
-    /// from js-bao itself (measured: the same mutations re-encoded give
-    /// `["a","b"]` for one update and `["b","a"]` for the next). Swift sorts
-    /// instead, which is at least self-consistent. Asserting the JS order here
-    /// would be asserting noise; the MEMBERS are the claim, and the ordered
-    /// case is pinned in the store suite where both sides apply the mutations
-    /// one at a time and both are deterministic.
+    /// Records, compared exactly, a stringset's array order included: both
+    /// folds read a field's members back `ORDER BY value`, the canonical order
+    /// (#3881), whatever order the update's keys arrived in.
     private func assertRecordsMatch(
         _ expected: [String: Any], _ store: Format2RecordStore,
         file: StaticString = #filePath, line: UInt = #line
@@ -522,8 +512,8 @@ final class Format2ObserverHermeticTests: XCTestCase {
             XCTAssertEqual(mine[index].type, row["_type"] as? String, file: file, line: line)
             XCTAssertEqual(mine[index].id, row["_id"] as? String, file: file, line: line)
             XCTAssertEqual(
-                Self.orderInsensitive(Self.decode(mine[index].data)),
-                Self.orderInsensitive(Self.decode(row["_data"] as? String ?? "")),
+                Self.decode(mine[index].data),
+                Self.decode(row["_data"] as? String ?? ""),
                 "_data differs for \(mine[index].type)/\(mine[index].id)",
                 file: file, line: line
             )
@@ -537,8 +527,8 @@ final class Format2ObserverHermeticTests: XCTestCase {
         let rows = try XCTUnwrap(expected["members"] as? [[String: Any]])
         let mine = try store.dumpMembers()
         XCTAssertEqual(mine.count, rows.count, "members row count", file: file, line: line)
-        // Per record and field, the same members — see `assertRecordsMatch`
-        // for why the rowid ORDER is not the claim on this path.
+        // Per record and field, the same members. Row order is each table's
+        // own insertion order, which is not part of the claim.
         let theirs = Set(rows.map {
             "\($0["_type"] ?? "")/\($0["_record_id"] ?? "")/\($0["field"] ?? "")/\($0["value"] ?? "")"
         })
@@ -547,17 +537,6 @@ final class Format2ObserverHermeticTests: XCTestCase {
             theirs,
             file: file, line: line
         )
-    }
-
-    /// Sort any array value, so a stringset's unspecified order does not read
-    /// as a differing record.
-    private static func orderInsensitive(
-        _ row: [String: JSONValue]?
-    ) -> [String: JSONValue]? {
-        row?.mapValues { value in
-            guard case .array(let members) = value else { return value }
-            return .array(members.sorted { ($0.stringValue ?? "") < ($1.stringValue ?? "") })
-        }
     }
 
     private static func decode(_ json: String) -> [String: JSONValue]? {

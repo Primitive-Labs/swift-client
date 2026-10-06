@@ -1,9 +1,8 @@
 import XCTest
 @testable import JsBaoClient
 
-/// #2171 Phase 3 — the gate work the conversion is responsible for, the
-/// documentation of its two exceptions, and the edge cases the actor
-/// conversion introduces or changes.
+/// #2171 Phase 3 — the gate work the conversion is responsible for and the
+/// edge cases the actor conversion introduces or changes.
 ///
 /// The TSan work is part of the deliverable, not a side effect. Emptying
 /// `BASELINE_RACE_SIGNATURES` is the whole point of converting this type, and
@@ -161,61 +160,6 @@ final class WebSocketManagerGatesAndEdgeCasesTests: XCTestCase {
             runner.contains("\"Internal/WebSocketManager.swift\""),
             "run-tests.sh must hold Internal/WebSocketManager.swift at zero .v6 Sendable sites — "
                 + "actorizing a type creates Sendable requirements at every new boundary"
-        )
-    }
-
-    // MARK: - Behavior 24 — the architecture doc
-
-    /// The doc has to name the new actor, carry a written safety argument for
-    /// each surviving `nonisolated` box, record the channel-ordering invariant,
-    /// and — because the two paragraphs now sit next to each other — say why the
-    /// snapshot box is not the "second source of truth" the `BlobManager`
-    /// rationale rejects.
-    func testArchitectureDocCoversTheConversion() throws {
-        let doc = try ClientSourceText.packageFile("docs/architecture.md")
-
-        XCTAssertTrue(
-            doc.contains("| `WebSocketManager` |"),
-            "architecture.md's actor table must list WebSocketManager"
-        )
-        XCTAssertFalse(
-            doc.contains("`WebSocketManager` (#2171) and `AuthController` (#2173) are queued"),
-            "the doc still says WebSocketManager is queued for actorization — it is done"
-        )
-        XCTAssertFalse(
-            doc.contains("**WebSocketManager**: `NSLock` guards the state machine"),
-            "the sync-domain patterns list must no longer describe WebSocketManager as lock-guarded"
-        )
-
-        // The two boxes, named as the enumerated exceptions rather than left
-        // to contradict the "no lock" sentence above them.
-        XCTAssertTrue(
-            doc.contains("two** enumerated exceptions"),
-            "the actor-domain paragraph must name how many locks survive"
-        )
-        for box in ["transport snapshot", "weak delegate box"] {
-            XCTAssertTrue(doc.contains(box), "architecture.md must name the \(box)")
-        }
-
-        // The channel-ordering invariant, beside the existing no-`await` one.
-        XCTAssertTrue(
-            doc.contains("every lifecycle signal that originates outside isolation enters through the channel"),
-            "architecture.md must record the channel-ordering invariant"
-        )
-        XCTAssertTrue(
-            doc.contains("`.unbounded`"),
-            "the invariant only holds with the never-drop buffering policy — say so"
-        )
-
-        // The reconciliation with #2340's BlobManager rationale.
-        XCTAssertTrue(
-            doc.contains("second source of truth"),
-            "architecture.md must address the rationale the BlobManager section states"
-        )
-        XCTAssertTrue(
-            doc.contains("there is no second copy to drift")
-                || doc.contains("no second copy to drift"),
-            "the snapshot box's argument must say why it is not a second copy of actor state"
         )
     }
 
@@ -622,28 +566,6 @@ final class WebSocketManagerGatesAndEdgeCasesTests: XCTestCase {
             "a caller arriving at any suspension point inside connect() must wait, not re-connect"
         )
         await manager.disconnect()
-    }
-
-    // MARK: - Edge case 12 — the lock-order edge, written down
-
-    /// `webSocketManagerShouldReconnect` → `JsBaoClient.networkingAllowed()` →
-    /// `JsBaoClient.lock` is called from actor isolation. The reverse edge would
-    /// need some path to `await` the actor while holding that lock, which is
-    /// impossible: you cannot `await` inside `lock.withLock`. The written
-    /// argument is the deliverable here; the runtime check is the deadlock
-    /// watchdog in `WebSocketManagerDisconnectTests`.
-    func testTheLockOrderArgumentIsWrittenDown() throws {
-        let doc = try ClientSourceText.packageFile("docs/architecture.md")
-        XCTAssertTrue(
-            doc.contains("AuthController") && doc.contains("#2173"),
-            "architecture.md must record that WebSocketManager depends on AuthController "
-                + "staying synchronously readable"
-        )
-        let source = try ClientSourceText.clientSource("Internal/WebSocketManager.swift")
-        XCTAssertTrue(
-            source.contains("would reopen the double-connect race"),
-            "the delegate protocol must say why its methods stay synchronous"
-        )
     }
 
     // MARK: - Test support

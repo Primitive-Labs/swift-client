@@ -135,67 +135,13 @@ public final class HttpClient: @unchecked Sendable {
         self.session = URLSession(configuration: sessionConfig)
     }
 
-    // MARK: - Public API
-
-    /// Make an HTTP request and return decoded JSON. Throws on non-2xx responses.
-    ///
-    /// The deprecated `Any`-graph surface. It now delegates to the same
-    /// `executeRaw` spine the typed `Transport` helpers use, so there is one
-    /// response-classification policy in the client rather than two — the
-    /// classification itself lives on `TransportResponse.legacyParsedJSON`.
-    public func request(
-        method: String,
-        path: String,
-        data: Any? = nil,
-        options: RequestOptions? = nil
-    ) async throws -> Any? {
-        let result = try await executeRaw(
-            method: method,
-            path: path,
-            body: try HttpClient.encodeLegacyBody(data, method: method, options: options),
-            options: options
-        )
-        if !result.ok {
-            // #850 — parse the structured `{code, error/message}` body
-            // so callers see "This app is invite-only..." instead of
-            // "HTTP 403", and can switch on `serverCode` /
-            // `authCode` without re-parsing.
-            let parsed = HttpError.parseBody(result.text)
-            throw HttpError(
-                status: result.status,
-                message: "HTTP \(result.status)",
-                body: result.text,
-                serverCode: parsed.code,
-                serverMessage: parsed.message
-            )
-        }
-        // Hand back the raw `JSONSerialization` graph unchanged — typed
-        // decoders downstream cast it with `as? [String: Any]` etc.
-        return result.legacyParsedJSON
-    }
-
-    /// Make an HTTP request and return the full response without throwing on non-2xx.
-    public func requestRaw(
-        method: String,
-        path: String,
-        data: Any? = nil,
-        options: RequestOptions? = nil
-    ) async throws -> HttpClientResponse {
-        try await executeRaw(
-            method: method,
-            path: path,
-            body: try HttpClient.encodeLegacyBody(data, method: method, options: options),
-            options: options
-        ).toHttpClientResponse()
-    }
-
     /// Perform one round trip and return the **raw** response bytes with the
     /// status and headers. Does not throw on a non-2xx status.
     ///
-    /// This is the client's single request spine: `Transport.execute`, the
-    /// deprecated `request`/`requestRaw`, and the raw blob path all funnel
-    /// through it. It takes the method as a `String` (rather than
-    /// `HTTPMethod`) so legacy callers passing an arbitrary verb keep working.
+    /// This is the client's single request spine: `Transport.execute` and the
+    /// raw blob path both funnel through it. It takes the method as a
+    /// `String` because `fetchWithRefresh` and `buildURLRequest` are written
+    /// against one; `Transport.execute` passes `method.rawValue`.
     func executeRaw(
         method: String,
         path: String,
@@ -229,29 +175,6 @@ public final class HttpClient: @unchecked Sendable {
         )
     }
 
-    /// Encode the deprecated `Any` body argument into wire bytes using the
-    /// exact rules `buildURLRequest` applied inline before: `rawBody` takes
-    /// `Data`/`String` verbatim, everything else goes through
-    /// `JSONSerialization`, and methods that cannot carry a body encode to
-    /// `nil` (so a fragment body on a GET still never throws).
-    static func encodeLegacyBody(
-        _ data: Any?,
-        method: String,
-        options: RequestOptions?
-    ) throws -> Data? {
-        guard let data = data, canHaveBody(method: method) else { return nil }
-        if options?.rawBody == true {
-            if let rawData = data as? Data { return rawData }
-            if let rawString = data as? String { return rawString.data(using: .utf8) }
-            return nil
-        }
-        return try JSONSerialization.data(withJSONObject: data, options: [])
-    }
-
-    private static func canHaveBody(method: String) -> Bool {
-        !["GET", "HEAD"].contains(method.uppercased())
-    }
-
     /// The endpoints that skip the refresh interceptor — no expiry preflight
     /// and no refresh-and-retry on a 401 (see `executeRaw` /
     /// `fetchWithRefresh`).
@@ -271,6 +194,10 @@ public final class HttpClient: @unchecked Sendable {
     /// (`src/client/internal/authController.ts`); this set is the port of that
     /// behavior (#2658).
     ///
+    /// `/auth/email/request` starts email sign-in: it is unauthenticated
+    /// credential issuance, so an expiring token on a signed-in client must
+    /// not make it pre-refresh either.
+    ///
     /// The native Sign in with Apple callback (`/auth/apple/callback`) belongs
     /// to the same family as the native Google one (`/auth/oauth/callback`): a
     /// signed-out client posts a single-use identity token to it. Its absence
@@ -284,9 +211,8 @@ public final class HttpClient: @unchecked Sendable {
     /// do carry a bearer token, so an expired one should still refresh.
     private static let interceptorExemptPaths: Set<String> = [
         "/auth/refresh",
-        "/auth/magic-link/request",
+        "/auth/email/request",
         "/auth/magic-link/verify",
-        "/auth/otp/request",
         "/auth/otp/verify",
         "/passkey/auth/start",
         "/passkey/auth/finish",
@@ -392,24 +318,7 @@ public final class HttpClient: @unchecked Sendable {
     func buildURLRequest(
         method: String,
         path: String,
-        data: Any? = nil,
-        options: RequestOptions? = nil
-    ) throws -> URLRequest {
-        try buildURLRequest(
-            method: method,
-            path: path,
-            body: try HttpClient.encodeLegacyBody(data, method: method, options: options),
-            options: options
-        )
-    }
-
-    /// Build the request from already-encoded body bytes. The `Any` overload
-    /// above encodes first and calls through here, so URL construction exists
-    /// in one place for both the legacy and the typed path.
-    func buildURLRequest(
-        method: String,
-        path: String,
-        body: Data?,
+        body: Data? = nil,
         options: RequestOptions? = nil
     ) throws -> URLRequest {
         // Split path into pure path and query string
@@ -600,10 +509,9 @@ public final class HttpClient: @unchecked Sendable {
 // MARK: - Transport conformance
 
 /// The production `Transport`. It satisfies the protocol's single requirement
-/// by forwarding to the same `executeRaw` spine the deprecated `Any` surface
-/// uses, so the URL construction, `percentEncodedPath`/`percentEncodedQuery`
-/// pass-through, token/refresh, 401-retry, and refresh-proxy behavior are
-/// identical on the typed path — none of it is reimplemented.
+/// by forwarding to the `executeRaw` spine, which owns the URL construction,
+/// the `percentEncodedPath`/`percentEncodedQuery` pass-through, and the
+/// token, refresh, 401-retry and refresh-proxy behavior.
 extension HttpClient: Transport {
     public func execute(
         method: HTTPMethod,

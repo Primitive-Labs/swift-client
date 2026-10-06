@@ -165,12 +165,14 @@ public enum SnapshotChunkReader {
         stringSetFields: Set<String>
     ) -> OverlayRecordEntry {
         var fields: [String: JSONValue] = [:]
-        var stringSets: [String: [String: Bool]] = [:]
+        var stringSets: [String: [ByteKey: Bool]] = [:]
         for (field, value) in data {
             if field == "id" { continue }
             if stringSetFields.contains(field), case .array(let members) = value {
-                var set: [String: Bool] = [:]
-                for member in members { set[memberName(member)] = true }
+                // Keyed by bytes, so two spellings Swift calls equal are both
+                // loaded, as the JS loader loads them (#3881).
+                var set: [ByteKey: Bool] = [:]
+                for member in members { set[ByteKey(memberName(member))] = true }
                 stringSets[field] = set
                 continue
             }

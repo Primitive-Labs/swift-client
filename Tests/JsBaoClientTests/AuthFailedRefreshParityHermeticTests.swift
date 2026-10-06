@@ -69,7 +69,7 @@ final class AuthFailedRefreshParityHermeticTests: XCTestCase {
         )
 
         do {
-            _ = try await http.request(method: "GET", path: "/me")
+            let _: JSONValue? = try await http.requestOptional(method: .get, path: "/me")
             XCTFail("a rejected refresh must surface the 401 to the caller")
         } catch {
             // The request outcome is pinned by the sign-out suites (#2655);
@@ -116,7 +116,7 @@ final class AuthFailedRefreshParityHermeticTests: XCTestCase {
             emitter: emitter
         )
 
-        _ = try? await http.request(method: "GET", path: "/me")
+        let _: JSONValue? = try? await http.requestOptional(method: .get, path: "/me")
 
         let observed = failures.all
         XCTAssertEqual(

@@ -37,7 +37,7 @@ final class TypedSitesB3Tests: XCTestCase {
         let controller = makeController()
 
         do {
-            _ = try await controller.otpRequest(email: "a@b.c")
+            _ = try await controller.emailSignInRequest(email: "a@b.c")
             XCTFail("expected an unavailable error before setTransport")
         } catch let error as JsBaoError {
             XCTAssertEqual(error.code, .unavailable)
@@ -49,11 +49,11 @@ final class TypedSitesB3Tests: XCTestCase {
         let controller = makeController()
         controller.setTransport(transport)
 
-        let requested = try await controller.otpRequest(email: "a@b.c")
+        let requested = try await controller.emailSignInRequest(email: "a@b.c")
 
         XCTAssertTrue(requested)
         XCTAssertEqual(transport.lastCall?.method, .post)
-        XCTAssertEqual(transport.lastCall?.path, "/auth/otp/request")
+        XCTAssertEqual(transport.lastCall?.path, "/auth/email/request")
         XCTAssertEqual(transport.lastCall?.jsonBody?["email"]?.stringValue, "a@b.c")
     }
 
@@ -497,8 +497,8 @@ final class TypedSitesB3Tests: XCTestCase {
         XCTAssertEqual(transport.calls.count, 1, "the rejected verb never reached the wire")
     }
 
-    /// GET/HEAD carry no body — the legacy `encodeLegacyBody` path dropped it,
-    /// and the typed path must too.
+    /// GET/HEAD carry no body: `HttpClient` drops one on those verbs whatever
+    /// the caller encoded, and the cache facade must not send one either.
     func testFetchHttpDropsTheBodyOnBodylessVerbs() async throws {
         let transport = RecordingTransport(json: #"{"ok": true}"#)
         let facade = makeFacade(transport)

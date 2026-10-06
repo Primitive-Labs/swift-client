@@ -73,7 +73,7 @@ Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource
 | `Events.swift` | `JsBaoEvent` enum + typed payload structs (`SyncEvent`, `AuthStateEvent`, `StatusChangedEvent`, …) |
 | `JsBaoEventPayload.swift` | The payload/event association (`JsBaoEventPayload.eventKey`), the nine payload types converted from dictionaries, and the conformance table the drift guards read |
 | `Errors.swift` | `JsBaoError` / `AuthError` / `HttpError` — error codes match the JS client for cross-platform consistency |
-| `EventEmitter.swift` | The event registry. Serves `AsyncStream` consumers (`client.stream(for:)`, `observeOnMainActor`, `nextEvent`) and the deprecated `on` / `onAny` callback shim from one `emit`, so both keep their delivery contracts |
+| `EventEmitter.swift` | The event registry. One `emit` fans out to both delivery shapes — the `AsyncStream` consumers behind `client.stream(for:)` / `nextEvent`, and the typed callback subscriptions (`subscribe(_:)`) behind `observeOnMainActor` — so the two cannot diverge. The untyped `on` / `onAny` shim was removed in #2367 |
 
 ## Concurrency Model
 
@@ -228,7 +228,7 @@ Local writes are detected via `YDocument.observeUpdate()` (our yswift fork addit
 5. Events emitted: authSuccess, authFailed, authState, authRefreshDeferred
 ```
 
-Additional auth methods: OAuth (`startOAuthFlow` / `handleOAuthCallback`), Magic Link (`magicLinkRequest` / `magicLinkVerify`), OTP (`otpRequest` / `otpVerify`).
+Additional auth methods: OAuth (`startOAuthFlow` / `handleOAuthCallback`), email sign-in (`auth.emailSignInRequest`, finished with `magicLinkVerify` or `otpVerify`).
 
 ## Offline-First Design
 

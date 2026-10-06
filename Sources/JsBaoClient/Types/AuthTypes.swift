@@ -22,10 +22,8 @@ public struct AuthUser: Decodable, Sendable, Equatable {
     public let name: String?
 }
 
-// MARK: Magic link
+// MARK: Email sign-in
 
-/// Parameters for `auth.magicLinkRequest(...)`. Mirrors JS
-/// `magicLinkRequest({ email, redirectUri })`.
 /// Parameters for `auth.emailSignInRequest(...)` (#2884). Mirrors JS
 /// `emailSignInRequest({ email, redirectUri })`.
 ///
@@ -48,20 +46,7 @@ public struct EmailSignInRequestResult: Decodable, Sendable, Equatable {
     public let success: Bool
 }
 
-public struct MagicLinkRequestParams: Sendable {
-    public var email: String
-    public var redirectUri: String
-
-    public init(email: String, redirectUri: String) {
-        self.email = email
-        self.redirectUri = redirectUri
-    }
-}
-
-/// Result of `auth.magicLinkRequest(...)`. Mirrors JS `{ success: boolean }`.
-public struct MagicLinkRequestResult: Decodable, Sendable, Equatable {
-    public let success: Bool
-}
+// MARK: Magic link
 
 /// Result of `auth.magicLinkVerify(...)`. Mirrors JS
 /// `{ user, promptAddPasskey?, isNewUser? }`. On success the SDK has already
@@ -75,11 +60,6 @@ public struct MagicLinkVerifyResult: Decodable, Sendable, Equatable {
 }
 
 // MARK: OTP
-
-/// Result of `auth.otpRequest(...)`. Mirrors JS `{ success: boolean }`.
-public struct OtpRequestResult: Decodable, Sendable, Equatable {
-    public let success: Bool
-}
 
 /// Parameters for `auth.otpVerify(...)`. Mirrors JS
 /// `otpVerify(email, code, { inviteToken })`.
@@ -196,12 +176,6 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     /// one email carrying a code and, when a link can be issued, a link, so
     /// there is no per-method availability to report.
     public let emailSignInEnabled: Bool
-    /// - Warning: Deprecated by #2884. A server that has the unified flow
-    ///   reports both of these equal to `emailSignInEnabled`; they exist so
-    ///   already-published clients keep reading a value that matches
-    ///   behavior. New code reads `emailSignInEnabled`.
-    public let magicLinkEnabled: Bool
-    public let otpEnabled: Bool
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -216,23 +190,14 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
         hasPasskey = try c.decodeIfPresent(Bool.self, forKey: .hasPasskey) ?? false
         appleSignInEnabled = try c.decodeIfPresent(Bool.self, forKey: .appleSignInEnabled) ?? false
         hasApple = try c.decodeIfPresent(Bool.self, forKey: .hasApple) ?? false
-        magicLinkEnabled = try c.decodeIfPresent(Bool.self, forKey: .magicLinkEnabled) ?? false
-        otpEnabled = try c.decodeIfPresent(Bool.self, forKey: .otpEnabled) ?? false
-        // A server that predates #2884 sends no `emailSignInEnabled` at all,
-        // so derive it from the pair it replaced: email sign-in is off only
-        // when BOTH legacy flags are explicitly false. Reading the absent key
-        // as `false` would black out the email button against every older
-        // server.
-        emailSignInEnabled =
-            try c.decodeIfPresent(Bool.self, forKey: .emailSignInEnabled)
-            ?? (magicLinkEnabled || otpEnabled)
+        emailSignInEnabled = try c.decodeIfPresent(Bool.self, forKey: .emailSignInEnabled) ?? false
     }
 
     private enum CodingKeys: String, CodingKey {
         case appId, name, mode, waitlistEnabled, googleOAuthEnabled, googleClients
         case passkeyEnabled
         case passkeyRpConfig, hasPasskey, appleSignInEnabled, hasApple
-        case emailSignInEnabled, magicLinkEnabled, otpEnabled
+        case emailSignInEnabled
     }
 }
 
@@ -276,7 +241,9 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
     /// native-configured one and so was wrong in one direction or the other.
     public let googleAvailable: Bool
     public let hasPasskey: Bool
-    public let magicLinkEnabled: Bool
+    /// Is email sign-in available? One flag: one request sends one email
+    /// carrying a code and, when a link can be issued, a link.
+    public let emailSignInEnabled: Bool
 
     public init(
         appId: String,
@@ -285,7 +252,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
         waitlistEnabled: Bool,
         googleAvailable: Bool,
         hasPasskey: Bool,
-        magicLinkEnabled: Bool
+        emailSignInEnabled: Bool
     ) {
         self.appId = appId
         self.name = name
@@ -293,7 +260,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
         self.waitlistEnabled = waitlistEnabled
         self.googleAvailable = googleAvailable
         self.hasPasskey = hasPasskey
-        self.magicLinkEnabled = magicLinkEnabled
+        self.emailSignInEnabled = emailSignInEnabled
     }
 
     /// Project the launch-UI subset out of the full envelope.
@@ -308,7 +275,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
             waitlistEnabled: config.waitlistEnabled,
             googleAvailable: config.googleSignInAvailable,
             hasPasskey: config.hasPasskey,
-            magicLinkEnabled: config.magicLinkEnabled
+            emailSignInEnabled: config.emailSignInEnabled
         )
     }
 

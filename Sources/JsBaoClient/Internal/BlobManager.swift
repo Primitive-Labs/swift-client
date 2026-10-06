@@ -23,10 +23,12 @@ import CryptoKit
 /// * **`downloadUrl` stays synchronous, permanently.** It reads only the
 ///   immutable `getApiUrl` / `getAppId` closures, so it is `nonisolated` and
 ///   keeps its exact shape — it feeds URLs straight from SwiftUI bodies.
-/// * **Everything else on the queue surface is `async`.** The synchronous
-///   forms that have to survive (or be guided through) the deprecation window
-///   live on `JsBaoClient`, `DocumentsAPI` and `DocumentBlobContext`; see the
-///   Fork 1 Option C note on those types.
+/// * **Everything else on the queue surface is `async`.** The public forms are
+///   the `…Async` members on `JsBaoClient`, `DocumentsAPI` and
+///   `DocumentBlobContext`. The synchronous forms that bridged the conversion
+///   were removed in #2367; `DocumentsAPI` keeps a few as unavailable-renamed
+///   stubs so the compiler points a migrating call at its twin (see the note
+///   above its app-wide upload-queue verbs).
 public actor BlobManager {
     private nonisolated let logger: Logger
 

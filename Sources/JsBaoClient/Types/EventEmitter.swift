@@ -711,6 +711,72 @@ extension EventEmitter {
         }
     }
 
+    /// Wait for one pending create to commit — the wait behind
+    /// `documents.validateAccess` on a document whose create has not reached
+    /// the server yet (#4159).
+    ///
+    /// Built like `waitForNextEvent`, with one addition: inside the
+    /// continuation body it subscribes FIRST and only then asks `stillPending`,
+    /// so a commit that lands between the caller's check and the subscription
+    /// is seen by the recheck rather than missed (`nextEvent` does not replay).
+    ///
+    /// Returns on a `PendingCreateCommittedEvent` for `documentId`, or at once
+    /// when `stillPending` answers false. Throws `JsBaoError(.pendingCreate)`
+    /// when `isOffline` answers true, when a `NetworkModeEvent` reports
+    /// `.offline`, or when `timeout` elapses; `CancellationError` when the
+    /// calling task is cancelled. Commit-failure events do not end the wait:
+    /// the client retries a failed commit, and the retry's success emits the
+    /// commit event.
+    func waitForPendingCreateCommit(
+        documentId: String,
+        timeout: TimeInterval,
+        stillPending: @escaping @Sendable () -> Bool,
+        isOffline: @escaping @Sendable () -> Bool
+    ) async throws {
+        let wait = SubscriptionHolder()
+        let cancellation = CancellationBridge()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                cancellation.onCancelResume {
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: CancellationError())
+                }
+                let refuse: @Sendable () -> Void = {
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: JsBaoError(
+                        code: .pendingCreate,
+                        message: "Document create has not reached the server yet",
+                        details: ["documentId": .string(documentId)]
+                    ))
+                }
+                wait.set(subscribe(PendingCreateCommittedEvent.self) { payload in
+                    guard payload.documentId == documentId, wait.claim() else { return }
+                    continuation.resume()
+                })
+                let modeSubscription = subscribe(NetworkModeEvent.self) { payload in
+                    if payload.mode == .offline { refuse() }
+                }
+                wait.set(onSettled: { modeSubscription.cancel() })
+
+                if !stillPending() {
+                    guard wait.claim() else { return }
+                    continuation.resume()
+                    return
+                }
+                if isOffline() {
+                    refuse()
+                    return
+                }
+                wait.set(timeoutTask: Task {
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    refuse()
+                })
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
     private func timeoutTask<T>(
         wait: SubscriptionHolder,
         timeout: TimeInterval,
