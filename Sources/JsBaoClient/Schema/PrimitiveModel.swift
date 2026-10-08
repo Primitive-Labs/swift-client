@@ -14,8 +14,8 @@ import Foundation
 /// nested value enums, and `RelatedRecords` — a spelling of the shared
 /// `PrimitiveRow` bag, whose `[String: JSONValue]` contents are `Sendable`),
 /// so the conformance is satisfied automatically. This makes the metatype
-/// `any PrimitiveModel.Type` `Sendable`, which lets it be stored on the
-/// `Sendable` `CsvImportOptions.model` field without an escape hatch.
+/// `any PrimitiveModel.Type` `Sendable`, so it can be stored on a `Sendable`
+/// value without an escape hatch.
 public protocol PrimitiveModel: Sendable {
     static var modelName: String { get }
     static var primitiveSchema: PrimitiveSchema { get }

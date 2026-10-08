@@ -95,7 +95,7 @@ final class Format2AggregateDocumentsHermeticTests: XCTestCase {
 
     /// The `team` values the aggregation grouped by, sorted.
     private func teams(_ rows: [[String: JSONValue]]) -> [String] {
-        rows.compactMap { $0["team"]?.stringValue }.sorted()
+        rows.compactMap { $0["group"]?["team"]?.stringValue }.sorted()
     }
 
     // MARK: - The option, on the shared facade

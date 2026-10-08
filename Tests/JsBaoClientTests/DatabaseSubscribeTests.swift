@@ -93,14 +93,12 @@ final class DatabaseSubscribeTests: XCTestCase {
     }
 
     private func saveTask(id: String, title: String) async throws {
-        _ = try await client.databases.executeOperation(
-            databaseId: databaseId,
-            name: "seed_save",
-            options: ExecuteOperationOptions(params: .object([
-                "modelName": .string("Task"),
-                "id": .string(id),
-                "data": .object(["id": .string(id), "title": .string(title)]),
-            ]))
+        // The owner writes through the database handle; the operation execute
+        // door this used to call is admin-only since #3188 and the client no
+        // longer carries it.
+        try await client.databases.connect(databaseId: databaseId).save(
+            modelName: "Task",
+            data: ["id": .string(id), "title": .string(title)]
         )
     }
 

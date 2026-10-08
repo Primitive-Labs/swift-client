@@ -1,6 +1,6 @@
 // AUTO-GENERATED FROM functions/123-job.toml — DO NOT EDIT.
 // Run `primitive functions codegen --lang swift` to regenerate.
-// fingerprint: 7058a7879af79597
+// fingerprint: cbf1d6be86fd87e2
 
 import Foundation
 import JsBaoClient

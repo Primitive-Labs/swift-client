@@ -526,11 +526,9 @@ final class TransportSpineTests: XCTestCase {
             "DoDb.swift",
             "GroupsAPI.swift",
             "GroupTypeConfigsAPI.swift",
-            "IntegrationsAPI.swift",
             "InvitationsAPI.swift",
             "MeAPI.swift",
             "NotificationsAPI.swift",
-            "PromptsAPI.swift",
             "RuleSetsAPI.swift",
             "SessionAPI.swift",
             "UsersAPI.swift",
@@ -607,7 +605,10 @@ final class TransportSpineTests: XCTestCase {
             // `Int64` past 2^53 on a signature that had not changed. The file
             // set is net zero on this commit: `JsBaoClient.swift` gave one back
             // (22 -> 21) below.
-            "API/WorkflowsAPI.swift": (11, 2, 0),
+            // #3188 took it 11 -> 7 and its `JSONSerialization` uses 2 -> 1:
+            // `runSync` (both overloads) is gone with its `input`, `meta` and
+            // `payload` composition, so `start` is the one composer left.
+            "API/WorkflowsAPI.swift": (7, 1, 0),
             // #3278 opened this at eleven because there were no per-key types
             // to express an invocation with; #3344 generated them and closed
             // the four sites that existed only for their absence. The untyped

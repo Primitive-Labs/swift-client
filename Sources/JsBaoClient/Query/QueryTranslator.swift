@@ -311,9 +311,16 @@ public struct QueryTranslator {
     ///     the junction on a specific value and group by a `true`/`false`
     ///     CASE on whether the member is present.
     ///
-    /// Output stays flat `[[String: JSONValue]]` rows (Swift's idiom) rather
-    /// than js-bao's nested map. `scopedToDocIds`, when set, scopes the
-    /// query to those documents — woven into the WHERE here (not spliced by
+    /// Every group level is selected under its positional alias (`_g<i>`, `i`
+    /// its index in `groupBy`) and every operation under its own (`_o<i>`, `i`
+    /// its index in `operations`), so no group column shares a name with an
+    /// operation, whatever its `resultKey`; `aggregationRows` turns the SQL
+    /// rows into js-bao's `["group": …, <op keys>]` rows. Two levels that
+    /// would share a key in `group`, or an operation whose `resultKey` is
+    /// `group`, are refused here, before any SQL is built
+    /// (`ambiguousGroupKeysMessage`, `reservedOperationKeyMessage`).
+    ///
+    /// `scopedToDocIds`, when set, scopes the query to those documents — woven into the WHERE here (not spliced by
     /// the caller) so its bind params land after any JOIN params. An empty
     /// list is a scope that admits nothing, not one that admits everything:
     /// it is what a model with no connected document of the kind being read
@@ -326,16 +333,23 @@ public struct QueryTranslator {
         fieldTypes: [String: String]? = nil,
         scopedToDocIds: [String]? = nil
     ) throws -> (String, [Any]) {
-        var regularFields: [String] = []
-        var facetFields: [String] = []
-        var memberships: [(field: String, contains: String)] = []
-        for clause in options.groupBy {
+        if let key = ambiguousGroupKey(options.groupBy) {
+            throw JsBaoError(code: .invalidArgument, message: ambiguousGroupKeysMessage(key))
+        }
+        if options.operations.contains(where: { $0.resultKey == groupRowKey }) {
+            throw JsBaoError(code: .invalidArgument, message: reservedOperationKeyMessage)
+        }
+
+        var regularFields: [(index: Int, name: String)] = []
+        var facetFields: [(index: Int, name: String)] = []
+        var memberships: [(index: Int, field: String, contains: String)] = []
+        for (index, clause) in options.groupBy.enumerated() {
             switch clause {
             case let .field(name):
-                if stringsetFields.contains(name) { facetFields.append(name) }
-                else { regularFields.append(name) }
+                if stringsetFields.contains(name) { facetFields.append((index, name)) }
+                else { regularFields.append((index, name)) }
             case let .stringSetMembership(field, contains):
-                memberships.append((field, contains))
+                memberships.append((index, field, contains))
             }
         }
 
@@ -354,7 +368,7 @@ public struct QueryTranslator {
         if regularFields.isEmpty && memberships.isEmpty && !facetFields.isEmpty {
             if facetFields.count == 1 {
                 return try buildFacetAggregation(
-                    tableName: tableName, facetField: facetFields[0],
+                    tableName: tableName, facet: facetFields[0],
                     options: options, stringsetFields: stringsetFields,
                     stringFields: stringFields, fieldTypes: fieldTypes,
                     scopedToDocIds: scopedToDocIds
@@ -364,7 +378,7 @@ public struct QueryTranslator {
             // a guaranteed-empty result instead of aborting the caller.
             log.warn(
                 "aggregate: grouping by multiple stringset facet fields is "
-                + "unsupported (\(facetFields)); returning no rows. Group by a "
+                + "unsupported (\(facetFields.map(\.name))); returning no rows. Group by a "
                 + "single facet field, or combine facets with regular / "
                 + "membership group-bys."
             )
@@ -403,8 +417,8 @@ public struct QueryTranslator {
     /// membership group keys via correlated LEFT JOINs.
     private static func buildRegularAggregation(
         tableName: String,
-        regularFields: [String],
-        memberships: [(field: String, contains: String)],
+        regularFields: [(index: Int, name: String)],
+        memberships: [(index: Int, field: String, contains: String)],
         options: AggregateOptions,
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
@@ -417,22 +431,20 @@ public struct QueryTranslator {
         var groupByClauses: [String] = []
         var joinClauses: [String] = []
 
-        for field in regularFields {
-            selectClauses.append("\(t).\(quoted(field))")
-            groupByClauses.append("\(t).\(quoted(field))")
+        // The expression `sort` orders by when it names a group key.
+        var sortExpressions: [String: String] = [:]
+
+        for (index, field) in regularFields {
+            let column = "\(t).\(quoted(field))"
+            selectClauses.append("\(column) AS \(quoted(positionalGroupAlias(index)))")
+            groupByClauses.append(column)
+            sortExpressions[field] = column
         }
 
-        var usedAliases = Set<String>()
-        for membership in memberships {
-            var alias = membershipAlias(field: membership.field, contains: membership.contains)
-            var n = 1
-            while usedAliases.contains(alias) {
-                alias = membershipAlias(field: membership.field, contains: membership.contains) + "_\(n)"
-                n += 1
-            }
-            usedAliases.insert(alias)
-            let a = quoted(alias)
-            let junction = quoted("\(tableName)__\(membership.field)")
+        for (index, field, contains) in memberships {
+            let a = quoted(membershipJoinAlias(tableName: tableName, index: index))
+            let groupAlias = quoted(positionalGroupAlias(index))
+            let junction = quoted("\(tableName)__\(field)")
             // Correlate on parent_id AND _meta_doc_id (shared multi-doc
             // engine) and the specific member value — at most one match
             // per record, so COUNT(*) doesn't multiply.
@@ -441,10 +453,11 @@ public struct QueryTranslator {
                 + " AND \(a).\"_meta_doc_id\" = \(t).\"_meta_doc_id\""
                 + " AND \(a).\"value\" = ?"
             )
-            params.append(membership.contains)
+            params.append(contains)
             let caseExpr = "CASE WHEN \(a).\"parent_id\" IS NOT NULL THEN 'true' ELSE 'false' END"
-            selectClauses.append("\(caseExpr) AS \(a)")
+            selectClauses.append("\(caseExpr) AS \(groupAlias)")
             groupByClauses.append(caseExpr)
+            sortExpressions[aggregationGroupKey(.stringSetMembership(field: field, contains: contains))] = groupAlias
         }
 
         appendOperations(options.operations, table: t, into: &selectClauses)
@@ -474,7 +487,7 @@ public struct QueryTranslator {
         if !groupByClauses.isEmpty {
             sql += " GROUP BY \(groupByClauses.joined(separator: ", "))"
         }
-        sql += aggregateOrderLimit(options)
+        sql += aggregateOrderLimit(options, sortExpressions: sortExpressions)
         return (sql, params)
     }
 
@@ -482,7 +495,7 @@ public struct QueryTranslator {
     /// faceted field, with the count (and any ops) of records carrying it.
     private static func buildFacetAggregation(
         tableName: String,
-        facetField: String,
+        facet: (index: Int, name: String),
         options: AggregateOptions,
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
@@ -490,9 +503,10 @@ public struct QueryTranslator {
         scopedToDocIds: [String]?
     ) throws -> (String, [Any]) {
         let t = quoted(tableName)
-        let junction = quoted("\(tableName)__\(facetField)")
+        let junction = quoted("\(tableName)__\(facet.name)")
+        let member = "\(junction).\"value\""
         var params: [Any] = []
-        var selectClauses: [String] = ["\(junction).\"value\" AS \(quoted(facetField))"]
+        var selectClauses: [String] = ["\(member) AS \(quoted(positionalGroupAlias(facet.index)))"]
         appendOperations(options.operations, table: t, into: &selectClauses)
         if options.operations.isEmpty { selectClauses.append("COUNT(*) AS \"count\"") }
 
@@ -517,49 +531,58 @@ public struct QueryTranslator {
         }
         if !whereParts.isEmpty { sql += " WHERE " + whereParts.joined(separator: " AND ") }
 
-        sql += " GROUP BY \(junction).\"value\""
-        sql += aggregateOrderLimit(options)
+        sql += " GROUP BY \(member)"
+        sql += aggregateOrderLimit(options, sortExpressions: [facet.name: member])
         return (sql, params)
     }
 
     /// Append `count`/`sum`/`avg`/`min`/`max` SELECT clauses, qualifying
-    /// each operand field with the main table `t`.
+    /// each operand field with the main table `t`. Each is selected under its
+    /// positional alias; `aggregationRows` puts it back under its `resultKey`.
     private static func appendOperations(
         _ operations: [AggregateOperation],
         table t: String,
         into clauses: inout [String]
     ) {
-        for op in operations {
+        for (index, op) in operations.enumerated() {
+            let alias = quoted(positionalOperationAlias(index))
             switch op.type {
             case .count:
-                clauses.append("COUNT(*) AS \(quoted(op.resultKey))")
+                clauses.append("COUNT(*) AS \(alias)")
             case .sum:
                 if let field = op.field {
-                    clauses.append("SUM(CAST(\(t).\(quoted(field)) AS REAL)) AS \(quoted(op.resultKey))")
+                    clauses.append("SUM(CAST(\(t).\(quoted(field)) AS REAL)) AS \(alias)")
                 }
             case .avg:
                 if let field = op.field {
-                    clauses.append("AVG(CAST(\(t).\(quoted(field)) AS REAL)) AS \(quoted(op.resultKey))")
+                    clauses.append("AVG(CAST(\(t).\(quoted(field)) AS REAL)) AS \(alias)")
                 }
             case .min:
                 if let field = op.field {
-                    clauses.append("MIN(\(t).\(quoted(field))) AS \(quoted(op.resultKey))")
+                    clauses.append("MIN(\(t).\(quoted(field))) AS \(alias)")
                 }
             case .max:
                 if let field = op.field {
-                    clauses.append("MAX(\(t).\(quoted(field))) AS \(quoted(op.resultKey))")
+                    clauses.append("MAX(\(t).\(quoted(field))) AS \(alias)")
                 }
             }
         }
     }
 
-    /// ORDER BY (by group-by field or an op's output alias — SQLite
-    /// resolves the identifier either way) + LIMIT.
-    private static func aggregateOrderLimit(_ options: AggregateOptions) -> String {
+    /// ORDER BY + LIMIT. `sort.field` names an operation's result key first
+    /// (as in js-bao, where a group field named `count` does not shadow the
+    /// count), then a group key, by the expression in `sortExpressions`.
+    private static func aggregateOrderLimit(
+        _ options: AggregateOptions,
+        sortExpressions: [String: String]
+    ) -> String {
         var sql = ""
         if let sort = options.sort {
             let dir = sort.direction == -1 ? "DESC" : "ASC"
-            sql += " ORDER BY \(quoted(sort.field)) \(dir)"
+            let expression = options.operations.firstIndex { $0.resultKey == sort.field }
+                .map { quoted(positionalOperationAlias($0)) }
+                ?? sortExpressions[sort.field] ?? quoted(sort.field)
+            sql += " ORDER BY \(expression) \(dir)"
         }
         if let limit = options.limit, limit >= 0 {
             sql += " LIMIT \(limit)"
@@ -567,14 +590,84 @@ public struct QueryTranslator {
         return sql
     }
 
-    /// Deterministic, SQL-safe alias for a membership group key. The
-    /// actual match value is bound as a parameter, so alias sanitization
-    /// only affects the output column name (`has_<field>_<contains>`).
-    private static func membershipAlias(field: String, contains: String) -> String {
-        func san(_ s: String) -> String {
-            String(s.map { ($0.isLetter || $0.isNumber) ? $0 : "_" })
+    // MARK: - Aggregate rows
+
+    /// The key a `groupBy` level takes in a row's `group`: the field name for
+    /// a plain field or a StringSet facet, `has_<field>_<contains>` for a
+    /// membership check, with `field` and `contains` written as given.
+    static func aggregationGroupKey(_ level: AggregateGroupBy) -> String {
+        switch level {
+        case let .field(name): return name
+        case let .stringSetMembership(field, contains): return "has_\(field)_\(contains)"
         }
-        return "has_\(san(field))_\(san(contains))"
+    }
+
+    /// The SQL alias the level at `index` of `groupBy` is selected under. It
+    /// never appears in a returned row.
+    static func positionalGroupAlias(_ index: Int) -> String { "_g\(index)" }
+
+    /// The SQL alias the operation at `index` of `operations` is selected
+    /// under. Disjoint from every group alias, so a custom `outputField` (even
+    /// `_g0`) cannot take a group column's name. It never appears in a
+    /// returned row.
+    static func positionalOperationAlias(_ index: Int) -> String { "_o\(index)" }
+
+    /// The alias the membership level at `index` joins its junction table
+    /// under. Built on the model's table name and longer than it, so it can
+    /// never name the main table (SQLite compares identifiers ignoring case),
+    /// and never a junction (`<table>__<field>`).
+    static func membershipJoinAlias(tableName: String, index: Int) -> String {
+        "\(tableName)_m\(index)"
+    }
+
+    /// The row key holding the group values, so no operation may take it.
+    static let groupRowKey = "group"
+
+    /// The refusal for an operation whose `resultKey` is the row's `group`.
+    static let reservedOperationKeyMessage =
+        "Aggregation operation result key 'group' is reserved for the row's group values"
+
+    /// The first group key more than one `groupBy` level would take, or nil.
+    static func ambiguousGroupKey(_ groupBy: [AggregateGroupBy]) -> String? {
+        var seen = Set<String>()
+        for level in groupBy {
+            let key = aggregationGroupKey(level)
+            if !seen.insert(key).inserted { return key }
+        }
+        return nil
+    }
+
+    /// The refusal for two `groupBy` levels that would share one row key —
+    /// js-bao's message, word for word.
+    static func ambiguousGroupKeysMessage(_ key: String) -> String {
+        "Ambiguous aggregation group keys: '\(key)' names more than one groupBy level"
+    }
+
+    /// The rows of a statement `buildAggregation` built, as js-bao answers
+    /// them: each level's value as stored under its key in `group` (`null`
+    /// for a missing value or a level the statement did not select), and every
+    /// operation's value beside it under its result key, `null` when SQL had
+    /// none to give.
+    static func aggregationRows(
+        _ sqlRows: [[String: JSONValue]],
+        options: AggregateOptions
+    ) -> [[String: JSONValue]] {
+        sqlRows.map { sqlRow in
+            var row = sqlRow
+            var group: [String: JSONValue] = [:]
+            for (index, level) in options.groupBy.enumerated() {
+                group[aggregationGroupKey(level)] =
+                    row.removeValue(forKey: positionalGroupAlias(index)) ?? .null
+            }
+            for (index, operation) in options.operations.enumerated() {
+                let value = row.removeValue(forKey: positionalOperationAlias(index))
+                if value != nil || row[operation.resultKey] == nil {
+                    row[operation.resultKey] = value ?? .null
+                }
+            }
+            row[groupRowKey] = .object(group)
+            return row
+        }
     }
 
     // MARK: - Helpers

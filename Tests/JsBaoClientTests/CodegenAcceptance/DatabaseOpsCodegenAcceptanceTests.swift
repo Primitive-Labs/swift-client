@@ -12,28 +12,19 @@ import XCTest
 /// compiles against the real library and round-trips.
 ///
 /// Every generated symbol is nested under a `public enum <Type>` namespace
-/// (issue #1687), so record/params/result types and the `Ops` factory are
-/// referenced qualified (`Portfolio.Account`, `Catalog.SearchProductsParams`,
-/// `Edge.ops(...)`).
+/// (issue #1687), so record/params/result types are referenced qualified
+/// (`Portfolio.Account`, `Catalog.SearchProductsParams`).
 ///
 /// This file covers:
 ///   - record + params structs encode → JSON → decode → equal, and a
 ///     server-shaped JSON fixture decodes into the generated record;
 ///   - each op's `<Type>.<Op>Result` typealias resolves to the right SDK result
-///     envelope, decoded from a server-shaped payload;
-///   - the generated `<Type>.Ops` factory binds `<Op>Params` in and `<Op>Result`
-///     out over the additive generic `DatabasesAPI.executeOperation` overload,
-///     exercised live against a recording transport.
+///     envelope, decoded from a server-shaped payload.
+///
+/// The generated `<Type>.Ops` factory and the generic `executeOperation`
+/// overload it called retired with the client's operation execute door
+/// (#3188); the files carry the record, params and result types only.
 final class DatabaseOpsCodegenAcceptanceTests: XCTestCase {
-
-    // MARK: - Stub transport
-
-    /// `RecordingTransport` scripts the response bytes and records the request
-    /// it was handed, which is what the factory tests below assert on. Hold the
-    /// transport so the recorded call can be read back after the `await`.
-    private func api(_ transport: RecordingTransport) -> DatabasesAPI {
-        DatabasesAPI(transport: transport)
-    }
 
     // MARK: - Record + params round-trip
 
@@ -118,73 +109,4 @@ final class DatabaseOpsCodegenAcceptanceTests: XCTestCase {
         XCTAssertEqual(result.data.count, 1)
         XCTAssertEqual(result.data[0], .object(["title": .string("T")]))
     }
-
-    // MARK: - Generic executeOperation overload (published surface)
-
-    func test_factory_queryOp_bindsTypedResult() async throws {
-        let transport = RecordingTransport(
-            json: #"{"data":[{"id":"a1","accountNumber":"0001"}]}"#
-        )
-        // Drive the generic overload directly against the recording transport
-        // (the generated factory delegates to exactly this call).
-        let result: Portfolio.ListAccountsResult = try await api(transport).executeOperation(
-            databaseId: "db_1",
-            name: "listAccounts",
-            params: Portfolio.ListAccountsParams()
-        )
-        let call = try XCTUnwrap(transport.lastCall)
-        XCTAssertEqual(call.method, .post)
-        XCTAssertEqual(call.path, "/databases/db_1/operations/listAccounts/execute")
-        XCTAssertEqual(result.data.first?.accountNumber, "0001")
-    }
-
-    func test_factory_mutationOp_encodesTypedParams() async throws {
-        let transport = RecordingTransport(
-            json: #"{"results":[{"op":"save","success":true,"id":"acc_1"}]}"#
-        )
-        let result: Portfolio.SaveAccountResult = try await api(transport).executeOperation(
-            databaseId: "db_1",
-            name: "saveAccount",
-            params: Portfolio.SaveAccountParams(accountNumber: "0001")
-        )
-        // Typed params were encoded into the request `params` object.
-        let params = try XCTUnwrap(transport.lastCall?.jsonBody?["params"])
-        XCTAssertEqual(params["accountNumber"]?.stringValue, "0001")
-        XCTAssertEqual(result.results.first?.id, "acc_1")
-    }
-}
-
-/// Compile-only proof (behavior 16) that the committed `<Type>.Ops` factories
-/// bind `<Op>Params` in and `<Op>Result` out over the generic
-/// `DatabasesAPI.executeOperation` overload. Never executed — being COMPILED is
-/// the assertion.
-@available(*, unavailable)
-private func _dbAcceptanceFactoryBindingsCompile(_ client: JsBaoClient) async throws {
-    let portfolio = Portfolio.ops(client, databaseId: "db_1")
-    let accounts: Portfolio.ListAccountsResult = try await portfolio.listAccounts()
-    _ = accounts.data.first?.accountNumber
-    let saved: Portfolio.SaveAccountResult = try await portfolio.saveAccount(
-        Portfolio.SaveAccountParams(accountNumber: "0001")
-    )
-    _ = saved.results
-    let count: Portfolio.CountAccountsResult = try await portfolio.countAccounts()
-    _ = count.count
-
-    let catalog = Catalog.ops(client, databaseId: "db_2")
-    let found: Catalog.SearchProductsResult = try await catalog.searchProducts(
-        Catalog.SearchProductsParams(ids: ["x"], kind: .physical)
-    )
-    _ = found.data
-    let agg: Catalog.SummarizeResult = try await catalog.summarize()
-    _ = agg.result
-    let applied: Catalog.ArchiveStaleResult = try await catalog.archiveStale()
-    _ = applied.matched
-    let piped: Catalog.RunPipelineResult = try await catalog.runPipeline()
-    _ = piped.data
-
-    let edge = Edge.ops(client, databaseId: "db_3")
-    let deleted: Edge.DeleteResult = try await edge.delete(Edge.DeleteParams(recordId: "r_1"))
-    _ = deleted.results
-    let def: Edge.DefaultResult = try await edge.`default`()
-    _ = def.data
 }

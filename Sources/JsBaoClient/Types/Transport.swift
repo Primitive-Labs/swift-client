@@ -263,7 +263,7 @@ public extension Transport {
     ///
     /// For the handful of endpoints whose request body is an opaque,
     /// caller-supplied JSON graph the client is not allowed to interpret
-    /// (`workflows.start` / `runSync` `rootInput` and `meta`). Re-encoding
+    /// (`workflows.start` `rootInput` and `meta`). Re-encoding
     /// such a graph through `JSONValue` would collapse every number to
     /// `Double` and silently lose exactness past 2^53, so the caller composes
     /// the bytes itself and they go out untouched.
@@ -349,7 +349,7 @@ public extension Transport {
 
     /// The full response — status, headers, parsed `JSONValue?`, text —
     /// **without** throwing on a non-2xx status, for callers that inspect the
-    /// status themselves (`IntegrationsAPI`, access validation).
+    /// status themselves (access validation).
     func requestRaw<Body: Encodable & Sendable>(
         method: HTTPMethod,
         path: String,

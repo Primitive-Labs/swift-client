@@ -49,25 +49,6 @@ public struct CreateCheckoutSessionWorkflow: Sendable {
         self.client = client
     }
 
-    /// Run the workflow synchronously and wait for its terminal status.
-    /// Emitted only because `create-checkout-session` is `syncCallable` (parity with JS).
-    public func runSync(
-        input: CreateCheckoutSessionInput,
-        runKey: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: Any]? = nil,
-        timeout: TimeInterval? = nil
-    ) async throws -> RunSyncResult<CreateCheckoutSessionOutput> {
-        try await client.workflows.runSync(
-            workflowKey: "create-checkout-session",
-            input: input,
-            runKey: runKey,
-            contextDocId: contextDocId,
-            meta: meta,
-            timeout: timeout
-        )
-    }
-
     /// Start the workflow asynchronously; returns the run handle.
     @discardableResult
     public func start(

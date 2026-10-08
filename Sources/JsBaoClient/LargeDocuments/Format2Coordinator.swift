@@ -1126,10 +1126,18 @@ public final class Format2Coordinator: @unchecked Sendable {
         // instead — and NOT stopped, because a chain nobody has tried yet is
         // not a document that has to be reloaded.
         //
+        // A resync naming the NEXT epoch takes the same path (#4228). It is
+        // the refusal of a frame this client sent just before a seal, and it
+        // arrives ahead of the seal or, when the seal's broadcast was lost,
+        // instead of it. It carries no `baseDiscontinuity`, so a move on it
+        // could carry the owed writes across a bulk load as deltas; the
+        // re-handshake's `epoch.info` says whether the sealed epoch was one
+        // before anything is stated again.
+        //
         // The frame carries no chain (`epoch.seal` has no `sealedEpochs`), so
         // the caller needs a fresh `epoch.info` to learn the archives. From
         // here the held overlay is the client's own (behavior 17).
-        if target > held + 1 {
+        if target > held + 1 || (kind == "epoch.resync" && target == held + 1) {
             logger?.debug(
                 "[format2]", kind, "for", documentId, "skips epochs (held:",
                 held, "target:", target, ") — the sealed chain has to be applied"

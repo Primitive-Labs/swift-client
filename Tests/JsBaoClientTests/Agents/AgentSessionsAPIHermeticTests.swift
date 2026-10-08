@@ -362,6 +362,67 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(eventTransport.lastCall?.jsonBody, ["kind": "viewed", "data": .null, "eventId": "e1", "refersTo": "c1"])
     }
 
+    // MARK: - #4256: the unread dot and markRead
+
+    func testListItemsDecodeTheUnreadDotWithAndWithoutTheFieldsAndRoundTrip() async throws {
+        let (sessions, _) = api(#"""
+        {"items":[{"sessionId":"s1","agentKey":"helper","scope":null,"documentId":"d1","ownerUserId":"u1",
+                   "role":"owner","title":"A","lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null,
+                   "hasUnread":true,"lastReadAt":null},
+                  {"sessionId":"s2","agentKey":"helper","scope":null,"documentId":"d2","ownerUserId":"u1",
+                   "role":"viewer","title":null,"lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null,
+                   "hasUnread":false,"lastReadAt":"2026-10-02T00:00:05.000Z"},
+                  {"sessionId":"s3","agentKey":"helper","scope":null,"documentId":"d3","ownerUserId":"u1",
+                   "role":"viewer","title":null,"lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null}],
+         "hasMore":false}
+        """#)
+        let page = try await sessions.list()
+        XCTAssertEqual(page.items.map(\.hasUnread), [true, false, false], "absent reads as false")
+        XCTAssertEqual(page.items.map(\.lastReadAt), [nil, "2026-10-02T00:00:05.000Z", nil])
+
+        let encoded = try JSONEncoder().encode(page.items[1])
+        let decoded = try JSONDecoder().decode(AgentSessionListItem.self, from: encoded)
+        XCTAssertEqual(decoded, page.items[1])
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(object["hasUnread"] as? Bool, false)
+        XCTAssertEqual(object["lastReadAt"] as? String, "2026-10-02T00:00:05.000Z")
+    }
+
+    func testGetDecodesTheCallersUnreadDotAndDefaultsItWhenAbsent() async throws {
+        let withDot = Self.memberInfo.replacingOccurrences(
+            of: #""role":"participant","#, with: #""role":"participant","hasUnread":true,"lastReadAt":"2026-10-01T12:00:00.000Z","#
+        )
+        let (sessions, _) = api(withDot)
+        let info = try await sessions.get(sessionId: "s1")
+        XCTAssertTrue(info.hasUnread)
+        XCTAssertEqual(info.lastReadAt, "2026-10-01T12:00:00.000Z")
+
+        let (older, _) = api(Self.adminInfo)
+        let admin = try await older.get(sessionId: "s1")
+        XCTAssertFalse(admin.hasUnread)
+        XCTAssertNil(admin.lastReadAt)
+    }
+
+    func testMarkReadPostsAnEmptyObjectAndDecodesTheMarker() async throws {
+        let (sessions, transport) = api(#"{"sessionId":"s 1","lastReadAt":"2026-10-02T00:00:09.000Z"}"#)
+        let marked = try await sessions.markRead(sessionId: "s 1")
+        let call = try XCTUnwrap(transport.lastCall)
+        XCTAssertEqual(call.method, .post)
+        XCTAssertEqual(call.path, "/agent-sessions/s%201/read")
+        XCTAssertEqual(call.jsonBody, [:], "the JS client's body: {}")
+        XCTAssertEqual(marked, AgentSessionReadResult(sessionId: "s 1", lastReadAt: "2026-10-02T00:00:09.000Z"))
+
+        let (refusing, _) = api(status: 403, #"{"code":"AGENT_SESSION_MEMBER_ONLY","error":"Only the session's owner and members mark it read"}"#)
+        do {
+            _ = try await refusing.markRead(sessionId: "s1")
+            XCTFail("expected the refusal")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.serverCode, "AGENT_SESSION_MEMBER_ONLY")
+            XCTAssertEqual(error.status, 403)
+        }
+        await assertInvalidArgument { _ = try await sessions.markRead(sessionId: "") }
+    }
+
     // MARK: - Behavior 8: refusals
 
     func testEveryOperationSurfacesTheServersCodeAndStatus() async {

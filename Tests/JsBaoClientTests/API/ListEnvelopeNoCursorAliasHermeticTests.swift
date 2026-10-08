@@ -7,6 +7,7 @@ import XCTest
 /// The server no longer sends a `cursor` alias of `nextCursor`, so a body that
 /// carries only `cursor` has no continuation: it decodes to `nextCursor == nil`
 /// and `hasMore == false`. `NotificationListResult` joined the same envelope.
+/// `DeferredGrantListResult` dropped its legacy `grants` key (#4282).
 ///
 /// Server-free: each case decodes a literal body.
 final class ListEnvelopeNoCursorAliasHermeticTests: XCTestCase {
@@ -69,6 +70,56 @@ final class ListEnvelopeNoCursorAliasHermeticTests: XCTestCase {
     func testDocumentListPageIgnoresLegacyDocumentsKey() throws {
         let page = try decode(DocumentListPage.self, #"{"documents":[{"documentId":"d1"}]}"#)
         XCTAssertEqual(page.items.count, 0)
+    }
+
+    private let documentGrant = #"""
+        {"deferredId":"dg-1","type":"document","email":"a@example.com","documentId":"doc-1",\#
+        "permission":"read-write","grantedBy":"u-1","createdAt":"2026-01-01T00:00:00Z",\#
+        "expiresAt":"2026-02-01T00:00:00Z"}
+        """#
+    private let groupGrant = #"""
+        {"deferredId":"gg-1","type":"group","email":"b@example.com","groupType":"team",\#
+        "groupId":"grp-1","addedBy":"u-1","createdAt":"2026-01-01T00:00:00Z",\#
+        "expiresAt":"2026-02-01T00:00:00Z"}
+        """#
+
+    func testDeferredGrantListResult() throws {
+        try assertEnvelope(DeferredGrantListResult.self, next: { $0.nextCursor }, hasMore: { $0.hasMore })
+    }
+
+    func testDeferredGrantListResultIgnoresLegacyGrantsKey() throws {
+        // The row is a complete grant, so an empty page means the key was ignored.
+        let row = try decode(DeferredGrant.self, documentGrant)
+        XCTAssertEqual(row.deferredId, "dg-1")
+
+        let page = try decode(DeferredGrantListResult.self, #"{"grants":[\#(documentGrant)]}"#)
+        XCTAssertTrue(page.items.isEmpty)
+        XCTAssertNil(page.nextCursor)
+        XCTAssertFalse(page.hasMore)
+
+        let both = try decode(DeferredGrantListResult.self, #"{"items":[],"grants":[\#(documentGrant)]}"#)
+        XCTAssertTrue(both.items.isEmpty)
+    }
+
+    func testDeferredGrantListResultDecodesItems() throws {
+        let page = try decode(
+            DeferredGrantListResult.self,
+            #"{"items":[\#(documentGrant),\#(groupGrant)],"hasMore":false}"#
+        )
+        XCTAssertEqual(page.items.count, 2)
+        guard case let .document(first) = page.items[0] else {
+            return XCTFail("first item should be a document grant")
+        }
+        XCTAssertEqual(first.deferredId, "dg-1")
+        guard case let .group(second) = page.items[1] else {
+            return XCTFail("second item should be a group grant")
+        }
+        XCTAssertEqual(second.deferredId, "gg-1")
+        XCTAssertFalse(page.hasMore)
+        XCTAssertNil(page.nextCursor)
+
+        XCTAssertTrue(DeferredGrantListResult(items: [], nextCursor: "c").hasMore)
+        XCTAssertFalse(DeferredGrantListResult(items: []).hasMore)
     }
 
     func testNotificationListResultReadsTheEnvelope() throws {

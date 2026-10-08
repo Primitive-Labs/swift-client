@@ -90,25 +90,6 @@ public struct ProcessPaymentWorkflow: Sendable {
         self.client = client
     }
 
-    /// Run the workflow synchronously and wait for its terminal status.
-    /// Emitted only because `process-payment` is `syncCallable` (parity with JS).
-    public func runSync(
-        input: ProcessPaymentInput,
-        runKey: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: Any]? = nil,
-        timeout: TimeInterval? = nil
-    ) async throws -> RunSyncResult<ProcessPaymentOutput> {
-        try await client.workflows.runSync(
-            workflowKey: "process-payment",
-            input: input,
-            runKey: runKey,
-            contextDocId: contextDocId,
-            meta: meta,
-            timeout: timeout
-        )
-    }
-
     /// Start the workflow asynchronously; returns the run handle.
     @discardableResult
     public func start(

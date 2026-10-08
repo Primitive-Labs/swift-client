@@ -166,6 +166,29 @@ public final class AgentSessionView: @unchecked Sendable {
     private var refreshQueued = false
     private var olderInFlight: Task<AgentSessionLoadOlderResult, Error>?
     private var closed = false
+    /// Client-tool handlers by tool name.
+    private var toolHandlers: [String: ClientToolRegistration] = [:]
+    /// The calls a handler runs now, by call id.
+    private var runningCalls: [String: RunningClientTool] = [:]
+    private var runningOrder: [String] = []
+    /// Calls this view answered (or lost to another answer), by call id: their turn.
+    private var answeredCalls: [String: String] = [:]
+    /// Calls the server refused an answer for, by call id: their turn and the
+    /// state they were in.
+    private var failedCalls: [String: (turnId: String, state: String)] = [:]
+    private var evaluateQueued = false
+    private var syncTask: Task<Void, Never>?
+
+    private struct ClientToolRegistration: Sendable {
+        let id: UUID
+        let handler: AgentClientToolHandler
+        let onError: (@Sendable (AgentClientToolError) -> Void)?
+    }
+
+    private struct RunningClientTool {
+        let id: UUID
+        var task: Task<Void, Never>?
+    }
 
     init(api: AgentSessionsAPI, client: JsBaoClient, info: AgentSessionInfo, pageSize: Int) {
         self.api = api
@@ -338,6 +361,69 @@ public final class AgentSessionView: @unchecked Sendable {
         return try await api.cancel(sessionId: sessionId, turnId: target)
     }
 
+    /// Mark the session read for the signed-in user (`sessions.markRead`):
+    /// `info.hasUnread` becomes `false` and `info.lastReadAt` the marker, and
+    /// `onChange` fires. Call it when the user opens or returns to the session.
+    @discardableResult
+    public func markRead() async throws -> AgentSessionReadResult {
+        let result = try await api.markRead(sessionId: sessionId)
+        lock.withLock {
+            _info.hasUnread = false
+            _info.lastReadAt = result.lastReadAt
+        }
+        notify()
+        return result
+    }
+
+    // MARK: - Client tools
+
+    /// Call ids a handler of this view is running now, in start order.
+    public var runningClientToolCalls: [String] { lock.withLock { runningOrder } }
+
+    /// Run client tools for this member: when the active turn is yours, each
+    /// call of a named tool that waits for its result (`input-available`, or
+    /// approved) runs its handler and is answered with the result. Calls
+    /// waiting when you register, or found again when the document re-syncs,
+    /// run too. Every one of your open views runs a call and the first answer
+    /// wins, so keep handlers free of side effects. Approvals stay with your
+    /// UI.
+    ///
+    /// Throws `.invalidArgument` when a name already has a handler on this
+    /// view (nothing is registered) or the view is closed.
+    ///
+    /// - Returns: A function that removes these handlers; runs in flight
+    ///   still answer.
+    @discardableResult
+    public func handleClientTools(
+        _ handlers: [String: AgentClientToolHandler],
+        options: HandleClientToolsOptions = HandleClientToolsOptions()
+    ) throws -> @Sendable () -> Void {
+        let id = UUID()
+        let refusal: JsBaoError? = lock.withLock {
+            if closed { return JsBaoError(code: .invalidArgument, message: "The session view is closed") }
+            if let taken = handlers.keys.sorted().first(where: { toolHandlers[$0] != nil }) {
+                return JsBaoError(
+                    code: .invalidArgument, message: "Client tool \"\(taken)\" already has a handler on this view",
+                    details: ["toolName": .string(taken)]
+                )
+            }
+            for (name, handler) in handlers {
+                toolHandlers[name] = ClientToolRegistration(id: id, handler: handler, onError: options.onError)
+            }
+            return nil
+        }
+        if let refusal { throw refusal }
+        guard !handlers.isEmpty else { return {} }
+        work.async { [weak self] in self?.evaluateClientTools() }
+        let names = Array(handlers.keys)
+        return { [weak self] in
+            guard let self else { return }
+            self.lock.withLock {
+                for name in names where self.toolHandlers[name]?.id == id { self.toolHandlers[name] = nil }
+            }
+        }
+    }
+
     /// Read the session's info again (`get`), and notify when it is read.
     @discardableResult
     public func refreshInfo() async throws -> AgentSessionInfo {
@@ -347,34 +433,65 @@ public final class AgentSessionView: @unchecked Sendable {
         return next
     }
 
-    /// Stop listening and close the session's document. Idempotent.
+    /// Stop listening and close the session's document. Running client-tool
+    /// handlers are cancelled and their answers never sent. Idempotent.
     public func close() async {
-        let unsubscribing: [@Sendable () -> Void]? = lock.withLock {
+        let closing: (unsubscribes: [@Sendable () -> Void], tasks: [Task<Void, Never>])? = lock.withLock {
             guard !closed else { return nil }
             closed = true
             listeners.removeAll()
+            var tasks = runningCalls.values.compactMap(\.task)
+            if let syncTask { tasks.append(syncTask) }
+            syncTask = nil
+            runningCalls.removeAll()
+            runningOrder.removeAll()
+            toolHandlers.removeAll()
+            answeredCalls.removeAll()
+            failedCalls.removeAll()
             defer { unsubscribes.removeAll() }
-            return unsubscribes
+            return (unsubscribes, tasks)
         }
-        guard let unsubscribing else { return }
-        for unsubscribe in unsubscribing { unsubscribe() }
+        guard let closing else { return }
+        for unsubscribe in closing.unsubscribes { unsubscribe() }
+        for task in closing.tasks { task.cancel() }
         await client.documents.close(documentId)
     }
 
     // MARK: - Internals
 
-    /// Subscribe to the four models and load the first window.
+    /// Subscribe to the four models and the document's syncs, and load the
+    /// first window.
     func start() async throws {
         var unsubs: [@Sendable () -> Void] = []
         for schema in AgentSessionModels.schemas {
             unsubs.append(client.codegen.subscribe(schema) { [weak self] in self?.scheduleRefresh() })
         }
+        let documentId = self.documentId
+        let syncs = Self.syncEvents(of: client)
+        let sync = Task { [weak self] in
+            for await event in syncs where event.documentId == documentId && event.synced {
+                self?.scheduleEvaluate()
+            }
+        }
         let alreadyClosed: Bool = lock.withLock {
-            if !closed { unsubscribes.append(contentsOf: unsubs) }
+            if !closed {
+                unsubscribes.append(contentsOf: unsubs)
+                syncTask = sync
+            }
             return closed
         }
-        if alreadyClosed { unsubs.forEach { $0() } }
+        if alreadyClosed {
+            unsubs.forEach { $0() }
+            sync.cancel()
+        }
         try await onWorkQueue { try self.refreshNow(notify: false) }
+    }
+
+    /// Every document's `SyncEvent`, unbounded: the stream is filtered to the
+    /// session's document only after buffering, so a bounded buffer would let
+    /// a reconnect burst of other documents' syncs evict this one's.
+    static func syncEvents(of client: JsBaoClient) -> AsyncStream<SyncEvent> {
+        client.stream(for: SyncEvent.self, buffering: .unbounded)
     }
 
     private func onWorkQueue<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
@@ -452,6 +569,148 @@ public final class AgentSessionView: @unchecked Sendable {
             return rebuildLocked() || changed || olderBefore != olderRemain
         }
         if changed && shouldNotify { notify() }
+        evaluateClientTools(session: sessionRow.flatMap(PrimitiveSession.init(row:)))
+    }
+
+    /// At most one evaluation waits behind the running work, so a burst of
+    /// sync events is read once.
+    private func scheduleEvaluate() {
+        let schedule: Bool = lock.withLock {
+            guard !closed, !toolHandlers.isEmpty, !evaluateQueued else { return false }
+            evaluateQueued = true
+            return true
+        }
+        guard schedule else { return }
+        work.asyncAfter(deadline: .now() + Self.refreshCoalesceWindow) { [weak self] in
+            guard let self else { return }
+            self.lock.withLock { self.evaluateQueued = false }
+            self.evaluateClientTools()
+        }
+    }
+
+    /// `evaluateClientTools(session:)` over the session row read now. Runs on
+    /// `work`.
+    private func evaluateClientTools() {
+        guard lock.withLock({ !closed && !toolHandlers.isEmpty }) else { return }
+        let row = try? client.codegen.query(
+            PrimitiveSession.primitiveSchema, filter: nil, options: options(limit: 1)
+        ).first
+        evaluateClientTools(session: row.flatMap(PrimitiveSession.init(row:)))
+    }
+
+    /// Start a handler for each call of the active turn that waits on this
+    /// member, read from the document rather than the window. Runs only when
+    /// the session row names the current user as the turn's initiator. Runs
+    /// on `work`.
+    private func evaluateClientTools(session: PrimitiveSession?) {
+        let turnId = session?.activeTurnId
+        let proceed: Bool = lock.withLock {
+            guard !closed, !toolHandlers.isEmpty else { return false }
+            answeredCalls = answeredCalls.filter { $0.value == turnId }
+            failedCalls = failedCalls.filter { $0.value.turnId == turnId }
+            return true
+        }
+        guard proceed, let turnId, let userId = client.userId,
+              session?.activeTurnInitiatorUserId == userId
+        else { return }
+        let codegen = client.codegen
+        guard let messages = try? codegen.query(
+            PrimitiveMessage.primitiveSchema, filter: ["turnId": .string(turnId)], options: options()
+        ) else { return }
+        let messageIds = messages.compactMap(PrimitiveMessage.init(row:)).map(\.id).sorted()
+        var parts: [PrimitivePart] = []
+        for chunk in Self.chunks(messageIds, Self.inChunk) {
+            guard let rows = try? codegen.query(
+                PrimitivePart.primitiveSchema,
+                filter: ["messageId": ["$in": .array(chunk.map { .string($0) })], "kind": "tool_call"],
+                options: options()
+            ) else { return }
+            parts.append(contentsOf: rows.compactMap(PrimitivePart.init(row:)))
+        }
+        let starts: [(AgentClientToolDecisions.EligibleCall, ClientToolRegistration, UUID)] = lock.withLock {
+            guard !closed else { return [] }
+            var starts: [(AgentClientToolDecisions.EligibleCall, ClientToolRegistration, UUID)] = []
+            let registered = Set(toolHandlers.keys)
+            for part in parts.sorted(by: { ($0.seq, $0.id) < ($1.seq, $1.id) }) {
+                guard let callId = part.toolCallId else { continue }
+                if let state = part.state, AgentClientToolDecisions.terminalStates.contains(state) {
+                    answeredCalls[callId] = nil
+                }
+                if let failed = failedCalls[callId], failed.state != part.state { failedCalls[callId] = nil }
+                guard let call = AgentClientToolDecisions.eligibleCall(part: part, registered: registered),
+                      runningCalls[callId] == nil, answeredCalls[callId] == nil, failedCalls[callId] == nil,
+                      let registration = toolHandlers[call.toolName]
+                else { continue }
+                let runId = UUID()
+                runningCalls[callId] = RunningClientTool(id: runId, task: nil)
+                runningOrder.append(callId)
+                starts.append((call, registration, runId))
+            }
+            return starts
+        }
+        guard !starts.isEmpty else { return }
+        for (call, registration, runId) in starts {
+            let task = runClientTool(call, turnId: turnId, registration: registration, runId: runId)
+            let stillRunning: Bool = lock.withLock {
+                guard runningCalls[call.callId]?.id == runId else { return false }
+                runningCalls[call.callId]?.task = task
+                return true
+            }
+            if !stillRunning { task.cancel() }
+        }
+        notify()
+    }
+
+    /// Run one call's handler and answer it; refusals are read by
+    /// `AgentClientToolDecisions.classifyAnswerFailure`.
+    private func runClientTool(
+        _ call: AgentClientToolDecisions.EligibleCall, turnId: String, registration: ClientToolRegistration,
+        runId: UUID
+    ) -> Task<Void, Never> {
+        let request = AgentClientToolCall(
+            sessionId: sessionId, turnId: turnId, callId: call.callId, messageId: call.messageId,
+            partId: call.partId, toolName: call.toolName, input: call.input ?? .null
+        )
+        return Task { [weak self] in
+            let answer: AgentCallAnswer
+            do {
+                answer = try await registration.handler.answer(request)
+            } catch {
+                answer = .error(message: AgentClientToolDecisions.errorMessage(of: error))
+            }
+            guard let self, !Task.isCancelled, !self.lock.withLock({ self.closed }) else { return }
+            do {
+                _ = try await self.api.answer(sessionId: self.sessionId, callId: call.callId, answer)
+                self.lock.withLock { self.answeredCalls[call.callId] = turnId }
+            } catch {
+                guard !self.lock.withLock({ self.closed }) else { return }
+                let failure = AgentClientToolDecisions.classifyAnswerFailure(error)
+                switch failure {
+                case let .lost(code):
+                    if code == "AGENT_CALL_ANSWERED" {
+                        self.lock.withLock { self.answeredCalls[call.callId] = turnId }
+                    }
+                case let .refused(code, message):
+                    self.lock.withLock { self.failedCalls[call.callId] = (turnId, call.state) }
+                    registration.onError?(AgentClientToolError(
+                        callId: call.callId, toolName: call.toolName, turnId: turnId, code: code,
+                        message: message, error: error
+                    ))
+                case let .transport(message):
+                    registration.onError?(AgentClientToolError(
+                        callId: call.callId, toolName: call.toolName, turnId: turnId, code: nil,
+                        message: message, error: error
+                    ))
+                }
+            }
+            let settled: Bool = self.lock.withLock {
+                guard self.runningCalls[call.callId]?.id == runId else { return false }
+                self.runningCalls[call.callId] = nil
+                self.runningOrder.removeAll { $0 == call.callId }
+                return true
+            }
+            if settled { self.notify() }
+        }
     }
 
     private func loadOlderNow() throws -> AgentSessionLoadOlderResult {

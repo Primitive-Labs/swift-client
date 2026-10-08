@@ -97,7 +97,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
         // conformance was unchecked while it held `[String: Any]`. So a `meta`
         // that arrives through the options struct is already `JSONValue`-shaped
         // and cannot be made exact here; a `meta` passed positionally (the
-        // generic `start` and both `runSync` overloads) never goes near
+        // generic `start` overload) never goes near
         // `JSONValue`. Both the CHANGELOG and the migration guide record which
         // form is which; closing the gap needs a `JSONValue` integer case.
         //
@@ -174,47 +174,6 @@ public final class WorkflowsAPI: @unchecked Sendable {
         )
     }
 
-    /// Synchronously run a workflow and wait for its terminal status (#728/#956).
-    /// Mirrors js-bao's `workflows.runSync`. The result envelope carries the
-    /// terminal `status` (`completed`/`failed`/`terminated`/`timeout`/
-    /// `apply_pending`); only transport/connectivity errors throw.
-    ///
-    /// - Parameter timeout: hard wall-clock ceiling in **seconds** (renamed
-    ///   from `timeoutMs` in #2367; the wire field is still `timeoutMs`).
-    ///   Defaults server-side to 5s, capped at 30s. On exceed the run resolves
-    ///   with `status == "timeout"`.
-    ///
-    /// (Swift omits the JS `AbortSignal` — the JS transport doesn't wire it
-    /// through either; cancel via the surrounding `Task` and read final state
-    /// with `getStatus` if needed.)
-    public func runSync(
-        workflowKey: String,
-        input: [String: Any] = [:],
-        runKey: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: Any]? = nil,
-        timeout: TimeInterval? = nil
-    ) async throws -> RunSyncWorkflowResult {
-        let encodedKey = URLEncoding.encodeComponent(workflowKey)
-        // Same reasoning as `start`: `input`/`meta` are opaque caller data, so
-        // the bytes are composed here rather than passed through `JSONValue`.
-        var payload: [String: Any] = ["rootInput": input]
-        if let runKey { payload["runKey"] = runKey }
-        if let contextDocId { payload["contextDocId"] = contextDocId }
-        if let meta { payload["meta"] = meta }
-        // The Swift parameter is a `TimeInterval` (#2367); the wire field
-        // stays `timeoutMs`, so convert here rather than renaming the key.
-        if let timeout, timeout > 0 {
-            payload["timeoutMs"] = timeout.wholeMilliseconds
-        }
-        let bodyData = try JSONSerialization.data(withJSONObject: payload, options: [])
-        return try await transport.request(
-            method: .post,
-            path: "/workflows/\(encodedKey)/run-sync",
-            bodyData: bodyData
-        )
-    }
-
     /// Gets the status of a workflow run. Mirrors the JS client's
     /// `getStatus` — returns a decoded `WorkflowStatusResult` (#954) whose
     /// `status` is the server's reconciled run status and `run` is the DB
@@ -252,47 +211,12 @@ public final class WorkflowsAPI: @unchecked Sendable {
     // path. `input` is optional so an omitted input sends `{}` (parity with the
     // JS client's `input ?? {}`).
 
-    /// Synchronously run a workflow with a typed `Codable` input and a typed
-    /// `Output`. Mirrors the JS `runSync<I, O>`. Returns a `RunSyncResult<Output>`
-    /// whose `output` is decoded into `Output`; only transport errors throw.
-    public func runSync<Input: Encodable, Output: Decodable & Sendable>(
-        workflowKey: String,
-        input: Input?,
-        runKey: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: Any]? = nil,
-        timeout: TimeInterval? = nil
-    ) async throws -> RunSyncResult<Output> {
-        let encoded = try Self.encodeInputObject(input)
-        let untyped = try await runSync(
-            workflowKey: workflowKey,
-            input: encoded,
-            runKey: runKey,
-            contextDocId: contextDocId,
-            meta: meta,
-            timeout: timeout
-        )
-        return RunSyncResult(
-            runId: untyped.runId,
-            runKey: untyped.runKey,
-            status: untyped.status,
-            output: try Self.decodeTypedOutput(untyped.output),
-            error: untyped.error,
-            run: untyped.run,
-            existing: untyped.existing,
-            // #2636 — the typed envelope mirrors every field of the untyped
-            // one, so an app on the generated invokers can branch on the reason
-            // an elided run did not run.
-            skipReason: untyped.skipReason
-        )
-    }
-
     /// Start a workflow with a typed `Codable` input. Mirrors the JS
     /// `start<I>` — the start result (`StartWorkflowResult`) is not output-typed
     /// on either client, so only the input is generic here.
     ///
     /// `meta` is `[String: Any]` and reaches the wire untouched, so an `Int64`
-    /// past 2^53 stays exact. Use this form (or `runSync`) rather than
+    /// past 2^53 stays exact. Use this form rather than
     /// `StartWorkflowOptions.meta` when you pass large integer IDs.
     @discardableResult
     public func start<Input: Encodable>(
@@ -604,8 +528,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
     /// Every exit path clears the timer and cancels both event subscriptions.
     ///
     /// - Note: reconcile deliberately uses the runId-keyed status endpoint, never
-    ///   the runKey-keyed `getStatus`. Keying on `runId` avoids the runKey
-    ///   route's history of answering 404 for a `runSync` run.
+    ///   the runKey-keyed `getStatus`.
     public func waitFor(
         runId: String,
         options: WaitForWorkflowOptions? = nil
@@ -751,8 +674,7 @@ public final class WorkflowsAPI: @unchecked Sendable {
     }
 
     /// Typed generic overload of `waitFor` — decodes the run's opaque `output`
-    /// blob into `Output`. Mirrors the `getStatus<Output>` / `runSync<Output>`
-    /// overloads. `output` is `nil` when absent or when `status != "completed"`.
+    /// blob into `Output`. Mirrors the `getStatus<Output>` overload. `output` is `nil` when absent or when `status != "completed"`.
     public func waitFor<Output: Decodable & Sendable>(
         runId: String,
         as outputType: Output.Type,

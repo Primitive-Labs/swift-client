@@ -46,8 +46,6 @@ public final class JsBaoClient: @unchecked Sendable {
     public let groups: GroupsAPI
     public let ruleSets: RuleSetsAPI
     public let groupTypeConfigs: GroupTypeConfigsAPI
-    public let integrations: IntegrationsAPI
-    public let prompts: PromptsAPI
     public let workflows: WorkflowsAPI
     /// Server functions (invoke / start / getStatus / waitFor / terminate).
     /// A request function answers its result; a task function answers a run
@@ -688,13 +686,6 @@ public final class JsBaoClient: @unchecked Sendable {
         self.groups = GroupsAPI(transport: gatedTransport)
         self.ruleSets = RuleSetsAPI(transport: gatedTransport)
         self.groupTypeConfigs = GroupTypeConfigsAPI(transport: gatedTransport)
-        // IntegrationsAPI needs the full HttpClientResponse to surface
-        // upstream status / headers / typed error mapping (the proxy
-        // envelope puts the upstream status in the body and the proxy's
-        // OWN status in the response status), so it uses
-        // `Transport.requestRaw`, which does not throw on a non-2xx status.
-        self.integrations = IntegrationsAPI(transport: gatedTransport)
-        self.prompts = PromptsAPI(transport: gatedTransport)
         self.invitations = InvitationsAPI(transport: gatedTransport)
         self.notifications = NotificationsAPI(transport: gatedTransport)
         self.locks = LocksAPI(transport: gatedTransport)

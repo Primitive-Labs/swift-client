@@ -15,8 +15,9 @@ import XCTest
 ///   - behavior 14: `<Key>Input`/`<Key>Output` encode → JSON → decode → equal,
 ///     and a server-shaped JSON fixture decodes into the generated type.
 ///   - behavior 15: the generated invoker binds `<Key>Input`/`<Key>Output` over
-///     the additive generic `WorkflowsAPI` overloads, `runSync` only for
-///     `syncCallable` workflows. The compile of `Generated/` + `bindingsCompile`
+///     the additive generic `WorkflowsAPI` overloads; no invoker carries a
+///     `runSync` member (the client door retired with #3188). The compile of
+///     `Generated/` + `bindingsCompile`
 ///     below is the binding proof; the generic overloads are exercised live
 ///     against a recording transport.
 final class WorkflowCodegenAcceptanceTests: XCTestCase {
@@ -97,43 +98,6 @@ final class WorkflowCodegenAcceptanceTests: XCTestCase {
 
     // MARK: - Behavior 15: generic WorkflowsAPI overloads (published surface)
 
-    func test_genericRunSync_typedInputAndOutput() async throws {
-        let transport = RecordingTransport(json: #"""
-        {"runId":"run_1","runKey":"rk_1","status":"completed",
-         "output":{"checkoutUrl":"https://pay.example/abc"}}
-        """#)
-        let result: RunSyncResult<CreateCheckoutSessionOutput> =
-            try await api(transport).runSync(
-                workflowKey: "create-checkout-session",
-                input: CreateCheckoutSessionInput(priceId: "price_123")
-            )
-        let call = try XCTUnwrap(transport.lastCall)
-        XCTAssertEqual(call.method, .post)
-        XCTAssertEqual(call.path, "/workflows/create-checkout-session/run-sync")
-        // Typed input was encoded into the opaque `rootInput` object.
-        let rootInput = try XCTUnwrap(call.jsonBody?["rootInput"])
-        XCTAssertEqual(rootInput["priceId"]?.stringValue, "price_123")
-        // Typed output decoded from the opaque `output` blob.
-        XCTAssertEqual(result.status, "completed")
-        XCTAssertEqual(result.output?.checkoutUrl, "https://pay.example/abc")
-    }
-
-    func test_genericRunSync_oneOfOutput() async throws {
-        let transport = RecordingTransport(json: #"""
-        {"runId":"run_2","runKey":"rk_2","status":"completed",
-         "output":{"kind":"bank","accountId":"acct_9"}}
-        """#)
-        let result: RunSyncResult<ProcessPaymentOutput> =
-            try await api(transport).runSync(
-                workflowKey: "process-payment",
-                input: ProcessPaymentInput(amount: 42)
-            )
-        guard case let .bank(branch) = result.output else {
-            return XCTFail("expected .bank branch decoded from generic runSync")
-        }
-        XCTAssertEqual(branch.accountId, "acct_9")
-    }
-
     func test_genericGetStatus_typedOutput() async throws {
         let transport = RecordingTransport(json: #"""
         {"status":{"status":"completed","output":{"checkoutUrl":"https://x"}},
@@ -177,17 +141,12 @@ final class WorkflowCodegenAcceptanceTests: XCTestCase {
 
 /// Compile-only proof (behavior 15) that the committed invoker factories bind
 /// `<Key>Input`/`<Key>Output` over the generic `WorkflowsAPI` overloads. Never
-/// executed — being COMPILED is the assertion. `runSync` is referenced only for
-/// the `syncCallable` workflows (`create-checkout-session`, `process-payment`);
-/// the async-only ones (`import-csv`, `update-profile`) expose `start` +
-/// `getStatus` only — the generator does not emit `runSync` for them, which the
-/// TS golden asserts negatively.
+/// executed — being COMPILED is the assertion. Every invoker exposes `start`,
+/// `getStatus` and `terminate`; none carries `runSync` (#3188), which the TS
+/// golden asserts negatively.
 @available(*, unavailable)
 private func _acceptanceInvokerBindingsCompile(_ client: JsBaoClient) async throws {
     let checkout = createCheckoutSession(client)
-    let checkoutOut: RunSyncResult<CreateCheckoutSessionOutput> =
-        try await checkout.runSync(input: CreateCheckoutSessionInput(priceId: "p"))
-    _ = checkoutOut.output?.checkoutUrl
     let checkoutStatus: WorkflowStatus<CreateCheckoutSessionOutput> =
         try await checkout.getStatus(runKey: "rk")
     _ = checkoutStatus.output
@@ -228,12 +187,11 @@ private func _acceptanceInvokerBindingsCompile(_ client: JsBaoClient) async thro
     }
 
     let payment = processPayment(client)
-    let paymentOut: RunSyncResult<ProcessPaymentOutput> =
-        try await payment.runSync(input: ProcessPaymentInput(amount: 1))
-    _ = paymentOut.output
+    let paymentStatus: WorkflowStatus<ProcessPaymentOutput> =
+        try await payment.getStatus(runKey: "rk")
+    _ = paymentStatus.output
 
-    // Async-only invokers: start + getStatus, input optional (schema-less /
-    // typed) — no runSync member exists to call.
+    // Input optional (schema-less / typed).
     let importer = importCsv(client)
     _ = try await importer.start(input: nil)
     _ = try await importer.getStatus(runKey: "rk")

@@ -596,37 +596,6 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/databases/db1/group-permissions")
     }
 
-    func test_databases_executeBatch_path() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["imported": 1, "failed": 0]
-        _ = try await api.executeBatch(
-            databaseId: "db1", operationName: "save",
-            batch: [DatabaseBatchOperation(params: .object(["id": .string("1")]))]
-        )
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/databases/db1/operations/save/batch")
-        let body = r.body as? [String: Any]
-        XCTAssertNotNil(body?["batch"])
-    }
-
-    func test_databases_importRows_batchesAndSumsResults() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["imported": 1, "failed": 0]
-        let rows: [[String: JSONValue]] = [
-            ["id": .string("1")], ["id": .string("2")], ["id": .string("3")],
-            ["id": .string("4")], ["id": .string("5")],
-        ]
-        let result = try await api.importRows(
-            databaseId: "db1", operationName: "save",
-            rows: rows, batchSize: 2
-        )
-        // 5 rows / batchSize 2 → 3 batches; stub returns imported:1 each
-        // call, so total is 3.
-        XCTAssertEqual(result.imported, 3)
-    }
-
     // MARK: - WorkflowsAPI options threading
 
     func test_workflows_start_forceRerunSerializes() async throws {

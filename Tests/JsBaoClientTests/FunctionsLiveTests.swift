@@ -306,19 +306,26 @@ final class FunctionsLiveTests: XCTestCase {
             appId: testApp.appId,
             workflowKey: workflowKey,
             steps: [["id": "n", "kind": "noop", "message": "hi", "saveAs": "output"]],
-            requiresClientApply: false,
-            syncCallable: true
+            requiresClientApply: false
         )
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
 
-        let run = try await client.workflows.runSync(
+        // Started and waited for: the synchronous door this case used
+        // retired with #3188. The wait polls the runId route (shared by DSL
+        // runs): `workflows.waitFor` settles on a socket frame, and this
+        // suite's client never connects its socket.
+        let started = try await client.workflows.start(StartWorkflowOptions(
             workflowKey: workflowKey,
             runKey: "swift-slice-dsl-run",
             contextDocId: docId
+        ))
+        let settled = try await client.functions.waitFor(
+            runId: started.runId,
+            options: FunctionWaitOptions(timeout: 60)
         )
-        XCTAssertEqual(run.status, "completed")
+        XCTAssertEqual(settled.status, "completed")
 
-        let status = try await client.functions.getStatus(runId: run.runId)
+        let status = try await client.functions.getStatus(runId: started.runId)
         XCTAssertNil(status.slice, "a DSL run has no slice record")
     }
 

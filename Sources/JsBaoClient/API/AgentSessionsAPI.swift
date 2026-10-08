@@ -5,8 +5,8 @@ import Foundation
 /// Agents, available as `client.agents`. Mirrors the JS client's
 /// `client.agents` (#3810).
 public final class AgentsAPI: @unchecked Sendable {
-    /// Agent sessions: list, get, open, send, answer, cancel, events, rename,
-    /// delete and members.
+    /// Agent sessions: list, get, open, send, answer, cancel, events, mark
+    /// read, rename, delete and members.
     public let sessions: AgentSessionsAPI
 
     /// Designated initializer — the typed transport spine. A sessions API
@@ -27,8 +27,8 @@ public final class AgentsAPI: @unchecked Sendable {
 ///
 /// A session is created by a server function (`ctx.agents.createSession`);
 /// from a client you list the sessions you own or belong to, open one as a
-/// live view, send messages, answer calls, record events and cancel a turn,
-/// and — as its owner — rename it, delete it and manage its members. App
+/// live view, send messages, answer calls, record events, cancel a turn and
+/// mark a session read, and — as its owner — rename it, delete it and manage its members. App
 /// owners and admins may also list any user's sessions and get or delete any
 /// session.
 ///
@@ -160,6 +160,19 @@ public final class AgentSessionsAPI: @unchecked Sendable {
             method: .post,
             path: try Self.sessionPath(sessionId) + "/cancel",
             body: ["turnId": turnId]
+        )
+    }
+
+    /// Mark a session read for the signed-in user (the owner, a participant
+    /// or a viewer): its `hasUnread` is `false` in `list` and `get`, on every
+    /// device, until the next activity. Call it when the user opens the
+    /// session; an open view's `markRead()` does the same and updates its
+    /// `info`. An app owner or admin who is not in the session is refused
+    /// with `AGENT_SESSION_MEMBER_ONLY`.
+    @discardableResult
+    public func markRead(sessionId: String) async throws -> AgentSessionReadResult {
+        try await transport.request(
+            method: .post, path: try Self.sessionPath(sessionId) + "/read", body: [String: String]()
         )
     }
 

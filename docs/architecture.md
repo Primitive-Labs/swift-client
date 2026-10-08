@@ -47,7 +47,7 @@ The main class wires everything together and exposes the public API. It owns ins
 
 Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource:
 
-`CollectionsAPI`, `DatabasesAPI`, `DocumentsAPI`, `GroupsAPI`, `GroupTypeConfigsAPI`, `IntegrationsAPI`, `MeAPI`, `PromptsAPI`, `RuleSetsAPI`, `SessionAPI`, `UsersAPI`
+`CollectionsAPI`, `DatabasesAPI`, `DocumentsAPI`, `GroupsAPI`, `GroupTypeConfigsAPI`, `MeAPI`, `RuleSetsAPI`, `SessionAPI`, `UsersAPI`
 
 ### `Storage/`
 

@@ -73,11 +73,13 @@ public struct DBCountResult: Codable, Sendable, Equatable {
     }
 }
 
-/// An `aggregate` op returns a single result object.
+/// An `aggregate` op returns one row per group: each row carries `group`
+/// (one entry per `groupBy` level) beside its operation values (`count`,
+/// `<op>_<field>`).
 public struct DBAggregateResult: Codable, Sendable, Equatable {
-    public var result: [String: JSONValue]
+    public var result: [[String: JSONValue]]
 
-    public init(result: [String: JSONValue]) {
+    public init(result: [[String: JSONValue]]) {
         self.result = result
     }
 }

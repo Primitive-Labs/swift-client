@@ -2,10 +2,8 @@ import XCTest
 @testable import JsBaoClient
 
 /// Database CRUD and permissions against the live server. (The CEL-context
-/// metadata cases this file once ported were removed with the surface, #3991.)
-///
-/// The timing suite (js-bao-client-database-timing.test.ts) is ported in
-/// `DatabaseOperationTimingLiveTests.swift`, not here.
+/// metadata cases this file once ported were removed with the surface, #3991;
+/// the operation timing suite left with the execute door, #3188.)
 final class DatabaseTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

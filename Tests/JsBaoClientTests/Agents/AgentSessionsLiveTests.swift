@@ -140,7 +140,9 @@ final class AgentSessionsLiveTests: XCTestCase {
         _ = await expectServerCode("AGENT_TURN_STALE") {
             _ = try await partC.agents.sessions.cancel(sessionId: s.sessionId, turnId: PrimitiveSchemaRegistry.generateULID())
         }
-        _ = await expectServerCode("AGENT_SESSION_LIST_USER_FORBIDDEN") {
+        // #4142: listing another user's sessions is refused with the shared
+        // subject-user code.
+        _ = await expectServerCode("SUBJECT_USER_FORBIDDEN") {
             _ = try await partC.agents.sessions.list(options: ListAgentSessionsOptions(userId: h.owner.userId))
         }
         _ = await expectServerCode("AGENT_SESSION_CONTEXT_NOT_ALLOWED") {
@@ -665,5 +667,34 @@ final class AgentSessionsLiveTests: XCTestCase {
         XCTAssertEqual(failed.error?.code, "AGENT_SESSION_RATE_LIMITED")
         XCTAssertNotNil(failed.error?.retryAfter)
         _ = try? await view.cancel()
+    }
+
+    // MARK: - #4256: the unread dot
+
+    func testMarkReadClearsTheDotInListAndGetForTheCallerAlone() async throws {
+        let s = try await h.createSession(h.plain, participants: [h.part], viewers: [h.viewer])
+        let partC = try await h.client(h.part)
+        let viewerC = try await h.client(h.viewer)
+        let adminC = try await h.client(h.admin)
+        let options = ListAgentSessionsOptions(limit: 100)
+
+        let before = try await partC.agents.sessions.list(options: options)
+        XCTAssertEqual(before.items.first { $0.sessionId == s.sessionId }?.hasUnread, true, "never marked")
+
+        let marked = try await partC.agents.sessions.markRead(sessionId: s.sessionId)
+        XCTAssertEqual(marked.sessionId, s.sessionId)
+        let after = try await partC.agents.sessions.list(options: options)
+        let item = try XCTUnwrap(after.items.first { $0.sessionId == s.sessionId })
+        XCTAssertFalse(item.hasUnread)
+        XCTAssertEqual(item.lastReadAt, marked.lastReadAt)
+        let info = try await partC.agents.sessions.get(sessionId: s.sessionId)
+        XCTAssertFalse(info.hasUnread)
+        XCTAssertEqual(info.lastReadAt, marked.lastReadAt)
+
+        let viewerInfo = try await viewerC.agents.sessions.get(sessionId: s.sessionId)
+        XCTAssertTrue(viewerInfo.hasUnread, "another member's dot is theirs")
+        _ = await expectServerCode("AGENT_SESSION_MEMBER_ONLY") {
+            _ = try await adminC.agents.sessions.markRead(sessionId: s.sessionId)
+        }
     }
 }

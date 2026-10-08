@@ -162,6 +162,13 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
     public let scope: String?
     /// ISO-8601; `nil` when the session's listing entry is missing.
     public let lastActivityAt: String?
+    /// Whether you have activity in this session you have not marked read
+    /// (`markRead`): an agent's answer or pause, a turn's end, or another
+    /// member's message or event. Always `false` for an app owner or admin
+    /// who is not in the session; `false` when the server does not send it.
+    public internal(set) var hasUnread: Bool
+    /// When you last marked the session read (ISO-8601), or `nil`.
+    public internal(set) var lastReadAt: String?
     public let members: AgentSessionMembers
     public let role: AgentSessionRole
     /// Decided from the session object, never the session row. Open: a status
@@ -180,7 +187,7 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case sessionId, agentKey, documentId, ownerUserId, createdAt, title, scope
-        case lastActivityAt, members, role, status, turn, object, turnContexts, lastTurn
+        case lastActivityAt, hasUnread, lastReadAt, members, role, status, turn, object, turnContexts, lastTurn
     }
 
     public init(from decoder: Decoder) throws {
@@ -193,6 +200,8 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
         title = try c.decodeIfPresent(String.self, forKey: .title)
         scope = try c.decodeIfPresent(String.self, forKey: .scope)
         lastActivityAt = try c.decodeIfPresent(String.self, forKey: .lastActivityAt)
+        hasUnread = try c.decodeIfPresent(Bool.self, forKey: .hasUnread) ?? false
+        lastReadAt = try c.decodeIfPresent(String.self, forKey: .lastReadAt)
         members = try c.decode(AgentSessionMembers.self, forKey: .members)
         role = try c.decode(AgentSessionRole.self, forKey: .role)
         status = PrimitiveSessionStatus(rawValue: try c.decode(String.self, forKey: .status))
@@ -226,6 +235,33 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
     /// ISO-8601.
     public let lastActivityAt: String
     public let createdAt: String?
+    /// Whether the listed user has activity in this session they have not
+    /// marked read: an agent's answer or pause, a turn's end, or another
+    /// member's message or event. Their own never count. `false` when the
+    /// server does not send it.
+    public let hasUnread: Bool
+    /// When the listed user last marked the session read (ISO-8601), or `nil`.
+    public let lastReadAt: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId, agentKey, scope, documentId, ownerUserId, role, title
+        case lastActivityAt, createdAt, hasUnread, lastReadAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        agentKey = try c.decode(String.self, forKey: .agentKey)
+        scope = try c.decodeIfPresent(String.self, forKey: .scope)
+        documentId = try c.decode(String.self, forKey: .documentId)
+        ownerUserId = try c.decode(String.self, forKey: .ownerUserId)
+        role = try c.decode(AgentSessionRole.self, forKey: .role)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        lastActivityAt = try c.decode(String.self, forKey: .lastActivityAt)
+        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+        hasUnread = try c.decodeIfPresent(Bool.self, forKey: .hasUnread) ?? false
+        lastReadAt = try c.decodeIfPresent(String.self, forKey: .lastReadAt)
+    }
 }
 
 /// Filters and paging for `client.agents.sessions.list`.
@@ -395,6 +431,13 @@ public struct AgentCallAnswerResult: Decodable, Sendable, Equatable {
     }
 }
 
+/// What `markRead` answers.
+public struct AgentSessionReadResult: Codable, Sendable, Equatable {
+    public let sessionId: String
+    /// Your read marker now (ISO-8601).
+    public let lastReadAt: String
+}
+
 /// What `cancel` answers.
 public struct AgentSessionCancelResult: Codable, Sendable, Equatable {
     public let turnId: String
@@ -439,4 +482,130 @@ public struct AgentSessionEventResult: Codable, Sendable, Equatable {
     public let messageId: String
     public let seq: Double
     public let duplicate: Bool?
+}
+
+// MARK: - Client-tool handlers
+
+/// A call a client-tool handler runs: the call's ids and its input.
+public struct AgentClientToolCall<Input: Sendable>: Sendable {
+    public let sessionId: String
+    public let turnId: String
+    /// The call, the tool call part's `toolCallId`.
+    public let callId: String
+    public let messageId: String
+    public let partId: String
+    public let toolName: String
+    public let input: Input
+
+    public init(
+        sessionId: String, turnId: String, callId: String, messageId: String, partId: String,
+        toolName: String, input: Input
+    ) {
+        self.sessionId = sessionId
+        self.turnId = turnId
+        self.callId = callId
+        self.messageId = messageId
+        self.partId = partId
+        self.toolName = toolName
+        self.input = input
+    }
+}
+
+/// What a client-tool handler returns: the call's output, and an optional
+/// artifact.
+public struct AgentClientToolResult<Output: Sendable>: Sendable {
+    public var output: Output
+    public var artifact: JSONValue?
+
+    public init(output: Output, artifact: JSONValue? = nil) {
+        self.output = output
+        self.artifact = artifact
+    }
+}
+
+/// Runs a client tool's call for `AgentSessionView.handleClientTools`.
+/// Return the output; throw to answer the call with the error's message.
+///
+/// Build it untyped over `JSONValue`, or with `typed` over the generated
+/// `<Key>Tool<Name>Input` and `<Key>Tool<Name>Output` types (or any
+/// `Decodable` input and `Encodable` output).
+public struct AgentClientToolHandler: Sendable {
+    private let run: @Sendable (AgentClientToolCall<JSONValue>) async throws -> AgentCallAnswer
+
+    /// A handler over the part's `input` as `JSONValue`, answering with a
+    /// `JSONValue` output.
+    public init(
+        _ run: @escaping @Sendable (AgentClientToolCall<JSONValue>) async throws -> AgentClientToolResult<JSONValue>
+    ) {
+        self.run = { call in
+            let result = try await run(call)
+            return .output(result.output, artifact: result.artifact)
+        }
+    }
+
+    private init(answering run: @escaping @Sendable (AgentClientToolCall<JSONValue>) async throws -> AgentCallAnswer) {
+        self.run = run
+    }
+
+    /// A handler whose input is decoded into `Input` and whose output is
+    /// encoded from `Output`. An input that does not decode, or an output
+    /// that does not encode, answers the call with the error.
+    public static func typed<Input: Decodable & Sendable, Output: Encodable & Sendable>(
+        _ run: @escaping @Sendable (AgentClientToolCall<Input>) async throws -> AgentClientToolResult<Output>
+    ) -> AgentClientToolHandler {
+        AgentClientToolHandler(answering: { call in
+            let input = try JSONCoding.decodeData(Input.self, from: JSONCoding.encodeData(call.input))
+            let result = try await run(AgentClientToolCall(
+                sessionId: call.sessionId, turnId: call.turnId, callId: call.callId,
+                messageId: call.messageId, partId: call.partId, toolName: call.toolName, input: input
+            ))
+            return try AgentCallAnswer.output(encoding: result.output, artifact: result.artifact)
+        })
+    }
+
+    /// The answer the handler gives `call`: its result, encoded. The whole
+    /// answer, artifact included, is encoded here, so a value the wire cannot
+    /// carry (a non-finite number, a failing `Encodable`) is a handler error,
+    /// never a failed request.
+    func answer(_ call: AgentClientToolCall<JSONValue>) async throws -> AgentCallAnswer {
+        let answer = try await run(call)
+        _ = try JSONCoding.encodeData(answer)
+        return answer
+    }
+}
+
+/// A client-tool answer that did not land, other than one lost to another
+/// answer.
+public struct AgentClientToolError: Sendable {
+    public let callId: String
+    public let toolName: String
+    public let turnId: String
+    /// The server's refusal code; `nil` for a network, offline or other
+    /// local failure.
+    public let code: String?
+    public let message: String
+    /// The error the answer failed with.
+    public let error: any Error
+
+    public init(callId: String, toolName: String, turnId: String, code: String?, message: String, error: any Error) {
+        self.callId = callId
+        self.toolName = toolName
+        self.turnId = turnId
+        self.code = code
+        self.message = message
+        self.error = error
+    }
+}
+
+/// Options for `AgentSessionView.handleClientTools`.
+public struct HandleClientToolsOptions: Sendable {
+    /// Hears every answer that failed, except one lost to another answer.
+    /// With a `code` the server refused it and the call is not run again
+    /// while its part is unchanged; without one the call runs again on the
+    /// next refresh or sync.
+    public var onError: (@Sendable (AgentClientToolError) -> Void)?
+
+    public init(onError: (@Sendable (AgentClientToolError) -> Void)? = nil) {
+        self.onError = onError
+    }
 }

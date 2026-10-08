@@ -1,6 +1,6 @@
 // AUTO-GENERATED FROM functions/order-sweep.toml — DO NOT EDIT.
 // Run `primitive functions codegen --lang swift` to regenerate.
-// fingerprint: 6c79c4c4a51de013
+// fingerprint: bfee94bccbb88909
 
 import Foundation
 import JsBaoClient

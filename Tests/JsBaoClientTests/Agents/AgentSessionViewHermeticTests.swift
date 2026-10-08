@@ -582,6 +582,28 @@ final class AgentSessionViewHermeticTests: XCTestCase {
         await view.close()
     }
 
+    func testMarkReadMarksTheSessionClearsTheDotAndNotifies() async throws {
+        let h = harness("mark-read")
+        let documentId = try await session(h, "s1")
+        h.script.set(.get, "/agent-sessions/s1", Self.info("s1", documentId: documentId).replacingOccurrences(
+            of: #""role":"owner","#, with: #""role":"owner","hasUnread":true,"lastReadAt":null,"#
+        ))
+        let view = try await open(h, "s1")
+        XCTAssertTrue(view.info.hasUnread)
+        let counter = Counter()
+        view.onChange { counter.increment() }
+        h.script.on(.post, "/agent-sessions/s1/read", #"{"sessionId":"s1","lastReadAt":"2026-10-02T00:00:09.000Z"}"#)
+        let marked = try await view.markRead()
+        XCTAssertEqual(marked.lastReadAt, "2026-10-02T00:00:09.000Z")
+        XCTAssertEqual(h.transport.lastCall?.path, "/agent-sessions/s1/read")
+        XCTAssertEqual(h.transport.lastCall?.jsonBody, [:])
+        XCTAssertFalse(view.info.hasUnread)
+        XCTAssertEqual(view.info.lastReadAt, "2026-10-02T00:00:09.000Z")
+        XCTAssertEqual(view.info.sessionId, "s1", "the rest of info is kept")
+        XCTAssertEqual(counter.count, 1)
+        await view.close()
+    }
+
     // MARK: - Behavior 18: rows that do not decode, page size
 
     func testAnUndecodableSessionRowLeavesSessionNilAndUnknownPartsAreListed() async throws {

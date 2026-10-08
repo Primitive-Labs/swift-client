@@ -20,6 +20,119 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: a local `aggregate` answers rows with a `group` (#4347)
+
+`aggregate` on a model (`DynamicModel`, `MultiDocModel`, a generated
+model's static `aggregate`) now answers the rows the JavaScript client
+answers: each row holds the `groupBy` values under `group`, and every
+operation's value beside it.
+
+```swift
+// before: ["category": "work", "count": 8]
+// after:  ["group": ["category": "work"], "count": 8]
+```
+
+- **Migrate:** read a group value as `row["group"]?["category"]` where you
+  read `row["category"]`. Operation values stay where they were
+  (`row["count"]`, `row["sum_estimatedHours"]`). An aggregate with no
+  `groupBy` is one row whose `group` is empty.
+- A membership key is written raw: `contains: "a-b"` is `has_tags_a-b`, no
+  longer `has_tags_a_b`.
+- Two `groupBy` entries that would share a key in `group` (the same field
+  twice, two identical memberships, or a field named like a membership key)
+  throw `JsBaoError(.invalidArgument)` with
+  `Ambiguous aggregation group keys: '<key>' names more than one groupBy level`.
+  A repeated membership used to come back as `has_<field>_<value>_1`.
+- A `groupBy` field named like an operation key (`count`, `sum_amount`) keeps
+  both values: the group value under `group`, the operation's beside it.
+- An operation with no value to report is present as `null` rather than
+  missing from the row.
+- `group` is the row's own key, so an operation whose `outputField` is
+  `group` throws `JsBaoError(.invalidArgument)` before anything is read; give
+  it another name.
+
+### Breaking: a registered `aggregate` operation's result is rows (#4265)
+
+`DBAggregateResult.result` is now `[[String: JSONValue]]`: one row per group,
+each with a `group` object holding the `groupBy` values and every operation's
+value beside it (`count`, `<op>_<field>`). `DoDb.aggregate` still returns a
+`JSONValue`, now an array of those rows.
+
+### Added: agent sessions show unseen activity in the list (#4256)
+
+`AgentSessionListItem` and `AgentSessionInfo` carry `hasUnread` and
+`lastReadAt`: whether the user has activity in the session they have not
+marked read (an agent's answer or pause, a turn's end, or another member's
+message or event) and when they last marked it. Mark a session read with
+`client.agents.sessions.markRead(sessionId:)`, or `view.markRead()` on an
+open session, which also updates the view's `info`. The mark is stored on the
+server, so it holds on every device; the user's own messages, events and
+cancels never make a session unread for them. `hasUnread` decodes as `false`
+when a server does not send it.
+
+### Breaking: `DeferredGrantListResult` drops the `grants` alias (#4282)
+
+#3985 removed the legacy list-envelope keys but missed this page type. The
+deprecated `grants` property and the `init(grants:nextCursor:hasMore:)`
+initializer are gone, and the decoder reads only `items`, `hasMore` and
+`nextCursor`. The server has sent only `items` since #3985, so `grants` was
+already an alias of `items`, not a key on the wire.
+
+Migration: read `page.items` where you read `page.grants`, and build pages
+with `init(items:nextCursor:hasMore:)`.
+
+### Breaking: `runSync`, `client.prompts`, `client.integrations` and the operation execute methods are removed (#3188)
+
+The client methods that called a member route for a one-request workflow run,
+a prompt, an integration or a registered database operation are gone with
+those routes. Each piece of work now runs inside a server function the app
+calls with `client.functions.invoke`:
+
+| Removed | Use instead |
+|---|---|
+| `client.workflows.runSync(...)` (both overloads), `RunSyncWorkflowResult`, `RunSyncResult<Output>` | `client.functions.invoke(...)` for a result in one request, or `client.workflows.start(...)` and `client.workflows.waitFor(runId:)` for a workflow run |
+| `client.prompts.execute(...)`, `PromptsAPI` and its option and result types | `ctx.prompts.run(...)` inside a function |
+| `client.integrations.call(...)`, `IntegrationsAPI` and its request and response types | `ctx.integrations.call(...)` inside a function |
+| `client.databases.executeOperation(...)` (both overloads), `ExecuteOperationOptions` | `ctx.db(...)` inside a function |
+| `client.databases.executeBatch(...)`, `client.databases.importRows(...)`, `client.databases.importCsv(...)`, `DatabaseBatchOperation`, `DatabaseBatchResult`, `CsvImportOptions`, `CsvImportResult` | write the rows from a function, or `primitive databases import-csv` |
+| `client.databases.listOperations(databaseId:)` | `primitive databases operations list` (owner or admin) |
+
+`createOperation`, `getOperation`, `updateOperation`, `deleteOperation` and
+`DatabaseOperationInfo` stay unchanged for now; they are removed together with
+database operations in a later release. The generated
+`workflows codegen --lang swift` invokers no longer carry `runSync`, and the
+generated `databases codegen --lang swift` files no longer carry an `Ops`
+factory.
+
+### Run an agent's client tools with `view.handleClientTools` (#4263)
+
+Register an `AgentClientToolHandler` per client tool on an `AgentSessionView`,
+and the view answers the tool's calls for you: when the active turn is the
+current user's, each call of a named tool that waits for its result runs its
+handler, and the handler's `AgentClientToolResult` answers it. Calls already
+waiting when you register, or found again when the session's document
+re-syncs after a reconnect, run too. Build a handler untyped over `JSONValue`,
+or with `AgentClientToolHandler.typed` over the generated
+`<Base>Tool<Name>Input` / `Output` types; an input that does not decode or an
+output that does not encode answers the call with the error.
+
+A thrown error answers the call with its message. A lost race is silent; any
+other failed answer reaches `HandleClientToolsOptions.onError`, with the
+server's `code` for a refusal and none for an offline or network failure,
+which runs again on the next refresh or re-sync. `runningClientToolCalls`
+lists the calls a handler is running now. `close()` cancels running handlers
+and sends no answer after it.
+
+### Fixed: a large document keeps writing when its epoch moves during a write (#4228)
+
+When the server refused a write it could not integrate just after it sealed
+the document's epoch, its `epoch.resync` named the epoch the seal opened, and
+the client stopped the document with `FORMAT2_RELOAD_REQUIRED` (plan
+`epoch.resync`). The client now asks the server for the document's epochs
+again and catches up onto that epoch, as it does when a seal leaves it behind,
+then goes on writing with no reload. When the sealed epoch was a bulk load, its
+unacknowledged writes wait for the new base instead of being sent across it.
+
 ### A large document's string sets are read sorted, and keep every spelling (#3881)
 
 A `stringset` field is a set, and a large document now returns its values in

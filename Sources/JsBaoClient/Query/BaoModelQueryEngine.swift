@@ -1161,7 +1161,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         return results.first?["COUNT(*)"]?.numberValue.map { Int($0) } ?? 0
     }
 
-    /// Execute an aggregation query. `scopedToDocId` restricts the
+    /// Execute an aggregation query, answering js-bao's rows (see
+    /// `AggregateOptions`). `scopedToDocId` restricts the
     /// underlying SELECT to rows from the named doc; omit to run
     /// across every doc that's written into this engine — that's
     /// how cross-doc aggregate works on a shared store.
@@ -1205,7 +1206,9 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 documents: Self.narrow(options.documents, to: documents)
             )
         )
-        return try executeQuery(sql, params: params)
+        return QueryTranslator.aggregationRows(
+            try executeQuery(sql, params: params), options: options
+        )
     }
 
     /// Two document scopes as one: neither may widen the other (finding

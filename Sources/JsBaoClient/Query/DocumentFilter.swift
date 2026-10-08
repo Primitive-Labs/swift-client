@@ -125,6 +125,23 @@ public enum AggregateGroupBy: Sendable, Equatable, ExpressibleByStringLiteral {
 }
 
 /// Options for aggregate operations.
+///
+/// `aggregate` answers one row per group, as js-bao does. Each row holds the
+/// `groupBy` values under `group`, keyed by the field name (or
+/// `has_<field>_<contains>` for a membership check) with the value as stored,
+/// and every operation's value beside it under its `resultKey`:
+///
+/// ```swift
+/// ["group": ["category": "work"], "count": 8, "sum_estimatedHours": 40]
+/// ```
+///
+/// An aggregate with no `groupBy` is one row with an empty `group`. Two
+/// levels that would share a key in `group` (the same field twice, or a field
+/// named like a membership key) throw `JsBaoError(.invalidArgument)`,
+/// `Ambiguous aggregation group keys: '<key>' names more than one groupBy
+/// level`, before anything is read.
+/// An operation whose `resultKey` is `group` throws
+/// `JsBaoError(.invalidArgument)` too: that key holds the group values.
 public struct AggregateOptions {
     /// Fields to group by
     public var groupBy: [AggregateGroupBy]

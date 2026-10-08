@@ -77,7 +77,7 @@ public struct FunctionInvokeResult: Decodable, Sendable {
 /// Typed twin of `FunctionInvokeResult`: the same envelope with `output`
 /// decoded into `Output`. `nil` when the output is absent or JSON `null`.
 /// Named separately because Swift does not let a generic and a non-generic
-/// type share a name — the `RunSyncWorkflowResult` / `RunSyncResult<Output>`
+/// type share a name — the `WorkflowStatusResult` / `WorkflowStatus<Output>`
 /// split.
 public struct FunctionResult<Output: Decodable & Sendable>: Sendable {
     public let status: String

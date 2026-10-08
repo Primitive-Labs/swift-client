@@ -203,26 +203,19 @@ public enum DeferredGrant: Decodable, Sendable, Equatable {
     }
 }
 
-/// A page of deferred grants. Mirrors JS `DeferredGrantListResult`.
-/// As of #1316 the server emits the unified `{ items, hasMore, nextCursor }`
-/// envelope with `grants` kept as a legacy alias of `items` for one
-/// deprecation window; the cursor is a real position token (previously a
-/// non-functional `"more"` sentinel).
+/// A page of deferred grants. Mirrors JS `DeferredGrantListResult`
+/// (`{ items, hasMore, nextCursor? }`). The cursor is a real position token
+/// (#1316).
 public struct DeferredGrantListResult: Decodable, Sendable, Equatable {
-    /// The page's grants — the unified list key (#1316, #1982). Mirrors JS
-    /// `DeferredGrantListResult.items`.
+    /// The page's grants. Mirrors JS `DeferredGrantListResult.items`.
     public let items: [DeferredGrant]
-    /// Deprecated alias of `items` kept for one deprecation window. Computed
-    /// from `items` so the type's own initializers never reference the
-    /// deprecated declaration.
-    @available(*, deprecated, message: "Use items.")
-    public var grants: [DeferredGrant] { items }
+    /// Continuation token for the next page (#1316).
     public let nextCursor: String?
     /// True when a next page exists (#1316).
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case grants, items, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(items: [DeferredGrant], nextCursor: String? = nil, hasMore: Bool? = nil) {
@@ -231,16 +224,9 @@ public struct DeferredGrantListResult: Decodable, Sendable, Equatable {
         self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
-    /// Deprecated spelling of ``init(items:nextCursor:hasMore:)``.
-    @available(*, deprecated, message: "Use init(items:nextCursor:hasMore:).")
-    public init(grants: [DeferredGrant], nextCursor: String? = nil, hasMore: Bool? = nil) {
-        self.init(items: grants, nextCursor: nextCursor, hasMore: hasMore)
-    }
-
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        items = try c.decodeIfPresent([DeferredGrant].self, forKey: .items)
-            ?? c.decodeIfPresent([DeferredGrant].self, forKey: .grants) ?? []
+        items = try c.decodeIfPresent([DeferredGrant].self, forKey: .items) ?? []
         nextCursor = try c.decodeIfPresent(String.self, forKey: .nextCursor)
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (nextCursor != nil)
     }

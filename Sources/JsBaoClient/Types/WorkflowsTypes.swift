@@ -76,9 +76,7 @@ public struct WorkflowRunInfo: Decodable, Sendable, Equatable {
     /// A durable run (`workflows.start()`) that aborted during setup, before
     /// any of its own steps ran, reads `"__setup__"` with
     /// `failedStepKind == "setup"` — a synthetic step, so it will not be found
-    /// in the workflow definition. The same abort on a `syncCallable` workflow
-    /// (`workflows.runSync()`) reads `nil` here, with the reason still in
-    /// `errorMessage`.
+    /// in the workflow definition.
     ///
     /// `nil` when the run did not fail, and for the failures that hold no step
     /// results at all: a run rejected at launch, a run reclaimed after its
@@ -569,89 +567,15 @@ public struct PendingApplyInfo: Decodable, Sendable, Equatable {
     }
 }
 
-// MARK: Run-sync
-
-/// Result envelope from `workflows.runSync` (#728/#956). All non-transport
-/// outcomes resolve with this shape; only connectivity errors `throw`.
-public struct RunSyncWorkflowResult: Decodable, Sendable {
-    public let runId: String
-    public let runKey: String
-    /// `completed` | `failed` | `terminated` | `timeout` | `apply_pending` |
-    /// `skipped`.
-    public let status: String
-    /// Final output when `status == "completed"`.
-    public let output: JSONValue?
-    /// Error message when `status == "failed"`.
-    public let error: String?
-    /// #2636 — why the workflow did not run, when `status == "skipped"`: its
-    /// declarative lock was held and the definition declared
-    /// `onContention: "ignore"`. The envelope then carries neither `output` nor
-    /// `error`.
-    public let skipReason: String?
-    /// Persisted run record (present on success).
-    public let run: WorkflowRunInfo?
-    /// `true` if `runKey` matched an existing run (no new execution occurred).
-    public let existing: Bool?
-}
-
 // MARK: - Typed workflow results (#1547, Phase 3)
 //
-// The generic `WorkflowsAPI` overloads (`runSync<Input,Output>` /
-// `getStatus<Output>`) return these typed envelopes: identical to the untyped
-// `RunSyncWorkflowResult` / `WorkflowStatusResult` above but with the opaque
-// `output` blob decoded into the generated `<Key>Output` type. They mirror the
-// JS client's `RunSyncWorkflowResult<O>` / `WorkflowStatusResult<O>` generics
-// (Swift structs cannot carry a defaulted generic parameter, so these are named
-// mirrors rather than the same symbol). Constructed by the API layer from the
+// The generic `WorkflowsAPI.getStatus<Output>` overload returns this typed
+// envelope: identical to the untyped `WorkflowStatusResult` above but with the
+// opaque `output` blob decoded into the generated `<Key>Output` type. It
+// mirrors the JS client's `WorkflowStatusResult<O>` generic (Swift structs
+// cannot carry a defaulted generic parameter, so this is a named mirror rather
+// than the same symbol). Constructed by the API layer from the
 // untyped result, so no bespoke decode logic diverges from the untyped path.
-
-/// Typed result envelope from the generic `workflows.runSync`. Mirrors JS
-/// `RunSyncWorkflowResult<O>` — every field matches `RunSyncWorkflowResult`
-/// except `output`, which is decoded into `Output`.
-public struct RunSyncResult<Output: Decodable & Sendable>: Sendable {
-    public let runId: String
-    public let runKey: String
-    /// `completed` | `failed` | `terminated` | `timeout` | `apply_pending` |
-    /// `skipped`.
-    public let status: String
-    /// Final output decoded into `Output` when `status == "completed"` (and the
-    /// server returned a non-null output); `nil` otherwise.
-    public let output: Output?
-    /// Error message when `status == "failed"`.
-    public let error: String?
-    /// #2636 — why the workflow did not run, when `status == "skipped"`: its
-    /// declarative lock was held and the definition declared
-    /// `onContention: "ignore"`. The result then carries neither `output` nor
-    /// `error`. Branch on this rather than on message text — the typed
-    /// envelope carries it for the same reason the untyped one does.
-    public let skipReason: String?
-    /// Persisted run record (present on success).
-    public let run: WorkflowRunInfo?
-    /// `true` if `runKey` matched an existing run (no new execution occurred).
-    public let existing: Bool?
-
-    public init(
-        runId: String,
-        runKey: String,
-        status: String,
-        output: Output?,
-        error: String?,
-        run: WorkflowRunInfo?,
-        existing: Bool?,
-        // Trailing with a default so the pre-#2636 memberwise call still
-        // compiles for anyone constructing one of these directly.
-        skipReason: String? = nil
-    ) {
-        self.runId = runId
-        self.runKey = runKey
-        self.status = status
-        self.output = output
-        self.error = error
-        self.run = run
-        self.existing = existing
-        self.skipReason = skipReason
-    }
-}
 
 /// Typed result of the generic `workflows.getStatus`. Mirrors JS
 /// `WorkflowStatusResult<O>` — same fields as `WorkflowStatusResult` except
@@ -784,7 +708,7 @@ public struct WaitForWorkflowResult: Sendable {
 /// `WaitForWorkflowResult` but with the opaque `output` blob decoded into
 /// `Output`. Named separately from `WaitForWorkflowResult` because Swift does
 /// not allow a generic and a non-generic type to share a name — same split as
-/// `RunSyncWorkflowResult` / `RunSyncResult<Output>`.
+/// `WorkflowStatusResult` / `WorkflowStatus<Output>`.
 public struct WaitForResult<Output: Decodable & Sendable>: Sendable {
     /// Terminal status of the run. Never `running`.
     public let status: String

@@ -76,7 +76,7 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// List pending deferred grants (admin/owner only). Grants are
     /// permissions/memberships created for users who haven't signed up
     /// yet — they activate when the user accepts the linked invitation.
-    /// Returns a typed `{ grants, nextCursor }` page; each grant is a
+    /// Returns a typed `{ items, hasMore, nextCursor? }` page; each grant is a
     /// `DeferredGrant` discriminated on `type`.
     ///
     /// - Parameters:

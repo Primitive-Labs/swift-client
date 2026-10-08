@@ -253,19 +253,15 @@ final class TestContext: @unchecked Sendable {
     /// `steps` under the workflow-config model) and activate it.
     /// Returns the workflowId. `requiresClientApply` defaults to true so
     /// the run parks in `apply_pending` until a client claims and applies.
-    /// `syncCallable` opts the workflow into `runSync` (mirrors the JS
-    /// `createSyncWorkflow` helper in
-    /// tests/client/js-bao-client-workflow-runSync.test.ts — which, like
-    /// this helper, does not go near the legacy publish endpoint: it was
+    /// The helper does not go near the legacy publish endpoint: it was
     /// retired in #2768, and activation is the workflow's active
-    /// configuration).
+    /// configuration.
     @discardableResult
     func setupWorkflow(
         appId: String,
         workflowKey: String,
         steps: [[String: Any]],
-        requiresClientApply: Bool = true,
-        syncCallable: Bool = false
+        requiresClientApply: Bool = true
     ) async throws -> String {
         let createRes = try await adminPost(
             "/admin/api/apps/\(appId)/workflows",
@@ -276,7 +272,6 @@ final class TestContext: @unchecked Sendable {
                 // #2652: caller workflows must state who may start them.
                 "accessRule": "true",
                 "steps": steps,
-                "syncCallable": syncCallable,
             ]
         )
         guard let workflow = createRes["workflow"] as? [String: Any],
@@ -314,8 +309,11 @@ final class TestContext: @unchecked Sendable {
     /// the base64 TOML, sources and bundle plus the bundle's SHA-256
     /// `contentHash`. `bundle` is ESM whose default export is the handler.
     ///
-    /// `durable: true` makes it a task function (`mode = "task"`); the default
-    /// is a request function. `inputSchema` / `outputSchema` are the JSON
+    /// `durable` and `mode` name the runtime a caller had in mind, and are
+    /// not sent: a function has no runtime key since #3482 (the caller picks
+    /// it at each call), and since #3188 the server refuses a push whose TOML
+    /// or payload still carries `mode` or `durable`. The helper pushes what
+    /// the JS helper pushes. `inputSchema` / `outputSchema` are the JSON
     /// schemas the server validates against, when the case is about them.
     @discardableResult
     func pushFunction(
@@ -324,10 +322,7 @@ final class TestContext: @unchecked Sendable {
         bundle: String,
         access: String = "true",
         durable: Bool = false,
-        /// #3454 — `"request"`, `"task"` or `"any"`. Absent leaves the
-        /// pre-#3454 shape: the `durable` boolean alone, which is a LOCK
-        /// either way. An `any` push sends no `durable`, because a boolean
-        /// beside `mode = "any"` is the disagreement the server refuses.
+        /// #3454 — `"request"`, `"task"` or `"any"`; not sent (see above).
         mode: String? = nil,
         inputSchema: [String: Any]? = nil,
         outputSchema: [String: Any]? = nil
@@ -345,25 +340,18 @@ final class TestContext: @unchecked Sendable {
         }
 
         let entry = "functions/\(functionKey).ts"
-        var toml = "[function]\nkey = \"\(functionKey)\"\n"
-        if let mode, mode != "any" { toml += "mode = \"\(mode)\"\n" }
+        let toml = "[function]\nkey = \"\(functionKey)\"\n"
         let bundleData = Data(bundle.utf8)
         let contentHash = SHA256.hash(data: bundleData)
             .map { String(format: "%02x", $0) }
             .joined()
-        var config: [String: Any] = [
+        let config: [String: Any] = [
             "entry": entry,
             "toml": Data(toml.utf8).base64EncodedString(),
             "sources": [["path": entry, "content": bundleData.base64EncodedString()]],
             "bundle": bundleData.base64EncodedString(),
             "contentHash": contentHash,
         ]
-        if let mode {
-            config["mode"] = mode
-            if mode != "any" { config["durable"] = mode == "task" }
-        } else {
-            config["durable"] = durable
-        }
         let pushed = try await adminPost("\(base)/\(functionId)/configs", body: config)
         return PushedFunction(
             functionId: functionId,
