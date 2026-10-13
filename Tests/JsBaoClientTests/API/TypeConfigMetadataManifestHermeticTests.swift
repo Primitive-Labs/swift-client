@@ -272,7 +272,7 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
         """
         {
           "appId": "app1", "databaseType": "userDB", "ruleSetId": "rs1",
-          "triggers": null, "metadataAccess": null,
+          "triggers": null,
           "metadataManifest": \(manifest ?? "null"),
           "createdAt": "2024-01-01T00:00:00Z",
           "modifiedAt": "2024-01-01T00:00:00Z",

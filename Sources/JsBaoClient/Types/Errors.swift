@@ -68,63 +68,46 @@ public enum JsBaoErrorCode: String, Sendable {
     /// when there was one.
     case channelSubscribeFailed = "CHANNEL_SUBSCRIBE_FAILED"
 
-    // MARK: - Large documents (format 2, #3436)
+    // MARK: - Local record stores
     //
     // Raw values are the JS client's strings verbatim. A Swift app and a JS
     // app hitting the same condition report the same code, which is what
-    // makes a shared runbook possible (principle 11).
+    // makes a shared runbook possible (principle 11). The `FORMAT2_` codes
+    // keep the name of the large-document format they were introduced for,
+    // which is no longer served; a record-log document raises them now.
 
-    /// The room refused this client build: the document is a large document
-    /// and the client either did not declare format 2 or declared a manifest
-    /// version below the document's base. Followed by close 4426, which the
-    /// reconnect policy does not act on. `details` carry `documentId`.
-    case clientUpgradeRequired = "CLIENT_UPGRADE_REQUIRED"
-    /// A large document was opened on storage that cannot host its record
-    /// store. `details` carry `reason`: `not-persistent` (an in-memory
+    /// A record-log document was opened on storage that cannot host its
+    /// record store. `details` carry `reason`: `not-persistent` (an in-memory
     /// provider) or `over-quota`.
     case format2StorageUnavailable = "FORMAT2_STORAGE_UNAVAILABLE"
-    /// The document's local state cannot be advanced to the room's epoch
-    /// in place — it has to be reloaded from a covering base. Reads keep
-    /// answering from the local merged view; writes and outbound frames are
-    /// held. `details` carry `plan`.
-    case format2ReloadRequired = "FORMAT2_RELOAD_REQUIRED"
     /// An unscoped query on a model whose connected documents are of both
     /// kinds. The two kinds' rows live in different query engines, so there is
     /// no one table to answer from; scope the query to documents of one kind.
     case format2QueryScope = "FORMAT2_QUERY_SCOPE"
-    /// A model was read on a large document whose rows have not been loaded.
+    /// A model was read on a record-log document whose rows have not been
+    /// loaded.
     case format2ModelNotHydrated = "FORMAT2_MODEL_NOT_HYDRATED"
-    /// A fold of the epoch overlay into the merged view failed, so the merged
-    /// row is wrong and later updates cannot be trusted over it. Sticky: every
-    /// read and write on the document is refused until a rebind's whole-overlay
-    /// catch-up repairs it. `details` carry `error`.
-    case format2FoldBroken = "FORMAT2_FOLD_BROKEN"
     /// A snapshot manifest is malformed. `details` carry `reason`.
     case snapshotManifestInvalid = "SNAPSHOT_MANIFEST_INVALID"
     /// A snapshot manifest is well formed but written in a shape this client
     /// does not read. `details` carry `version`.
     case snapshotManifestUnsupported = "SNAPSHOT_MANIFEST_UNSUPPORTED"
-    /// A cold load ran out of repair passes with chunks still missing.
-    /// `details` carry `missing`.
-    case format2SnapshotLoadIncomplete = "FORMAT2_SNAPSHOT_LOAD_INCOMPLETE"
-    /// A local write on a large document that has not synced for longer than
-    /// its offline write window, so the server can no longer reconcile a write
-    /// made against the epoch this client holds. Reads keep answering, and a
-    /// sync restores writes. `details` carry `lastSyncAt`, `windowDays` and
-    /// `overdueMs`. The JS client's own code string.
+    /// A write the room refused because this client had not synced for
+    /// longer than the document's offline write window. `details` carry what
+    /// the room sent. The JS client's own code string.
     case documentOfflineWindowExpired = "DOCUMENT_OFFLINE_WINDOW_EXPIRED"
-    // Appended rather than filed beside `clientUpgradeRequired`, which is where
-    // it belongs by subject: a case INSERTED into this enum shifts every later
-    // case's ordinal, and SwiftPM does not recompile a test object whose library
-    // signatures moved underneath it — so a stale incremental build reads every
-    // code after the insertion point as its neighbour (#3436's linker hazard,
-    // sixty tests' worth of it). At the end, nothing that already exists moves.
+    // Appended rather than filed by subject: a case INSERTED into this enum
+    // shifts every later case's ordinal, and SwiftPM does not recompile a test
+    // object whose library signatures moved underneath it — so a stale
+    // incremental build reads every code after the insertion point as its
+    // neighbour (#3436's linker hazard, sixty tests' worth of it). At the end,
+    // nothing that already exists moves.
     /// This client opened a document as one format and the platform resolved the
-    /// other (#3764). The document is NOT served: a format-2 client fed ordinary
-    /// sync frames, or a format-1 client fed `epoch.info`, is a client silently
-    /// reading the wrong document. Unlike `clientUpgradeRequired` the connection
-    /// is not closed — the disagreement is about one document — and the document
-    /// is closed under the app with its store intact. `details` carry
+    /// other (#3764). The document is NOT served: a format-1 client fed a
+    /// record-log document's frames is a client silently reading the wrong
+    /// document. The connection is not closed — the disagreement is about one
+    /// document — and the document is closed under the app with its store
+    /// intact. `details` carry
     /// `documentId`, `declared` and `actual`. The JS client's code, verbatim.
     case documentFormatMismatch = "DOCUMENT_FORMAT_MISMATCH"
     /// An agent session view's `cancel()` found no turn to cancel: none was
@@ -135,6 +118,37 @@ public enum JsBaoErrorCode: String, Sendable {
     /// platform model name with a different schema; nothing was registered or
     /// opened. `details` carry `model`. The JS client's code, verbatim.
     case agentSessionModelNameTaken = "AGENT_SESSION_MODEL_NAME_TAKEN"
+    // The record-log (`documentFormat: 3`) codes, appended for the reason given
+    // above `documentFormatMismatch`. Each is the JS client's string verbatim.
+    /// The platform no longer serves this document's format — a large
+    /// document (`documentFormat: 2`). Thrown by a create that asks for one
+    /// and by an open whose format resolves to it, before anything is sent,
+    /// and for the platform's own refusal (an HTTP 410, a refused open). The
+    /// document is closed under the app with its local store left as it was.
+    /// `details` carry `documentId` when there is one.
+    case documentFormatUnsupported = "DOCUMENT_FORMAT_UNSUPPORTED"
+    /// A write to a format-3 document would give two records the same unique
+    /// key. `details` carry `documentId`, `scope`, `constraint` and `conflicting`.
+    case documentConstraintViolated = "DOCUMENT_CONSTRAINT_VIOLATED"
+    /// A format-3 write was made in an epoch the room has frozen; it is handed
+    /// back with nothing applied.
+    case documentEpochFrozen = "DOCUMENT_EPOCH_FROZEN"
+    /// A format-3 document's local store was purged (an eviction or an account
+    /// wipe) with writes the room had not judged; they are handed back.
+    case documentStorePurged = "DOCUMENT_STORE_PURGED"
+    /// This client's copies of the two epochs it may write into are full;
+    /// connect so the room can rotate before writing more.
+    case documentEpochBudget = "DOCUMENT_EPOCH_BUDGET"
+    /// A format-3 write is larger than the room reads (1 MiB of JSON).
+    case documentEntryTooLarge = "DOCUMENT_ENTRY_TOO_LARGE"
+    /// A format-3 write holds a value the wire cannot carry exactly: a number
+    /// that is not finite, or an integer outside ±2^53.
+    case documentEntryInvalid = "DOCUMENT_ENTRY_INVALID"
+    /// A format-3 write names an epoch the room has not opened.
+    case documentEpochNotOpen = "DOCUMENT_EPOCH_NOT_OPEN"
+    /// This client may no longer write to the document; its unjudged writes
+    /// are handed back.
+    case writeAccessDenied = "WRITE_ACCESS_DENIED"
 }
 
 /// Main error type for the JsBao client library

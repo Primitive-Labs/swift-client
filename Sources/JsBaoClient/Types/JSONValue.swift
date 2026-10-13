@@ -30,8 +30,8 @@ import Foundation
 /// as a nearby value rather than the one that was sent. Nothing throws; the
 /// digits just change.
 ///
-/// This bites on the dynamic payloads specifically: `DoDb` record fields
-/// (`[String: JSONValue]`), document `metadata`, and workflow inputs are all
+/// This bites on the dynamic payloads specifically: document `metadata`,
+/// resource metadata values (`[String: JSONValue]`), and workflow inputs are all
 /// caller-defined, so the client cannot know a field was meant to be an
 /// exact large integer. Platform identifiers are unaffected — they are ULID
 /// **strings**, not numbers.

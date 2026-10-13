@@ -332,10 +332,10 @@ final class OversizeOutboundConcurrencyHermeticTests: XCTestCase {
         )
     }
 
-    // MARK: - Finding 3559-SO-002 — the epoch under the upload
+    // MARK: - An uploaded payload
 
     /// Stands in for the offload, and parks in it until the test says
-    /// otherwise — which is the window an epoch move has to land in.
+    /// otherwise.
     private final class PausedUpload: @unchecked Sendable {
         private let started = DispatchSemaphore(value: 0)
         private let release = DispatchSemaphore(value: 0)
@@ -365,69 +365,16 @@ final class OversizeOutboundConcurrencyHermeticTests: XCTestCase {
         DocumentManager(logger: Logger(level: .none, scope: "oversize-epoch"))
     }
 
-    /// An oversize payload whose document moves epoch while the bytes are
-    /// going up is not sent at all.
-    ///
-    /// Sending it is the exact frame the move's discard of the outbound queue
-    /// exists to prevent: a delta against the overlay the room has just
-    /// archived, which the room parks and then answers with a resync request
-    /// for ever. The move carried its content onto the fresh overlay, so what
-    /// it carried is not lost — the resync answer is the frame that now
-    /// carries it.
-    func testAnUploadWhoseEpochMovedUnderItIsNotSent() async throws {
+    /// An oversize update goes out, once its upload has finished, with the
+    /// `uploadId` it was promised and no inline bytes.
+    func testAnUploadedUpdateGoesOutWithItsUploadId() async throws {
         let manager = manager()
-        let documentId = "epoch-moved-under-upload"
+        let documentId = "uploaded-update"
         let sent = LockedBox<[String]>([])
-        let settlements = LockedBox<[DocumentManager.OutboundSettlement]>([])
-        let generation = LockedBox<Int>(0)
         let upload = PausedUpload()
 
         manager.sendWebSocketMessage = { frame in sent.withValue { $0.append(frame) } }
         manager.uploadLargeUpdate = { _, _ in await upload.run() }
-        manager.outboundGeneration = { _ in generation.value }
-        manager.settleOutboundUpdate = { _, _, settlement in
-            settlements.withValue { $0.append(settlement) }
-        }
-
-        let payload = [UInt8](repeating: 7, count: maxInlineUpdateBytes + 1)
-        let send = Task { await manager.sendLocalUpdate(documentId: documentId, update: payload) }
-
-        upload.waitUntilStarted()
-        // The room seals this document's epoch while the bytes are in flight.
-        generation.withValue { $0 += 1 }
-        upload.finish()
-
-        let drained = await send.value
-        XCTAssertFalse(drained, "an update whose epoch moved under it has not drained")
-        XCTAssertTrue(
-            sent.value.isEmpty,
-            "the stale delta must not reach the room; frames: \(sent.value)"
-        )
-        XCTAssertEqual(
-            settlements.value.count, 1, "exactly one settlement per claim, always"
-        )
-        guard case .stale = settlements.value.first else {
-            return XCTFail("the claim was settled \(String(describing: settlements.value.first))")
-        }
-    }
-
-    /// The control, and the reason the check is a GENERATION rather than a
-    /// cancellation: an upload the epoch did not move under still goes out,
-    /// with the `uploadId` it was promised.
-    func testAnUploadWhoseEpochHeldStillGoesOut() async throws {
-        let manager = manager()
-        let documentId = "epoch-held-under-upload"
-        let sent = LockedBox<[String]>([])
-        let settlements = LockedBox<[DocumentManager.OutboundSettlement]>([])
-        let generation = LockedBox<Int>(0)
-        let upload = PausedUpload()
-
-        manager.sendWebSocketMessage = { frame in sent.withValue { $0.append(frame) } }
-        manager.uploadLargeUpdate = { _, _ in await upload.run() }
-        manager.outboundGeneration = { _ in generation.value }
-        manager.settleOutboundUpdate = { _, _, settlement in
-            settlements.withValue { $0.append(settlement) }
-        }
 
         let payload = [UInt8](repeating: 7, count: maxInlineUpdateBytes + 1)
         let send = Task { await manager.sendLocalUpdate(documentId: documentId, update: payload) }
@@ -443,50 +390,5 @@ final class OversizeOutboundConcurrencyHermeticTests: XCTestCase {
         )
         XCTAssertEqual(frame["uploadId"] as? String, upload.uploadId)
         XCTAssertNil(frame["update"])
-        guard case .sent = settlements.value.first else {
-            return XCTFail("the claim was settled \(String(describing: settlements.value.first))")
-        }
-    }
-
-    /// And the same rule on the other outbound path: an oversize `syncStep2`
-    /// answer whose document moved epoch while it was going up is not
-    /// answered. The room's own `syncStep1` follows every move, so the answer
-    /// is owed afresh rather than lost.
-    func testAnOversizeSyncStep2AnswerWhoseEpochMovedUnderItIsNotAnswered() async throws {
-        let manager = manager()
-        let documentId = "epoch-moved-under-syncstep2"
-        let generation = LockedBox<Int>(0)
-        let upload = PausedUpload()
-
-        manager.uploadLargeUpdate = { _, _ in await upload.run() }
-        manager.outboundGeneration = { _ in generation.value }
-
-        let doc = try await manager.openDocument(
-            documentId: documentId,
-            options: OpenDocumentOptions(
-                waitForLoad: .localIfAvailableElseNetwork, enableNetworkSync: false
-            )
-        )
-        let map: YMap<JSONValue> = doc.getOrCreateMap(named: "Note")
-        let value = noise(122_000)
-        doc.transactSync { transaction in
-            map.updateValue(.string(value), forKey: "n1/title", transaction: transaction)
-        }
-
-        let emptyStateVector = Data([0]).base64EncodedString()
-        let answer = Task {
-            await manager.buildSyncStep2Response(
-                documentId: documentId, serverStateVectorBase64: emptyStateVector
-            )
-        }
-        upload.waitUntilStarted()
-        generation.withValue { $0 += 1 }
-        upload.finish()
-
-        let response = await answer.value
-        XCTAssertNil(
-            response,
-            "a diff against an archived overlay is not the answer to the room's question"
-        )
     }
 }

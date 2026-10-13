@@ -1,0 +1,685 @@
+import Foundation
+import YSwift
+
+/// The client's record-log (format-3) state, built on first use.
+///
+/// A client that never opens a format-3 document builds none of this — no
+/// client id, no store, no table in its database.
+///
+/// `@unchecked Sendable`: every mutable property is read and written under
+/// `lock`, which is never held across a call out of this class.
+final class RecordLogClientState: @unchecked Sendable {
+
+    private let lock = NSRecursiveLock()
+    private var _clientId: String?
+    private var _engine: BaoModelQueryEngine?
+    private var _engineHost: ObjectIdentifier?
+    private var _bindings: [String: RecordLogDocumentBinding] = [:]
+    private var _sessions: [String: RecordLogSession] = [:]
+    private var _resolvedFormats: [String: Int] = [:]
+    private var _resolving: Set<String> = []
+    private var _unresolved: Set<String> = []
+    private var _connection: RecordLogSocketConnection?
+
+    /// The identity this client's writers are minted under: a ULID minted
+    /// lazily once per `JsBaoClient` instance, never persisted. A relaunch is a
+    /// new client; an earlier instance's writer with unjudged entries is an
+    /// orphan the next open drains.
+    var clientId: String {
+        lock.withLock {
+            if let _clientId { return _clientId }
+            let minted = ULID.generate()
+            _clientId = minted
+            return minted
+        }
+    }
+
+    /// The engine every format-3 document's filtered reads run on, over `host`.
+    func engine(host: any Format2SqlHost, logger: Logger?) -> BaoModelQueryEngine {
+        lock.withLock {
+            if let _engine, _engineHost == ObjectIdentifier(host) { return _engine }
+            let built = BaoModelQueryEngine(host: host, logger: logger)
+            _engine = built
+            _engineHost = ObjectIdentifier(host)
+            return built
+        }
+    }
+
+    func binding(_ documentId: String) -> RecordLogDocumentBinding? { lock.withLock { _bindings[documentId] } }
+    func session(_ documentId: String) -> RecordLogSession? { lock.withLock { _sessions[documentId] } }
+    var bindings: [(String, RecordLogDocumentBinding)] { lock.withLock { _bindings.map { ($0.key, $0.value) } } }
+    var sessions: [RecordLogSession] { lock.withLock { Array(_sessions.values) } }
+    var isEmpty: Bool { lock.withLock { _bindings.isEmpty } }
+
+    func set(_ binding: RecordLogDocumentBinding, _ session: RecordLogSession, for documentId: String) {
+        lock.withLock {
+            _bindings[documentId] = binding
+            _sessions[documentId] = session
+        }
+    }
+
+    func remove(_ documentId: String) -> (RecordLogDocumentBinding, RecordLogSession)? {
+        lock.withLock {
+            guard let binding = _bindings.removeValue(forKey: documentId),
+                  let session = _sessions.removeValue(forKey: documentId)
+            else { return nil }
+            return (binding, session)
+        }
+    }
+
+    /// The format an open learned from the documents API before the document
+    /// had a local row to remember it on.
+    func resolvedFormat(_ documentId: String) -> Int? { lock.withLock { _resolvedFormats[documentId] } }
+    func noteResolvedFormat(_ documentId: String, _ format: Int) { lock.withLock { _resolvedFormats[documentId] = format } }
+
+    /// Documents whose open could not ask the documents API their format: the
+    /// handshake asks once, before it goes out.
+    func noteUnresolved(_ documentId: String) { lock.withLock { _ = _unresolved.insert(documentId) } }
+    func noteResolved(_ documentId: String) { lock.withLock { _ = _unresolved.remove(documentId) } }
+    func isUnresolved(_ documentId: String) -> Bool { lock.withLock { _unresolved.contains(documentId) } }
+
+    /// Claim the documents-API question about `documentId` for one caller; a
+    /// second caller while it is out answers `false`.
+    func beginResolving(_ documentId: String) -> Bool { lock.withLock { _resolving.insert(documentId).inserted } }
+    func endResolving(_ documentId: String) { lock.withLock { _ = _resolving.remove(documentId) } }
+
+    func connection(make: () -> RecordLogSocketConnection) -> RecordLogSocketConnection {
+        lock.withLock {
+            if let _connection { return _connection }
+            let made = make()
+            _connection = made
+            return made
+        }
+    }
+
+    /// Forget every open document and the client id: the store was reset for
+    /// another user, and this client's writers must not be reused for them.
+    func resetForAnotherUser() -> [(String, RecordLogDocumentBinding, RecordLogSession)] {
+        lock.withLock {
+            let open = _bindings.compactMap { id, binding in _sessions[id].map { (id, binding, $0) } }
+            _bindings = [:]
+            _sessions = [:]
+            _clientId = nil
+            return open
+        }
+    }
+}
+
+/// The socket every format-3 session sends on: frames go out in the order they
+/// were handed over, one at a time, on one lane. Artifacts a receipt reads
+/// (a load's manifest and chunks, a segment's) are fetched over HTTP.
+///
+/// `@unchecked Sendable`: its stored properties are immutable after `init`;
+/// the stream continuation and the predicate are themselves thread-safe, and
+/// the lane's only mutable state lives in the consuming task, under no lock
+/// because one task owns it.
+final class RecordLogSocketConnection: RecordLogConnection, @unchecked Sendable {
+    private let lane: AsyncStream<String>.Continuation
+    private let consumer: Task<Void, Never>
+    private let isOpen: @Sendable () -> Bool
+    private let fetch: (@Sendable (String) async throws -> Data)?
+
+    init(
+        send: @escaping @Sendable (String) async -> Void, isOpen: @escaping @Sendable () -> Bool,
+        fetch: (@Sendable (String) async throws -> Data)? = nil
+    ) {
+        let (stream, lane) = AsyncStream.makeStream(of: String.self)
+        self.lane = lane
+        self.isOpen = isOpen
+        self.fetch = fetch
+        self.consumer = Task {
+            for await text in stream { await send(text) }
+        }
+    }
+
+    var fetchesArtifacts: Bool { fetch != nil }
+
+    func fetchArtifact(_ path: String) async throws -> Data {
+        guard let fetch else { throw RecordLogReceiptFailure("the connection cannot fetch artifacts") }
+        return try await fetch(path)
+    }
+
+    deinit {
+        lane.finish()
+        consumer.cancel()
+    }
+
+    func send(_ frame: [String: JSONValue]) {
+        lane.yield(RecordLogJSON.text(.object(frame)))
+    }
+
+    func connected() -> Bool { isOpen() }
+}
+
+/// An artifact read answered something other than 200 (or could not be
+/// addressed). Its description shows the grant path without its token.
+struct RecordLogArtifactError: Error, CustomStringConvertible {
+    let status: Int?
+    let path: String
+    var description: String {
+        "GET \(recordLogShownPath(path)) answered \(status.map(String.init) ?? "nothing (the path could not be resolved)")"
+    }
+}
+
+// MARK: - The client's format-3 front door
+
+extension JsBaoClient {
+
+    /// Whether `documentId` is open here as a record-log (format-3) document.
+    func isRecordLogDocument(_ documentId: String) -> Bool {
+        recordLogState.binding(documentId) != nil
+    }
+
+    /// The binding of an open format-3 document, or `nil`.
+    func recordLogBinding(_ documentId: String) -> RecordLogDocumentBinding? {
+        recordLogState.binding(documentId)
+    }
+
+    /// The session of an open format-3 document, or `nil`.
+    func recordLogSession(_ documentId: String) -> RecordLogSession? {
+        recordLogState.session(documentId)
+    }
+
+    private var recordLogConnection: RecordLogSocketConnection {
+        recordLogState.connection {
+            RecordLogSocketConnection(
+                send: { [weak self] text in
+                    guard let self else { return }
+                    self.recordLogFrameSentForTest?(text)
+                    do {
+                        try await self.wsManager.send(text)
+                    } catch {
+                        self.logger.warn("[record-log] a frame could not be sent:", error.localizedDescription)
+                    }
+                },
+                isOpen: { [weak self] in
+                    guard let self else { return false }
+                    return self.wsManager.isSocketOpen && self.networkingAllowed()
+                },
+                fetch: { [weak self] path in
+                    guard let self else { throw CancellationError() }
+                    return try await self.fetchRecordLogArtifact(path)
+                }
+            )
+        }
+    }
+
+    /// Fetch one artifact a format-3 room granted, at its origin-relative grant
+    /// path resolved against the API URL. The path carries the grant, so no
+    /// `Authorization` header is sent; only a 200 answers the bytes.
+    func fetchRecordLogArtifact(_ path: String) async throws -> Data {
+        if let hook = recordLogArtifactFetchForTest { try await hook(path) }
+        guard let url = URL(string: path, relativeTo: URL(string: apiUrl))?.absoluteURL else {
+            throw RecordLogArtifactError(status: nil, path: path)
+        }
+        let data: Data
+        let status: Int?
+        do {
+            let (body, response) = try await NetworkSession.data(from: url)
+            data = body
+            status = (response as? HTTPURLResponse)?.statusCode
+        } catch {
+            recordLogArtifactStatusForTest?(path, nil)
+            throw error
+        }
+        recordLogArtifactStatusForTest?(path, status)
+        guard status == 200 else {
+            logger.debug("[record-log] artifact", recordLogShownPath(path), "answered", status.map(String.init) ?? "no status")
+            throw RecordLogArtifactError(status: status, path: path)
+        }
+        return data
+    }
+
+    // MARK: - Resolving the format before the open
+
+    /// Resolve `documentId`'s format before anything about it reaches the wire,
+    /// as the JS client does: the local row, else — when the network may be
+    /// used — the documents API, remembered for the row the open creates. A
+    /// format-3 document needs a storage provider that can host it; one that
+    /// cannot is refused here, before a single frame.
+    ///
+    /// A format of 2 — a large document, no longer served — from the row or
+    /// from the server is refused here, before anything is opened or sent.
+    ///
+    /// Offline with no local row the open proceeds as before, and binds once
+    /// the row names format 3. With the socket not up yet (an open that
+    /// connects it, a reconnect under way) the question is asked before the
+    /// handshake instead: see ``resolveRecordLogBeforeHandshake(_:)``.
+    func prepareRecordLogFormat(_ documentId: String) async throws {
+        var format = documentManager.documentFormat(documentId) ?? recordLogState.resolvedFormat(documentId)
+        let askable = format == nil && !documentManager.isLocalOnly(documentId) && !documentManager.isPendingCreate(documentId)
+        if askable, !(networkingAllowed() && (wsManager.isSocketOpen || isConnected)) {
+            recordLogState.noteUnresolved(documentId)
+        }
+        if askable, networkingAllowed(), wsManager.isSocketOpen || isConnected {
+            do {
+                if let resolved = try await lookUpDocumentFormat(documentId) {
+                    recordLogState.noteResolvedFormat(documentId, resolved)
+                    documentManager.noteDocumentFormat(documentId, resolved)
+                    format = resolved
+                }
+            } catch let error as HttpError where error.status == 410 {
+                throw documentFormatUnsupported(documentId: documentId, message: error.serverMessage)
+            } catch {
+                logger.debug("[record-log] the documents API did not say what format", documentId, "is:", error.localizedDescription)
+            }
+        }
+        if format == largeDocumentFormat {
+            throw documentFormatUnsupported(documentId: documentId)
+        }
+        guard format == RecordLogTransport.documentFormat else { return }
+        _ = try await recordLogHost(documentId)
+    }
+
+    /// The store host for this client's storage, or the typed refusal.
+    private func recordLogHost(_ documentId: String) async throws -> any Format2SqlHost {
+        guard let provider = await offlineStore.getStorageProvider() else {
+            throw Format2Storage.unavailable(reason: .notPersistent, documentId: documentId)
+        }
+        return try Format2Storage.host(for: provider, documentId: documentId)
+    }
+
+    // MARK: - Binding
+
+    /// Bind a document the open has resolved as format 3: open its store, mint
+    /// this client's writer, attach its session. The models connected next bind
+    /// to it in `connectToSharedModels`.
+    func bindRecordLogDocumentIfResolved(_ documentId: String) async throws {
+        if let resolved = recordLogState.resolvedFormat(documentId) {
+            documentManager.noteDocumentFormat(documentId, resolved)
+        }
+        let format = documentManager.documentFormat(documentId) ?? recordLogState.resolvedFormat(documentId)
+        guard format == RecordLogTransport.documentFormat else { return }
+        _ = try await bindRecordLogDocument(documentId)
+    }
+
+    @discardableResult
+    func bindRecordLogDocument(_ documentId: String) async throws -> RecordLogDocumentBinding {
+        if let existing = recordLogState.binding(documentId) { return existing }
+        let host = try await recordLogHost(documentId)
+        try await checkRecordLogOwner(host: host)
+        let binding = try RecordLogDocumentBinding(
+            host: host, documentId: documentId, clientId: recordLogState.clientId,
+            engine: recordLogState.engine(host: host, logger: logger), logger: logger
+        )
+        binding.setRefusalReporter { [weak self] event in
+            self?.eventEmitter.emit(event)
+        }
+        binding.onError { [weak self] error in
+            guard let self else { return }
+            self.logger.warn("[record-log]", documentId, "—", error.message)
+            var detail = error.details ?? [:]
+            detail["code"] = .string(error.code.rawValue)
+            self.eventEmitter.emit(ConnectionErrorEvent(
+                message: error.message, documentId: documentId, messageType: "record.commit", detail: .object(detail)
+            ))
+        }
+        let session = RecordLogSession(
+            documentId: documentId, binding: binding,
+            host: RecordLogSessionHost(
+                connection: { [weak self] in self?.recordLogConnection },
+                declarations: { [weak self] in self?.recordLogDeclarations() ?? [:] },
+                synced: { [weak self] documentId in
+                    Task { await self?.recordLogSessionSynced(documentId) }
+                },
+                syncFailed: { [weak self] documentId, reason in
+                    self?.logger.debug("[record-log]", documentId, "— the open did not complete:", reason)
+                    self?.documentManager.completePendingSyncOperation(documentId)
+                },
+                progress: { [weak self] documentId in
+                    self?.recordLogSyncProgress(documentId)
+                }
+            ),
+            logger: logger
+        )
+        await session.attach()
+        recordLogState.set(binding, session, for: documentId)
+        return binding
+    }
+
+    /// Every registered model's declaration, as `record.declare` carries it:
+    /// its fields with their options, and its compound unique constraints.
+    func recordLogDeclarations() -> [String: JSONValue] {
+        var out: [String: JSONValue] = [:]
+        for name in registeredModelNames() {
+            guard let schema = sharedModel(name)?.schema else { continue }
+            out[name] = Self.recordLogDeclaration(schema)
+        }
+        return out
+    }
+
+    static func recordLogDeclaration(_ schema: PrimitiveSchema) -> JSONValue {
+        var fields: [String: JSONValue] = [:]
+        for (name, descriptor) in schema.fields {
+            var options: [String: JSONValue] = ["type": .string(descriptor.type.rawValue)]
+            if descriptor.indexed { options["indexed"] = true }
+            if descriptor.unique { options["unique"] = true }
+            if descriptor.required { options["required"] = true }
+            if descriptor.autoAssign { options["autoAssign"] = true }
+            if let autoStamp = descriptor.autoStamp { options["autoStamp"] = .string(autoStamp.rawValue) }
+            if let maxLength = descriptor.maxLength { options["maxLength"] = .number(Double(maxLength)) }
+            if let maxCount = descriptor.maxCount { options["maxCount"] = .number(Double(maxCount)) }
+            if let value = descriptor.default, let json = try? JSONValue(jsonAny: value.encodedForMeta()), json != .null {
+                options["default"] = json
+            }
+            fields[name] = .object(options)
+        }
+        var declaration: [String: JSONValue] = ["fields": .object(fields)]
+        let compound = schema.constraints.values.filter { $0.fields.count > 0 }.sorted { $0.name < $1.name }
+        if !compound.isEmpty {
+            declaration["uniqueConstraints"] = .array(compound.map {
+                .object(["name": .string($0.name), "fields": .array($0.fields.map { .string($0) })])
+            })
+        }
+        return .object(declaration)
+    }
+
+    /// Bind every member of the open format-3 documents to `model`, for a model
+    /// registered after they opened: its query tables are hydrated from the
+    /// view, and an open session declares it to the room before any entry of it.
+    func bindRecordLogDocumentsTo(_ model: MultiDocModel) {
+        for (documentId, binding) in recordLogState.bindings {
+            guard let member = model.member(docId: documentId) else { continue }
+            do {
+                try member.bindRecordLog(binding)
+            } catch {
+                logger.warn("[record-log] could not bind", model.schema.name, "to", documentId, ":", error.localizedDescription)
+            }
+            if let session = recordLogState.session(documentId) {
+                Task { await session.declare() }
+            }
+        }
+    }
+
+    /// Bind every registered model's member of `documentId` to its store.
+    private func bindRecordLogMembers(_ documentId: String, _ binding: RecordLogDocumentBinding) {
+        for name in registeredModelNames() {
+            guard let member = sharedModel(name)?.member(docId: documentId) else { continue }
+            do {
+                try member.bindRecordLog(binding)
+            } catch {
+                logger.warn("[record-log] could not bind", name, "to", documentId, ":", error.localizedDescription)
+            }
+        }
+    }
+
+    /// The handshake is about to go out for a document whose open could not
+    /// ask the documents API what format it is (the socket was not up yet, and
+    /// this is the handshake that brings it up, or a reconnect re-syncing it).
+    /// Ask now, once, and bind it when it is format 3, so the handshake is
+    /// `record.open` rather than a `syncStep1` the room answers with
+    /// `DOCUMENT_FORMAT_MISMATCH`.
+    ///
+    /// Answers `false` when the handshake must not go out this time: another
+    /// call is asking about the same document, or it resolved as format 3 and
+    /// could not be bound. A question with no answer leaves the handshake as
+    /// it was, as an open with the socket up does.
+    func resolveRecordLogBeforeHandshake(_ documentId: String) async -> Bool {
+        // A row that came to name format 2 after the open — a large document,
+        // no longer served — never handshakes.
+        if documentManager.documentFormat(documentId) == largeDocumentFormat
+            || recordLogState.resolvedFormat(documentId) == largeDocumentFormat {
+            await refuseUnsupportedDocumentFormat(documentId, error: documentFormatUnsupported(documentId: documentId))
+            return false
+        }
+        guard recordLogState.isUnresolved(documentId) else { return true }
+        guard recordLogState.binding(documentId) == nil,
+              documentManager.documentFormat(documentId) == nil,
+              recordLogState.resolvedFormat(documentId) == nil,
+              documentManager.getDocument(documentId) != nil,
+              !documentManager.isLocalOnly(documentId), !documentManager.isPendingCreate(documentId)
+        else {
+            recordLogState.noteResolved(documentId)
+            return true
+        }
+        guard networkingAllowed() else { return true }
+        guard recordLogState.beginResolving(documentId) else { return false }
+        defer { recordLogState.endResolving(documentId) }
+        let resolved: Int
+        do {
+            let format = try await lookUpDocumentFormat(documentId)
+            recordLogState.noteResolved(documentId)
+            guard let format else { return true }
+            resolved = format
+        } catch {
+            recordLogState.noteResolved(documentId)
+            logger.debug("[record-log] the documents API did not say what format", documentId, "is:", error.localizedDescription)
+            return true
+        }
+        recordLogState.noteResolvedFormat(documentId, resolved)
+        documentManager.noteDocumentFormat(documentId, resolved)
+        if resolved == largeDocumentFormat {
+            // A large document is no longer served: the handshake does not go
+            // out, the document is closed under the app, and nothing it stored
+            // is touched.
+            await refuseUnsupportedDocumentFormat(documentId, error: documentFormatUnsupported(documentId: documentId))
+            return false
+        }
+        guard resolved == RecordLogTransport.documentFormat, documentManager.getDocument(documentId) != nil else { return true }
+        do {
+            let binding = try await bindRecordLogDocument(documentId)
+            bindRecordLogMembers(documentId, binding)
+            return true
+        } catch {
+            logger.warn("[record-log]", documentId, "is a format-3 document this client cannot open:", error.localizedDescription)
+            let refusal = (error as? JsBaoError) ?? JsBaoError(
+                code: .unavailable, message: error.localizedDescription, details: ["documentId": .string(documentId)]
+            )
+            awaitingOpens.fail(documentId: documentId, error: refusal)
+            return false
+        }
+    }
+
+    /// Whether this device holds `documentId`'s format-3 data: rows, a cursor
+    /// past 0, or a writer with entries.
+    func recordLogHasLocalData(_ documentId: String) -> Bool {
+        guard let binding = recordLogState.binding(documentId),
+              let state = try? binding.store.storedState()
+        else { return false }
+        return state.rows > 0 || state.cursor > 0 || !state.writers.isEmpty
+    }
+
+    // MARK: - Frames
+
+    /// Whether a frame belongs to a format-3 session, from its `type`,
+    /// `messageType` and `code`: a `record.*` frame, or an `error` answering
+    /// one (other than a format mismatch, which tears the document down
+    /// through its own arm).
+    static func isRecordLogFrame(type: String?, messageType: String?, code: String?) -> Bool {
+        if type?.hasPrefix("record.") == true { return true }
+        guard type == "error", messageType?.hasPrefix("record.") == true else { return false }
+        return code != JsBaoErrorCode.documentFormatMismatch.rawValue
+    }
+
+    /// Hand a format-3 frame to its document's session; one for a document
+    /// with no session is dropped.
+    func routeRecordLogFrame(_ frame: [String: JSONValue]) async {
+        recordLogFrameForTest?(frame)
+        guard let documentId = frame["documentId"]?.stringValue ?? frame["roomId"]?.stringValue,
+              let session = recordLogState.session(documentId)
+        else {
+            logger.debug("[record-log] dropped", frame["type"]?.stringValue ?? "a frame", "for a document with no session")
+            return
+        }
+        await session.receive(frame)
+    }
+
+    // MARK: - The connection
+
+    /// The socket closed: every session drops what was in flight.
+    func recordLogDisconnected() {
+        let sessions = recordLogState.sessions
+        guard !sessions.isEmpty else { return }
+        Task {
+            for session in sessions { await session.disconnected() }
+        }
+    }
+
+    /// Networking may be allowed again on the same socket: every session
+    /// sends what it queued meanwhile.
+    func recordLogKick() {
+        let sessions = recordLogState.sessions
+        guard !sessions.isEmpty else { return }
+        Task {
+            for session in sessions { await session.kick() }
+        }
+    }
+
+    // MARK: - Closing and purging
+
+    /// The document closed: its session stops and its binding closes. The
+    /// store keeps everything; the next open catches up from the cursor.
+    func closeRecordLogDocument(_ documentId: String) async {
+        guard let (binding, session) = recordLogState.remove(documentId) else { return }
+        await session.close()
+        binding.close()
+    }
+
+    /// Remove `documentId`'s format-3 data from this device (an eviction, an
+    /// account wipe). Unacknowledged writes are dropped and handed back as one
+    /// `DocumentWriteRefusedEvent` with `.documentStorePurged`.
+    func purgeRecordLogDocument(_ documentId: String) async {
+        await closeRecordLogDocument(documentId)
+        guard let provider = await offlineStore.getStorageProvider(),
+              let host = provider as? any Format2SqlHost,
+              (try? RecordLogStore.hasTables(host: host)) == true
+        else { return }
+        let store = RecordLogStore(host: host, documentId: documentId, clientId: recordLogState.clientId, logger: logger)
+        do {
+            let specs = registeredModelNames().compactMap { sharedModel($0)?.schema }.map(RecordLogProjectionSpec.init)
+            let reply = try store.purge(force: true, project: specs)
+            reportPurged(documentId, reply.handedBack)
+            if !reply.nothingStored {
+                logger.log("[record-log]", documentId, "— local store purged (", reply.pendingOps, "unacknowledged write(s) dropped)")
+            }
+        } catch {
+            logger.warn("[record-log] purging", documentId, "failed:", error.localizedDescription)
+        }
+    }
+
+    /// Purge every format-3 document this device holds.
+    func purgeAllRecordLogDocuments() async {
+        guard let provider = await offlineStore.getStorageProvider(),
+              let host = provider as? any Format2SqlHost
+        else { return }
+        guard (try? RecordLogStore.hasTables(host: host)) == true else { return }
+        let documents: [String] = (try? host.withConnection { connection in
+            try connection.query("SELECT doc_id FROM record_log_state").compactMap { $0["doc_id"].stringValue }
+        }) ?? []
+        for documentId in Set(documents + recordLogState.bindings.map(\.0)) {
+            await purgeRecordLogDocument(documentId)
+        }
+    }
+
+    private func reportPurged(_ documentId: String, _ handedBack: [RecordLogPendingEntry]) {
+        let writes = handedBack.flatMap(\.refusedWrites)
+        guard let first = writes.first else { return }
+        logger.warn("[record-log] write-refused", documentId, "— DOCUMENT_STORE_PURGED handed back", handedBack.count, "entr(ies)")
+        eventEmitter.emit(DocumentWriteRefusedEvent(
+            documentId: documentId, model: first.model, recordId: first.recordId,
+            error: JsBaoError(
+                code: .documentStorePurged,
+                message: "The local copy of '\(documentId)' was removed before the room received "
+                    + "\(handedBack.count) write(s); they were not applied.",
+                details: ["documentId": .string(documentId), "scope": "local"]
+            ),
+            writes: writes, conflictingRecord: nil
+        ))
+    }
+
+    // MARK: - The principal
+
+    /// Compare the user the record-log tables belong to with the one signed in.
+    ///
+    /// The browser's store is scoped by user through its file's namespace; this
+    /// client's file is one per app, so the owner is written down. When both are
+    /// known and differ the store is reset: every open format-3 document is
+    /// closed, every document's rows, entries and projections are removed, and
+    /// the client id is minted again — the previous user's writers are bound to
+    /// them on the server, and their unsent writes are theirs, so no refusal is
+    /// raised for them. Signed out (an offline relaunch before the token is
+    /// back), nothing is compared. The owner is written at the first bind under
+    /// a known user.
+    ///
+    /// - Throws: when the owner cannot be read, or the reset or the owner's
+    ///   update does not complete. Nothing of the store may be bound then: the
+    ///   bind that called this fails, and the next one checks again.
+    func checkRecordLogOwner(host explicitHost: (any Format2SqlHost)? = nil) async throws {
+        guard let userId = authController.getUserId(), !userId.isEmpty else { return }
+        let host: any Format2SqlHost
+        if let explicitHost {
+            host = explicitHost
+        } else {
+            guard let provider = await offlineStore.getStorageProvider(),
+                  let found = provider as? any Format2SqlHost
+            else { return }
+            host = found
+        }
+        let owner = try RecordLogStore.owner(host: host)
+        if owner == userId { return }
+        if let owner {
+            try await resetRecordLogStore(host: host, from: owner, to: userId)
+            return
+        }
+        // Nothing to compare against yet: only a store that holds record-log
+        // tables is claimed, so a client that never binds a format-3 document
+        // creates none of them.
+        if try explicitHost != nil || RecordLogStore.hasTables(host: host) {
+            try RecordLogStore.setOwner(host: host, userId: userId)
+        }
+    }
+
+    /// The owner check at sign-in, which has no caller to throw to: a check
+    /// that did not complete closes every open format-3 document, so nothing
+    /// of a store that may be another user's is read or sent until a bind's
+    /// own check passes.
+    func checkRecordLogOwnerAtSignIn() async {
+        do {
+            try await checkRecordLogOwner()
+        } catch {
+            let closed = await closeAllRecordLogDocuments()
+            logger.warn(
+                "[record-log] could not check the store's owner (", error.localizedDescription, "):",
+                closed, "open format-3 document(s) closed until a later open checks again"
+            )
+        }
+    }
+
+    /// Close every open format-3 document and forget the client id.
+    @discardableResult
+    private func closeAllRecordLogDocuments() async -> Int {
+        let open = recordLogState.resetForAnotherUser()
+        for (documentId, binding, session) in open {
+            await session.close()
+            binding.close()
+            disconnectRecordLogMembers(documentId)
+        }
+        return open.count
+    }
+
+    private func resetRecordLogStore(host: any Format2SqlHost, from previous: String, to userId: String) async throws {
+        let closed = await closeAllRecordLogDocuments()
+        let specs = registeredModelNames().compactMap { sharedModel($0)?.schema }.map(RecordLogProjectionSpec.init)
+        let dropped: Int
+        do {
+            dropped = try RecordLogStore.purgeAll(host: host, project: specs)
+            try RecordLogStore.setOwner(host: host, userId: userId)
+        } catch {
+            logger.warn("[record-log] resetting the store for another user failed:", error.localizedDescription)
+            throw error
+        }
+        logger.log(
+            "[record-log] another user signed in: the record-log store of the previous user was reset (",
+            dropped, "unsent write(s) of theirs dropped,", closed, "open document(s) closed)"
+        )
+        _ = previous
+    }
+
+    /// Point every shared model's member of `documentId` back at its Y.Doc-less
+    /// state: the binding it read through is gone.
+    private func disconnectRecordLogMembers(_ documentId: String) {
+        for name in registeredModelNames() {
+            sharedModel(name)?.disconnect(docId: documentId)
+        }
+    }
+}

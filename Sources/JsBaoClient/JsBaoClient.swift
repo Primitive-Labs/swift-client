@@ -41,7 +41,6 @@ public final class JsBaoClient: @unchecked Sendable {
     // `setupSubApis()`, behind a non-optional public computed property.
 
     public let collections: CollectionsAPI
-    public let databases: DatabasesAPI
     public let session: SessionAPI
     public let groups: GroupsAPI
     public let ruleSets: RuleSetsAPI
@@ -113,15 +112,9 @@ public final class JsBaoClient: @unchecked Sendable {
 
     private let options: JsBaoClientOptions
 
-    /// How much room this app said it will give a large document (#3437,
-    /// behavior 34). Read by the format-2 bind, which hands it to the
-    /// coordinator; `nil` probes the client's own database volume.
-    var largeDocumentStorageOptions: LargeDocumentStorageOptions? {
-        options.largeDocumentStorage
-    }
     /// `internal` (not `private`) so the client's own extensions in other
-    /// files of this module can log — the large-document front door in
-    /// `LargeDocuments/Format2Client.swift` is one (#3436). Not public.
+    /// files of this module can log — the record-log front door in
+    /// `RecordLog/RecordLogClient.swift` is one. Not public.
     let logger: Logger
     private let httpClient: HttpClient
     /// `httpClient` behind the offline gate: every HTTP call the app makes
@@ -129,9 +122,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// not allowed throws `.offline` instead of going out. Authentication and
     /// the blob manager keep the ungated `httpClient`, as in the JS client.
     private let gatedTransport: NetworkGatedTransport
-    /// `internal` for the same reason as `logger`: the large-document open
-    /// path raises the socket's receive limit before the handshake, and the
-    /// released-hold path puts kept frames back on the wire (#3436).
+    /// `internal` for the same reason as `logger`: the open path raises the
+    /// socket's receive limit before the handshake, and the record-log
+    /// session sends its frames on it.
     let wsManager: WebSocketManager
     /// `internal` (not `private`) so `@testable import JsBaoClient`
     /// tests can drive auth flows directly (e.g., concurrent-refresh
@@ -142,16 +135,16 @@ public final class JsBaoClient: @unchecked Sendable {
     private let pendingTokenConnect = PendingTokenConnectBox()
     /// The `openDocument` network waits in flight, so a refusal the router
     /// handles can fail one instead of leaving it to time out (#3436).
-    private let awaitingOpens = AwaitingOpenRegistry()
+    let awaitingOpens = AwaitingOpenRegistry()
     let documentManager: DocumentManager
     private let blobManager: BlobManager
-    /// `internal` so the large-document open path can ask the provider whether
-    /// it can host one at all (#3436). Not public.
+    /// `internal` so the record-log open path can ask the provider whether it
+    /// can host one at all. Not public.
     let offlineStore: OfflineStore
-    /// The large documents this client has open, built on first use (#3436).
-    /// A client that never opens one never builds a coordinator, a client id,
-    /// or a single format-2 table.
-    let format2State = Format2ClientState()
+    /// The record-log (format-3) documents this client has open, built on
+    /// first use. A client that never opens one never mints a writer or
+    /// creates a single record-log table.
+    let recordLogState = RecordLogClientState()
     /// Internal (not `private`) so `@testable` integration tests can observe
     /// logged events via `AnalyticsQueue.onEventLogged` — the Swift analog of
     /// the JS tests poking `client.analyticsQueue` (#963 coverage).
@@ -411,6 +404,26 @@ public final class JsBaoClient: @unchecked Sendable {
     /// code.
     var onSyncStep1SendForTest: (@Sendable (String) async -> Void)?
 
+    /// Test seam inside a format-3 receipt's artifact fetch: awaited with the
+    /// grant path before the request goes out, where a test holds a fetch in
+    /// flight or fails it by throwing. Internal; never set in production code.
+    var recordLogArtifactFetchForTest: (@Sendable (String) async throws -> Void)?
+    /// Test seam after a format-3 artifact read: its grant path and the status
+    /// it was answered (`nil` when no HTTP answer came). Internal; never set in
+    /// production code.
+    var recordLogArtifactStatusForTest: (@Sendable (String, Int?) -> Void)?
+
+    /// Test seam for the documents API's answer to "what format is this
+    /// document?", asked before a handshake. Answers in place of the request
+    /// when set. Internal; never set in production code.
+    var documentFormatLookupForTest: (@Sendable (String) async throws -> Int?)?
+
+    /// Test seams on the format-3 frames: each frame routed to a session as it
+    /// arrives, and each frame a session hands the socket (its JSON text).
+    /// Internal; never set in production code.
+    var recordLogFrameForTest: (@Sendable ([String: JSONValue]) -> Void)?
+    var recordLogFrameSentForTest: (@Sendable (String) -> Void)?
+
     // MARK: Outbound work handed off the receive loop (#3559)
 
     /// The tail of each document's outbound lane: the last job handed over,
@@ -586,9 +599,8 @@ public final class JsBaoClient: @unchecked Sendable {
         // layer can forward the live connection id as `X-JB-Connection-Id`.
         // (`HttpClientConfig` is immutable; the previous `{ nil }` placeholder
         // could never be "set after wsManager init", so Swift HTTP writes were
-        // silently unattributed — JS forwards the id on every request, which
-        // is what makes `db.change` frames round-trip with `isOrigin: true`
-        // for the writer's own connection, #737.)
+        // silently unattributed — JS forwards the id on every request, so the
+        // server can tell the writer's own connection apart, #737.)
         let wsManager = WebSocketManager(
             logger: logger,
             maxReconnectDelayMs: Int(options.maxReconnectDelay * 1000)
@@ -713,30 +725,6 @@ public final class JsBaoClient: @unchecked Sendable {
             queue: analyticsQueue,
             resolveUserUlid: { [weak authController] in authController?.getUserId() }
         )
-        // Realtime DB subscriptions (`databases.subscribe`). The registry
-        // routes inbound `db.change` frames and is re-subscribed on reconnect.
-        let dbSubscriptionRegistry = DatabaseSubscriptionRegistry(logger: logger)
-        dbSubscriptionRegistry.setOriginContext(
-            DatabaseSubscriptionRegistry.OriginContext(
-                getConnectionId: { [weak wsManager] in wsManager?.connectionId },
-                getCurrentUserId: { [weak authController] in authController?.getUserId() }
-            )
-        )
-        self.databases = DatabasesAPI(
-            transport: gatedTransport,
-            subscriptionRegistry: dbSubscriptionRegistry,
-            sendWSMessage: { [weak wsManager] message in
-                guard let wsManager else { return }
-                Task { try? await wsManager.send(message) }
-            },
-            isWebSocketOpen: { [weak wsManager] in wsManager?.isSocketOpen ?? false },
-            connectWebSocket: { [weak wsManager] in
-                guard let wsManager else { return }
-                Task { try? await wsManager.connect() }
-            },
-            logger: logger
-        )
-
         // Wire up dependencies
         setupDependencies()
         setupSubApis()
@@ -831,7 +819,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // Safe from the recovery's own reconnect, which goes through
         // `wsManager.forceReconnect()` and never reaches here.
         wsAuthRecovery.reset()
-        // #3436 — the receive limit has to be settled before the task is
+        // The receive limit has to be settled before the task is
         // built: Foundation ignores it on a task that is already running, so
         // deciding it afterwards would cost a rebuilt socket.
         await ensureReceiveLimitForKnownDocuments()
@@ -1448,7 +1436,7 @@ public final class JsBaoClient: @unchecked Sendable {
         for entry in documentManager.openDocumentsSnapshot() {
             created.connect(docId: entry.documentId, doc: entry.doc)
         }
-        bindLargeDocumentsTo(created)
+        bindRecordLogDocumentsTo(created)
         return created
     }
 
@@ -1458,8 +1446,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Every model registered with this client's shared cross-document stores.
-    /// A large document's overlay observer watches one map per model, so this
-    /// is the set it attaches to at bind (#3436).
+    /// A record-log document declares and projects this set at bind.
     func registeredModelNames() -> [String] {
         lock.withLock { Array(sharedModels.keys) }.sorted()
     }
@@ -1505,38 +1492,6 @@ public final class JsBaoClient: @unchecked Sendable {
         for schema in schemas { _ = sharedModel(for: schema) }
     }
 
-    /// Point every registered model's member for `documentId` at the binding
-    /// a late bind just produced (#3436).
-    ///
-    /// The mirror image of `bindLargeDocumentsTo`, and just as necessary: a
-    /// document whose format nothing local knew is bound only when the room's
-    /// `epoch.info` says so, which is AFTER `connectToSharedModels` ran. Every
-    /// member is reading nested Y.Maps at that point — the layout a large
-    /// document does not have — so without this a first open of one answers
-    /// nothing at all, however much the store holds.
-    func bindLargeDocumentToSharedModels(
-        _ documentId: String, binding: Format2DocumentBinding
-    ) {
-        let models = lock.withLock { Array(sharedModels.values) }
-        for model in models {
-            guard let member = model.member(docId: documentId) else { continue }
-            member.bindFormat2(binding)
-        }
-    }
-
-    /// Point a model registered AFTER a large document was opened at that
-    /// document's record store (#3436). `sharedModel(for:)` connects the open
-    /// documents; this is the half that knows which of them are large.
-    private func bindLargeDocumentsTo(_ model: MultiDocModel) {
-        guard let coordinator = format2State.coordinator else { return }
-        for documentId in coordinator.boundDocumentIds() {
-            guard let binding = coordinator.binding(documentId),
-                  let member = model.member(docId: documentId)
-            else { continue }
-            member.bindFormat2(binding)
-        }
-    }
-
     /// `PrimitiveModel.Type` overload: `client.registerModels([TodoRecord.self, …])`.
     public func registerModels(_ types: [any PrimitiveModel.Type]) {
         registerModels(types.map { $0.primitiveSchema })
@@ -1547,14 +1502,20 @@ public final class JsBaoClient: @unchecked Sendable {
     /// re-connect re-seeds the doc's rows).
     private func connectToSharedModels(documentId: String, doc: YDocument) {
         let models = lock.withLock { Array(sharedModels.values) }
-        // #3436 — a large document's records are not in the Y.Doc at all, so
+        // A record-log document's records are not in the Y.Doc at all, so
         // each member is pointed at the document's record store instead of at
         // nested maps. `nil` is an ordinary document and nothing below changes
         // for it.
-        let binding = format2State.coordinator?.binding(documentId)
+        let recordLog = recordLogState.binding(documentId)
         for model in models {
             let member = model.connect(docId: documentId, doc: doc)
-            if let binding { member.bindFormat2(binding) }
+            if let recordLog {
+                do {
+                    try member.bindRecordLog(recordLog)
+                } catch {
+                    logger.warn("[record-log] could not bind", model.schema.name, "to", documentId, ":", error.localizedDescription)
+                }
+            }
         }
     }
 
@@ -1628,11 +1589,11 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Evict a single doc's local data from this device. Background;
     /// the call returns once the eviction task is scheduled.
     public func evictLocalDocument(_ documentId: String) async {
-        // #3436 — the large-document purge is not here but inside
+        // A record-log document's purge is not here but inside
         // `evictLocalData`, which is the one path every eviction passes
         // through: an evicting `closeDocument`, a retention sweep and a
         // document the server reports gone all reach it without coming through
-        // this method. See `DocumentManager.purgeFormat2Data`.
+        // this method. See `DocumentManager.purgeLocalStoreData`.
         await documentManager.evictLocalData(documentId: documentId)
         // #3764 — the eviction took the row the refused belief was read from,
         // which is the recovery the docs prescribe for a client whose row is
@@ -1880,11 +1841,10 @@ public final class JsBaoClient: @unchecked Sendable {
     // MARK: - Oversize outbound payloads (#3559)
     //
     // A payload too large for one inline frame is uploaded to R2 and named by
-    // `uploadId`, exactly as the JS client does (`transmitLocalUpdate` /
-    // `sendFormat2SyncStep2`). Two steps, in this order: ask the room for an
-    // upload URL over the socket, then PUT the bytes at it. The room mints the
-    // key, so the URL cannot be composed here; and a large document's key is
-    // in the signature-only subtree, which only the room can address.
+    // `uploadId`, exactly as the JS client does (`transmitLocalUpdate`). Two
+    // steps, in this order: ask the room for an upload URL over the socket,
+    // then PUT the bytes at it. The room mints the key, so the URL cannot be
+    // composed here.
     //
     // The waiter pattern is `checkStateVector`'s, keyed on the request id the
     // room echoes rather than on a document: several documents can have an
@@ -2227,10 +2187,13 @@ public final class JsBaoClient: @unchecked Sendable {
         if options.wipeLocal {
             await documentManager.evictAllLocalData()
             await kvCache.clearAll()
-            // #3436 — and every large document's own tables, including the
-            // ones this session never opened. Leaving a previous account's
-            // records on the device is what criterion 7 forbids.
-            await purgeAllLargeDocuments()
+            // And every document's own tables, including the ones this session
+            // never opened — the record-log stores, and whatever large
+            // documents a pre-removal build left on the device. Leaving a
+            // previous account's records behind is what the wipe exists to
+            // prevent.
+            await purgeLegacyLargeDocumentTables()
+            await purgeAllRecordLogDocuments()
         }
     }
 
@@ -2405,7 +2368,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `offlineRequestError`, message and `details` included.
     internal func offlineRequestError(method: HTTPMethod, path: String) -> JsBaoError? {
         guard !networkingAllowed() else { return nil }
-        let (mode, reachable) = lock.withLock { (networkModeStorage, reachable) }
+        let (mode, reachable) = lock.withLock { (networkModeStorage, self.reachable) }
         return JsBaoError(
             code: .offline,
             message: "Client is offline (networkMode=\(mode.rawValue)\(reachable ? "" : ", no network reachable"))",
@@ -2730,6 +2693,9 @@ public final class JsBaoClient: @unchecked Sendable {
             return mode == .auto && !wasAuto
         }
         authController.setNetworkMode(mode)
+        // The socket may have stayed open while networking was not allowed:
+        // record-log entries queued meanwhile leave once it is allowed again.
+        if mode != .offline { recordLogKick() }
         eventEmitter.emit(NetworkModeEvent(
             mode: mode,
             isOnline: computeReportedOnline(),
@@ -3125,14 +3091,18 @@ public final class JsBaoClient: @unchecked Sendable {
             throw refusal
         }
 
-        // #3436 — what kind of document is this, and can this client hold it?
+        // What kind of document is this, and can this client hold it?
         // Deliberately the FIRST thing the open does: the socket's receive
-        // limit has to be raised while there is still time (the frame that
-        // would tell this client the format is the frame the limit protects),
-        // and an app that configured storage which cannot hold a large
-        // document is told so before a single frame goes out rather than
-        // being connected to a document it cannot store.
+        // limit has to be raised while there is still time, and a large
+        // document (format 2), which is no longer served, is refused before a
+        // single frame goes out and before anything is opened.
         try await prepareDocumentFormat(documentId)
+        // A record-log (format-3) document is resolved the same way, and must
+        // be, before any frame: the room answers a Yjs frame for one with
+        // DOCUMENT_FORMAT_MISMATCH. A device that never saw the document asks
+        // the documents API when it may use the network — and is refused if
+        // the answer is 2.
+        try await prepareRecordLogFormat(documentId)
 
         let (doc, origin) = try await documentManager.openDocumentReportingOrigin(
             documentId: documentId,
@@ -3159,7 +3129,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // `networkTimeout` where JS resolves with the empty document (#2667,
         // C8) — would make the create → open → write flow fail offline. JS
         // counts its pending creates the same way (`hasLocalCopy`).
-        let effectiveHasLocal = documentManager.ydocHasData(documentId)
+        var effectiveHasLocal = documentManager.ydocHasData(documentId)
             || documentManager.isPendingCreate(documentId)
             || documentManager.isLocalOnly(documentId)
 
@@ -3169,11 +3139,13 @@ public final class JsBaoClient: @unchecked Sendable {
         // and the local state has to be discarded (#2664, C14).
         noteSuspectedStaleLocalState(documentId)
 
-        // #3436 — a large document's Y.Doc IS the current epoch's overlay, so
-        // the binding is made over the document this open produced, and only
-        // now that there is one. The capability check that could refuse this
-        // ran before the open, so nothing here can fail for storage.
-        try await bindLargeDocumentIfResolved(documentId, doc: doc)
+        // A record-log document is bound before its models connect, so each
+        // member reads the document's store. Its Y.Doc stays empty, so whether
+        // it holds data locally is the store's answer.
+        try await bindRecordLogDocumentIfResolved(documentId)
+        if isRecordLogDocument(documentId) {
+            effectiveHasLocal = effectiveHasLocal || recordLogHasLocalData(documentId)
+        }
 
         // Mirror the doc into every registered cross-document store so
         // `Model.query()` sees it. Covers `openDocumentByAlias` too (it
@@ -3211,7 +3183,7 @@ public final class JsBaoClient: @unchecked Sendable {
             || (options.waitForLoad == .localIfAvailableElseNetwork && !effectiveHasLocal)
         logger.debug(
             "[open] opened locally", documentId, "origin:", origin,
-            "hasLocal:", effectiveHasLocal, "large:", isLargeDocument(documentId),
+            "hasLocal:", effectiveHasLocal, "recordLog:", isRecordLogDocument(documentId),
             "needsNetworkWait:", needsNetworkWait
         )
 
@@ -3343,12 +3315,12 @@ public final class JsBaoClient: @unchecked Sendable {
             // baseline.
             let wait = SubscriptionHolder()
 
-            // #3436 — a refusal the router handles fails this wait
-            // directly. `CLIENT_UPGRADE_REQUIRED` is the room's last
-            // word before it closes the socket, so nothing will ever
-            // arrive to settle the wait the ordinary way and the
-            // caller would be told `NETWORK_TIMEOUT` half a minute
-            // later about a server that answered at once.
+            // A refusal the router handles fails this wait directly.
+            // `DOCUMENT_FORMAT_UNSUPPORTED` is the platform's last word
+            // for the document, so nothing will ever arrive to settle
+            // the wait the ordinary way and the caller would be told
+            // `NETWORK_TIMEOUT` half a minute later about a server that
+            // answered at once.
             // #3764, D9 — attached rather than registered here: the
             // registration happened before the open got this far, so a
             // refusal answered in between is delivered the moment this
@@ -3522,15 +3494,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// minus the flush/evict/announce work: nothing was handed to a caller,
     /// so there is nothing to persist and no `close` to report.
     private func abortOpenedDocument(_ documentId: String) {
-        // #3436 — the large-document binding goes with the document, for the
-        // same reason `closeDocument` releases it: a binding holds the Y.Doc
-        // that IS this document's epoch overlay, and this method is dropping
-        // that document. A binding left behind is handed back by the next
-        // `bindLargeDocument` on this client, so a retry after a failed open
-        // would attach every model to the overlay of a document whose update
-        // observer and persistence are already gone — writes published where
-        // nothing sends them, updates arriving somewhere else.
-        format2State.coordinator?.unbind(documentId: documentId)
+        Task { [weak self] in await self?.closeRecordLogDocument(documentId) }
         disconnectFromSharedModels(documentId: documentId)
         clearSyncWatchdog(documentId)
         lock.withLock {
@@ -3640,21 +3604,10 @@ public final class JsBaoClient: @unchecked Sendable {
         let documentId: String
     }
 
-    /// Drop the outbound updates queued for a document whose epoch has moved
-    /// (#3437, behavior 10).
-    ///
-    /// Only ever called for a LARGE document, and only by an epoch move. Every
-    /// queued update is a Yjs DELTA built on the overlay the room has just
-    /// archived, so the room cannot integrate it — it PARKS it, and from then
-    /// on it answers every later update from that connection with another
-    /// resync request instead of an acknowledgement, permanently. Measured
-    /// live: a document whose pre-seal delta reached the room after the seal
-    /// never got another ack, and a probe with nothing owed at the seal was
-    /// acknowledged normally.
-    ///
-    /// Discarding a queued update would lose a write on any other path. Here
-    /// it loses nothing: the carry has just written that write's content onto
-    /// the fresh overlay, and the whole-state frame that follows carries it.
+    /// Drop the outbound updates queued for a document the platform has
+    /// refused on this connection. Every one of them was built for a document
+    /// the room will not serve this client; what they wrote stays in the
+    /// document's local persistence.
     func discardQueuedOutboundUpdates(documentId: String) {
         let dropped: Int = lock.withLock {
             outboundDebounceTimers[documentId]?.cancel()
@@ -3663,8 +3616,8 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         guard dropped > 0 else { return }
         logger.debug(
-            "[format2] dropped", dropped, "queued update(s) for", documentId,
-            "— each is a delta against the overlay the room has archived"
+            "dropped", dropped, "queued update(s) for", documentId,
+            "— the platform refused the document on this connection"
         )
     }
 
@@ -3768,13 +3721,9 @@ public final class JsBaoClient: @unchecked Sendable {
             syncErrorReported.remove(documentId)
         }
 
-        // #3436 — release the large-document binding with the document. A
-        // large document's Y.Doc IS its epoch overlay, so a reopen produces a
-        // NEW one; a binding kept across the close would leave every later
-        // write publishing into the document that was closed, where nothing
-        // reads it and nothing sends it. The STORE stays — that is what an
-        // ordinary close keeps, and what makes the next open cheap.
-        format2State.coordinator?.unbind(documentId: documentId)
+        // A record-log document's session stops and its binding closes; its
+        // store keeps everything, and the next open catches up from the cursor.
+        await closeRecordLogDocument(documentId)
 
         // Nothing may keep re-syncing a document the caller closed (#2664, C7).
         clearSyncWatchdog(documentId)
@@ -4143,6 +4092,11 @@ public final class JsBaoClient: @unchecked Sendable {
             }
             return
         }
+        // A document whose format nothing local knows is asked about now that
+        // the socket is up, before a handshake that could be the wrong one: a
+        // format-3 document must open with `record.open` (its open could not
+        // ask if it began before the socket connected).
+        guard await resolveRecordLogBeforeHandshake(documentId) else { return }
         // One syncStep1->syncComplete cycle in flight per document (JS
         // parity: `sendSyncStep1` skips while `hasPendingSyncOperation`).
         // Without this, the 350ms availability-retry loop floods the
@@ -4152,6 +4106,16 @@ public final class JsBaoClient: @unchecked Sendable {
         // below - or by aging out (the `staleAfter` watchdog stand-in).
         guard documentManager.beginPendingSyncOperation(documentId) else {
             logger.debug("startNetworkSync: sync already in progress for", documentId)
+            return
+        }
+        // A record-log (format-3) document opens with `record.open`, never a
+        // `syncStep1`: its session holds the conversation. The claim and the
+        // watchdog are the same; the session reports synced when its catch-up
+        // completes.
+        if let session = recordLogSession(documentId) {
+            lock.withLock { _ = subscribedDocuments.insert(documentId) }
+            scheduleSyncWatchdog(documentId)
+            await session.start()
             return
         }
         guard let message = documentManager.buildSyncStep1Message(documentId: documentId) else {
@@ -4195,6 +4159,31 @@ public final class JsBaoClient: @unchecked Sendable {
             lock.withLock { syncWatchdogTimers.removeValue(forKey: documentId)?.cancel() }
             scheduleSyncRetry(documentId)
         }
+    }
+
+    /// A record-log document's session completed its open as this client's
+    /// writer: the same completion `syncComplete` gives an ordinary document.
+    func recordLogSessionSynced(_ documentId: String) async {
+        // A room that refused this client's writes (WRITE_ACCESS_DENIED) left
+        // the store read-only; an open the document's permission allows to
+        // write lifts it.
+        if let binding = recordLogBinding(documentId), binding.isReadOnly,
+           !documentManager.isReadOnly(documentId) {
+            await recordLogSession(documentId)?.adoptWriteAccess()
+        }
+        clearSyncWatchdog(documentId)
+        documentManager.handleSyncComplete(documentId: documentId, synced: true)
+        reconcileUnsyncedAfterSync(documentId: documentId, synced: true)
+        reportSyncRecovered(documentId)
+    }
+
+    /// A record-log document's open made progress without completing (a chunk
+    /// of a receipt, a catch-up page): a watchdog armed for it starts its
+    /// handshake budget again, so a receipt longer than the budget neither
+    /// reports a sync error nor rebuilds the socket.
+    func recordLogSyncProgress(_ documentId: String) {
+        let armed = lock.withLock { syncWatchdogTimers[documentId] != nil }
+        if armed { scheduleSyncWatchdog(documentId) }
     }
 
     // MARK: - Sync watchdog (#2664, C7)
@@ -5681,48 +5670,11 @@ public final class JsBaoClient: @unchecked Sendable {
         documentManager.onLocalUpdate = { [weak self] documentId, update in
             self?.queueOutboundUpdate(documentId: documentId, update: update)
         }
-        // #3436 — a large document's `update` frame says which local sequences
-        // it carries; the claim is made when the frame is built and settled
-        // when the socket has answered for it.
-        // #3436 — every eviction, whichever door it came through, takes the
-        // large document's own tables with it (decision 3436-SO-06).
-        documentManager.purgeFormat2Data = { [weak self] documentId in
-            await self?.purgeLargeDocument(documentId)
-        }
-        // #3437, behavior 17 — while a large document is behind the room its
-        // overlay stays the client's own: the room's current epoch is not
-        // merged into an overlay the epoch move is about to read owed values
-        // off. Every format-1 document, and every large document that is not
-        // behind, answers `true` and applies frames exactly as before.
-        documentManager.acceptsInboundFrame = { [weak self] documentId in
-            guard let coordinator = self?.format2State.coordinator,
-                  coordinator.isLargeDocument(documentId)
-            else { return true }
-            return coordinator.admitInbound(documentId)
-        }
-        documentManager.stampOutboundUpdate = { [weak self] documentId, mergedCount in
-            guard let coordinator = self?.format2State.coordinator else { return nil }
-            return try? coordinator.outboundClaim(
-                documentId: documentId, covering: mergedCount
-            )
-        }
-        documentManager.settleOutboundUpdate = { [weak self] documentId, claim, settlement in
-            guard let coordinator = self?.format2State.coordinator else { return }
-            switch settlement {
-            case .sent:
-                coordinator.markSent(documentId: documentId, claim: claim)
-            case .failed:
-                coordinator.restoreClaim(documentId: documentId, claim: claim)
-            case .stale:
-                coordinator.discardClaim(documentId: documentId, claim: claim)
-            }
-        }
-        // #3559 — the epoch generation an outbound payload was built against.
-        // Zero for an ordinary document, and for a client with no coordinator:
-        // a constant answer is an answer that never goes stale, which is right
-        // for a document that has no epochs to move between.
-        documentManager.outboundGeneration = { [weak self] documentId in
-            self?.format2State.coordinator?.outboundGeneration(documentId) ?? 0
+        // Every eviction, whichever door it came through, takes a record-log
+        // document's rows, entries and projections with it, its unsent writes
+        // handed back as DOCUMENT_STORE_PURGED.
+        documentManager.purgeLocalStoreData = { [weak self] documentId in
+            await self?.purgeRecordLogDocument(documentId)
         }
         // A `pendingCreate` doc doesn't exist server-side yet, so the
         // syncStep1 sent at open time never gets a `syncComplete` back and its
@@ -6020,8 +5972,8 @@ public final class JsBaoClient: @unchecked Sendable {
             // Restore analytics queue
             await analyticsQueue.restoreBuffer()
 
-            // #3436 — the local rows are loaded, so the question "is every
-            // document this client knows ordinary?" can be answered. Answered
+            // The local rows are loaded, so the question "is every document
+            // this client knows ordinary?" can be answered. Answered
             // HERE, before the auto-connect below, so the answer reaches the
             // first task rather than the second.
             await ensureReceiveLimitForKnownDocuments()
@@ -6066,6 +6018,9 @@ public final class JsBaoClient: @unchecked Sendable {
             try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: userId)
             await documentManager.loadLocalMetadata()
         }
+        // The record-log store is one per app file: reset it when it belongs
+        // to another user than the one signed in.
+        await checkRecordLogOwnerAtSignIn()
         releaseHeldOutboundClassifications()
     }
 
@@ -6110,6 +6065,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `waitForStorageReady()` confirms the initial bind has finished.
     public func rebindUserScopedStorage() async {
         let newUserId = authController.getUserId() ?? ""
+        // The record-log store is reset when another user than its owner signs
+        // in; the same user keeps it, with its unsent writes.
+        await checkRecordLogOwnerAtSignIn()
         if documentManager.userId == newUserId {
             // Same user, but a logout in this process dropped in-memory
             // user-scoped state the store still holds (#2874): reload it here,
@@ -6364,6 +6322,61 @@ public final class JsBaoClient: @unchecked Sendable {
             ]
         )
 
+        let tornDown = await tearDownRefusedDocument(
+            documentId, error: error,
+            reason: "the platform serves it as format \(actual) and this client opened it as \(declared)"
+        )
+        guard tornDown else { return }
+
+        eventEmitter.emit(ConnectionErrorEvent(
+            message: message,
+            documentId: documentId,
+            messageType: "syncStep1",
+            detail: .object([
+                "code": .string(JsBaoErrorCode.documentFormatMismatch.rawValue),
+                "declared": .number(Double(declared)),
+                "actual": .number(Double(actual)),
+            ])
+        ))
+        eventEmitter.emit(DocumentFormatMismatchEvent(
+            documentId: documentId,
+            declared: declared,
+            actual: actual,
+            error: error
+        ))
+    }
+
+    /// Refuse ONE document because the platform no longer serves its format:
+    /// a large document (`documentFormat: 2`). The same document-scoped
+    /// teardown as a format disagreement — an open waiting on it fails, a
+    /// document already open is closed under the app, nothing more is sent
+    /// for it on this connection, and its local store is left as it was.
+    func refuseUnsupportedDocumentFormat(
+        _ documentId: String,
+        error: JsBaoError,
+        messageType: String? = nil,
+        detail: JSONValue? = nil
+    ) async {
+        let tornDown = await tearDownRefusedDocument(
+            documentId, error: error, reason: "its format is no longer served"
+        )
+        guard tornDown else { return }
+        eventEmitter.emit(ConnectionErrorEvent(
+            message: error.message,
+            documentId: documentId,
+            messageType: messageType,
+            detail: detail ?? .object([
+                "code": .string(JsBaoErrorCode.documentFormatUnsupported.rawValue),
+            ])
+        ))
+    }
+
+    /// The teardown both refusals share. Answers whether this call tore the
+    /// document down; `false` — the document was not held, or was already
+    /// refused — means only a waiting open was failed.
+    private func tearDownRefusedDocument(
+        _ documentId: String, error: JsBaoError, reason: String
+    ) async -> Bool {
         // The refusal is CLAIMED before any waiting open is released. Failing the
         // wait resumes the open's task, and its abort path removes the document
         // it had registered — concurrently, since nothing here is actor-isolated.
@@ -6388,13 +6401,10 @@ public final class JsBaoClient: @unchecked Sendable {
                 "[#3764] format refusal not acted on (not held, or already refused):",
                 documentId
             )
-            return
+            return false
         }
 
-        logger.error(
-            "[#3764] Document format disagreement: the platform serves",
-            documentId, "as format", actual, "and this client opened it as", declared
-        )
+        logger.error("[#3764] Document refused:", documentId, "—", reason)
 
         // Nothing may keep re-syncing a document the room refuses.
         clearSyncWatchdog(documentId)
@@ -6403,7 +6413,6 @@ public final class JsBaoClient: @unchecked Sendable {
         // this client, and the durable pending log is what carries those writes
         // to the open that agrees.
         discardQueuedOutboundUpdates(documentId: documentId)
-        format2State.coordinator?.unbind(documentId: documentId)
         disconnectFromSharedModels(documentId: documentId)
         // A document opened with `retainLocal: false` evicts at close, and
         // `CloseDocumentOptions()` does not stop it: that setting says "do not
@@ -6423,23 +6432,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // already run, so the open's own abort finds nothing left to remove and
         // cannot race it.
         failAwaitingOpen(documentId, error: error)
-
-        eventEmitter.emit(ConnectionErrorEvent(
-            message: message,
-            documentId: documentId,
-            messageType: "syncStep1",
-            detail: .object([
-                "code": .string(JsBaoErrorCode.documentFormatMismatch.rawValue),
-                "declared": .number(Double(declared)),
-                "actual": .number(Double(actual)),
-            ])
-        ))
-        eventEmitter.emit(DocumentFormatMismatchEvent(
-            documentId: documentId,
-            declared: declared,
-            actual: actual,
-            error: error
-        ))
+        return true
     }
 
     func handleWebSocketMessage(_ text: String) async {
@@ -6507,6 +6500,32 @@ public final class JsBaoClient: @unchecked Sendable {
                         + "opened it as format \(declared)."
             )
 
+        case "error" where json["code"] as? String
+                == JsBaoErrorCode.documentFormatUnsupported.rawValue && roomId != nil:
+            // The platform no longer serves this document's format (a large
+            // document). A document-scoped teardown, as for a mismatch: an open
+            // waiting on it fails with the typed error instead of timing out,
+            // nothing more is sent for it, and its local store is kept.
+            let documentId = roomId ?? ""
+            logger.warn("Document format unsupported:", documentId, json["message"] as? String ?? "")
+            await refuseUnsupportedDocumentFormat(
+                documentId,
+                error: documentFormatUnsupported(
+                    documentId: documentId, message: json["message"] as? String
+                ),
+                messageType: json["messageType"] as? String,
+                detail: errorFrameDetail(detail: json["detail"], code: json["code"] as? String)
+            )
+
+        case _ where Self.isRecordLogFrame(
+            type: action, messageType: json["messageType"] as? String, code: json["code"] as? String
+        ):
+            // A record-log (format-3) document's conversation: every `record.*`
+            // frame, and every error answering one, goes to its session.
+            if let frame = try? JSONValue.typedRow(from: json, subject: "A record frame") {
+                await routeRecordLogFrame(frame)
+            }
+
         case "error":
             // Server-side rejection of something this client sent (bad frame,
             // permission failure, invalid message). JS surfaces it as
@@ -6523,52 +6542,6 @@ public final class JsBaoClient: @unchecked Sendable {
                 messageType: json["messageType"] as? String,
                 detail: detail
             ))
-            // #3436 — an upgrade refusal is a permanent answer about this
-            // client build, not a fault on one frame. It is the room's last
-            // word before close 4426, so an open still waiting for this
-            // document's sync has to be failed here: nothing else will ever
-            // arrive for it.
-            if json["code"] as? String == JsBaoErrorCode.clientUpgradeRequired.rawValue,
-               let documentId = roomId {
-                logger.warn(
-                    "[format2] refused by the room: this client build cannot read",
-                    documentId
-                )
-                failAwaitingOpen(documentId, error: JsBaoError(
-                    code: .clientUpgradeRequired,
-                    message: json["message"] as? String
-                        ?? "This client is too old to read document \(documentId).",
-                    details: ["documentId": .string(documentId)]
-                ))
-            }
-
-        case "epoch.info":
-            // #3436 — the room's answer for a large document: which epoch it
-            // is on, what it has sealed, and what base it can offer. It is
-            // also where a client whose local row said nothing learns that
-            // this document is large at all.
-            await handleEpochInfoFrame(json)
-
-        case "update.ack":
-            // #3436 — the server's contiguous high-water mark for this
-            // client's sequences, and the only thing that prunes the durable
-            // pending-op log.
-            handleUpdateAckFrame(json)
-
-        case "epoch.seal", "epoch.resync":
-            // #3436, behavior 30 — the room rotated or replaced the epoch this
-            // client's overlay belongs to. Held and stopped: following the
-            // seal needs the sealed chain, which is #3437's. Reads keep
-            // answering and the pending log is kept. A `resync` at the epoch
-            // this client is already on is the one exception — it asks for
-            // self-contained state, which this answers with the whole overlay.
-            await handleEpochSealFrame(json)
-
-        case "snapshot.ready", "epoch.grants":
-            // #3436 — a new base finished building, or fresh grants arrived.
-            // Recorded for the next handshake and for a load in flight;
-            // neither moves anything on its own.
-            handleSnapshotInfoFrame(json)
 
         case "availability":
             // Document-availability push: carries the server's view of whether
@@ -6631,11 +6604,6 @@ public final class JsBaoClient: @unchecked Sendable {
                         documentId: roomId,
                         serverStateVectorBase64: stateVectorB64
                     ) else { return }
-                // #3436 — the answer is this document's local state under
-                // another name, so a held large document keeps it rather than
-                // sending it. Kept: the room asked, and it is owed an answer
-                // the moment the hold releases.
-                if client.holdKeeps(roomId, frame: responseMsg) { return }
                 try? await client.wsManager.send(responseMsg)
             }
 
@@ -6690,31 +6658,14 @@ public final class JsBaoClient: @unchecked Sendable {
             // leave the document in sync. JS resolves it identically
             // (`data.synced === false ? false : true`) — #2666.
             let syncedVerdict = (json["synced"] as? Bool) != false
-            // #3436 — a handshake that completed carrying no `epoch.info` is
-            // the room's answer "this is an ordinary document". Recording it
-            // is what lets this client keep Foundation's receive limit for
-            // this document in every later session.
-            if syncedVerdict { noteHandshakeWithoutEpochInfo(roomId) }
-            // #4190 — a large document's rows are folded from the overlay on
-            // the binding's fold queue, after the `syncStep2` above was
-            // applied. Reporting the sync before that fold lands would let an
-            // open parked on `.sync` resolve, and `isSynced` read true, over a
-            // merged view that does not yet hold what the room sent. JS awaits
-            // its query projection on the same path.
-            if let binding = format2?.binding(roomId) {
-                await binding.awaitScheduledFolds()
-                // The transport closed during the wait: the close cancelled
-                // this receive loop and marked the document unsynced, and a
-                // reconnect may have claimed a new cycle. This completion
-                // belongs to the dead connection, so it reports nothing.
-                if Task.isCancelled { return }
+            // A Yjs handshake that completed is the room's answer "this is an
+            // ordinary document". Recording it is what lets this client keep
+            // Foundation's receive limit for this document in every later
+            // session.
+            if syncedVerdict, !isRecordLogDocument(roomId) {
+                documentManager.noteDocumentFormat(roomId, 1)
             }
             documentManager.handleSyncComplete(documentId: roomId, synced: syncedVerdict)
-            // #3437, behavior 20 — the joined epoch's content is in, so a
-            // judgement a move deferred can run: the writes it held back are
-            // weighed against the sealed overlays the catch-up applied, the
-            // survivors are stated and the withhold released.
-            if syncedVerdict { await completeDeferredReplayIfOwed(roomId) }
             reconcileUnsyncedAfterSync(documentId: roomId, synced: syncedVerdict)
             // The document converged after the app was told its sync was
             // failing, so the app hears that it can drop the warning (#3390).
@@ -6965,12 +6916,6 @@ public final class JsBaoClient: @unchecked Sendable {
                 source: "server"
             )
 
-        case "db.change":
-            // Route to the matching databases.subscribe callback. Frames with
-            // no matching registration (arrived before register / after unsub)
-            // are debug-logged and dropped inside dispatch.
-            databases.subscriptionRegistry?.dispatch(json)
-
         case "auth_required", "auth_failed":
             // The server is telling us this connection's token is expiring or
             // no longer valid. It holds the socket open for a grace period
@@ -7005,13 +6950,6 @@ public final class JsBaoClient: @unchecked Sendable {
             // (and lifts the logout guard). A token the server pushed is the
             // background rotation the guard exists to catch.
             authController.applyServerPushedToken(pushed)
-
-        case "db.subscribed", "db.unsubscribed":
-            // Server-side ack. No client action — subscribe() returns a
-            // synchronous unsubscribe handle.
-            logger.debug("[db-sub] ack received", action,
-                         json["databaseId"] as? String ?? "",
-                         json["subscriptionKey"] as? String ?? "")
 
         case "channel.subscribed":
             // The server's ack for one channel: it carries the membership's
@@ -7317,6 +7255,14 @@ public final class JsBaoClient: @unchecked Sendable {
             logger.debug("[outbound] ignoring zero-length update", documentId)
             return
         }
+        // A record-log (format-3) document carries no Yjs traffic: the room
+        // answers a Yjs frame for one with DOCUMENT_FORMAT_MISMATCH, which tears
+        // the document down. Its records travel as entries; a write into its
+        // Y.Doc is not one, and is dropped here.
+        if isRecordLogDocument(documentId) {
+            logger.debug("[outbound] not sending a Yjs update for record-log document", documentId)
+            return
+        }
         if documentManager.isReadOnly(documentId) {
             // The server would reject it, so don't spend a frame on it. The
             // edit stays in the local Y.Doc; JS marks nothing here either —
@@ -7375,13 +7321,6 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         applyUnsyncedFlag(documentId, true, seq: markSeq)
 
-        // #3436 — note which of this client's local sequences this update
-        // covers, HERE and not where the frame is built: the queue merges a
-        // debounce window into one frame, so the frame that carries this
-        // window is the only frame those sequences will ever have. A no-op for
-        // an ordinary document.
-        noteLocalUpdateForLargeDocument(documentId)
-
         lock.withLock {
             var updates = pendingUpdates[documentId] ?? []
             updates.append(update)
@@ -7418,11 +7357,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `syncComplete` that may never come (#2664, C21; JS
     /// `flushAllLocalUpdates("ws-open")`).
     ///
-    /// It is a named path rather than a loop inside the connect handler
-    /// because a large document's hold has to cover it too (#3436): this runs
-    /// before any handshake frame exists, so it is the earliest door local
-    /// state can leave by. The per-document drain refuses a held document; the
-    /// batch stays queued for the release.
+    /// It runs before any handshake frame exists, so it is the earliest door
+    /// local state can leave by. The per-document drain refuses a document the
+    /// platform has refused; the batch is dropped there.
     func flushAllLocalUpdates(_ reason: String) async {
         let queuedDocIds = lock.withLock { Array(pendingUpdates.keys) }
         guard !queuedDocIds.isEmpty else { return }
@@ -7595,29 +7532,7 @@ public final class JsBaoClient: @unchecked Sendable {
                         "[#3764] dropping queued updates for a refused document", documentId
                     )
                     discardQueuedOutboundUpdates(documentId: documentId)
-                    format2State.coordinator?.forgetQueuedUpdates(documentId: documentId)
                     continue
-                }
-
-                // #3436 — a large document whose `epoch.info` has not been
-                // answered, or which is stopped pending a reload, may not put
-                // local state on the wire: the server would take it as the
-                // truth of an epoch this client has not been told it is on.
-                // Held, not dropped — the batch stays queued and the release
-                // flushes it, exactly as the classification hold below does.
-                if let reason = format2State.coordinator?.hold.reason(documentId) {
-                    logger.debug(
-                        "[format2] holding queued updates for", documentId, "—", reason
-                    )
-                    let retryAfterRequest: Bool = lock.withLock {
-                        guard outboundFlushOwner[documentId] == token else { return false }
-                        if outboundReflushRequested.remove(documentId) != nil { return true }
-                        outboundFlushOwner.removeValue(forKey: documentId)
-                        return false
-                    }
-                    if retryAfterRequest { continue }
-                    onOutboundFlushedForTest?(documentId)
-                    return
                 }
 
                 if documentManager.isLocalOnly(documentId) {
@@ -7632,11 +7547,6 @@ public final class JsBaoClient: @unchecked Sendable {
                     // ownership and decides the unsynced clear.
                     logger.debug("[outbound] dropping queued updates for local-only document", documentId)
                     lock.withLock { _ = pendingUpdates.removeValue(forKey: documentId) }
-                    // #3436 — the ack ledger holds one place per queued update
-                    // so a claim can count them; dropping the queue without
-                    // dropping its places would leave the two out of step, and
-                    // the next claim would count somebody else's updates.
-                    format2State.coordinator?.forgetQueuedUpdates(documentId: documentId)
                     continue
                 }
 
@@ -7688,11 +7598,6 @@ public final class JsBaoClient: @unchecked Sendable {
                 // (JS parity: `Y.mergeUpdates`; see `mergeUpdates` for why this
                 // matters to a cold server room - #2584).
                 let merged = documentManager.mergeUpdates(batch)
-                // #3436 — the frame claims the local sequences of the updates it
-                // MERGES, not of everything queued: a write can commit between
-                // this batch being taken and the frame being stamped, and a
-                // claim over that one would have the server acknowledge a write
-                // whose bytes are still in this queue.
                 let sent = await documentManager.sendLocalUpdate(
                     documentId: documentId, update: merged,
                     mergedUpdateCount: batch.count
@@ -7899,20 +7804,6 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnConnected() {
         logger.log("WebSocket connected")
-        // #3436, decision 3436-SO-02 — every large document is held again the
-        // moment a socket comes up, BEFORE anything below can put local state
-        // on it. The bind's hold covers a document's first open; it releases on
-        // that open's `epoch.info` and never comes back, so a client that
-        // joined, went away, was edited offline and reconnected would flush
-        // those edits in `flushAllLocalUpdates("ws-open")` — against an epoch
-        // the room may have rotated or replaced since, which is the escape the
-        // hold exists for. Held, not dropped: this connection's `epoch.info`
-        // releases them, in order.
-        //
-        // Synchronous, and first: the flush is scheduled further down this same
-        // method, so a hold taken after it would be taken after the writes it
-        // was for had already gone out.
-        holdLargeDocumentsForNewConnection()
         wsAuthRecovery.noteConnected()
         // A fresh socket gets a fresh claim: whatever a stalled document spent
         // on the previous connection says nothing about this one (#3390).
@@ -7973,9 +7864,6 @@ extension JsBaoClient: WebSocketManagerDelegate {
             await documents.reconcileScopeAtConnect()
             // Flush analytics
             await analyticsQueue.flush()
-            // Re-issue db.subscribe for every live database subscription —
-            // the server-side connection mapping is dropped on disconnect.
-            databases.resubscribeAll()
         }
     }
 
@@ -8016,6 +7904,8 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // disconnect emits its own at initiation. Emitting again delivered two
         // per close (#2663).
         eventEmitter.emit(ConnectionCloseEvent(code: code, reason: reason))
+        // Every record-log session drops what was in flight on this socket.
+        recordLogDisconnected()
         // A 4401 close, or any close before the socket ever opened, means the
         // access token was rejected: refresh it and reconnect, rather than
         // retrying the same expired token until the app is relaunched (#2637).
@@ -8075,6 +7965,10 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnDisconnectInitiated() {
         logger.debug("WebSocket disconnect initiated")
+        // Every record-log session drops what was in flight on the socket that
+        // is going away, here and not only on the close callback: a disconnect
+        // that resolves on its timeout never delivers that callback.
+        recordLogDisconnected()
         // Report the disconnect as it starts rather than up to the 500ms close
         // timeout later, and stop claiming the open documents are synced
         // (JS parity: `handleDisconnectInitiated`, #2663).
@@ -8109,17 +8003,6 @@ extension JsBaoClient: WebSocketManagerDelegate {
     }
 
     func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool {
-        // #3436 — the one close code that is a permanent answer rather than a
-        // fault. The room sends 4426 after `CLIENT_UPGRADE_REQUIRED` because
-        // this client BUILD cannot read the document; reconnecting produces
-        // the identical refusal, for ever, as fast as the backoff allows.
-        // Every other code below is a condition that can change.
-        if code == Format2Transport.upgradeRequiredCloseCode {
-            logger.warn(
-                "[format2] not reconnecting: the room refused this client build (4426)"
-            )
-            return false
-        }
         // No close-code allowlist, matching the JS client's `shouldReconnect`
         // (#2660). The codes this used to suppress on were the wrong ones: the
         // server sends 4401 for an expired token, sends 4001 only alongside

@@ -217,6 +217,21 @@ public final class CodegenAPI: @unchecked Sendable {
             .save(id: id, values: values, changedFields: changedFields)
     }
 
+    /// ``save(_:id:values:in:changedFields:)``, and on a record-log
+    /// (format-3) document, with `confirm: true`, return once the room has
+    /// acknowledged the save — throwing the hand-back's error when it refuses
+    /// it. See `DynamicModel.save(id:values:changedFields:confirm:)`.
+    @discardableResult
+    public func save(
+        _ schema: PrimitiveSchema, id: String,
+        values: [String: PrimitiveValue], in docId: String,
+        changedFields: Set<String>? = nil,
+        confirm: Bool
+    ) async throws -> PrimitiveRecord {
+        try await requireClient("save").requireMember(schema, in: docId)
+            .save(id: id, values: values, changedFields: changedFields, confirm: confirm)
+    }
+
     /// Insert-or-update a record in document `docId`, matched by the
     /// single-field unique constraint on `field` — mirrors js-bao's
     /// `save({ upsertOn: field })`. Throws if the doc isn't open.

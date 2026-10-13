@@ -20,6 +20,128 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: large documents (`documentFormat: 2`) are removed
+
+The platform no longer serves large documents, and the Swift client no longer
+holds their code. A create that asks for one — `documents.create`,
+`createDocument`, `createWithAlias` and `getOrCreateWithAlias` with
+`documentFormat: 2` — throws `JsBaoError(.documentFormatUnsupported)` before
+any request. An open whose format resolves to 2, from the local row or from the
+server, throws the same code before any frame is sent; the document is left
+closed and whatever an older build stored for it stays on the device until
+`logout(wipeLocal: true)`. Use `documentFormat: 3` (record-log documents) for
+large data; an export of a large document made by an earlier release loads
+into a record-log document with
+`primitive documents ingest <document-id> --input <export-dir>`.
+
+Removed:
+
+- `JsBaoClientOptions.largeDocumentStorage` and `LargeDocumentStorageOptions`.
+- `JsBaoErrorCode.clientUpgradeRequired`, `.format2ReloadRequired`,
+  `.format2FoldBroken` and `.format2SnapshotLoadIncomplete`.
+- The `.documentSnapshotLoad` and `.documentOfflineWritesResolved` events with
+  `DocumentSnapshotLoadEvent` and `DocumentOfflineWritesResolvedEvent`.
+- Every public large-document type: `Format2RecordStore`, `Format2Coordinator`,
+  `Format2DocumentBinding`, `Format2Transport`, `Format2QueryProjection`,
+  `Format2Observer`, `Format2WritePath`, `Format2SnapshotLoader`,
+  `Format2StorageCapability`, `OverlayDocument`, `OverlayMutation`,
+  `OverlayKeys`, `SnapshotManifest`, `SnapshotChunkReader` and the types they
+  carried.
+- `DocumentManager.sendLocalUpdate(documentId:update:mergedUpdateCount:claiming:)`
+  loses `claiming:`.
+
+`syncStep1` no longer carries `formats` or `manifestVersion`. Kept under their
+names, because the record-log store runs on them: `Format2SqlHost`,
+`Format2SqlConnection`, `Format2SqlValue`, `Format2Storage`,
+`.format2StorageUnavailable`, `.format2QueryScope` and
+`.format2ModelNotHydrated`. A refusal frame from the room
+(`DOCUMENT_FORMAT_UNSUPPORTED`) now closes the document under the app, as a
+format mismatch does.
+
+### Record-log documents receive bulk loads and checkpoint segments as chunks
+
+A `documentFormat: 3` document's bulk loads and the room's checkpoint segment
+now reach the Swift client as compressed chunks read through a short-lived
+grant, live and on reconnect, rather than as rows over the socket. Listeners
+hear a load once per chunk. A save to a record-log document with a field named
+`type` or starting with `_` now throws `.documentEntryInvalid` locally ("Field
+'…' is reserved … Rename the field."), as the room refuses it. Nothing to
+change in apps; give each `JsBaoClient` its own storage directory.
+
+### Breaking: `client.databases` is removed; reach records through a server function
+
+The client's direct database surface is gone: `client.databases` (database
+lifecycle, the `DoDb` records handle from `connect`, permissions, group
+permissions, operation CRUD and change subscriptions), with `DatabasesAPI`,
+`DoDb` and its types, `DatabaseInfo`, `CreateDatabaseParams`,
+`UpdateDatabaseParams`, `DatabaseOperationInfo`, `DatabaseChangeEvent` and
+`DatabaseSubscribeOptions`. Every `databases/*` route now answers only an app
+admin or owner, so an app's own code reads and writes its records in a server
+function, which runs with the app's authority. `client.databaseTypeConfigs`
+stays for admin tooling; its `metadataAccess` key and the deprecated
+initializers that took it are removed, and the server refuses the key.
+
+| Before | Now |
+| --- | --- |
+| `client.databases.connect(databaseId:)` then `query`, `save`, `count`, `aggregate` on the `DoDb` handle | a server function: `ctx.db(id, "<type>").model("<Model>").query(...)` / `.save(...)`, invoked with `client.functions.invoke` or the generated `<Key>Function` invoker |
+| `client.databases.create`, `get`, `list`, `update`, `delete`, `addManager`, `removeManager` | `ctx.api.databases.*` in a server function, or the admin console and `primitive databases` |
+| `client.databases.subscribe(...)` | a server function that writes and then publishes with `ctx.channels.publish`; the app joins the channel with `client.subscribeToChannel` |
+| `client.databases.createOperation`, `getOperation`, `updateOperation`, `deleteOperation` | the operation's logic as a server function |
+| `metadataAccess` on `CreateDatabaseTypeConfigParams`, `UpdateDatabaseTypeConfigParams`, `DatabaseTypeConfigInfo` (`celContextAccess` in the type's TOML), and the type's `defaultAccess` | the function's own `access` gate, and resource metadata categories read as `md.self.<category>.<key>`; `config push` and the type-config routes refuse all three keys by name |
+
+The `db.*` WebSocket frames are retired with subscriptions, so the client
+neither routes them nor re-subscribes on reconnect.
+
+### Added: record-log documents (`documentFormat: 3`)
+
+A Swift app can create, open and use a record-log document through the same
+model facade as any document (`docs/record-log.md`). Additive only — nothing
+existing changes shape:
+
+- `CreateDocumentOptions.documentFormat` accepts `3`; the open resolves a
+  document's format before the handshake, through the documents API when this
+  device never saw it.
+- `DocumentWriteRefusedEvent` gains `writes` (every handed-back write with its
+  values) and `conflictingRecord`, both `nil` for a format-2 refusal; the
+  existing four-parameter initializer is unchanged, and a second one takes
+  both.
+- `JsBaoErrorCode` gains, appended: `documentFormatUnsupported`,
+  `documentConstraintViolated`, `documentEpochFrozen`, `documentStorePurged`,
+  `documentEpochBudget`, `documentEntryTooLarge`, `documentEntryInvalid`,
+  `documentEpochNotOpen`, `writeAccessDenied` — the JS client's strings.
+- `DynamicModel.save(id:values:changedFields:confirm:)` and
+  `CodegenAPI.save(_:id:values:in:changedFields:confirm:)` (async): with
+  `confirm: true` on a record-log document, return once the room has
+  acknowledged the save.
+- `PrimitiveRecord.syncState` (`pending`, `confirmed`, `refused`, or `nil` off
+  format 3) and `PrimitiveRecord.recordLogSeq`.
+- `transact` on a record-log document lands its saves as one entry.
+- A record-log document's store commits saves issued together in one group at
+  `synchronous=NORMAL`: an app or process crash loses nothing; an OS crash or
+  power loss may lose the last few commits. Format-1 storage keeps the
+  provider's own setting.
+
+### Added: a local `aggregate` groups a date field by month, quarter or year (#4266)
+
+`AggregateGroupBy.datePeriod(field:period:)`, with `DatePeriod` `.month`,
+`.quarter` or `.year`, buckets a `.date` (or `.string`) field by calendar
+period, beside any other `groupBy` levels. Its key in `group` is
+`<field>_<period>` and its value `YYYY-MM`, `YYYY-Qn` or `YYYY`, read from the
+stored text with no time-zone conversion — the same buckets js-bao answers for
+the same stored strings. A missing or non-date value is `.null`. A field of
+another type throws `JsBaoError(.invalidArgument)` before anything is read.
+
+```swift
+let monthly = try Transaction.aggregate(AggregateOptions(
+  groupBy: ["categoryId", .datePeriod(field: "date", period: .month)],
+  operations: [AggregateOperation(type: .sum, field: "amount"), AggregateOperation(type: .count)],
+  filter: ["date": ["$gte": "2025-11-01", "$lte": "2026-10-31"]]
+))
+// [["group": ["categoryId": "food", "date_month": "2025-11"], "sum_amount": -50, "count": 2], ...]
+```
+
+An exhaustive `switch` over `AggregateGroupBy` in app code needs the new case.
+
 ### Breaking: a local `aggregate` answers rows with a `group` (#4347)
 
 `aggregate` on a model (`DynamicModel`, `MultiDocModel`, a generated

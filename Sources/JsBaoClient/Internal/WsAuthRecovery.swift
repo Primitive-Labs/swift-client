@@ -221,7 +221,7 @@ final class WsAuthRecovery: @unchecked Sendable {
             // client closed says nothing about its token, whether or not the
             // handshake had completed. The handshake flag alone could not carry
             // this — a rebuild that lands on a connection still opening (the
-            // receive-limit raise a first large document forces, #3436) reads
+            // receive-limit raise a first record-log document forces) reads
             // exactly like the server refusing the upgrade (#3437).
             if deliberateClose { return .skip("a close this client made itself") }
             if let code, Self.terminalAuthCloseCodes.contains(code) {

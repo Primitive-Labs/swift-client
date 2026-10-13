@@ -7,8 +7,7 @@ import Foundation
 /// `pendingChannelSubscribes` / `channelEpochs` / `channelSubscribeChain`
 /// (`src/client/JsBaoClient.ts`, #3184).
 ///
-/// Self-contained and synchronous, in the shape of
-/// `DatabaseSubscriptionRegistry`: it never touches the network. `JsBaoClient`
+/// Self-contained and synchronous: it never touches the network. `JsBaoClient`
 /// sends the frames, decides the outcomes, and resumes the continuations this
 /// registry hands back — always OUTSIDE the lock, so a resumed caller that
 /// subscribes again from its continuation cannot deadlock against the

@@ -12,21 +12,40 @@ enum Gzip {
     /// Decode one gzip member, or `nil` if the bytes are not a well-formed
     /// gzip stream. Callers treat `nil` like a dropped frame rather than
     /// applying partial output, so a truncated body can't reach a ydoc.
-    static func gunzip(_ data: Data) -> Data? {
+    ///
+    /// - Parameter limit: The most bytes the member may decode to; decoding
+    ///   stops, answering `nil`, the moment the output passes it.
+    static func gunzip(_ data: Data, limit: Int? = nil) -> Data? {
+        if case .inflated(let inflated) = gunzipBounded(data, limit: limit) { return inflated }
+        return nil
+    }
+
+    /// What a bounded decode found.
+    enum Bounded: Equatable {
+        case inflated(Data)
+        /// The output passed the limit; decoding stopped there.
+        case pastLimit
+        /// The bytes are not one well-formed gzip member.
+        case unreadable
+    }
+
+    /// Decode one gzip member, stopping the moment the output passes `limit`
+    /// so bytes from a caller that declare less than they inflate to are never
+    /// held whole.
+    static func gunzipBounded(_ data: Data, limit: Int? = nil) -> Bounded {
         // Offsets below are relative to `base`, not absolute: `data` may be a
         // slice, whose `startIndex` is not 0.
         let base = data.startIndex
-        guard let headerLength = headerLength(data) else { return nil }
+        guard let headerLength = headerLength(data) else { return .unreadable }
         // 8-byte trailer: CRC-32 then ISIZE (uncompressed length mod 2^32).
         let deflateEnd = data.count - 8
-        guard deflateEnd > headerLength else { return nil }
+        guard deflateEnd > headerLength else { return .unreadable }
 
-        guard let inflated = inflateRaw(
-            data[(base + headerLength)..<(base + deflateEnd)]
-        ) else { return nil }
+        let inflated = inflateRaw(data[(base + headerLength)..<(base + deflateEnd)], limit: limit)
+        guard case .inflated(let output) = inflated else { return inflated }
 
         let isize = readUInt32LE(data, at: data.count - 4)
-        guard UInt32(truncatingIfNeeded: inflated.count) == isize else { return nil }
+        guard UInt32(truncatingIfNeeded: output.count) == isize else { return .unreadable }
         return inflated
     }
 
@@ -85,7 +104,7 @@ enum Gzip {
     /// Streaming raw-DEFLATE decode. `COMPRESSION_ZLIB` is Apple's name for
     /// raw DEFLATE (no zlib wrapper), which is exactly what sits between a
     /// gzip header and its trailer.
-    private static func inflateRaw(_ deflated: Data) -> Data? {
+    private static func inflateRaw(_ deflated: Data, limit: Int?) -> Bounded {
         let bufferSize = 64 * 1024
         let destination = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
         defer { destination.deallocate() }
@@ -94,12 +113,12 @@ enum Gzip {
         defer { streamPointer.deallocate() }
         guard compression_stream_init(
             streamPointer, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB
-        ) == COMPRESSION_STATUS_OK else { return nil }
+        ) == COMPRESSION_STATUS_OK else { return .unreadable }
         defer { compression_stream_destroy(streamPointer) }
 
         var output = Data()
-        return deflated.withUnsafeBytes { raw -> Data? in
-            guard let input = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+        return deflated.withUnsafeBytes { raw -> Bounded in
+            guard let input = raw.bindMemory(to: UInt8.self).baseAddress else { return .unreadable }
             streamPointer.pointee.src_ptr = input
             streamPointer.pointee.src_size = raw.count
 
@@ -114,14 +133,15 @@ enum Gzip {
                 if produced > 0 {
                     output.append(destination, count: produced)
                 }
+                if let limit, output.count > limit { return .pastLimit }
 
                 switch status {
                 case COMPRESSION_STATUS_OK:
                     continue  // output buffer filled; drain and keep going
                 case COMPRESSION_STATUS_END:
-                    return output
+                    return .inflated(output)
                 default:
-                    return nil  // truncated or corrupt input
+                    return .unreadable  // truncated or corrupt input
                 }
             }
         }

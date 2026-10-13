@@ -513,8 +513,9 @@ final class TransportSpineTests: XCTestCase {
     }
 
     /// Every API class converted to the typed spine (B1's `CollectionsAPI`,
-    /// all of B2, and B3's `DoDb` / `MeAPI`) carries no untyped dictionary,
-    /// no `JSONSerialization`, and no call into the deprecated closure.
+    /// all of B2, and B3's `MeAPI`) carries no untyped dictionary, no
+    /// `JSONSerialization`, and no call into the deprecated closure. (B3's
+    /// `DoDb` left with `client.databases`, #3189.)
     func testConvertedApiSourceHasNoUntypedDictionariesOrJsonSerialization() throws {
         let converted = [
             "BlobBucketsAPI.swift",
@@ -523,7 +524,6 @@ final class TransportSpineTests: XCTestCase {
             "CronTriggersAPI.swift",
             "DatabaseTypeConfigsAPI.swift",
             "DocumentsAPI.swift",
-            "DoDb.swift",
             "GroupsAPI.swift",
             "GroupTypeConfigsAPI.swift",
             "InvitationsAPI.swift",
@@ -577,15 +577,9 @@ final class TransportSpineTests: XCTestCase {
             // dictionaries, so changing these is a public-signature break
             // deferred to a later phase.
             "API/AuthAPI.swift": (6, 0, 0),
-            // The two WebSocket control frames (`db.subscribe` /
-            // `db.unsubscribe`) and the `JSONSerialization` that encodes them.
-            // #2367 typed the public `params` to `[String: JSONValue]`, so what
-            // is left is the wire-encoding boundary itself, not public surface.
-            // The review of this PR took it 2 -> 3: `sendSubscribeFrame`'s
-            // lowering is a `do`/`catch` that logs the encode failure rather
-            // than a `try?` that silently sent an empty `params` bag, which
-            // needs the declaration and the cast on separate lines.
-            "API/DatabasesAPI.swift": (3, 2, 0),
+            // `API/DatabasesAPI.swift` (3, 2, 0: the `db.subscribe` /
+            // `db.unsubscribe` frames it encoded) left with `client.databases`
+            // in #3189, so its entry is gone rather than zeroed.
             // Public `rootInput` / `meta` signatures. The two
             // `JSONSerialization` uses are deliberate: `start`/`runSync`
             // compose the opaque caller payload straight to request bytes,
@@ -717,44 +711,6 @@ final class TransportSpineTests: XCTestCase {
             // function is handed — internal shape checks on a value that is
             // already untyped, not new untyped surface.
             "Internal/KvCache.swift": (5, 4, 0),
-            // #3436 — the three format-2 WebSocket frames the coordinator
-            // handles: `epoch.info` and `update.ack` inbound, and the outbound
-            // `update` frame it stamps `seq`/`seqFrom`/`ackedSeq` onto. This is
-            // the SAME currency every arm of `handleWebSocketMessage` already
-            // speaks (`json["x"] as? T` off a parsed frame), not a new untyped
-            // surface and not an HTTP response body — decoding these two into
-            // structs while every neighbouring frame stays a dictionary would
-            // be the second pattern principle 4 warns about. No response body
-            // is read here and nothing is lowered into an `Any` graph.
-            // #3436 phase B took it 2 -> 8: `epoch.seal`/`epoch.resync` and
-            // `snapshot.ready`/`epoch.grants` are two more inbound frames, the
-            // question "does this frame ask for a resync rather than a reload"
-            // is asked of a third, and reading a frame's `sealedEpochs` array,
-            // its `download` block and its `snapshot` block is three more
-            // casts off the same graph. What is NOT untyped is the state any
-            // of it leaves behind — the sealed chain becomes
-            // `[SealedEpochChainEntry]` and the snapshot block a
-            // `SnapshotOffer` — because that outlives the frame and the next
-            // handshake has to agree with it about its shape.
-            "LargeDocuments/Format2Coordinator.swift": (8, 0, 0),
-            // #3436 — the two inbound frames the client's large-document front
-            // door routes, `epoch.info` and `update.ack`. They are handed the
-            // dictionary `handleWebSocketMessage` already parsed, and pass it
-            // to the coordinator budgeted above: the same currency, carried one
-            // call further, not a new untyped surface. No response body is read
-            // here and nothing is lowered into an `Any` graph.
-            // #3436 phase B took it 2 -> 4: the two epoch frames the router
-            // gained, `epoch.seal`/`epoch.resync` and
-            // `snapshot.ready`/`epoch.grants`, handed on to the coordinator
-            // budgeted above. The grant the cold start refreshes with is read
-            // off the typed `SnapshotOffer`, not off a dictionary.
-            // The `JSONSerialization` count went 0 -> 1 with it: a load whose
-            // signature expired asks the room to re-mint it, which is one more
-            // OUTBOUND frame (`{type: "epoch.grants", documentId}`), encoded
-            // the way every other outbound frame in this client is. The
-            // dictionary it encodes is `[String: String]`, so it does not
-            // count against the untyped total.
-            "LargeDocuments/Format2Client.swift": (4, 1, 0),
         ]
         let sources = sourcesDirectory
 

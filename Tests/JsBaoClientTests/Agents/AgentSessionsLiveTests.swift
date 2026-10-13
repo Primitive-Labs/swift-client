@@ -403,11 +403,13 @@ final class AgentSessionsLiveTests: XCTestCase {
         try await h.slowRound(s, ms: 10_000)
         let first = try await view.send(text: "First line\nsecond line")
         try await h.poll(timeout: 20, "the row names the running turn") { view.activeTurnId == first.turnId }
-        let states = Recorder<AgentSessionSyncedMessage.State>()
-        let second = try await view.send(text: "Second.")
+        // Listening before the send: the change that shows the row queued can
+        // come before `send` returns, and the next one can show it synced.
+        let seen = Recorder<[String: AgentSessionSyncedMessage.State]>()
         view.onChange { [view] in
-            if let state = view.syncedMessages.first(where: { $0.messageId == second.messageId })?.state { states.append(state) }
+            seen.append(Dictionary(view.syncedMessages.map { ($0.messageId, $0.state) }, uniquingKeysWith: { _, last in last }))
         }
+        let second = try await view.send(text: "Second.")
         XCTAssertTrue(second.queued)
         try await h.poll(timeout: 20, "the second message shows queued") {
             view.queue.flatMap(\.messageIds).contains(second.messageId)
@@ -416,7 +418,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         try await h.poll(timeout: 120, "the second message runs") {
             view.syncedMessages.first { $0.messageId == second.messageId }?.state == .synced
         }
-        XCTAssertTrue(states.all.contains(.queued))
+        XCTAssertTrue(seen.all.contains { $0[second.messageId] == .queued }, "a change showed the second message queued")
         try await h.settled(s)
 
         // The same client message id: same text answers the first; other text is refused.

@@ -92,8 +92,9 @@ public final class DocumentsAPI: @unchecked Sendable {
             // fall back to the direct server POST. This door touches no local
             // state, so the manager's guard never runs for it — and the server
             // does not read `localOnly` at all, so without this line a caller
-            // asking for a local-only large document here would get a server
-            // document that is not local-only, silently. One rule, every door.
+            // asking for a local-only record-log document here would get a
+            // server document that is not local-only, silently. One rule,
+            // every door.
             try assertDocumentFormatAllowsLocalOnly(
                 documentFormat: options.documentFormat, localOnly: options.localOnly
             )
@@ -779,6 +780,8 @@ public final class DocumentsAPI: @unchecked Sendable {
         guard !options.alias.aliasKey.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "alias.aliasKey is required")
         }
+        // A large document is no longer served: refused before the request.
+        try assertRequestedDocumentFormat(options.documentFormat)
         return try await transport.request(
             method: .post,
             path: "/documents/create-with-alias",
@@ -1121,6 +1124,8 @@ public final class DocumentsAPI: @unchecked Sendable {
         guard !alias.aliasKey.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "alias.aliasKey is required")
         }
+        // A large document is no longer served: refused before the request.
+        try assertRequestedDocumentFormat(options.documentFormat)
         var userId = alias.userId
         if alias.scope == .user, userId == nil {
             userId = client?.userId

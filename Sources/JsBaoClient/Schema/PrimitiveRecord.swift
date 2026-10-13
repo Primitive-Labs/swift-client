@@ -12,8 +12,8 @@ import Yniffi
 ///
 /// ## `Sendable` — plain and checked (#1992, Phase C)
 ///
-/// No `@unchecked` here, and none is needed: all three stored properties are
-/// `let` and `Sendable` (`String`, `String`, and `DynamicModel`, which is
+/// No `@unchecked` here, and none is needed: every stored property is `let`
+/// and `Sendable` (`String`s, `Int?`s, and `DynamicModel`, which is
 /// `@unchecked Sendable` behind its documented lock invariants). The compiler
 /// verifies this conformance, so the type carries no safety-argument debt of
 /// its own — that debt is `DynamicModel`'s, stated once there.
@@ -31,10 +31,32 @@ public final class PrimitiveRecord: Sendable {
     // drops its handle to the DynamicModel immediately after `create`.
     internal let model: DynamicModel
 
-    internal init(modelName: String, id: String, model: DynamicModel) {
+    /// On a record-log (format-3) document, the writer's sequence number of
+    /// the entry the save that returned this handle committed; `nil` for any
+    /// other handle (a lookup, another format, a save inside `transact`).
+    public let recordLogSeq: Int?
+
+    /// The save that returned this handle, as its document's binding names it:
+    /// `recordLogSeq` is minted again after a group of saves failed to commit,
+    /// and a later save under the same number is not this one.
+    internal let recordLogTicket: Int?
+
+    internal init(modelName: String, id: String, model: DynamicModel, recordLogSeq: Int? = nil) {
         self.modelName = modelName
         self.id = id
         self.model = model
+        self.recordLogSeq = recordLogSeq
+        self.recordLogTicket = recordLogSeq.flatMap { model.recordLog?.binding.ticket(of: $0) }
+    }
+
+    /// Whether this record's writes from this client have reached the room,
+    /// on a record-log (format-3) document: `pending` while an entry of this
+    /// client touching the record is unacknowledged, `refused` when the save
+    /// that produced this handle was handed back, `confirmed` otherwise. `nil`
+    /// on any other document. The model's listeners hear a record move to
+    /// `confirmed`.
+    public var syncState: RecordSyncState? {
+        model.recordLog?.binding.syncState(model: modelName, id: id, lastSeq: recordLogSeq, ticket: recordLogTicket)
     }
 
     // MARK: - Subscript

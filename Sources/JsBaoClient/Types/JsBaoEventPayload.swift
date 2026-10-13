@@ -291,36 +291,20 @@ extension DocumentSyncStateChangedEvent: JsBaoEventPayload {
     // and use the stream for subsequent changes.
 }
 
-extension DocumentSnapshotLoadEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .documentSnapshotLoad }
-    // Deliberately not replayable, for the reason
-    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
-    // key and this payload is scoped to a DOCUMENT, so a replay would hand
-    // back whichever document last loaded a base.
-}
-
 extension DocumentWriteRefusedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .documentWriteRefused }
-    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
-    // is not: retention is one slot per event key and this payload is scoped
-    // to a DOCUMENT and a RECORD, so a replay would hand back whichever write
+    // Deliberately not replayable, for the reason
+    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
+    // key and this payload is scoped to a DOCUMENT and a RECORD, so a replay would hand back whichever write
     // was refused last, frequently not the one the consumer cares about.
 }
 
 extension DocumentFormatMismatchEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .documentFormatMismatch }
-    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
-    // is not: retention is one slot per event key and this payload is scoped to
-    // a DOCUMENT, so a replay would hand back whichever document was last
-    // refused.
-}
-
-extension DocumentOfflineWritesResolvedEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .documentOfflineWritesResolved }
-    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
-    // is not: retention is one slot per event key and this payload is scoped
-    // to a DOCUMENT and one replay of it, so a replay would hand back
-    // whichever document last resolved its offline writes.
+    // Deliberately not replayable, for the reason
+    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
+    // key and this payload is scoped to a DOCUMENT, so a replay would hand
+    // back whichever document was last refused.
 }
 
 extension SyncEvent: JsBaoEventPayload {
@@ -446,10 +430,8 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     PendingCreateFailedEvent.self,
     DocumentMetadataChangedEvent.self,
     DocumentSyncStateChangedEvent.self,
-    DocumentSnapshotLoadEvent.self,
     DocumentWriteRefusedEvent.self,
     DocumentFormatMismatchEvent.self,
-    DocumentOfflineWritesResolvedEvent.self,
     SyncEvent.self,
     SyncPerfEvent.self,
     AwarenessEvent.self,

@@ -38,32 +38,4 @@ final class InitialMetadataEncodingTests: XCTestCase {
         let dict = try encodedObject(CreateCollectionParams(name: "Plain"))
         XCTAssertNil(dict["initialMetadata"])
     }
-
-    // MARK: CreateDatabaseParams
-
-    /// Behavior 3 + 4: the plain initializer accepts `initialMetadata` and
-    /// encodes it under the `initialMetadata` wire key.
-    func testDatabaseParamsEncodeInitialMetadata() throws {
-        let dict = try encodedObject(
-            CreateDatabaseParams(
-                title: "Class Roster",
-                databaseType: "roster",
-                initialMetadata: ["settings": ["visibility": .string("class-only")]]
-            )
-        )
-        XCTAssertEqual(dict["title"] as? String, "Class Roster")
-        XCTAssertEqual(dict["databaseType"] as? String, "roster")
-        let initial = try XCTUnwrap(dict["initialMetadata"] as? [String: Any])
-        let settings = try XCTUnwrap(initial["settings"] as? [String: Any])
-        XCTAssertEqual(settings["visibility"] as? String, "class-only")
-        // The retired CEL-context keys are never sent (#3991).
-        XCTAssertNil(dict["metadata"])
-        XCTAssertNil(dict["celContext"])
-    }
-
-    /// Behavior 5: omitting it leaves the key off the wire.
-    func testDatabaseParamsOmitInitialMetadataWhenUnset() throws {
-        let dict = try encodedObject(CreateDatabaseParams(title: "A", databaseType: "t"))
-        XCTAssertNil(dict["initialMetadata"])
-    }
 }

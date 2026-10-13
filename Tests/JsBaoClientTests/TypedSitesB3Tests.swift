@@ -2,9 +2,9 @@ import XCTest
 @testable import JsBaoClient
 
 /// Server-free tests for the non-mechanical conversions of #1991 Phase B3:
-/// `AuthController` (behavior 5), `DoDb` (behavior 6), `MeAPI` (behavior 9's
+/// `AuthController` (behavior 5), `MeAPI` (behavior 9's
 /// `MeAPI.get` parity edge case), and `BlobManager` (behavior 8's blob call
-/// site).
+/// site). Behavior 6's `DoDb` cases left with `client.databases` (#3189).
 ///
 /// Everything runs against a `RecordingTransport`, so each test asserts the
 /// exact bytes the converted site puts on the wire and the typed value it
@@ -209,113 +209,6 @@ final class TypedSitesB3Tests: XCTestCase {
             XCTAssertEqual(error.serverCode, "INVALID_CODE")
             XCTAssertEqual(error.serverMessage, "bad code")
         }
-    }
-
-    // MARK: - Behavior 6: DoDb round-trips dynamic record fields
-
-    func testDoDbSaveRoundTripsEveryJsonFieldKindWithoutLoss() async throws {
-        let transport = RecordingTransport(json: #"{"id": "rec-1"}"#)
-        let db = DoDb(databaseId: "db-1", transport: transport)
-
-        let record: [String: JSONValue] = [
-            "id": .string("rec-1"),
-            "title": .string("hello"),
-            "done": .bool(false),
-            "count": .number(3),
-            "note": .null,
-            "tags": .array([.string("a"), .string("b")]),
-            "nested": .object(["deep": .object(["deeper": .string("yes")])]),
-        ]
-
-        let savedId = try await db.save(modelName: "Task", data: record)
-
-        XCTAssertEqual(savedId, "rec-1")
-        let body = try XCTUnwrap(transport.lastCall?.jsonBody)
-        XCTAssertEqual(body["modelName"]?.stringValue, "Task")
-        XCTAssertEqual(body["id"]?.stringValue, "rec-1")
-        // Every field kind survives the encode byte-for-byte, including the
-        // explicit null and the nested object.
-        XCTAssertEqual(body["data"], .object(record))
-        XCTAssertEqual(body["data"]?["note"]?.isNull, true)
-        XCTAssertEqual(body["data"]?["nested"]?["deep"]?["deeper"]?.stringValue, "yes")
-    }
-
-    func testDoDbQueryDecodesTheTypedResultAndSendsTheEngineBody() async throws {
-        let transport = RecordingTransport(json: #"""
-        {"data": [{"id": "rec-1", "title": "hello"}], "count": 1}
-        """#)
-        let db = DoDb(databaseId: "db-1", transport: transport)
-
-        let result = try await db.query(
-            modelName: "Task",
-            filter: .object(["done": .bool(false)])
-        )
-
-        XCTAssertEqual(result.data.count, 1)
-        XCTAssertEqual(result.data.first?["title"]?.stringValue, "hello")
-        XCTAssertEqual(transport.lastCall?.method, .post)
-        XCTAssertEqual(
-            transport.lastCall?.path,
-            "/databases/db-1/records/query?docId=db-1"
-        )
-        XCTAssertEqual(
-            transport.lastCall?.jsonBody?["filter"]?["done"]?.boolValue, false
-        )
-    }
-
-    func testDoDbCountAcceptsANonIntegralJsonNumber() async throws {
-        let transport = RecordingTransport(json: #"{"count": 7.0}"#)
-        let db = DoDb(databaseId: "db-1", transport: transport)
-
-        let count = try await db.count(modelName: "Task")
-
-        XCTAssertEqual(count, 7)
-    }
-
-    /// A count the server could never legitimately send must not take the
-    /// process down with it. `Int(_: Double)` is a **trapping** conversion —
-    /// NaN, ±infinity and anything past `Int.max` abort — and this is a
-    /// response parser reading untrusted bytes (same failure class as #2056).
-    func testDoDbCountRejectsAnUnrepresentableNumberInsteadOfTrapping() async throws {
-        for wire in ["1e300", "-1e300"] {
-            let transport = RecordingTransport(json: #"{"count": \#(wire)}"#)
-            let db = DoDb(databaseId: "db-1", transport: transport)
-            do {
-                _ = try await db.count(modelName: "Task")
-                XCTFail("expected a DoDbError for \(wire)")
-            } catch let error as DoDbError {
-                XCTAssertEqual(error, .unexpectedResponse(field: "count"))
-            }
-        }
-    }
-
-    func testDoDbSurfacesAMissingContractFieldAsDoDbError() async throws {
-        let transport = RecordingTransport(json: #"{}"#)
-        let db = DoDb(databaseId: "db-1", transport: transport)
-
-        do {
-            _ = try await db.delete(modelName: "Task", id: "rec-1")
-            XCTFail("expected a DoDbError")
-        } catch let error as DoDbError {
-            XCTAssertEqual(error, .unexpectedResponse(field: "success"))
-        }
-    }
-
-    func testDoDbListIndexesAcceptsBothDocumentedShapes() async throws {
-        let enveloped = RecordingTransport(json: #"""
-        {"indexes": [{"model_name": "Task", "field_name": "done", "field_type": "boolean", "is_unique": 0, "created_at": "2026-01-01"}]}
-        """#)
-        let bare = RecordingTransport(json: #"""
-        [{"model_name": "Task", "field_name": "done", "field_type": "boolean", "is_unique": 0, "created_at": "2026-01-01"}]
-        """#)
-
-        let fromEnvelope = try await DoDb(databaseId: "db-1", transport: enveloped).listIndexes()
-        let fromArray = try await DoDb(databaseId: "db-1", transport: bare).listIndexes()
-
-        XCTAssertEqual(fromEnvelope.count, 1)
-        XCTAssertEqual(fromArray.count, 1)
-        XCTAssertEqual(fromEnvelope.first?.fieldName, "done")
-        XCTAssertEqual(fromArray.first?.fieldName, "done")
     }
 
     // MARK: - MeAPI: nil on empty AND on a malformed body (edge case)

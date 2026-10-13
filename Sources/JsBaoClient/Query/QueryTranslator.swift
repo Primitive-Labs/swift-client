@@ -309,7 +309,9 @@ public struct QueryTranslator {
     ///     INNER JOIN the member junction and group by member `value`;
     ///   - **stringset membership** (`.stringSetMembership`) → LEFT JOIN
     ///     the junction on a specific value and group by a `true`/`false`
-    ///     CASE on whether the member is present.
+    ///     CASE on whether the member is present;
+    ///   - **date period** (`.datePeriod`) → group by the bucket expression
+    ///     `periodBucketSQL` emits over the field's stored text.
     ///
     /// Every group level is selected under its positional alias (`_g<i>`, `i`
     /// its index in `groupBy`) and every operation under its own (`_o<i>`, `i`
@@ -343,6 +345,7 @@ public struct QueryTranslator {
         var regularFields: [(index: Int, name: String)] = []
         var facetFields: [(index: Int, name: String)] = []
         var memberships: [(index: Int, field: String, contains: String)] = []
+        var periods: [(index: Int, field: String, period: DatePeriod)] = []
         for (index, clause) in options.groupBy.enumerated() {
             switch clause {
             case let .field(name):
@@ -350,6 +353,8 @@ public struct QueryTranslator {
                 else { regularFields.append((index, name)) }
             case let .stringSetMembership(field, contains):
                 memberships.append((index, field, contains))
+            case let .datePeriod(field, period):
+                periods.append((index, field, period))
             }
         }
 
@@ -365,7 +370,7 @@ public struct QueryTranslator {
         // every layer), so we DEGRADE here rather than crash the host app: a
         // pure single facet runs; a pure multi-facet returns no rows; anything
         // mixed drops the facet and proceeds as regular aggregation.
-        if regularFields.isEmpty && memberships.isEmpty && !facetFields.isEmpty {
+        if regularFields.isEmpty && memberships.isEmpty && periods.isEmpty && !facetFields.isEmpty {
             if facetFields.count == 1 {
                 return try buildFacetAggregation(
                     tableName: tableName, facet: facetFields[0],
@@ -391,7 +396,7 @@ public struct QueryTranslator {
         // rollup when both are empty) proceeds normally.
         return try buildRegularAggregation(
             tableName: tableName, regularFields: regularFields,
-            memberships: memberships, options: options,
+            memberships: memberships, periods: periods, options: options,
             stringsetFields: stringsetFields, stringFields: stringFields,
             fieldTypes: fieldTypes, scopedToDocIds: scopedToDocIds
         )
@@ -419,6 +424,7 @@ public struct QueryTranslator {
         tableName: String,
         regularFields: [(index: Int, name: String)],
         memberships: [(index: Int, field: String, contains: String)],
+        periods: [(index: Int, field: String, period: DatePeriod)],
         options: AggregateOptions,
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
@@ -458,6 +464,14 @@ public struct QueryTranslator {
             selectClauses.append("\(caseExpr) AS \(groupAlias)")
             groupByClauses.append(caseExpr)
             sortExpressions[aggregationGroupKey(.stringSetMembership(field: field, contains: contains))] = groupAlias
+        }
+
+        for (index, field, period) in periods {
+            let bucket = periodBucketSQL(column: "\(t).\(quoted(field))", period: period)
+            let groupAlias = quoted(positionalGroupAlias(index))
+            selectClauses.append("\(bucket) AS \(groupAlias)")
+            groupByClauses.append(bucket)
+            sortExpressions[aggregationGroupKey(.datePeriod(field: field, period: period))] = groupAlias
         }
 
         appendOperations(options.operations, table: t, into: &selectClauses)
@@ -599,6 +613,46 @@ public struct QueryTranslator {
         switch level {
         case let .field(name): return name
         case let .stringSetMembership(field, contains): return "has_\(field)_\(contains)"
+        case let .datePeriod(field, period): return "\(field)_\(period.rawValue)"
+        }
+    }
+
+    /// The expression bucketing `column` by `period`, read from the stored
+    /// text with no time-zone conversion: `YYYY-MM`, `YYYY-Qn` or `YYYY`, and
+    /// `NULL` for a missing value or text that does not begin `YYYY-MM`.
+    /// Digits are not range-checked. The same text js-bao's `periodBucketSql`
+    /// emits, so the two clients bucket the same stored strings alike.
+    static func periodBucketSQL(column: String, period: DatePeriod) -> String {
+        let bucket: String
+        switch period {
+        case .month:
+            bucket = "substr(\(column), 1, 7)"
+        case .quarter:
+            bucket = "substr(\(column), 1, 4) || '-Q' || ((CAST(substr(\(column), 6, 2) AS INTEGER) + 2) / 3)"
+        case .year:
+            bucket = "substr(\(column), 1, 4)"
+        }
+        return "CASE WHEN \(column) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' THEN \(bucket) ELSE NULL END"
+    }
+
+    /// Refuses a `.datePeriod` level whose field is not in `fields` or is not
+    /// a `.date` or `.string` field, with js-bao's messages, before any SQL.
+    static func validatePeriodLevels(
+        _ groupBy: [AggregateGroupBy], fields: [String: FieldDescriptor]
+    ) throws {
+        for case let .datePeriod(field, _) in groupBy {
+            guard let descriptor = fields[field] else {
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "Unknown field '\(field)' in period groupBy"
+                )
+            }
+            guard descriptor.type == .date || descriptor.type == .string else {
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "Field '\(field)' is not a date or string field but used in period groupBy"
+                )
+            }
         }
     }
 

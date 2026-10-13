@@ -112,15 +112,29 @@ public struct AggregateSort: Sendable {
     }
 }
 
-/// A group-by clause: a plain field, or a StringSet-membership check
-/// (`{ field, contains }`). Mirrors js-bao's `GroupByField`
-/// (`string | StringSetMembership`). A bare string literal is a field,
-/// so existing `groupBy: ["category"]` call sites keep working; a
+/// A calendar period a `.date` field can be grouped by.
+public enum DatePeriod: String, Sendable, Equatable {
+    case month, quarter, year
+}
+
+/// A group-by clause: a plain field, a StringSet-membership check
+/// (`{ field, contains }`), or a calendar period of a date field
+/// (`{ field, period }`). Mirrors js-bao's `GroupByField`
+/// (`string | StringSetMembership | DatePeriodGroup`). A bare string literal
+/// is a field, so existing `groupBy: ["category"]` call sites keep working; a
 /// stringset *field* name groups by member value (facet), and
 /// `.stringSetMembership` groups by whether the set contains a value.
+///
+/// `.datePeriod` groups a `.date` or `.string` field by the calendar month,
+/// quarter or year of its stored text, with no time-zone conversion. Its key
+/// in a row's `group` is `<field>_<period>` (`dueDate_month`), holding
+/// `YYYY-MM`, `YYYY-Qn` or `YYYY`; a missing value, or text that does not
+/// begin `YYYY-MM`, is `.null`. A field of any other type throws
+/// `JsBaoError(.invalidArgument)` before anything is read.
 public enum AggregateGroupBy: Sendable, Equatable, ExpressibleByStringLiteral {
     case field(String)
     case stringSetMembership(field: String, contains: String)
+    case datePeriod(field: String, period: DatePeriod)
     public init(stringLiteral value: String) { self = .field(value) }
 }
 
@@ -128,7 +142,8 @@ public enum AggregateGroupBy: Sendable, Equatable, ExpressibleByStringLiteral {
 ///
 /// `aggregate` answers one row per group, as js-bao does. Each row holds the
 /// `groupBy` values under `group`, keyed by the field name (or
-/// `has_<field>_<contains>` for a membership check) with the value as stored,
+/// `has_<field>_<contains>` for a membership check, `<field>_<period>` for a
+/// period level) with the value as stored,
 /// and every operation's value beside it under its `resultKey`:
 ///
 /// ```swift

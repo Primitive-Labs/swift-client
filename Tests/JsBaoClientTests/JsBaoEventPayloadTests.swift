@@ -43,28 +43,15 @@ final class JsBaoEventPayloadTests: XCTestCase {
         PendingCreateFailedEvent(documentId: "d1", error: "nope"),
         DocumentMetadataChangedEvent(documentId: "d1", action: "updated", source: "server"),
         DocumentSyncStateChangedEvent(documentId: "d1", state: "synced"),
-        DocumentSnapshotLoadEvent(
-            documentId: "d1", phase: .progress, epoch: 5,
-            rows: 10, totalRows: 40, chunks: 1, totalChunks: 4, model: "Note"
-        ),
         DocumentWriteRefusedEvent(
             documentId: "d1", model: "Note", recordId: "r1",
             error: JsBaoError(
-                code: .documentOfflineWindowExpired, message: "past the window"
+                code: .documentConstraintViolated, message: "taken"
             )
         ),
         DocumentFormatMismatchEvent(
-            documentId: "d1", declared: 1, actual: 2,
-            error: JsBaoError(code: .documentFormatMismatch, message: "format 2")
-        ),
-        DocumentOfflineWritesResolvedEvent(
-            documentId: "d1", epoch: 5,
-            notices: [
-                OfflineReplayNotice(
-                    model: "Note", recordId: "r1", field: "title", op: .patch,
-                    outcome: .dropped, reason: .outdated, epoch: 4, ts: 1
-                )
-            ]
+            documentId: "d1", declared: 1, actual: 3,
+            error: JsBaoError(code: .documentFormatMismatch, message: "format 3")
         ),
         SyncEvent(documentId: "d1", synced: true),
         SyncPerfEvent(documentId: "d1", timings: ["totalMs": 5]),

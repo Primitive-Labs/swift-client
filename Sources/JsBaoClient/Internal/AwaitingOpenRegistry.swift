@@ -5,9 +5,9 @@ import Foundation
 ///
 /// `openDocument`'s network wait settles on a `SyncEvent` or on its own
 /// availability timeout. That is right for every failure the server reports by
-/// staying quiet, but wrong for one it reports and then hangs up on: the room's
-/// `CLIENT_UPGRADE_REQUIRED` refusal (#3436) is its last word before close
-/// 4426, so a wait left to time out would report `NETWORK_TIMEOUT` half a
+/// staying quiet, but wrong for one it reports and then hangs up on: the
+/// platform's `DOCUMENT_FORMAT_UNSUPPORTED` refusal is its last word for the
+/// document, so a wait left to time out would report `NETWORK_TIMEOUT` half a
 /// minute later against a server that answered immediately and precisely.
 ///
 /// Registration is per WAIT, not per document: two opens of one document each

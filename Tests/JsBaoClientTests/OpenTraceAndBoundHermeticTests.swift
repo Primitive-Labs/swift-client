@@ -188,17 +188,17 @@ final class OpenTraceAndBoundHermeticTests: XCTestCase {
 
     // MARK: - The trace of one open
 
-    /// A never-held large document, opened with default options against a
-    /// room that answers the way the report's did: `epoch.info`, a
-    /// `syncStep2` parked in R2, then `syncComplete`. With debug on at runtime
-    /// the app can follow every step of the open from its own log.
+    /// A never-held document, opened with default options against a room
+    /// that answers with a `syncStep2` parked in R2, then `syncComplete`. With
+    /// debug on at runtime the app can follow every step of the open from its
+    /// own log.
     func testDebugTracesAnOpenFromItsStartToTheEventThatResolvesIt() async throws {
-        let peer = OverlayDocument()
-        peer.apply(
-            OverlayMutation(id: "r1", kind: .create, fields: ["title": .string("from the room")]),
-            model: "Note"
-        )
-        let payload = Data(peer.encodeStateAsUpdate())
+        let peer = YDocument()
+        let probe: YMap<JSONValue> = peer.getOrCreateMap(named: "Probe")
+        peer.transactSync { transaction in
+            probe.updateValue(.string("from the room"), forKey: "r1", transaction: transaction)
+        }
+        let payload = Data(peer.transactSync { $0.transactionEncodeStateAsUpdate() })
         let r2 = try LoopbackHTTPServer(body: payload)
         let updateUrl = try r2.start()
         defer { r2.stop() }
@@ -212,10 +212,6 @@ final class OpenTraceAndBoundHermeticTests: XCTestCase {
         try await waitFor("the open's syncStep1") { self.sentSyncStep1(server, documentId) }
 
         XCTAssertTrue(server.push("""
-        {"type":"epoch.info","documentId":"\(documentId)","documentFormat":2,\
-        "epoch":1,"sealedEpochs":[],"offlineWindowDays":14}
-        """))
-        XCTAssertTrue(server.push("""
         {"type":"syncStep2","documentId":"\(documentId)","updateUrl":"\(updateUrl.absoluteString)"}
         """))
         XCTAssertTrue(server.push(#"{"type":"syncComplete","documentId":"\#(documentId)"}"#))
@@ -225,8 +221,11 @@ final class OpenTraceAndBoundHermeticTests: XCTestCase {
         }
         XCTAssertEqual(outcome, "resolved")
 
-        let model = try XCTUnwrap(client.sharedModel("Note")?.member(docId: documentId))
-        try await waitFor("the folded record to be readable") { model.find(id: "r1") != nil }
+        let opened = try XCTUnwrap(client.documentManager.getDocument(documentId))
+        let received: YMap<JSONValue> = opened.getOrCreateMap(named: "Probe")
+        try await waitFor("the room's state to be readable") {
+            opened.transactSync { received.get(key: "r1", transaction: $0) } != nil
+        }
 
         let trace = lines.all
             .filter { $0.level == .debug && $0.message.contains(documentId) }
@@ -240,12 +239,10 @@ final class OpenTraceAndBoundHermeticTests: XCTestCase {
         }
         traced("[open] start", "the open starting")
         traced("[open] network wait", "the open deciding to wait on the network")
-        traced("plan: join", "the handshake plan")
         traced("[open] download start", "the R2 download starting")
         traced("[open] download end", "the R2 download ending")
         traced("bytes: \(payload.count)", "the downloaded byte count")
         traced("[open] apply", "the downloaded state being applied")
-        traced("[format2] folded", "the fold")
         traced("[open] resolved by sync", "the event that resolved the open")
     }
 

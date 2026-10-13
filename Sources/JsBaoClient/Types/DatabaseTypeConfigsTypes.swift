@@ -122,8 +122,7 @@ public enum DeclaredManifestPath: Codable, Sendable, Equatable {
 /// config's CEL rules may load: `self` categories on the subject, declared
 /// traversal ``paths``, and the ``secrets`` / ``vars`` keys the rules
 /// reference. A category is reachable from a rule as `md.self.<category>.<key>`
-/// only when it is declared here — this is the manifest prerequisite for
-/// migrating off `metadataAccess` to metadata categories.
+/// only when it is declared here.
 /// Persisted JSON-stringified; the API returns it parsed.
 public struct DeclaredMetadataManifest: Codable, Sendable, Equatable {
     /// The `self` declaration: categories on the subject resource to load
@@ -172,8 +171,8 @@ public struct DeclaredMetadataManifest: Codable, Sendable, Equatable {
 ///
 /// Database type configs control schema-less database behavior for documents
 /// tagged with a particular `databaseType`: which rule set governs access,
-/// which CEL-driven `triggers` run on writes, and how `metadataAccess` is
-/// gated.
+/// which CEL-driven `triggers` run on writes, and which metadata categories
+/// those rules may read.
 public struct DatabaseTypeConfigInfo: Decodable, Sendable, Equatable {
     public let appId: String
     public let databaseType: String
@@ -183,23 +182,10 @@ public struct DatabaseTypeConfigInfo: Decodable, Sendable, Equatable {
     /// `["Task": ["triggers": [["on": "create", "set": [...]]]]]`). `nil`
     /// when no triggers are configured.
     public let triggers: [String: JSONValue]?
-    /// Non-deprecated backing storage for `metadataAccess` (#1815). The
-    /// initializers write here so they never reference the deprecated
-    /// declaration (assigning a deprecated stored property warns); the
-    /// `CodingKeys` map it to the `metadataAccess` wire key.
-    private let metadataAccessStorage: String?
-    /// CEL expression evaluated to decide whether the caller can read
-    /// database metadata. `nil` when not configured.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on
-    /// `DatabaseTypeConfigInfo.metadataAccess`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: this single expression gates read AND update of the database CEL context, so granting read also grants update. Declare a metadata category in metadataManifest (defined via the CLI `primitive sync` or the REST metadata-categories API) — a category has separate readRule/writeRule — and read it from CEL as md.self.<category>.<key>. This field still works; the runtime gate is unchanged.")
-    public var metadataAccess: String? { metadataAccessStorage }
     /// The declared-access manifest for this type's CEL rules, returned
     /// parsed. `nil` when none is set. Declaring a category here is the
     /// prerequisite for reading `md.self.<category>.<key>` from this type's
-    /// rules — i.e. for migrating a ``metadataAccess`` gate to a metadata
-    /// category.
+    /// rules.
     public let metadataManifest: DeclaredMetadataManifest?
     public let createdAt: String
     public let modifiedAt: String
@@ -207,13 +193,9 @@ public struct DatabaseTypeConfigInfo: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case appId, databaseType, ruleSetId, triggers
-        case metadataAccessStorage = "metadataAccess"
         case metadataManifest, createdAt, modifiedAt, createdBy
     }
 
-    /// Non-deprecated initializer. Set `metadataAccess` through the deprecated
-    /// overload below so that binding one surfaces the warning at the call
-    /// site.
     public init(
         appId: String,
         databaseType: String,
@@ -228,33 +210,6 @@ public struct DatabaseTypeConfigInfo: Decodable, Sendable, Equatable {
         self.databaseType = databaseType
         self.ruleSetId = ruleSetId
         self.triggers = triggers
-        self.metadataAccessStorage = nil
-        self.metadataManifest = metadataManifest
-        self.createdAt = createdAt
-        self.modifiedAt = modifiedAt
-        self.createdBy = createdBy
-    }
-
-    /// Deprecated overload that accepts `metadataAccess`. It has no default
-    /// here so it does not collide with the non-deprecated initializer when
-    /// omitted.
-    @available(*, deprecated, message: "Prefer resource metadata categories: this single expression gates read AND update of the database CEL context, so granting read also grants update. Declare a metadata category in metadataManifest (defined via the CLI `primitive sync` or the REST metadata-categories API) — a category has separate readRule/writeRule — and read it from CEL as md.self.<category>.<key>. This field still works; the runtime gate is unchanged.")
-    public init(
-        appId: String,
-        databaseType: String,
-        ruleSetId: String? = nil,
-        triggers: [String: JSONValue]? = nil,
-        metadataAccess: String?,
-        metadataManifest: DeclaredMetadataManifest? = nil,
-        createdAt: String,
-        modifiedAt: String,
-        createdBy: String
-    ) {
-        self.appId = appId
-        self.databaseType = databaseType
-        self.ruleSetId = ruleSetId
-        self.triggers = triggers
-        self.metadataAccessStorage = metadataAccess
         self.metadataManifest = metadataManifest
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
@@ -273,36 +228,16 @@ public struct CreateDatabaseTypeConfigParams: Encodable, Sendable {
     public var ruleSetId: String?
     /// Optional trigger rules keyed by model name. Validated server-side.
     public var triggers: [String: JSONValue]?
-    /// Non-deprecated backing storage for `metadataAccess` (#1815). The
-    /// initializers write here so they never reference the deprecated
-    /// declaration (assigning a deprecated stored property warns); the
-    /// `CodingKeys` map it to the `metadataAccess` wire key.
-    private var metadataAccessStorage: String?
-    /// Optional CEL expression gating metadata access.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on
-    /// `CreateDatabaseTypeConfigParams.metadataAccess`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: declare a category in metadataManifest (separate readRule/writeRule, so read no longer implies update) and read it from CEL as md.self.<category>.<key>. This field still works.")
-    public var metadataAccess: String? {
-        get { metadataAccessStorage }
-        set { metadataAccessStorage = newValue }
-    }
     /// Optional declared-access manifest that lets this type's CEL rules load
     /// metadata categories as `md.self.<category>.<key>` (and traversed
-    /// `md.<node>.*`). Declaring a category here is the prerequisite for
-    /// migrating a `metadataAccess` gate to a metadata category. Omitted from
-    /// the body when `nil`.
+    /// `md.<node>.*`). Omitted from the body when `nil`.
     public var metadataManifest: DeclaredMetadataManifest?
 
     private enum CodingKeys: String, CodingKey {
         case databaseType, ruleSetId, triggers
-        case metadataAccessStorage = "metadataAccess"
         case metadataManifest
     }
 
-    /// Non-deprecated initializer. Set `metadataAccess` through the deprecated
-    /// overload below so that binding one surfaces the warning at the call
-    /// site.
     public init(
         databaseType: String,
         ruleSetId: String? = nil,
@@ -312,24 +247,6 @@ public struct CreateDatabaseTypeConfigParams: Encodable, Sendable {
         self.databaseType = databaseType
         self.ruleSetId = ruleSetId
         self.triggers = triggers
-        self.metadataManifest = metadataManifest
-    }
-
-    /// Deprecated overload that accepts `metadataAccess`. It has no default
-    /// here so it does not collide with the non-deprecated initializer when
-    /// omitted.
-    @available(*, deprecated, message: "Prefer resource metadata categories: declare a category in metadataManifest (separate readRule/writeRule, so read no longer implies update) and read it from CEL as md.self.<category>.<key>. This field still works.")
-    public init(
-        databaseType: String,
-        ruleSetId: String? = nil,
-        triggers: [String: JSONValue]? = nil,
-        metadataAccess: String?,
-        metadataManifest: DeclaredMetadataManifest? = nil
-    ) {
-        self.databaseType = databaseType
-        self.ruleSetId = ruleSetId
-        self.triggers = triggers
-        self.metadataAccessStorage = metadataAccess
         self.metadataManifest = metadataManifest
     }
 }
@@ -345,36 +262,16 @@ public struct UpdateDatabaseTypeConfigParams: Encodable, Sendable {
     /// Replacement trigger rules object (`.value`), or `.clear` to remove all
     /// triggers.
     public var triggers: Updatable<[String: JSONValue]>?
-    /// Non-deprecated backing storage for `metadataAccess` (#1815). The
-    /// initializers write here so they never reference the deprecated
-    /// declaration (assigning a deprecated stored property warns); the
-    /// `CodingKeys` map it to the `metadataAccess` wire key.
-    private var metadataAccessStorage: Updatable<String>?
-    /// Replacement metadata-access CEL expression (`.value`), or `.clear` to
-    /// remove it.
-    ///
-    /// Deprecated — mirrors js-bao's `@deprecated` on
-    /// `UpdateDatabaseTypeConfigParams.metadataAccess`.
-    @available(*, deprecated, message: "Prefer resource metadata categories: declare a category in metadataManifest (separate readRule/writeRule, so read no longer implies update) and read it from CEL as md.self.<category>.<key>. This field still works.")
-    public var metadataAccess: Updatable<String>? {
-        get { metadataAccessStorage }
-        set { metadataAccessStorage = newValue }
-    }
     /// Replacement declared-access manifest (`.value`), or `.clear` to remove
     /// it. Set this to make metadata categories reachable from this type's CEL
-    /// rules as `md.self.<category>.<key>` when migrating off
-    /// `metadataAccess`.
+    /// rules as `md.self.<category>.<key>`.
     public var metadataManifest: Updatable<DeclaredMetadataManifest>?
 
     private enum CodingKeys: String, CodingKey {
         case ruleSetId, triggers
-        case metadataAccessStorage = "metadataAccess"
         case metadataManifest
     }
 
-    /// Non-deprecated initializer. Set `metadataAccess` through the deprecated
-    /// overload below so that binding one surfaces the warning at the call
-    /// site.
     public init(
         ruleSetId: Updatable<String>? = nil,
         triggers: Updatable<[String: JSONValue]>? = nil,
@@ -382,22 +279,6 @@ public struct UpdateDatabaseTypeConfigParams: Encodable, Sendable {
     ) {
         self.ruleSetId = ruleSetId
         self.triggers = triggers
-        self.metadataManifest = metadataManifest
-    }
-
-    /// Deprecated overload that accepts `metadataAccess`. It has no default
-    /// here so it does not collide with the non-deprecated initializer when
-    /// omitted.
-    @available(*, deprecated, message: "Prefer resource metadata categories: declare a category in metadataManifest (separate readRule/writeRule, so read no longer implies update) and read it from CEL as md.self.<category>.<key>. This field still works.")
-    public init(
-        ruleSetId: Updatable<String>? = nil,
-        triggers: Updatable<[String: JSONValue]>? = nil,
-        metadataAccess: Updatable<String>?,
-        metadataManifest: Updatable<DeclaredMetadataManifest>? = nil
-    ) {
-        self.ruleSetId = ruleSetId
-        self.triggers = triggers
-        self.metadataAccessStorage = metadataAccess
         self.metadataManifest = metadataManifest
     }
 }

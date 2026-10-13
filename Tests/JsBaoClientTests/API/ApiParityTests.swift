@@ -559,43 +559,6 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/documents/d1/access-requests/r1/deny")
     }
 
-    // MARK: - DatabasesAPI new methods
-
-    func test_databases_addManager_PUTsPermission() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = [
-            "databaseId": "db1", "userId": "u1", "permission": "manager",
-            "grantedAt": "2024-01-01T00:00:00Z", "grantedBy": "owner",
-        ]
-        _ = try await api.addManager(databaseId: "db1", params: AddManagerParams(userId: "u1"))
-        XCTAssertEqual(r.method, "PUT")
-        XCTAssertEqual(r.path, "/databases/db1/permissions")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["userId"] as? String, "u1")
-        XCTAssertEqual(body?["permission"] as? String, "manager")
-    }
-
-    func test_databases_removeManager_DELETE() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["success": true]
-        _ = try await api.removeManager(databaseId: "db1", userId: "u1")
-        XCTAssertEqual(r.method, "DELETE")
-        XCTAssertEqual(r.path, "/databases/db1/permissions/u1")
-    }
-
-    func test_databases_listGroupPermissions_includeSystem_buildsQS() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = [[String: Any]]()
-        _ = try await api.listGroupPermissions(databaseId: "db1", includeSystem: true)
-        XCTAssertEqual(r.path, "/databases/db1/group-permissions?includeSystem=true")
-
-        _ = try await api.listGroupPermissions(databaseId: "db1")
-        XCTAssertEqual(r.path, "/databases/db1/group-permissions")
-    }
-
     // MARK: - WorkflowsAPI options threading
 
     func test_workflows_start_forceRerunSerializes() async throws {

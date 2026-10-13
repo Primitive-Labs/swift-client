@@ -5,10 +5,9 @@ import Foundation
 // Several endpoints answer with either a single-key envelope or a bare array,
 // and the typed API classes have to decode both. Written per call site that
 // was the same `Decodable` repeated with a different key and element type —
-// including two outright duplicates (`{ fields }`, served by both
-// `databases.describeModel` and the DO engine's `/describe`; and the document
-// list, served by both `documents.list` and `me.ownedDocuments`). They live
-// here once, so the probe order is the same everywhere too.
+// including an outright duplicate (the document list, served by both
+// `documents.list` and `me.ownedDocuments`). They live here once, so the probe
+// order is the same everywhere too.
 
 /// `{ items: [...] }`, with a bare `[Element]` accepted defensively.
 ///
@@ -28,24 +27,6 @@ struct ItemsEnvelope<Element: Decodable & Sendable>: Decodable, Sendable {
         }
         let container = try decoder.singleValueContainer()
         items = try container.decode([Element].self)
-    }
-}
-
-/// `{ fields: [...] }` or a bare `[ModelFieldInfo]` — the model-describe
-/// shape.
-struct ModelFieldsEnvelope: Decodable, Sendable {
-    let fields: [ModelFieldInfo]
-
-    private enum CodingKeys: String, CodingKey { case fields }
-
-    init(from decoder: Decoder) throws {
-        if let container = try? decoder.container(keyedBy: CodingKeys.self),
-           container.contains(.fields) {
-            fields = try container.decode([ModelFieldInfo].self, forKey: .fields)
-            return
-        }
-        let container = try decoder.singleValueContainer()
-        fields = try container.decode([ModelFieldInfo].self)
     }
 }
 
@@ -104,7 +85,7 @@ struct DocumentListEnvelope: Decodable, Sendable {
 
 /// The `{ items, hasMore, nextCursor? }` pagination envelope, with a
 /// bare `[Element]` accepted as the pre-pagination response an older server
-/// still sends (`GET /databases` before #1958).
+/// still sends.
 ///
 /// A bare array carries no continuation token, so it normalizes to a single
 /// page — `hasMore: false`, no cursor — which is what the JS client, the CLI,
@@ -124,7 +105,7 @@ struct PaginatedPageEnvelope<Element: Decodable & Sendable>: Decodable, Sendable
     /// filters added alongside pagination, and it ignores query parameters it
     /// does not know — so it answers a filtered request with its complete
     /// list. Callers that sent such a filter must apply it themselves on this
-    /// path; see `DatabasesAPI.listPage`'s `owner` handling.
+    /// path.
     let isLegacyArray: Bool
 
     init(from decoder: Decoder) throws {

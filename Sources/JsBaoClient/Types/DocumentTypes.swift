@@ -96,9 +96,11 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// `documents.getLinkAccess(documentId:)` — the document GET is gated on
     /// content access and would fail.
     public let linkAccess: DocumentLinkAccessLevel?
-    /// `2` for a large document, `1` for an ordinary one, `nil` when the
-    /// server did not say (#3436) — which is every document described before
-    /// large documents existed, so absent decodes rather than throwing.
+    /// `3` for a record-log document, `1` for an ordinary one, `nil` when the
+    /// server did not say — which is every document described before formats
+    /// existed, so absent decodes rather than throwing. `2` names a large
+    /// document, which is no longer served: opening one throws
+    /// `.documentFormatUnsupported`.
     public let documentFormat: Int?
 
     private enum CodingKeys: String, CodingKey {
@@ -259,9 +261,10 @@ public struct CreateWithAliasOptions: Encodable, Sendable {
     /// Opaque metadata blob to attach at creation (≤ 4 KB serialized UTF-8).
     /// The platform round-trips it verbatim.
     public var metadata: JSONValue?
-    /// Create a LARGE document (`2`) instead of an ordinary one, with the same
-    /// meaning it has on `CreateDocumentOptions.documentFormat`. The server
-    /// refuses a value outside the set, as it does for the plain create.
+    /// The document's format, `1` or `3`, with the same meaning it has on
+    /// `CreateDocumentOptions.documentFormat`. `2` (a large document) is
+    /// refused with `.documentFormatUnsupported` before any request; the
+    /// server refuses any other value outside the set.
     public var documentFormat: Int?
 
     public init(
@@ -306,14 +309,17 @@ public struct GetOrCreateWithAliasOptions: Encodable, Sendable {
     public var alias: AliasRef
     public var title: String?
     public var tags: [String]?
-    /// Create a LARGE document (`2`) instead of an ordinary one.
+    /// The document's format, `1` or `3`, as on
+    /// `CreateDocumentOptions.documentFormat`. `2` (a large document) is
+    /// refused with `.documentFormatUnsupported` before any request.
     ///
     /// Applied when this call creates the document, and otherwise taken as a
     /// statement about the document the alias already names: a stored format
     /// that differs makes the call fail with server code
-    /// `DOCUMENT_FORMAT_MISMATCH`, because an app that asks for a large document
-    /// and is handed an ordinary one has already made the mistake this route
-    /// exists to prevent. A format that agrees is echoed back on the result.
+    /// `DOCUMENT_FORMAT_MISMATCH`, because an app that asks for a record-log
+    /// document and is handed an ordinary one has already made the mistake
+    /// this route exists to prevent. A format that agrees is echoed back on
+    /// the result.
     ///
     /// `nil` — the default — states nothing, so an existing binding is answered
     /// exactly as it was before this option existed.
@@ -471,7 +477,7 @@ public struct CreateWithAliasResult: Decodable, Sendable {
     public let createdAt: String?
     public let modifiedAt: String?
     public let alias: DocumentAliasInfo
-    /// `2` for a large document, absent for an ordinary one.
+    /// `3` for a record-log document, absent for an ordinary one.
     public let documentFormat: Int?
     /// Echoed when the call applied tags.
     public let tags: [String]?
@@ -489,7 +495,7 @@ public struct GetOrCreateWithAliasResult: Decodable, Sendable {
     public let modifiedAt: String?
     public let alias: DocumentAliasInfo
     public let created: Bool
-    /// `2` for a large document, absent for an ordinary one — echoed on a
+    /// `3` for a record-log document, absent for an ordinary one — echoed on a
     /// create, and on an existing binding when the caller stated a format that
     /// agreed with the stored one (#3757).
     public let documentFormat: Int?

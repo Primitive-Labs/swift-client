@@ -304,7 +304,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         maxReconnectDelayMs = ms
     }
 
-    // MARK: - Receive limit (#2477, #3436)
+    // MARK: - Receive limit (#2477)
 
     /// The receive limit this manager has been asked for, or `nil` while it is
     /// still on Foundation's default (1 MiB).
@@ -317,10 +317,10 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// Raise the receive limit, for every task from here on.
     ///
     /// NEVER LOWERS. One socket carries every document, so a format-1 document
-    /// opened after a large one would otherwise take the limit back down and
-    /// the large document's next `epoch.info` would be refused by the receive
-    /// — a failure that surfaces as a dead socket rather than as anything
-    /// naming the frame.
+    /// opened after a record-log one would otherwise take the limit back down
+    /// and the record-log document's next large frame would be refused by the
+    /// receive — a failure that surfaces as a dead socket rather than as
+    /// anything naming the frame.
     ///
     /// **A raise on a LIVE task rebuilds the socket, and it has to.**
     /// `URLSessionWebSocketTask.maximumMessageSize` is only honoured if it is
@@ -329,14 +329,14 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// takes the connection down with it. So assigning the property to a
     /// running task is not a smaller version of this — it does nothing, and a
     /// client that had only ever opened ordinary documents would find its
-    /// first large one's `epoch.info` refused by the very limit this call was
-    /// made to lift. The reconnect is ordinary: the sweep re-syncs every open
+    /// first record-log document's catch-up refused by the very limit this
+    /// call was made to lift. The reconnect is ordinary: the sweep re-syncs every open
     /// document, and it happens at most once per session, on the first
     /// document not locally known to be format 1.
     ///
-    /// (This is why decision 3436-SO-07 raises the limit at the OPEN rather
-    /// than when a document turns out to be large: on a first open, before the
-    /// socket is up, there is no task to rebuild.)
+    /// (This is why the limit is raised at the OPEN rather than when a
+    /// document's format is learned: on a first open, before the socket is
+    /// up, there is no task to rebuild.)
     func setMaximumMessageSize(_ bytes: Int) {
         guard bytes > (configuredMaximumMessageSize ?? 0) else { return }
         configuredMaximumMessageSize = bytes
@@ -467,9 +467,9 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         let oldSession = session
         session = newSession
         let newTask = newSession.webSocketTask(with: request)
-        // #3436 — a reconnect must not silently drop back to Foundation's
-        // 1 MiB: the document that needed the larger limit is still open, and
-        // its `epoch.info` is the frame that would be refused.
+        // A reconnect must not silently drop back to Foundation's 1 MiB: the
+        // document that needed the larger limit is still open, and its next
+        // large frame is the one that would be refused.
         applyMaximumMessageSize(to: newTask)
         task = newTask
         _connecting = true

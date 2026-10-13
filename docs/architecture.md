@@ -43,6 +43,24 @@ The main class wires everything together and exposes the public API. It owns ins
 | `AnalyticsQueue.swift` | Persists events to SQLite while offline, flushes on reconnect |
 | `Logger.swift` | Leveled logger (debug/info/warn/error) |
 
+### `RecordLog/`
+
+Record-log (`documentFormat: 3`) documents, reached only for format 3 — a client that never opens one builds none of it (`docs/record-log.md`). A port of js-bao's `record-log-client/`, module for module.
+
+| File | Responsibility |
+|------|----------------|
+| `RecordLogTypes.swift`, `RecordLogGuess.swift`, `RecordLogRules.swift` | The vocabulary, plain-row guesses, and the client's rules over a `RecordLogTables` port (memory tables for the golden-trace replay) |
+| `RecordLogSchema.swift`, `RecordLogStore.swift`, `RecordLogQueryProjection.swift` | The `record_log_*` tables in the provider's database, the store (confirmed rows, the view, pending entries, catch-up, refusals, re-mint, purge) and the projection of the view into the model query tables |
+| `RecordLogGroupCommit.swift` | Saves grouped into one transaction at `synchronous=NORMAL`, committed by a 5 ms timer, by any other store command, or by any other work on the provider's queue (`RecordLogGroupCommitHost`, adopted by `SQLiteStorageProvider`) |
+| `RecordLogWritePlan.swift`, `RecordLogSender.swift` | Planning a save as an entry and refusing what the wire cannot carry; the upstream queue (tick, window, frame target) |
+| `RecordLogDocumentBinding.swift`, `RecordLogModelDelegate.swift` | One open document (writer, acknowledgements, hand-backs, transactions) and the `LocalRecordDelegate` models read and write through |
+| `RecordLogReceipt.swift`, `RecordLogChunkReader.swift` | Receipts of a bulk load's or a checkpoint segment's chunks: the pointers, manifests and receipt state, and the readers that check each chunk's length, digest, size, row count and ids before it is applied |
+| `RecordLogSession.swift` | The document's conversation with its room — an actor, see Concurrency Model; a receipt of chunks runs in a task the session owns |
+| `RecordLogClient.swift` | The `JsBaoClient` extension: format resolution, bind, frame routing, purge, the store's owner |
+| `Format2Storage.swift` | Whether the client's storage can host a record-log store (`Format2SqlHost` conformance), and the `FORMAT2_STORAGE_UNAVAILABLE` refusal when it cannot |
+
+`Schema/LocalRecordDelegate.swift` is the one surface `DynamicModel` and `MultiDocModel` route a record-log member through. `Schema/DocumentFormatRules.swift` holds what a create may ask for: `documentFormat: 2` (a large document, no longer served) is refused with `.documentFormatUnsupported` before anything is created or sent, and `Internal/DocumentFormatGate.swift` refuses an open whose format resolves to 2 before any frame.
+
 ### `API/`
 
 Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource:
@@ -55,6 +73,7 @@ Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource
 |------|-------------|
 | `StorageProvider.swift` | Protocol: `put`, `get`, `delete`, `putBatch`, `iterate` — generic over `Codable` values |
 | `SQLiteStorageProvider.swift` | WAL-mode SQLite via C API, single `kv_store` table with compound key `(store, key)`, `DispatchQueue`-serialized writes |
+| `Format2SqlHost.swift` | Serialized SQL on the provider's own connection (`Format2SqlHost`, `Format2SqlConnection`, `Format2SqlValue`), which the record-log store and the file-backed query engine run on; the `Format2` names are kept from the large-document format |
 | `MemoryStorageProvider.swift` | In-memory dictionary, useful for tests |
 
 ### `Query/`
@@ -90,6 +109,7 @@ The service managers that own async work are Swift `actor`s. Their state is acto
 | `AnalyticsQueue` | The event buffer, the batch flush timer, transmission |
 | `BlobManager` | The upload queue, the in-memory blob cache, the upload-concurrency setting, the single coalesced queue timer |
 | `WebSocketManager` | The socket and its session, the connect/disconnect state machine and waiter lists, the reconnect backoff and disconnect-timeout timers, the ordered delegate-event channel |
+| `RecordLogSession` | One record-log document's open, catch-up, sender and timers. Its frame handlers never suspend — every store call is synchronous on the provider's queue and frames leave through one ordered lane — and its timers re-check the connection generation they were armed under. A receipt of chunks is a task isolated to the session that suspends only to fetch and to read a chunk, and re-checks the receipt and the connection after each suspension |
 
 `AuthController` (#2173) is queued for the same treatment and is class-plus-lock today. `WebSocketManager` depends on it staying that way: its delegate methods are synchronous, so `connect()`'s decision region reads the access token without suspending.
 
@@ -134,7 +154,7 @@ A handful of types sit next to that core and are also permanently class-plus-loc
 
 Key patterns in this domain:
 
-- **SQLiteStorageProvider**: A serial `DispatchQueue` serializes all database access
+- **SQLiteStorageProvider**: A serial `DispatchQueue` serializes all database access. A record-log group of saves may stay open across work items; any other work on the queue commits it first (`RecordLogGroupCommitHost`)
 - **DocumentManager**: Lock-protected dictionaries for open documents and sync state
 - **Task-based timers**: Reconnect delays and retry backoff use `Task.sleep` with cancellation
 

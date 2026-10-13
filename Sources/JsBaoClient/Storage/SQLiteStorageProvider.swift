@@ -18,9 +18,8 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
 
     /// Where the database file is, once it is open.
     ///
-    /// Read by the format-2 storage probe (#3437, behavior 33): what a large
-    /// document may keep is a property of the volume this file is on. `nil`
-    /// for an in-memory provider, which has no file and no volume.
+    /// What a document may keep is a property of the volume this file is on.
+    /// `nil` for an in-memory provider, which has no file and no volume.
     public var databaseDirectory: String? {
         // The queue is the mutex, and this may be asked from inside a call
         // that already holds it — so the same re-entrancy check every other
@@ -43,6 +42,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         // Tag the queue with this provider, so a nested `withRawConnection`
         // running on it can recognize that it already holds the lock (#3436).
         queue.setSpecific(key: Self.queueKey, value: queueToken)
+        recordLogGroup = RecordLogGroupCommit(host: self)
     }
 
     // MARK: - StorageProvider
@@ -129,6 +129,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     public func close() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async { [self] in
+                flushDeferredRecordLogCommit()
                 if let db {
                     sqlite3_close_v2(db)
                     self.db = nil
@@ -333,9 +334,9 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
 
     /// Run `body` on the serial queue with this provider's own connection.
     ///
-    /// A large document's records are real SQL tables, not `kv_store` rows —
-    /// a 2 GB document read one JSON blob at a time is not a document — so
-    /// the format-2 layer needs the handle itself. It reuses THIS connection
+    /// A record-log document's records are real SQL tables, not `kv_store`
+    /// rows — a large document read one JSON blob at a time is not a
+    /// document — so the record-log layer needs the handle itself. It reuses THIS connection
     /// and THIS queue deliberately: `JsBaoClient.setupStorage` records that a
     /// second handle on the same WAL file produced `SQLITE_BUSY` under
     /// concurrent auth and data writes, and serializing on one queue is what
@@ -344,7 +345,13 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     /// `internal` to the module and reached through ``Format2SqlHost``, so the
     /// public ``StorageProvider`` surface is unchanged and no app can take a
     /// raw handle out of the provider.
-    func withRawConnection<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+    ///
+    /// Any other caller's work first closes a record-log group left open
+    /// (`flushingGroup`, see ``RecordLogGroupCommitHost``); only the record-log
+    /// store's own work joins it.
+    func withRawConnection<T>(
+        flushingGroup: Bool = true, _ body: (OpaquePointer) throws -> T
+    ) throws -> T {
         try withoutActuallyEscaping(body) { body in
             let work = QueueWork { () throws -> T in
                 guard self._isReady, let db = self.db else {
@@ -353,16 +360,19 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                 return try body(db)
             }
             // RE-ENTRANT, and it has to be. The queue is the mutex, so being
-            // on it already means this call holds it — and the format-2 layer
-            // genuinely nests: a fold runs inside `transaction`, which is
-            // itself inside this call, and each `applyRemote` asks for the
-            // connection again. A plain `queue.sync` from the queue's own
+            // on it already means this call holds it — and the record-log layer
+            // genuinely nests: a store command runs inside `transaction`,
+            // which is itself inside this call, and asks for the connection
+            // again. A plain `queue.sync` from the queue's own
             // thread deadlocks (it traps under the test runner), so the
             // nested call runs inline on the lock it already owns.
             if DispatchQueue.getSpecific(key: Self.queueKey) == queueToken {
                 return try work.run()
             }
-            return try queue.sync { try work.run() }
+            return try queue.sync {
+                if flushingGroup { flushDeferredRecordLogCommit() }
+                return try work.run()
+            }
         }
     }
 
@@ -390,6 +400,22 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         let created = SQLiteFormat2Connection(db: db)
         format2Connection = created
         return created
+    }
+
+    // MARK: - The record-log group commit
+
+    /// The record-log store's group of saves on this connection; set in `init`.
+    private var recordLogGroup: RecordLogGroupCommit?
+
+    /// The commit that closes an open record-log group, run before any other
+    /// work on the queue. Read and written only on `queue`.
+    private var deferredRecordLogCommit: ((any Format2SqlConnection) -> Void)?
+
+    /// Must be called on `queue`.
+    private func flushDeferredRecordLogCommit() {
+        guard let commit = deferredRecordLogCommit, let db else { return }
+        deferredRecordLogCommit = nil
+        commit(format2ConnectionOnQueue(db))
     }
 
     // MARK: - Private helpers
@@ -502,6 +528,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         let work = QueueWork(run: work)
         return try await withCheckedThrowingContinuation { continuation in
             queue.async {
+                self.flushDeferredRecordLogCommit()
                 do {
                     let result = try work.run()
                     continuation.resume(returning: result)
@@ -566,5 +593,30 @@ public enum SQLiteStorageError: Error, LocalizedError {
         case .decodingFailed:
             return "Failed to decode value from JSON"
         }
+    }
+}
+
+// MARK: - The record-log group commit (format 3)
+
+extension SQLiteStorageProvider: RecordLogGroupCommitHost {
+
+    var recordLogGroupCommit: RecordLogGroupCommit { recordLogGroup! }
+
+    func withRecordLogConnection<T>(_ body: (any Format2SqlConnection) throws -> T) throws -> T {
+        try withRawConnection(flushingGroup: false) { db in
+            try body(format2ConnectionOnQueue(db))
+        }
+    }
+
+    func registerDeferredCommit(_ commit: @escaping (any Format2SqlConnection) -> Void) {
+        deferredRecordLogCommit = commit
+    }
+
+    func clearDeferredCommit() {
+        deferredRecordLogCommit = nil
+    }
+
+    func scheduleOnQueue(afterMilliseconds milliseconds: Int, _ work: @escaping @Sendable () -> Void) {
+        queue.asyncAfter(deadline: .now() + .milliseconds(milliseconds), execute: work)
     }
 }

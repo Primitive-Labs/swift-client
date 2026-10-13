@@ -86,26 +86,6 @@ final class InitialMetadataCreateTests: XCTestCase {
         XCTAssertEqual(stamped["tier"] as? String, "pro")
     }
 
-    /// Behavior 7: `databases.create` stamps the named category on the new
-    /// database.
-    func testDatabaseCreateStampsInitialMetadata() async throws {
-        try await createCategory(resourceType: "database", category: "settings", field: "visibility")
-
-        let created = try await client.databases.create(params: CreateDatabaseParams(
-            title: "Class Roster",
-            databaseType: "roster",
-            initialMetadata: ["settings": ["visibility": .string("class-only")]]
-        ))
-        XCTAssertFalse(created.databaseId.isEmpty)
-
-        let stamped = try await readMetadata(
-            resourceType: "database",
-            resourceId: created.databaseId,
-            category: "settings"
-        )
-        XCTAssertEqual(stamped["visibility"] as? String, "class-only")
-    }
-
     /// Behavior 8: an unknown category fails the whole create — the Swift call
     /// throws and no collection is left behind.
     func testCollectionCreateWithUnknownCategoryFailsAtomically() async throws {

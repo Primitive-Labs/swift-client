@@ -6,8 +6,8 @@ import XCTest
 ///
 /// Phases D1-D3 converted `OfflineStore`, `KvCache` and `AnalyticsQueue`. Two
 /// types the design originally listed were deliberately kept out of that set by
-/// the sponsor: `DatabaseSubscriptionRegistry` (permanently — it does no I/O)
-/// and `AuthController` (deferred to #2173). Keeping a lock is fine; keeping a
+/// the sponsor: `DatabaseSubscriptionRegistry` (it did no I/O; it left with
+/// `client.databases` in #3189) and `AuthController` (deferred to #2173). Keeping a lock is fine; keeping a
 /// bare `@unchecked Sendable` is not, because that attribute is a claim the
 /// compiler never checks. This suite checks that the invariants each type's
 /// safety argument relies on hold in the code.
@@ -19,23 +19,6 @@ import XCTest
 final class SyncAdjacentBoundaryTypesTests: XCTestCase {
 
     // MARK: - The invariants behind the safety arguments
-
-    /// The registry stays a class **by decision**, not by omission, so pin the
-    /// decision: it must not have drifted into an actor, and it must not have
-    /// grown a second lock (the safety argument's "there is no acquisition
-    /// order to get wrong" clause depends on there being exactly one).
-    func testTheRegistryStaysClassPlusLockWithASingleLock() throws {
-        let code = try ClientSourceText.code("Internal/DatabaseSubscriptionRegistry.swift")
-        XCTAssertTrue(
-            code.contains("final class DatabaseSubscriptionRegistry"),
-            "the registry is deliberately not an actor — see the Decisions of record on #1993"
-        )
-        XCTAssertFalse(code.contains("actor DatabaseSubscriptionRegistry"))
-        XCTAssertEqual(
-            code.components(separatedBy: "NSLock()").count - 1, 1,
-            "exactly one lock — a second one would make the safety argument's single-lock claim false"
-        )
-    }
 
     /// `AuthController`'s argument claims every mutable field is lock-confined.
     /// This checks the code: no read of `networkMode` may sit outside a
@@ -71,130 +54,6 @@ final class SyncAdjacentBoundaryTypesTests: XCTestCase {
         }
 
         XCTAssertGreaterThan(checked, 0, "expected at least one networkMode access to check")
-    }
-
-    // MARK: - The two dead methods
-
-    /// `has(databaseId:subscriptionKey:)` and `clear()` had zero callers in
-    /// `Sources/` and `Tests/` — dead code the design flagged for deletion
-    /// rather than for porting. Assert they are gone, and that nothing has
-    /// reintroduced a caller.
-    func testDeadRegistryMethodsAreDeleted() throws {
-        let code = try ClientSourceText.code("Internal/DatabaseSubscriptionRegistry.swift")
-        XCTAssertFalse(
-            code.contains("func has(databaseId:"),
-            "DatabaseSubscriptionRegistry.has had no callers and was deleted in #1993 Phase D4"
-        )
-        XCTAssertFalse(
-            code.contains("func clear()"),
-            "DatabaseSubscriptionRegistry.clear had no callers and was deleted in #1993 Phase D4"
-        )
-
-        let callers = try ClientSourceText.allClientSources()
-            .filter { $0.contains("subscriptionRegistry.has(") || $0.contains("subscriptionRegistry.clear(") }
-        XCTAssertTrue(callers.isEmpty, "a caller of a deleted registry method reappeared")
-
-        // The surviving surface is what `DatabasesAPI` and `JsBaoClient` use.
-        for survivor in ["func register(", "func unregister(", "func list()",
-                         "func dispatch(", "func setOriginContext("] {
-            XCTAssertTrue(code.contains(survivor), "the deletion must not have taken `\(survivor)` with it")
-        }
-    }
-
-    /// Behavioral cover for the deletion: the registry still registers,
-    /// replaces, dispatches, unregisters and lists. Written against the real
-    /// type with no server, so it is the regression that would actually catch a
-    /// too-eager deletion.
-    func testRegistryStillRoutesFramesAfterTheDeletion() {
-        let registry = DatabaseSubscriptionRegistry(logger: Logger(level: .none, scope: "db-sub"))
-        registry.setOriginContext(DatabaseSubscriptionRegistry.OriginContext(
-            getConnectionId: { "conn-1" },
-            getCurrentUserId: { "user-1" }
-        ))
-
-        let received = ThreadSafeBox<[DatabaseChangePayload]>([])
-        // `register` hands back the registration's identity, which `unregister`
-        // needs so a stale handle cannot remove a live registration.
-        let registration = registry.register(
-            databaseId: "db1", subscriptionKey: "k1", params: ["limit": 10]
-        ) { payload in
-            received.mutate { $0.append(payload) }
-        }
-
-        XCTAssertEqual(registry.list().count, 1)
-        XCTAssertEqual(registry.list().first?.databaseId, "db1")
-
-        // A frame from this very connection is attributed to us.
-        registry.dispatch([
-            "databaseId": "db1",
-            "subscriptionKey": "k1",
-            "changes": [],
-            "timestamp": "2026-01-01T00:00:00Z",
-            "originConnectionId": "conn-1",
-            "originUserId": "user-1",
-        ])
-        XCTAssertEqual(received.value.count, 1)
-        XCTAssertEqual(received.value.first?.isOrigin, true)
-        XCTAssertEqual(received.value.first?.isOriginUser, true)
-
-        // A frame from someone else is not.
-        registry.dispatch([
-            "databaseId": "db1",
-            "subscriptionKey": "k1",
-            "changes": [],
-            "timestamp": "2026-01-01T00:00:01Z",
-            "originConnectionId": "conn-2",
-            "originUserId": "user-2",
-        ])
-        XCTAssertEqual(received.value.count, 2)
-        XCTAssertEqual(received.value.last?.isOrigin, false)
-        XCTAssertEqual(received.value.last?.isOriginUser, false)
-
-        // Unregister is what `clear()` never got used for — it still works, and
-        // it is the only removal path the client has.
-        XCTAssertTrue(
-            registry.unregister(databaseId: "db1", subscriptionKey: "k1", id: registration),
-            "the live registration's own id must remove it"
-        )
-        XCTAssertTrue(registry.list().isEmpty)
-        registry.dispatch([
-            "databaseId": "db1", "subscriptionKey": "k1", "changes": [],
-            "timestamp": "2026-01-01T00:00:02Z",
-        ])
-        XCTAssertEqual(received.value.count, 2, "a frame after unregister must be dropped")
-    }
-
-    /// The safety argument's load-bearing clause: `dispatch` must not hold the
-    /// lock while it calls out to app code. If it did, an `onChange` that calls
-    /// back into the registry would deadlock against the non-recursive
-    /// `NSLock`. Prove it behaviorally rather than by reading the source — a
-    /// handler that unregisters itself completes instead of hanging.
-    func testDispatchDoesNotHoldTheLockWhileCallingBack() {
-        let registry = DatabaseSubscriptionRegistry(logger: Logger(level: .none, scope: "db-sub"))
-        let reentered = ThreadSafeBox<Bool>(false)
-        // The handler needs its own registration id to unregister itself, and
-        // that id only exists once `register` returns — so it is handed over
-        // through a box the handler reads at dispatch time.
-        let handle = ThreadSafeBox<DatabaseSubscriptionRegistry.RegistrationID?>(nil)
-
-        let registration = registry.register(
-            databaseId: "db1", subscriptionKey: "k1", params: [:]
-        ) { [weak registry] _ in
-            // Re-entering under a held non-recursive lock would deadlock here.
-            if let id = handle.value {
-                registry?.unregister(databaseId: "db1", subscriptionKey: "k1", id: id)
-            }
-            reentered.mutate { $0 = true }
-        }
-        handle.mutate { $0 = registration }
-
-        registry.dispatch([
-            "databaseId": "db1", "subscriptionKey": "k1", "changes": [],
-            "timestamp": "2026-01-01T00:00:00Z",
-        ])
-
-        XCTAssertTrue(reentered.value, "the callback must have run to completion")
-        XCTAssertTrue(registry.list().isEmpty, "the re-entrant unregister must have taken effect")
     }
 
     // MARK: - The gate scripts

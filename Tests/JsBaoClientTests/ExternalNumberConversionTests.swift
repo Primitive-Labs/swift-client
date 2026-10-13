@@ -7,35 +7,9 @@ import XCTest
 /// `Int(_:)`, which traps — aborting the whole process — on a non-finite or
 /// out-of-range value. They now use `Int(exactly:)` and surface the bad value
 /// as an error or an absent field instead. (The integration-proxy status case
-/// left with `IntegrationsAPI`, retired by #3188.)
+/// left with `IntegrationsAPI`, retired by #3188; the `DoDb.intValue` cases
+/// left with `DoDb` and `client.databases`, retired by #3189.)
 final class ExternalNumberConversionTests: XCTestCase {
-
-    // MARK: - DoDb.intValue (API/DoDb.swift)
-
-    func testDoDbIntValueAcceptsInRangeNumbers() throws {
-        XCTAssertEqual(try DoDb.intValue(7, field: "count"), 7)
-        XCTAssertEqual(try DoDb.intValue(7.0, field: "count"), 7)
-        // Truncation toward zero, as the old `Int(_:)` did.
-        XCTAssertEqual(try DoDb.intValue(7.9, field: "count"), 7)
-        XCTAssertEqual(try DoDb.intValue(-7.9, field: "count"), -7)
-    }
-
-    func testDoDbIntValueRejectsOutOfRangeNumbersInsteadOfTrapping() {
-        for bad: Double in [.infinity, -.infinity, .nan, 1e30, -1e30] {
-            XCTAssertThrowsError(
-                try DoDb.intValue(bad, field: "count"),
-                "value \(bad) must surface as an error, not trap"
-            ) { error in
-                XCTAssertEqual(error as? DoDbError, .unexpectedResponse(field: "count"))
-            }
-        }
-    }
-
-    func testDoDbIntValueRejectsMissingField() {
-        XCTAssertThrowsError(try DoDb.intValue(nil, field: "count")) { error in
-            XCTAssertEqual(error as? DoDbError, .unexpectedResponse(field: "count"))
-        }
-    }
 
     // MARK: - SchemaDiscovery.boundedInt (Schema/SchemaDiscovery.swift)
 

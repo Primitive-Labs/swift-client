@@ -16,7 +16,7 @@ Known divergences from the JS client are tracked as GitHub issues (label `swift-
 
 - [`overview.md`](overview.md) — orientation: what is this client, layer diagram, key types
 - [`baomodels.md`](baomodels.md) — typed model authoring guide (`PrimitiveModel`, `TypedModel<T>`, `DynamicModel`)
-- [`large-documents.md`](large-documents.md) — opening a large document (`documentFormat: 2`), what differs, and what is deferred
+- [`record-log.md`](record-log.md) — record-log documents (`documentFormat: 3`): the store, refusals, upserts, `confirm`, `syncState`, `transact`
 - [`architecture.md`](architecture.md) — how internals fit together
 
 ### "I'm contributing to the Swift client"
@@ -33,7 +33,7 @@ docs/
 ├── overview.md                       ← layer diagram, key types, quick start
 ├── architecture.md                   ← module map, concurrency model
 ├── baomodels.md                      ← typed model authoring
-├── large-documents.md                ← large documents (documentFormat: 2)
+├── record-log.md                     ← record-log documents (documentFormat: 3)
 ├── testing.md                        ← running the suite
 └── yswift-fork.md                    ← CRDT layer fork rationale
 ```

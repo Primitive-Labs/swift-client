@@ -49,8 +49,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         /// serialized by `lock`, rebuilt from the Y.Maps every session.
         case owned(OpaquePointer?)
         /// The storage provider's OWN connection, on its own serial queue —
-        /// the file-backed tables a large document's rows are projected into
-        /// (#3436, decision 3436-SO-05). Never a second handle on the same
+        /// the file-backed tables a record-log document's rows are projected
+        /// into. Never a second handle on the same
         /// file: that is the `SQLITE_BUSY` class `setupStorage`'s comment
         /// records. A statement issued while the record store holds a
         /// transaction is part of THAT transaction, which is what lets a
@@ -139,14 +139,14 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     ///
     /// The tables are the same tables, in the provider's database file rather
     /// than in memory, so the rows survive the session — which is what makes
-    /// reopening a large document cheap — and every statement is serialized
+    /// reopening a record-log document cheap — and every statement is serialized
     /// with the record store's and the key-value store's on the provider's
     /// queue. No PRAGMA is issued here: the connection belongs to the
     /// provider, which has already configured it.
     ///
     /// **Lock order.** A read takes `lock` and then enters the provider's
     /// queue. Nothing that runs ON that queue may take `lock` — the projection
-    /// writes (`Format2QueryProjection`) deliberately do not, which is what
+    /// writes (`RecordLogQueryProjection`) deliberately do not, which is what
     /// keeps the two from closing a cycle.
     public convenience init(host: any Format2SqlHost) {
         self.init(host: host, logger: nil)
@@ -1169,7 +1169,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     ///
     /// `documents` is the several-document form of the same scope, mirroring
     /// `count(documents:)` and `QueryOptions.documents`: an empty list matches
-    /// nothing. #3436 reads it for a model whose large documents are the ones
+    /// nothing. Read for a model whose record-log documents are the ones
     /// connected, where the scope is "these documents", not "this one".
     ///
     /// The caller's own `options.documents` (#3760) is INTERSECTED with the
@@ -1178,7 +1178,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// Preferring the caller's list over the facade's was the defect finding
     /// 3760-REVIEW-05 names: the facade's list is the routed scope, narrowed to
     /// the documents that are CONNECTED, and these query tables also hold the
-    /// rows of large documents that are closed (#3756 keeps them), so a request
+    /// rows of record-log documents that are closed (#3756 keeps them), so a request
     /// naming a closed document answered from it where `query` — which narrows
     /// the same request — answered nothing.
     public func aggregate(
