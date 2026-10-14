@@ -855,7 +855,7 @@ actor RecordLogSession {
             try binding.store.receive(writer: writer, items: items, project: binding.projectionSpecs)
         }
         notify(reply.changed)
-        // Every number the room answered frees its place in the window.
+        // Every number the room answered is one its frame no longer owes.
         var seqs: [Int] = []
         for item in items {
             switch item {
@@ -895,7 +895,6 @@ actor RecordLogSession {
             return
         }
         let writer = current.writer
-        let named = try binding.store.pendingOf(writer).first { $0.seq == refusal.seq }
         let reply = try binding.withOperation {
             try binding.store.refused(writer: writer, refusal: refusal, project: binding.projectionSpecs)
         }
@@ -903,6 +902,12 @@ actor RecordLogSession {
         let sender = senderOf(writer)
         var after: [Int: RecordLogPendingEntry] = [:]
         for entry in try binding.store.pendingOf(writer) { after[entry.seq] = entry }
+        // The refusal is the room's answer to the refused number: the marker left
+        // in its place, or a withdrawn entry's marker it answers, waits on nothing.
+        if after[refusal.seq]?.isVoid == true {
+            try binding.withOperation { try binding.store.settled(writer: writer, seq: refusal.seq) }
+            after[refusal.seq] = nil
+        }
         for frame in reply.frames { sender?.enqueueControl(frame) }
         for entry in reply.handedBack {
             let marker = after[entry.seq]
@@ -910,10 +915,6 @@ actor RecordLogSession {
         }
         sender?.acknowledged(refusal.seq)
         answered([refusal.seq] + reply.handedBack.map(\.seq))
-        // The room's answer to a withdrawn entry's copy: the marker stands for it.
-        if named?.isVoid == true {
-            try binding.withOperation { try binding.store.settled(writer: writer, seq: refusal.seq) }
-        }
         let handed = reply.handedBack.filter { !$0.isVoid }
         guard !handed.isEmpty else {
             logger?.debug("[record-log]", documentId, "— refusal of", refusal.seq, "(\(refusal.code)) withdrew nothing new")
@@ -1254,8 +1255,8 @@ actor RecordLogSession {
         if !orphan {
             // What the sender holds carries the old numbers: queued entries
             // would go under the new writer with another entry's number, and
-            // in-flight numbers would hold window slots no answer frees. The
-            // open that follows sends every renumbered entry again.
+            // in-flight numbers would hold a frame no answer frees. The open
+            // that follows sends every renumbered entry again.
             ownSender?.reset()
             binding.reminted(writer: fresh, renumbered: renumbered)
             try binding.refreshMarks()

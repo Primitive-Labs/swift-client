@@ -519,6 +519,68 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         XCTAssertEqual(fixture.connection.last("record.resume")?["records"], [.object(["model": "Note", "id": "a", "from": 1])])
     }
 
+    // MARK: - A refusal of the writer's last pending entry (#4497)
+
+    private func constraintRefusal(_ seq: Int, _ id: String) -> [String: JSONValue] {
+        [
+            "type": "record.refused", "documentId": "doc-1", "seq": .number(Double(seq)), "code": "DOCUMENT_CONSTRAINT_VIOLATED",
+            "scope": "record", "from": .number(Double(seq)),
+            "records": [.object(["model": "Note", "id": .string(id), "from": .number(Double(seq))])],
+            "conflicting": .object(["model": "Note", "id": "winner"]),
+        ]
+    }
+
+    private func sentSeqs(_ connection: RecordingConnection) -> [Int] {
+        connection.all("record.entries").flatMap { entrySeqs($0) }
+    }
+
+    func testARefusalOfTheOnlyEntryInFlightLeavesNothingPending() async throws {
+        let fixture = try await makeFixture()
+        let binding = fixture.binding
+        try write(binding, "loser", ["slug": "k"])
+        let outcome = LockedBox<Error?>(nil)
+        let waiter = Task {
+            do { try await binding.whenAcknowledged(1) } catch { outcome.withValue { $0 = error } }
+        }
+        await fixture.session.start()
+        await fixture.session.receive(opened())
+        await eventually("the entry") { sentSeqs(fixture.connection) == [1] }
+
+        await fixture.session.receive(constraintRefusal(1, "loser"))
+
+        XCTAssertEqual(try binding.store.pendingOf(binding.writer).map(\.seq), [], "the refused entry's marker settles")
+        await waiter.value
+        XCTAssertEqual((outcome.value as? JsBaoError)?.code, .documentConstraintViolated)
+        XCTAssertEqual(fixture.refusals.value.count, 1)
+        XCTAssertEqual(fixture.refusals.value.first?.writes?.map(\.recordId), ["loser"])
+        XCTAssertNil(try binding.store.read(model: "Note", id: "loser"))
+        await eventually("the resume") { fixture.connection.last("record.resume") != nil }
+        XCTAssertEqual(sentSeqs(fixture.connection), [1], "the marker is not sent")
+
+        try write(binding, "after", ["slug": "k2"])
+        await eventually("the next save") { sentSeqs(fixture.connection) == [1, 2] }
+    }
+
+    func testARefusalOfTheLastOfSeveralEntriesLeavesNothingPending() async throws {
+        let fixture = try await makeFixture()
+        let binding = fixture.binding
+        try write(binding, "kept", ["slug": "other"])
+        try write(binding, "loser", ["slug": "k"])
+        await fixture.session.start()
+        await fixture.session.receive(opened())
+        await eventually("the entries") { sentSeqs(fixture.connection) == [1, 2] }
+
+        await fixture.session.receive(results([result(1, "kept", "kept", w: binding.writer, seq: 1)]))
+        XCTAssertEqual(try binding.store.pendingOf(binding.writer).map(\.seq), [2])
+        await fixture.session.receive(constraintRefusal(2, "loser"))
+
+        XCTAssertEqual(try binding.store.pendingOf(binding.writer).map(\.seq), [], "the refused entry's marker settles")
+        XCTAssertEqual(fixture.refusals.value.count, 1)
+        XCTAssertNil(try binding.store.read(model: "Note", id: "loser"))
+        XCTAssertNotNil(try binding.store.read(model: "Note", id: "kept"))
+        XCTAssertEqual(sentSeqs(fixture.connection), [1, 2])
+    }
+
     // MARK: - A model registered on an open document (4309-C2-02)
 
     func testAModelRegisteredOnAnOpenDocumentIsDeclaredBeforeItsEntries() async throws {
@@ -591,11 +653,14 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         await fixture.session.receive(results((1...5).map { result($0, "a\($0)", "a\($0)", w: oldWriter, seq: $0) }))
         XCTAssertEqual(try binding.store.pendingOf(oldWriter).filter { $0.acked == nil }, [])
 
-        // Ten more: eight in flight (the window), two queued.
+        // Ten more, written with nothing in flight: they leave together, in one frame.
+        fixture.connection.isOpen = false
         for index in 1...10 { try write(binding, "b\(index)") }
-        await eventually("the window full") {
-            fixture.connection.all("record.entries").flatMap { entrySeqs($0) }.filter { $0 > 5 }.count == 8
-        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        fixture.connection.isOpen = true
+        await fixture.session.kick()
+        await eventually("the ten in flight") { entrySeqs(fixture.connection.last("record.entries")) == Array(6...15) }
+        XCTAssertEqual(fixture.connection.all("record.entries").map { entrySeqs($0) }, [Array(1...5), Array(6...15)])
         fixture.connection.clear()
 
         // The room drops the subscription and no longer knows the writer.
@@ -608,9 +673,10 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         await eventually("the renumbered entries") { fixture.connection.last("record.entries") != nil }
         try await Task.sleep(nanoseconds: 20_000_000)
 
+        XCTAssertEqual(fixture.connection.types(), ["record.open", "record.open", "record.declare", "record.entries"])
         let sent = fixture.connection.all("record.entries").flatMap { $0["entries"]?.arrayValue ?? [] }
-        XCTAssertEqual(sent.compactMap { $0["seq"]?.wholeNumber }, Array(1...8),
-                       "the new writer's numbers from 1, in order, up to the window")
+        XCTAssertEqual(sent.compactMap { $0["seq"]?.wholeNumber }, Array(1...10),
+                       "the new writer's numbers from 1, in order, in one frame")
         for entry in sent {
             let seq = try XCTUnwrap(entry["seq"]?.wholeNumber)
             XCTAssertEqual(entry["m"]?["id"]?.stringValue, "b\(seq)", "entry \(seq) carries its own write")

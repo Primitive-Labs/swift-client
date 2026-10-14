@@ -92,14 +92,24 @@ enum RecordLogTransport {
     static let entryMaxBytes = 1024 * 1024
     /// The size a batch of entries aims at; a larger entry travels alone.
     static let frameTargetBytes = 64 * 1024
-    /// How many unacknowledged entries are in flight at most.
-    static let sendWindow = 8
+    /// How many `record.entries` frames of one writer are unanswered at a
+    /// time. Entries written meanwhile queue, and leave together once the
+    /// frame's last entry is answered.
+    static let framesInFlight = 1
+    /// How long an unanswered `record.entries` frame holds back the next.
+    /// After it, what is queued leaves; the frame's entries are still sent
+    /// again when the room reports them missing.
+    static let frameWaitMs = 2_000
     /// How long the sender gathers the entries of one batch.
     static let tickMs = 5
     /// How long a group of saves stays open before it commits.
     static let groupCommitMs = 5
-    /// The most entries one `record.entries` frame carries.
+    /// The most entries the room takes in one `record.entries` frame.
     static let upBatchMax = 200
+    /// The most entries one `record.entries` frame of this client carries.
+    /// Fewer than the room takes, so another writer's save is not held long
+    /// behind one request of a burst.
+    static let frameEntriesMax = 64
     /// How long an orphan writer's drain waits for the room's answers.
     static let drainWaitMs = 15_000
     /// How long a result ahead of the cursor may wait for the gap to fill.
@@ -570,10 +580,10 @@ enum RecordLogJSON {
         return text
     }
 
-    /// The text parsed, or `nil` when it is not JSON.
+    /// The text parsed, or `nil` when it is not JSON. Every stored entry and
+    /// row is read through here, so it throws nothing (`JSONValue(jsonText:)`).
     static func parse(_ text: String) -> JSONValue? {
-        guard let data = text.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(JSONValue.self, from: data)
+        JSONValue(jsonText: text)
     }
 
     /// A row parsed from the store; an empty row when the text is not an object.

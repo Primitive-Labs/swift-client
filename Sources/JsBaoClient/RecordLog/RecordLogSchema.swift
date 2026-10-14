@@ -118,6 +118,10 @@ enum RecordLogSchema {
         )
         """,
         "CREATE INDEX IF NOT EXISTS record_log_pending_acked ON record_log_pending(doc_id, acked) WHERE acked IS NOT NULL",
+        // A write numbers its entry after the highest `ord` and counts its
+        // epoch's unwithdrawn entries; neither reads the entries.
+        "CREATE INDEX IF NOT EXISTS record_log_pending_by_ord ON record_log_pending(doc_id, ord)",
+        "CREATE INDEX IF NOT EXISTS record_log_pending_by_epoch ON record_log_pending(doc_id, e) WHERE void = 0",
         """
         CREATE TABLE IF NOT EXISTS record_log_pending_keys (
           doc_id TEXT NOT NULL,
@@ -129,7 +133,10 @@ enum RecordLogSchema {
           PRIMARY KEY (doc_id, writer, seq, _type, _id)
         )
         """,
-        "CREATE INDEX IF NOT EXISTS record_log_pending_keys_by_record ON record_log_pending_keys(doc_id, _type, _id)",
+        // The entries touching a record, answered from the index alone: without
+        // `writer, seq` in it SQLite reads the keys' primary key by document.
+        "DROP INDEX IF EXISTS record_log_pending_keys_by_record",
+        "CREATE INDEX IF NOT EXISTS record_log_pending_keys_by_record_entry ON record_log_pending_keys(doc_id, _type, _id, writer, seq)",
         """
         CREATE TABLE IF NOT EXISTS record_log_pending_values (
           doc_id TEXT NOT NULL,

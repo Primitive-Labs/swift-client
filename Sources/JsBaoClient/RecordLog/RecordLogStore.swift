@@ -241,6 +241,9 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
     private var heldWarned = false
     /// Records of entries changed or removed since the last `takeDirty`.
     private var dirty: [RecordLogRecordKey] = []
+    /// Inside ``countingEpochs(_:)``, each epoch's unwithdrawn pending entries
+    /// once counted, kept as entries are added; `nil` outside it.
+    private var epochPending: [Int: Int]?
 
     init(docId: String, logger: Logger? = nil) {
         self.docId = docId
@@ -527,13 +530,30 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
         try sql.rows(
             "SELECT entry, acked FROM record_log_pending WHERE doc_id = ? AND writer = ? ORDER BY seq",
             [doc, .text(writer)]
-        ).compactMap { row in
-            guard var entry = RecordLogPendingEntry(stored: row["entry"].stringValue.flatMap(RecordLogJSON.parse)) else {
-                return nil
-            }
-            entry.acked = row["acked"].intValue
-            return entry
+        ).compactMap(Self.pendingEntry(row:))
+    }
+
+    func pendingEntry(_ writer: String, _ seq: Int) throws -> RecordLogPendingEntry? {
+        try sql.first(
+            "SELECT entry, acked FROM record_log_pending WHERE doc_id = ? AND writer = ? AND seq = ?",
+            [doc, .text(writer), .integer(Int64(seq))]
+        ).flatMap(Self.pendingEntry(row:))
+    }
+
+    func pendingThrough(_ writer: String, _ seq: Int) throws -> [RecordLogPendingEntry] {
+        try sql.rows(
+            "SELECT entry, acked FROM record_log_pending WHERE doc_id = ? AND writer = ? AND seq <= ? ORDER BY seq",
+            [doc, .text(writer), .integer(Int64(seq))]
+        ).compactMap(Self.pendingEntry(row:))
+    }
+
+    /// A `record_log_pending` row's entry, its acknowledgement with it.
+    private static func pendingEntry(row: Format2SqlRow) -> RecordLogPendingEntry? {
+        guard var entry = RecordLogPendingEntry(stored: row["entry"].stringValue.flatMap(RecordLogJSON.parse)) else {
+            return nil
         }
+        entry.acked = row["acked"].intValue
+        return entry
     }
 
     func putPending(_ writer: String, _ entry: RecordLogPendingEntry) throws {
@@ -545,6 +565,7 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
             "SELECT 1 AS present FROM record_log_pending WHERE doc_id = ? AND writer = ? AND seq = ?", [doc, w, seq]
         ) != nil
         if exists {
+            if epochPending != nil { epochPending = [:] }
             try markDirty(writer, entry.seq)
             try sql.exec(
                 "UPDATE record_log_pending SET entry = ?, void = ?, acked = ?, e = ? WHERE doc_id = ? AND writer = ? AND seq = ?",
@@ -563,6 +584,7 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
                     .text(stored), entry.ts.map { .integer($0) } ?? .null, .integer(entry.isVoid ? 1 : 0), acked,
                 ]
             )
+            if !entry.isVoid, let n = epochPending?[entry.e] { epochPending?[entry.e] = n + 1 }
         }
         try putValues(writer, entry)
         for key in entry.keys {
@@ -600,6 +622,7 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
     }
 
     func deletePending(_ writer: String, _ seq: Int) throws {
+        if epochPending != nil { epochPending = [:] }
         try markDirty(writer, seq)
         let bindings: [Format2SqlValue] = [doc, .text(writer), .integer(Int64(seq))]
         try sql.exec("DELETE FROM record_log_pending WHERE doc_id = ? AND writer = ? AND seq = ?", bindings)
@@ -652,9 +675,21 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
     }
 
     func pendingInEpoch(_ e: Int) throws -> Int {
-        try sql.first(
+        if let n = epochPending?[e] { return n }
+        let n = try sql.first(
             "SELECT COUNT(*) AS n FROM record_log_pending WHERE doc_id = ? AND void = 0 AND e = ?", [doc, .integer(Int64(e))]
         )?["n"].intValue ?? 0
+        if epochPending != nil { epochPending?[e] = n }
+        return n
+    }
+
+    /// Run `body` counting each epoch's pending entries once: a commit's
+    /// writes each check the budget, and inside one transaction only they
+    /// change the count. Any other change to the pending log counts again.
+    func countingEpochs<T>(_ body: () throws -> T) rethrows -> T {
+        epochPending = [:]
+        defer { epochPending = nil }
+        return try body()
     }
 }
 
@@ -1448,22 +1483,24 @@ final class RecordLogStore: @unchecked Sendable {
             }
         }
         return try save(listener: heard) { sql in
-            let rules = rules(writer)
-            var entries: [RecordLogPendingEntry] = []
-            var refreshed: [RecordLogRecordKey] = []
-            for write in writes {
-                guard let m = write.mutations.first else { continue }
-                try rules.budgetCheck(documentId: documentId)
-                let entry = try rules.write(
-                    m, also: Array(write.mutations.dropFirst()), upsertOn: write.upsertOn,
-                    ts: ts ?? Int64(Date().timeIntervalSince1970 * 1000)
-                )
-                // Each write lands on the view before the next is applied over it.
-                refreshed.append(contentsOf: try refreshView(sql, entry.keys + tables.takeDirty()))
-                entries.append(entry)
+            try tables.countingEpochs {
+                let rules = rules(writer)
+                var entries: [RecordLogPendingEntry] = []
+                var refreshed: [RecordLogRecordKey] = []
+                for write in writes {
+                    guard let m = write.mutations.first else { continue }
+                    try rules.budgetCheck(documentId: documentId)
+                    let entry = try rules.write(
+                        m, also: Array(write.mutations.dropFirst()), upsertOn: write.upsertOn,
+                        ts: ts ?? Int64(Date().timeIntervalSince1970 * 1000)
+                    )
+                    // Each write lands on the view before the next is applied over it.
+                    refreshed.append(contentsOf: try refreshView(sql, entry.keys + tables.takeDirty()))
+                    entries.append(entry)
+                }
+                let changed = try settleView(sql, [], project, refreshed: refreshed)
+                return RecordLogCommitReply(entries: entries, changed: changed, cursor: try tables.cursor())
             }
-            let changed = try settleView(sql, [], project, refreshed: refreshed)
-            return RecordLogCommitReply(entries: entries, changed: changed, cursor: try tables.cursor())
         }
     }
 

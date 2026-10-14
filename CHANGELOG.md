@@ -20,6 +20,24 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Bursts of record-log saves leave in a few frames
+
+A client now keeps one `record.entries` frame in flight per record-log
+document instead of 8 entries. Saves made while it is out leave together as the
+next frame, up to 64 entries, so a burst of 200 saves is acknowledged in a few
+round trips instead of 25. A lone save leaves as before. Nothing public
+changed.
+
+### Session views read a tool call's artifact
+
+`view.artifact(of: part)` answers a tool call's artifact as a `JSONValue`, the
+same value whether the server stored it on the part or, being large, as a blob
+on the session's document. The blob is downloaded only when `artifact(of:)` is
+called; opening, refreshing and `loadOlder()` never read one. It answers `nil`
+for a part that is not a tool call or a call with no artifact, and throws the
+blob read's error for a failed download and a `DecodingError` for a blob that
+is not JSON.
+
 ### Breaking: large documents (`documentFormat: 2`) are removed
 
 The platform no longer serves large documents, and the Swift client no longer

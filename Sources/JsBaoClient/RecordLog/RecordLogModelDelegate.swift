@@ -311,7 +311,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
 
     /// The JSON a field is stored as, the nested-map path's spelling.
     static func jsonValue(_ value: PrimitiveValue) -> JSONValue? {
-        guard let encoded = value.encodedForYrs(), let data = encoded.data(using: .utf8) else { return nil }
-        return try? JSONCoding.decodeData(JSONValue.self, from: data)
+        guard let encoded = value.encodedForYrs() else { return nil }
+        return JSONValue(jsonText: encoded)
     }
 }

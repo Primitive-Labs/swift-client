@@ -337,6 +337,23 @@ public final class AgentSessionView: @unchecked Sendable {
         try await api.answer(sessionId: sessionId, callId: callId, answer)
     }
 
+    /// A tool call's artifact: the same value whether the server stored it
+    /// inline or, being large, as a blob on the session's document, which is
+    /// read only now. `nil` when the call has none or `part` is not a tool
+    /// call; `.null` for a stored JSON null.
+    ///
+    /// Throws `.invalidArgument` on a closed view, the blob read's error for
+    /// a download that fails, and a `DecodingError` for a blob that is not
+    /// JSON.
+    public func artifact(of part: PrimitivePart) async throws -> JSONValue? {
+        if lock.withLock({ closed }) {
+            throw JsBaoError(code: .invalidArgument, message: "The session view is closed")
+        }
+        guard case .toolCall(let call) = part.content else { return nil }
+        guard let blobId = call.artifactBlobId, !blobId.isEmpty else { return call.artifact }
+        return try await client.documents.blobs(documentId: documentId).read(blobId: blobId, as: JSONValue.self)
+    }
+
     /// Record an event on the session.
     @discardableResult
     public func recordEvent(_ event: AgentSessionEvent) async throws -> AgentSessionEventResult {

@@ -662,6 +662,72 @@ final class AgentSessionViewHermeticTests: XCTestCase {
         XCTAssertEqual(after, before, "no subscription was left behind")
         XCTAssertFalse(h.client.isDocumentOpen("never-created"))
     }
+
+    // MARK: - #4466: a call's artifact, view-local rules
+
+    private func saveToolCall(
+        _ h: Harness, in documentId: String, id: String, messageId: String, seq: Double,
+        artifact: String? = nil, artifactBlobId: String? = nil
+    ) throws {
+        var values: [String: PrimitiveValue] = [
+            "messageId": .string(messageId), "seq": .number(seq), "kind": .string("tool_call"),
+            "state": .string("output-available"), "toolCallId": .string("call-\(id)"),
+            "toolName": .string("chart"), "createdAt": .date(Self.created),
+        ]
+        if let artifact { values["artifact"] = .string(artifact) }
+        if let artifactBlobId { values["artifactBlobId"] = .string(artifactBlobId) }
+        try h.client.codegen.save(PrimitivePart.primitiveSchema, id: id, values: values, in: documentId)
+    }
+
+    /// No blob content is scripted: a read would go to the client's
+    /// unreachable API and throw, so an answer proves none was made.
+    func testArtifactAnswersTheInlineValueNullAndNilWithoutReadingABlob() async throws {
+        let h = harness("artifact-inline")
+        let documentId = try await session(h, "s1")
+        try saveMessage(h, in: documentId, id: "m1", seq: 1, authorKind: "agent")
+        try saveToolCall(h, in: documentId, id: "inline", messageId: "m1", seq: 1, artifact: #"{"rows":[1,2,3]}"#)
+        try saveToolCall(h, in: documentId, id: "null", messageId: "m1", seq: 2, artifact: "null")
+        try saveToolCall(h, in: documentId, id: "none", messageId: "m1", seq: 3)
+        try saveToolCall(
+            h, in: documentId, id: "empty-id", messageId: "m1", seq: 4, artifact: #"{"a":1}"#, artifactBlobId: ""
+        )
+        try savePart(h, in: documentId, id: "text", messageId: "m1", seq: 5)
+        let view = try await open(h, "s1")
+        try await eventually(description: "the five parts reach the window") {
+            self.synced(view).first?.parts.count == 5
+        }
+        let parts = try XCTUnwrap(synced(view).first?.parts)
+        func part(_ id: String) throws -> PrimitivePart { try XCTUnwrap(parts.first { $0.id == id }) }
+
+        let inline = try await view.artifact(of: part("inline"))
+        XCTAssertEqual(inline, ["rows": [1, 2, 3]])
+        let null = try await view.artifact(of: part("null"))
+        XCTAssertEqual(null, .null, "a stored JSON null answers .null, not nil")
+        let none = try await view.artifact(of: part("none"))
+        XCTAssertNil(none)
+        let emptyId = try await view.artifact(of: part("empty-id"))
+        XCTAssertEqual(emptyId, ["a": 1], "an empty blob id is no blob id")
+        let text = try await view.artifact(of: part("text"))
+        XCTAssertNil(text, "a part that is no tool call has no artifact")
+        XCTAssertEqual(h.transport.calls.map(\.path), ["/agent-sessions/s1"])
+        await view.close()
+    }
+
+    func testArtifactOnAClosedViewThrowsInvalidArgumentWithoutReading() async throws {
+        let h = harness("artifact-closed")
+        let documentId = try await session(h, "s1")
+        try saveMessage(h, in: documentId, id: "m1", seq: 1, authorKind: "agent")
+        try saveToolCall(h, in: documentId, id: "blob", messageId: "m1", seq: 1, artifactBlobId: "blob-1")
+        try saveToolCall(h, in: documentId, id: "inline", messageId: "m1", seq: 2, artifact: #"{"a":1}"#)
+        let view = try await open(h, "s1")
+        try await eventually(description: "the parts reach the window") { self.synced(view).first?.parts.count == 2 }
+        let parts = try XCTUnwrap(synced(view).first?.parts)
+        await view.close()
+        for part in parts {
+            await assertCode(.invalidArgument) { _ = try await view.artifact(of: part) }
+        }
+        XCTAssertEqual(h.transport.calls.map(\.path), ["/agent-sessions/s1"])
+    }
 }
 
 /// A one-shot gate an async test opens to let a scripted answer through.

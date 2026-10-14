@@ -97,6 +97,53 @@ public final class SQLiteFormat2Connection: Format2SqlConnection {
     /// halfway through.
     private var transactionDepth = 0
 
+    /// Compiled statements by SQL text, so the same text is compiled once and
+    /// run again rather than prepared and finalized on every call — the record
+    /// store issues a handful of texts thousands of times.
+    ///
+    /// Each statement is reset and its bindings cleared as soon as its call
+    /// returns, so a cached one never holds a read open or carries a value
+    /// into the next call. Texts built per call (an `IN` list of `?` per
+    /// member) would grow the cache without end, so it is bounded and the
+    /// statement used longest ago goes first.
+    private var statements: [StatementKey: CachedStatement] = [:]
+    private var uses: UInt64 = 0
+    static let statementLimit = 64
+
+    /// A SQL text compared by its bytes. `String` equality is canonical
+    /// equivalence — `é` as one scalar equals `e` and a combining accent — but
+    /// SQLite reads the bytes, and two such texts can name two tables.
+    private struct StatementKey: Hashable {
+        let sql: String
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            var left = lhs.sql
+            var right = rhs.sql
+            return left.withUTF8 { left in
+                right.withUTF8 { right in
+                    left.count == right.count
+                        && (left.isEmpty || memcmp(left.baseAddress!, right.baseAddress!, left.count) == 0)
+                }
+            }
+        }
+
+        func hash(into hasher: inout Hasher) {
+            var sql = sql
+            sql.withUTF8 { hasher.combine(bytes: UnsafeRawBufferPointer($0)) }
+        }
+    }
+
+    /// A class, so marking a use does not hash the SQL text a second time.
+    private final class CachedStatement {
+        let handle: OpaquePointer
+        var lastUse: UInt64
+
+        init(handle: OpaquePointer, lastUse: UInt64) {
+            self.handle = handle
+            self.lastUse = lastUse
+        }
+    }
+
     init(db: OpaquePointer) {
         self.db = db
     }
@@ -110,32 +157,48 @@ public final class SQLiteFormat2Connection: Format2SqlConnection {
     /// Run a statement for effect.
     public func execute(_ sql: String, _ bindings: [Format2SqlValue]) throws {
         let statement = try prepare(sql, bindings)
-        defer { sqlite3_finalize(statement) }
         let rc = sqlite3_step(statement)
         guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
-            throw Format2SqlError.executionFailed(sql: sql, message: lastError())
+            throw failed(sql)
         }
+        release(statement)
     }
 
     /// Run a statement and collect its rows.
     public func query(_ sql: String, _ bindings: [Format2SqlValue]) throws -> [Format2SqlRow] {
         let statement = try prepare(sql, bindings)
-        defer { sqlite3_finalize(statement) }
 
+        var count: Int32 = 0
+        var names: [String?] = []
+        var index: Int32 = 0
         var rows: [Format2SqlRow] = []
         while true {
             let rc = sqlite3_step(statement)
             if rc == SQLITE_DONE { break }
             guard rc == SQLITE_ROW else {
-                throw Format2SqlError.executionFailed(sql: sql, message: lastError())
+                throw failed(sql)
             }
-            var columns: [String: Format2SqlValue] = [:]
-            for index in 0..<sqlite3_column_count(statement) {
-                guard let namePtr = sqlite3_column_name(statement, index) else { continue }
-                columns[String(cString: namePtr)] = Self.value(of: statement, at: index)
+            // The names once per call rather than once per row, and after the
+            // first step: a cached statement whose table changed under it is
+            // recompiled by the step, and its columns with it.
+            if rows.isEmpty {
+                count = sqlite3_column_count(statement)
+                names.reserveCapacity(Int(count))
+                index = 0
+                while index < count {
+                    names.append(sqlite3_column_name(statement, index).map { String(cString: $0) })
+                    index += 1
+                }
+            }
+            var columns = [String: Format2SqlValue](minimumCapacity: names.count)
+            index = 0
+            while index < count {
+                if let name = names[Int(index)] { columns[name] = Self.value(of: statement, at: index) }
+                index += 1
             }
             rows.append(Format2SqlRow(columns: columns))
         }
+        release(statement)
         return rows
     }
 
@@ -194,21 +257,40 @@ public final class SQLiteFormat2Connection: Format2SqlConnection {
 
     // MARK: - Private
 
+    /// The compiled statement for `sql` — the cached one, or one compiled now
+    /// and cached — with `bindings` bound. Hand it back with `release(_:)`
+    /// once its rows are read, or drop it with `failed(_:)`.
     private func prepare(
         _ sql: String, _ bindings: [Format2SqlValue]
     ) throws -> OpaquePointer? {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            sqlite3_finalize(statement)
-            throw Format2SqlError.prepareFailed(sql: sql, message: lastError())
+        uses &+= 1
+        let statement: OpaquePointer?
+        let key = StatementKey(sql: sql)
+        if let cached = statements[key] {
+            cached.lastUse = uses
+            statement = cached.handle
+        } else {
+            var compiled: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &compiled, nil) == SQLITE_OK else {
+                sqlite3_finalize(compiled)
+                throw Format2SqlError.prepareFailed(sql: sql, message: lastError())
+            }
+            // Text with no statement in it (only a comment) compiles to
+            // nothing, which the step reports as misuse, as it always has.
+            if let compiled {
+                if statements.count >= Self.statementLimit { evictLeastRecentlyUsed() }
+                statements[key] = CachedStatement(handle: compiled, lastUse: uses)
+            }
+            statement = compiled
         }
-        for (offset, binding) in bindings.enumerated() {
-            let index = Int32(offset + 1)
+        var index: Int32 = 1
+        for binding in bindings {
+            defer { index += 1 }
             switch binding {
             case .null:
                 sqlite3_bind_null(statement, index)
             case .text(let text):
-                sqlite3_bind_text(statement, index, text, -1, Self.transient)
+                _ = text.withCString { sqlite3_bind_text(statement, index, $0, -1, Self.transient) }
             case .integer(let value):
                 sqlite3_bind_int64(statement, index, value)
             case .real(let value):
@@ -232,6 +314,35 @@ public final class SQLiteFormat2Connection: Format2SqlConnection {
             guard let text = sqlite3_column_text(statement, index) else { return .null }
             return .text(String(cString: text))
         }
+    }
+
+    /// Put a statement back for its next call: no longer running, nothing bound.
+    private func release(_ statement: OpaquePointer?) {
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+    }
+
+    /// The error a failed step on `sql` throws, read before anything else
+    /// touches the handle. The statement is finalized rather than kept: one
+    /// that failed for its schema (a table dropped under it) would fail again.
+    private func failed(_ sql: String) -> Format2SqlError {
+        let error = Format2SqlError.executionFailed(sql: sql, message: lastError())
+        if let cached = statements.removeValue(forKey: StatementKey(sql: sql)) { sqlite3_finalize(cached.handle) }
+        return error
+    }
+
+    private func evictLeastRecentlyUsed() {
+        guard let oldest = statements.min(by: { $0.value.lastUse < $1.value.lastUse }) else { return }
+        statements.removeValue(forKey: oldest.key)
+        sqlite3_finalize(oldest.value.handle)
+    }
+
+    /// Finalize every cached statement. The provider calls this before it
+    /// closes the handle, so the close is a real one: `sqlite3_close_v2` keeps a
+    /// connection with a live statement open as a zombie.
+    func finalizeStatements() {
+        for statement in statements.values { sqlite3_finalize(statement.handle) }
+        statements.removeAll()
     }
 
     private func lastError() -> String { String(cString: sqlite3_errmsg(db)) }

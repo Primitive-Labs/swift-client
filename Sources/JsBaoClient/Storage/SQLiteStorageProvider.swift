@@ -130,6 +130,11 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async { [self] in
                 flushDeferredRecordLogCommit()
+                // The record-log connection's compiled statements go first, and
+                // the connection with them: a reopened handle can land at the
+                // same address, and must not find statements of the closed one.
+                format2Connection?.finalizeStatements()
+                format2Connection = nil
                 if let db {
                     sqlite3_close_v2(db)
                     self.db = nil

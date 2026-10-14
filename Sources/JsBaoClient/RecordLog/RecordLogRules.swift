@@ -58,6 +58,10 @@ protocol RecordLogTables: AnyObject {
     func setWriterState(_ writer: String, _ state: RecordLogWriterState) throws
     /// A writer's unjudged entries, in `seq` order.
     func pending(_ writer: String) throws -> [RecordLogPendingEntry]
+    /// One of a writer's unjudged entries, or `nil`.
+    func pendingEntry(_ writer: String, _ seq: Int) throws -> RecordLogPendingEntry?
+    /// A writer's unjudged entries at or below `seq`, in `seq` order.
+    func pendingThrough(_ writer: String, _ seq: Int) throws -> [RecordLogPendingEntry]
     /// Insert or replace a writer's entry.
     func putPending(_ writer: String, _ entry: RecordLogPendingEntry) throws
     func deletePending(_ writer: String, _ seq: Int) throws
@@ -71,6 +75,18 @@ protocol RecordLogTables: AnyObject {
     func countEpoch(_ e: Int) throws
     /// How many unjudged, unwithdrawn entries of epoch `e` the store holds, every writer's.
     func pendingInEpoch(_ e: Int) throws -> Int
+}
+
+extension RecordLogTables {
+    /// Answered from ``pending(_:)``, reading every entry of the writer.
+    func pendingEntry(_ writer: String, _ seq: Int) throws -> RecordLogPendingEntry? {
+        try pending(writer).first(where: { $0.seq == seq })
+    }
+
+    /// Answered from ``pending(_:)``.
+    func pendingThrough(_ writer: String, _ seq: Int) throws -> [RecordLogPendingEntry] {
+        try pending(writer).filter { $0.seq <= seq }
+    }
 }
 
 /// Tables that receive loads and segments: they keep the replacement's
@@ -207,7 +223,7 @@ final class RecordLogRules {
 
     /// The room has moved past a withdrawn entry's sequence number.
     func settled(_ seq: Int) throws {
-        if let entry = try tables.pending(writer).first(where: { $0.seq == seq }), entry.isVoid {
+        if let entry = try tables.pendingEntry(writer, seq), entry.isVoid {
             try tables.deletePending(writer, seq)
         }
     }
@@ -222,7 +238,7 @@ final class RecordLogRules {
         var out = RecordLogReceiveOutcome()
         switch item {
         case .void(let seq):
-            if let entry = try tables.pending(writer).first(where: { $0.seq == seq }) {
+            if let entry = try tables.pendingEntry(writer, seq) {
                 try tables.deletePending(writer, seq)
                 out.settled.append(RecordLogEntryRef(writer: writer, seq: seq))
                 if !entry.isVoid { out.touched.append(contentsOf: entry.keys) }
@@ -230,7 +246,7 @@ final class RecordLogRules {
             return out
         case .duplicate(let seq):
             // Accepted before: the row comes from catch-up.
-            let entry = try tables.pending(writer).first(where: { $0.seq == seq })
+            let entry = try tables.pendingEntry(writer, seq)
             out.acknowledged.append(RecordLogEntryRef(writer: writer, seq: seq))
             if let entry {
                 try tables.deletePending(writer, seq)
@@ -241,7 +257,7 @@ final class RecordLogRules {
         case .result(let result):
             if let w = result.w, let seq = result.seq, try tables.isWriter(w) {
                 out.acknowledged.append(RecordLogEntryRef(writer: w, seq: seq))
-                if var entry = try tables.pending(w).first(where: { $0.seq == seq }),
+                if var entry = try tables.pendingEntry(w, seq),
                    !entry.isVoid, entry.acked == nil {
                     entry.acked = result.l
                     if let alias = result.alias { entry.alias = alias }
@@ -275,7 +291,7 @@ final class RecordLogRules {
     /// store, before the acknowledgement arrived.
     private func settleAcknowledged(_ out: inout RecordLogReceiveOutcome) throws {
         for ref in try tables.acknowledgedThrough(try tables.cursor()) {
-            guard let entry = try tables.pending(ref.writer).first(where: { $0.seq == ref.seq }) else { continue }
+            guard let entry = try tables.pendingEntry(ref.writer, ref.seq) else { continue }
             try tables.deletePending(ref.writer, ref.seq)
             out.settled.append(ref)
             out.touched.append(contentsOf: entry.keys)
@@ -290,7 +306,7 @@ final class RecordLogRules {
     private func confirmEntry(
         writer: String, seq: Int, alias: RecordLogAlias?, _ out: inout RecordLogReceiveOutcome
     ) throws {
-        for entry in try tables.pending(writer) where entry.seq <= seq {
+        for entry in try tables.pendingThrough(writer, seq) {
             try tables.deletePending(writer, entry.seq)
             out.settled.append(RecordLogEntryRef(writer: writer, seq: entry.seq))
             if !entry.isVoid { out.touched.append(contentsOf: entry.keys) }
