@@ -49,7 +49,7 @@ const PART_KINDS = {
   tool_call: [
     "kind", "state", "toolCallId", "toolName", "input", "output", "errorText", "errorCode",
     "statusText", "approvalApproved", "approvalReason", "approvalUserId", "approvalRespondedAt",
-    "resolvedByUserId", "artifact", "artifactBlobId", "providerMetadata",
+    "resolvedByUserId", "artifact", "artifactBlobId", "providerMetadata", "callNumber",
   ],
   file: ["kind", "mediaType", "filename", "blobId", "sizeBytes"],
   event: ["kind", "eventKind", "eventId", "refersTo", "data"],

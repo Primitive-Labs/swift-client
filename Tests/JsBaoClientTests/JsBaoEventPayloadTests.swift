@@ -69,6 +69,9 @@ final class JsBaoEventPayloadTests: XCTestCase {
         ChannelMessageEvent(channel: "orders:1", payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
         ChannelSubscribeFailedEvent(channel: "orders:1", message: "refused"),
         DirectMessageEvent(payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
+        AgentSessionChangedEvent(
+            action: .removed, change: .deleted, at: "2026-01-01", sessionId: "s1", item: nil, members: nil
+        ),
         blobProgress,
         blobCompleted,
         blobFailed,

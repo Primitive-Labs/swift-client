@@ -368,6 +368,10 @@ extension DirectMessageEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .directMessage }
 }
 
+extension AgentSessionChangedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .agentSessionChanged }
+}
+
 extension BlobUploadProgressEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .blobsUploadProgress }
 }
@@ -448,6 +452,7 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     ChannelMessageEvent.self,
     ChannelSubscribeFailedEvent.self,
     DirectMessageEvent.self,
+    AgentSessionChangedEvent.self,
     BlobUploadProgressEvent.self,
     BlobUploadCompletedEvent.self,
     BlobUploadFailedEvent.self,

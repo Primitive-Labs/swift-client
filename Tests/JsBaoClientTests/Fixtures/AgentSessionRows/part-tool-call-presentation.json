@@ -1,0 +1,36 @@
+{
+  "model": "PrimitivePart",
+  "row": {
+    "id": "01K6PART00000000000000000009",
+    "messageId": "01K6MESSAGE0000000000000000",
+    "seq": 4,
+    "createdAt": "2026-10-14T12:00:00.000Z",
+    "kind": "tool_call",
+    "toolCallId": "call_01K6CALL0000000000000000009",
+    "toolName": "present",
+    "state": "output-available",
+    "input": "{\"show\":[1],\"suggestions\":[\"Compare last year\"]}",
+    "output": "{\"delivered\":true}",
+    "callNumber": 3
+  },
+  "expect": {
+    "kind": "tool_call",
+    "state": "output-available",
+    "toolName": "present",
+    "input": {
+      "show": [
+        1
+      ],
+      "suggestions": [
+        "Compare last year"
+      ]
+    },
+    "output": {
+      "delivered": true
+    },
+    "callNumber": 3,
+    "errorCode": {
+      "$absent": true
+    }
+  }
+}

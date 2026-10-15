@@ -197,6 +197,12 @@ public enum JsBaoEvent: String, Sendable {
     /// JS `KvCache`'s `cacheUpdateFailed` (`src/client/kv-cache.ts`).
     /// Payload: `CacheUpdateFailedEvent` (`key` / `error`).
     case cacheUpdateFailed
+    // Appended, as `documentFormatMismatch` was, so no earlier case's ordinal moves.
+    /// A session you own or belong to changed for you: activity, a read mark,
+    /// a status change, a rename, a member change, a removal or a delete.
+    /// Payload: `AgentSessionChangedEvent`. Mirrors JS `agentSessionChanged`;
+    /// `agents.sessions.watch` and an open session view apply it for you.
+    case agentSessionChanged
 }
 
 // MARK: - Event Payloads

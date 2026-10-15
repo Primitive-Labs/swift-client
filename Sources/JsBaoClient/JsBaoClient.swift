@@ -6984,6 +6984,16 @@ public final class JsBaoClient: @unchecked Sendable {
                 sentAt: json["sentAt"] as? String ?? ""
             ))
 
+        case "agentSession":
+            // A session the user owns or belongs to changed for them (JS
+            // `handleAgentSessionMessage`). Decoded whole; a frame that does
+            // not decode is logged and dropped, never emitted half-read.
+            guard let event = try? JSONCoding.decodeData(AgentSessionChangedEvent.self, from: Data(text.utf8)) else {
+                logger.warn("Dropping agentSession frame: it does not decode")
+                break
+            }
+            eventEmitter.emit(event)
+
         case "direct.message":
             // A function sent straight to this user or connection
             // (`ctx.users.send` / `ctx.connections.send`). Decode and emit,

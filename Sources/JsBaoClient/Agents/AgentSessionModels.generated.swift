@@ -611,6 +611,7 @@ public struct PrimitivePart: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
             "artifact": FieldDescriptor(type: .string),
             "artifactBlobId": FieldDescriptor(type: .string),
             "providerMetadata": FieldDescriptor(type: .string),
+            "callNumber": FieldDescriptor(type: .number),
             "mediaType": FieldDescriptor(type: .string),
             "filename": FieldDescriptor(type: .string),
             "blobId": FieldDescriptor(type: .string),
@@ -645,6 +646,7 @@ public struct PrimitivePart: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
     public var artifact: JSONValue?
     public var artifactBlobId: String?
     public var providerMetadata: [String: JSONValue]?
+    public var callNumber: Double?
     public var mediaType: String?
     public var filename: String?
     public var blobId: String?
@@ -686,6 +688,7 @@ public struct PrimitivePart: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
         self.artifact = AgentSessionJSON.parse(row["artifact"])
         self.artifactBlobId = row["artifactBlobId"]?.stringValue
         self.providerMetadata = AgentSessionJSON.object(row["providerMetadata"], emptyOnWrongType: false)
+        self.callNumber = AgentSessionJSON.number(row["callNumber"])
         self.mediaType = row["mediaType"]?.stringValue
         self.filename = row["filename"]?.stringValue
         self.blobId = row["blobId"]?.stringValue
@@ -725,6 +728,7 @@ public struct PrimitivePart: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
         if let artifact { values["artifact"] = .string(AgentSessionJSON.text(artifact)) }
         if let artifactBlobId { values["artifactBlobId"] = .string(artifactBlobId) }
         if let providerMetadata { values["providerMetadata"] = .string(AgentSessionJSON.text(.object(providerMetadata))) }
+        if let callNumber { values["callNumber"] = .number(callNumber) }
         if let mediaType { values["mediaType"] = .string(mediaType) }
         if let filename { values["filename"] = .string(filename) }
         if let blobId { values["blobId"] = .string(blobId) }
@@ -771,7 +775,8 @@ public struct PrimitivePart: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
                 resolvedByUserId: resolvedByUserId,
                 artifact: artifact,
                 artifactBlobId: artifactBlobId,
-                providerMetadata: providerMetadata
+                providerMetadata: providerMetadata,
+                callNumber: callNumber
             ))
         case .file:
             return .file(PrimitiveFilePartContent(
@@ -1094,6 +1099,7 @@ public struct PrimitiveToolCallPartContent: Sendable, Equatable {
     public var artifact: JSONValue?
     public var artifactBlobId: String?
     public var providerMetadata: [String: JSONValue]?
+    public var callNumber: Double?
 }
 
 public struct PrimitiveFilePartContent: Sendable, Equatable {

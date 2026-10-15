@@ -5,8 +5,9 @@ import XCTest
 /// The live setup the agent session suites share (#3810): one app with an
 /// owner, two participants, a viewer, a stranger and a tenant admin; a second
 /// app with a user of its own; the pushed functions (`create`, `note`,
-/// `lookup`, `sweep`); and six agents steered at temperature 0 — PLAIN,
-/// TOOLS, INITIATOR, EXPIRES, CONTEXT and SERVER.
+/// `lookup`, `sweep`); and seven agents steered at temperature 0 — PLAIN,
+/// TOOLS, INITIATOR, EXPIRES, CONTEXT, SERVER and PRESENT (#4549: a server
+/// tool, then a presentation referencing its result by call number).
 ///
 /// Each live class builds its own through `make`, because a filtered
 /// checkpoint runs one class alone. Assertions built on it are on shapes and
@@ -42,6 +43,7 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
     var expires: String { "swift-expires-\(stamp)" }
     var context: String { "swift-context-\(stamp)" }
     var server: String { "swift-server-\(stamp)" }
+    var present: String { "swift-present-\(stamp)" }
 
     private let clientsBox = LockedBox([JsBaoClient]())
     private let viewsBox = LockedBox([AgentSessionView]())
@@ -192,6 +194,25 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
             ["tools": [
                 ["name": "lookup", "description": "Look a topic up.", "function": lookupKey],
                 ["name": "sweep", "description": "Sweep the month.", "function": sweepKey, "invoke": "task"],
+            ]]
+        )
+        try await createAgent(
+            present,
+            "You are a test harness, not an assistant. If the user's latest message is exactly `Go.` and you have " +
+                "not yet called a tool in this turn, call the tool `lookup` with {\"topic\":\"rent\"} and write no " +
+                "text. Once its result is back, in ONE response write the text `Here.` and call the tool `present` " +
+                "with {\"show\":[N]} where N is the \"call\" number the lookup result was sent with. To any other " +
+                "message, reply with the single word: ok.",
+            ["tools": [
+                ["name": "lookup", "description": "Look a topic up.", "function": lookupKey],
+                [
+                    "name": "present", "description": "Show the chosen results as cards beside your reply.",
+                    "runs": "presentation", "references": ["show"],
+                    "inputSchema": [
+                        "type": "object", "required": ["show"],
+                        "properties": ["show": ["type": "array", "items": ["type": "integer"]]],
+                    ],
+                ],
             ]]
         )
     }

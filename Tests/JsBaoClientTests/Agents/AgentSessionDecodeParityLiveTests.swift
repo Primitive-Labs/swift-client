@@ -67,8 +67,9 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
     // MARK: - The corpus
 
     /// One TOOLS session (approved, denied and superseded calls, a Swift event
-    /// and a `note` function event) and one SERVER session (request and task
-    /// tools, a file). Answers the reading client and the two documents.
+    /// and a `note` function event), one SERVER session (request and task
+    /// tools, a file) and one PRESENT session (#4549: numbered calls and a
+    /// presentation). Answers the reading client and the three documents.
     private func provision(_ h: AgentSessionScenarioHarness) async throws -> (JsBaoClient, [String]) {
         let partC = try await h.client(h.part)
         let part2C = try await h.client(h.part2)
@@ -119,7 +120,27 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
         let blobId = try await h.uploadPng(partC, server)
         _ = try await serverView.send(text: "", files: [AgentSessionFileRef(blobId: blobId)])
         try await h.settled(server)
-        return (partC, [tools.documentId, server.documentId])
+
+        // #4549: a presentation referencing the lookup by its call number, read
+        // through the Swift view as the JS view reads it.
+        let presenting = try await h.createSession(h.present, participants: [h.part])
+        let presentView = try await h.open(partC, presenting)
+        var presented: AgentPresentation?
+        for _ in 0..<2 where presented == nil {
+            _ = try await presentView.send(text: "Go.")
+            try await h.settled(presenting)
+            try? await h.poll(timeout: 30, "the presentation syncs") {
+                presented = presentView.syncedMessages
+                    .flatMap { presentView.presentations(of: $0.message, names: ["present"]) }
+                    .first
+                return presented != nil
+            }
+        }
+        let presentation = try XCTUnwrap(presented, "the model presented a result")
+        let shown = try XCTUnwrap(presentation.input["show"]?.arrayValue?.first?.wholeNumber)
+        XCTAssertEqual(presentation.call(shown)?.toolName, "lookup")
+        XCTAssertNotNil(presentation.part.callNumber)
+        return (partC, [tools.documentId, server.documentId, presenting.documentId])
     }
 
     /// What the corpus must hold before the comparison means anything.
@@ -148,6 +169,14 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
             }
             for kind in ["model_call", "tool_call"] where !column("PrimitiveStep", "kind").contains(kind) {
                 missing.append("a \(kind) step")
+            }
+            // #4549: numbered calls, a presentation among them.
+            let numbered = rows.filter {
+                $0.model == "PrimitivePart" && $0.row["kind"]?.stringValue == "tool_call" && $0.row["callNumber"] != nil
+            }
+            if numbered.isEmpty { missing.append("a numbered tool_call part") }
+            if !numbered.contains(where: { $0.row["toolName"]?.stringValue == "present" && $0.row["state"]?.stringValue == "output-available" }) {
+                missing.append("a presentation part")
             }
             self.missing = missing
         }

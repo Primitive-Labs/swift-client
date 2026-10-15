@@ -53,6 +53,17 @@ saves sent first, or a restored local store) waits for the open as before,
 also when the document was closed and opened again in between.
 There is nothing to configure.
 
+### Presentations from an agent session
+
+`view.presentations(of:names:)` answers the presentations an agent message
+carries — calls to tools declared `runs = "presentation"` that are
+`output-available` — as `AgentPresentation` values with `name`, `input`,
+`part`, and `call(_:)`, which resolves a call number the input names to that
+call's part in the view's window. Pass the generated
+`<Agent>Agent.presentationNames`, and decode one with the generated
+`<Agent>AgentPresentation(_:)`. `PrimitiveToolCallPartContent` carries
+`callNumber`, the call's number in its turn.
+
 ### Breaking: a field named after a generated model's member is refused (#4505)
 
 A model field can no longer take a name the generated model already uses on
@@ -289,6 +300,33 @@ operation's value beside it.
 each with a `group` object holding the `groupBy` values and every operation's
 value beside it (`count`, `<op>_<field>`). `DoDb.aggregate` still returns a
 `JSONValue`, now an array of those rows.
+
+### Added: agent session lists and open views stay live (#4380)
+
+`client.agents.sessions.watch(options:)` answers an `AgentSessionList`: the
+first page of `list`, kept current as sessions change — new activity and the
+unread dot, a read mark from the user's other devices, a rename, a status
+change, a member change, a removal or a delete — without polling and without
+opening any document. `items` (`AgentSessionWatchedItem`: the list item, read
+through directly, and the `members` once a change has named them) are
+ordered by last activity, newest first; `loadMore()` reads the next page,
+`refresh()` reads the loaded pages again (the list does this itself after
+every reconnect, merging each field with what the changes already said),
+`onChange` hears every change and `close()` stops it. A `userId` in
+`WatchAgentSessionsOptions` throws `.invalidArgument` before any request.
+
+An open view's `info` now follows the same changes (title, last activity,
+`hasUnread`, members and status) and is read again after a reconnect;
+`AgentSessionInfo`'s `title`, `scope`, `lastActivityAt`, `members` and
+`status` are `internal(set) var` for it. `OpenAgentSessionOptions(markRead:
+.whileOpen)` marks the session read once it is open and again whenever new
+activity arrives while it is open.
+
+`AgentSessionListItem` gains `status: PrimitiveSessionStatus?`, decoded open
+and `nil` for an entry written before it was listed, and each change is the
+`.agentSessionChanged` event (`AgentSessionChangedEvent`, streamed by
+`client.stream(for:)`); a frame that does not decode is dropped with a
+warning.
 
 ### Added: agent sessions show unseen activity in the list (#4256)
 

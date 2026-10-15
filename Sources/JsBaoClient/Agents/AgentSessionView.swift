@@ -14,6 +14,20 @@ import Foundation
 //
 // Swift carries no `uiMessages()`: the AI SDK adapter is the JS client's.
 // Read a part's typed `content` instead.
+//
+// `info` follows the server's `AgentSessionChangedEvent`s for the session, and
+// is read again after a reconnect; `markRead: .whileOpen` keeps the session
+// read while the view is open.
+
+/// When an open view marks its session read by itself.
+public enum AgentSessionMarkRead: Sendable, Equatable {
+    /// Once the view is open, and again whenever new activity arrives while
+    /// it is open (or a reconnect finds it unread), so activity you watched
+    /// arrive does not stay unread on your other devices. Nothing is sent for
+    /// an app owner or admin who is not in the session, or after `close()`;
+    /// a failed mark is retried on the next activity or reconnect.
+    case whileOpen
+}
 
 /// Options for `client.agents.sessions.open`.
 public struct OpenAgentSessionOptions: Sendable {
@@ -22,10 +36,14 @@ public struct OpenAgentSessionOptions: Sendable {
     /// How to open the document. `nil` opens it with
     /// `waitForLoad: .network, enableNetworkSync: true`.
     public var open: OpenDocumentOptions?
+    /// `.whileOpen` keeps the session read while the view is open; `nil`
+    /// marks it read only when you call `markRead()`.
+    public var markRead: AgentSessionMarkRead?
 
-    public init(pageSize: Int = 50, open: OpenDocumentOptions? = nil) {
+    public init(pageSize: Int = 50, open: OpenDocumentOptions? = nil, markRead: AgentSessionMarkRead? = nil) {
         self.pageSize = pageSize
         self.open = open
+        self.markRead = markRead
     }
 }
 
@@ -178,6 +196,26 @@ public final class AgentSessionView: @unchecked Sendable {
     private var failedCalls: [String: (turnId: String, state: String)] = [:]
     private var evaluateQueued = false
     private var syncTask: Task<Void, Never>?
+    /// The change events and connection states, heard since before `get`.
+    private let signals: AgentSessionViewSignals
+    /// For each `get` in flight, the changes made to `info` since it was
+    /// sent, made again over its answer so it never undoes them (CSO-4380-002).
+    private var infoReads: [UUID: [@Sendable (AgentSessionInfo) -> AgentSessionInfo]] = [:]
+    /// The `at` of the latest change event applied to `info`, in milliseconds.
+    private var infoAt: Double?
+    /// When the session was removed for you: an older upsert is ignored.
+    private var removedAt: Double?
+    /// Whether the connection now up has been heard since `info` was read.
+    private var live = false
+    private let markWhileOpen: Bool
+    private var reading = false
+    private var readAgain = false
+    /// Set once a mark is refused not found: the session is no longer yours.
+    private var readStopped = false
+    private var reconciling = false
+    private var reconcileAgain = false
+    /// The reconnect's reads of `info`, cancelled by `close()` (CSO-4380-015).
+    private var reconcileTask: Task<Void, Never>?
 
     private struct ClientToolRegistration: Sendable {
         let id: UUID
@@ -190,16 +228,24 @@ public final class AgentSessionView: @unchecked Sendable {
         var task: Task<Void, Never>?
     }
 
-    init(api: AgentSessionsAPI, client: JsBaoClient, info: AgentSessionInfo, pageSize: Int) {
+    init(
+        api: AgentSessionsAPI, client: JsBaoClient, info: AgentSessionInfo, pageSize: Int,
+        markWhileOpen: Bool = false, connectedAtOpen: Bool = false, signals: AgentSessionViewSignals? = nil
+    ) {
         self.api = api
         self.client = client
         self._info = info
         self.pageSize = pageSize
+        self.markWhileOpen = markWhileOpen
+        self.live = connectedAtOpen
+        self.signals = signals ?? AgentSessionViewSignals(client: client)
     }
 
     // MARK: - State
 
-    /// The session's info as `get` answered it; `refreshInfo()` reads it again.
+    /// The session's info as `get` answered it, kept current by the server's
+    /// change events (title, last activity, the dot, members, status) and read
+    /// again after a reconnect; `refreshInfo()` reads it again on demand.
     public var info: AgentSessionInfo { lock.withLock { _info } }
 
     /// The session's id.
@@ -354,6 +400,26 @@ public final class AgentSessionView: @unchecked Sendable {
         return try await client.documents.blobs(documentId: documentId).read(blobId: blobId, as: JSONValue.self)
     }
 
+    /// The presentations an agent message carries: each `tool_call` part in
+    /// `output-available` state whose tool is one of `names`, in part order.
+    /// A part alone does not say whether its tool is a presentation, so pass
+    /// the generated `<Key>Agent.presentationNames`. A refused presentation
+    /// (`output-error`) and a message that is not the agent's yield none.
+    /// `call(_:)` on each resolves numbers against the turn's parts in the
+    /// window.
+    public func presentations(of message: PrimitiveMessage, names: [String]) -> [AgentPresentation] {
+        lock.withLock {
+            let turnParts: [PrimitivePart] = message.turnId.map { turnId in
+                window.values
+                    .filter { $0.turnId == turnId }
+                    .flatMap { partsByMessage[$0.id] ?? [] }
+            } ?? []
+            return AgentPresentation.collect(
+                message: message, parts: partsByMessage[message.id] ?? [], turnParts: turnParts, names: names
+            )
+        }
+    }
+
     /// Record an event on the session.
     @discardableResult
     public func recordEvent(_ event: AgentSessionEvent) async throws -> AgentSessionEventResult {
@@ -380,13 +446,22 @@ public final class AgentSessionView: @unchecked Sendable {
 
     /// Mark the session read for the signed-in user (`sessions.markRead`):
     /// `info.hasUnread` becomes `false` and `info.lastReadAt` the marker, and
-    /// `onChange` fires. Call it when the user opens or returns to the session.
+    /// `onChange` fires. Activity that arrived after the marker, while the
+    /// call was answering, keeps the dot. Call it when the user opens or
+    /// returns to the session.
     @discardableResult
     public func markRead() async throws -> AgentSessionReadResult {
         let result = try await api.markRead(sessionId: sessionId)
+        let read: @Sendable (AgentSessionInfo) -> AgentSessionInfo = { info in
+            var info = info
+            info.lastReadAt = AgentSessionList.laterOf(info.lastReadAt, result.lastReadAt)
+            // Activity after this marker keeps its dot (CSO-4380-007).
+            info.hasUnread = info.hasUnread && AgentSessionList.unread(info.lastActivityAt, info.lastReadAt)
+            return info
+        }
         lock.withLock {
-            _info.hasUnread = false
-            _info.lastReadAt = result.lastReadAt
+            _info = read(_info)
+            amendInfoReadsLocked(read)
         }
         notify()
         return result
@@ -444,8 +519,35 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Read the session's info again (`get`), and notify when it is read.
     @discardableResult
     public func refreshInfo() async throws -> AgentSessionInfo {
-        let next = try await api.get(sessionId: sessionId)
-        lock.withLock { _info = next }
+        guard let next = try await readInfo(whileOpen: false) else { return info }
+        return next
+    }
+
+    /// `get`, applied to `info` over the changes made while it was in flight.
+    /// `whileOpen` (a reconnect's read): nothing is sent once the view is
+    /// closed, and an answer that arrives after `close()` is dropped — nil.
+    private func readInfo(whileOpen: Bool) async throws -> AgentSessionInfo? {
+        let id = UUID()
+        let start: Bool = lock.withLock {
+            if whileOpen && closed { return false }
+            infoReads[id] = []
+            return true
+        }
+        guard start else { return nil }
+        let answered: AgentSessionInfo
+        do {
+            answered = try await api.get(sessionId: sessionId)
+        } catch {
+            _ = lock.withLock { infoReads.removeValue(forKey: id) }
+            throw error
+        }
+        let next: AgentSessionInfo? = lock.withLock {
+            let since = infoReads.removeValue(forKey: id) ?? []
+            if whileOpen && closed { return nil }
+            _info = since.reduce(answered) { info, change in change(info) }
+            return _info
+        }
+        guard let next else { return nil }
         notify()
         return next
     }
@@ -460,6 +562,8 @@ public final class AgentSessionView: @unchecked Sendable {
             var tasks = runningCalls.values.compactMap(\.task)
             if let syncTask { tasks.append(syncTask) }
             syncTask = nil
+            if let reconcileTask { tasks.append(reconcileTask) }
+            reconcileTask = nil
             runningCalls.removeAll()
             runningOrder.removeAll()
             toolHandlers.removeAll()
@@ -469,6 +573,7 @@ public final class AgentSessionView: @unchecked Sendable {
             return (unsubscribes, tasks)
         }
         guard let closing else { return }
+        signals.release()
         for unsubscribe in closing.unsubscribes { unsubscribe() }
         for task in closing.tasks { task.cancel() }
         await client.documents.close(documentId)
@@ -500,8 +605,166 @@ public final class AgentSessionView: @unchecked Sendable {
         if alreadyClosed {
             unsubs.forEach { $0() }
             sync.cancel()
+            signals.release()
+        }
+        // What arrived while the session was read and its document opened, then the rest.
+        signals.attach { [weak self] signal in
+            switch signal {
+            case .change(let event): self?.onSessionChanged(event)
+            case .status(let status): self?.onConnectionStatus(status)
+            }
         }
         try await onWorkQueue { try self.refreshNow(notify: false) }
+        if markWhileOpen { readWhileOpen() }
+    }
+
+    /// A change event: this session's upsert merged into `info`; a removal
+    /// changes nothing.
+    private func onSessionChanged(_ event: AgentSessionChangedEvent) {
+        let (changed, unread): (Bool, Bool) = lock.withLock {
+            guard !closed, event.sessionId == _info.sessionId else { return (false, false) }
+            let at = AgentSessionList.ms(event.at) ?? 0
+            switch event.action {
+            case .removed:
+                removedAt = max(at, removedAt ?? 0)
+                return (false, false)
+            case .unknown:
+                return (false, false)
+            case .upsert:
+                break
+            }
+            guard let item = event.item else { return (false, false) }
+            if let removedAt, at <= removedAt { return (false, false) }
+            // An event older than the last one applied adds only its instants.
+            let newer = infoAt == nil || at >= infoAt!
+            if newer { infoAt = at }
+            _info = Self.merged(_info, event, item, newer: newer)
+            amendInfoReadsLocked { Self.merged($0, event, item, newer: newer) }
+            return (true, _info.hasUnread)
+        }
+        guard changed else { return }
+        notify()
+        if markWhileOpen && unread { readWhileOpen() }
+    }
+
+    /// A change event merged into a session's info: a newer event's title,
+    /// scope, members and status; the later of each instant; the dot from them.
+    private static func merged(
+        _ info: AgentSessionInfo, _ event: AgentSessionChangedEvent, _ item: AgentSessionListItem, newer: Bool
+    ) -> AgentSessionInfo {
+        var info = info
+        if newer {
+            info.title = item.title
+            info.scope = item.scope
+            if let members = event.members { info.members = members }
+            if let status = item.status { info.status = status }
+        }
+        info.lastActivityAt = AgentSessionList.laterOf(info.lastActivityAt, item.lastActivityAt)
+        info.lastReadAt = AgentSessionList.laterOf(info.lastReadAt, item.lastReadAt)
+        // The dot is a member's; an app owner or admin who is not in the session has none.
+        info.hasUnread = info.role != .admin && AgentSessionList.unread(info.lastActivityAt, info.lastReadAt)
+        return info
+    }
+
+    /// A change to `info`, kept for each `get` in flight to make again over its answer.
+    private func amendInfoReadsLocked(_ change: @escaping @Sendable (AgentSessionInfo) -> AgentSessionInfo) {
+        for id in infoReads.keys { infoReads[id]?.append(change) }
+    }
+
+    /// A reconnect: `info` read again, one read at a time, then the while-open read.
+    private func onConnectionStatus(_ status: ConnectionStatus) {
+        let reconcile: Bool = lock.withLock {
+            guard !closed else { return false }
+            switch status {
+            case .disconnected:
+                live = false
+                return false
+            case .connected:
+                if live { return false }
+                live = true
+                return true
+            case .connecting:
+                return false
+            }
+        }
+        if reconcile { reconcileInfo() }
+    }
+
+    private func reconcileInfo() {
+        let start: Bool = lock.withLock {
+            guard !closed else { return false }
+            if reconciling {
+                reconcileAgain = true
+                return false
+            }
+            reconciling = true
+            return true
+        }
+        guard start else { return }
+        let task = Task { [weak self] in
+            while let self {
+                let proceed: Bool = self.lock.withLock {
+                    self.reconcileAgain = false
+                    return !self.closed
+                }
+                if proceed, !Task.isCancelled,
+                   let info = try? await self.readInfo(whileOpen: true), self.markWhileOpen, info.hasUnread {
+                    self.readWhileOpen()
+                }
+                let again: Bool = self.lock.withLock {
+                    if proceed && self.reconcileAgain && !self.closed { return true }
+                    self.reconciling = false
+                    return false
+                }
+                if !again { break }
+            }
+        }
+        // A close that ran meanwhile has already taken the tasks it cancels.
+        let cancel: Bool = lock.withLock {
+            if closed { return true }
+            reconcileTask = task
+            return false
+        }
+        if cancel { task.cancel() }
+    }
+
+    /// One `markRead()` at a time: a request while one runs makes one more
+    /// after it. A failure waits for the next activity or reconnect; a
+    /// refusal as not found stops the loop.
+    private func readWhileOpen() {
+        let start: Bool = lock.withLock {
+            guard !closed, !readStopped, _info.role != .admin else { return false }
+            if reading {
+                readAgain = true
+                return false
+            }
+            reading = true
+            return true
+        }
+        guard start else { return }
+        Task { [weak self] in
+            while let self {
+                let proceed: Bool = self.lock.withLock {
+                    self.readAgain = false
+                    return !self.closed && !self.readStopped
+                }
+                if proceed {
+                    do {
+                        try await self.markRead()
+                    } catch {
+                        if (error as? HttpError)?.serverCode == "AGENT_SESSION_NOT_FOUND" {
+                            self.lock.withLock { self.readStopped = true }
+                        }
+                    }
+                }
+                let again: Bool = self.lock.withLock {
+                    if proceed && self.readAgain && !self.closed && !self.readStopped { return true }
+                    self.reading = false
+                    return false
+                }
+                if !again { break }
+            }
+        }
     }
 
     /// Every document's `SyncEvent`, unbounded: the stream is filtered to the
@@ -887,12 +1150,87 @@ public final class AgentSessionView: @unchecked Sendable {
     }
 }
 
+// MARK: - Signals
+
+/// The client's change events and connection states, heard from before a
+/// view's first `get` and held until the view takes them, so nothing that
+/// arrives while the session is read or its document opens is lost
+/// (CSO-4380-001).
+final class AgentSessionViewSignals: @unchecked Sendable {
+    enum Signal: Sendable {
+        case change(AgentSessionChangedEvent)
+        case status(ConnectionStatus)
+    }
+
+    private let lock = NSLock()
+    // Guarded by `lock`.
+    private var held: [Signal] = []
+    private var sink: (@Sendable (Signal) -> Void)?
+    private var released = false
+    private var tasks: [Task<Void, Never>] = []
+
+    init(client: JsBaoClient) {
+        let changes = client.stream(for: AgentSessionChangedEvent.self)
+        let statuses = AgentSessionsAPI.connectionStatuses(of: client)
+        let tasks = [
+            Task { [weak self] in
+                for await event in changes { self?.deliver(.change(event)) }
+            },
+            Task { [weak self] in
+                for await status in statuses { self?.deliver(.status(status)) }
+            },
+        ]
+        lock.withLock { self.tasks = tasks }
+    }
+
+    /// What was held, in arrival order, then everything after, to `sink`.
+    func attach(_ sink: @escaping @Sendable (Signal) -> Void) {
+        while true {
+            let batch: [Signal]? = lock.withLock {
+                if released { return nil }
+                if held.isEmpty {
+                    self.sink = sink
+                    return nil
+                }
+                defer { held.removeAll() }
+                return held
+            }
+            guard let batch else { return }
+            batch.forEach(sink)
+        }
+    }
+
+    /// Stop listening. Idempotent.
+    func release() {
+        let tasks: [Task<Void, Never>] = lock.withLock {
+            released = true
+            held.removeAll()
+            sink = nil
+            defer { self.tasks.removeAll() }
+            return self.tasks
+        }
+        tasks.forEach { $0.cancel() }
+    }
+
+    private func deliver(_ signal: Signal) {
+        let target: (@Sendable (Signal) -> Void)? = lock.withLock {
+            if released { return nil }
+            if let sink { return sink }
+            held.append(signal)
+            return nil
+        }
+        target?(signal)
+    }
+}
+
 // MARK: - open
 
 extension AgentSessionsAPI {
     /// Open a session as a live view: its info, the latest page of messages
     /// with their parts and steps (older pages with `loadOlder()`), your own
     /// messages shown at once while they send, and `onChange` on every change.
+    /// `info` stays current as the session changes; `markRead: .whileOpen`
+    /// keeps the session read while the view is open.
     ///
     /// Runs `get` first (a refusal throws before anything is opened), then
     /// registers the four platform models — throwing
@@ -915,23 +1253,37 @@ extension AgentSessionsAPI {
         guard let client else {
             throw JsBaoError(code: .unavailable, message: "agents.sessions.open requires a wired JsBaoClient")
         }
-        let info = try await get(sessionId: sessionId)
-        for schema in AgentSessionModels.schemas {
-            if let existing = client.sharedModel(schema.name), existing.schema != schema {
-                throw JsBaoError(
-                    code: .agentSessionModelNameTaken,
-                    message: "A model named \(schema.name) is already registered with a different schema; " +
-                        "the platform's session models need the name.",
-                    details: ["model": .string(schema.name)]
-                )
+        // Heard from before `get`: a change or the first connection while the
+        // session is read or its document opens reaches the view (CSO-4380-001).
+        let signals = AgentSessionViewSignals(client: client)
+        // A connection already up when `get` is read hears every change since.
+        let connectedAtOpen = client.isConnected
+        let info: AgentSessionInfo
+        do {
+            info = try await get(sessionId: sessionId)
+            for schema in AgentSessionModels.schemas {
+                if let existing = client.sharedModel(schema.name), existing.schema != schema {
+                    throw JsBaoError(
+                        code: .agentSessionModelNameTaken,
+                        message: "A model named \(schema.name) is already registered with a different schema; " +
+                            "the platform's session models need the name.",
+                        details: ["model": .string(schema.name)]
+                    )
+                }
             }
+            client.registerModels(AgentSessionModels.schemas)
+            _ = try await client.documents.open(
+                info.documentId,
+                options: options.open ?? OpenDocumentOptions(waitForLoad: .network, enableNetworkSync: true)
+            )
+        } catch {
+            signals.release()
+            throw error
         }
-        client.registerModels(AgentSessionModels.schemas)
-        _ = try await client.documents.open(
-            info.documentId,
-            options: options.open ?? OpenDocumentOptions(waitForLoad: .network, enableNetworkSync: true)
+        let view = AgentSessionView(
+            api: self, client: client, info: info, pageSize: options.pageSize,
+            markWhileOpen: options.markRead == .whileOpen, connectedAtOpen: connectedAtOpen, signals: signals
         )
-        let view = AgentSessionView(api: self, client: client, info: info, pageSize: options.pageSize)
         do {
             try await view.start()
         } catch {

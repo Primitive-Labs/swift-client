@@ -95,6 +95,7 @@ enum AgentSessionProjection {
             out["artifact"] = value(c.artifact)
             out["artifactBlobId"] = value(c.artifactBlobId)
             out["providerMetadata"] = value(c.providerMetadata)
+            out["callNumber"] = value(c.callNumber)
         case let .file(c):
             out["kind"] = "file"
             out["mediaType"] = value(c.mediaType)

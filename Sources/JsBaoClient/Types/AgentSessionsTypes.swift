@@ -158,10 +158,12 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
     public let ownerUserId: String
     /// ISO-8601.
     public let createdAt: String
-    public let title: String?
-    public let scope: String?
-    /// ISO-8601; `nil` when the session's listing entry is missing.
-    public let lastActivityAt: String?
+    /// An open view keeps it current as the session is renamed.
+    public internal(set) var title: String?
+    public internal(set) var scope: String?
+    /// ISO-8601; `nil` when the session's listing entry is missing. An open
+    /// view keeps it current as activity arrives.
+    public internal(set) var lastActivityAt: String?
     /// Whether you have activity in this session you have not marked read
     /// (`markRead`): an agent's answer or pause, a turn's end, or another
     /// member's message or event. Always `false` for an app owner or admin
@@ -169,11 +171,13 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
     public internal(set) var hasUnread: Bool
     /// When you last marked the session read (ISO-8601), or `nil`.
     public internal(set) var lastReadAt: String?
-    public let members: AgentSessionMembers
+    /// An open view keeps it current as members change.
+    public internal(set) var members: AgentSessionMembers
     public let role: AgentSessionRole
     /// Decided from the session object, never the session row. Open: a status
-    /// outside the vocabulary reads `.unknown(raw)`.
-    public let status: PrimitiveSessionStatus
+    /// outside the vocabulary reads `.unknown(raw)`. An open view keeps it
+    /// current.
+    public internal(set) var status: PrimitiveSessionStatus
     /// The active turn, or `nil` when none runs.
     public let turn: AgentSessionTurnSummary?
     /// For app owners and admins only: what only the session object knows
@@ -242,10 +246,34 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
     public let hasUnread: Bool
     /// When the listed user last marked the session read (ISO-8601), or `nil`.
     public let lastReadAt: String?
+    /// The session's status as of its last listed activity, or `nil` for an
+    /// entry written before the status was listed. A watched list (`watch`)
+    /// and its change events carry every status change as it happens. Open: a
+    /// status outside the vocabulary reads `.unknown(raw)`.
+    public let status: PrimitiveSessionStatus?
 
     private enum CodingKeys: String, CodingKey {
         case sessionId, agentKey, scope, documentId, ownerUserId, role, title
-        case lastActivityAt, createdAt, hasUnread, lastReadAt
+        case lastActivityAt, createdAt, hasUnread, lastReadAt, status
+    }
+
+    init(
+        sessionId: String, agentKey: String, scope: String?, documentId: String, ownerUserId: String,
+        role: AgentSessionRole, title: String?, lastActivityAt: String, createdAt: String?,
+        hasUnread: Bool, lastReadAt: String?, status: PrimitiveSessionStatus?
+    ) {
+        self.sessionId = sessionId
+        self.agentKey = agentKey
+        self.scope = scope
+        self.documentId = documentId
+        self.ownerUserId = ownerUserId
+        self.role = role
+        self.title = title
+        self.lastActivityAt = lastActivityAt
+        self.createdAt = createdAt
+        self.hasUnread = hasUnread
+        self.lastReadAt = lastReadAt
+        self.status = status
     }
 
     public init(from decoder: Decoder) throws {
@@ -261,6 +289,142 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
         hasUnread = try c.decodeIfPresent(Bool.self, forKey: .hasUnread) ?? false
         lastReadAt = try c.decodeIfPresent(String.self, forKey: .lastReadAt)
+        status = try c.decodeIfPresent(String.self, forKey: .status).map(PrimitiveSessionStatus.init(rawValue:))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(sessionId, forKey: .sessionId)
+        try c.encode(agentKey, forKey: .agentKey)
+        try c.encode(scope, forKey: .scope)
+        try c.encode(documentId, forKey: .documentId)
+        try c.encode(ownerUserId, forKey: .ownerUserId)
+        try c.encode(role, forKey: .role)
+        try c.encode(title, forKey: .title)
+        try c.encode(lastActivityAt, forKey: .lastActivityAt)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(hasUnread, forKey: .hasUnread)
+        try c.encode(lastReadAt, forKey: .lastReadAt)
+        try c.encode(status?.rawValue, forKey: .status)
+    }
+
+    /// This item with some fields replaced.
+    func with(
+        lastActivityAt: String? = nil, lastReadAt: String?? = nil, hasUnread: Bool? = nil,
+        status: PrimitiveSessionStatus?? = nil
+    ) -> AgentSessionListItem {
+        AgentSessionListItem(
+            sessionId: sessionId, agentKey: agentKey, scope: scope, documentId: documentId,
+            ownerUserId: ownerUserId, role: role, title: title,
+            lastActivityAt: lastActivityAt ?? self.lastActivityAt, createdAt: createdAt,
+            hasUnread: hasUnread ?? self.hasUnread, lastReadAt: lastReadAt ?? self.lastReadAt,
+            status: status ?? self.status
+        )
+    }
+}
+
+/// What changed a session's listing entry, in an `AgentSessionChangedEvent`.
+/// Open: a change this client does not know reads `.unknown(raw)`.
+public enum AgentSessionChange: Sendable, Equatable, Hashable {
+    case created
+    case activity
+    case status
+    case read
+    case title
+    case members
+    case removed
+    case deleted
+    case unknown(String)
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "created": self = .created
+        case "activity": self = .activity
+        case "status": self = .status
+        case "read": self = .read
+        case "title": self = .title
+        case "members": self = .members
+        case "removed": self = .removed
+        case "deleted": self = .deleted
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .created: return "created"
+        case .activity: return "activity"
+        case .status: return "status"
+        case .read: return "read"
+        case .title: return "title"
+        case .members: return "members"
+        case .removed: return "removed"
+        case .deleted: return "deleted"
+        case .unknown(let raw): return raw
+        }
+    }
+}
+
+/// Payload of `.agentSessionChanged`
+/// (`for await e in client.stream(for: AgentSessionChangedEvent.self)`): a
+/// session you own or belong to changed for you. `.upsert` carries your list
+/// item, as `list` would answer it, and the members; `.removed` (you were
+/// removed, or the session was deleted) carries neither. `watch` and an open
+/// view apply these for you.
+public struct AgentSessionChangedEvent: Sendable, Equatable, Decodable {
+    /// Whether your entry changed or left your list. Open: an action this
+    /// client does not know reads `.unknown(raw)`.
+    public enum Action: Sendable, Equatable, Hashable {
+        case upsert
+        case removed
+        case unknown(String)
+
+        public init(rawValue: String) {
+            switch rawValue {
+            case "upsert": self = .upsert
+            case "removed": self = .removed
+            default: self = .unknown(rawValue)
+            }
+        }
+    }
+
+    public let action: Action
+    public let change: AgentSessionChange
+    /// ISO-8601: when the change happened on the server.
+    public let at: String
+    public let sessionId: String
+    /// Your list item; `nil` on `.removed`.
+    public let item: AgentSessionListItem?
+    /// The members; `nil` on `.removed`.
+    public let members: AgentSessionMembers?
+
+    public init(
+        action: Action, change: AgentSessionChange, at: String, sessionId: String,
+        item: AgentSessionListItem?, members: AgentSessionMembers?
+    ) {
+        self.action = action
+        self.change = change
+        self.at = at
+        self.sessionId = sessionId
+        self.item = item
+        self.members = members
+    }
+
+    private enum CodingKeys: String, CodingKey { case action, change, at, sessionId, item, members }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        action = Action(rawValue: try c.decode(String.self, forKey: .action))
+        change = AgentSessionChange(rawValue: try c.decode(String.self, forKey: .change))
+        at = try c.decode(String.self, forKey: .at)
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        item = try c.decodeIfPresent(AgentSessionListItem.self, forKey: .item)
+        members = try c.decodeIfPresent(AgentSessionMembers.self, forKey: .members)
+        if action == .upsert && item == nil {
+            throw DecodingError.dataCorruptedError(
+                forKey: .item, in: c, debugDescription: "an upsert carries the recipient's item"
+            )
+        }
     }
 }
 
