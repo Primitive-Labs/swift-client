@@ -46,6 +46,9 @@ struct RecordLogMarks: Equatable, Sendable {
     var writer: String?
     /// The writer's next sequence number.
     var nextSeq: Int
+    /// The `nextSeq` the writer last resumed at after a writer-scoped refusal
+    /// (0 when it never did): every number a hand-back removed is below it.
+    var resumedAt: Int
     /// The writer's lowest unjudged sequence number.
     var lowestPending: Int?
     /// How many unjudged entries the writer has.
@@ -54,12 +57,15 @@ struct RecordLogMarks: Equatable, Sendable {
     var unacked: [(seq: Int, records: [RecordLogRecordKey])]
     /// The latest receipt of a load's or a segment's chunks begun and not completed, or `nil`.
     var receipt: RecordLogReceipt?
+    /// The segment the confirmed rows were last replaced from, or `nil`.
+    var segment: RecordLogHeldSegment? = nil
 
     static func == (a: RecordLogMarks, b: RecordLogMarks) -> Bool {
         a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
             && a.constraints == b.constraints && a.permission == b.permission && a.replacing == b.replacing
-            && a.replacement == b.replacement && a.receipt == b.receipt
+            && a.replacement == b.replacement && a.receipt == b.receipt && a.segment == b.segment
             && a.lastCatchUpAt == b.lastCatchUpAt && a.writer == b.writer && a.nextSeq == b.nextSeq
+            && a.resumedAt == b.resumedAt
             && a.lowestPending == b.lowestPending && a.pending == b.pending
             && a.unacked.map(\.seq) == b.unacked.map(\.seq) && a.unacked.map(\.records) == b.unacked.map(\.records)
     }
@@ -95,6 +101,8 @@ struct RecordLogChangeReply: Sendable {
     var settled: [RecordLogEntryRef] = []
     var handedBack: [RecordLogPendingEntry] = []
     var frames: [RecordLogUpFrame] = []
+    /// A compact acknowledgement the store could not derive; the session opens again from the cursor.
+    var underivable: RecordLogUnderivableAck?
 }
 
 /// The ids a bulk change of one model fell within, first and last included.
@@ -121,6 +129,8 @@ struct RecordLogChunkReply: Sendable {
     /// The receipt attempt is no longer in progress in the store, or another
     /// replacement overtook its generation: nothing changed.
     var stale = false
+    /// A held chunk could not be kept: nothing changed, and it is read instead.
+    var mismatch = false
 }
 
 /// What `commitEntries` answers.
@@ -337,6 +347,35 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
             "UPDATE record_log_state SET receipt = ? WHERE doc_id = ?",
             [state.map { .text(RecordLogJSON.text($0.json)) } ?? .null, doc]
         )
+    }
+
+    func heldSegment() throws -> RecordLogHeldSegment? {
+        guard let text = try state()?["segment"].stringValue, !text.isEmpty else { return nil }
+        return RecordLogHeldSegment(json: RecordLogJSON.parse(text))
+    }
+
+    func setHeldSegment(_ segment: RecordLogHeldSegment?) throws {
+        try ensureState()
+        try sql.exec(
+            "UPDATE record_log_state SET segment = ? WHERE doc_id = ?",
+            [segment.map { .text(RecordLogJSON.text($0.json)) } ?? .null, doc]
+        )
+    }
+
+    func keepConfirmedRange(model: String, firstId: String, lastId: String, rows: Int) throws -> Bool {
+        let state = try state()
+        guard let replacing = state?["replacing"], !replacing.isNull, let generation = replacing.intValue else { return false }
+        // The confirmed generation's rows only: one an interrupted replacement
+        // put carries that replacement's generation. `_id` compares BINARY, the
+        // order the room cut the chunk in.
+        let predicate = "WHERE doc_id = ? AND _type = ? AND _id >= ? AND _id <= ? AND _gen = ?"
+        let bindings: [Format2SqlValue] = [
+            doc, .text(model), .text(firstId), .text(lastId), .integer(Int64(state?["rows_gen"].intValue ?? 0)),
+        ]
+        let count = try sql.first("SELECT COUNT(*) AS n FROM record_log_rows \(predicate)", bindings)?["n"].intValue ?? 0
+        guard count == rows else { return false }
+        try sql.exec("UPDATE record_log_rows SET _gen = ? \(predicate)", [.integer(Int64(generation))] + bindings)
+        return true
     }
 
     func noteLoadKeys(_ attempt: String, _ keys: [RecordLogRecordKey]) throws {
@@ -913,6 +952,7 @@ final class RecordLogStore: @unchecked Sendable {
         let epochs = try tables.epochs()
         let state = try sql.first("SELECT * FROM record_log_state WHERE doc_id = ?", [doc])
         let writer = try writerOf(sql)
+        let writerState = try writer.map { try tables.writerState($0) }
         let pending = try writer.flatMap { writer in
             try sql.first(
                 "SELECT MIN(seq) AS lowest, COUNT(*) AS n FROM record_log_pending WHERE doc_id = ? AND writer = ?",
@@ -927,11 +967,13 @@ final class RecordLogStore: @unchecked Sendable {
             replacement: try tables.replacing(),
             lastCatchUpAt: state?["last_catch_up_at"].intValue.map { Int64($0) },
             writer: writer,
-            nextSeq: try writer.map { try tables.writerState($0).nextSeq } ?? 1,
+            nextSeq: writerState?.nextSeq ?? 1,
+            resumedAt: writerState?.resumedAt ?? 0,
             lowestPending: pending?["lowest"].intValue,
             pending: pending?["n"].intValue ?? 0,
             unacked: try writer.map { try unackedOf(sql, $0) } ?? [],
-            receipt: try tables.receipts()?.latest
+            receipt: try tables.receipts()?.latest,
+            segment: try tables.heldSegment()
         )
     }
 
@@ -1515,6 +1557,7 @@ final class RecordLogStore: @unchecked Sendable {
                 touched.append(contentsOf: out.touched)
                 reply.acknowledged.append(contentsOf: out.acknowledged)
                 reply.settled.append(contentsOf: out.settled)
+                if reply.underivable == nil { reply.underivable = out.underivable }
             }
             reply.changed = try settleView(sql, touched, project)
             reply.cursor = try tables.cursor()
@@ -1552,6 +1595,16 @@ final class RecordLogStore: @unchecked Sendable {
         try command { _ in try rules(writer).beginFencedCatchUp(full: full) }
     }
 
+    /// Begin a segment's full replacement: its generation, and the segment the
+    /// store's rows were last replaced from, read in the same transaction (a
+    /// mirror's may be older). The receipt tries to keep only those chunks.
+    func beginSegmentReplacement(writer: String) throws -> (generation: Int?, held: RecordLogHeldSegment?) {
+        try command { _ in
+            let generation = try rules(writer).beginFencedCatchUp(full: true)
+            return (generation, try tables.heldSegment())
+        }
+    }
+
     /// Whether `generation` is not the replacement the store is in.
     private func staleGeneration(_ generation: Int?) throws -> Bool {
         guard let generation else { return false }
@@ -1582,19 +1635,20 @@ final class RecordLogStore: @unchecked Sendable {
     /// replacement every attempt whose last change came before it began.
     func completeCatchUp(
         writer: String, lsn: Int, high: Int? = nil, full: Bool = false, generation: Int? = nil,
-        receipt: String? = nil, at: Int64? = nil, project: [RecordLogProjectionSpec] = []
+        receipt: String? = nil, segment: RecordLogHeldSegment? = nil, at: Int64? = nil, project: [RecordLogProjectionSpec] = []
     ) throws -> RecordLogChangeReply {
         try command { sql in
             let cursor = try tables.cursor()
             if cursor > lsn { return RecordLogChangeReply(cursor: cursor, stale: true) }
             if try staleGeneration(generation) { return RecordLogChangeReply(cursor: cursor, stale: true) }
             let out = try rules(writer).completeCatchUp(
-                lsn: lsn, high: high, full: full, generation: generation, receipt: receipt
+                lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment
             )
             try tables.setLastCatchUpAt(at ?? Int64(Date().timeIntervalSince1970 * 1000))
             var reply = RecordLogChangeReply()
             reply.acknowledged = out.acknowledged
             reply.settled = out.settled
+            reply.underivable = out.underivable
             reply.changed = try settleView(sql, out.touched, project)
             reply.cursor = try tables.cursor()
             return reply
@@ -1692,6 +1746,39 @@ final class RecordLogStore: @unchecked Sendable {
                 reply.ranges = [RecordLogIdRange(model: first.model, firstId: first.id, lastId: last.id)]
             }
             reply.cursor = cursor
+            return reply
+        }
+    }
+
+    /// Keep one chunk of segment `segmentId` from the confirmed rows instead of
+    /// reading it, in one transaction, as
+    /// ``RecordLogRules/keepSegmentChunk(generation:attempt:object:sha256:model:firstId:lastId:rows:)``
+    /// decides: the reply's `applied` is the rows kept, or it answers
+    /// `mismatch` and nothing changed. `stale` as
+    /// ``applySegmentChunk(writer:generation:attempt:rows:project:)``, and for
+    /// an attempt no longer in progress. The view and query rows are already
+    /// the kept rows'.
+    func keepSegmentChunk(
+        writer: String, generation: Int, attempt: String, segmentId: String, object: String, sha256: String, model: String,
+        firstId: String, lastId: String, rows: Int
+    ) throws -> RecordLogChunkReply {
+        try command { _ in
+            let cursor = try tables.cursor()
+            if try staleGeneration(generation) { return RecordLogChunkReply(cursor: cursor, stale: true) }
+            if let stale = try staleReceipt(writer, attempt) { return stale }
+            let out = try rules(writer).keepSegmentChunk(
+                generation: generation, attempt: attempt, object: object, sha256: sha256, model: model,
+                firstId: firstId, lastId: lastId, rows: rows
+            )
+            var reply = RecordLogChunkReply()
+            reply.cursor = cursor
+            switch out {
+            case .mismatch:
+                reply.mismatch = true
+            case .kept(let kept, let ranges):
+                reply.applied = kept
+                reply.ranges = ranges
+            }
             return reply
         }
     }

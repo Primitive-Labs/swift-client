@@ -150,9 +150,9 @@ listeners hear the batch once, after it is applied.
 
 Rows that arrive in bulk reach the client as compressed chunks rather than one
 by one over the socket: a load committed through the document's ingest routes
-(`primitive documents ingest`, or the ingest API), and the room's checkpoint
-segment when the client was away long enough to fall behind it. Nothing changes
-in how you read them:
+(`primitive documents ingest`, or `client.documents.ingests`), and the room's
+checkpoint segment when the client was away long enough to fall behind it.
+Nothing changes in how you read them:
 
 ```swift
 let stop = notes?.subscribe {
@@ -163,10 +163,19 @@ let stop = notes?.subscribe {
 
 A connected client is told when a load completes and reads its chunks through
 a short-lived link the room grants. A client that was offline reads the same
-chunks when it reconnects. Either way the load's rows, with every write made
-during the load applied on top and the rows the room refused left out, become
+chunks when it reconnects. Either way the load's rows, with every write ordered
+after the load applied on top and the rows the room refused left out, become
 queryable within about 10 seconds at 100,000 rows. Saves made while the chunks
 arrive apply locally at once and are sent when the receipt completes.
+
+To load rows from the app itself, build the chunks with
+`client.documents.ingests.buildChunks(rows:)` and drive the session with
+`create(documentId:options:)`, `uploadChunk`, `commit` and `get` until it reads
+`complete`, `failed` or `aborted`; `abort` gives one up. Which writes come
+after the load is the session's `reserveEpoch`: with `.open` (the default) the
+load is ordered when the session is created, so every write made while it
+uploads and applies wins over it; with `.commit` it is ordered at commit, so a
+write made while the chunks were uploading loses to it.
 
 If a receipt fails twice in a row (the link expired, a chunk could not be read),
 the next open asks for rows instead, so the document always catches up. A

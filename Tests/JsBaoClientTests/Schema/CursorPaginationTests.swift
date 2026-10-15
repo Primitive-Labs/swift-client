@@ -743,3 +743,140 @@ final class CursorPaginationTests: XCTestCase {
         XCTAssertFalse(idOnly.sql.contains("IS NULL"))
     }
 }
+
+/// #4504 — a cursor is bound to the sort that minted it. It carries the
+/// per-field `sortDirections` beside `sortFields`, and a query whose fields or
+/// directions differ refuses it with `InvalidCursorError` instead of paging
+/// from the wrong position. A cursor without `sortDirections` (minted before
+/// the field existed) is checked on its fields only.
+///
+/// The two fixture strings are the ones
+/// `tests/unit/workflows/function-document-sort-4504.test.ts` pins on the
+/// js-bao side, so each client decodes the other's cursor.
+final class CursorSortBindingHermeticTests: XCTestCase {
+
+    private let schema = PrimitiveSchema(
+        name: "sort4504_items",
+        fields: [
+            "id": FieldDescriptor(type: .id),
+            "n":  FieldDescriptor(type: .number),
+        ]
+    )
+
+    private func seeded() throws -> DynamicModel {
+        SchemaSync.clearCache()
+        let model = DynamicModel(doc: YDocument(), schema: schema)
+        for i in 0..<5 {
+            _ = try model.create(id: "s-\(i)", values: ["n": .number(Double(i))])
+        }
+        return model
+    }
+
+    /// A cursor js-bao mints for `{ city: -1 }` ending on `東京`.
+    private let jsMintedCityCursor =
+        "eyJ2YWx1ZXMiOnsiY2l0eSI6Ilx1Njc3MVx1NGVhYyIsImlkIjoiYy0wIn0sInNvcnRGaWVsZHMiOlsiY2l0eSIsImlkIl0s"
+        + "ImRpcmVjdGlvbiI6MSwic29ydERpcmVjdGlvbnMiOlstMSwxXX0="
+    /// The same position as this client mints it.
+    private let swiftMintedCityCursor =
+        "eyJkaXJlY3Rpb24iOjEsInNvcnREaXJlY3Rpb25zIjpbLTEsMV0sInNvcnRGaWVsZHMiOlsiY2l0eSIsImlkIl0sInZhbHVl"
+        + "cyI6eyJjaXR5IjoiXHU2NzcxXHU0ZWFjIiwiaWQiOiJjLTAifX0="
+
+    func testCursorsCarrySortDirections() throws {
+        let model = try seeded()
+        let page = try model.queryPaged(
+            nil, options: QueryOptions(sort: ["n": -1], limit: 2)
+        )
+        XCTAssertEqual(page.data.map { $0["id"]?.stringValue }, ["s-4", "s-3"])
+        let cursor = try CursorManager.decodeCursor(page.nextCursor!)
+        XCTAssertEqual(cursor.sortFields, ["n", "id"])
+        XCTAssertEqual(cursor.sortDirections, [-1, 1])
+
+        let next = try model.queryPaged(
+            nil,
+            options: QueryOptions(
+                sort: ["n": -1], limit: 2,
+                cursor: page.nextCursor, direction: .forward
+            )
+        )
+        XCTAssertEqual(next.data.map { $0["id"]?.stringValue }, ["s-2", "s-1"])
+    }
+
+    func testReversedDirectionThrows() throws {
+        let model = try seeded()
+        let page = try model.queryPaged(
+            nil, options: QueryOptions(sort: ["n": -1], limit: 2)
+        )
+        XCTAssertThrowsError(try model.queryPaged(
+            nil,
+            options: QueryOptions(
+                sort: ["n": 1], limit: 2,
+                cursor: page.nextCursor, direction: .forward
+            )
+        )) { error in
+            XCTAssertTrue(error is InvalidCursorError, "got \(error)")
+        }
+    }
+
+    func testIdDescendingCursorUnderNoSortThrows() throws {
+        let model = try seeded()
+        let page = try model.queryPaged(
+            nil, options: QueryOptions(sort: ["id": -1], limit: 2)
+        )
+        let cursor = try CursorManager.decodeCursor(page.nextCursor!)
+        XCTAssertEqual(cursor.sortFields, ["id"])
+        XCTAssertEqual(cursor.sortDirections, [-1])
+        XCTAssertThrowsError(try model.queryPaged(
+            nil,
+            options: QueryOptions(limit: 2, cursor: page.nextCursor, direction: .forward)
+        )) { error in
+            XCTAssertTrue(error is InvalidCursorError, "got \(error)")
+        }
+    }
+
+    func testCursorWithoutSortDirectionsIsCheckedOnFieldsOnly() throws {
+        let model = try seeded()
+        let legacy = Data(
+            #"{"values":{"id":"s-1"},"sortFields":["id"],"direction":1}"#.utf8
+        ).base64EncodedString()
+        XCTAssertNil(try CursorManager.decodeCursor(legacy).sortDirections)
+        let page = try model.queryPaged(
+            nil,
+            options: QueryOptions(limit: 2, cursor: legacy, direction: .forward)
+        )
+        XCTAssertEqual(page.data.map { $0["id"]?.stringValue }, ["s-2", "s-3"])
+    }
+
+    func testMalformedSortDirectionsThrows() {
+        for raw in [
+            #"{"values":{"id":"a"},"sortFields":["id"],"direction":1,"sortDirections":[0]}"#,
+            #"{"values":{"id":"a"},"sortFields":["id"],"direction":1,"sortDirections":[1,1]}"#,
+            #"{"values":{"id":"a"},"sortFields":["id"],"direction":1,"sortDirections":"x"}"#,
+        ] {
+            let token = Data(raw.utf8).base64EncodedString()
+            XCTAssertThrowsError(try CursorManager.decodeCursor(token), raw)
+        }
+    }
+
+    func testDecodesAJsBaoMintedCursor() throws {
+        let decoded = try CursorManager.decodeCursor(jsMintedCityCursor)
+        XCTAssertEqual(decoded.values["city"], .string("東京"))
+        XCTAssertEqual(decoded.values["id"], .string("c-0"))
+        XCTAssertEqual(decoded.sortFields, ["city", "id"])
+        XCTAssertEqual(decoded.direction, 1)
+        XCTAssertEqual(decoded.sortDirections, [-1, 1])
+    }
+
+    func testMintsTheCursorJsBaoDecodes() throws {
+        let encoded = try CursorManager.encodeCursor(CursorData(
+            values: ["city": .string("東京"), "id": .string("c-0")],
+            sortFields: ["city", "id"],
+            direction: 1,
+            sortDirections: [-1, 1]
+        ))
+        XCTAssertEqual(encoded, swiftMintedCityCursor)
+        // ASCII on the wire, so js-bao's `atob` reads it back unchanged.
+        let json = String(data: Data(base64Encoded: encoded)!, encoding: .utf8)!
+        XCTAssertTrue(json.unicodeScalars.allSatisfy { $0.isASCII }, json)
+        XCTAssertEqual(try CursorManager.decodeCursor(encoded).values["city"], .string("東京"))
+    }
+}

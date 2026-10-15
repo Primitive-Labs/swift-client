@@ -94,6 +94,9 @@ final class RecordLogSender {
     /// Entries sent and not yet acknowledged.
     var inFlightCount: Int { inFlight.count }
 
+    /// The numbers of the entries sent and not yet acknowledged.
+    var inFlightSeqs: Set<Int> { inFlight }
+
     /// `record.entries` frames that hold the next back: sent, not answered in
     /// full, and within their wait.
     var framesInFlight: Int { frames.count }

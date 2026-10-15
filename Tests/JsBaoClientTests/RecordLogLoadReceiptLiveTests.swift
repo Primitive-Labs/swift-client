@@ -5,7 +5,7 @@ import XCTest
 /// against the dev server: the Swift twin of js-bao's
 /// `record-log-load-receipt-4311.test.ts`.
 ///
-/// - A connected client declares `accepts: ["load", "segment"]`, is sent
+/// - A connected client declares `accepts: ["load", "segment", "building"]`, is sent
 ///   `record.load complete` (never `record.released`), reads the manifest and
 ///   chunks through the grant, pages the remainder, and equals the room within
 ///   10 s of the frame at 20,000 rows: the patches another client made during
@@ -133,7 +133,7 @@ final class RecordLogLoadReceiptLiveTests: XCTestCase {
         let state = try await live.route(documentId, "state")
         let accepts = state["accepts"] as? [String: [String]] ?? [:]
         XCTAssertEqual(accepts.count, 2, "\(state["accepts"] ?? "none")")
-        for (_, kinds) in accepts { XCTAssertEqual(kinds, ["load", "segment"]) }
+        for (_, kinds) in accepts { XCTAssertEqual(kinds, ["load", "segment", "building"]) }
 
         // Before the load: a holder of the unique key, a record a line will patch, 50 records y patches during it.
         try create(y, documentId, "x-holder", ["title": .string("holds"), "slug": .string("taken")])
@@ -475,8 +475,9 @@ final class RecordLogLoadReceiptLiveTests: XCTestCase {
         XCTAssertEqual(try live.marks(x, documentId).cursor, cursor)
         XCTAssertEqual(try live.marks(x, documentId).receipt?.kind, .load)
         XCTAssertNotNil(try live.localRows(x, documentId, "Note")["x-dup"], "the committed chunk holds the refused create")
-        // The room answers the next open rows (it offers no pointer past a remainder of 0 rows).
-        try await load.test("set-limits", ["catchUpPointerRows": 0])
+        // The room answers the next open rows: it offers no pointer past a remainder of 0 rows, and with
+        // no grant to mint it builds no segment for the reader to wait for (#4556).
+        try await load.test("set-limits", ["catchUpPointerRows": 0, "artifactGrants": false])
         await x.goOnline()
         try await recovered(documentId, x)
         XCTAssertTrue(watch.sent("record.catchUp").contains { $0["full"] == true && $0["cursor"] == 0 }, "\(watch.sent("record.catchUp"))")

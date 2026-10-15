@@ -55,10 +55,63 @@ struct RecordLogSessionTimings: Sendable {
     var replacementWaitMs = 30_000
     /// How often that wait looks whether the other replacement completed.
     var replacementPollMs = 100
+    /// How long an open waits on `building` answers (a segment being built for
+    /// it) before it opens without declaring `building` and takes pages.
+    var buildingMaxWaitMs = 60_000
 }
 
-/// What a connection that fetches artifacts declares it takes beside rows.
-private let recordLogAccepts: JSONValue = ["load", "segment"]
+/// What a document's sessions keep for as long as the client keeps its
+/// connection id: across reconnects, and across the document closed and opened
+/// again. The room may hold that id's subscription, and deliver what it queued
+/// on it, for as long.
+///
+/// `@unchecked Sendable`: both mutable properties, `_opened` and `_stale`, are
+/// read and written only under `lock`, a leaf lock held for the access alone.
+final class RecordLogWriterHistory: @unchecked Sendable {
+    /// A restored store's writer was re-minted while the room still owed
+    /// answers to entries sent ahead under its old id.
+    struct Stale {
+        /// The old id.
+        let writer: String
+        /// The number its `record.open` names.
+        let nextSeq: Int
+        /// Its numbers the room has not answered.
+        var seqs: Set<Int>
+    }
+
+    private let lock = NSLock()
+    private var _opened = Set<String>()
+    private var _stale: Stale?
+
+    /// The writers a `record.open` was sent for since the room last answered
+    /// the own writer's. A first open sends ahead only when none is another
+    /// writer: a server that judges the frames under a surviving subscription
+    /// would judge them as that writer's.
+    var opened: Set<String> {
+        get { lock.withLock { _opened } }
+        set { lock.withLock { _opened = newValue } }
+    }
+
+    /// The re-minted writer's old id the new id's open waits for, or `nil`.
+    var stale: Stale? {
+        get { lock.withLock { _stale } }
+        set { lock.withLock { _stale = newValue } }
+    }
+}
+
+/// What a connection that fetches artifacts declares it takes beside rows: a
+/// load's chunks, a segment's, and an answer to wait for a segment being built
+/// (`building`).
+private let recordLogAccepts: JSONValue = ["load", "segment", "building"]
+
+/// ``recordLogAccepts`` once an open has waited on `building` answers past its cap.
+private let recordLogAcceptsWithoutBuilding: JSONValue = ["load", "segment"]
+
+/// A streamed catch-up's reader credits the room after every this many pages that have `next`.
+let recordLogStreamCreditPages = 4
+
+/// The wait before opening again after a `building` answer that names none.
+private let recordLogBuildingRetryMs = 1_000
 
 /// Consecutive failed receipts after which the next open declares it takes rows only.
 let recordLogReceiptFailuresBeforeRows = 2
@@ -74,6 +127,15 @@ func recordLogShownPath(_ path: String) -> String {
 /// A format-3 document's conversation with its room over the client's socket:
 /// the port of js-bao's `session.ts`, rule for rule.
 ///
+/// A paged catch-up starts as a stream (#4556): `record.catchUp` carries a
+/// fresh `stream` id, the room pushes every page marked with it, and the
+/// session credits every ``recordLogStreamCreditPages``th page that has
+/// `next`. A page marked with another id is ignored, so an abandoned attempt's
+/// last page never completes a newer one; a page with no mark is an older
+/// room's answer, and the next is asked for per `next` as before. A room that
+/// is building a segment for an open answers `building`, and the session
+/// opens again after the wait it names.
+///
 /// The session opens the document — first as each writer of the store that an
 /// earlier session left entries under (it resubmits them so the room answers
 /// each one, then moves on), then as this client's own writer. Each open
@@ -82,6 +144,28 @@ func recordLogShownPath(_ path: String) -> String {
 /// writer is open, the models are declared, entries are sent as their group
 /// commits, results and refusals are applied, and a refusal's withdrawn writes
 /// are handed back.
+///
+/// The connection's first open, when it is the own writer's (no orphan was
+/// opened before it), does not wait for `record.opened`: the declaration and
+/// the unacknowledged entries leave right behind `record.open`, so a reconnect
+/// with pending writes has them answered one round trip sooner. They go only
+/// when no `record.resume` can be owed: the lowest unacknowledged number is
+/// above the writer's `resumedAt`, so every number below it was judged by the
+/// room. The answers to those frames that arrive before the catch-up completes
+/// are held and applied in arrival order once it does, and a server that
+/// refuses them (`DOCUMENT_NOT_OPEN`) gets them again after the catch-up, as
+/// every other open sends them. Any later open on the connection (a reopen, an
+/// orphan's, the own writer's after an orphan's, a re-minted writer's) may
+/// replace the writer the socket's frames are judged under, so it sends
+/// `record.open` alone. So does a first open while the room may still hold the
+/// connection's subscription for another writer (one opened on an earlier
+/// connection since the own writer's last `record.opened`): a server that
+/// judges the frames under a surviving subscription would judge them as that
+/// writer's. A restored store's writer, re-minted at `record.opened`, opens
+/// under its new id only once the room answered what went ahead under the old
+/// one. Both are kept per document for as long as the client keeps its
+/// connection id (a reconnect, the document closed and opened again), as long
+/// as the room may hold that id's subscription.
 ///
 /// **Concurrency.** An actor whose frame handlers contain no `await`: every
 /// store call is synchronous (it runs on the storage provider's queue), and
@@ -92,6 +176,20 @@ func recordLogShownPath(_ path: String) -> String {
 actor RecordLogSession {
 
     private enum Phase { case idle, opening, catchingUp, loading, draining, open, closed }
+
+    /// An answer held until the catch-up completes, applied in arrival order.
+    private enum HeldAnswer {
+        case results([RecordLogResultItem])
+        case refused(RecordLogRefusal)
+    }
+
+    /// What the open in progress sent ahead of its `record.opened`.
+    private struct SentAhead {
+        /// The server answered them `DOCUMENT_NOT_OPEN`: the catch-up's end sends them again.
+        var refused = false
+        /// The numbers its `record.entries` frame carried.
+        var seqs: Set<Int> = []
+    }
 
     /// The paged catch-up in progress. `released` once the room dropped the
     /// subscription while a page request was out: the open goes again when
@@ -107,6 +205,21 @@ actor RecordLogSession {
         var generation: Int?
         /// The receipt whose remainder these pages are.
         var receipt: Receipt?
+        /// The id its start asked the room to stream under; `nil` once an older
+        /// room answered with a page that carries none (its pages are then
+        /// asked for one at a time).
+        var stream: String?
+        /// A page marked with `stream` arrived: the room streams, and no request is out.
+        var streamed = false
+        /// Pages with `next` applied, counted for credits.
+        var pages = 0
+    }
+
+    /// Streamed catch-ups: pages applied, pages ignored as another stream's, credits sent.
+    struct StreamCounters: Sendable, Equatable {
+        var pages = 0
+        var stalePages = 0
+        var credits = 0
     }
 
     /// A receipt of a load's or a segment's chunks in progress. Read and
@@ -127,6 +240,10 @@ actor RecordLogSession {
         /// The store's id for it, once begun; its commands carry it.
         var attempt: String?
         var remainderRows = 0
+        /// A segment's chunks kept from the rows the store held instead of fetched.
+        var kept: Int?
+        /// A segment's chunks, as the store holds them once the receipt completes.
+        var segment: RecordLogHeldSegment?
         /// A `record.released` arrived while its chunks were fetched: it stops after the one in flight.
         var released = false
         var task: Task<Void, Never>?
@@ -156,8 +273,24 @@ actor RecordLogSession {
     /// The orphan writer's entries the room has not answered yet.
     private var outstanding = Set<Int>()
     private var drainTimer: Task<Void, Never>?
-    /// Result frames that arrived while a catch-up was being read.
-    private var heldResults: [[RecordLogResultItem]] = []
+    /// Result frames that arrived while a catch-up was being read; for an open
+    /// that sent frames ahead, also their answers (results and refusals) that
+    /// arrived while it was opening.
+    private var held: [HeldAnswer] = []
+    /// The open in progress sent its declaration and entries ahead of `record.opened`, or `nil`.
+    private var ahead: SentAhead?
+    /// `record.open` frames sent on this connection; only its first may send frames ahead.
+    private var openedOnConnection = 0
+    /// Set while the frames sent ahead are flushed: the sender may send before the open completes.
+    private var sendingAhead = false
+    /// What the document's earlier sessions on this connection id left.
+    private let history: RecordLogWriterHistory
+    /// The wait past which a re-minted writer's open asks the old id's stream for a barrier.
+    private var staleTimer: Task<Void, Never>?
+    /// A `record.open` of the re-minted writer's old id is out on this
+    /// connection: its `record.opened`, queued on the old id's stream behind
+    /// every answer queued there before it, ends the wait.
+    private var barrier = false
     private var paging: Paging?
     private var takenRetryMs: Int
     private var catchUpRetryMs: Int
@@ -191,11 +324,25 @@ actor RecordLogSession {
     /// Counts opens; a wait for another client's replacement opens again only if none was sent since.
     private var opens = 0
     private var replacementTimer: Task<Void, Never>?
+    /// The room streams: its last `record.opened` said so (`streams: true`),
+    /// or a page marked with a stream id arrived on this connection. A stream
+    /// start then has no answer out; an older room answers it with an
+    /// unmarked page.
+    private var roomStreams = false
+    /// When the first of the `building` answers in a row arrived; `nil` when the last answer was another form.
+    private var buildingSince: Date?
+    /// This session's stream ids: a prefix of its own and a count.
+    private let streamPrefix = String(UUID().uuidString.prefix(8))
+    private var streamSeq = 0
+    /// Streamed catch-ups, for the tests.
+    private(set) var streamCounters = StreamCounters()
 
     init(
         documentId: String, binding: RecordLogDocumentBinding, host: RecordLogSessionHost,
-        timings: RecordLogSessionTimings = RecordLogSessionTimings(), logger: Logger? = nil
+        timings: RecordLogSessionTimings = RecordLogSessionTimings(), logger: Logger? = nil,
+        history: RecordLogWriterHistory = RecordLogWriterHistory()
     ) {
+        self.history = history
         self.documentId = documentId
         self.binding = binding
         self.host = host
@@ -240,7 +387,7 @@ actor RecordLogSession {
         return RecordLogSender(
             clock: clock, tickMs: timings.tickMs,
             connected: {
-                guard let orphanWriter else { return self.phase == .open && self.connected() }
+                guard let orphanWriter else { return (self.phase == .open || self.sendingAhead) && self.connected() }
                 return self.phase == .draining && self.current?.writer == orphanWriter && self.connected()
             },
             send: { frame in self.send(frame.json) }
@@ -305,6 +452,20 @@ actor RecordLogSession {
             host.synced(documentId)
             return
         }
+        if phase == .catchingUp || phase == .loading, let stream = paging?.stream, paging?.streamed == true || roomStreams {
+            // Started again while a stream runs: the open's watchdog saw no
+            // page in its budget (a room evicted mid stream ignores the credit
+            // and pushes nothing more). No request is out, and a late page of
+            // this stream is ignored by its id, so the open goes again at once.
+            // A room not known to stream may still owe the start an unmarked
+            // page, which the next open's catch-up would take for its own:
+            // that one is waited for, as for any page request.
+            logger?.log("[record-log]", documentId, "— the streamed catch-up", stream, "stopped; opening again from the cursor")
+            paging = nil
+            stopReceipt()
+            attempt("reopen a stopped stream") { try sendOpen() }
+            return
+        }
         guard phase == .idle else { return }
         guard connected() else {
             host.syncFailed(documentId, "not connected")
@@ -320,6 +481,9 @@ actor RecordLogSession {
             if !orphans.isEmpty {
                 logger?.log("[record-log]", documentId, "— draining", orphans.count, "earlier writer(s) before opening")
             }
+            // A re-minted writer's old id may still have answers queued for this
+            // connection id: they come through before anything is opened.
+            if history.stale != nil { return try sendBarrier() }
             try openNext()
         }
     }
@@ -352,6 +516,12 @@ actor RecordLogSession {
 
     private func sendOpen() throws {
         guard let current else { return }
+        if ahead != nil {
+            // This open replaces one that sent frames ahead: what was held for
+            // them belongs to it, and this open resubmits what is still unjudged.
+            ahead = nil
+            held = []
+        }
         let marks = try binding.refreshMarks()
         let pending = try binding.store.pendingOf(current.writer)
         let unacked = pending.filter { $0.acked == nil }
@@ -373,11 +543,121 @@ actor RecordLogSession {
             "open": .number(Double(marks.open)),
             "formats": [3],
             "documentFormat": 3,
+            // Own entries the room applied as written come back as {l, e, w, seq}:
+            // the store derives their rows from its pending entries.
+            "acks": "compact",
         ]
         if host.connection()?.fetchesArtifacts == true {
-            open["accepts"] = failedReceipts >= recordLogReceiptFailuresBeforeRows ? [] : recordLogAccepts
+            let waited = buildingSince.map { Date().timeIntervalSince($0) * 1000 >= Double(timings.buildingMaxWaitMs) } ?? false
+            if waited {
+                logger?.log("[record-log]", documentId, "— waited", timings.buildingMaxWaitMs, "ms for a segment being built; opening for pages instead")
+            }
+            open["accepts"] = failedReceipts >= recordLogReceiptFailuresBeforeRows
+                ? [] : (waited ? recordLogAcceptsWithoutBuilding : recordLogAccepts)
         }
+        // Only the connection's first open sends ahead: a later one may switch
+        // the writer the socket's frames are judged under, and the answers to
+        // frames sent under a writer since replaced cannot be told apart once
+        // its numbers are reused. Nor while the room may still hold this
+        // connection id's subscription for another writer: a server that
+        // judges the frames under it would answer them as that writer's. And
+        // only when no resume can be owed: every number below `nextSeq` is
+        // then one the room judged.
+        let sendAhead = !current.orphan && openedOnConnection == 0
+            && history.opened.allSatisfy { $0 == current.writer } && nextSeq > marks.resumedAt
+        openedOnConnection += 1
+        history.opened.insert(current.writer)
         send(.object(open))
+        guard sendAhead else { return }
+        ahead = SentAhead()
+        declaredVersion = binding.declarationVersion
+        sender.enqueueControl(.declare(models: host.declarations()))
+        for entry in unacked { sender.enqueue(entry.wire) }
+        sendingAhead = true
+        sender.flush()
+        sendingAhead = false
+        ahead?.seqs = sender.inFlightSeqs
+    }
+
+    /// The numbers sent ahead under the writer being opened that the room has
+    /// not answered: none once it refused them, and none an answer held so far
+    /// names.
+    private func owedAhead(_ writer: String) -> Set<Int> {
+        guard let ahead, !ahead.refused else { return [] }
+        var owed = ahead.seqs
+        for answer in held {
+            switch answer {
+            case .refused(let refusal): owed.remove(refusal.seq)
+            case .results(let items): owed.subtract(Self.answeredSeqs(items, writer: writer))
+            }
+        }
+        return owed
+    }
+
+    /// A restored store's writer was re-minted while the room owed answers to
+    /// entries sent ahead under its old id. The room queues those answers on
+    /// the old subscription's stream, which the new open's does not wait for,
+    /// and a `void` or `duplicate` names no writer: one arriving once the new
+    /// id's renumbered entries went would be read as theirs. So the new id
+    /// opens once every owed number is answered (the answers are dropped), the
+    /// entries frame is refused, or the subscription is released. Past the
+    /// drain wait the old id is opened again (``sendBarrier()``): its
+    /// `record.opened` follows what is queued for it.
+    private func waitForStale(writer: String, nextSeq: Int, owed: Set<Int>) {
+        ahead = nil
+        held = []
+        history.stale = RecordLogWriterHistory.Stale(writer: writer, nextSeq: nextSeq, seqs: owed)
+        staleTimer = after(timings.drainWaitMs) { session in
+            guard let stale = session.history.stale, session.staleTimer != nil else { return }
+            session.staleTimer = nil
+            session.logger?.warn(
+                "[record-log]", session.documentId, "— the room has not answered", stale.seqs.count,
+                "entr(ies) sent under the re-minted writer's old id; opening the old id again so its answer follows them"
+            )
+            session.attempt("re-minted writer's old open") { try session.sendBarrier() }
+        }
+    }
+
+    /// Open the re-minted writer's old id again. The room queues the answer on
+    /// that id's stream, behind every answer queued there before it; a room
+    /// that lost them (stopped, or its delivery failed) answers on a stream
+    /// that never carries them. A wait past which answers are taken to be lost
+    /// would let a late one settle the new id's numbers. Answers that arrive
+    /// meanwhile are dropped; only this open's answer ends the wait.
+    private func sendBarrier() throws {
+        guard let stale = history.stale else { return }
+        let marks = try binding.refreshMarks()
+        barrier = true
+        openedOnConnection += 1
+        history.opened.insert(stale.writer)
+        send(.object([
+            "type": "record.open",
+            "writer": .string(stale.writer),
+            "cursor": .number(Double(marks.cursor)),
+            "nextSeq": .number(Double(stale.nextSeq)),
+            "open": .number(Double(marks.open)),
+            "formats": [3],
+            "documentFormat": 3,
+            "acks": "compact",
+        ]))
+    }
+
+    /// Answers to the old id's entries arrived: dropped, and the new id opens once none is owed.
+    private func staleAnswered(_ seqs: [Int]) throws {
+        guard var stale = history.stale, !barrier else { return }
+        stale.seqs.subtract(seqs)
+        history.stale = stale
+        if stale.seqs.isEmpty { try endStale() }
+    }
+
+    /// Nothing more of the old id can come: the document opens (orphans first, on a new connection).
+    private func endStale() throws {
+        guard history.stale != nil else { return }
+        staleTimer?.cancel()
+        staleTimer = nil
+        barrier = false
+        history.stale = nil
+        try openNext()
     }
 
     /// The socket closed: everything in flight is gone, and the next open starts over.
@@ -388,7 +668,16 @@ actor RecordLogSession {
         current = nil
         orphans = []
         paging = nil
-        heldResults = []
+        roomStreams = false
+        buildingSince = nil
+        held = []
+        ahead = nil
+        openedOnConnection = 0
+        // A re-minted writer's wait outlives the socket: what the old id's
+        // subscription queued may be delivered on the next one.
+        staleTimer?.cancel()
+        staleTimer = nil
+        barrier = false
         ownSender?.reset()
         orphanSender?.reset()
         orphanSender = nil
@@ -518,11 +807,18 @@ actor RecordLogSession {
     }
 
     private func opened(_ frame: [String: JSONValue]) throws {
+        if history.stale != nil {
+            // The old id opened again: everything its stream carried before is in.
+            if barrier && phase == .opening { return try endStale() }
+            logger?.debug("[record-log]", documentId, "— record.opened while a re-minted writer waits for its old id; ignored")
+            return
+        }
         guard phase == .opening, let current else {
             logger?.debug("[record-log]", documentId, "— record.opened outside an open; ignored")
             return
         }
         takenRetryMs = timings.writerTakenRetryMs
+        roomStreams = frame["streams"]?.boolValue == true
         let epochs = frame["epochs"]?.objectValue ?? [:]
         let currentEpoch = epochs["current"]?.wholeNumber ?? RecordLogTransport.firstEpoch
         let high = epochs["high"]?.wholeNumber ?? currentEpoch
@@ -539,12 +835,19 @@ actor RecordLogSession {
                 "[record-log]", documentId, "— the room has judged writer", current.writer, "up to", lastSeq,
                 "past the", marks.nextSeq - 1, "it minted (a restored store); re-minting"
             )
+            let owed = owedAhead(current.writer)
             try remint(current.writer, orphan: false)
+            if !owed.isEmpty { return waitForStale(writer: current.writer, nextSeq: lastSeq + 1, owed: owed) }
             try sendOpen()
             return
         }
+        // The room now holds this connection's subscription for the writer it
+        // answered, and for no other.
+        if !current.orphan { history.opened = [current.writer] }
         let catchUp = frame["catchUp"]?.objectValue ?? ["mode": "inline", "lsn": frame["lsn"] ?? 0]
         let mode = catchUp["mode"]?.stringValue
+        if mode == "building" { return waitForSegment(catchUp) }
+        buildingSince = nil
         phase = .catchingUp
         if mode == "load" {
             guard let pointer = RecordLogLoadPointer(json: catchUp["load"]) else {
@@ -571,20 +874,16 @@ actor RecordLogSession {
                     + "walking the room's whole table (to \(upTo))"
             )
             let replacing = try binding.withOperation { try binding.store.beginFencedCatchUp(writer: current.writer, full: true) }
-            let paging = Paging(cursor: 0, upTo: upTo, full: true, high: high, generation: replacing)
-            self.paging = paging
-            send(catchUpRequest(paging, after: nil))
+            beginPaging(Paging(cursor: 0, upTo: upTo, full: true, high: high, generation: replacing))
             return
         }
         if mode == "paged" {
             let full = catchUp["full"]?.boolValue == true
             let replacing = try binding.withOperation { try binding.store.beginFencedCatchUp(writer: current.writer, full: full) }
-            let paging = Paging(
+            beginPaging(Paging(
                 cursor: catchUp["cursor"]?.wholeNumber ?? 0, upTo: catchUp["upTo"]?.wholeNumber ?? 0, full: full, high: high,
                 generation: replacing
-            )
-            self.paging = paging
-            send(catchUpRequest(paging, after: nil))
+            ))
             return
         }
         let full = mode == "full"
@@ -595,13 +894,55 @@ actor RecordLogSession {
         let done = try complete(lsn: lsn, high: high, full: full, writer: current.writer, generation: replacing)
         if done.stale { return try overtaken(lsn: lsn, cursor: done.cursor, replacing: replacing) }
         if full { failedReceipts = 0 }
-        try caughtUp(done.acknowledged)
+        try caughtUp(done.acknowledged, underivable: done.underivable)
+    }
+
+    /// Begin a paged catch-up as a stream: the start carries a fresh id, and the
+    /// room pushes every page marked with it. An older room answers the start
+    /// with an unmarked page, and the rest are asked for one at a time.
+    private func beginPaging(_ start: Paging) {
+        var paging = start
+        streamSeq += 1
+        paging.stream = "\(streamPrefix)-\(streamSeq)"
+        self.paging = paging
+        send(catchUpRequest(paging, after: nil))
+    }
+
+    /// A page of a stream this session is not running (ended, replaced or released): it applies to nothing.
+    private func stalePage(_ frame: [String: JSONValue], _ why: String) {
+        streamCounters.stalePages += 1
+        logger?.debug("[record-log]", documentId, "— catch-up page of stream", frame["stream"]?.stringValue ?? "(none)", "ignored:", why)
+    }
+
+    /// The room is building a segment for this open (`mode: "building"`): the
+    /// subscription is registered, but nothing is caught up. Results that
+    /// arrive meanwhile are dropped (the next open's catch-up carries them),
+    /// progress is reported so the open's watchdog waits, and the document is
+    /// opened again after `retryMs`. Past ``RecordLogSessionTimings/buildingMaxWaitMs``
+    /// of such answers, the open no longer declares `building`.
+    private func waitForSegment(_ catchUp: [String: JSONValue]) {
+        if buildingSince == nil { buildingSince = Date() }
+        let retryMs = max(0, catchUp["retryMs"]?.wholeNumber ?? recordLogBuildingRetryMs)
+        logger?.log(
+            "[record-log]", documentId, "— the room is building segment", catchUp["segmentId"]?.stringValue ?? "",
+            "for this open; opening again in", retryMs, "ms"
+        )
+        phase = .opening
+        host.progress(documentId)
+        let waiting = opens
+        retryTimer?.cancel()
+        retryTimer = after(retryMs) { session in
+            session.retryTimer = nil
+            guard session.opens == waiting, session.phase == .opening, session.current != nil else { return }
+            session.attempt("open after building") { try session.sendOpen() }
+        }
     }
 
     private func catchUpRequest(_ paging: Paging, after: JSONValue?) -> JSONValue {
         var request: [String: JSONValue] = [
             "type": "record.catchUp", "cursor": .number(Double(paging.cursor)), "upTo": .number(Double(paging.upTo)),
         ]
+        if after == nil, let stream = paging.stream { request["stream"] = .string(stream) }
         if paging.full { request["full"] = true }
         if let receipt = paging.receipt, receipt.kind == .load { request["load"] = .string(receipt.id) }
         if let after { request["after"] = after }
@@ -626,11 +967,12 @@ actor RecordLogSession {
     }
 
     private func complete(
-        lsn: Int, high: Int, full: Bool, writer: String, generation: Int?, receipt: String? = nil
+        lsn: Int, high: Int, full: Bool, writer: String, generation: Int?, receipt: String? = nil,
+        segment: RecordLogHeldSegment? = nil
     ) throws -> RecordLogChangeReply {
         let reply = try binding.withOperation {
             try binding.store.completeCatchUp(
-                writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt,
+                writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment,
                 project: binding.projectionSpecs
             )
         }
@@ -700,7 +1042,27 @@ actor RecordLogSession {
     }
 
     private func catchUpPage(_ frame: [String: JSONValue]) throws {
-        guard phase == .catchingUp || phase == .loading, let paging, let current else { return }
+        let marked = frame["stream"]?.stringValue
+        guard phase == .catchingUp || phase == .loading, var paging, let current else {
+            if marked != nil { stalePage(frame, "no catch-up is in progress") }
+            return
+        }
+        if let marked {
+            // Only the stream this catch-up started: an earlier one's last page
+            // would otherwise complete it with rows it never carried.
+            guard marked == paging.stream else {
+                return stalePage(frame, "the catch-up in progress is \(paging.stream ?? "paged per request")")
+            }
+            paging.streamed = true
+            roomStreams = true
+            streamCounters.pages += 1
+        } else if paging.stream != nil, paging.streamed || roomStreams {
+            return stalePage(frame, "an unmarked page during a stream")
+        } else if paging.stream != nil {
+            logger?.debug("[record-log]", documentId, "— the room answered a stream start with a page per request; asking for each page")
+            paging.stream = nil
+        }
+        self.paging = paging
         let receipt = paging.receipt
         if paging.released {
             logger?.log("[record-log]", documentId, "— a catch-up page requested before the room released the subscription; discarded")
@@ -721,6 +1083,16 @@ actor RecordLogSession {
         if page.stale { return try overtaken(lsn: lsn, cursor: page.cursor, replacing: paging.generation) }
         receipt?.remainderRows += (frame["rows"]?.arrayValue?.count ?? 0) + (frame["gone"]?.arrayValue?.count ?? 0)
         host.progress(documentId)
+        if let next = frame["next"], let stream = paging.stream {
+            // The room pushes on; the credit lets it run past the window.
+            paging.pages += 1
+            self.paging = paging
+            if paging.pages % recordLogStreamCreditPages == 0 {
+                streamCounters.credits += 1
+                send(.object(["type": "record.catchUp", "stream": .string(stream), "credit": next]))
+            }
+            return
+        }
         if let next = frame["next"] {
             send(catchUpRequest(paging, after: next))
             return
@@ -729,12 +1101,12 @@ actor RecordLogSession {
         let full = paging.generation != nil
         let done = try complete(
             lsn: lsn, high: paging.high, full: full, writer: current.writer, generation: paging.generation,
-            receipt: receipt?.attempt
+            receipt: receipt?.attempt, segment: receipt?.segment
         )
         if done.stale { return try overtaken(lsn: lsn, cursor: done.cursor, replacing: paging.generation) }
         if full { failedReceipts = 0 }
         if let receipt { receiptDone(receipt) }
-        try caughtUp(done.acknowledged)
+        try caughtUp(done.acknowledged, underivable: done.underivable)
     }
 
     /// The room answered a catch-up page request with an error: no page is
@@ -747,7 +1119,8 @@ actor RecordLogSession {
             frame["code"]?.stringValue ?? "an error", "; opening again from the cursor in", wait, "ms"
         )
         paging = nil
-        heldResults = []
+        held = []
+        ahead = nil
         phase = .idle
         current = nil
         retryTimer?.cancel()
@@ -757,17 +1130,47 @@ actor RecordLogSession {
         }
     }
 
-    /// The catch-up is complete: results held meanwhile apply, then the writer's entries go.
-    private func caughtUp(_ acknowledged: [RecordLogEntryRef]) throws {
+    /// The catch-up is complete: answers held meanwhile apply, then the writer's
+    /// entries go. A compact acknowledgement left underivable (by the completion
+    /// or a held result) opens the document again once they have.
+    private func caughtUp(_ acknowledged: [RecordLogEntryRef], underivable: RecordLogUnderivableAck? = nil) throws {
         guard let current else { return }
+        let ahead = self.ahead
+        self.ahead = nil
+        // The server refused the frames sent ahead, the declaration with them:
+        // nothing of them is owed an answer, and they go again as a first
+        // open's do, the declaration first.
+        if ahead?.refused == true { ownSender?.reset() }
         catchUpRetryMs = timings.catchUpRetryMs
         clearGap()
         settleAcknowledged(acknowledged)
-        let held = heldResults
-        heldResults = []
+        let answers = held
+        held = []
         phase = current.orphan ? .draining : .open
-        for items in held { try applyResults(items) }
+        var underivable = underivable
+        for answer in answers {
+            switch answer {
+            case .results(let items): underivable = try applyResults(items) ?? underivable
+            case .refused(let refusal): try applyRefusal(refusal)
+            }
+        }
+        if let underivable {
+            logUnderivable(underivable)
+            reopenAfterCatchUp = true
+        }
         let unsent = try binding.store.pendingOf(current.writer).filter { $0.acked == nil }
+        if let ahead, !ahead.refused {
+            // The marks are read again, as the resume check below does, so the
+            // open reports them as the catch-up left them.
+            if unsent.isEmpty { try binding.refreshMarks() }
+            // The declaration and the entries went with the open, with no
+            // resume owed: what goes now is a model registered since, then what
+            // was committed meanwhile (the sender keeps those in flight or
+            // queued once).
+            declareIfChanged()
+            for entry in unsent { sender.enqueue(entry.wire) }
+            return try synced()
+        }
         // Entries handed back without the room hearing of it leave a gap the
         // room would wait on; tell it where this writer goes on from.
         let first = try unsent.first?.seq ?? binding.refreshMarks().nextSeq
@@ -779,12 +1182,19 @@ actor RecordLogSession {
             try drain(current.writer, unsent)
             return
         }
-        // Opened again on this connection (a gap, a restart): what was in flight
-        // is sent again, so the room answers it with what it made of it.
+        // Opened again on this connection (a gap, a restart), or the frames
+        // sent ahead were refused: what was in flight is sent again, so the
+        // room answers it with what it made of it.
         sender.requeueInFlight(unsent.map(\.wire))
         declaredVersion = binding.declarationVersion
         sender.enqueueControl(.declare(models: host.declarations()))
         for entry in unsent { sender.enqueue(entry.wire) }
+        try synced()
+    }
+
+    /// The own writer is open: what waits leaves, the open is reported, and
+    /// loads announced meanwhile are received.
+    private func synced() throws {
         sender.kick()
         host.synced(documentId)
         if reopenAfterCatchUp {
@@ -839,31 +1249,51 @@ actor RecordLogSession {
         return current.orphan ? orphanSender : sender
     }
 
+    /// Whether answers are held until the catch-up completes: during it, and
+    /// while an open that sent frames ahead waits for `record.opened` (a server
+    /// can answer those frames before it).
+    private var holding: Bool {
+        phase == .catchingUp || phase == .loading || (ahead != nil && phase == .opening)
+    }
+
     private func results(_ items: [RecordLogResultItem]) throws {
         guard !items.isEmpty else { return }
-        if phase == .catchingUp || phase == .loading {
-            heldResults.append(items)
+        if let stale = history.stale {
+            // Answers on the replaced subscription's stream: none is the new
+            // id's. Other writers' rows come with its catch-up.
+            return try staleAnswered(Self.answeredSeqs(items, writer: stale.writer))
+        }
+        if holding {
+            held.append(.results(items))
             return
         }
         guard phase == .open || phase == .draining else { return }
-        try applyResults(items)
+        if let underivable = try applyResults(items) {
+            logUnderivable(underivable)
+            clearGap()
+            try sendOpen()
+        }
     }
 
-    private func applyResults(_ items: [RecordLogResultItem]) throws {
+    /// A compact acknowledgement the store could not derive: the open that follows brings its row.
+    private func logUnderivable(_ ack: RecordLogUnderivableAck) {
+        logger?.warn(
+            "[record-log] \(documentId): the compact acknowledgement of writer \(ack.writer) seq \(ack.seq) (log number \(ack.l)) "
+                + "names no pending entry to derive its rows from; opening again from the cursor"
+        )
+    }
+
+    /// Apply relayed items; answers a compact acknowledgement the store could
+    /// not derive, if one holds the cursor back.
+    @discardableResult
+    private func applyResults(_ items: [RecordLogResultItem]) throws -> RecordLogUnderivableAck? {
         let writer = current?.writer ?? binding.writer
         let reply = try binding.withOperation {
             try binding.store.receive(writer: writer, items: items, project: binding.projectionSpecs)
         }
         notify(reply.changed)
         // Every number the room answered is one its frame no longer owes.
-        var seqs: [Int] = []
-        for item in items {
-            switch item {
-            case .void(let seq), .duplicate(let seq): seqs.append(seq)
-            case .result(let result):
-                if result.w == writer, let seq = result.seq { seqs.append(seq) }
-            }
-        }
+        let seqs = Self.answeredSeqs(items, writer: writer)
         for item in items {
             if case .result(let result) = item, result.w == binding.writer, let alias = result.alias {
                 binding.noteAlias(alias)
@@ -874,6 +1304,21 @@ actor RecordLogSession {
         answered(seqs)
         settleAcknowledged(reply.acknowledged)
         watchGap(cursor: reply.cursor, items: items)
+        return reply.underivable
+    }
+
+    /// The numbers of `writer`'s entries that results answer: a `void` or
+    /// `duplicate` names no writer.
+    private static func answeredSeqs(_ items: [RecordLogResultItem], writer: String) -> [Int] {
+        var seqs: [Int] = []
+        for item in items {
+            switch item {
+            case .void(let seq), .duplicate(let seq): seqs.append(seq)
+            case .result(let result):
+                if result.w == writer, let seq = result.seq { seqs.append(seq) }
+            }
+        }
+        return seqs
     }
 
     /// This client's writer's entries the room acknowledged: confirmed, and their waiters resolve.
@@ -886,7 +1331,14 @@ actor RecordLogSession {
     }
 
     private func refused(_ refusal: RecordLogRefusal) throws {
-        guard let current else { return }
+        if history.stale != nil { return try staleAnswered([refusal.seq]) }
+        guard current != nil else { return }
+        if ahead != nil && holding {
+            // A refusal of a frame sent ahead: applied with the results held
+            // beside it, after the catch-up, as if it had arrived then.
+            held.append(.refused(refusal))
+            return
+        }
         if phase == .opening || phase == .idle {
             // Sent for the subscription this open replaces: its numbers are not
             // the ones the next open resubmits, and a resubmission replays a
@@ -894,6 +1346,11 @@ actor RecordLogSession {
             logger?.debug("[record-log]", documentId, "— dropped a refusal of", refusal.seq, "that arrived before record.opened")
             return
         }
+        try applyRefusal(refusal)
+    }
+
+    private func applyRefusal(_ refusal: RecordLogRefusal) throws {
+        guard let current else { return }
         let writer = current.writer
         let reply = try binding.withOperation {
             try binding.store.refused(writer: writer, refusal: refusal, project: binding.projectionSpecs)
@@ -974,6 +1431,12 @@ actor RecordLogSession {
     }
 
     private func gap(_ expected: Int) throws {
+        // The old id's entries from `expected` are not held: nothing more of them
+        // is answered. With its open out again, that open's answer ends the wait.
+        if history.stale != nil {
+            if !barrier { try endStale() }
+            return
+        }
         guard let current else { return }
         logger?.log("[record-log]", documentId, "— the room is missing entries from", expected, "; resending")
         let unjudged = try binding.store.pendingOf(current.writer).filter { $0.acked == nil }.map(\.wire)
@@ -983,17 +1446,30 @@ actor RecordLogSession {
     /// The room dropped this connection's subscription (a delivery to it
     /// failed): nothing more is coming, so the writer is opened again from the
     /// cursor. Mid paged catch-up, a page request is out: the open goes again
-    /// once that answer is in, and the page is discarded.
+    /// once that answer is in, and the page is discarded. A streamed catch-up
+    /// has no request out once the room is known to stream (its
+    /// `record.opened` said so, or a marked page arrived): it dropped the
+    /// stream with the subscription, and the open goes at once.
     private func released(_ frame: [String: JSONValue]) throws {
+        // The old id's subscription is gone: nothing more of it is coming.
+        if history.stale != nil {
+            if phase == .opening { try endStale() }
+            return
+        }
         guard current != nil, phase != .idle, phase != .closed else { return }
         logger?.warn(
             "[record-log]", documentId, "— the room released this connection's subscription (",
             frame["reason"]?.stringValue ?? "no reason given", "); opening again from the cursor"
         )
         clearGap()
-        if phase == .catchingUp || phase == .loading, paging != nil {
-            paging?.released = true
-            return
+        if phase == .catchingUp || phase == .loading, let paging {
+            guard paging.stream != nil, paging.streamed || roomStreams else {
+                self.paging?.released = true
+                return
+            }
+            self.paging = nil
+            stopReceipt()
+            return try sendOpen()
         }
         if let receipt, paging == nil {
             // Its chunks are being fetched: the one in flight completes, then
@@ -1007,10 +1483,24 @@ actor RecordLogSession {
 
     private func error(_ frame: [String: JSONValue]) throws {
         let code = frame["code"]?.stringValue ?? ""
+        let messageType = frame["messageType"]?.stringValue
         logger?.warn(
             "[record-log]", documentId, "—", frame["messageType"]?.stringValue ?? "record frame", "answered", code,
             ":", frame["message"]?.stringValue ?? ""
         )
+        if history.stale != nil && barrier {
+            // The room would not open the old id again: no subscription of it on
+            // this connection is left to queue answers on.
+            if messageType == "record.open" && phase == .opening { try endStale() }
+            return
+        }
+        if history.stale != nil, messageType == "record.entries" || messageType == "record.declare" {
+            // The old id's frames answered with an error: its entries were not
+            // judged, and the new id's open goes. Its numbers are not the new
+            // id's; the room answers the new id's frames for themselves.
+            if messageType == "record.entries" { try endStale() }
+            return
+        }
         guard let current else { return }
         if frame["messageType"]?.stringValue == "record.catchUp", let receipt = paging?.receipt {
             return try receiptFailed(receipt, "the remainder was answered \(code.isEmpty ? "an error" : code)")
@@ -1033,13 +1523,21 @@ actor RecordLogSession {
             takenRetryMs = min(takenRetryMs * 2, 30_000)
             phase = .idle
             self.current = nil
+            held = []
+            ahead = nil
             retryTimer?.cancel()
             retryTimer = after(wait) { session in
                 session.retryTimer = nil
                 session.start()
             }
         case "DOCUMENT_NOT_OPEN":
-            if phase == .open || phase == .draining { try sendOpen() }
+            if phase == .open || phase == .draining {
+                try sendOpen()
+            } else if ahead != nil, messageType == "record.entries" || messageType == "record.declare" {
+                // A server that does not hold frames behind their open: they go
+                // again after the catch-up, as every other open sends them.
+                ahead?.refused = true
+            }
         case "WRITE_ACCESS_DENIED":
             try binding.setState(permission: .some("read"))
             let pending = try binding.store.pendingOf(current.writer).filter { !$0.isVoid && $0.acked == nil }
@@ -1061,9 +1559,13 @@ actor RecordLogSession {
             let handed = reply.handedBack.filter { !$0.isVoid }
             if !handed.isEmpty { handBack(writer: current.writer, handed, refusal) }
         default:
+            // An answer to a frame sent ahead is not the open's: it ends nothing.
+            if ahead != nil, messageType == "record.entries" || messageType == "record.declare" { return }
             if phase == .opening {
                 phase = .idle
                 self.current = nil
+                held = []
+                ahead = nil
                 host.syncFailed(documentId, code.isEmpty ? "error" : code)
             }
         }
@@ -1195,9 +1697,10 @@ actor RecordLogSession {
         failedReceipts = 0
         if loadInProgress == receipt.id { loadInProgress = nil }
         let ms = Int(Date().timeIntervalSince(receipt.startedAt) * 1000)
+        let kept = receipt.kept.map { "; \($0) kept, \(receipt.chunks - $0) fetched" } ?? ""
         logger?.log(
             "[record-log] \(receipt.kind.rawValue) received \(documentId): \(receipt.id) \(receipt.rows) rows in "
-                + "\(receipt.chunks) chunks, remainder \(receipt.remainderRows) rows, \(ms) ms"
+                + "\(receipt.chunks) chunks, remainder \(receipt.remainderRows) rows, \(ms) ms\(kept)"
         )
     }
 
@@ -1212,7 +1715,7 @@ actor RecordLogSession {
         )
         self.receipt = nil
         paging = nil
-        heldResults = []
+        held = []
         if loadInProgress == receipt.id { loadInProgress = nil }
         if current != nil { try sendOpen() }
     }
@@ -1221,7 +1724,7 @@ actor RecordLogSession {
     private func openFailedReceipt(_ kind: RecordLogReceiptKind, _ reason: String) throws {
         failedReceipts += 1
         logger?.warn("[record-log] \(kind.rawValue) receipt failed \(documentId): \(reason); opening again from the cursor")
-        heldResults = []
+        held = []
         try sendOpen()
     }
 
@@ -1236,7 +1739,7 @@ actor RecordLogSession {
         )
         self.receipt = nil
         paging = nil
-        heldResults = []
+        held = []
         guard current != nil else { return }
         if let replacing {
             try openAfterReplacement(replacing)
@@ -1362,9 +1865,7 @@ actor RecordLogSession {
             }
             guard receiving(receipt) else { return }
             if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
-            let paging = Paging(cursor: remainder.cursor, upTo: remainder.upTo, full: false, high: remainder.high, receipt: receipt)
-            self.paging = paging
-            send(catchUpRequest(paging, after: nil))
+            beginPaging(Paging(cursor: remainder.cursor, upTo: remainder.upTo, full: false, high: remainder.high, receipt: receipt))
         } catch {
             attempt("load receipt") { try receiptFailed(receipt, Self.describe(error)) }
         }
@@ -1383,15 +1884,54 @@ actor RecordLogSession {
             else { throw RecordLogReceiptFailure("a segment chunk's path leaves the grant") }
             // The receipt is begun before its replacement, so a replacement that
             // overtakes this one counts every change this one made.
-            let (attempt, generation) = try binding.withOperation { () -> (String, Int?) in
+            // The segment the store's rows came from is read with the
+            // replacement's start: a chunk it lists is kept from those rows when
+            // the store agrees.
+            let (attempt, generation, held) = try binding.withOperation { () -> (String, Int?, RecordLogHeldSegment?) in
                 let attempt = try binding.store.beginReceipt(writer: receipt.writer, kind: .segment, id: segment.segmentId).attempt
-                return (attempt, try binding.store.beginFencedCatchUp(writer: receipt.writer, full: true))
+                let begun = try binding.store.beginSegmentReplacement(writer: receipt.writer)
+                return (attempt, begun.generation, begun.held)
             }
             receipt.attempt = attempt
             let writer = receipt.writer
             guard let generation else { throw RecordLogReceiptFailure("the store handed out no replacement generation") }
-            for chunk in segment.chunks {
+            let marker = RecordLogHeldSegment(segmentId: segment.segmentId, chunks: segment.chunks.map { chunk in
+                RecordLogHeldSegmentChunk(
+                    object: recordLogSegmentChunkObject(
+                        segmentId: segment.segmentId, model: chunk.model, index: chunk.index, source: chunk.source
+                    ),
+                    model: chunk.model, index: chunk.index, firstId: chunk.firstId, lastId: chunk.lastId, rows: chunk.rows,
+                    sha256: chunk.sha256
+                )
+            })
+            receipt.segment = marker
+            receipt.kept = 0
+            var holds: [String: RecordLogHeldSegmentChunk] = [:]
+            for chunk in held?.chunks ?? [] { holds[chunk.object] = chunk }
+            for (at, chunk) in segment.chunks.enumerated() {
                 guard receiving(receipt) else { return }
+                let mine = marker.chunks[at]
+                if let had = holds[mine.object], had.sha256 == mine.sha256, had.rows == mine.rows,
+                   had.firstId == mine.firstId, had.lastId == mine.lastId {
+                    let reply = try binding.withOperation {
+                        try binding.store.keepSegmentChunk(
+                            writer: writer, generation: generation, attempt: attempt, segmentId: segment.segmentId,
+                            object: mine.object, sha256: mine.sha256, model: mine.model, firstId: mine.firstId,
+                            lastId: mine.lastId, rows: mine.rows
+                        )
+                    }
+                    guard receiving(receipt) else { return }
+                    if reply.stale {
+                        return try abandonReceipt(receipt, "another client of the store began replacing it", replacing: generation)
+                    }
+                    if !reply.mismatch {
+                        receipt.kept = (receipt.kept ?? 0) + 1
+                        host.progress(documentId)
+                        if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
+                        continue
+                    }
+                    logger?.debug("[record-log] \(documentId): the held chunk \(mine.object) could not be kept; fetching it")
+                }
                 let applied = try await applyChunk(receipt, path: "\(base)/\(chunk.path)", read: {
                     try RecordLogChunkReader.readSegmentChunk($0, chunk)
                 }, apply: { session, rows in
@@ -1432,11 +1972,9 @@ actor RecordLogSession {
             // replayed over rows older than it), and a page that fails fails it.
             guard current != nil else { return }
             if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
-            let paging = Paging(
+            beginPaging(Paging(
                 cursor: segment.completedLsn, upTo: upTo, full: false, high: high, generation: generation, receipt: receipt
-            )
-            self.paging = paging
-            send(catchUpRequest(paging, after: nil))
+            ))
         } catch {
             attempt("segment receipt") { try receiptFailed(receipt, Self.describe(error)) }
         }

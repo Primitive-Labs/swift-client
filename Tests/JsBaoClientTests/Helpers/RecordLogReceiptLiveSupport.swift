@@ -17,9 +17,7 @@ final class RecordLogClientWatch: @unchecked Sendable {
     private var failNext: (match: @Sendable (String) -> Bool, status: Int, times: Int)?
 
     init(_ client: JsBaoClient) {
-        client.recordLogFrameForTest = { [weak self] frame in
-            self?.lock.withLock { self?._received.append((Date(), frame)) }
-        }
+        client.recordLogFrameForTest = { [weak self] frame in self?.record(frame) }
         client.recordLogFrameSentForTest = { [weak self] text in
             guard let frame = RecordLogJSON.parse(text)?.objectValue else { return }
             self?.lock.withLock { self?._sent.append(frame) }
@@ -53,6 +51,11 @@ final class RecordLogClientWatch: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Keep a frame the client was routed: for a test that hooks the routing itself.
+    func record(_ frame: [String: JSONValue]) {
+        lock.withLock { _received.append((Date(), frame)) }
     }
 
     var received: [(at: Date, frame: [String: JSONValue])] { lock.withLock { _received } }

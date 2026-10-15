@@ -129,10 +129,13 @@ func run() -> Int32 {
     // Parse.
     let schemas: [ParsedSchema]
     do {
+        // An authoring door, like js-bao-codegen-v2: a field name that
+        // breaks a generated model on either client is refused here.
         schemas = try TomlParser.parse(
             tomlString: tomlString,
             swiftNameSuffix: args.swiftNameSuffix,
-            strict: args.strict
+            strict: args.strict,
+            rejectReservedFieldNames: true
         )
     } catch let err as CodegenError {
         FileHandle.standardError.write(Data("swift-bao-codegen: \(err.description)\n".utf8))

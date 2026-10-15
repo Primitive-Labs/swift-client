@@ -46,6 +46,8 @@ struct RecordLogChunkDescriptor: Equatable, Sendable {
     var sha256: String
     var firstId: String
     var lastId: String
+    /// The earlier segment that wrote the object, for a chunk a segment reuses; `path` then names it.
+    var source: String? = nil
 
     /// The chunk's place in a refusal or a log line.
     var place: String { "\(model)/\(index)" }

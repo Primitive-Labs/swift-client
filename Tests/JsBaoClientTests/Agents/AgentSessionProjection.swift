@@ -143,6 +143,7 @@ enum AgentSessionProjection {
             "historyMode": value(s.historyMode),
             "historySelection": value(s.historySelection),
             "providerDurationMs": value(s.providerDurationMs),
+            "resolvedByUserId": value(s.resolvedByUserId),
         ]
     }
 

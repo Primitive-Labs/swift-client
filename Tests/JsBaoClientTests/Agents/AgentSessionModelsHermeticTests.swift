@@ -156,6 +156,23 @@ final class AgentSessionModelsHermeticTests: XCTestCase {
         XCTAssertEqual(PrimitiveStep.primitiveSchema.fields["providerDurationMs"], FieldDescriptor(type: .number))
     }
 
+    // #4467: a client tool's call, how long it waited and who made it final.
+    func testTheClientCallKindAndItsAnswererDecode() throws {
+        let answered = try XCTUnwrap(PrimitiveStep(row: try fixture("step-client-call-completed").row))
+        XCTAssertEqual(answered.kind, .clientCall)
+        XCTAssertTrue(answered.kind.isKnown)
+        XCTAssertTrue(PrimitiveStepKind.known.contains(.clientCall))
+        XCTAssertEqual(PrimitiveStepKind(rawValue: "client_call"), .clientCall)
+        XCTAssertEqual(answered.durationMs, 1500)
+        XCTAssertEqual(answered.resolvedByUserId, "u_participant_1")
+        let cancelled = try XCTUnwrap(PrimitiveStep(row: try fixture("step-client-call-cancelled").row))
+        XCTAssertEqual(cancelled.status, .failed)
+        XCTAssertEqual(cancelled.errorCode, "AGENT_CALL_CANCELLED")
+        XCTAssertEqual(cancelled.resolvedByUserId, "u_owner")
+        XCTAssertEqual(PrimitiveStep.primitiveSchema.fields["resolvedByUserId"], FieldDescriptor(type: .string))
+        XCTAssertEqual(AgentSessionProjection.project(answered)["resolvedByUserId"], .string("u_participant_1"))
+    }
+
     func testApprovalApprovedReadsBooleansAndZeroOneAsJavaScriptDoes() throws {
         let cases: [(String, Bool?)] = [
             ("part-tool-call-output", true),

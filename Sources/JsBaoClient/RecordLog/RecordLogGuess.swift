@@ -49,27 +49,41 @@ func recordLogApplyGuess(_ table: RecordLogRowTable, _ entry: RecordLogPendingEn
     for mutation in try recordLogResolveEntry(table, entry).mutations {
         let key = mutation.key
         touched.append(key)
-        if mutation.kind == .delete {
+        if let row = recordLogPlainRowAfter(try table.row(key), mutation) {
+            try table.set(key, row)
+        } else if mutation.kind == .delete {
             try table.delete(key)
-            continue
         }
-        let prior: RecordLogRow? = mutation.kind == .create ? ["id": .string(mutation.id)] : try table.row(key)
-        guard var row = prior else { continue }
-        for (field, value) in mutation.fields ?? [:] { row[field] = value }
-        for (field, deltas) in mutation.stringSetDeltas ?? [:] {
-            var members = row[field]?.arrayValue?.compactMap(\.stringValue) ?? []
-            for (member, present) in deltas {
-                if present {
-                    members.append(member)
-                } else {
-                    members.removeAll { recordLogSameText($0, member) }
-                }
-            }
-            row[field] = .array(recordLogCanonicalStringSet(members).map { .string($0) })
-        }
-        try table.set(key, row)
     }
     return touched
+}
+
+/// A record's row after one mutation applied as a plain row operation, with no
+/// stamps and no rules: a create is `{ id, ...fields }` with its string-set
+/// deltas applied to empty sets; a patch sets its fields and applies its
+/// deltas on a record that shows a row and does nothing on one that does not;
+/// a delete removes the row. String sets are kept in code point order. The
+/// room vouches for a compact acknowledgement by this rule (js-bao's
+/// `plainRowAfter`).
+///
+/// - Returns: the row after it, or `nil` when the record shows none.
+func recordLogPlainRowAfter(_ row: RecordLogRow?, _ mutation: RecordLogMutation) -> RecordLogRow? {
+    if mutation.kind == .delete { return nil }
+    let prior: RecordLogRow? = mutation.kind == .create ? ["id": .string(mutation.id)] : row
+    guard var next = prior else { return nil }
+    for (field, value) in mutation.fields ?? [:] { next[field] = value }
+    for (field, deltas) in mutation.stringSetDeltas ?? [:] {
+        var members = next[field]?.arrayValue?.compactMap(\.stringValue) ?? []
+        for (member, present) in deltas {
+            if present {
+                members.append(member)
+            } else {
+                members.removeAll { recordLogSameText($0, member) }
+            }
+        }
+        next[field] = .array(recordLogCanonicalStringSet(members).map { .string($0) })
+    }
+    return next
 }
 
 /// Apply one record's change from a result to a table of confirmed rows.

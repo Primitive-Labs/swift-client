@@ -5,6 +5,7 @@ import XCTest
 /// replayed through the record-log STORE: a `RecordLogStore` over a real
 /// `SQLiteStorageProvider`, driven through `beginReceipt`, `applyLoadChunk`,
 /// `completeLoad`, `beginFencedCatchUp`, `applySegmentChunk`,
+/// `keepSegmentChunk` (a chunk the model kept, #4394),
 /// `applySegmentCorrections`, `applyCatchUpPage` and `completeCatchUp` with
 /// their generation and receipt, as js-bao's `replayLoadTraceThroughStore`
 /// drives its store. After every event the store's state must equal the
@@ -39,16 +40,23 @@ final class RecordLogLoadTraceStoreHermeticTests: XCTestCase {
         var projectedBad = 0
         var events = 0
         var first = ""
+        var kept = 0
+        var mismatched = 0
         for trace in traces {
             let result = try RecordLogStoreLoadTraceReplay.replayLoadTrace(trace, provider: provider, spec: traceSpec)
             bad += result.bad
             projectedBad += result.checkedBad
+            kept += result.kept
+            mismatched += result.mismatched
             events += trace.events.count
             if first.isEmpty { first = result.first }
         }
         XCTAssertGreaterThan(events, 700)
         XCTAssertEqual(bad, 0, first)
         XCTAssertEqual(projectedBad, 0, first)
+        // Every chunk the model kept is kept by the store (#4394).
+        XCTAssertGreaterThan(kept, 0)
+        XCTAssertEqual(mismatched, 0, first)
     }
 }
 
@@ -161,9 +169,10 @@ enum RecordLogStoreLoadTraceReplay {
                     writer: writer, rows: rows, gone: gone, generation: generation, project: project
                 ).stale, "a page")
             },
-            complete: { lsn, high, full, generation, receipt in
+            complete: { lsn, high, full, generation, receipt, segment in
                 try fresh(try store.completeCatchUp(
-                    writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, project: project
+                    writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment,
+                    project: project
                 ).stale, "a completion")
             },
             beginReceipt: { kind, id in try store.beginReceipt(writer: writer, kind: kind, id: id).attempt },
@@ -186,6 +195,14 @@ enum RecordLogStoreLoadTraceReplay {
                 try fresh(try store.applySegmentCorrections(
                     writer: writer, generation: generation, attempt: attempt, lines: lines, project: project
                 ).stale, "the corrections")
+            },
+            keep: { generation, attempt, segmentId, chunk in
+                let reply = try store.keepSegmentChunk(
+                    writer: writer, generation: generation, attempt: attempt, segmentId: segmentId, object: chunk.object,
+                    sha256: chunk.sha256, model: chunk.model, firstId: chunk.firstId, lastId: chunk.lastId, rows: chunk.rows
+                )
+                try fresh(reply.stale, "a kept chunk")
+                return !reply.mismatch
             },
             snapshot: { handedBack in
                 let marks = try store.marks()

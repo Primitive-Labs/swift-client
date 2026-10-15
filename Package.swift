@@ -120,9 +120,10 @@ let package = Package(
             // target's path tree but compiles as its own executable
             // target (`E2EMiniApp`) — exclude here so SwiftPM
             // doesn't pull the same Swift sources into both target
-            // compilations. The session-row fixtures (#3802) are JSON the
-            // JS and Swift suites both read by path, not bundle resources.
-            exclude: ["CrossPlatform/E2E", "Fixtures/AgentSessionRows"]
+            // compilations. The session-row fixtures (#3802) and the bulk-load
+            // chunk fixtures (#4475) are JSON the JS and Swift suites both
+            // read by path, not bundle resources.
+            exclude: ["CrossPlatform/E2E", "Fixtures/AgentSessionRows", "Fixtures/DocumentIngestChunks"]
         ),
         .testTarget(
             name: "SwiftBaoCodegenTests",

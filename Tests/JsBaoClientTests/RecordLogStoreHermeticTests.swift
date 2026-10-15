@@ -98,7 +98,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         XCTAssertEqual(try columns(provider, "record_log_state"), [
             "doc_id TEXT", "cursor INTEGER", "open_epoch INTEGER", "grant_epoch INTEGER", "epoch_entries INTEGER",
             "constraints TEXT", "last_catch_up_at INTEGER", "permission TEXT", "rows_gen INTEGER", "replacing INTEGER",
-            "receipt TEXT",
+            "receipt TEXT", "segment TEXT",
         ])
         XCTAssertEqual(try columns(provider, "record_log_writers"), [
             "doc_id TEXT", "client_id TEXT", "writer TEXT", "next_seq INTEGER", "resumed_at INTEGER",

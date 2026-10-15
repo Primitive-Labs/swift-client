@@ -108,6 +108,15 @@ protocol RecordLogReceiptTables: RecordLogTables {
     func forgetLoad(_ attempt: String) throws
     /// Forget the records every receipt but `attempts` named.
     func keepLoads(_ attempts: [String]) throws
+    /// The segment the confirmed rows were last replaced from, or `nil`.
+    func heldSegment() throws -> RecordLogHeldSegment?
+    /// Record the segment a full replacement's completion replaced the rows from (`nil`: none).
+    func setHeldSegment(_ segment: RecordLogHeldSegment?) throws
+    /// Under the full replacement in progress, keep the confirmed rows of
+    /// `model` with ids in `[firstId, lastId]` (rows of no other replacement)
+    /// when there are exactly `rows` of them, as though it had put them.
+    /// Answers whether it did; when not, nothing changed.
+    func keepConfirmedRange(model: String, firstId: String, lastId: String, rows: Int) throws -> Bool
 }
 
 /// What a refusal did.
@@ -120,6 +129,18 @@ struct RecordLogRefusalOutcome: Sendable {
     var frames: [RecordLogUpFrame] = []
 }
 
+/// A compact acknowledgement the client could not derive: no unwithdrawn
+/// pending entry of `writer` has its `seq`. It waits at `l`, and the session
+/// opens the document again from the cursor so the catch-up carries the row.
+struct RecordLogUnderivableAck: Equatable, Sendable {
+    /// The acknowledged entry's log number.
+    var l: Int
+    /// The writer it names.
+    var writer: String
+    /// The sequence number it names.
+    var seq: Int
+}
+
 /// What a received item did.
 struct RecordLogReceiveOutcome: Sendable {
     /// Records whose view may have moved.
@@ -128,6 +149,8 @@ struct RecordLogReceiveOutcome: Sendable {
     var acknowledged: [RecordLogEntryRef] = []
     /// Writer entries that left the pending log.
     var settled: [RecordLogEntryRef] = []
+    /// A compact acknowledgement at the cursor that could not be derived, which holds every later result back.
+    var underivable: RecordLogUnderivableAck?
 }
 
 /// A catch-up's content: changed rows, or the whole table.
@@ -234,6 +257,12 @@ final class RecordLogRules {
     /// store acknowledges that writer's entry at once; the entry leaves the
     /// pending log, and its guess the view, once its result's row is applied.
     /// `void` and `duplicate` items settle the entry they name.
+    ///
+    /// A compact acknowledgement (no `changes`) is applied, in its turn, by its
+    /// pending entry's mutations as plain row operations, the rule by which the
+    /// room vouched for it. With no unwithdrawn pending entry for its `seq` it
+    /// stays buffered, the cursor stops below it, and the outcome names it
+    /// (`underivable`).
     func receive(_ item: RecordLogResultItem) throws -> RecordLogReceiveOutcome {
         var out = RecordLogReceiveOutcome()
         switch item {
@@ -268,9 +297,14 @@ final class RecordLogRules {
             if result.l > (try tables.cursor()) {
                 tables.buffer(result)
                 while let next = tables.buffered(try tables.cursor() + 1) {
-                    for change in next.changes {
-                        try recordLogApplyChange(confirmed, change)
-                        out.touched.append(RecordLogRecordKey(model: change.model, id: change.id))
+                    if let changes = next.changes {
+                        for change in changes {
+                            try recordLogApplyChange(confirmed, change)
+                            out.touched.append(RecordLogRecordKey(model: change.model, id: change.id))
+                        }
+                    } else if try !applyOwnEntry(confirmed, next, &out) {
+                        out.underivable = RecordLogUnderivableAck(l: next.l, writer: next.w ?? "", seq: next.seq ?? 0)
+                        break
                     }
                     try tables.setCursor(next.l)
                     tables.dropBufferedThrough(next.l)
@@ -284,6 +318,27 @@ final class RecordLogRules {
             try settleAcknowledged(&out)
             return out
         }
+    }
+
+    /// A compact acknowledgement's changes, derived: the mutations of the
+    /// pending entry it names applied in order to the confirmed rows as plain
+    /// row operations. Answers `false`, changing nothing, when no unwithdrawn
+    /// pending entry of a writer of this store has its `seq`.
+    private func applyOwnEntry(
+        _ confirmed: RecordLogRowTable, _ item: RecordLogResult, _ out: inout RecordLogReceiveOutcome
+    ) throws -> Bool {
+        guard let w = item.w, let seq = item.seq, try tables.isWriter(w),
+              let entry = try tables.pendingEntry(w, seq), !entry.isVoid
+        else { return false }
+        for mutation in entry.mutations {
+            if let row = recordLogPlainRowAfter(try confirmed.row(mutation.key), mutation) {
+                try confirmed.set(mutation.key, row)
+            } else if mutation.kind == .delete {
+                try confirmed.delete(mutation.key)
+            }
+            out.touched.append(mutation.key)
+        }
+        return true
     }
 
     /// Acknowledged entries whose result's row the cursor has passed leave the
@@ -451,12 +506,18 @@ final class RecordLogRules {
     /// - Parameters:
     ///   - generation: The replacement's generation, checked before anything is removed.
     ///   - receipt: The receipt attempt it completes: that attempt's changes are the room's now.
+    ///   - segment: For a segment's replacement, the segment and its chunks: the store holds them from now.
     func completeCatchUp(
-        lsn: Int, high: Int?, full: Bool, generation: Int? = nil, receipt: String? = nil
+        lsn: Int, high: Int?, full: Bool, generation: Int? = nil, receipt: String? = nil, segment: RecordLogHeldSegment? = nil
     ) throws -> RecordLogReceiveOutcome {
         try assertGeneration(generation)
         var out = RecordLogReceiveOutcome()
-        if full { out.touched.append(contentsOf: try tables.completeReplace()) }
+        if full {
+            out.touched.append(contentsOf: try tables.completeReplace())
+            // The marker describes the rows of the generation that completed:
+            // any other replacement's leaves none.
+            try (tables as? RecordLogReceiptTables)?.setHeldSegment(segment)
+        }
         // A completed receipt leaves its own changes the room's, and a full
         // replacement every change made before it began; a receipt that changed
         // rows after stays in progress.
@@ -470,6 +531,7 @@ final class RecordLogRules {
             out.touched.append(contentsOf: replay.touched)
             out.acknowledged.append(contentsOf: replay.acknowledged)
             out.settled.append(contentsOf: replay.settled)
+            if let underivable = replay.underivable { out.underivable = underivable }
         }
         try settleAcknowledged(&out)
         return out
@@ -623,6 +685,39 @@ final class RecordLogRules {
         return touched
     }
 
+    /// Keep one chunk of a segment from the rows the store holds instead of
+    /// reading it, under the replacement `generation` as receipt `attempt`. The
+    /// rows are kept only when the held segment's marker lists the same object
+    /// with the same digest, row count and range, no other receipt attempt is
+    /// in progress, and the confirmed rows of that range number exactly `rows`;
+    /// otherwise nothing changes and it answers ``RecordLogKeepOutcome/mismatch``,
+    /// and the chunk is read. A kept row the room changed after the new segment
+    /// began is corrected by its corrections or the pages after them.
+    ///
+    /// - Throws: ``RecordLogStaleReplacementError`` under a superseded
+    ///   generation; ``RecordLogStaleReceiptError`` for an attempt no longer in progress.
+    func keepSegmentChunk(
+        generation: Int, attempt: String, object: String, sha256: String, model: String, firstId: String, lastId: String,
+        rows: Int
+    ) throws -> RecordLogKeepOutcome {
+        try assertGeneration(generation)
+        let receiving = try receiptTables()
+        guard let state = try receiving.receipts(), state.attempts.contains(where: { $0.attempt == attempt }) else {
+            throw RecordLogStaleReceiptError(attempt: attempt)
+        }
+        let entry = try receiving.heldSegment()?.chunks.first { $0.object == object }
+        let same = entry.map {
+            $0.model == model && $0.sha256 == sha256 && $0.rows == rows && $0.firstId == firstId && $0.lastId == lastId
+        } ?? false
+        // Another attempt's committed chunks may hold rows the room does not.
+        let alone = state.attempts.allSatisfy { $0.attempt == attempt }
+        guard same, alone, try receiving.keepConfirmedRange(model: model, firstId: firstId, lastId: lastId, rows: rows) else {
+            return .mismatch
+        }
+        try touchReceipt(attempt)
+        return .kept(rows: rows, ranges: [RecordLogIdRange(model: model, firstId: firstId, lastId: lastId)])
+    }
+
     /// Apply a segment's corrections under the replacement `generation`: a row
     /// replaces the record's, a `nil` deletes it (one the chunks did not carry
     /// changes nothing).
@@ -670,9 +765,12 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
     /// The records a full replacement has put, in the order it put them.
     private var replaced: [RecordLogRecordKey]?
     private var replacingSet = Set<RecordLogRecordKey>()
+    /// The records interrupted replacements put since the last completion: not of the confirmed generation.
+    private var interruptedSet = Set<RecordLogRecordKey>()
     /// Counts the replacements begun; the one in progress is the latest.
     private var generationValue = 0
     private var receiptValue: RecordLogReceiptState?
+    private var heldValue: RecordLogHeldSegment?
     /// Per receipt attempt, the records its load's chunks named.
     private var loadKeys: [String: Set<RecordLogRecordKey>] = [:]
     private var held: [Int: RecordLogResult] = [:]
@@ -740,6 +838,8 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
     }
 
     func beginReplace() {
+        // A row an interrupted attempt put stays unconfirmed, as its generation does in the store.
+        interruptedSet.formUnion(replacingSet)
         replaced = []
         replacingSet = []
         generationValue += 1
@@ -764,6 +864,24 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
 
     func forgetLoad(_ attempt: String) { loadKeys[attempt] = nil }
 
+    func heldSegment() -> RecordLogHeldSegment? { heldValue }
+    func setHeldSegment(_ segment: RecordLogHeldSegment?) { heldValue = segment }
+
+    func keepConfirmedRange(model: String, firstId: String, lastId: String, rows: Int) -> Bool {
+        guard replaced != nil else { return false }
+        let within = self.rows.order.filter { key in
+            key.model == model && !replacingSet.contains(key) && !interruptedSet.contains(key)
+                && RecordLogChunkReader.compareIds(key.id, firstId) >= 0 && RecordLogChunkReader.compareIds(key.id, lastId) <= 0
+        }
+        guard within.count == rows else { return false }
+        // Kept in the chunk's order, as reading it would have put them.
+        for key in within.sorted(by: { RecordLogChunkReader.compareIds($0.id, $1.id) < 0 }) {
+            replacingSet.insert(key)
+            replaced?.append(key)
+        }
+        return true
+    }
+
     func keepLoads(_ attempts: [String]) {
         let kept = Set(attempts)
         loadKeys = loadKeys.filter { kept.contains($0.key) }
@@ -777,6 +895,7 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
         let keptSet = replacingSet
         replaced = nil
         replacingSet = []
+        interruptedSet = []
         // The room's table, in the room's order: the rows the replacement put.
         let next = RecordLogMapRowTable()
         for key in kept { if let row = rows.row(key) { next.set(key, row) } }

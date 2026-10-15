@@ -231,6 +231,65 @@ enum RecordLogReceiptHarness {
             ]
         }
 
+        /// Publish a segment's row chunks and corrections behind a grant; answers
+        /// its pointer. A reused chunk is an earlier segment's object: its path
+        /// is `{sourceSegmentId}/{model}/{index}` and it carries `source`.
+        func publishSegment(
+            segmentId: String, lsn: Int, completedLsn: Int, chunks: [PublishedChunk],
+            corrections: [(String, [String: JSONValue])], objects: SegmentObjects
+        ) -> JSONValue {
+            grants += 1
+            let base = "/doc-artifact/segment-grant\(grants)"
+            var listed: [JSONValue] = []
+            var own = 0
+            var total = 0
+            for chunk in chunks {
+                switch chunk {
+                case .reuse(let object):
+                    guard let found = objects.get(object) else { preconditionFailure("no object \(object) was published") }
+                    let index = found.entry["index"]?.wholeNumber ?? 0
+                    let path = "\(found.segmentId)/Note/\(index)"
+                    connection.put("\(base)/\(path)", found.body)
+                    var entry = found.entry
+                    entry["path"] = .string(path)
+                    entry["source"] = .object(["segmentId": .string(found.segmentId)])
+                    total += entry["rows"]?.wholeNumber ?? 0
+                    listed.append(.object(entry))
+                case .rows(let rows):
+                    let text = rows.map { "\($0["id"]?.stringValue ?? "")\t\(RecordLogJSON.text(.object($0)))\n" }.joined()
+                    let raw = Data(text.utf8)
+                    let body = GzipFixture.gzip(raw)
+                    let path = "Note/\(own)"
+                    connection.put("\(base)/\(path)", body)
+                    let entry: [String: JSONValue] = [
+                        "model": "Note", "index": .number(Double(own)), "path": .string(path), "rows": .number(Double(rows.count)),
+                        "bytes": .number(Double(body.count)), "rawBytes": .number(Double(raw.count)),
+                        "sha256": .string(RecordLogReceiptHarness.sha256(body)),
+                        "firstId": rows.first?["id"] ?? "", "lastId": rows.last?["id"] ?? "",
+                    ]
+                    objects.put("\(segmentId)/Note/\(own)", entry: entry, body: body, segmentId: segmentId)
+                    own += 1
+                    total += rows.count
+                    listed.append(.object(entry))
+                }
+            }
+            let correctionsText = corrections.map { "\($0.0)\t\(RecordLogJSON.text(.object($0.1)))\n" }.joined()
+            let correctionsRaw = Data(correctionsText.utf8)
+            let correctionsBody = GzipFixture.gzip(correctionsRaw)
+            connection.put("\(base)/corrections", correctionsBody)
+            return .object([
+                "segmentId": .string(segmentId), "lsn": .number(Double(lsn)), "completedLsn": .number(Double(completedLsn)),
+                "rows": .number(Double(total)),
+                "download": .object(["path": .string(base), "expiresAt": 9_999_999_999_999]),
+                "chunks": .array(listed),
+                "corrections": .object([
+                    "rows": .number(Double(corrections.count)), "bytes": .number(Double(correctionsBody.count)),
+                    "rawBytes": .number(Double(correctionsRaw.count)),
+                    "sha256": .string(RecordLogReceiptHarness.sha256(correctionsBody)), "path": "corrections",
+                ]),
+            ])
+        }
+
         /// Publish a segment's row chunk and corrections behind a grant; answers its pointer.
         func publishSegment(
             segmentId: String, lsn: Int, completedLsn: Int, rows: [[String: JSONValue]],
@@ -263,6 +322,26 @@ enum RecordLogReceiptHarness {
                 ]),
             ])
         }
+    }
+
+    /// One chunk of a published segment (#4394): rows written by it, or an
+    /// earlier segment's object reused by reference.
+    enum PublishedChunk {
+        case rows([[String: JSONValue]])
+        case reuse(String)
+    }
+
+    /// The segment objects published so far, by `{segmentId}/{model}/{index}`:
+    /// their pointer entries and bytes, shared by every session of one store.
+    final class SegmentObjects: @unchecked Sendable {
+        private let lock = NSLock()
+        private var objects: [String: (entry: [String: JSONValue], body: Data, segmentId: String)] = [:]
+        func put(_ object: String, entry: [String: JSONValue], body: Data, segmentId: String) {
+            lock.withLock { objects[object] = (entry, body, segmentId) }
+        }
+        func get(_ object: String) -> (entry: [String: JSONValue], body: Data, segmentId: String)? { lock.withLock { objects[object] } }
+        /// An object's pointer entry, as the segment that wrote it lists it.
+        func entry(_ object: String) -> JSONValue? { get(object).map { .object($0.entry) } }
     }
 
     static func sha256(_ data: Data) -> String {

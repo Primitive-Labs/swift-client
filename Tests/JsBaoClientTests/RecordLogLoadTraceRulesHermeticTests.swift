@@ -13,12 +13,16 @@ import XCTest
 /// - `loadRemainder`: its rows and gone records as a catch-up page, completed
 ///   at its log number as the receipt; on a reconnect the outcomes are settled
 ///   and the epochs and constraints recorded, as a catch-up's are.
-/// - `segment`: a replacement under its generation: the chunks' rows, the
+/// - `segment`: a replacement under its generation: the chunks' rows (a chunk
+///   the model kept is kept through `keepSegmentChunk` instead, #4394), the
 ///   corrections, the rows changed since `C`, completed at `upTo`.
 /// - the seven kinds of the golden traces, as their replay drives them.
 final class RecordLogLoadTraceRulesHermeticTests: XCTestCase {
 
-    static let receiptCases = ["aborted", "failed", "held", "live", "reconnect", "recreated", "refresh", "refused-gone", "segment"]
+    static let receiptCases = [
+        "aborted", "failed", "held", "live", "reconnect", "recreated", "refresh", "refused-gone", "segment", "segment-kept",
+        "segment-tombstone-rewrite",
+    ]
 
     func testTheFileHoldsEveryKindAndEveryReceiptCase() throws {
         let schedules = try RecordLogTraceFixture.loadReceiptSchedules()
@@ -35,16 +39,23 @@ final class RecordLogLoadTraceRulesHermeticTests: XCTestCase {
         var events = 0
         var first = ""
         var leaked = 0
+        var kept = 0
+        var mismatched = 0
         for trace in traces {
             let result = try RecordLogLoadTraceReplay.inMemory(trace)
             bad += result.bad
             leaked += result.leakedLoadKeys
+            kept += result.kept
+            mismatched += result.mismatched
             events += trace.events.count
             if first.isEmpty { first = result.first }
         }
         XCTAssertGreaterThan(events, 700)
         XCTAssertEqual(bad, 0, first)
         XCTAssertEqual(leaked, 0, "no receipt's load keys outlive it")
+        // Every chunk the model kept is kept by the rules (#4394).
+        XCTAssertGreaterThan(kept, 0)
+        XCTAssertEqual(mismatched, 0, first)
     }
 }
 
@@ -66,12 +77,16 @@ enum RecordLogLoadTraceReplay {
         var constraints: (_ names: JSONValue?) throws -> Void
         var beginCatchUp: (_ full: Bool) throws -> Int?
         var page: (_ rows: [RecordLogCatchUpRow], _ gone: [RecordLogRecordKey], _ generation: Int?) throws -> Void
-        var complete: (_ lsn: Int, _ high: Int?, _ full: Bool, _ generation: Int?, _ receipt: String?) throws -> Void
+        var complete: (
+            _ lsn: Int, _ high: Int?, _ full: Bool, _ generation: Int?, _ receipt: String?, _ segment: RecordLogHeldSegment?
+        ) throws -> Void
         var beginReceipt: (_ kind: RecordLogReceiptKind, _ id: String) throws -> String
         var loadLines: (_ attempt: String, _ model: String, _ lines: [RecordLogLoadLine]) throws -> Void
         var completeLoad: (_ attempt: String, _ mode: RecordLogLoadMode, _ models: [String]) throws -> Void
         var segmentRows: (_ generation: Int, _ attempt: String, _ rows: [RecordLogCatchUpRow]) throws -> Void
         var segmentCorrections: (_ generation: Int, _ attempt: String, _ lines: [RecordLogCorrection]) throws -> Void
+        /// Keep a held chunk (#4394); answers whether the client kept it (`false`: it answered mismatch).
+        var keep: (_ generation: Int, _ attempt: String, _ segmentId: String, _ chunk: RecordLogHeldSegmentChunk) throws -> Bool
         /// The client's state as the model records it, `handedBack` included.
         var snapshot: (_ handedBack: [Int]) throws -> JSONValue
     }
@@ -82,6 +97,10 @@ enum RecordLogLoadTraceReplay {
         var checkedBad = 0
         var first = ""
         var leakedLoadKeys = 0
+        /// Segment chunks kept through the keep command (#4394).
+        var kept = 0
+        /// Kept chunks the client answered mismatch for, where the model kept them.
+        var mismatched = 0
     }
 
     /// Replay `trace`; `check` runs after every event and answers a difference to report, or `nil`.
@@ -160,7 +179,7 @@ enum RecordLogLoadTraceReplay {
                     try ops.page(F.rowsOf(input["changed"]), F.goneOf(input["changed"]), generation)
                 }
                 try ops.complete(
-                    Int(input["lsn"]?.numberValue ?? 0), input["high"]?.numberValue.map { Int($0) }, full, generation, nil
+                    Int(input["lsn"]?.numberValue ?? 0), input["high"]?.numberValue.map { Int($0) }, full, generation, nil, nil
                 )
                 try learn(input, &calls)
             case "load":
@@ -183,7 +202,7 @@ enum RecordLogLoadTraceReplay {
                     RecordLogRecordKey(model: F.model, id: $0)
                 }, nil)
                 try ops.complete(
-                    Int(input["lsn"]?.numberValue ?? 0), input["high"]?.numberValue.map { Int($0) }, false, nil, attempt
+                    Int(input["lsn"]?.numberValue ?? 0), input["high"]?.numberValue.map { Int($0) }, false, nil, attempt, nil
                 )
                 attempt = nil
                 if reconnect { try learn(input, &calls) }
@@ -193,12 +212,27 @@ enum RecordLogLoadTraceReplay {
                 guard let generation = try ops.beginCatchUp(true) else {
                     throw JsBaoError(code: .unavailable, message: "a full catch-up answered no generation")
                 }
-                try ops.segmentRows(generation, segmentAttempt, F.segmentRows(input))
+                // A chunk the model kept from the rows it held is kept here too (#4394).
+                let segmentId = input["segmentId"]?.stringValue ?? ""
+                let held = F.heldSegment(input)
+                for (at, chunk) in (input["chunks"]?.arrayValue ?? []).enumerated() {
+                    if chunk["kept"]?.boolValue == true {
+                        result.kept += 1
+                        if try !ops.keep(generation, segmentAttempt, segmentId, held.chunks[at]) {
+                            result.mismatched += 1
+                            if result.first.isEmpty {
+                                result.first = "client \(trace.id) event \(n) (segment): the client would not keep \(held.chunks[at].object)"
+                            }
+                        }
+                        continue
+                    }
+                    try ops.segmentRows(generation, segmentAttempt, F.chunkRows(chunk))
+                }
                 try ops.segmentCorrections(generation, segmentAttempt, F.corrections(input))
                 try ops.page(F.rowsOf(input["changed"]), F.goneOf(input["changed"]), generation)
                 try ops.complete(
                     Int(input["upTo"]?.numberValue ?? 0), input["high"]?.numberValue.map { Int($0) }, true, generation,
-                    segmentAttempt
+                    segmentAttempt, held
                 )
                 try learn(input, &calls)
             default:
@@ -257,8 +291,10 @@ enum RecordLogLoadTraceReplay {
             page: { rows, gone, generation in
                 _ = try rules.applyCatchUpPage(RecordLogCatchUpInput(rows: rows, gone: gone), generation: generation)
             },
-            complete: { lsn, high, full, generation, receipt in
-                _ = try rules.completeCatchUp(lsn: lsn, high: high, full: full, generation: generation, receipt: receipt)
+            complete: { lsn, high, full, generation, receipt, segment in
+                _ = try rules.completeCatchUp(
+                    lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment
+                )
             },
             beginReceipt: { kind, id in try rules.beginReceipt(RecordLogReceipt(kind: kind, id: id)) },
             loadLines: { attempt, model, lines in _ = try rules.applyLoadLines(attempt: attempt, model: model, lines: lines) },
@@ -268,6 +304,12 @@ enum RecordLogLoadTraceReplay {
             },
             segmentCorrections: { generation, attempt, lines in
                 _ = try rules.applySegmentCorrections(generation: generation, attempt: attempt, lines: lines)
+            },
+            keep: { generation, attempt, _, chunk in
+                try rules.keepSegmentChunk(
+                    generation: generation, attempt: attempt, object: chunk.object, sha256: chunk.sha256, model: chunk.model,
+                    firstId: chunk.firstId, lastId: chunk.lastId, rows: chunk.rows
+                ) != .mismatch
             },
             snapshot: { handedBack in
                 let epochs = tables.epochs()

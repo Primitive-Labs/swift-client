@@ -60,7 +60,7 @@ const STEP_KEYS = [
   "model", "configId", "callId", "toolName", "functionName", "functionVersion", "inputTokens",
   "outputTokens", "totalTokens", "reasoningTokens", "cachedInputTokens", "cost",
   "historyMessageIds", "errorCode", "errorMessage", "historyMode", "historySelection",
-  "providerDurationMs",
+  "providerDurationMs", "resolvedByUserId",
 ];
 
 function project(model, row) {

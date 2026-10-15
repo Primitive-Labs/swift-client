@@ -381,8 +381,10 @@ struct RecordLogResult: Equatable, Sendable {
     var l: Int
     /// The entry's epoch.
     var e: Int
-    /// What it changed.
-    var changes: [RecordLogChange]
+    /// What it changed. `nil` only in a compact acknowledgement: the writer's
+    /// own item for an entry the room applied as written, whose changes the
+    /// client derives from its pending entry. `[]` means nothing visible changed.
+    var changes: [RecordLogChange]?
     /// The upsert's resolution, when there was one.
     var alias: RecordLogAlias?
     /// The writer, on the acknowledging connection only.
@@ -413,7 +415,7 @@ enum RecordLogResultItem: Equatable, Sendable {
         guard let l = object["l"]?.wholeNumber, let e = object["e"]?.wholeNumber else { return nil }
         self = .result(RecordLogResult(
             l: l, e: e,
-            changes: (object["changes"]?.arrayValue ?? []).compactMap { RecordLogChange(json: $0) },
+            changes: object["changes"]?.arrayValue.map { $0.compactMap { RecordLogChange(json: $0) } },
             alias: RecordLogAlias(json: object["alias"]),
             w: object["w"]?.stringValue,
             seq: object["seq"]?.wholeNumber

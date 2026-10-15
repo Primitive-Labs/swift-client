@@ -114,13 +114,16 @@ private func recordLogBadValue(_ value: JSONValue, _ path: String) -> String? {
     }
 }
 
-/// Why a field name is the room's own, or `nil` when a record may carry it:
-/// `type` is the model's column in queries and a leading `_` is internal;
-/// `id` is allowed. The one rule js-bao's `checkReservedFieldName` states.
+/// Why a field name is reserved, or `nil` when a record may carry it:
+/// `type` is the model's column in queries, a leading `_` is internal, and a
+/// name in `ReservedFieldNames` breaks a generated model on the JavaScript or
+/// the Swift client; `id` is allowed. The one rule js-bao's
+/// `checkReservedFieldName` states, with the same sentence.
 func recordLogReservedFieldProblem(_ field: String) -> String? {
     if field == "id" { return nil }
     if field == "type" { return "Field 'type' is reserved (maps to internal _type column in queries)" }
     if field.hasPrefix("_") { return "Field '\(field)' is reserved (fields starting with '_' are internal)" }
+    if let reason = ReservedFieldNames.reasons[field] { return "Field '\(field)' is reserved (\(reason))" }
     return nil
 }
 
@@ -141,8 +144,9 @@ func recordLogLocalRefusal(
 }
 
 /// Refuse an entry the room would not take, before anything commits: a field
-/// named `type` or beginning with `_`, or a value that is not finite or an
-/// integer outside ±2^53 (`.documentEntryInvalid`), or
+/// `recordLogReservedFieldProblem` reserves (`type`, a leading `_`, or a name
+/// that breaks a generated model on either client), or a value that is not
+/// finite or an integer outside ±2^53 (`.documentEntryInvalid`), or
 /// an entry whose JSON is over 1 MiB (`.documentEntryTooLarge`). The refusal
 /// is reported through `report` with the one write it refused, then thrown.
 func assertRecordLogEntry(

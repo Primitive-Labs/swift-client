@@ -947,7 +947,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             direction: options?.direction ?? .forward,
             hasMore: hasMore,
             isFirstPage: isFirstPage,
-            aliasedSortFields: aliasedSortFields
+            aliasedSortFields: aliasedSortFields,
+            sortDirections: resolved.directions
         )
         rows = rows.map {
             CursorManager.stripSortValueAliases(

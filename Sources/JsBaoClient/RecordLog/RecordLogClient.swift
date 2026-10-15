@@ -16,6 +16,8 @@ final class RecordLogClientState: @unchecked Sendable {
     private var _engineHost: ObjectIdentifier?
     private var _bindings: [String: RecordLogDocumentBinding] = [:]
     private var _sessions: [String: RecordLogSession] = [:]
+    /// Each document's writer history, kept while the client keeps its connection id.
+    private var _histories: [String: RecordLogWriterHistory] = [:]
     private var _resolvedFormats: [String: Int] = [:]
     private var _resolving: Set<String> = []
     private var _unresolved: Set<String> = []
@@ -47,6 +49,16 @@ final class RecordLogClientState: @unchecked Sendable {
 
     func binding(_ documentId: String) -> RecordLogDocumentBinding? { lock.withLock { _bindings[documentId] } }
     func session(_ documentId: String) -> RecordLogSession? { lock.withLock { _sessions[documentId] } }
+
+    /// What `documentId`'s earlier sessions on this connection id left; one per document.
+    func history(_ documentId: String) -> RecordLogWriterHistory {
+        lock.withLock {
+            if let kept = _histories[documentId] { return kept }
+            let made = RecordLogWriterHistory()
+            _histories[documentId] = made
+            return made
+        }
+    }
     var bindings: [(String, RecordLogDocumentBinding)] { lock.withLock { _bindings.map { ($0.key, $0.value) } } }
     var sessions: [RecordLogSession] { lock.withLock { Array(_sessions.values) } }
     var isEmpty: Bool { lock.withLock { _bindings.isEmpty } }
@@ -99,6 +111,7 @@ final class RecordLogClientState: @unchecked Sendable {
             let open = _bindings.compactMap { id, binding in _sessions[id].map { (id, binding, $0) } }
             _bindings = [:]
             _sessions = [:]
+            _histories = [:]
             _clientId = nil
             return open
         }
@@ -330,7 +343,8 @@ extension JsBaoClient {
                     self?.recordLogSyncProgress(documentId)
                 }
             ),
-            logger: logger
+            logger: logger,
+            history: recordLogState.history(documentId)
         )
         await session.attach()
         recordLogState.set(binding, session, for: documentId)

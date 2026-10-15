@@ -6,8 +6,64 @@ import Foundation
 /// (`decompressGzip` in `src/client/utils/binary.ts`); Swift used to drop the
 /// frame, which is silently lossy the moment compression is turned on (#2661).
 ///
-/// Only decoding is implemented — the client never compresses an upload.
+/// Encoding is for the chunks of a bulk load (`DocumentIngestsAPI.buildChunks`),
+/// which upload gzipped.
 enum Gzip {
+
+    /// Encode `data` as one gzip member: raw DEFLATE from the Compression
+    /// framework, with the header's variable fields fixed (MTIME 0, XFL 0,
+    /// OS 3) as the JS client fixes them, so the same bytes in give the same
+    /// member out on this platform.
+    static func gzip(_ data: Data) -> Data {
+        var out = Data([0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03])
+        out.append(deflateRaw(data))
+        var crc = crc32(data).littleEndian
+        withUnsafeBytes(of: &crc) { out.append(contentsOf: $0) }
+        var size = UInt32(truncatingIfNeeded: data.count).littleEndian
+        withUnsafeBytes(of: &size) { out.append(contentsOf: $0) }
+        return out
+    }
+
+    /// Raw DEFLATE of `data`. `COMPRESSION_ZLIB` is raw DEFLATE, as for decoding.
+    private static func deflateRaw(_ data: Data) -> Data {
+        // The empty input's stream: one final fixed-Huffman block holding only
+        // its end marker.
+        guard !data.isEmpty else { return Data([0x03, 0x00]) }
+        // DEFLATE's worst case is a few bytes per stored block beyond the input.
+        let capacity = data.count + data.count / 64 + 64 * 1024
+        var destination = Data(count: capacity)
+        let written = destination.withUnsafeMutableBytes { dst -> Int in
+            data.withUnsafeBytes { src -> Int in
+                compression_encode_buffer(
+                    dst.bindMemory(to: UInt8.self).baseAddress!, capacity,
+                    src.bindMemory(to: UInt8.self).baseAddress!, data.count,
+                    nil, COMPRESSION_ZLIB
+                )
+            }
+        }
+        return destination.prefix(written)
+    }
+
+    /// The CRC-32 (IEEE 802.3) table, one entry per byte value.
+    private static let crcTable: [UInt32] = (0..<256).map { value in
+        var crc = UInt32(value)
+        for _ in 0..<8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0 &- (crc & 1)))
+        }
+        return crc
+    }
+
+    /// CRC-32 of `data`, as a gzip trailer carries it.
+    static func crc32(_ data: Data) -> UInt32 {
+        let table = crcTable
+        var crc: UInt32 = 0xffff_ffff
+        data.withUnsafeBytes { raw in
+            for byte in raw.bindMemory(to: UInt8.self) {
+                crc = (crc >> 8) ^ table[Int((crc ^ UInt32(byte)) & 0xff)]
+            }
+        }
+        return crc ^ 0xffff_ffff
+    }
 
     /// Decode one gzip member, or `nil` if the bytes are not a well-formed
     /// gzip stream. Callers treat `nil` like a dropped frame rather than

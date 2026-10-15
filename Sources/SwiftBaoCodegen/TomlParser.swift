@@ -21,6 +21,9 @@ enum CodegenError: Error, CustomStringConvertible {
     /// A unique constraint on a stringset field (#3719); `message` is the
     /// sentence js-bao and `TomlSchemaLoader` answer.
     case uniqueOnStringset(message: String)
+    /// A declared field name the platform reserves (#3501, #4505); `message`
+    /// is js-bao's `[models.<model>.fields.<field>]: <sentence>`.
+    case reservedFieldName(message: String)
 
     var description: String {
         switch self {
@@ -57,6 +60,8 @@ enum CodegenError: Error, CustomStringConvertible {
         case let .unknownKey(context, key, allowed):
             return "\(context): unknown key `\(key)`. Allowed: \(allowed.joined(separator: ", "))"
         case let .uniqueOnStringset(message):
+            return message
+        case let .reservedFieldName(message):
             return message
         }
     }
@@ -96,10 +101,17 @@ enum TomlParser {
     /// a typo'd key (`requierd = true`) fails loud at codegen time
     /// rather than producing a subtly-wrong model. Pass `strict: false`
     /// (the `--no-strict` CLI flag) for the legacy lenient behavior.
+    ///
+    /// When `rejectReservedFieldNames` is true, a declared field name the
+    /// platform reserves (`reservedFieldProblem`) raises
+    /// `CodegenError.reservedFieldName` before the field's type is checked —
+    /// js-bao's loader option of the same name, in the same order. The plugin
+    /// passes `true`; the default reads a schema as stored.
     static func parse(
         tomlString: String,
         swiftNameSuffix: String,
-        strict: Bool = true
+        strict: Bool = true,
+        rejectReservedFieldNames: Bool = false
     ) throws -> [ParsedSchema] {
         let table: TOMLTable
         do {
@@ -134,7 +146,8 @@ enum TomlParser {
             )
             var schema = try buildSchema(
                 name: key, table: model,
-                swiftNameSuffix: swiftNameSuffix, strict: strict
+                swiftNameSuffix: swiftNameSuffix, strict: strict,
+                rejectReservedFieldNames: rejectReservedFieldNames
             )
             // TOMLKit hands keys back alphabetically, which is fine for
             // every internal use (lookups go through a dictionary) but
@@ -198,10 +211,12 @@ enum TomlParser {
         name: String,
         table: TOMLTable,
         swiftNameSuffix: String,
-        strict: Bool
+        strict: Bool,
+        rejectReservedFieldNames: Bool
     ) throws -> ParsedSchema {
         let (fieldOrder, fields) = try buildFields(
-            modelName: name, table: table, strict: strict
+            modelName: name, table: table, strict: strict,
+            rejectReservedFieldNames: rejectReservedFieldNames
         )
         let constraints = try buildUniqueConstraints(
             modelName: name, table: table, fieldNames: Set(fields.keys),
@@ -360,10 +375,24 @@ enum TomlParser {
 
     // MARK: - Fields
 
+    /// Why a field name is reserved, or `nil` when a model may declare it —
+    /// js-bao's `checkReservedFieldName`, sentence for sentence: `id` is
+    /// allowed, `type` maps to the internal `_type` column, a leading `_` is
+    /// internal, and a name in `ReservedFieldNames` (generated from js-bao's
+    /// list) breaks a generated model on the JavaScript or the Swift client.
+    static func reservedFieldProblem(_ name: String) -> String? {
+        if name == "id" { return nil }
+        if name == "type" { return "Field 'type' is reserved (maps to internal _type column in queries)" }
+        if name.hasPrefix("_") { return "Field '\(name)' is reserved (fields starting with '_' are internal)" }
+        if let reason = ReservedFieldNames.reasons[name] { return "Field '\(name)' is reserved (\(reason))" }
+        return nil
+    }
+
     private static func buildFields(
         modelName: String,
         table: TOMLTable,
-        strict: Bool
+        strict: Bool,
+        rejectReservedFieldNames: Bool
     ) throws -> ([String], [String: ParsedField]) {
         guard let fieldsTable = table["fields"]?.table else { return ([], [:]) }
         var order: [String] = []
@@ -372,7 +401,8 @@ enum TomlParser {
             guard let field = fieldsTable[fieldName]?.table else { continue }
             out[fieldName] = try buildField(
                 modelName: modelName, fieldName: fieldName,
-                table: field, strict: strict
+                table: field, strict: strict,
+                rejectReservedFieldNames: rejectReservedFieldNames
             )
             order.append(fieldName)
         }
@@ -383,8 +413,17 @@ enum TomlParser {
         modelName: String,
         fieldName: String,
         table: TOMLTable,
-        strict: Bool
+        strict: Bool,
+        rejectReservedFieldNames: Bool
     ) throws -> ParsedField {
+        // js-bao refuses a reserved name before it parses the field's
+        // options, so a reserved field with no `type` names the reserved
+        // name, not the missing type.
+        if rejectReservedFieldNames, let problem = reservedFieldProblem(fieldName) {
+            throw CodegenError.reservedFieldName(
+                message: "[models.\(modelName).fields.\(fieldName)]: \(problem)"
+            )
+        }
         // js-bao validates the field type FIRST (before the unknown-key
         // sweep) — match that order so the error a malformed field
         // surfaces is identical across runtimes.

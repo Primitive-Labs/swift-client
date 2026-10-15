@@ -20,6 +20,98 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Opening a large document with no local copy is faster
+
+A client that opens a large record-log document it holds no copy of (a new
+device, or after its local copy was evicted) now receives the catch-up as a stream of
+pages after one request, instead of asking for each page in turn, so its time
+no longer grows with one round trip per page. When the document has no segment
+that covers the client, the server builds one and the open waits briefly for
+it, reporting progress, then downloads it; segments are also built a few
+seconds after a large change. The rows the client ends with are unchanged.
+The JS client behaves the same way. There is nothing to configure.
+
+### A client that holds a segment downloads only what changed
+
+A large document's next segment reuses the parts of the previous one that no
+write has touched. A client that received the previous segment, and is pointed
+at the next one, keeps the rows it already holds for those parts and downloads
+only the parts that changed and the writes since; it ends with the same rows as
+before. When its rows for a part do not match what the segment lists (another
+client of the same store changed them, or a receipt was interrupted), it
+downloads that part. There is nothing to configure.
+
+### Record-log saves made offline are acknowledged sooner after a reconnect
+
+A client reconnecting to a record-log document with saves made offline now
+sends them right behind its open, instead of waiting for the room to answer
+the open first, so they are acknowledged one round trip sooner. A reconnect
+with nothing pending sends what it did before, and the JS client behaves the
+same way. The ordering, refusals and hand-backs of those saves are unchanged.
+A reconnect right after the client switched writer ids (an earlier session's
+saves sent first, or a restored local store) waits for the open as before,
+also when the document was closed and opened again in between.
+There is nothing to configure.
+
+### Breaking: a field named after a generated model's member is refused (#4505)
+
+A model field can no longer take a name the generated model already uses on
+either client: `related`, `CodingKeys`, `discardChanges`, `markAllChanged`,
+`primitiveValues` and `hashValue` on the Swift struct, and `syncState`,
+`save`, `delete`, `isDirty`, `toJSON`, `constructor` and the rest of
+`BaseModel`'s members on the JavaScript client — the full list is
+`packages/js-bao/src/utils/reservedFieldNames.json`, rendered into the client
+as `ReservedFieldNames`, and the Reserved Field Names section of the documents
+and databases pages lists every one. The Swift codegen plugin now refuses such
+a schema with js-bao's sentence,
+`[models.<model>.fields.<field>]: Field '<name>' is reserved (<reason>)`, as it
+does `type` and `_`-prefixed names, and exits before writing any file; the
+record-log pre-check refuses the field with `.documentEntryInvalid`. Matching is
+exact: `Save` and `syncStatus` are fine, and `id` stays allowed.
+
+Stored schemas and records still load; the refusal appears at the next
+codegen, push or record write. A Swift-only app may hold a field the Swift
+struct compiled with — `syncState`, `save`, `delete`, … — that is reserved
+only because the JavaScript model breaks on it: it is refused too, so a schema
+written for one platform builds on the other. Rename the field and regenerate.
+
+### Your own record-log saves come back smaller
+
+A client writing to a record-log document no longer downloads each of its own
+saves back in full. It asks the room for compact acknowledgements when it opens
+the document, and for a save the room applied exactly as written the
+acknowledgement carries only its log number, epoch, writer and sequence number;
+the client derives the row from the save it already holds. A save the room
+changed — a field another writer set later, an upsert that resolved to an
+existing record — is still acknowledged in full. Rows, sync states and events
+are the same as before, and there is nothing to configure. A room that predates
+the change ignores the request and keeps acknowledging in full.
+
+### Bulk loads from Swift: `client.documents.ingests`
+
+`client.documents.ingests` drives a bulk load into a record-log document:
+`buildChunks(rows:options:)` turns `DocumentIngestRow`s into upload-ready
+`DocumentIngestChunk`s (for the same rows, the same decompressed text,
+`rows`, `rawBytes`, `firstId`, `lastId` and `index` as the JS client's chunks;
+the gzip bytes, and so `bytes` and `sha256`, are each platform's own, and a
+chunk whose compressed size passes 8 MiB is split by the platform's compressor,
+which can cut it differently), `create(documentId:options:)` opens a session with
+`DocumentIngestCreateOptions(mode:models:reserveEpoch:)` (no body when none is
+set), and `uploadChunk`, `commit`, `get`, `list` and `abort` drive it.
+A refusal throws `HttpError` with the server's code (`INGEST_OPTION_INVALID`,
+`INGEST_SESSION_NOT_ABORTABLE`, …); the builder throws `JsBaoError`
+`.invalidArgument` for a row or an artifact the platform would refuse.
+
+### Added: a client tool call's wait is a `client_call` step (#4467)
+
+An agent session's steps gain `PrimitiveStepKind.clientCall`: one step per
+client tool call the turn waited on, from the call being written until its
+answer arrived, with `PrimitiveStep.resolvedByUserId` naming the member whose
+answer or cancel made it final. A call that ends unanswered has its step
+`failed` with how it ended (`AGENT_CALL_CANCELLED`, `AGENT_CALL_SUPERSEDED`,
+`AGENT_CALL_EXPIRED` or the failed turn's code). An earlier client reads the
+kind as `.unknown("client_call")`.
+
 ### Bursts of record-log saves leave in a few frames
 
 A client now keeps one `record.entries` frame in flight per record-log

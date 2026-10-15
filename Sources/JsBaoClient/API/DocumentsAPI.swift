@@ -53,6 +53,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     public let aliases: DocumentAliasesAPI
+    /// Bulk loads of a large document.
+    public let ingests: DocumentIngestsAPI
 
     /// Designated initializer — the typed transport spine.
     public init(
@@ -66,6 +68,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         self.documentManager = documentManager
         self.client = client
         self.aliases = DocumentAliasesAPI(transport: transport)
+        self.ingests = DocumentIngestsAPI(transport: transport)
     }
 
     // MARK: - CRUD

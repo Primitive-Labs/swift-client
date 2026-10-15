@@ -11,8 +11,9 @@ import Foundation
 ///   unjudged entry applied as a guess; rewritten per touched record in the
 ///   transaction that changes it.
 /// - `record_log_state`: per document, the cursor, the epochs, the
-///   constraints the room declared, the full replacement in progress, and the
-///   receipts of a load's or a segment's chunks begun and not completed.
+///   constraints the room declared, the full replacement in progress, the
+///   receipts of a load's or a segment's chunks begun and not completed, and
+///   the segment the confirmed rows were last replaced from.
 /// - `record_log_writers`: per document and client, its writer and next
 ///   sequence number.
 /// - `record_log_pending` and `record_log_pending_keys`: the unjudged entries,
@@ -51,6 +52,7 @@ enum RecordLogSchema {
     /// existing table as it was.
     static let addedColumns: [(table: String, column: String, add: String)] = [
         ("record_log_state", "receipt", "ALTER TABLE record_log_state ADD COLUMN receipt TEXT"),
+        ("record_log_state", "segment", "ALTER TABLE record_log_state ADD COLUMN segment TEXT"),
     ]
 
     /// The table naming the user the record-log tables belong to.
@@ -89,7 +91,8 @@ enum RecordLogSchema {
           permission TEXT,
           rows_gen INTEGER NOT NULL DEFAULT 0,
           replacing INTEGER,
-          receipt TEXT
+          receipt TEXT,
+          segment TEXT
         )
         """,
         """

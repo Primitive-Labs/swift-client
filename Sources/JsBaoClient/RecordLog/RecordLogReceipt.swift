@@ -101,6 +101,77 @@ struct RecordLogReceiptState: Equatable, Sendable {
     }
 }
 
+/// The object a segment's chunk was written as: `{segmentId}/{model}/{index}`
+/// of the segment that wrote it (the chunk's `source`, else the segment's own).
+/// Two segments that list one object list the same rows.
+func recordLogSegmentChunkObject(segmentId: String, model: String, index: Int, source: String?) -> String {
+    "\(source ?? segmentId)/\(model)/\(index)"
+}
+
+/// One chunk of the segment a store last received, as its marker records it.
+struct RecordLogHeldSegmentChunk: Equatable, Sendable {
+    /// The object it was read from (``recordLogSegmentChunkObject(segmentId:model:index:source:)``).
+    var object: String
+    var model: String
+    var index: Int
+    var firstId: String
+    var lastId: String
+    var rows: Int
+    var sha256: String
+}
+
+/// The segment a store's confirmed rows were last replaced from, with its
+/// chunks: a later segment that lists one of the same objects may keep those
+/// rows instead of downloading them again. Stored in
+/// `record_log_state.segment` as the JS store keeps it.
+struct RecordLogHeldSegment: Equatable, Sendable {
+    var segmentId: String
+    var chunks: [RecordLogHeldSegmentChunk]
+
+    /// The JSON the JS store keeps in `record_log_state.segment`.
+    var json: JSONValue {
+        .object([
+            "segmentId": .string(segmentId),
+            "chunks": .array(chunks.map { chunk in
+                .object([
+                    "object": .string(chunk.object), "model": .string(chunk.model), "index": .number(Double(chunk.index)),
+                    "firstId": .string(chunk.firstId), "lastId": .string(chunk.lastId), "rows": .number(Double(chunk.rows)),
+                    "sha256": .string(chunk.sha256),
+                ])
+            }),
+        ])
+    }
+
+    init(segmentId: String, chunks: [RecordLogHeldSegmentChunk]) {
+        self.segmentId = segmentId
+        self.chunks = chunks
+    }
+
+    /// The stored marker, or `nil` when it is not one.
+    init?(json: JSONValue?) {
+        guard let json, let segmentId = json["segmentId"]?.stringValue, let list = json["chunks"]?.arrayValue else { return nil }
+        let chunks = list.compactMap { item -> RecordLogHeldSegmentChunk? in
+            guard let object = item["object"]?.stringValue, let model = item["model"]?.stringValue,
+                  let index = item["index"]?.wholeNumber, let firstId = item["firstId"]?.stringValue,
+                  let lastId = item["lastId"]?.stringValue, let rows = item["rows"]?.wholeNumber,
+                  let sha256 = item["sha256"]?.stringValue
+            else { return nil }
+            return RecordLogHeldSegmentChunk(
+                object: object, model: model, index: index, firstId: firstId, lastId: lastId, rows: rows, sha256: sha256
+            )
+        }
+        guard chunks.count == list.count else { return nil }
+        self.init(segmentId: segmentId, chunks: chunks)
+    }
+}
+
+/// What keeping a chunk of the held segment answers: the rows kept and their
+/// range, or that it kept nothing.
+enum RecordLogKeepOutcome: Equatable, Sendable {
+    case kept(rows: Int, ranges: [RecordLogIdRange])
+    case mismatch
+}
+
 /// One line of a bulk load's chunk: a record id and the merge patch it applies.
 struct RecordLogLoadLine: Equatable, Sendable {
     var id: String
@@ -240,7 +311,8 @@ extension RecordLogChunkDescriptor {
         else { return nil }
         self.init(
             model: model, index: json["index"]?.wholeNumber ?? position, path: path, rows: rows, bytes: bytes,
-            rawBytes: rawBytes, sha256: sha256, firstId: firstId, lastId: lastId
+            rawBytes: rawBytes, sha256: sha256, firstId: firstId, lastId: lastId,
+            source: json["source"]?["segmentId"]?.stringValue
         )
     }
 

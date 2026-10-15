@@ -1,0 +1,36 @@
+{
+  "model": "PrimitiveStep",
+  "row": {
+    "id": "01K6STEP00000000000000004467",
+    "turnId": "turn_1",
+    "seq": 4,
+    "kind": "client_call",
+    "status": "completed",
+    "startedAt": "2026-10-02T12:00:00.000Z",
+    "endedAt": "2026-10-02T12:00:01.500Z",
+    "durationMs": 1500,
+    "callId": "call_01K6CALL0000000000000004467",
+    "toolName": "pick",
+    "resolvedByUserId": "u_participant_1"
+  },
+  "expect": {
+    "seq": 4,
+    "kind": "client_call",
+    "status": "completed",
+    "endedAt": "2026-10-02T12:00:01.500Z",
+    "durationMs": 1500,
+    "callId": "call_01K6CALL0000000000000004467",
+    "toolName": "pick",
+    "resolvedByUserId": "u_participant_1",
+    "functionName": {
+      "$absent": true
+    },
+    "provider": {
+      "$absent": true
+    },
+    "errorCode": {
+      "$absent": true
+    },
+    "historyMessageIds": []
+  }
+}

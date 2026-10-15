@@ -7,7 +7,7 @@ import XCTest
 /// `-edges-4311` suites. The live suites are the evidence of the wire; this
 /// pins the session's transitions.
 ///
-/// - `record.open` declares `accepts: ["load", "segment"]` when the connection
+/// - `record.open` declares `accepts: ["load", "segment", "building"]` when the connection
 ///   fetches artifacts, none when it cannot, and `[]` after two failed receipts
 ///   in a row; a completed receipt or full replacement resets the count.
 /// - A load received live holds results, fetches the manifest and the chunks
@@ -94,7 +94,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
     func testTheOpenDeclaresLoadAndSegmentWhenTheConnectionFetchesAndNothingWhenItCannot() async throws {
         let able = try await harness()
         await able.session.start()
-        XCTAssertEqual(able.of("record.open").first?["accepts"], ["load", "segment"])
+        XCTAssertEqual(able.of("record.open").first?["accepts"], ["load", "segment", "building"])
         XCTAssertEqual(able.of("record.open").first?["formats"], [3])
         let unable = try await harness(fetches: false)
         await unable.session.start()
@@ -402,7 +402,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         await h.feed(H.opened(lsn: 2, catchUp: loadForm(pointer, cursor: 0, upTo: 2)))
         await until("the first reopen") { h.of("record.open").count == 2 }
         XCTAssertEqual(h.of("record.open")[1]["cursor"], 0)
-        XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment"])
+        XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment", "building"])
         XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .load, id: Self.session1))
         XCTAssertTrue(lines.contains("[record-log] load receipt failed \(H.documentId): \(Self.session1) fetching ", level: .warn))
         XCTAssertFalse(lines.messages().contains { $0.contains("grant1/Note") && $0.contains("receipt failed") && $0.contains("/doc-artifact/grant1") },
@@ -437,7 +437,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         // The count was reset: the next open declares accepts again.
         await h.session.disconnected()
         await h.session.start()
-        XCTAssertEqual(h.of("record.open")[3]["accepts"], ["load", "segment"])
+        XCTAssertEqual(h.of("record.open")[3]["accepts"], ["load", "segment", "building"])
     }
 
     func testEveryReceiptFailureOpensAgainFromTheUnchangedCursorWithAWarnLine() async throws {
@@ -573,7 +573,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
             }
             await until("the reopen (\(n))") { h.of("record.open").count == n + 1 }
         }
-        XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment"])
+        XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment", "building"])
         XCTAssertEqual(h.of("record.open")[2]["accepts"], [])
         XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .segment, id: "G1"))
     }
@@ -623,7 +623,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
             "[record-log] \(H.documentId): load receipt \(Self.session1) abandoned (the room released the subscription); opening again from the cursor"
         ))
         // No failure was counted.
-        XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment"])
+        XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment", "building"])
     }
 
     func testAReleaseDuringTheRemaindersPagingDiscardsThePageAndOpensAgain() async throws {
@@ -658,7 +658,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
             _ = try other.completeCatchUp(writer: otherWriter, lsn: 0, full: true, generation: generation)
             gate.open()
             await until("the reopen (\(round))") { h.of("record.open").count == round + 1 }
-            XCTAssertEqual(h.of("record.open").dropFirst(round).first?["accepts"], ["load", "segment"], "an abandon counts no failure")
+            XCTAssertEqual(h.of("record.open").dropFirst(round).first?["accepts"], ["load", "segment", "building"], "an abandon counts no failure")
         }
         XCTAssertNil(try h.read("n2"), "the stale chunk changed nothing")
         XCTAssertTrue(lines.contains(
@@ -701,7 +701,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         _ = try other.completeCatchUp(writer: otherWriter, lsn: 16, full: true, generation: generation)
         await until("the open after the other replacement") { h.of("record.open").count == 2 }
         XCTAssertEqual(h.of("record.open")[1]["cursor"], 16)
-        XCTAssertEqual(h.of("record.open")[1]["accepts"], ["load", "segment"], "no failure counted")
+        XCTAssertEqual(h.of("record.open")[1]["accepts"], ["load", "segment", "building"], "no failure counted")
         await h.feed(H.opened(lsn: 16))
         await until("synced") { h.synced.value == 1 }
         XCTAssertEqual(try h.read("s1"), ["id": "s1", "title": "theirs"])

@@ -112,6 +112,34 @@ enum RecordLogTraceFixture {
         }
     }
 
+    /// One segment chunk's rows, in order.
+    static func chunkRows(_ chunk: JSONValue) -> [RecordLogCatchUpRow] {
+        (chunk["rows"]?.arrayValue ?? []).map { row in
+            RecordLogCatchUpRow(model: chunk["model"]?.stringValue ?? model, id: row["id"]?.stringValue ?? "", row: row.objectValue ?? [:])
+        }
+    }
+
+    /// A segment event's chunks as the store holds them once it completes
+    /// (#4394): each chunk's object, range and row count; the object's name
+    /// stands for its digest.
+    static func heldSegment(_ input: JSONValue) -> RecordLogHeldSegment {
+        let segmentId = input["segmentId"]?.stringValue ?? ""
+        return RecordLogHeldSegment(
+            segmentId: segmentId,
+            chunks: (input["chunks"]?.arrayValue ?? []).enumerated().map { at, chunk in
+                let rows = chunk["rows"]?.arrayValue ?? []
+                let chunkModel = chunk["model"]?.stringValue ?? model
+                let object = chunk["object"]?.stringValue ?? "\(segmentId)/\(chunkModel)/\(at)"
+                return RecordLogHeldSegmentChunk(
+                    object: object, model: chunkModel, index: chunk["index"]?.wholeNumber ?? at,
+                    firstId: chunk["firstId"]?.stringValue ?? rows.first?["id"]?.stringValue ?? "",
+                    lastId: chunk["lastId"]?.stringValue ?? rows.last?["id"]?.stringValue ?? "",
+                    rows: rows.count, sha256: object
+                )
+            }
+        )
+    }
+
     /// A segment event's chunk rows, every chunk's, in order.
     static func segmentRows(_ input: JSONValue) -> [RecordLogCatchUpRow] {
         (input["chunks"]?.arrayValue ?? []).flatMap { chunk in
@@ -161,11 +189,14 @@ enum RecordLogTraceFixture {
 
     static func resultItem(_ input: JSONValue) -> RecordLogResultItem {
         var object = input.objectValue ?? [:]
-        object["changes"] = .array((input["changes"]?.arrayValue ?? []).map { change in
-            var c = change.objectValue ?? [:]
-            c["model"] = .string(model)
-            return .object(c)
-        })
+        // A compact own acknowledgement (#4473) carries no changes.
+        if let changes = input["changes"]?.arrayValue {
+            object["changes"] = .array(changes.map { change in
+                var c = change.objectValue ?? [:]
+                c["model"] = .string(model)
+                return .object(c)
+            })
+        }
         if var alias = input["alias"]?.objectValue {
             alias["model"] = .string(model)
             object["alias"] = .object(alias)

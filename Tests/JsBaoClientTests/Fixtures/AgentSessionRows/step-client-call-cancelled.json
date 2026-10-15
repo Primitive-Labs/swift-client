@@ -1,0 +1,28 @@
+{
+  "model": "PrimitiveStep",
+  "row": {
+    "id": "01K6STEP00000000000000004468",
+    "turnId": "turn_1",
+    "seq": 5,
+    "kind": "client_call",
+    "status": "failed",
+    "startedAt": "2026-10-02T12:00:00.000Z",
+    "endedAt": "2026-10-02T12:00:00.800Z",
+    "durationMs": 800,
+    "callId": "call_01K6CALL0000000000000004468",
+    "toolName": "sign",
+    "errorCode": "AGENT_CALL_CANCELLED",
+    "errorMessage": "The turn was cancelled",
+    "resolvedByUserId": "u_owner"
+  },
+  "expect": {
+    "kind": "client_call",
+    "status": "failed",
+    "durationMs": 800,
+    "callId": "call_01K6CALL0000000000000004468",
+    "toolName": "sign",
+    "errorCode": "AGENT_CALL_CANCELLED",
+    "errorMessage": "The turn was cancelled",
+    "resolvedByUserId": "u_owner"
+  }
+}

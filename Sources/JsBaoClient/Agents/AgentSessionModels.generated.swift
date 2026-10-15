@@ -214,10 +214,11 @@ public enum PrimitiveStepKind: Sendable, Equatable, Hashable {
     case toolCall
     case contextCall
     case historyCall
+    case clientCall
     case unknown(String)
 
     /// The values this client knows, in the schema's order.
-    public static let known: [PrimitiveStepKind] = [.modelCall, .toolCall, .contextCall, .historyCall]
+    public static let known: [PrimitiveStepKind] = [.modelCall, .toolCall, .contextCall, .historyCall, .clientCall]
 
     public init(rawValue: String) {
         switch rawValue {
@@ -225,6 +226,7 @@ public enum PrimitiveStepKind: Sendable, Equatable, Hashable {
         case "tool_call": self = .toolCall
         case "context_call": self = .contextCall
         case "history_call": self = .historyCall
+        case "client_call": self = .clientCall
         default: self = .unknown(rawValue)
         }
     }
@@ -235,6 +237,7 @@ public enum PrimitiveStepKind: Sendable, Equatable, Hashable {
         case .toolCall: return "tool_call"
         case .contextCall: return "context_call"
         case .historyCall: return "history_call"
+        case .clientCall: return "client_call"
         case let .unknown(raw): return raw
         }
     }
@@ -887,6 +890,7 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
             "historyMode": FieldDescriptor(type: .string),
             "historySelection": FieldDescriptor(type: .string),
             "providerDurationMs": FieldDescriptor(type: .number),
+            "resolvedByUserId": FieldDescriptor(type: .string),
         ]
     )
 
@@ -917,6 +921,7 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
     public var historyMode: String?
     public var historySelection: JSONValue?
     public var providerDurationMs: Double?
+    public var resolvedByUserId: String?
 
     /// Decode a row. `nil` when a required scalar column is missing or does
     /// not read; an optional column, JSON and stringsets included, never fails a row.
@@ -955,6 +960,7 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
         self.historyMode = row["historyMode"]?.stringValue
         self.historySelection = AgentSessionJSON.parse(row["historySelection"])
         self.providerDurationMs = AgentSessionJSON.number(row["providerDurationMs"])
+        self.resolvedByUserId = row["resolvedByUserId"]?.stringValue
     }
 
     public init?(record: PrimitiveRecord) {
@@ -990,6 +996,7 @@ public struct PrimitiveStep: PrimitiveModel, PrimitiveRowDecodable, Equatable, S
         if let historyMode { values["historyMode"] = .string(historyMode) }
         if let historySelection { values["historySelection"] = .string(AgentSessionJSON.text(historySelection)) }
         if let providerDurationMs { values["providerDurationMs"] = .number(providerDurationMs) }
+        if let resolvedByUserId { values["resolvedByUserId"] = .string(resolvedByUserId) }
         return values
     }
 }
