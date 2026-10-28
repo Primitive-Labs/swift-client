@@ -70,6 +70,12 @@ public struct QueryOptions: Sendable {
     /// `nil` returns every field.
     public var projection: [String: Int]?
 
+    /// Scope the read to these db3s: `documents` under its db3 name. A db3 it
+    /// names that is not resident on this device (its rows not loaded here)
+    /// is refused `DB3_NOT_RESIDENT`, where `documents` leaves it out. Both
+    /// set with different values is refused `.invalidArgument`.
+    public var db3: [String]?
+
     /// `offset` was removed in #2367: offset paging is unstable in
     /// CRDT-backed datasets, because a concurrent insert from another client
     /// shifts the rows before offset N and makes the same row appear twice or
@@ -84,7 +90,8 @@ public struct QueryOptions: Sendable {
         cursor: String? = nil,
         direction: CursorDirection = .forward,
         documents: [String]? = nil,
-        projection: [String: Int]? = nil
+        projection: [String: Int]? = nil,
+        db3: [String]? = nil
     ) {
         self.sort = sort
         self.sortOrder = sortOrder
@@ -93,8 +100,55 @@ public struct QueryOptions: Sendable {
         self.direction = direction
         self.documents = documents
         self.projection = projection
+        self.db3 = db3
     }
 
+}
+
+/// The documents a read is scoped to, from its `documents` and `db3` forms:
+/// `nil` for none, refused `.invalidArgument` when both name different ids.
+func resolvedDocumentScope(documents: [String]?, db3: [String]?) throws -> [String]? {
+    guard let db3 else { return documents }
+    guard let documents else { return db3 }
+    guard Set(documents) == Set(db3) else {
+        throw JsBaoError(
+            code: .invalidArgument,
+            message: "A read names both `documents` and `db3` with different ids; `db3` is `documents` under its db3 "
+                + "name, so pass one of them.",
+            details: ["documents": .array(documents.map { .string($0) }), "db3": .array(db3.map { .string($0) })]
+        )
+    }
+    return documents
+}
+
+extension QueryOptions {
+    /// The documents the read is scoped to: `documents` or its `db3` form.
+    func documentScope() throws -> [String]? {
+        try resolvedDocumentScope(documents: documents, db3: db3)
+    }
+
+    /// The sort a paged query runs: `sortOrder` when set, else `sort`'s
+    /// fields in name order, with `id` ascending appended as the tiebreaker
+    /// when the sort lacks it, as js-bao's `extractSortFields` does.
+    var pagingSort: (fields: [String], directions: [Int]) {
+        var fields: [String]
+        var directions: [Int]
+        if let ordered = sortOrder, !ordered.isEmpty {
+            fields = ordered.map { $0.0 }
+            directions = ordered.map { $0.1 == -1 ? -1 : 1 }
+        } else if let sort, !sort.isEmpty {
+            fields = sort.keys.sorted()
+            directions = fields.map { sort[$0] == -1 ? -1 : 1 }
+        } else {
+            fields = []
+            directions = []
+        }
+        if !fields.contains("id") {
+            fields.append("id")
+            directions.append(1)
+        }
+        return (fields, directions)
+    }
 }
 
 /// Ordering spec for aggregation results. `field` can name either a
@@ -179,6 +233,10 @@ public struct AggregateOptions {
     /// groups. Appended last, and defaulted, so every existing call site
     /// compiles unchanged.
     public var documents: [String]?
+    /// Aggregate only these db3s: `documents` under its db3 name, refusing a
+    /// db3 not resident on this device `DB3_NOT_RESIDENT` (see
+    /// ``QueryOptions/db3``).
+    public var db3: [String]?
 
     public init(
         groupBy: [AggregateGroupBy] = [],
@@ -186,7 +244,8 @@ public struct AggregateOptions {
         filter: DocumentFilter? = nil,
         sort: AggregateSort? = nil,
         limit: Int? = nil,
-        documents: [String]? = nil
+        documents: [String]? = nil,
+        db3: [String]? = nil
     ) {
         self.groupBy = groupBy
         self.operations = operations
@@ -194,6 +253,7 @@ public struct AggregateOptions {
         self.sort = sort
         self.limit = limit
         self.documents = documents
+        self.db3 = db3
     }
 }
 

@@ -20,6 +20,443 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: the server assigns every group's id
+
+- `CreateGroupParams` loses `groupId` and its initializer parameter: a
+  group's id is always a ULID the server assigns. Read it from the returned
+  `GroupInfo.groupId` and keep it. A call that passed `groupId:` no longer
+  compiles; drop the argument.
+- A create whose body still sends `groupId` — from a server function or the
+  admin API — is refused with a 400 whose code is `GROUP_ID_NOT_ACCEPTED`.
+  Groups that already hold a chosen id keep answering by it.
+
+### Added: db3 write guards and counters on generated models
+
+Every generated model gains `save(in:options:)`, `delete(in:options:)` and
+`static increment(id:fields:in:options:)`, taking `Db3WriteOptions`
+(`condition`, `ifNotExists`, `confirm`):
+
+```swift
+task = try await task.save(in: db3Id, options: Db3WriteOptions(condition: ["category": "open"], confirm: true))
+let values = try await Post.increment(id: postId, fields: ["views": 1], in: db3Id)
+```
+
+A failed guard is refused `.db3ConditionNotMet` with the record's current row
+under `details["current"]`; an increment of a record this device does not hold
+is refused `.db3RecordNotFound`. `client.codegen` gains the methods they call:
+`save(_:id:values:in:changedFields:options:)`, `delete(_:id:in:options:)` and
+`increment(_:id:fields:in:options:)`. The generated members name the options
+type `JsBaoClient.Db3WriteOptions`, a new public alias (with
+`CodegenAPI.WriteOptions`), so a model named `Db3WriteOptions` does not shadow
+it. A field named `increment` stays allowed. Models regenerate at build; no
+existing type or method changes.
+
+### Added: sharing and blobs in `client.db3`
+
+`client.db3.permissions(_:)` (`Db3PermissionsAPI`) is a db3's sharing over
+its own routes, with the `client.documents` sharing types: `list()`,
+`set(_:)`, `remove(_:)`, `listPendingInvitations()`,
+`listGroups(includeSystem:)`, `grantGroup(_:)`, `revokeGroup(_:)`,
+`getLinkAccess()`, `setLinkAccess(_:)`, `clearLinkAccess()`,
+`requestAccess(_:)`, `listAccessRequests()`,
+`approveAccessRequest(_:options:)` and `denyAccessRequest(_:options:)`.
+Removing your own grant keeps the db3's copy on the device readable (the
+next subscribe is refused); `listGroups()` filters nothing on the client; an
+empty user id or email throws `.invalidArgument` before any request. A
+grant-adding call on a sync-off db3 is refused `DB3_SYNC_OFF_NO_SHARING`.
+
+`client.db3.blobs(_:)` (`Db3BlobContext`) is a db3's blobs, with the method
+set of `DocumentBlobContext`. Its uploads follow the JS client's offline
+contract: while the client is offline `upload` stores and queues the bytes,
+sends nothing and answers `bytesTransferred == 0`; an upload that cannot
+reach the server answers the same instead of throwing, and is sent once the
+client is online, by the next client over the same storage too. A refusal,
+`NOT_A_DB3` included, throws and queues nothing. With no local copy, `read`
+throws `JsBaoError` `.offline` while the client is offline. Its local copies
+and queue verbs are its own; the app-wide `client.documents` queue verbs
+still reach every upload of an id.
+
+A document that is not a db3 is refused `HttpError` 409 `NOT_A_DB3` by every
+call of both. No existing type or method changes, and `client.documents`
+blobs behave as before.
+
+### Added: `client.db3.create` works with networking stopped
+
+A create of a db3 you hold, with sync on and no `custodian`, mints its id on
+the device. Online it still waits for the server and sends that id in
+`POST db3`. With networking stopped, or when the request cannot reach the
+server, it returns at once with the db3 created on the device: models save and
+query, and `state.pendingCreate` is `true` until the create is saved on
+reconnect, retried with backoff.
+
+- `Db3CreatedEvent` (`.db3Created`) and `Db3CreateFailedEvent`
+  (`.db3CreateFailed`), which `client.db3.create` and `getOrCreateWithAlias`
+  emit. A refused deferred create keeps its records and carries its `id`;
+  `commitOfflineCreate(documentId:)` tries again, as a fresh round retried
+  with backoff (it answers `["scheduled": true]`; the events report the
+  outcome).
+- `Db3State.pendingCreate` (its initializer parameter defaults to `false`);
+  `LocalMetadataEntry.db3Create`, `db3Type` and `commitRefused`, and
+  `CommitError.code`, all optional, so stored rows decode as before.
+
+### Added: bulk loads in `client.db3`
+
+`client.db3.ingests` (`Db3IngestsAPI`) is the `client.documents.ingests`
+bulk load over a db3's own routes: `buildChunks(rows:options:)`,
+`create(db3Id:options:)`, `uploadChunk(db3Id:sessionId:chunk:)`,
+`commit(db3Id:sessionId:)`, `abort(db3Id:sessionId:)`,
+`get(db3Id:sessionId:)` and `list(db3Id:limit:cursor:)`, with the same
+`DocumentIngest*` types, chunks and multipart body. A document that is not a
+db3 is refused `HttpError` 409 `NOT_A_DB3`. No existing type or method changes.
+
+### Added: `DocumentAccessSource.resource`
+
+- A member of the platform resource that holds a db3, such as an agent
+  session, reads it as a `reader`, and `client.db3.get(_:)` answers
+  `accessSource == .resource`. `Db3Info.custodian` can name that resource
+  (`agentSession:<sessionId>`). A `switch` over `DocumentAccessSource` with no
+  `default` needs the new case.
+
+### Breaking: groups and collections have roles; the type-config namespaces are gone
+
+Groups and collections now have fixed roles, one custodian, and groups are
+addressed by `groupId` alone. The client follows the server and the JS client.
+
+- **Removed:** `client.groupTypeConfigs` and `client.collectionTypeConfigs`,
+  with `GroupTypeConfigsAPI`, `CollectionTypeConfigsAPI` and their types
+  (`GroupTypeConfigInfo`, `CreateGroupTypeConfigParams`,
+  `UpdateGroupTypeConfigParams`, `CollectionTypeConfigInfo`,
+  `CreateCollectionTypeConfigParams`, `UpdateCollectionTypeConfigParams`).
+  Their routes were already gone, so every call answered 404.
+  `client.databaseTypeConfigs` is unchanged.
+- **Groups:** every per-group call takes `groupId:` alone
+  (`get(groupId:)`, `update(groupId:params:)`, `listMembers(groupId:…)`, …).
+  New `transfer(groupId:to:)` (`to` is `"user:<userId>"`) and
+  `setMemberRole(groupId:userId:role:)`. `GroupInfo` carries `custodian` and
+  `settings` (`ResourceSettings`, `memberList: .members | .managers`), member
+  and membership rows carry `role`, and `.userId(_:role:)` / `.email(_:role:)`
+  add with a `GroupRole`. `UpdateGroupParams` takes `settings`.
+- **Collections:** `listMembers(collectionId:)` answers users and groups as
+  principals (`CollectionMemberEntry`) with a `CollectionRole`.
+  `addMember` takes `.user(_:role:…)` / `.email(_:role:…)`; new
+  `addGroupMember(collectionId:groupId:role:)`,
+  `setMemberRole(collectionId:principal:role:)`,
+  `removeMember(collectionId:principal:)` (a user's id, or `group:<groupId>`),
+  `transfer(collectionId:to:)` and `resolveRole(collectionId:userId:)`.
+  `CollectionInfo` carries `custodian`, `settings` and `role`;
+  `CreateCollectionParams` and `UpdateCollectionParams` take `settings`.
+- **Documents:** `GrantGroupPermissionParams(groupId:permission:)` and
+  `revokeGroupPermission(documentId:groupId:)` name a group by id.
+- **Deprecated, removed by #4718** (each still works and its warning names
+  the replacement): the `groupType:` labels on every group call,
+  `groups.create(params:)` and `CreateGroupParams` (the server refuses every
+  session's group create: create from a server function or the admin API),
+  `ListGroupsOptions.type` and `init(type:…)`; `collections.getAccess`,
+  `grantGroupPermission`, `revokeGroupPermission`,
+  `removeMember(collectionId:userId:)`, the `permission:` factories and init,
+  `CollectionPermission`, `GrantCollectionGroupPermissionParams`, and the
+  compatibility fields `collectionType`, `permission`, member-row `addedBy`
+  and grant-row `groupType`; `CreateCollectionParams.collectionType` and its
+  init; `GrantGroupPermissionParams.groupType`, its typed init and the typed
+  `revokeGroupPermission(documentId:groupType:groupId:)`.
+
+### Added: create and manage a db3 from `client.db3`
+
+```swift
+let orders = try await client.db3.create(title: "Orders", type: "orders")
+// Resident at once: its models save and query here before any subscribe.
+let sub = try client.db3.subscribe(orders.id)   // the first subscribe sends those writes
+try await sub.ready()
+```
+
+- `client.db3.create(title:type:sync:custodian:tags:metadata:)` creates a db3
+  on the server and answers its `Db3Info`. A synced db3 is on the device from
+  the answer on: `stored()` lists it, its models save and query before any
+  subscribe, and the first subscribe sends those writes. A sync-off db3
+  (`sync: false`, an app owner or admin only) is never stored on a device.
+- `get(_:)`, `delete(_:)`, `listMine(options:)`,
+  `getOrCreateWithAlias(_:)`, `getSync(_:)`/`setSync(_:sync:)`,
+  `getType(_:)`/`setType(_:type:)`, `getAppAccess(_:)`/`setAppAccess(_:level:)`,
+  `transfer(_:to:)` and `setOwnerRow(_:present:)`, with their answer types
+  (`Db3Info`, `Db3GetOrCreateWithAliasOptions`/`Result`, `Db3SyncState`/`Change`,
+  `Db3TypeState`/`Change`, `Db3TypeRevision`, `Db3InstalledType`,
+  `Db3AppAccessLevel`, `Db3AppAccess`/`Change`, `Db3OwnerRowChange`). A refusal
+  throws the route's `HttpError`, its `serverCode` naming why.
+- A db3 whose sync is turned off is gone with `Db3GoneEvent.Reason.syncOff`
+  (`DB3_SYNC_OFF`): `ready()` throws `.db3SyncOff`, its rows stay readable, new
+  writes are refused, and once the sync is on again a subscribe opens it as
+  before. `Db3GoneEvent.Reason` gains `.syncOff`: a `switch` over it with no
+  `default` needs the new case.
+- `DocumentAccessSource` gains `.app` (a db3's app access), and an
+  `accessSource` this client does not know decodes as `nil` instead of failing
+  the whole `DocumentInfo` or `Db3Info`. A `switch` over `DocumentAccessSource`
+  with no `default` needs the new case.
+
+### Added: typed db3s
+
+- `JsBaoErrorCode` gains `.db3DeclarationRefusedTyped`
+  (`DB3_DECLARATION_REFUSED_TYPED`) and `.db3ModelNotDeclared`
+  (`DB3_MODEL_NOT_DECLARED`), the JS client's strings.
+- On a db3 with a type, the room's refusal of the client's declaration is taken
+  as acknowledged, so the db3 opens as any other; a write to a model the type
+  does not declare is handed back with `.db3ModelNotDeclared`.
+
+### Added: increments, write guards and the format-1 warning
+
+- `DynamicModel.increment(id:fields:options:)` adds to numeric fields of a
+  db3 record, synchronously inside `transact` and `async` (with `confirm` or
+  a `condition`, the platform's values) outside it.
+- `save(id:values:changedFields:options:)` and `delete(id:options:)` take a
+  `Db3WriteOptions` with `condition`, `ifNotExists` (save only) and
+  `confirm`. A refused guard is handed back as `.db3ConditionNotMet` with
+  `details["current"]`, and `DocumentWriteRefusedEvent.current` carries the
+  record.
+- New error codes `.db3ConditionNotMet`, `.db3RecordNotFound`,
+  `.db3ClientOutdated` and `.db3SyncOff` (the JS client's strings), and
+  `Db3GoneEvent.Reason.clientOutdated`.
+- Saving a model into a format-1 document logs a deprecation warning, once
+  per model per document.
+- `RecordLogWriteKind` gains `.increment` and `Db3GoneEvent.Reason` gains
+  `.clientOutdated`: a `switch` over either with no `default` needs the new
+  case.
+
+### The `denied` function run status
+
+A webhook or cron fire of a function whose `authorize` denied it now leaves a
+run that settled `denied`, before its handler ran; the deny's code leads the
+run's error message. `FunctionRunStatus.terminalStatuses` and `statusValues`
+include it, so `functions.waitFor` returns such a run instead of refusing its
+status.
+
+### Breaking: a db3 is queried as the room queries it
+
+On a format-3 document (a db3), `query`, `queryPaged`, `count` and
+`aggregate` on a generated model, a `DynamicModel` or the cross-document
+store, and `client.documents.records(id).query` and `count`, now answer from
+the document's own rows with the room's statement and its limits:
+
+- The stored JSON type decides a comparison: `["n": 5]` no longer matches a
+  stored `"5"`, `["b": true]` matches a stored `true` or `1`, and a field
+  answers as stored. `["f": nil]` matches a field that is absent or null,
+  `["f": ["$eq": nil]]` matches nothing, and nulls sort first ascending and
+  last descending.
+- A page answers 100 records when no `limit` is sent and at most 10,000; a
+  `limit` outside 1 to 10,000 throws `.invalidArgument`. A page ends before
+  the record that would take it past 8 MiB of JSON, with `hasMore` set. Read
+  every row by following `nextCursor`. A cursor carries the document, so a
+  cursor from the JS client pages a Swift query and the reverse; a cursor
+  minted before this update is refused.
+- An include resolves within each parent's own document, and a `hasMany`
+  leg is attached whole. An include nesting a fourth level, or an invalid
+  one, throws `.invalidArgument` (`Invalid include: <reason>`). A `hasMany`
+  leg reading more than 1,000 related rows for the page, a page whose
+  `_related` passes 8 MiB, and an aggregate whose rows pass 8 MiB throw the
+  new `.db3PageTooLarge` (`DB3_PAGE_TOO_LARGE`).
+- An aggregate groups a declared string-set field as a facet (one row per
+  member) and sums, averages and compares the stored values.
+- The store's indexes come from the room's index list (`db3/:id/indexes`),
+  read when the document opens and when the room acknowledges a declaration,
+  not from the model's `indexed` and `unique` fields directly.
+- The client runs its own SQLite, 3.53.4, the release the JS client's
+  sqlite-wasm carries, so every OS answers the same SQL. A package that opens
+  the client's database file links the `JsBaoSQLite` product of this package,
+  not the OS's `SQLite3`.
+- The first open after the update migrates the local store once (storage
+  version 2): the tables a db3's models were projected into are dropped. No
+  record is touched.
+
+Format-1 documents are unchanged.
+
+### `client.db3`: subscribe to a db3 and read its copy on this device
+
+`client.db3.subscribe(id)` keeps a db3 up to date with its room while any
+subscription is held, and answers a `Db3Subscription` at once: `available()`
+returns as soon as a readable copy is on the device, `ready()` once it is up
+to date (it throws `DB3_READY_TIMEOUT` after `readyTimeout`, default 30 s,
+with no progress, `DB3_ACCESS_REFUSED`, `DB3_DISPOSED` or `NOT_A_DB3`),
+`state` is its `Db3State`, and `stream()` / `observe(_:)` deliver its own
+events. `dispose()` gives it up; the last one stops the room's updates and
+the copy stays readable. Also on `client.db3`: `unsubscribe`, `refresh`,
+`evict` (`DB3_PENDING_WRITES` without `force`), `stored()`, `state`,
+`setRetentionPolicy`, and `indexes` (`list`, `register`, `drop`). The client
+emits `Db3StateEvent`, `Db3ReadyEvent`, `Db3RowsEvent`,
+`Db3WriteRefusedEvent`, `Db3EvictedEvent`, `Db3GoneEvent` and `Db3ErrorEvent`
+under the JS client's `db3:*` keys.
+
+A db3 this device holds is resident: bound when storage is ready, after a
+sign-in, and at its create, it answers queries and takes writes while
+unsubscribed, and its writes are sent at the next subscribe.
+`QueryOptions(db3:)` and `AggregateOptions(db3:)` scope a read to db3s, and
+`client.setDefaultDb3(_:)` records one as the default document.
+
+Breaking, on a db3 only:
+
+- `closeDocument` / `documents.close` keep the db3's copy readable: the
+  model API and `documents.records(id)` still answer after the close, and the
+  close ends this client's subscriptions to it. A close that evicts
+  (`evictLocal`, or an open with `retainLocal: false`) removes it as before.
+  `openDocument` / `documents.open` and the closes log one warning per client
+  naming the `client.db3` form.
+- A db3 whose first load has not completed here is left out of an unscoped
+  read, and naming it (`QueryOptions(db3:)`, `save(in:)`,
+  `setDefaultDb3`, a `documents.records(id)` read) throws the new
+  `DB3_NOT_RESIDENT`; a `documents.records(id)` write to it is queued.
+- A db3 whose access was revoked, or which a listing or a metadata sync no
+  longer reports, stays on the device: it turns `.gone`, its rows stay
+  readable, new writes throw `WRITE_ACCESS_DENIED`, and unsent writes are
+  kept. `client.db3.evict` removes it. `documents.evict` counts its unsent
+  writes as unsynced changes.
+- A logout, with or without a wipe, ends every subscription and takes every
+  db3 out of reads and writes; the same user's next sign-in brings them back.
+
+### Blob uploads survive a restart
+
+A queued or in-flight upload, document or session, now outlives the process.
+With `storageConfig: .sqlite(...)` (the default database included), the
+upload's record and bytes are written to the client's database before its
+first PUT, and the next `JsBaoClient` for the same app and user restores it
+once `waitForStorageReady()` returns: it is listed in `uploadsAsync()` /
+`view.attachments.uploads()`, retried on its existing backoff, and pause,
+resume, cancel and the `blobs:upload-*` events work on it as on any upload.
+A paused upload stays paused and a refused session upload stays `.failed`
+until resumed. Nothing is restored for another app or another user; the
+owner gets it back at their next sign-in. `.memory` storage keeps the queue
+in memory only, as before. No API changes.
+
+**Behaviour change:** a document upload queued while a user is signed in now
+belongs to that user, as session uploads already did. It is listed, retried,
+paused and cancelled only while that user is signed in, each attempt
+(the first PUT inside `upload` included) sends that user's token, and it
+resumes when they sign in again. A 401 answered after the client refreshed
+that user's token is sent once more with the new one. Before, an upload ran
+under whichever token was signed in when it was sent. An upload queued with
+nobody signed in is unchanged. `destroy()` now ends a pending
+`view.attachments.waitUntilUploaded`, and a send waiting on an upload, with
+`.unavailable`; the upload itself stays stored for the next launch.
+
+### Format-3 documents: records of any model, with no generated model
+
+`client.documents.records(documentId)` reads and writes the records of an
+open format-3 document by model name, whether or not a model declares them,
+and `client.documents.schema(documentId)` answers what the document holds:
+
+```swift
+let records = client.documents.records(documentId)
+let note = try records.put("Note", ["title": "Groceries", "n": 1, "tags": ["home"]])
+try records.patch("Note", id: note["id"]!.stringValue!, ["tags": .setChange(add: ["weekly"])])
+let page = try records.query("Note", ["tags": ["$contains": "home"]], options: QueryOptions(limit: 20))
+let stop = try records.subscribe("Note") { print("notes changed") }
+```
+
+- `DocumentRecords`: `put`, `patch`, `delete` (each also with `confirm:`),
+  `get`, `query`, `count` and `subscribe`. Reads answer from the local copy,
+  offline too; a query takes the model API's filter grammar on any field.
+- `DocumentRecordValue`: a string, a number, a boolean, `nil`, a string set
+  (an array literal), or `.setChange(add:remove:clear:)`.
+- A document that is not open throws `.notFound`; one that is not format 3
+  throws `.documentFormatMismatch`. A write the room would refuse throws
+  `.documentEntryInvalid` before it is sent and arrives as a
+  `DocumentWriteRefusedEvent`.
+- Generated models on a format-3 document: a field whose stored value does
+  not fit its declared type reads as missing from `find`; `query` answers it
+  as stored (see "a db3 is queried as the room queries it"). A save that names a string set without changing it sends it as an
+  empty change, and an object or a non-string array in a field is refused
+  before it is sent, as the room refuses it.
+
+### Agent sessions: files, waiting sends and session-gone, by `sessionId` alone
+
+A session view now carries the session's files, so an app needs no document
+ID to upload, send or read them:
+
+```swift
+let view = try await client.agents.sessions.open(sessionId: sessionId)
+let file = try await view.attachments.upload(
+    png, options: AgentSessionAttachmentUploadOptions(filename: "chart.png", contentType: "image/png")
+)
+try await view.send(text: "What does this show?", files: [AgentSessionFileRef(blobId: file.blobId)])
+```
+
+- `view.attachments` (`AgentSessionAttachments`): `upload`, `uploads`,
+  `pause`, `resume`, `cancel`, `waitUntilUploaded` and `read`. An upload is
+  queued and retried, also after `view.close()` and across a restart; it
+  belongs to the signed-in user who made it and is never sent with another
+  user's token. When another user signs in or the token is cleared, waits
+  on it throw `.agentSessionUploadIdentityChanged`, and it resumes when its
+  user signs in again. A refused upload stays in `uploads()` as `.failed`, with its
+  bytes, until `resume` retries it or `cancel` drops it.
+- A send that names an upload still queued waits for it. **Source change:**
+  `AgentSessionPendingMessage.State` gains `case waiting`, so an exhaustive
+  `switch` over it needs one more case.
+- `view.artifact(of:)` shares one download among concurrent calls for the
+  same artifact.
+- Once the client sees a session is gone (its own `delete`, or a session call
+  answered `AGENT_SESSION_NOT_FOUND`), the session's queued uploads and the
+  messages waiting on them fail with that error.
+- `client.agents.sessions.inspect.storage(_:)` answers the backing document
+  for diagnostics; `uploadAttachment`, `downloadAttachment` and
+  `attachmentHeaders` are the one-request calls.
+- `AgentSessionInfo.documentId`, `AgentSessionListItem.documentId` and
+  `AgentSessionView.documentId` are deprecated: use `sessionId` and the calls
+  above.
+
+### Breaking: function runs are read and stopped on `functions` routes
+
+`FunctionsAPI.getStatus(runId:)`, `waitFor` and `terminate` now call
+`GET functions/runs/{runId}/status` and
+`POST functions/{functionKey}/instances/{runKey}/terminate`. The server no
+longer serves the `workflows/runs/...` and `workflows/{key}/instances/...`
+routes earlier builds called, so an app on an earlier build gets `.notFound`
+from each of these methods until it takes this update. The methods take and
+return what they did before.
+
+| Before | Now |
+| --- | --- |
+| `GET workflows/runs/{runId}/status` | `GET functions/runs/{runId}/status` |
+| `GET workflows/{key}/instances/{runKey}/status` | `GET functions/{functionKey}/instances/{runKey}/status` |
+| `POST workflows/{key}/instances/{runKey}/terminate` | `POST functions/{functionKey}/instances/{runKey}/terminate` |
+| `GET workflows/runs`, `GET workflows/runs/{runId}/steps` | `client.functions.listRuns`, `client.functions.listRunSteps` |
+| `mode` in the body of `POST functions/{key}` | `client.functions.start` (a body carrying `mode` is refused 400 `RETIRED_REQUEST_KEY`) |
+
+### Breaking: `client.workflows` and `client.cronTriggers` are removed
+
+The server no longer runs DSL workflows or standalone cron triggers, so the
+client no longer has `client.workflows` or `client.cronTriggers`. Call a server
+function with `client.functions` instead, and schedule one by declaring
+`[[function.triggers.cron]]` in its config. `functions.waitFor` now throws
+`.functionWaitTimeout` (`FUNCTION_WAIT_TIMEOUT`) when its timeout passes.
+
+| Before | Now |
+| --- | --- |
+| `client.workflows.start` | `client.functions.start` |
+| `client.workflows.getStatus`, `waitFor`, `terminate` | `client.functions.getStatus(runId:)`, `waitFor`, `terminate` |
+| `client.workflows.listRuns`, `listStepRuns` | `client.functions.listRuns`, `listRunSteps` |
+| `client.workflows.define` and the apply trio | A function writes the document itself; nothing to apply |
+| `client.cronTriggers.*` | `[[function.triggers.cron]]` in the function's config |
+| The `.workflowStatus` and `.workflowStarted` events | Poll with `client.functions.getStatus` or `waitFor` |
+| `WorkflowStatusResult`, `WorkflowRunInfo`, `WorkflowRunError`, `WaitForWorkflowResult` and the other workflow types | `FunctionRunStatus`, `FunctionRunInfo`, `FunctionRunError`, `FunctionRunResult` |
+| `WorkflowSliceInfo` | `FunctionRunSlice` |
+| `StartWorkflowOptions`, `TerminateWorkflowOptions`, `ListWorkflowRunsOptions` | The `client.functions` method parameters, `FunctionRunRef` |
+| `CronTriggersAPI` and its types | None |
+| `.workflowWaitTimeout` | `.functionWaitTimeout` |
+| `.workflowApplyNotConfirmed` | None: nothing the client calls returns it |
+| `.functionModeMismatch` | None: `invoke` returns the server's answer as it came, and a `start` answer with no run id is a decode failure |
+
+### Breaking: an output-schema refusal is `FUNCTION_OUTPUT_INVALID` on every run
+
+A run whose output its function's `outputSchema` refuses reports
+`FUNCTION_OUTPUT_INVALID` in `FunctionRunError.code` and
+`FunctionRunInfo.errorCode`, whether it was invoked or started; a run that
+failed this way before the change reads back the same way. Code that compared
+against `"OUTPUT_SCHEMA_VIOLATION"` compares against
+`"FUNCTION_OUTPUT_INVALID"`.
+
+### A function run says which runtime it ran on
+
+`FunctionRunInfo.runtime` is `"request"` for a run that answered within one
+request (a webhook fire) and `"task"` for a started run. It is on the `run`
+block of `functions.getStatus` and `functions.waitFor` and on every item of
+`functions.listRuns`, and `nil` when the server did not report it.
+
 ### Opening a large document with no local copy is faster
 
 A client that opens a large record-log document it holds no copy of (a new
@@ -52,6 +489,15 @@ A reconnect right after the client switched writer ids (an earlier session's
 saves sent first, or a restored local store) waits for the open as before,
 also when the document was closed and opened again in between.
 There is nothing to configure.
+
+### Fixed: a created document no longer stays a pending create after its commit
+
+The server answers a create and tells the creating client about the new
+document at the same moment. When the two landed together, the metadata
+merge for the server's notice could put back the `pendingCreate: true` the
+commit had just cleared, and nothing retried it: the document stayed a
+pending create for the rest of the session. The merge and the commit no
+longer overwrite each other.
 
 ### Presentations from an agent session
 

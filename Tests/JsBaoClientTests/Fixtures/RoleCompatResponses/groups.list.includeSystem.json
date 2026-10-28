@@ -1,0 +1,26 @@
+{
+  "name": "groups.list.includeSystem",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/groups?includeSystem=true",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "items": [
+      {
+        "appId": "<appId>",
+        "groupType": "team",
+        "groupId": "baseline",
+        "name": "Baseline Team",
+        "description": "Compatibility baseline",
+        "memberCount": 0,
+        "createdAt": "<iso>",
+        "createdBy": "<ulid>",
+        "modifiedAt": "<iso>"
+      }
+    ],
+    "hasMore": false
+  }
+}

@@ -50,7 +50,8 @@ Record-log (`documentFormat: 3`) documents, reached only for format 3 — a clie
 | File | Responsibility |
 |------|----------------|
 | `RecordLogTypes.swift`, `RecordLogGuess.swift`, `RecordLogRules.swift` | The vocabulary, plain-row guesses, and the client's rules over a `RecordLogTables` port (memory tables for the golden-trace replay) |
-| `RecordLogSchema.swift`, `RecordLogStore.swift`, `RecordLogQueryProjection.swift` | The `record_log_*` tables in the provider's database, the store (confirmed rows, the view, pending entries, catch-up, refusals, re-mint, purge) and the projection of the view into the model query tables |
+| `RecordLogSchema.swift`, `RecordLogStore.swift` | The `record_log_*` tables in the provider's database and their storage version, the store (confirmed rows, the view, pending entries, catch-up, refusals, re-mint, purge) |
+| `RecordLogViewReader.swift`, `RecordLogIndexes.swift` | Query, count, aggregate and includes over the view with the room's statement and the db3 limits; the view's indexes, built from the room's index list |
 | `RecordLogGroupCommit.swift` | Saves grouped into one transaction at `synchronous=NORMAL`, committed by a 5 ms timer, by any other store command, or by any other work on the provider's queue (`RecordLogGroupCommitHost`, adopted by `SQLiteStorageProvider`) |
 | `RecordLogWritePlan.swift`, `RecordLogSender.swift` | Planning a save as an entry and refusing what the wire cannot carry; the upstream queue (tick, window, frame target) |
 | `RecordLogDocumentBinding.swift`, `RecordLogModelDelegate.swift` | One open document (writer, acknowledgements, hand-backs, transactions) and the `LocalRecordDelegate` models read and write through |
@@ -73,7 +74,7 @@ Thin REST wrappers over `HttpClient`. Each file corresponds to a server resource
 |------|-------------|
 | `StorageProvider.swift` | Protocol: `put`, `get`, `delete`, `putBatch`, `iterate` — generic over `Codable` values |
 | `SQLiteStorageProvider.swift` | WAL-mode SQLite via C API, single `kv_store` table with compound key `(store, key)`, `DispatchQueue`-serialized writes |
-| `Format2SqlHost.swift` | Serialized SQL on the provider's own connection (`Format2SqlHost`, `Format2SqlConnection`, `Format2SqlValue`), which the record-log store and the file-backed query engine run on; the `Format2` names are kept from the large-document format |
+| `Format2SqlHost.swift` | Serialized SQL on the provider's own connection (`Format2SqlHost`, `Format2SqlConnection`, `Format2SqlValue`), which the record-log store runs on; the `Format2` names are kept from the large-document format |
 | `MemoryStorageProvider.swift` | In-memory dictionary, useful for tests |
 
 ### `Query/`

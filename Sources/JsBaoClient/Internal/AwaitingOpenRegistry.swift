@@ -16,6 +16,7 @@ final class AwaitingOpenRegistry: @unchecked Sendable {
 
     private let lock = NSLock()
     private var waits: [UUID: (documentId: String, fail: (JsBaoError) -> Void)] = [:]
+    private var deadlines: [UUID: (documentId: String, deadline: AvailabilityDeadline)] = [:]
 
     /// Register a wait. The returned token withdraws it — call it from the
     /// wait's own settle path, whichever way it settles.
@@ -29,7 +30,26 @@ final class AwaitingOpenRegistry: @unchecked Sendable {
     }
 
     func withdraw(_ token: UUID) {
-        lock.withLock { _ = waits.removeValue(forKey: token) }
+        lock.withLock {
+            _ = waits.removeValue(forKey: token)
+            _ = deadlines.removeValue(forKey: token)
+        }
+    }
+
+    /// Attach the availability budget of the wait `token` registered, so
+    /// progress on its document starts the budget again (#4609).
+    func attach(_ deadline: AvailabilityDeadline, to token: UUID) {
+        lock.withLock {
+            guard let documentId = waits[token]?.documentId else { return }
+            deadlines[token] = (documentId, deadline)
+        }
+    }
+
+    /// `documentId`'s first sync made progress: every wait on it gets a whole
+    /// budget from now.
+    func progress(documentId: String) {
+        let extended = lock.withLock { deadlines.values.filter { $0.documentId == documentId }.map(\.deadline) }
+        for deadline in extended { deadline.extend() }
     }
 
     /// Fail every wait on `documentId`. The handlers run OUTSIDE the lock:
@@ -42,6 +62,36 @@ final class AwaitingOpenRegistry: @unchecked Sendable {
             return matching.values.map { $0.fail }
         }
         for fail in doomed { fail(error) }
+    }
+}
+
+/// An open's availability budget, which bounds its wait WITHOUT progress
+/// (#4609): it runs from the start of the wait, and again from each progress
+/// report — a `building` answer, a catch-up page, a segment or load chunk.
+/// Measured on a monotonic clock, so a wall-clock correction neither cuts the
+/// budget short nor stretches it.
+final class AvailabilityDeadline: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private let clock = ContinuousClock()
+    private let budget: Duration
+    private var lastProgress: ContinuousClock.Instant
+
+    init(budget: TimeInterval) {
+        self.budget = .seconds(max(0, budget))
+        self.lastProgress = clock.now
+    }
+
+    /// Progress: a whole budget from now.
+    func extend() {
+        lock.withLock { lastProgress = clock.now }
+    }
+
+    /// Seconds until the budget runs out; zero or less once it has.
+    var remaining: TimeInterval {
+        let left = lock.withLock { lastProgress.advanced(by: budget) - clock.now }
+        let parts = left.components
+        return TimeInterval(parts.seconds) + TimeInterval(parts.attoseconds) / 1e18
     }
 }
 

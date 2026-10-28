@@ -38,15 +38,12 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         return provider
     }
 
-    /// A store with its tables, the `Note` query tables, and a minted writer.
+    /// A store with its tables and a minted writer.
     private func makeStore(_ provider: SQLiteStorageProvider, documentId: String = "doc-1") throws -> (RecordLogStore, String) {
         let store = RecordLogStore(host: provider, documentId: documentId, clientId: "client-1")
         try store.initialize()
-        try RecordLogQueryProjection.prepare(schema: Self.schema, engine: BaoModelQueryEngine(host: provider), host: provider)
         return (store, try store.mintWriter())
     }
-
-    private var spec: RecordLogProjectionSpec { RecordLogProjectionSpec(schema: Self.schema) }
 
     private func note(_ id: String, _ kind: RecordLogWriteKind = .create, _ fields: [String: JSONValue]? = nil,
                       tags: [String: Bool]? = nil) -> RecordLogMutation {
@@ -56,7 +53,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
     @discardableResult
     private func write(_ store: RecordLogStore, _ writer: String, _ mutations: RecordLogMutation..., upsertOn: String? = nil) throws -> RecordLogPendingEntry {
         try store.commitEntries(
-            writer: writer, writes: [RecordLogWrite(mutations: mutations, upsertOn: upsertOn)], project: [spec]
+            writer: writer, writes: [RecordLogWrite(mutations: mutations, upsertOn: upsertOn)]
         ).entries[0]
     }
 
@@ -84,21 +81,27 @@ final class RecordLogStoreHermeticTests: XCTestCase {
 
     // MARK: - Behavior 1: the tables
 
-    func testInitializeCreatesTheElevenTablesWithTheJSColumnsAndTheOwnerTableIdempotently() async throws {
+    func testInitializeCreatesTheTwelveTablesWithTheJSColumnsAndTheOwnerTableIdempotently() async throws {
         let provider = try await makeProvider()
         let store = RecordLogStore(host: provider, documentId: "doc-1", clientId: "client-1")
         try store.initialize()
         try store.initialize()
 
         let names = Set(try tableNames(provider).filter { $0.hasPrefix("record_log_") })
-        XCTAssertEqual(names, Set(RecordLogSchema.clientTables + ["record_log_owner"]))
-        XCTAssertEqual(RecordLogSchema.clientTables.count, 11)
+        // Since #4700: `record_log_indexes` (the room's index list per document)
+        // in, `record_log_projection` out, and the store-wide `record_log_meta`
+        // beside the owner table in place of the projection rule. Since #4701:
+        // `record_log_staged_base` (a staged full replacement's previous rows).
+        XCTAssertEqual(names, Set(RecordLogSchema.clientTables + ["record_log_owner", "record_log_meta"]))
+        XCTAssertEqual(RecordLogSchema.clientTables.count, 12)
+        XCTAssertTrue(RecordLogSchema.clientTables.contains("record_log_indexes"))
+        XCTAssertTrue(RecordLogSchema.clientTables.contains("record_log_staged_base"))
         XCTAssertEqual(try columns(provider, "record_log_rows"), ["doc_id TEXT", "_type TEXT", "_id TEXT", "_data TEXT", "_gen INTEGER"])
         XCTAssertEqual(try columns(provider, "record_log_view"), ["doc_id TEXT", "_type TEXT", "_id TEXT", "_data TEXT"])
         XCTAssertEqual(try columns(provider, "record_log_state"), [
             "doc_id TEXT", "cursor INTEGER", "open_epoch INTEGER", "grant_epoch INTEGER", "epoch_entries INTEGER",
             "constraints TEXT", "last_catch_up_at INTEGER", "permission TEXT", "rows_gen INTEGER", "replacing INTEGER",
-            "receipt TEXT", "segment TEXT",
+            "receipt TEXT", "segment TEXT", "staged INTEGER",
         ])
         XCTAssertEqual(try columns(provider, "record_log_writers"), [
             "doc_id TEXT", "client_id TEXT", "writer TEXT", "next_seq INTEGER", "resumed_at INTEGER",
@@ -117,9 +120,13 @@ final class RecordLogStoreHermeticTests: XCTestCase {
             "doc_id TEXT", "writer TEXT", "_type TEXT", "_id TEXT", "from_seq INTEGER", "until_seq INTEGER",
         ])
         XCTAssertEqual(try columns(provider, "record_log_epoch_counts"), ["doc_id TEXT", "epoch INTEGER", "count INTEGER"])
-        XCTAssertEqual(try columns(provider, "record_log_projection"), ["doc_id TEXT", "model TEXT"])
+        XCTAssertEqual(try columns(provider, "record_log_indexes"), [
+            "doc_id TEXT", "model TEXT", "fields TEXT", "is_unique INTEGER", "room_name TEXT",
+        ])
+        XCTAssertEqual(try columns(provider, "record_log_meta"), ["key TEXT", "value TEXT"])
         XCTAssertEqual(try columns(provider, "record_log_load_keys"), ["doc_id TEXT", "attempt TEXT", "_type TEXT", "_id TEXT"])
         XCTAssertEqual(try columns(provider, "record_log_owner"), ["user_id TEXT"])
+        XCTAssertEqual(try columns(provider, "record_log_staged_base"), ["doc_id TEXT", "_type TEXT", "_id TEXT", "_data TEXT"])
         let rows = try provider.withConnection { try $0.query("SELECT COUNT(*) AS n FROM record_log_state") }
         XCTAssertEqual(rows.first?["n"].intValue, 0, "creating the tables writes no row")
     }
@@ -200,18 +207,17 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         XCTAssertEqual(try store.pendingOf(writer).map(\.seq), [1, 2])
         XCTAssertEqual(try store.marks().nextSeq, 3)
 
-        let projected = try provider.withConnection { connection in
-            try connection.query("SELECT * FROM \"Note\" WHERE _meta_doc_id = ? AND id = ?", [.text("doc-1"), .text("n1")])
+        // The view row is what a query reads (the query tables until #4700).
+        let viewed = try provider.withConnection { connection in
+            try connection.query("SELECT _data FROM record_log_view WHERE doc_id = ? AND _id = ?", [.text("doc-1"), .text("n1")])
         }
-        XCTAssertEqual(projected.count, 1)
-        XCTAssertEqual(projected.first?["title"].stringValue, "one")
-        let members = try provider.withConnection { connection in
-            try connection.query("SELECT value FROM \"Note__tags\" WHERE _meta_doc_id = ? ORDER BY value", [.text("doc-1")])
-        }.compactMap { $0["value"].stringValue }
-        XCTAssertEqual(members, ["Z", "b", "é"])
+        XCTAssertEqual(viewed.count, 1)
+        let viewRow = RecordLogJSON.row(viewed.first?["_data"].stringValue)
+        XCTAssertEqual(viewRow["title"], "one")
+        XCTAssertEqual(viewRow["tags"], ["Z", "b", "é"])
 
-        // The entry, its view row and its query row are one save: read back
-        // after the group committed, they are all there.
+        // The entry and its view row are one save: read back after the group
+        // committed, they are all there.
         try store.flush()
         let stored = try provider.withConnection { connection in
             try connection.query("SELECT seq, e, entry FROM record_log_pending WHERE doc_id = ? ORDER BY seq", [.text("doc-1")])
@@ -235,7 +241,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
             seq: 1, code: "DOCUMENT_CONSTRAINT_VIOLATED", scope: .record, from: 1,
             records: [RecordLogRefusedRecord(model: "Note", id: "a", from: 1)]
         )
-        let reply = try store.refused(writer: writer, refusal: refusal, project: [spec])
+        let reply = try store.refused(writer: writer, refusal: refusal)
         XCTAssertEqual(reply.handedBack.map(\.seq), [1, 3, 4], "the refused record, and a withdrawn entry's other record from its number")
         XCTAssertEqual(reply.frames, [.resume(nextSeq: 6, records: [
             RecordLogRefusedRecord(model: "Note", id: "a", from: 1),
@@ -248,7 +254,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         XCTAssertNil(try store.read(model: "Note", id: "c"))
         XCTAssertEqual(try store.read(model: "Note", id: "b")?["title"], "b2", "a record outside the closure is untouched")
 
-        let again = try store.refused(writer: writer, refusal: refusal, project: [spec])
+        let again = try store.refused(writer: writer, refusal: refusal)
         XCTAssertEqual(again.handedBack.map(\.seq), [], "a refusal already acted on hands back nothing")
         XCTAssertEqual(again.frames, [], "and answers nothing")
     }
@@ -260,8 +266,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
 
         let reply = try store.refused(
             writer: writer,
-            refusal: RecordLogRefusal(seq: 2, code: "DOCUMENT_OFFLINE_WINDOW_EXPIRED", scope: .writer, from: 2),
-            project: [spec]
+            refusal: RecordLogRefusal(seq: 2, code: "DOCUMENT_OFFLINE_WINDOW_EXPIRED", scope: .writer, from: 2)
         )
         XCTAssertEqual(reply.handedBack.map(\.seq), [2, 3])
         XCTAssertEqual(reply.frames, [.resume(nextSeq: 4, records: nil)])
@@ -270,8 +275,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         try write(store, writer, note("d", .create, ["title": "d"]))  // 4, after the resume
         let stale = try store.refused(
             writer: writer,
-            refusal: RecordLogRefusal(seq: 1, code: "DOCUMENT_EPOCH_FROZEN", scope: .writer, from: 1),
-            project: [spec]
+            refusal: RecordLogRefusal(seq: 1, code: "DOCUMENT_EPOCH_FROZEN", scope: .writer, from: 1)
         )
         XCTAssertEqual(stale.handedBack.map(\.seq), [1], "only the run before the resume")
         XCTAssertEqual(stale.frames, [], "a stale refusal answers no frame")
@@ -291,7 +295,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         // acknowledged at once, and waits for 1 and 2 to settle.
         let ahead = try store.receive(writer: writer, items: [
             result(3, [RecordLogChange(model: "Note", id: "b", row: ["id": "b", "title": "b"])], w: writer, seq: 2),
-        ], project: [spec])
+        ])
         XCTAssertEqual(ahead.acknowledged, [RecordLogEntryRef(writer: writer, seq: 2)])
         XCTAssertEqual(ahead.settled, [])
         XCTAssertEqual(ahead.cursor, 0, "a result two ahead waits for the gap")
@@ -300,7 +304,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         let gap = try store.receive(writer: writer, items: [
             result(1, [RecordLogChange(model: "Note", id: "x", row: ["id": "x", "title": "other"])]),
             result(2, [RecordLogChange(model: "Note", id: "a", row: ["id": "a", "title": "a"])], w: writer, seq: 1),
-        ], project: [spec])
+        ])
         XCTAssertEqual(gap.cursor, 3, "the gap filled: 1, 2 and the held 3 applied in order")
         XCTAssertEqual(Set(gap.settled.map(\.seq)), [1, 2], "this writer's entries up to the acknowledged one confirmed")
         XCTAssertEqual(try store.pendingOf(writer).map(\.seq), [3])
@@ -309,7 +313,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         // A result at or below the cursor is ignored — but still acknowledges.
         let late = try store.receive(writer: writer, items: [
             result(2, [RecordLogChange(model: "Note", id: "c", row: ["id": "c", "title": "WRONG"])], w: writer, seq: 3),
-        ], project: [spec])
+        ])
         XCTAssertEqual(late.acknowledged, [RecordLogEntryRef(writer: writer, seq: 3)])
         XCTAssertEqual(late.cursor, 3)
         XCTAssertNil(try store.confirmedRows().first { $0["id"] == "c" }, "a result at or below the cursor is not applied")
@@ -327,11 +331,11 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         _ = try store.receive(writer: writer, items: [
             result(1, [RecordLogChange(model: "Note", id: "theirs", set: ["title": "t"])], w: writer, seq: 1,
                    alias: RecordLogAlias(model: "Note", from: "mine", to: "theirs")),
-        ], project: [spec])
+        ])
         let renamed = try XCTUnwrap(try store.pendingOf(writer).first { $0.seq == 2 })
         XCTAssertEqual(renamed.m.id, "theirs", "what the writer wrote since belongs to the record the upsert resolved to")
 
-        let settled = try store.receive(writer: writer, items: [.void(seq: 3), .duplicate(seq: 4)], project: [spec])
+        let settled = try store.receive(writer: writer, items: [.void(seq: 3), .duplicate(seq: 4)])
         XCTAssertEqual(settled.settled.map(\.seq), [3, 4])
         XCTAssertEqual(settled.acknowledged.map(\.seq), [4], "a duplicate was accepted before; a void was not")
         XCTAssertEqual(try store.pendingOf(writer).map(\.seq), [2])
@@ -345,31 +349,31 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         try store.beginCatchUp(writer: writer, full: true)
         _ = try store.applyCatchUpPage(writer: writer, rows: [
             RecordLogCatchUpRow(model: "Note", id: "old", row: ["id": "old", "title": "old"]),
-        ], project: [spec])
-        _ = try store.completeCatchUp(writer: writer, lsn: 5, full: true, project: [spec])
+        ])
+        _ = try store.completeCatchUp(writer: writer, lsn: 5, full: true)
 
         // An attempt that put a row and was interrupted…
         try store.beginCatchUp(writer: writer, full: true)
         _ = try store.applyCatchUpPage(writer: writer, rows: [
             RecordLogCatchUpRow(model: "Note", id: "half", row: ["id": "half", "title": "interrupted"]),
-        ], lsn: 6, project: [spec])
+        ], lsn: 6)
         XCTAssertTrue(try store.storedState().replacing)
         // …and the next that completes.
         try store.beginCatchUp(writer: writer, full: true)
         _ = try store.applyCatchUpPage(writer: writer, rows: [
             RecordLogCatchUpRow(model: "Note", id: "new", row: ["id": "new", "title": "new"]),
-        ], lsn: 7, project: [spec])
-        let done = try store.completeCatchUp(writer: writer, lsn: 7, high: 3, full: true, project: [spec])
+        ], lsn: 7)
+        let done = try store.completeCatchUp(writer: writer, lsn: 7, high: 3, full: true)
         XCTAssertEqual(done.cursor, 7)
         XCTAssertEqual(try store.confirmedRows().compactMap { $0["id"]?.stringValue }, ["new"])
         XCTAssertNil(try store.read(model: "Note", id: "half"))
         XCTAssertNil(try store.read(model: "Note", id: "old"))
         XCTAssertFalse(try store.storedState().replacing)
         XCTAssertEqual(try store.marks().open, 3, "the catch-up saw epoch 3")
-        let projected = try provider.withConnection {
-            try $0.query("SELECT id FROM \"Note\" WHERE _meta_doc_id = ? ORDER BY id", [.text("doc-1")])
-        }.compactMap { $0["id"].stringValue }
-        XCTAssertEqual(projected, ["new"])
+        let viewed = try provider.withConnection {
+            try $0.query("SELECT _id FROM record_log_view WHERE doc_id = ? ORDER BY _id", [.text("doc-1")])
+        }.compactMap { $0["_id"].stringValue }
+        XCTAssertEqual(viewed, ["new"])
     }
 
     func testPagedCatchUpAppliesPagesAndAPageOrCompletionBelowTheCursorIsStale() async throws {
@@ -378,11 +382,11 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         try store.beginCatchUp(writer: writer, full: false)
         _ = try store.applyCatchUpPage(writer: writer, rows: [
             RecordLogCatchUpRow(model: "Note", id: "p1", row: ["id": "p1"]),
-        ], lsn: 10, project: [spec])
+        ], lsn: 10)
         _ = try store.applyCatchUpPage(writer: writer, rows: [
             RecordLogCatchUpRow(model: "Note", id: "p2", row: ["id": "p2"]),
-        ], gone: [key("p1")], lsn: 10, project: [spec])
-        let done = try store.completeCatchUp(writer: writer, lsn: 10, high: 2, project: [spec])
+        ], gone: [key("p1")], lsn: 10)
+        let done = try store.completeCatchUp(writer: writer, lsn: 10, high: 2)
         XCTAssertFalse(done.stale)
         XCTAssertEqual(done.cursor, 10)
         XCTAssertEqual(try store.readRowsAfter(model: "Note", after: nil, limit: 10).compactMap { $0["id"]?.stringValue }, ["p2"])
@@ -390,9 +394,9 @@ final class RecordLogStoreHermeticTests: XCTestCase {
 
         let stalePage = try store.applyCatchUpPage(writer: writer, rows: [
             RecordLogCatchUpRow(model: "Note", id: "stale", row: ["id": "stale"]),
-        ], lsn: 9, project: [spec])
+        ], lsn: 9)
         XCTAssertTrue(stalePage.stale)
-        let staleDone = try store.completeCatchUp(writer: writer, lsn: 9, project: [spec])
+        let staleDone = try store.completeCatchUp(writer: writer, lsn: 9)
         XCTAssertTrue(staleDone.stale)
         XCTAssertEqual(staleDone.cursor, 10, "the cursor never moves back")
         XCTAssertNil(try store.read(model: "Note", id: "stale"), "a stale page changes nothing")
@@ -404,7 +408,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         let provider = try await makeProvider()
         let (store, writer) = try makeStore(provider)
         try store.setState(writer: writer, notice: (current: 1, next: 2, entries: 3))
-        _ = try store.receive(writer: writer, items: [result(1, e: 1, [])], project: [spec])   // one applied in epoch 1
+        _ = try store.receive(writer: writer, items: [result(1, e: 1, [])])   // one applied in epoch 1
         try write(store, writer, note("a", .create, ["title": "a"]))
         try write(store, writer, note("b", .create, ["title": "b"]))                         // epoch 1 holds 3
         let spilled = try write(store, writer, note("c", .create, ["title": "c"]))
@@ -439,11 +443,11 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         try write(store, writer, note("c", .create, ["title": "c"]))                         // 3, withdrawn
         try store.setState(writer: writer, notice: (current: 2, next: 3, entries: nil))
         try write(store, writer, note("d", .create, ["title": "d"]))                         // 4, epoch 2
-        _ = try store.receive(writer: writer, items: [result(5, [], w: writer, seq: 1)], project: [spec])
+        _ = try store.receive(writer: writer, items: [result(5, [], w: writer, seq: 1)])
         _ = try store.refused(writer: writer, refusal: RecordLogRefusal(
             seq: 3, code: "DOCUMENT_CONSTRAINT_VIOLATED", scope: .record, from: 3,
             records: [RecordLogRefusedRecord(model: "Note", id: "c", from: 3)]
-        ), project: [spec])
+        ))
         let before = try store.pendingOf(writer)
 
         let (fresh, renumbered) = try store.remintWriter(writer)
@@ -466,7 +470,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         // next sequence number is 1.
         _ = try store.receive(writer: fresh, items: [
             result(8, [], w: fresh, seq: 1), result(9, [], w: fresh, seq: 2),
-        ], project: [spec])
+        ])
         XCTAssertEqual(try store.pendingOf(fresh).compactMap(\.acked), [8, 9])
         let (last, nothing) = try store.remintWriter(fresh)
         XCTAssertEqual(nothing.count, 0)
@@ -482,15 +486,14 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         try write(store, writer, note("a", .create, ["title": "a"]))
         try write(store, writer, note("b", .create, ["title": "b"], tags: ["x": true]))
         try write(other, otherWriter, note("keep", .create, ["title": "kept"]))
-        _ = try store.projectModel(spec: spec)
 
-        let refused = try store.purge(force: false, project: [spec])
+        let refused = try store.purge(force: false)
         XCTAssertFalse(refused.purged)
         XCTAssertTrue(refused.refusedForPending)
         XCTAssertEqual(refused.pendingOps, 2)
         XCTAssertNotNil(try store.read(model: "Note", id: "a"))
 
-        let purged = try store.purge(force: true, project: [spec])
+        let purged = try store.purge(force: true)
         XCTAssertTrue(purged.purged)
         XCTAssertEqual(purged.handedBack.map(\.m.id), ["a", "b"], "in write order")
         try provider.withConnection { connection in
@@ -498,9 +501,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
                 let n = try connection.query("SELECT COUNT(*) AS n FROM \(table) WHERE doc_id = 'doc-1'").first?["n"].intValue
                 XCTAssertEqual(n, 0, table)
             }
-            XCTAssertEqual(try connection.query("SELECT COUNT(*) AS n FROM \"Note\" WHERE _meta_doc_id = 'doc-1'").first?["n"].intValue, 0)
-            XCTAssertEqual(try connection.query("SELECT COUNT(*) AS n FROM \"Note__tags\" WHERE _meta_doc_id = 'doc-1'").first?["n"].intValue, 0)
-            XCTAssertEqual(try connection.query("SELECT COUNT(*) AS n FROM \"Note\" WHERE _meta_doc_id = 'doc-2'").first?["n"].intValue, 1,
+            XCTAssertEqual(try connection.query("SELECT COUNT(*) AS n FROM record_log_view WHERE doc_id = 'doc-2'").first?["n"].intValue, 1,
                            "another document is untouched")
         }
         XCTAssertEqual(try other.read(model: "Note", id: "keep")?["title"], "kept")
@@ -515,7 +516,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         _ = try store.receive(writer: writer, items: [
             result(1, [RecordLogChange(model: "Note", id: "z", row: ["id": "z", "u": "k1"])]),
             result(2, [RecordLogChange(model: "Note", id: "a", row: ["id": "a", "u": "k1"])]),
-        ], project: [spec])
+        ])
         try write(store, writer, note("mine", .create, ["u": "k1", "title": "upserted"]), upsertOn: "u")
         XCTAssertEqual(try store.read(model: "Note", id: "z")?["title"], "upserted", "the first confirmed row in arrival order")
         XCTAssertNil(try store.read(model: "Note", id: "a")?["title"])
@@ -531,8 +532,27 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         // refresh reaching a record with an unjudged upsert recomputes it.
         _ = try store.receive(writer: writer, items: [
             result(3, [RecordLogChange(model: "Note", id: "z", set: ["u": "k9"])]),
-        ], project: [spec])
+        ])
         XCTAssertEqual(try store.read(model: "Note", id: "a")?["title"], "upserted", "the guess moved to the next holder")
         XCTAssertNil(try store.read(model: "Note", id: "z")?["title"])
+    }
+
+    // MARK: - #4701 behaviour 10: the documents a store holds
+
+    func testStoredDocumentIdsListsEveryDocumentWithAStateRowAndCreatesNothingOnAStoreWithout() async throws {
+        let bare = try await makeProvider()
+        XCTAssertEqual(try RecordLogStore.storedDocumentIds(host: bare), [])
+        XCTAssertEqual(try tableNames(bare).filter { $0.hasPrefix("record_log_") }, [], "no record-log table is created")
+
+        let provider = try await makeProvider()
+        let (second, secondWriter) = try makeStore(provider, documentId: "doc-b")
+        try write(second, secondWriter, note("n1"))
+        try second.flush()
+        let (first, _) = try makeStore(provider, documentId: "doc-a")
+        try first.flush()
+        _ = RecordLogStore(host: provider, documentId: "doc-unbound", clientId: "client-1")
+        XCTAssertEqual(try RecordLogStore.storedDocumentIds(host: provider), ["doc-a", "doc-b"], "sorted by id; a store never written holds no row")
+        _ = try first.purge(force: true)
+        XCTAssertEqual(try RecordLogStore.storedDocumentIds(host: provider), ["doc-b"], "a purged document is gone")
     }
 }

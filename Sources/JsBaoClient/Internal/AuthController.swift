@@ -86,6 +86,10 @@ public final class AuthController: @unchecked Sendable {
     private var currentToken: String?
     private var jwtPayload: [String: Any]?
     private var currentUserId: String?
+    /// Advanced in the critical section that installs or clears a token whose
+    /// user differs from the one before (`identity()`), so a reader never
+    /// sees one user's token with the previous user's epoch.
+    private var identityEpoch: UInt64 = 0
     private var networkMode: NetworkMode = .auto
     private var authReady = false
     private var authReadyContinuations: [CheckedContinuation<Void, Never>] = []
@@ -242,7 +246,23 @@ public final class AuthController: @unchecked Sendable {
     /// Drop the handler at client teardown, so a token applied afterwards
     /// cannot reach a socket that is being (or has been) closed.
     func clearTokenAppliedHandler() {
-        lock.withLock { tokenAppliedHandler = nil }
+        lock.withLock { tokenAppliedHandler = nil; identityChangedHandler = nil }
+    }
+
+    /// Called once the signed-in user changed — another user's token applied,
+    /// or the token cleared by a logout, `updateToken(nil)` or a rejected
+    /// refresh — after the change is installed. The token-applied handler is
+    /// told about none of the clearing paths.
+    private var identityChangedHandler: (@Sendable () -> Void)?
+
+    func setIdentityChangedHandler(_ handler: @escaping @Sendable () -> Void) {
+        lock.withLock { identityChangedHandler = handler }
+    }
+
+    /// The token in force, the user it names and the identity epoch, read
+    /// together under one lock.
+    func identity() -> (token: String?, userId: String?, epoch: UInt64) {
+        lock.withLock { (currentToken, Self.extractUserId(from: jwtPayload), identityEpoch) }
     }
 
     #if DEBUG
@@ -319,10 +339,12 @@ public final class AuthController: @unchecked Sendable {
         let installed = lock.withLock { () -> Bool in
             if blockNonInteractiveAuth { return false }
             if let current = currentToken, current != token { return false }
+            let previousUser = Self.extractUserId(from: jwtPayload)
             currentToken = token
             let payload = Self.parseJwtPayload(token: token)
             jwtPayload = payload
             currentUserId = Self.extractUserId(from: payload)
+            if currentUserId != previousUser { identityEpoch &+= 1 }
             return true
         }
         guard installed else {
@@ -493,6 +515,7 @@ public final class AuthController: @unchecked Sendable {
         // it is closing.
         enum DropReason { case loggedOut, signedIn, superseded }
         var dropReason: DropReason = .loggedOut
+        var userChanged = false
         let applied: (newUserId: String?, newToken: String?)? = lock.withLock {
             if token != nil, blockNonInteractiveAuth, !isSignIn {
                 return nil
@@ -508,6 +531,7 @@ public final class AuthController: @unchecked Sendable {
             if token != nil, isSignIn {
                 blockNonInteractiveAuth = false
             }
+            let previousUser = Self.extractUserId(from: jwtPayload)
             currentToken = token
 
             if let token = token {
@@ -517,6 +541,12 @@ public final class AuthController: @unchecked Sendable {
             } else {
                 jwtPayload = nil
                 currentUserId = nil
+            }
+            // Same section as the token, so the epoch and the token it
+            // describes are never seen apart.
+            if currentUserId != previousUser {
+                identityEpoch &+= 1
+                userChanged = true
             }
             return (currentUserId, currentToken)
         }
@@ -539,6 +569,11 @@ public final class AuthController: @unchecked Sendable {
         // Mirrors the JS `resetRefreshBackoff("bootstrap" / "token-updated")`
         // calls in `bootstrapToken` / `updateToken`.
         resetRefreshBackoff("token-updated")
+
+        if userChanged {
+            let notify = lock.withLock { identityChangedHandler }
+            notify?()
+        }
 
         // The mode is read through the locked accessor at each construction
         // site below rather than hoisted into a local here. Hoisting would be

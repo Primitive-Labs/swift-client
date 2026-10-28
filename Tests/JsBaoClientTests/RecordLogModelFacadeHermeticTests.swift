@@ -1,11 +1,12 @@
 import XCTest
-import SQLite3
+import JsBaoSQLite
 import YSwift
 @testable import JsBaoClient
 
 /// A model bound to a record-log (format-3) document, used through the same
 /// `DynamicModel` / `MultiDocModel` facade as any document: reads from the
-/// document's view, filtered reads from its query tables, writes as entries.
+/// document's view, filtered reads from its view too (its query tables until
+/// #4700), writes as entries.
 /// No server: the binding runs over a real `SQLiteStorageProvider`, and what
 /// the room would send is applied through the binding's store.
 final class RecordLogModelFacadeHermeticTests: XCTestCase {
@@ -52,13 +53,13 @@ final class RecordLogModelFacadeHermeticTests: XCTestCase {
         return provider
     }
 
-    private func makeFixture(provider existing: SQLiteStorageProvider? = nil, engine: BaoModelQueryEngine? = nil) async throws -> Fixture {
+    private func makeFixture(provider existing: SQLiteStorageProvider? = nil) async throws -> Fixture {
         let provider: SQLiteStorageProvider
         if let existing { provider = existing } else { provider = try await makeProvider() }
         let documentId = "rl-\(UUID().uuidString.prefix(8))"
         let binding = try RecordLogDocumentBinding(
             host: provider, documentId: documentId, clientId: "client-1",
-            engine: engine ?? BaoModelQueryEngine(host: provider), logger: Logger(level: .none)
+            logger: Logger(level: .none)
         )
         let doc = YDocument()
         let shared = MultiDocModel(schema: Self.schema)
@@ -153,7 +154,7 @@ final class RecordLogModelFacadeHermeticTests: XCTestCase {
         let reply = try fixture.binding.withOperation {
             try fixture.binding.store.receive(writer: writer, items: [
                 result(1, [RecordLogChange(model: "Note", id: "r1", row: ["id": "r1", "title": "remote", "views": 4])]),
-            ], project: fixture.binding.projectionSpecs)
+            ])
         }
         fixture.binding.notify(reply.changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) })
         let deadline = Date().addingTimeInterval(2)
@@ -283,19 +284,18 @@ final class RecordLogModelFacadeHermeticTests: XCTestCase {
             try fixture.binding.store.receive(writer: writer, items: [
                 result(1, [RecordLogChange(model: "Tag", id: "t1", row: ["id": "t1", "label": "red"])]),
                 result(2, [RecordLogChange(model: "Tag", id: "t2", row: ["id": "t2", "label": "blue"])]),
-            ], project: fixture.binding.projectionSpecs)
+            ])
         }
         let tags = MultiDocModel(schema: Self.tagSchema)
         let member = tags.connect(docId: fixture.documentId, doc: fixture.doc)
         try member.bindRecordLog(fixture.binding)
         XCTAssertEqual(try member.query(["label": "blue"]).compactMap { $0["id"]?.stringValue }, ["t2"])
         XCTAssertEqual(try member.count(), 2)
-        XCTAssertTrue(try fixture.binding.store.isProjected(model: "Tag"))
     }
 
     /// 4309-C2-04: a relaunch catches up before a model is registered; the
-    /// model's query tables did not take the change, so registering it later
-    /// rebuilds them rather than trusting their old mark.
+    /// model registered later reads the change. (Until #4700 its query tables
+    /// were rebuilt then; a db3's rows live in its view only.)
     func testAModelRegisteredAfterACatchUpItMissedIsRebuiltFromTheView() async throws {
         let provider = try await makeProvider()
         let fixture = try await makeFixture(provider: provider)
@@ -306,16 +306,15 @@ final class RecordLogModelFacadeHermeticTests: XCTestCase {
         _ = try fixture.binding.withOperation {
             try fixture.binding.store.receive(writer: first, items: [
                 result(1, [RecordLogChange(model: "Tag", id: "t1", row: ["id": "t1", "label": "red"])]),
-            ], project: fixture.binding.projectionSpecs)
+            ])
         }
         XCTAssertEqual(try member.query(["label": "red"]).count, 1)
-        XCTAssertTrue(try fixture.binding.store.isProjected(model: "Tag"))
         fixture.binding.close()
 
         // The relaunch: only Note is registered when the room's change lands.
         let relaunched = try RecordLogDocumentBinding(
             host: provider, documentId: fixture.documentId, clientId: "client-2",
-            engine: BaoModelQueryEngine(host: provider), logger: Logger(level: .none)
+            logger: Logger(level: .none)
         )
         try relaunched.registerModel(Self.schema)
         let writer = relaunched.writer
@@ -323,9 +322,8 @@ final class RecordLogModelFacadeHermeticTests: XCTestCase {
             try relaunched.store.receive(writer: writer, items: [
                 result(2, [RecordLogChange(model: "Tag", id: "t1", row: ["id": "t1", "label": "blue"])]),
                 result(3, [RecordLogChange(model: "Tag", id: "t2", row: ["id": "t2", "label": "green"])]),
-            ], project: relaunched.projectionSpecs)
+            ])
         }
-        XCTAssertFalse(try relaunched.store.isProjected(model: "Tag"), "Tag's query tables no longer hold its view")
 
         let later = MultiDocModel(schema: Self.tagSchema).connect(docId: fixture.documentId, doc: YDocument())
         try later.bindRecordLog(relaunched)

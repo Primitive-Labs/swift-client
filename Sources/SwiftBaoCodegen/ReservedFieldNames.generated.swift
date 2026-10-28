@@ -62,6 +62,7 @@ enum ReservedFieldNames {
         "findByUnique",
         "hasOwnProperty",
         "hash",
+        "increment",
         "isPrototypeOf",
         "modelName",
         "primitiveSchema",

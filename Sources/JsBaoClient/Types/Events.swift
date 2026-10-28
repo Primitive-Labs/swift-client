@@ -129,7 +129,6 @@ public enum JsBaoEvent: String, Sendable {
     /// notification while connected. Mirrors the JS client's `notification`
     /// event; fetch older rows via `client.notifications.list()`.
     case notification
-    case workflowStatus
     /// A message a server function published to a channel this client joined
     /// (#3278). Payload: `ChannelMessageEvent`. Mirrors JS `channelMessage`.
     case channelMessage
@@ -169,7 +168,6 @@ public enum JsBaoEvent: String, Sendable {
     case pendingCreateCommitted
     case schemaDiscovered = "schema-discovered"
     case syncPerf
-    case workflowStarted
     case documentSyncStateChanged
     /// Every write a record-log document's room refused, handed back with what
     /// it wrote. Raised for EVERY door — `create`, `update`, `save`, `upsert`,
@@ -203,6 +201,27 @@ public enum JsBaoEvent: String, Sendable {
     /// Payload: `AgentSessionChangedEvent`. Mirrors JS `agentSessionChanged`;
     /// `agents.sessions.watch` and an open session view apply it for you.
     case agentSessionChanged
+    // The `client.db3` events, appended for the same reason; each is the JS
+    // client's key verbatim. A `Db3Subscription` delivers its own db3's.
+    /// A db3's state on this device changed. Payload: `Db3StateEvent`.
+    case db3State = "db3:state"
+    /// A subscription reached `live`, once per subscribe. Payload: `Db3ReadyEvent`.
+    case db3Ready = "db3:ready"
+    /// Records of a db3 changed in the local copy. Payload: `Db3RowsEvent`.
+    case db3Rows = "db3:rows"
+    /// Writes to a db3 were handed back. Payload: `Db3WriteRefusedEvent`.
+    case db3WriteRefused = "db3:write-refused"
+    /// A db3's records left this device. Payload: `Db3EvictedEvent`.
+    case db3Evicted = "db3:evicted"
+    /// The room refused this user access to a db3. Payload: `Db3GoneEvent`.
+    case db3Gone = "db3:gone"
+    /// An open attempt of a db3 failed; the client retries. Payload: `Db3ErrorEvent`.
+    case db3Error = "db3:error"
+    // Appended (#4921), so no earlier case's ordinal moves.
+    /// The server has a db3 `client.db3.create` made. Payload: `Db3CreatedEvent`.
+    case db3Created = "db3:created"
+    /// The server refused a `client.db3.create`. Payload: `Db3CreateFailedEvent`.
+    case db3CreateFailed = "db3:create-failed"
 }
 
 // MARK: - Event Payloads
@@ -540,67 +559,6 @@ public struct BlobUploadFailedEvent: Sendable {
     }
 }
 
-/// Server-pushed workflow status event. Mirrors the JS client's
-/// `WorkflowStatusEvent` payload field-for-field — matches the
-/// `WorkflowStatusPayload` the server emits in
-/// `src/app-api/services/websocket-notifier.ts`.
-///
-/// The server only fires this for terminal statuses (`completed`, `failed`,
-/// `terminated`). When `needsApply == true` and the workflow has a handler
-/// registered via `client.workflows.define(...)`, the client triggers the
-/// claim → apply → confirm flow automatically.
-public struct WorkflowStatusEvent: @unchecked Sendable {
-    public let workflowKey: String
-    public let workflowId: String
-    public let runKey: String
-    public let runId: String
-    public let status: String   // "completed" | "failed" | "terminated" | "skipped"
-    public let output: Any?
-    public let error: String?
-    /// #2636 — the platform's classification of a `"failed"` run
-    /// (`"LOCK_CONTENTION"` / `"LOCK_TIMEOUT"`); `nil` on any other status.
-    public let errorCode: String?
-    /// #2636 — why a `"skipped"` run did not run (`"LOCK_CONTENTION"`): its
-    /// declarative lock was held and the definition declared
-    /// `onContention: "ignore"`. `nil` on any other status; such a frame
-    /// carries no `error`.
-    public let skipReason: String?
-    public let contextDocId: String?
-    public let needsApply: Bool
-    public let meta: [String: JSONValue]?
-    public let startedByUserId: String?
-
-    public init(
-        workflowKey: String,
-        workflowId: String,
-        runKey: String,
-        runId: String,
-        status: String,
-        output: Any? = nil,
-        error: String? = nil,
-        errorCode: String? = nil,
-        skipReason: String? = nil,
-        contextDocId: String? = nil,
-        needsApply: Bool = false,
-        meta: [String: JSONValue]? = nil,
-        startedByUserId: String? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.workflowId = workflowId
-        self.runKey = runKey
-        self.runId = runId
-        self.status = status
-        self.output = output
-        self.error = error
-        self.errorCode = errorCode
-        self.skipReason = skipReason
-        self.contextDocId = contextDocId
-        self.needsApply = needsApply
-        self.meta = meta
-        self.startedByUserId = startedByUserId
-    }
-}
-
 /// Payload for `.notification`
 /// (`for await e in client.stream(for: NotificationEvent.self)`).
 ///
@@ -705,43 +663,6 @@ public struct ChannelSubscribeFailedEvent: Sendable, Equatable {
     }
 }
 
-/// Context delivered to the user's `onApply` handler registered via
-/// `client.workflows.define(...)`. Mirrors the JS client's apply context.
-public struct WorkflowApplyContext: @unchecked Sendable {
-    public let workflowKey: String
-    public let runKey: String
-    public let runId: String
-    public let contextDocId: String?
-    public let output: Any?
-    public let startedByUserId: String?
-    public let meta: [String: JSONValue]?
-
-    public init(
-        workflowKey: String,
-        runKey: String,
-        runId: String,
-        contextDocId: String? = nil,
-        output: Any? = nil,
-        startedByUserId: String? = nil,
-        meta: [String: JSONValue]? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.runKey = runKey
-        self.runId = runId
-        self.contextDocId = contextDocId
-        self.output = output
-        self.startedByUserId = startedByUserId
-        self.meta = meta
-    }
-}
-
-/// Closure type for the user's apply handler registered via
-/// `client.workflows.define(workflowKey, onApply: ...)`. The closure runs
-/// after the client successfully claims the apply lease and fetches the
-/// workflow output. Throw to cause the claim to be released so another
-/// client (or a retry) can pick it up.
-public typealias WorkflowApplyHandler = @Sendable (WorkflowApplyContext) async throws -> Void
-
 // MARK: - Newly-added event payloads (parity gap 5)
 // Each struct mirrors the JS counterpart's payload field-for-field.
 // Where the JS payload is `{}`, the struct is empty.
@@ -829,6 +750,10 @@ public struct DocumentWriteRefusedEvent: Sendable {
     public let writes: [RecordLogRefusedWrite]?
     /// The record already holding the key, for a format-3 constraint refusal.
     public let conflictingRecord: RecordLogRecordKey?
+    /// For `DB3_CONDITION_NOT_MET`, the record whose guard failed and the
+    /// room's row of it; for `DB3_RECORD_NOT_FOUND`, the record an increment
+    /// named (`row == nil`). `nil` for any other refusal.
+    public let current: RecordLogCurrentRecord?
 
     public init(
         documentId: String, model: String, recordId: String, error: JsBaoError
@@ -839,11 +764,22 @@ public struct DocumentWriteRefusedEvent: Sendable {
         self.error = error
         self.writes = nil
         self.conflictingRecord = nil
+        self.current = nil
     }
 
     public init(
         documentId: String, model: String, recordId: String, error: JsBaoError,
         writes: [RecordLogRefusedWrite]?, conflictingRecord: RecordLogRecordKey?
+    ) {
+        self.init(
+            documentId: documentId, model: model, recordId: recordId, error: error,
+            writes: writes, conflictingRecord: conflictingRecord, current: nil
+        )
+    }
+
+    public init(
+        documentId: String, model: String, recordId: String, error: JsBaoError,
+        writes: [RecordLogRefusedWrite]?, conflictingRecord: RecordLogRecordKey?, current: RecordLogCurrentRecord?
     ) {
         self.documentId = documentId
         self.model = model
@@ -851,6 +787,7 @@ public struct DocumentWriteRefusedEvent: Sendable {
         self.error = error
         self.writes = writes
         self.conflictingRecord = conflictingRecord
+        self.current = current
     }
 }
 
@@ -968,43 +905,6 @@ public struct SyncPerfEvent: Sendable {
         self.documentId = documentId
         self.timings = timings
         self.clientTimings = clientTimings
-    }
-}
-
-/// Fired when a workflow run is started. Mirrors the JS client's
-/// `WorkflowStartedEvent` (`src/client/JsBaoClient.ts`) field-for-field.
-///
-/// Emitted exclusively from the server-pushed `workflowStarted` WS frame
-/// (the JS source of truth); every field is populated from the frame.
-/// The local `workflows.start(...)` HTTP path does NOT emit — it did
-/// pre-#1112, which double-emitted every start observed over WS.
-/// All fields beyond `workflowKey`/`runId` are optional so decoding /
-/// construction stays lenient when the frame omits them.
-public struct WorkflowStartedEvent: Sendable {
-    public let workflowKey: String
-    public let runId: String
-    public let workflowId: String?
-    public let runKey: String?
-    public let instanceId: String?
-    public let contextDocId: String?
-    public let meta: [String: JSONValue]?
-
-    public init(
-        workflowKey: String,
-        runId: String,
-        workflowId: String? = nil,
-        runKey: String? = nil,
-        instanceId: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: JSONValue]? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.runId = runId
-        self.workflowId = workflowId
-        self.runKey = runKey
-        self.instanceId = instanceId
-        self.contextDocId = contextDocId
-        self.meta = meta
     }
 }
 

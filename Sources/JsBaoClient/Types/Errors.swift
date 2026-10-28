@@ -20,10 +20,9 @@ public enum JsBaoErrorCode: String, Sendable {
     case integrationSecretMissing = "INTEGRATION_SECRET_MISSING"
     case integrationRequestInvalid = "INTEGRATION_REQUEST_INVALID"
     case integrationProxyFailed = "INTEGRATION_PROXY_FAILED"
-    case workflowApplyNotConfirmed = "WORKFLOW_APPLY_NOT_CONFIRMED"
-    /// `workflows.waitFor` gave up after `timeoutMs` without the run reaching
-    /// a terminal state. Mirrors the JS client's `WORKFLOW_WAIT_TIMEOUT`.
-    case workflowWaitTimeout = "WORKFLOW_WAIT_TIMEOUT"
+    /// `functions.waitFor` gave up after its timeout without the run reaching
+    /// a terminal state. Mirrors the JS client's `FUNCTION_WAIT_TIMEOUT`.
+    case functionWaitTimeout = "FUNCTION_WAIT_TIMEOUT"
     /// `locks.acquire` reached its `timeoutMs` deadline without winning the
     /// key. Mirrors the JS client's `LockTimeoutError` (`LOCK_TIMEOUT`); the
     /// error's `details` carry `key` and `timeoutMs`.
@@ -47,20 +46,6 @@ public enum JsBaoErrorCode: String, Sendable {
     /// it is waiting for. Mirrors JS `waitForAvailability`'s
     /// `NETWORK_REQUIRES_AUTOSTART` (#2667, parity C8).
     case networkRequiresAutostart = "NETWORK_REQUIRES_AUTOSTART"
-    /// DEPRECATED (#3482): the backstop against a server that predates the
-    /// runtime routes, removed by phase 7.
-    ///
-    /// A function's config no longer says anything about how it runs — the
-    /// caller picks the runtime at each call, `functions.invoke` posts to the
-    /// route that runs it inside the request and `functions.start` to the one
-    /// that runs it as a task — so against a current server neither verb can
-    /// be "the wrong one" and this is unreachable. Against an OLDER
-    /// deployment, where one route's body field decided what it answered, it
-    /// is still thrown when the envelope is the other shape. Mirrors the JS
-    /// client's `FUNCTION_MODE_MISMATCH` (#3278). `details` carry
-    /// `functionKey` plus `runId` (the run was started) or `status` (the
-    /// function ran).
-    case functionModeMismatch = "FUNCTION_MODE_MISMATCH"
     /// `subscribeToChannel` did not get its channel's ack: the server's
     /// uniform refusal, the 20 s ack timeout, the channel was left while the
     /// join was in flight, or the socket closed while joining (#3278).
@@ -149,6 +134,81 @@ public enum JsBaoErrorCode: String, Sendable {
     /// This client may no longer write to the document; its unjudged writes
     /// are handed back.
     case writeAccessDenied = "WRITE_ACCESS_DENIED"
+    // The agent session upload codes, appended for the reason given above
+    // `documentFormatMismatch`. Each is the JS client's string verbatim.
+    /// `view.attachments.waitUntilUploaded` named an upload this client
+    /// neither queued nor completed. `details` carry `blobId`.
+    case agentSessionUploadUnknown = "AGENT_SESSION_UPLOAD_UNKNOWN"
+    /// A session upload was cancelled (`view.attachments.cancel`) while
+    /// something waited for it. `details` carry `blobId`.
+    case agentSessionUploadCancelled = "AGENT_SESSION_UPLOAD_CANCELLED"
+    /// The signed-in user changed (another user's token, or a logout) while
+    /// something waited for a session upload. The upload stays with the user
+    /// who queued it. `details` carry `blobId`.
+    case agentSessionUploadIdentityChanged = "AGENT_SESSION_UPLOAD_IDENTITY_CHANGED"
+    // The db3 code, appended for the reason given above `documentFormatMismatch`;
+    // the JS client's string verbatim.
+    /// A db3 read whose answer would pass its limits and cannot be shortened
+    /// without changing it: an aggregate whose rows pass 8 MiB of JSON, a page
+    /// whose `_related` takes it past 8 MiB, or a `hasMany` include reading more
+    /// than 1,000 related rows for the page. `details` carry `bytes` and `limit`,
+    /// or `include`, `rows` and `limit` for an include leg. Narrow the filter,
+    /// group more coarsely, or pass `sort` and a smaller `limit`.
+    case db3PageTooLarge = "DB3_PAGE_TOO_LARGE"
+    // The `client.db3` lifecycle codes, appended for the reason given above
+    // `documentFormatMismatch`; each is the JS client's string verbatim.
+    /// A subscription's `ready()` waited its `readyTimeout` with no progress.
+    /// The client keeps retrying; `details` carry `db3Id` and `readyTimeoutMs`.
+    case db3ReadyTimeout = "DB3_READY_TIMEOUT"
+    /// The room refused this user access to the db3 (a revoked grant): its
+    /// subscriptions' `ready()` throws it, and `Db3GoneEvent` carries it.
+    case db3AccessRefused = "DB3_ACCESS_REFUSED"
+    /// `client.db3.evict` without `force` while the db3 holds writes the room
+    /// has not judged. `details` carry `db3Id` and `pendingWrites`.
+    case db3PendingWrites = "DB3_PENDING_WRITES"
+    /// `client.db3.evict` while another holder keeps the db3's store. Declared
+    /// for parity with the JS client, where another tab can; one process holds
+    /// a Swift client's store file, so it is never raised here.
+    case db3Held = "DB3_HELD"
+    /// A subscription was disposed, or its client destroyed or signed out,
+    /// before `ready()` settled.
+    case db3Disposed = "DB3_DISPOSED"
+    /// `client.db3.subscribe` of a document that is not a db3. `details` carry
+    /// `db3Id` and `documentFormat`.
+    case notADb3 = "NOT_A_DB3"
+    /// A db3 read or save named a db3 whose rows have not been loaded on this
+    /// device (its first load did not complete). Subscribe and await
+    /// `available()` first. `details` carry `documents`.
+    case db3NotResident = "DB3_NOT_RESIDENT"
+    // The db3 write codes, appended for the reason given above
+    // `documentFormatMismatch`; each is the JS client's string verbatim.
+    /// A db3 write's `condition` did not hold, or `ifNotExists` met a live
+    /// record: the room did not apply it. `details.current` is the record it
+    /// was judged against (`{ model, id, row }`, `row` null when it has none).
+    case db3ConditionNotMet = "DB3_CONDITION_NOT_MET"
+    /// An increment named a db3 record that does not exist or was deleted:
+    /// refused here when this device's view holds no row, or by the room,
+    /// whose refusal carries `details.current` with `row` null.
+    case db3RecordNotFound = "DB3_RECORD_NOT_FOUND"
+    /// The room needs a newer client than this one to sync the db3: it refused
+    /// the open for the wire version this client speaks. Subscriptions'
+    /// `ready()` throws it and `Db3GoneEvent` carries it
+    /// (`reason: .clientOutdated`). Update the client; the rows stay readable.
+    case db3ClientOutdated = "DB3_CLIENT_OUTDATED"
+    /// The db3's sync is off (an admin or a function turned it off): no socket
+    /// reaches it. A subscription's `ready()` throws it, and the db3 is gone
+    /// with `Db3GoneEvent.Reason.syncOff`, until its sync is on again.
+    case db3SyncOff = "DB3_SYNC_OFF"
+    /// One of the db3's triggers refused the write: the room did not apply
+    /// it. `details.reason` is the refusing trigger's own code.
+    case db3TriggerRefused = "DB3_TRIGGER_REFUSED"
+    /// The db3 is typed: its type declares its models, so the room declares
+    /// nothing the client sends. The client carries on under the type's
+    /// declarations, and a subscription still becomes ready.
+    case db3DeclarationRefusedTyped = "DB3_DECLARATION_REFUSED_TYPED"
+    /// A write to a model the db3's type does not declare: the room did not
+    /// apply it, and the write is handed back with this code.
+    case db3ModelNotDeclared = "DB3_MODEL_NOT_DECLARED"
 }
 
 /// Main error type for the JsBao client library

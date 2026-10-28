@@ -1,0 +1,22 @@
+{
+  "name": "documents.grantGroupPermission",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/documents/<ulid>/group-permissions",
+  "caller": "owner",
+  "request": {
+    "groupType": "team",
+    "groupId": "baseline",
+    "permission": "reader"
+  },
+  "status": 201,
+  "body": {
+    "documentId": "<ulid>",
+    "groupType": "team",
+    "groupId": "baseline",
+    "permission": "reader",
+    "grantedAt": "<iso>",
+    "grantedBy": "<ulid>"
+  }
+}

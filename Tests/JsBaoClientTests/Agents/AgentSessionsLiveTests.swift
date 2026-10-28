@@ -74,7 +74,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         let byId = Dictionary(uniqueKeysWithValues: mine.items.map { ($0.sessionId, $0) })
         XCTAssertEqual(byId[s.sessionId]?.role, .participant)
         XCTAssertEqual(byId[other.sessionId]?.role, .participant)
-        XCTAssertEqual(byId[s.sessionId]?.documentId, s.documentId)
+        XCTAssertEqual(byId[s.sessionId]?.storageDocumentId, s.documentId)
         XCTAssertEqual(byId[s.sessionId]?.scope, scope)
         let owned = try await ownerC.agents.sessions.list()
         XCTAssertEqual(owned.items.first { $0.sessionId == s.sessionId }?.role, .owner)

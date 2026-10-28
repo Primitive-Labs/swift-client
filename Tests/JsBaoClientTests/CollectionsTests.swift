@@ -99,65 +99,49 @@ final class CollectionsTests: XCTestCase {
         let _ = try await client.collections.delete(collectionId: collectionId)
     }
 
-    func testGrantGroupPermissionAndSeeInAccess() async throws {
-        // Create a group via HTTP
-        let devGroup: [String: JSONValue] = [
-            "groupType": "team",
-            "groupId": "devs",
-            "name": "Developers",
-        ]
-        _ = try await client.requestJSON(method: .post, path: "/groups", body: devGroup)
+    /// A group is a member of a collection with a role, listed as the
+    /// principal `group:<groupId>` (#4737). A session cannot create a group
+    /// (#4735), so it is created through the admin API, held by the app owner.
+    func testAddGroupMemberAndSeeItInListMembers() async throws {
+        let devs = try await ctx.createGroup(app: testApp, name: "Developers").groupId
 
-        let created = try await client.collections.create(params: CreateCollectionParams(name: "group-perm-test"))
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "group-member-test"))
         let collectionId = created.collectionId
 
-        let grantResult = try await client.collections.grantGroupPermission(
-            collectionId: collectionId,
-            params: GrantCollectionGroupPermissionParams(groupType: "team", groupId: "devs", permission: "reader")
+        let added = try await client.collections.addGroupMember(
+            collectionId: collectionId, groupId: devs, role: .viewer
         )
-        XCTAssertEqual(grantResult.groupType, "team")
-        XCTAssertEqual(grantResult.groupId, "devs")
-        XCTAssertEqual(grantResult.permission, "reader")
+        XCTAssertEqual(added.principal, "group:\(devs)")
+        XCTAssertEqual(added.groupId, devs)
+        XCTAssertEqual(added.role, .viewer)
 
-        let access = try await client.collections.getAccess(collectionId: collectionId)
-        let groups = access.groups
-        XCTAssertEqual(groups.count, 1)
-        XCTAssertEqual(groups.first?.groupType, "team")
+        let members = try await client.collections.listMembers(collectionId: collectionId)
+        let group = try XCTUnwrap(members.first { $0.principal == "group:\(devs)" })
+        XCTAssertEqual(group.groupId, devs)
+        XCTAssertEqual(group.role, .viewer)
+        XCTAssertEqual(members.first { $0.userId == testApp.ownerUserId }?.role, .owner)
 
         // Cleanup
         let _ = try await client.collections.delete(collectionId: collectionId)
     }
 
-    func testRevokeGroupPermission() async throws {
-        // Create a group via HTTP (may already exist from previous test, ignore error)
-        let revokeGroup: [String: JSONValue] = [
-            "groupType": "team",
-            "groupId": "revoke-devs",
-            "name": "Revoke Developers",
-        ]
-        _ = try? await client.requestJSON(method: .post, path: "/groups", body: revokeGroup)
+    func testRemoveGroupMember() async throws {
+        let revokeDevs = try await ctx.createGroup(app: testApp, name: "Revoke Developers").groupId
 
-        let created = try await client.collections.create(params: CreateCollectionParams(name: "revoke-perm-test"))
+        let created = try await client.collections.create(params: CreateCollectionParams(name: "remove-group-test"))
         let collectionId = created.collectionId
 
-        // Grant permission
-        let _ = try await client.collections.grantGroupPermission(
-            collectionId: collectionId,
-            params: GrantCollectionGroupPermissionParams(groupType: "team", groupId: "revoke-devs", permission: "reader")
+        _ = try await client.collections.addGroupMember(
+            collectionId: collectionId, groupId: revokeDevs, role: .viewer
         )
 
-        // Revoke permission
-        let revokeResult = try await client.collections.revokeGroupPermission(
-            collectionId: collectionId,
-            groupType: "team",
-            groupId: "revoke-devs"
+        let removeResult = try await client.collections.removeMember(
+            collectionId: collectionId, principal: "group:\(revokeDevs)"
         )
-        XCTAssertTrue(revokeResult.success)
+        XCTAssertTrue(removeResult.success)
 
-        // Verify access is empty
-        let access = try await client.collections.getAccess(collectionId: collectionId)
-        let groups = access.groups
-        XCTAssertEqual(groups.count, 0, "Groups should be empty after revoke")
+        let members = try await client.collections.listMembers(collectionId: collectionId)
+        XCTAssertFalse(members.contains { $0.groupId != nil }, "the group should be gone after removal")
 
         // Cleanup
         let _ = try await client.collections.delete(collectionId: collectionId)
@@ -170,15 +154,18 @@ final class CollectionsTests: XCTestCase {
 
         let addResult = try await client.collections.addMember(
             collectionId: collectionId,
-            params: .user(user2.userId, permission: .reader)
+            params: .user(user2.userId, role: .viewer)
         )
         // user2 is an existing app user, so the add resolves to a direct membership.
         guard case let .direct(direct) = addResult else {
             return XCTFail("Expected a direct add for an existing user, got: \(addResult)")
         }
         XCTAssertEqual(direct.userId, user2.userId)
+        XCTAssertEqual(direct.role, .viewer)
 
-        let removeResult = try await client.collections.removeMember(collectionId: collectionId, userId: user2.userId)
+        let removeResult = try await client.collections.removeMember(
+            collectionId: collectionId, principal: user2.userId
+        )
         XCTAssertTrue(removeResult.success)
     }
 

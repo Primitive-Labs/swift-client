@@ -1,0 +1,27 @@
+{
+  "name": "collections.list.asReader",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/collections",
+  "caller": "reader",
+  "request": null,
+  "status": 200,
+  "body": {
+    "items": [
+      {
+        "collectionId": "<ulid>",
+        "appId": "<appId>",
+        "name": "Baseline Collection Renamed",
+        "description": "Compatibility baseline",
+        "collectionType": "default",
+        "documentCount": 1,
+        "createdBy": "<ulid>",
+        "createdAt": "<iso>",
+        "modifiedAt": "<iso>",
+        "permission": "reader"
+      }
+    ],
+    "hasMore": false
+  }
+}

@@ -1,6 +1,6 @@
 import XCTest
 @testable import JsBaoClient
-import SQLite3
+import JsBaoSQLite
 
 /// A large document (`documentFormat: 2`) is no longer served (#4313). The
 /// Swift client refuses one with `.documentFormatUnsupported` wherever it

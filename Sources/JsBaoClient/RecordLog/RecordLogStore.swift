@@ -2,13 +2,14 @@ import Foundation
 
 // A format-3 document's local store over the storage provider's SQLite
 // connection: confirmed rows, the view reads answer from, the unjudged entries
-// per writer, the cursor and the epochs, and the projection of the view into
-// the model query tables. A port of js-bao's `record-log-client/store.ts`.
+// per writer, the cursor and the epochs. A db3's rows live in its view only
+// (#4700): reads answer from it (`RecordLogViewReader`). A port of js-bao's
+// `record-log-client/store.ts`.
 //
 // Synchronous: every call runs on the provider's serial queue. A save joins
 // the connection's group of saves (``RecordLogGroupCommit``); every other
-// command is one transaction of its own. A save's pending entry, its view row
-// and its query rows commit together or not at all.
+// command is one transaction of its own. A save's pending entry and its view
+// row commit together or not at all.
 
 /// What a store holds of a document, asked before the document is bound.
 struct RecordLogStoredState: Equatable, Sendable {
@@ -20,6 +21,11 @@ struct RecordLogStoredState: Equatable, Sendable {
     var writers: [Writer]
     /// A full replacement of the confirmed rows was interrupted.
     var replacing: Bool
+    /// When a load or catch-up last completed on this device (ms), or `nil`.
+    var lastCatchUpAt: Int64? = nil
+    /// The replacement in progress is staged: the view keeps the previous
+    /// completed generation until it commits.
+    var staged = false
 
     struct Writer: Equatable, Sendable {
         var writer: String
@@ -59,11 +65,13 @@ struct RecordLogMarks: Equatable, Sendable {
     var receipt: RecordLogReceipt?
     /// The segment the confirmed rows were last replaced from, or `nil`.
     var segment: RecordLogHeldSegment? = nil
+    /// The full replacement in progress is staged (see ``RecordLogStoredState/staged``).
+    var staged = false
 
     static func == (a: RecordLogMarks, b: RecordLogMarks) -> Bool {
         a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
             && a.constraints == b.constraints && a.permission == b.permission && a.replacing == b.replacing
-            && a.replacement == b.replacement && a.receipt == b.receipt && a.segment == b.segment
+            && a.replacement == b.replacement && a.receipt == b.receipt && a.segment == b.segment && a.staged == b.staged
             && a.lastCatchUpAt == b.lastCatchUpAt && a.writer == b.writer && a.nextSeq == b.nextSeq
             && a.resumedAt == b.resumedAt
             && a.lowestPending == b.lowestPending && a.pending == b.pending
@@ -99,6 +107,8 @@ struct RecordLogChangeReply: Sendable {
     var models: [String] = []
     var acknowledged: [RecordLogEntryRef] = []
     var settled: [RecordLogEntryRef] = []
+    /// The settled entries' records with their confirmed rows as each settled.
+    var settlements: [RecordLogEntryRef: RecordLogSettlement] = [:]
     var handedBack: [RecordLogPendingEntry] = []
     var frames: [RecordLogUpFrame] = []
     /// A compact acknowledgement the store could not derive; the session opens again from the cursor.
@@ -173,6 +183,20 @@ struct RecordLogSql {
 }
 
 extension Format2SqlValue {
+    /// A parameter `QueryTranslator` or `CursorManager` built, as a binding:
+    /// a boolean as 1/0, an integer as an integer, a `Double` as a real, text
+    /// as text and anything else (`NSNull`) as NULL.
+    init(bindable value: Any) {
+        switch value {
+        case let flag as Bool: self = .integer(flag ? 1 : 0)
+        case let number as Int64: self = .integer(number)
+        case let number as Int: self = .integer(Int64(number))
+        case let number as Double: self = .real(number)
+        case let text as String: self = .text(text)
+        default: self = .null
+        }
+    }
+
     /// A written value as `record_log_pending_values` keeps it: a boolean as
     /// 1/0, an object or array as its JSON.
     static func recordLogWritten(_ value: JSONValue) -> Format2SqlValue {
@@ -482,12 +506,64 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
 
     func beginReplace() throws {
         try ensureState()
+        // The view holds a completed generation when a catch-up completed here
+        // and no replacement is in progress, or the one in progress is staged:
+        // the new one is staged too, and the view keeps those rows until it
+        // completes. Over a cold load's rows it is written as rows arrive.
+        let before = try state()
+        let wasReplacing = before.map { !$0["replacing"].isNull } ?? false
+        let caughtUp = before.map { !$0["last_catch_up_at"].isNull } == true
+        let completeView = try caughtUp && (!wasReplacing || staged())
         // Every attempt takes a generation of its own: a row an interrupted
         // attempt put is gone unless this one puts it again.
         try sql.exec(
             "UPDATE record_log_state SET replacing = MAX(rows_gen, COALESCE(replacing, rows_gen)) + 1 WHERE doc_id = ?",
             [doc]
         )
+        try sql.exec("UPDATE record_log_state SET staged = \(completeView ? "replacing" : "NULL") WHERE doc_id = ?", [doc])
+        // A staged attempt after an interrupted staged one keeps the base the
+        // first took: the view still holds that completed generation.
+        if !completeView || !wasReplacing { try clearStagedBase() }
+    }
+
+    /// Whether the replacement in progress is staged: the view still holds
+    /// the previous completed generation's rows.
+    func staged() throws -> Bool {
+        guard let state = try state(), !state["replacing"].isNull, !state["staged"].isNull else { return false }
+        return state["staged"].intValue == state["replacing"].intValue
+    }
+
+    /// Keep, once per record, the previous completed generation's confirmed
+    /// row of each of `keys` (none when it had none) before a staged
+    /// replacement rewrites it.
+    func stageBase(_ keys: [RecordLogRecordKey]) throws {
+        for key in keys {
+            try sql.exec(
+                """
+                INSERT OR IGNORE INTO record_log_staged_base (doc_id, _type, _id, _data)
+                  VALUES (?, ?, ?, (SELECT _data FROM record_log_rows WHERE doc_id = ? AND _type = ? AND _id = ?))
+                """,
+                [doc, .text(key.model), .text(key.id), doc, .text(key.model), .text(key.id)]
+            )
+        }
+    }
+
+    /// What a view refresh guesses over: the confirmed rows, except, while a
+    /// staged replacement is in progress, the previous completed generation's
+    /// row of each record the replacement has rewritten.
+    func viewBase() throws -> (RecordLogRecordKey) throws -> RecordLogRow? {
+        guard try staged() else { return { [unowned self] key in try self.confirmedRow(key) } }
+        return { [unowned self] key in
+            guard let kept = try self.sql.first(
+                "SELECT _data FROM record_log_staged_base WHERE doc_id = ? AND _type = ? AND _id = ?",
+                [self.doc, .text(key.model), .text(key.id)]
+            ) else { return try self.confirmedRow(key) }
+            return kept["_data"].isNull ? nil : RecordLogJSON.row(kept["_data"].stringValue)
+        }
+    }
+
+    private func clearStagedBase() throws {
+        try sql.exec("DELETE FROM record_log_staged_base WHERE doc_id = ?", [doc])
     }
 
     func completeReplace() throws -> [RecordLogRecordKey] {
@@ -502,8 +578,10 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
         }
         try sql.exec("DELETE FROM record_log_rows WHERE doc_id = ? AND _gen <> ?", [doc, .integer(Int64(gen))])
         try sql.exec(
-            "UPDATE record_log_state SET rows_gen = ?, replacing = NULL WHERE doc_id = ?", [.integer(Int64(gen)), doc]
+            "UPDATE record_log_state SET rows_gen = ?, replacing = NULL, staged = NULL WHERE doc_id = ?",
+            [.integer(Int64(gen)), doc]
         )
+        try clearStagedBase()
         return removed
     }
 
@@ -783,6 +861,12 @@ final class RecordLogStore: @unchecked Sendable {
         try onConnection { sql in try group.read { try body(sql) } }
     }
 
+    /// Run a read of the view (``RecordLogViewReader``) on this store's
+    /// connection: no transaction, and it sees what the open group has written.
+    func readView<T>(_ body: (RecordLogSql) throws -> T) throws -> T {
+        try reading(body)
+    }
+
     /// A command that is not a save: the open group commits first.
     private func command<T>(_ body: (RecordLogSql) throws -> T) throws -> T {
         try onConnection { sql in try group.command(sql.connection) { try body(sql) } }
@@ -800,9 +884,34 @@ final class RecordLogStore: @unchecked Sendable {
 
     // MARK: - Tables and identity
 
-    /// Create the record-log tables. Idempotent; writes no row.
+    /// Create the record-log tables and bring the store to
+    /// ``RecordLogSchema/storageVersion``, in one transaction. Idempotent.
+    ///
+    /// A store at the version is answered by one read of its version and one
+    /// `sqlite_master` probe for the projection rule table an older build
+    /// creates on every open and the staged replacement's base table (#4701,
+    /// added with no version change): when neither says otherwise, nothing
+    /// else runs.
+    /// Otherwise the tables are created and the projection layout an older
+    /// build kept is retired (``retireProjection(_:)``), with every record
+    /// kept, and the version is written. An older build opening a store at
+    /// the version is not refused; its layout is retired again at the next open.
     func initialize() throws {
         try command { sql in
+            let version = (try? sql.first(
+                "SELECT value FROM record_log_meta WHERE key = 'storage_version'"
+            ))??["value"].intValue
+            // One probe: an older build's projection rule, and the staged
+            // replacement's base table a store from before #4701 lacks (its
+            // `staged` column is added with it).
+            let probed = Set(try sql.rows(
+                """
+                SELECT name FROM sqlite_master WHERE type = 'table'
+                   AND name IN ('record_log_projection_rule', 'record_log_staged_base')
+                """
+            ).compactMap { $0["name"].stringValue })
+            let olderBuildWasHere = probed.contains("record_log_projection_rule")
+            if version == RecordLogSchema.storageVersion && !olderBuildWasHere && probed.contains("record_log_staged_base") { return }
             for statement in RecordLogSchema.ddl { try sql.connection.executeScript(statement) }
             for added in RecordLogSchema.addedColumns {
                 let has = try sql.first(
@@ -810,7 +919,57 @@ final class RecordLogStore: @unchecked Sendable {
                 ) != nil
                 if !has { try sql.connection.executeScript(added.add) }
             }
+            let dropped = try retireProjection(sql)
+            try sql.exec(
+                """
+                INSERT INTO record_log_meta (key, value) VALUES ('storage_version', ?)
+                  ON CONFLICT (key) DO UPDATE SET value = excluded.value
+                """,
+                [.text(String(RecordLogSchema.storageVersion))]
+            )
+            if !dropped.isEmpty {
+                logger?.log(
+                    "[record-log] the local store was migrated to storage version \(RecordLogSchema.storageVersion):",
+                    "dropped \(dropped.joined(separator: ", ")); a db3's rows live in its view"
+                )
+            }
         }
+    }
+
+    /// Drop what the query projection kept beside the view (#4700): every
+    /// table with a `_meta_doc_id` column (in this database each is a db3's
+    /// query table or its string-set junction, since format-1 documents query
+    /// an in-memory mirror), the projection marks and rule, and the view
+    /// indexes the store built from declarations (`idx_record_log_view_f…`,
+    /// `idx_record_log_view_u…`; the store builds its indexes from the room's
+    /// list now). Never touches a record. Answers what it dropped.
+    private func retireProjection(_ sql: RecordLogSql) throws -> [String] {
+        var dropped: [String] = []
+        let derived = try sql.rows(
+            """
+            SELECT m.name AS name FROM sqlite_master m WHERE m.type = 'table'
+              AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = '_meta_doc_id')
+            """
+        ).compactMap { $0["name"].stringValue }
+        for table in derived {
+            try sql.connection.executeScript("DROP TABLE IF EXISTS \"\(table.replacingOccurrences(of: "\"", with: "\"\""))\"")
+            dropped.append(table)
+        }
+        for table in ["record_log_projection", "record_log_projection_rule"] where try sql.first(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?", [.text(table)]
+        ) != nil {
+            try sql.connection.executeScript("DROP TABLE \(table)")
+            dropped.append(table)
+        }
+        let declared = try sql.rows(
+            #"SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'record_log_view' "#
+                + #"AND (name LIKE 'idx\_record\_log\_view\_f%' ESCAPE '\' OR name LIKE 'idx\_record\_log\_view\_u%' ESCAPE '\')"#
+        ).compactMap { $0["name"].stringValue }
+        for index in declared {
+            try sql.connection.executeScript("DROP INDEX IF EXISTS \"\(index.replacingOccurrences(of: "\"", with: "\"\""))\"")
+            dropped.append(index)
+        }
+        return dropped
     }
 
     private func tablesExist(_ sql: RecordLogSql) throws -> Bool {
@@ -819,10 +978,13 @@ final class RecordLogStore: @unchecked Sendable {
         ) != nil
     }
 
-    /// What the store holds of this document, without creating anything.
+    /// What the store holds of this document, without creating anything: its
+    /// cursor, its view's row count, every writer with unjudged entries, and
+    /// the marks residency is read from (``isResident(_:createdLocally:)``).
     func storedState() throws -> RecordLogStoredState {
         try reading { sql in
             guard try tablesExist(sql) else { return RecordLogStoredState(cursor: 0, rows: 0, writers: [], replacing: false) }
+            let state = try sql.first("SELECT * FROM record_log_state WHERE doc_id = ?", [doc])
             let count = try sql.first("SELECT COUNT(*) AS n FROM record_log_view WHERE doc_id = ?", [doc])?["n"].intValue ?? 0
             let writers = try sql.rows(
                 """
@@ -842,7 +1004,8 @@ final class RecordLogStore: @unchecked Sendable {
                 )
             }
             return RecordLogStoredState(
-                cursor: try tables.cursor(), rows: count, writers: writers, replacing: try tables.isReplacing()
+                cursor: try tables.cursor(), rows: count, writers: writers, replacing: try tables.isReplacing(),
+                lastCatchUpAt: state?["last_catch_up_at"].intValue.map { Int64($0) }, staged: try tables.staged()
             )
         }
     }
@@ -915,11 +1078,13 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Remove everything the store keeps of this document: its rows, view,
-    /// unjudged entries, writers, epoch counts and projection marks, and its
-    /// rows in the query tables `project` names. Refused while it holds
-    /// unjudged writes, unless `force`; a forced purge answers what it dropped.
-    func purge(force: Bool, project: [RecordLogProjectionSpec] = []) throws -> RecordLogPurgeReply {
-        try command { sql in
+    /// unjudged entries, writers, epoch counts and cached index list. Refused
+    /// while it holds unjudged writes, unless `force`; a forced purge answers
+    /// what it dropped.
+    func purge(force: Bool) throws -> RecordLogPurgeReply {
+        // A store an older build wrote lacks tables the purge clears.
+        if try reading({ try tablesExist($0) }) { try initialize() }
+        return try command { sql in
             guard try tablesExist(sql) else {
                 return RecordLogPurgeReply(purged: true, nothingStored: true, pendingOps: 0, handedBack: [])
             }
@@ -930,9 +1095,6 @@ final class RecordLogStore: @unchecked Sendable {
                 return RecordLogPurgeReply(purged: false, refusedForPending: true, pendingOps: live.count, handedBack: [])
             }
             let held = try sql.first("SELECT COUNT(*) AS n FROM record_log_state WHERE doc_id = ?", [doc])?["n"].intValue ?? 0
-            for spec in project {
-                try RecordLogQueryProjection.removeDocument(sql, spec: spec, documentId: documentId)
-            }
             for table in RecordLogSchema.clientTables {
                 try sql.exec("DELETE FROM \(table) WHERE doc_id = ?", [doc])
             }
@@ -973,7 +1135,8 @@ final class RecordLogStore: @unchecked Sendable {
             pending: pending?["n"].intValue ?? 0,
             unacked: try writer.map { try unackedOf(sql, $0) } ?? [],
             receipt: try tables.receipts()?.latest,
-            segment: try tables.heldSegment()
+            segment: try tables.heldSegment(),
+            staged: try tables.staged()
         )
     }
 
@@ -1126,63 +1289,59 @@ final class RecordLogStore: @unchecked Sendable {
         return try sql.rows(query, bindings).compactMap { $0["_id"].stringValue }.filter { !excluding.contains($0) }
     }
 
-    /// Build the view's lookup indexes for one model: one per scalar `indexed`
-    /// or `unique` field and one per compound constraint, each partial on the
-    /// model; and on the confirmed rows one per such field and single-field
-    /// constraint, where an upsert's guess looks for the records holding its
-    /// value. A string-set field, or a name that is not an identifier, is
-    /// skipped. Never throws.
+    /// The records of `model` in the view matching `filter`, one page of
+    /// them, as stored: the model API's filter grammar on any field, declared
+    /// or not, answered by the statement the room runs for the same filter
+    /// (``RecordLogViewReader``). `options` sorts (`sortOrder`, else `sort`;
+    /// `id`, then the document, break ties), pages (`limit` from 1 to 10,000,
+    /// 100 when none is sent, a page ending before the record that would take
+    /// it past 8 MiB; `hasMore` exact; `cursor` and `direction`, a backward page
+    /// answered in sort order), keeps or drops row keys (`projection`, `id`
+    /// always kept) and scopes (`documents`: `nil` or a list naming this
+    /// document; any other answers no rows). A `limit` outside its range, or a
+    /// model or field name that is not an identifier, throws
+    /// `JsBaoError(.invalidArgument)` before any SQL runs; a cursor minted under
+    /// another sort throws `InvalidCursorError`.
+    func queryView(_ model: String, _ filter: DocumentFilter = [:], options: QueryOptions? = nil) throws
+        -> PagedQueryResult<RecordLogRow>
+    {
+        let page = try RecordLogViewReader(store: self, documents: scope(options?.documentScope()))
+            .page(model, filter, options: options, shape: .stored)
+        return PagedQueryResult(data: page.rows, nextCursor: page.nextCursor, prevCursor: page.prevCursor, hasMore: page.hasMore)
+    }
+
+    /// How many records of `model` in the view match `filter`, as
+    /// ``queryView(_:_:options:)`` matches them, in the `documents` scope.
+    func countView(_ model: String, _ filter: DocumentFilter = [:], documents: [String]? = nil) throws -> Int {
+        try RecordLogViewReader(store: self, documents: scope(documents)).count(model, filter)
+    }
+
+    /// This document, when a read's `documents` scope admits it.
+    private func scope(_ documents: [String]?) -> [String] {
+        documents.map { $0.contains(documentId) ? [documentId] : [] } ?? [documentId]
+    }
+
+    // MARK: - Indexes from the room's list
+
+    /// Cache `entries` as this document's index list and reconcile the store's
+    /// view indexes over every document's cached list (``RecordLogIndexes``);
+    /// `nil` reconciles from the cache. One command, so one transaction.
     @discardableResult
-    func ensureFieldIndexes(
-        model: String, fields: [String], constraints: [(name: String, fields: [String])], stringSetFields: [String] = []
-    ) -> Int {
-        guard RecordLogSchema.isValidIdentifier(model) else { return 0 }
-        let sets = Set(stringSetFields)
-        let usable = { (field: String) in !sets.contains(field) && RecordLogSchema.isValidIdentifier(field) }
-        var wanted = RecordLogOrderedMap<String, (table: String, columns: String)>()
-        let byField = { (field: String) in "doc_id, json_extract(_data, '$.\(field)'), _id" }
-        for field in fields where usable(field) {
-            wanted[RecordLogSchema.fieldIndexName(kind: .field, model: model, name: field)] = ("record_log_view", byField(field))
-            wanted[RecordLogSchema.fieldIndexName(kind: .field, model: model, name: field, table: .rows)] = ("record_log_rows", byField(field))
-        }
-        for constraint in constraints {
-            guard !constraint.fields.isEmpty, RecordLogSchema.isValidIdentifier(constraint.name),
-                  constraint.fields.allSatisfy(usable)
-            else { continue }
-            wanted[RecordLogSchema.fieldIndexName(kind: .constraint, model: model, name: constraint.name)] = (
-                "record_log_view",
-                (["doc_id"] + constraint.fields.map { "json_extract(_data, '$.\($0)')" } + ["_id"]).joined(separator: ", ")
-            )
-            if constraint.fields.count == 1 {
-                wanted[RecordLogSchema.fieldIndexName(kind: .field, model: model, name: constraint.fields[0], table: .rows)] = (
-                    "record_log_rows", byField(constraint.fields[0])
-                )
-            }
-        }
-        var created = 0
-        for (name, spec) in wanted.entries {
-            do {
-                try command { sql in
-                    let existed = try sql.first(
-                        "SELECT 1 AS present FROM sqlite_master WHERE type = 'index' AND name = ?", [.text(name)]
-                    ) != nil
-                    if existed { return }
-                    try sql.connection.executeScript(
-                        "CREATE INDEX IF NOT EXISTS \(name) ON \(spec.table)(\(spec.columns)) WHERE _type = '\(model)'"
-                    )
-                    created += 1
-                }
-            } catch {
-                logger?.warn("[record-log] Could not create lookup index", name, "; lookups on it scan:", error.localizedDescription)
-            }
-        }
-        return created
+    func syncIndexes(_ entries: [RecordLogIndexEntry]?) throws -> RecordLogIndexSync {
+        try command { sql in try RecordLogIndexes.sync(sql, documentId: documentId, entries, logger: logger) }
+    }
+
+    /// The store's view indexes as the room lists its own, sorted by model, then fields.
+    func indexTuples() throws -> [RecordLogIndexTuple] {
+        try reading { sql in try RecordLogIndexes.tuples(sql) }
     }
 
     // MARK: - The view
 
     /// Rewrite the view rows of `keys` and of every record an unjudged entry
-    /// touching them also touches: the confirmed row, then every such
+    /// touching them also touches: the confirmed row (or, while a staged
+    /// replacement is in progress, the previous generation's row of a record
+    /// it rewrote: ``SqlRecordLogTables/viewBase()``), then every such
     /// unwithdrawn entry's guess in the order they were written. Answers the
     /// records whose view row changed.
     ///
@@ -1195,6 +1354,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// the refresh again with that record in it.
     private func refreshView(_ sql: RecordLogSql, _ keys: [RecordLogRecordKey]) throws -> [RecordLogRecordKey] {
         guard !keys.isEmpty else { return [] }
+        let base = try tables.viewBase()
         var seeds = keys
         while true {
             var closure = RecordLogOrderedMap<RecordLogRecordKey, Bool>()
@@ -1254,7 +1414,7 @@ final class RecordLogStore: @unchecked Sendable {
                     "SELECT writer, seq FROM record_log_pending_keys WHERE doc_id = ? AND _type = ? AND _id = ?",
                     [doc, .text(key.model), .text(key.id)]
                 ))
-                for row in [try tables.confirmedRow(key), try viewRow(sql, key)] {
+                for row in [try base(key), try viewRow(sql, key)] {
                     for (field, value) in (row ?? [:]).sorted(by: { $0.key < $1.key }) where value != .null {
                         try probe(key.model, field, Format2SqlValue.recordLogWritten(value).recordLogNormalized)
                     }
@@ -1284,7 +1444,7 @@ final class RecordLogStore: @unchecked Sendable {
                 }
             }
 
-            let working = try guessView(sql, closure: closure.keys, entries: entries.keys)
+            let working = try guessView(sql, closure: closure.keys, entries: entries.keys, base: base)
             let outside = working.resolved.filter { !closure.contains($0) }
             if outside.isEmpty { return try writeView(sql, working.rows) }
             seeds.append(contentsOf: outside)
@@ -1400,24 +1560,30 @@ final class RecordLogStore: @unchecked Sendable {
         }
     }
 
-    /// The rows of `closure` as the confirmed rows with `entries`' guesses
+    /// The rows of `closure` as `base` answers them (the confirmed rows, or a
+    /// staged replacement's previous generation) with `entries`' guesses
     /// applied in the order they were written, and every record a guess
     /// resolved to (recorded against its entry, so a later refresh of either
     /// reaches the other).
     private func guessView(
-        _ sql: RecordLogSql, closure: [RecordLogRecordKey], entries: [RecordLogEntryRef]
+        _ sql: RecordLogSql, closure: [RecordLogRecordKey], entries: [RecordLogEntryRef],
+        base: (RecordLogRecordKey) throws -> RecordLogRow?
     ) throws -> (rows: RecordLogOrderedMap<RecordLogRecordKey, RecordLogRow?>, resolved: [RecordLogRecordKey]) {
         let table = WorkingTable(store: self, sql: sql)
-        for key in closure { table.rows[key] = .some(try tables.confirmedRow(key)) }
+        for key in closure { table.rows[key] = .some(try base(key)) }
 
         var ordered: [(ref: RecordLogEntryRef, ord: Int, entry: RecordLogPendingEntry)] = []
         for ref in entries {
             guard let row = try sql.first(
-                "SELECT ord, entry, void FROM record_log_pending WHERE doc_id = ? AND writer = ? AND seq = ?",
+                "SELECT ord, entry, void, acked FROM record_log_pending WHERE doc_id = ? AND writer = ? AND seq = ?",
                 [doc, .text(ref.writer), .integer(Int64(ref.seq))]
             ), row["void"].intValue != 1,
-                let entry = RecordLogPendingEntry(stored: row["entry"].stringValue.flatMap(RecordLogJSON.parse))
+                var entry = RecordLogPendingEntry(stored: row["entry"].stringValue.flatMap(RecordLogJSON.parse))
             else { continue }
+            // A guarded entry the room has not acknowledged stays out of the view;
+            // its keys stay in the closure, so its acknowledgement's refresh reaches it.
+            entry.acked = row["acked"].intValue
+            if recordLogGuessHeld(entry) { continue }
             ordered.append((ref, row["ord"].intValue ?? 0, entry))
         }
         ordered.sort { $0.ord < $1.ord }
@@ -1444,7 +1610,7 @@ final class RecordLogStore: @unchecked Sendable {
         var changed: [RecordLogRecordKey] = []
         for (key, row) in working.entries {
             let before = try viewRow(sql, key)
-            if before == row { continue }
+            if recordLogSameRow(before, row) { continue }
             if let row {
                 try sql.exec(
                     """
@@ -1464,30 +1630,15 @@ final class RecordLogStore: @unchecked Sendable {
         return changed
     }
 
-    /// Refresh, project and describe the view rows a command touched, with any already refreshed.
+    /// Refresh and describe the view rows a command touched, with any already refreshed.
     private func settleView(
-        _ sql: RecordLogSql, _ touched: [RecordLogRecordKey], _ project: [RecordLogProjectionSpec],
-        refreshed: [RecordLogRecordKey] = []
+        _ sql: RecordLogSql, _ touched: [RecordLogRecordKey], refreshed: [RecordLogRecordKey] = []
     ) throws -> [RecordLogRowChange] {
         var unique = RecordLogOrderedMap<RecordLogRecordKey, Bool>()
         for key in touched + tables.takeDirty() { unique[key] = true }
         var changed = RecordLogOrderedMap<RecordLogRecordKey, Bool>()
         for key in refreshed + (try refreshView(sql, unique.keys)) { changed[key] = true }
         let keys = changed.keys
-        for spec in project {
-            for key in keys where key.model == spec.model {
-                try RecordLogQueryProjection.projectRow(
-                    sql, spec: spec, documentId: documentId, id: key.id, row: try viewRow(sql, key)
-                )
-            }
-        }
-        // A model with no spec here (not registered yet in this process) had
-        // view rows change that its query tables did not take: they no longer
-        // hold its view, and its registration rebuilds them.
-        let projected = Set(project.map(\.model))
-        for model in Set(keys.map(\.model)).subtracting(projected) {
-            try sql.exec("DELETE FROM record_log_projection WHERE doc_id = ? AND model = ?", [doc, .text(model)])
-        }
         return try keys.map { RecordLogRowChange(model: $0.model, id: $0.id, row: try viewRow(sql, $0)) }
     }
 
@@ -1498,8 +1649,8 @@ final class RecordLogStore: @unchecked Sendable {
     // MARK: - Writes
 
     /// Commit local writes, one entry each, as one save in the connection's
-    /// group: the budget check, the pending entry, the guess on the view and
-    /// the projection. `listener` hears the group's outcome after it commits:
+    /// group: the budget check, the pending entry and the guess on the view.
+    /// `listener` hears the group's outcome after it commits:
     /// `nil`, or — when the group's `COMMIT` failed and everything in it was
     /// rolled back, these entries included — a `JsBaoError(.unavailable)`
     /// naming the document, with `details.reason` `"commit-failed"`.
@@ -1507,7 +1658,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// - Throws: `JsBaoError(.documentEpochBudget)` when both epochs this client
     ///   may write into are full; nothing of the save lands.
     func commitEntries(
-        writer: String, writes: [RecordLogWrite], project: [RecordLogProjectionSpec] = [],
+        writer: String, writes: [RecordLogWrite],
         ts: Int64? = nil, listener: RecordLogGroupCommit.Listener? = nil
     ) throws -> RecordLogCommitReply {
         let documentId = documentId
@@ -1540,14 +1691,14 @@ final class RecordLogStore: @unchecked Sendable {
                     refreshed.append(contentsOf: try refreshView(sql, entry.keys + tables.takeDirty()))
                     entries.append(entry)
                 }
-                let changed = try settleView(sql, [], project, refreshed: refreshed)
+                let changed = try settleView(sql, [], refreshed: refreshed)
                 return RecordLogCommitReply(entries: entries, changed: changed, cursor: try tables.cursor())
             }
         }
     }
 
     /// Apply what the room relayed, item by item.
-    func receive(writer: String, items: [RecordLogResultItem], project: [RecordLogProjectionSpec] = []) throws -> RecordLogChangeReply {
+    func receive(writer: String, items: [RecordLogResultItem]) throws -> RecordLogChangeReply {
         try command { sql in
             let rules = rules(writer)
             var reply = RecordLogChangeReply()
@@ -1557,22 +1708,23 @@ final class RecordLogStore: @unchecked Sendable {
                 touched.append(contentsOf: out.touched)
                 reply.acknowledged.append(contentsOf: out.acknowledged)
                 reply.settled.append(contentsOf: out.settled)
+                reply.settlements.merge(out.settlements) { _, new in new }
                 if reply.underivable == nil { reply.underivable = out.underivable }
             }
-            reply.changed = try settleView(sql, touched, project)
+            reply.changed = try settleView(sql, touched)
             reply.cursor = try tables.cursor()
             return reply
         }
     }
 
     /// Act on a refusal: hand back what it reaches and answer the frames that move the room past it.
-    func refused(writer: String, refusal: RecordLogRefusal, project: [RecordLogProjectionSpec] = []) throws -> RecordLogChangeReply {
+    func refused(writer: String, refusal: RecordLogRefusal) throws -> RecordLogChangeReply {
         try command { sql in
             let out = try rules(writer).refused(refusal)
             var reply = RecordLogChangeReply()
             reply.handedBack = out.handedBack
             reply.frames = out.frames
-            reply.changed = try settleView(sql, out.touched, project)
+            reply.changed = try settleView(sql, out.touched)
             reply.cursor = try tables.cursor()
             return reply
         }
@@ -1613,17 +1765,22 @@ final class RecordLogStore: @unchecked Sendable {
 
     /// Apply one page of a catch-up, read by the room at log number `lsn`. One
     /// older than the cursor, or under a replacement generation another began
-    /// after, is answered `stale` and changes nothing.
+    /// after, is answered `stale` and changes nothing. A staged replacement's
+    /// page keeps the previous row of each record it rewrites and leaves the
+    /// view as it was.
     func applyCatchUpPage(
         writer: String, rows: [RecordLogCatchUpRow], gone: [RecordLogRecordKey] = [], lsn: Int? = nil,
-        generation: Int? = nil, project: [RecordLogProjectionSpec] = []
+        generation: Int? = nil
     ) throws -> RecordLogChangeReply {
         try command { sql in
             let cursor = try tables.cursor()
             if let lsn, cursor > lsn { return RecordLogChangeReply(cursor: cursor, stale: true) }
             if try staleGeneration(generation) { return RecordLogChangeReply(cursor: cursor, stale: true) }
+            let staged = try generation != nil && tables.staged()
+            if staged { try tables.stageBase(rows.map { RecordLogRecordKey(model: $0.model, id: $0.id) } + gone) }
             let touched = try rules(writer).applyCatchUpPage(RecordLogCatchUpInput(rows: rows, gone: gone))
-            return RecordLogChangeReply(changed: try settleView(sql, touched, project), cursor: try tables.cursor())
+            // A staged replacement's pages reach the view at its completion.
+            return RecordLogChangeReply(changed: staged ? [] : try settleView(sql, touched), cursor: try tables.cursor())
         }
     }
 
@@ -1632,15 +1789,21 @@ final class RecordLogStore: @unchecked Sendable {
     /// generation another began after, is answered `stale`: the cursor never
     /// moves back, and a full replacement removes nothing. A completion that
     /// ends receipt attempt `receipt` ends it in the store, and a full
-    /// replacement every attempt whose last change came before it began.
+    /// replacement every attempt whose last change came before it began. A
+    /// staged replacement's completion rebuilds the view
+    /// (``settleReplacement(_:_:)``) and names exactly the records whose view
+    /// row changed, appeared or left.
     func completeCatchUp(
         writer: String, lsn: Int, high: Int? = nil, full: Bool = false, generation: Int? = nil,
-        receipt: String? = nil, segment: RecordLogHeldSegment? = nil, at: Int64? = nil, project: [RecordLogProjectionSpec] = []
+        receipt: String? = nil, segment: RecordLogHeldSegment? = nil, at: Int64? = nil
     ) throws -> RecordLogChangeReply {
         try command { sql in
             let cursor = try tables.cursor()
             if cursor > lsn { return RecordLogChangeReply(cursor: cursor, stale: true) }
             if try staleGeneration(generation) { return RecordLogChangeReply(cursor: cursor, stale: true) }
+            let staged = try full && tables.staged()
+            // The view as the staged replacement left it, to tell what its completion changes.
+            if staged { try snapshotView(sql) }
             let out = try rules(writer).completeCatchUp(
                 lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment
             )
@@ -1648,8 +1811,9 @@ final class RecordLogStore: @unchecked Sendable {
             var reply = RecordLogChangeReply()
             reply.acknowledged = out.acknowledged
             reply.settled = out.settled
+            reply.settlements = out.settlements
             reply.underivable = out.underivable
-            reply.changed = try settleView(sql, out.touched, project)
+            reply.changed = staged ? try settleReplacement(sql, out.touched) : try settleView(sql, out.touched)
             reply.cursor = try tables.cursor()
             return reply
         }
@@ -1676,14 +1840,13 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Apply one chunk of bulk load `sessionId` as receipt `attempt`, in one
-    /// transaction: its lines merged into the confirmed rows by key, the view
-    /// rows of the chunk's records, and their query rows. The reply names the
+    /// transaction: its lines merged into the confirmed rows by key, and the
+    /// view rows of the chunk's records. The reply names the
     /// model, and in `changed` only the records an unjudged entry touches. An
     /// attempt the store no longer has in progress (a full replacement or its
     /// own completion ended it) is answered `stale` and changes nothing.
     func applyLoadChunk(
-        writer: String, sessionId: String, attempt: String, model: String, lines: [RecordLogLoadLine],
-        project: [RecordLogProjectionSpec] = []
+        writer: String, sessionId: String, attempt: String, model: String, lines: [RecordLogLoadLine]
     ) throws -> RecordLogChunkReply {
         try command { sql in
             if let stale = try staleReceipt(writer, attempt) { return stale }
@@ -1694,7 +1857,7 @@ final class RecordLogStore: @unchecked Sendable {
             var reply = RecordLogChunkReply()
             reply.applied = touched.count - removed
             reply.removed = removed
-            reply.changed = try settleBulk(sql, touched, project)
+            reply.changed = try settleBulk(sql, touched)
             reply.models = [model]
             if let first = lines.first, let last = lines.last {
                 reply.ranges = [RecordLogIdRange(model: model, firstId: first.id, lastId: last.id)]
@@ -1706,19 +1869,18 @@ final class RecordLogStore: @unchecked Sendable {
 
     /// Receipt `attempt` applied every chunk of bulk load `sessionId`. A
     /// refresh removes the confirmed rows of `models` no line the attempt
-    /// applied named, from the view and the query tables too (an unjudged
+    /// applied named, from the view too (an unjudged
     /// entry's guess stays); a merge removes nothing. `stale` as
-    /// ``applyLoadChunk(writer:sessionId:attempt:model:lines:project:)``.
+    /// ``applyLoadChunk(writer:sessionId:attempt:model:lines:)``.
     func completeLoad(
-        writer: String, sessionId: String, attempt: String, mode: RecordLogLoadMode, models: [String],
-        project: [RecordLogProjectionSpec] = []
+        writer: String, sessionId: String, attempt: String, mode: RecordLogLoadMode, models: [String]
     ) throws -> RecordLogChunkReply {
         try command { sql in
             if let stale = try staleReceipt(writer, attempt) { return stale }
             let touched = try rules(writer).completeLoad(attempt: attempt, mode: mode, models: models)
             var reply = RecordLogChunkReply()
             reply.removed = touched.count
-            reply.changed = try settleBulk(sql, touched, project)
+            reply.changed = try settleBulk(sql, touched)
             reply.models = Self.modelsOf(touched)
             reply.cursor = try tables.cursor()
             return reply
@@ -1726,21 +1888,24 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Put one row chunk of a segment under the replacement `generation`, its
-    /// view and query rows with it. Under a generation another replacement
-    /// superseded, or as an attempt no longer in progress, it is answered
-    /// `stale` and changes nothing.
+    /// view rows with it (a staged replacement's reach the view at its
+    /// completion). Under a generation another replacement superseded, or as
+    /// an attempt no longer in progress, it is answered `stale` and changes
+    /// nothing.
     func applySegmentChunk(
-        writer: String, generation: Int, attempt: String? = nil, rows: [RecordLogCatchUpRow],
-        project: [RecordLogProjectionSpec] = []
+        writer: String, generation: Int, attempt: String? = nil, rows: [RecordLogCatchUpRow]
     ) throws -> RecordLogChunkReply {
         try command { sql in
             let cursor = try tables.cursor()
             if try staleGeneration(generation) { return RecordLogChunkReply(cursor: cursor, stale: true) }
             if let stale = try staleReceipt(writer, attempt) { return stale }
+            let staged = try tables.staged()
+            if staged { try tables.stageBase(rows.map { RecordLogRecordKey(model: $0.model, id: $0.id) }) }
             let touched = try rules(writer).applySegmentRows(generation: generation, attempt: attempt, rows: rows)
             var reply = RecordLogChunkReply()
             reply.applied = touched.count
-            reply.changed = try settleBulk(sql, touched, project)
+            if staged { reply.cursor = cursor; return reply }
+            reply.changed = try settleBulk(sql, touched)
             reply.models = Self.modelsOf(touched)
             if let first = rows.first, let last = rows.last, rows.allSatisfy({ $0.model == first.model }) {
                 reply.ranges = [RecordLogIdRange(model: first.model, firstId: first.id, lastId: last.id)]
@@ -1755,9 +1920,9 @@ final class RecordLogStore: @unchecked Sendable {
     /// ``RecordLogRules/keepSegmentChunk(generation:attempt:object:sha256:model:firstId:lastId:rows:)``
     /// decides: the reply's `applied` is the rows kept, or it answers
     /// `mismatch` and nothing changed. `stale` as
-    /// ``applySegmentChunk(writer:generation:attempt:rows:project:)``, and for
-    /// an attempt no longer in progress. The view and query rows are already
-    /// the kept rows'.
+    /// ``applySegmentChunk(writer:generation:attempt:rows:)``, and for
+    /// an attempt no longer in progress. The view rows are already the kept
+    /// rows'.
     func keepSegmentChunk(
         writer: String, generation: Int, attempt: String, segmentId: String, object: String, sha256: String, model: String,
         firstId: String, lastId: String, rows: Int
@@ -1784,22 +1949,24 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Apply a segment's corrections under the replacement `generation`;
-    /// `stale` as ``applySegmentChunk(writer:generation:attempt:rows:project:)``.
+    /// `stale` as ``applySegmentChunk(writer:generation:attempt:rows:)``.
     func applySegmentCorrections(
-        writer: String, generation: Int, attempt: String? = nil, lines: [RecordLogCorrection],
-        project: [RecordLogProjectionSpec] = []
+        writer: String, generation: Int, attempt: String? = nil, lines: [RecordLogCorrection]
     ) throws -> RecordLogChunkReply {
         try command { sql in
             let cursor = try tables.cursor()
             if try staleGeneration(generation) { return RecordLogChunkReply(cursor: cursor, stale: true) }
             if let stale = try staleReceipt(writer, attempt) { return stale }
+            let staged = try tables.staged()
+            if staged { try tables.stageBase(lines.map { RecordLogRecordKey(model: $0.model, id: $0.id) }) }
             let touched = try rules(writer).applySegmentCorrections(generation: generation, attempt: attempt, lines: lines)
             let hit = Set(touched)
             let removed = lines.filter { $0.row == nil && hit.contains(RecordLogRecordKey(model: $0.model, id: $0.id)) }.count
             var reply = RecordLogChunkReply()
             reply.applied = touched.count - removed
             reply.removed = removed
-            reply.changed = try settleBulk(sql, touched, project)
+            if staged { reply.cursor = cursor; return reply }
+            reply.changed = try settleBulk(sql, touched)
             reply.models = Self.modelsOf(touched)
             reply.cursor = cursor
             return reply
@@ -1812,14 +1979,12 @@ final class RecordLogStore: @unchecked Sendable {
         return keys.compactMap { seen.insert($0.model).inserted ? $0.model : nil }
     }
 
-    /// The view and query rows of records a chunk changed, written set-based:
+    /// The view rows of records a chunk changed, written set-based:
     /// a record no unjudged entry touches and no unjudged upsert's value lands
     /// on shows its confirmed row, copied in batches; the rest are refreshed one
     /// closure at a time as any other change is. Answers the records the
     /// refresh changed.
-    private func settleBulk(
-        _ sql: RecordLogSql, _ keys: [RecordLogRecordKey], _ project: [RecordLogProjectionSpec]
-    ) throws -> [RecordLogRowChange] {
+    private func settleBulk(_ sql: RecordLogSql, _ keys: [RecordLogRecordKey]) throws -> [RecordLogRowChange] {
         var models: [String] = []
         var byModel: [String: [String]] = [:]
         for key in keys {
@@ -1874,20 +2039,63 @@ final class RecordLogStore: @unchecked Sendable {
                 )
             }
             refresh.append(contentsOf: guessed.keys.map { RecordLogRecordKey(model: model, id: $0) })
-            if let spec = project.first(where: { $0.model == model }) {
-                for id in plain {
-                    try RecordLogQueryProjection.projectRow(
-                        sql, spec: spec, documentId: documentId, id: id,
-                        row: try viewRow(sql, RecordLogRecordKey(model: model, id: id))
-                    )
-                }
-            } else if !plain.isEmpty {
-                // Not registered here: its query tables no longer hold its view,
-                // and its registration rebuilds them.
-                try sql.exec("DELETE FROM record_log_projection WHERE doc_id = ? AND model = ?", [doc, .text(model)])
+        }
+        return try settleView(sql, refresh)
+    }
+
+    /// The view's rows of this document, copied aside before a staged
+    /// replacement completes (``settleReplacement(_:_:)`` compares with it).
+    private func snapshotView(_ sql: RecordLogSql) throws {
+        try sql.connection.executeScript("""
+            CREATE TEMP TABLE IF NOT EXISTS record_log_view_before (
+              _type TEXT NOT NULL, _id TEXT NOT NULL, _data TEXT NOT NULL, PRIMARY KEY (_type, _id)
+            )
+            """)
+        try sql.exec("DELETE FROM temp.record_log_view_before")
+        try sql.exec(
+            "INSERT INTO temp.record_log_view_before (_type, _id, _data) SELECT _type, _id, _data FROM record_log_view WHERE doc_id = ?",
+            [doc]
+        )
+    }
+
+    /// A staged replacement completed: the view becomes the completed
+    /// generation's rows with this client's guesses over them, every record
+    /// of the document rewritten as a chunk's are (``settleBulk(_:_:)``).
+    /// Answers each record whose view row changed, appeared or left, with its
+    /// row, by comparing with the view ``snapshotView(_:)`` kept: one pass
+    /// over the document's rows, once per replacement.
+    private func settleReplacement(_ sql: RecordLogSql, _ touched: [RecordLogRecordKey]) throws -> [RecordLogRowChange] {
+        var keys = RecordLogOrderedMap<RecordLogRecordKey, Bool>()
+        for key in touched { keys[key] = true }
+        for found in try sql.rows(
+            "SELECT _type, _id FROM record_log_rows WHERE doc_id = ? UNION SELECT _type, _id FROM record_log_view WHERE doc_id = ?",
+            [doc, doc]
+        ) {
+            if let model = found["_type"].stringValue, let id = found["_id"].stringValue {
+                keys[RecordLogRecordKey(model: model, id: id)] = true
             }
         }
-        return try settleView(sql, refresh, project)
+        _ = try settleBulk(sql, keys.keys)
+        var changed: [RecordLogRowChange] = []
+        for found in try sql.rows(
+            """
+            SELECT v._type AS _type, v._id AS _id, v._data AS _data FROM record_log_view v
+              LEFT JOIN temp.record_log_view_before b ON b._type = v._type AND b._id = v._id
+             WHERE v.doc_id = ? AND (b._id IS NULL OR b._data <> v._data)
+            UNION ALL
+            SELECT b._type AS _type, b._id AS _id, NULL AS _data FROM temp.record_log_view_before b
+             WHERE NOT EXISTS (SELECT 1 FROM record_log_view v WHERE v.doc_id = ? AND v._type = b._type AND v._id = b._id)
+            ORDER BY _type, _id
+            """,
+            [doc, doc]
+        ) {
+            guard let model = found["_type"].stringValue, let id = found["_id"].stringValue else { continue }
+            changed.append(RecordLogRowChange(
+                model: model, id: id, row: found["_data"].isNull ? nil : RecordLogJSON.row(found["_data"].stringValue)
+            ))
+        }
+        try sql.exec("DELETE FROM temp.record_log_view_before")
+        return changed
     }
 
     /// Record what the room said about epochs and constraints, and the permission the client holds.
@@ -1900,6 +2108,18 @@ final class RecordLogStore: @unchecked Sendable {
             if let notice { try rules(writer).notice(current: notice.current, next: notice.next, entries: notice.entries) }
             if let constraints { try tables.setConstraints(constraints) }
             if let permission { try tables.setPermission(permission) }
+            return try marksOn(sql)
+        }
+    }
+
+    /// Mark the copy of a db3 the server just created caught up (#4806): the
+    /// room's log is empty at create, so this store holds all of it and the
+    /// first open asks from its cursor (0). A store already marked keeps its
+    /// mark.
+    @discardableResult
+    func markCaughtUpAtCreate(at: Int64) throws -> RecordLogMarks {
+        try command { sql in
+            if try marksOn(sql).lastCatchUpAt == nil { try tables.setLastCatchUpAt(at) }
             return try marksOn(sql)
         }
     }
@@ -1919,62 +2139,34 @@ final class RecordLogStore: @unchecked Sendable {
         try command { _ in try rules(writer).sawEpoch(e) }
     }
 
-    // MARK: - The query projection
+    // MARK: - Residency
 
-    /// Project the named records' view rows into one model's query tables.
-    func projectRows(ids: [String], spec: RecordLogProjectionSpec) throws {
-        try command { sql in
-            for id in ids {
-                try RecordLogQueryProjection.projectRow(
-                    sql, spec: spec, documentId: documentId, id: id,
-                    row: try viewRow(sql, RecordLogRecordKey(model: spec.model, id: id))
-                )
-            }
-        }
+    /// Whether a db3's store holds a readable copy (js-bao's
+    /// `isRecordLogResident`): it was created here and not yet synced, or a
+    /// load or catch-up completed on this device and no replacement is
+    /// interrupted, or the one in progress is staged.
+    static func isResident(_ marks: RecordLogMarks, createdLocally: Bool = false) -> Bool {
+        isResident(lastCatchUpAt: marks.lastCatchUpAt, replacing: marks.replacing, staged: marks.staged, createdLocally: createdLocally)
     }
 
-    /// Project every view row of one model and mark the model projected, in one
-    /// transaction; a no-op when the mark is already there.
-    @discardableResult
-    func projectModel(spec: RecordLogProjectionSpec) throws -> Bool {
-        try command { sql in
-            if try sql.first(
-                "SELECT 1 AS present FROM record_log_projection WHERE doc_id = ? AND model = ?", [doc, .text(spec.model)]
-            ) != nil {
-                return false
-            }
-            try RecordLogQueryProjection.removeDocument(sql, spec: spec, documentId: documentId)
-            for row in try sql.rows(
-                "SELECT _id, _data FROM record_log_view WHERE doc_id = ? AND _type = ? ORDER BY _id", [doc, .text(spec.model)]
-            ) {
-                guard let id = row["_id"].stringValue else { continue }
-                try RecordLogQueryProjection.projectRow(
-                    sql, spec: spec, documentId: documentId, id: id, row: RecordLogJSON.row(row["_data"].stringValue)
-                )
-            }
-            try sql.exec("INSERT OR IGNORE INTO record_log_projection (doc_id, model) VALUES (?, ?)", [doc, .text(spec.model)])
-            return true
-        }
+    /// ``isResident(_:createdLocally:)`` over what a store holds of a document before it is bound.
+    static func isResident(_ state: RecordLogStoredState, createdLocally: Bool = false) -> Bool {
+        isResident(lastCatchUpAt: state.lastCatchUpAt, replacing: state.replacing, staged: state.staged, createdLocally: createdLocally)
     }
 
-    /// Whether one model's query tables hold this document's view.
-    func isProjected(model: String) throws -> Bool {
-        try reading { sql in
-            guard try tablesExist(sql) else { return false }
-            return try sql.first(
-                "SELECT 1 AS present FROM record_log_projection WHERE doc_id = ? AND model = ?", [doc, .text(model)]
-            ) != nil
-        }
+    private static func isResident(lastCatchUpAt: Int64?, replacing: Bool, staged: Bool, createdLocally: Bool) -> Bool {
+        if createdLocally { return true }
+        guard lastCatchUpAt != nil else { return false }
+        return !replacing || staged
     }
 
-    /// Forget that a model's query tables hold this document's view (one model, or all).
-    func forgetProjection(model: String? = nil) throws {
-        try command { sql in
-            if let model {
-                try sql.exec("DELETE FROM record_log_projection WHERE doc_id = ? AND model = ?", [doc, .text(model)])
-            } else {
-                try sql.exec("DELETE FROM record_log_projection WHERE doc_id = ?", [doc])
-            }
+    /// Every document the store holds a state row for, sorted by id; `[]`,
+    /// creating nothing, on a database with no record-log tables.
+    static func storedDocumentIds(host: any Format2SqlHost) throws -> [String] {
+        let store = RecordLogStore(host: host, documentId: "", clientId: "")
+        return try store.reading { sql in
+            guard try store.tablesExist(sql) else { return [] }
+            return try sql.rows("SELECT doc_id FROM record_log_state ORDER BY doc_id").compactMap { $0["doc_id"].stringValue }
         }
     }
 
@@ -2008,23 +2200,20 @@ final class RecordLogStore: @unchecked Sendable {
         }
     }
 
-    /// Remove every document's rows from every record-log table, and the
-    /// projected rows of the models `project` names: the store reset of a
-    /// principal change. Answers how many unjudged entries were dropped.
+    /// Remove every document's rows from every record-log table: the store
+    /// reset of a principal change. Answers how many unjudged entries were
+    /// dropped. A store an older build wrote is brought to the version first,
+    /// since it lacks tables the reset clears; a database with no record-log
+    /// table is left without one.
     @discardableResult
-    static func purgeAll(host: any Format2SqlHost, project: [RecordLogProjectionSpec] = []) throws -> Int {
+    static func purgeAll(host: any Format2SqlHost) throws -> Int {
         let store = RecordLogStore(host: host, documentId: "", clientId: "")
+        if try store.reading({ try store.tablesExist($0) }) { try store.initialize() }
         return try store.command { sql in
             guard try store.tablesExist(sql) else { return 0 }
             let dropped = try sql.first(
                 "SELECT COUNT(*) AS n FROM record_log_pending WHERE void = 0 AND acked IS NULL"
             )?["n"].intValue ?? 0
-            let documents = try sql.rows("SELECT DISTINCT doc_id FROM record_log_view").compactMap { $0["doc_id"].stringValue }
-            for spec in project {
-                for documentId in documents {
-                    try RecordLogQueryProjection.removeDocument(sql, spec: spec, documentId: documentId)
-                }
-            }
             for table in RecordLogSchema.clientTables { try sql.exec("DELETE FROM \(table)") }
             return dropped
         }

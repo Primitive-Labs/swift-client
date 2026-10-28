@@ -38,6 +38,13 @@ final class LoopbackAPIServer: @unchecked Sendable {
         /// that has to say what a generated invoker PUT ON THE WIRE reads it.
         var body: Data? = nil
 
+        /// The request headers, names lower-cased, so a test can say which
+        /// credentials or upload headers a request carried.
+        var headers: [String: String] = [:]
+
+        /// One header, by name in any case.
+        func header(_ name: String) -> String? { headers[name.lowercased()] }
+
         /// The body parsed as a JSON object, for a wire-shape assertion.
         var jsonBody: [String: Any]? {
             guard let body else { return nil }
@@ -45,14 +52,17 @@ final class LoopbackAPIServer: @unchecked Sendable {
         }
     }
 
-    /// What to answer with: an HTTP status and a JSON body.
+    /// What to answer with: an HTTP status and a JSON body, plus any extra
+    /// headers. A `HEAD` request is answered with the headers alone.
     struct Response: Sendable {
         let status: Int
         let body: String
+        var headers: [String: String] = [:]
 
-        init(status: Int = 200, body: String = "{}") {
+        init(status: Int = 200, body: String = "{}", headers: [String: String] = [:]) {
             self.status = status
             self.body = body
+            self.headers = headers
         }
 
         static func json(_ body: String) -> Response { Response(status: 200, body: body) }
@@ -152,20 +162,25 @@ final class LoopbackAPIServer: @unchecked Sendable {
             self.lock.withLock { self._requests.append(request) }
 
             self.responder(request) { response in
-                Self.send(response, on: connection)
+                Self.send(response, on: connection, head: request.method == "HEAD")
             }
         }
     }
 
-    private static func send(_ response: Response, on connection: NWConnection) {
+    private static func send(_ response: Response, on connection: NWConnection, head isHead: Bool) {
         let body = Data(response.body.utf8)
         var head = "HTTP/1.1 \(response.status) \(reason(response.status))\r\n"
-        head += "Content-Type: application/json\r\n"
+        if response.headers.keys.contains(where: { $0.lowercased() == "content-type" }) == false {
+            head += "Content-Type: application/json\r\n"
+        }
+        for (name, value) in response.headers.sorted(by: { $0.key < $1.key }) {
+            head += "\(name): \(value)\r\n"
+        }
         head += "Content-Length: \(body.count)\r\n"
         head += "Connection: close\r\n\r\n"
 
         var out = Data(head.utf8)
-        out.append(body)
+        if !isHead { out.append(body) }
         connection.send(content: out, completion: .contentProcessed { _ in
             connection.cancel()
         })
@@ -181,6 +196,12 @@ final class LoopbackAPIServer: @unchecked Sendable {
         let parts = line.split(separator: " ")
         guard parts.count >= 2 else { return nil }
         var request = Request(method: String(parts[0]), path: String(parts[1]))
+        for line in text.components(separatedBy: "\r\n").dropFirst() {
+            let pieces = line.split(separator: ":", maxSplits: 1)
+            guard pieces.count == 2 else { continue }
+            request.headers[pieces[0].trimmingCharacters(in: .whitespaces).lowercased()] =
+                pieces[1].trimmingCharacters(in: .whitespaces)
+        }
         if head.contentLength > 0 {
             let bodyBytes = buffer.dropFirst(head.bodyStart)
             if bodyBytes.count >= head.contentLength {
@@ -221,6 +242,8 @@ final class LoopbackAPIServer: @unchecked Sendable {
     private static func reason(_ status: Int) -> String {
         switch status {
         case 200: return "OK"
+        case 201: return "Created"
+        case 401: return "Unauthorized"
         case 403: return "Forbidden"
         case 404: return "Not Found"
         case 500: return "Internal Server Error"

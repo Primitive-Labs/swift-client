@@ -33,6 +33,49 @@ public enum RecordLogWriteKind: String, Sendable, Equatable {
     case create
     case patch
     case delete
+    /// Added each of its `fields`, a number, to the record's field.
+    case increment
+}
+
+/// A record a refusal names with the room's row of it: the record a failed
+/// `condition` was judged against, or the one an increment named
+/// (`row == nil` when the record has no live row).
+public struct RecordLogCurrentRecord: Sendable, Equatable {
+    /// The record's model.
+    public let model: String
+    /// The record's id.
+    public let id: String
+    /// The room's live row of the record, or `nil`.
+    public let row: [String: JSONValue]?
+
+    public init(model: String, id: String, row: [String: JSONValue]?) {
+        self.model = model
+        self.id = id
+        self.row = row
+    }
+
+    /// The record as the JS client's `current` spells it: `{ model, id, row }`, `row` `null` for none.
+    public var json: JSONValue {
+        .object(["model": .string(model), "id": .string(id), "row": row.map { .object($0) } ?? .null])
+    }
+
+    init?(json: JSONValue?) {
+        guard let model = json?["model"]?.stringValue, let id = json?["id"]?.stringValue else { return nil }
+        self.init(model: model, id: id, row: json?["row"]?.objectValue)
+    }
+}
+
+/// What a write of this client left in the confirmed rows when the room
+/// settled it: each record it touched and the room's row of it then (`nil`
+/// when the record shows none), before any later result and without the
+/// guesses of other pending writes.
+public struct RecordLogSettlement: Sendable, Equatable {
+    /// One per record the write touched.
+    public let rows: [RecordLogCurrentRecord]
+
+    public init(rows: [RecordLogCurrentRecord]) {
+        self.rows = rows
+    }
 }
 
 /// One write the room (or this client, before sending) handed back, with its
@@ -122,26 +165,48 @@ enum RecordLogTransport {
 ///
 /// `fields` absent from the mutation leave the record's values alone; a field
 /// given `.null` is set to `null`. A create replaces what its writer had seen of
-/// the record; a patch sets what it names; a delete removes the record.
+/// the record; a patch sets what it names; a delete removes the record; an
+/// increment adds each of its `fields` (a number) to the record's field, a
+/// missing or non-numeric one counting as 0. `condition` (the query filter
+/// grammar) and `ifNotExists` (a create only) are guards the room judges and
+/// never stores.
 struct RecordLogMutation: Equatable, Sendable {
     var model: String
     var id: String
     var kind: RecordLogWriteKind
     var fields: [String: JSONValue]?
     var stringSetDeltas: [String: [String: Bool]]?
+    /// The record must be live and match this filter when the room applies the write.
+    var condition: JSONValue?
+    /// On a create: applied only when the record has no live row.
+    var ifNotExists: Bool = false
 
     init(
         model: String, id: String, kind: RecordLogWriteKind,
-        fields: [String: JSONValue]? = nil, stringSetDeltas: [String: [String: Bool]]? = nil
+        fields: [String: JSONValue]? = nil, stringSetDeltas: [String: [String: Bool]]? = nil,
+        condition: JSONValue? = nil, ifNotExists: Bool = false
     ) {
         self.model = model
         self.id = id
         self.kind = kind
         self.fields = fields
         self.stringSetDeltas = stringSetDeltas
+        self.condition = condition
+        self.ifNotExists = ifNotExists
     }
 
     var key: RecordLogRecordKey { RecordLogRecordKey(model: model, id: id) }
+
+    /// Whether the room judges a guard of this mutation: a `condition` or `ifNotExists`.
+    var carriesGuard: Bool { condition != nil || ifNotExists }
+
+    /// The mutation with its guards dropped.
+    var withoutGuards: RecordLogMutation {
+        var plain = self
+        plain.condition = nil
+        plain.ifNotExists = false
+        return plain
+    }
 
     var json: JSONValue {
         var object: [String: JSONValue] = [
@@ -153,6 +218,8 @@ struct RecordLogMutation: Equatable, Sendable {
                 .object(members.mapValues { .bool($0) })
             })
         }
+        if let condition { object["condition"] = condition }
+        if ifNotExists { object["ifNotExists"] = .bool(true) }
         return .object(object)
     }
 
@@ -179,6 +246,8 @@ struct RecordLogMutation: Equatable, Sendable {
         } else {
             self.stringSetDeltas = nil
         }
+        self.condition = object["condition"]
+        self.ifNotExists = object["ifNotExists"]?.boolValue == true
     }
 }
 
@@ -461,11 +530,18 @@ struct RecordLogRefusal: Equatable, Sendable {
     var constraint: String?
     /// What the room said.
     var message: String?
+    /// For `DB3_CONDITION_NOT_MET`, the record whose guard failed and the
+    /// room's row of it; for `DB3_RECORD_NOT_FOUND`, the record an increment
+    /// named (`row == nil`).
+    var current: RecordLogCurrentRecord?
+    /// For `DB3_TRIGGER_REFUSED`, the code of the db3 trigger that refused the write.
+    var reason: String?
 
     init(
         seq: Int, code: String, scope: RecordLogRefusalScope, from: Int,
         records: [RecordLogRefusedRecord] = [], conflicting: RecordLogRecordKey? = nil,
-        constraint: String? = nil, message: String? = nil
+        constraint: String? = nil, message: String? = nil, current: RecordLogCurrentRecord? = nil,
+        reason: String? = nil
     ) {
         self.seq = seq
         self.code = code
@@ -475,6 +551,8 @@ struct RecordLogRefusal: Equatable, Sendable {
         self.conflicting = conflicting
         self.constraint = constraint
         self.message = message
+        self.current = current
+        self.reason = reason
     }
 
     init?(json: JSONValue?) {
@@ -495,7 +573,9 @@ struct RecordLogRefusal: Equatable, Sendable {
             },
             conflicting: RecordLogRecordKey(json: object["conflicting"]),
             constraint: object["constraint"]?.stringValue,
-            message: object["message"]?.stringValue
+            message: object["message"]?.stringValue,
+            current: RecordLogCurrentRecord(json: object["current"]),
+            reason: object["reason"]?.stringValue
         )
     }
 }
@@ -558,8 +638,13 @@ enum RecordLogHandBackCode {
         "DOCUMENT_CONSTRAINT_VIOLATED", "DOCUMENT_EPOCH_FROZEN", "DOCUMENT_OFFLINE_WINDOW_EXPIRED",
         "DOCUMENT_EPOCH_NOT_OPEN", "DOCUMENT_STORE_PURGED", "DOCUMENT_EPOCH_BUDGET",
         "DOCUMENT_ENTRY_TOO_LARGE", "DOCUMENT_ENTRY_INVALID", "WRITE_ACCESS_DENIED",
+        "DB3_CONDITION_NOT_MET", "DB3_RECORD_NOT_FOUND", "DB3_TRIGGER_REFUSED", "DB3_MODEL_NOT_DECLARED",
     ]
 }
+
+/// The wire version this client declares on `record.open`: 2 since the
+/// `increment` entry kind. A room past it refuses the open `DB3_CLIENT_OUTDATED`.
+let recordLogWireVersion = 2
 
 // MARK: - JSON
 
@@ -624,4 +709,27 @@ func recordLogCanonicalStringSet<S: Sequence>(_ values: S) -> [String] where S.E
 /// Whether two strings are the same bytes, which is how JS compares them.
 func recordLogSameText(_ a: String, _ b: String) -> Bool {
     a.utf8.elementsEqual(b.utf8)
+}
+
+/// Whether two values are the same JSON, strings compared by their bytes:
+/// `JSONValue`'s `==` compares strings canonically, so a set holding U+00E9
+/// equals one holding U+0065 U+0301 by it, and the JS client and the room
+/// keep them apart.
+func recordLogSameJSON(_ a: JSONValue, _ b: JSONValue) -> Bool {
+    switch (a, b) {
+    case (.string(let x), .string(let y)): return recordLogSameText(x, y)
+    case (.array(let x), .array(let y)): return x.count == y.count && zip(x, y).allSatisfy(recordLogSameJSON)
+    case (.object(let x), .object(let y)):
+        return x.count == y.count && x.allSatisfy { key, value in y[key].map { recordLogSameJSON(value, $0) } ?? false }
+    default: return a == b
+    }
+}
+
+/// Whether two rows (or their absence) are the same, as ``recordLogSameJSON(_:_:)`` compares.
+func recordLogSameRow(_ a: RecordLogRow?, _ b: RecordLogRow?) -> Bool {
+    switch (a, b) {
+    case (nil, nil): return true
+    case (let x?, let y?): return recordLogSameJSON(.object(x), .object(y))
+    default: return false
+    }
 }

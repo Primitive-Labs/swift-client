@@ -322,81 +322,18 @@ final class TransportSpineTests: XCTestCase {
     // MARK: - Pre-encoded bodies (exactness past 2^53)
 
     /// `request(bodyData:)` sends the caller's bytes verbatim, which is how
-    /// `workflows.start` keeps an `Int64` exact — routing the same value
+    /// `functions.start` keeps an `Int64` exact — routing the same value
     /// through `JSONValue` would round it to the nearest `Double`.
     func testPreEncodedBodyIsSentByteForByte() async throws {
         let transport = ScriptedTransport(json: #"{"name":"ok"}"#)
         let exact = Data(#"{"rootInput":{"id":9007199254740993}}"#.utf8)
 
         let result: Payload = try await transport.request(
-            method: .post, path: "/workflows/k/start", bodyData: exact
+            method: .post, path: "/functions/k/start", bodyData: exact
         )
 
         XCTAssertEqual(result, Payload(name: "ok"))
         XCTAssertEqual(try XCTUnwrap(transport.lastCall).body, exact)
-    }
-
-    /// The workflow `meta` fidelity table in `swift-client/CHANGELOG.md` and
-    /// the migration guide is a claim about bytes, so it is asserted here
-    /// rather than only described there.
-    ///
-    /// A `meta` taken positionally reaches `JSONSerialization` without passing
-    /// through `JSONValue`, so an `Int64` past 2^53 survives.
-    /// `StartWorkflowOptions.meta` is `[String: JSONValue]`, whose single
-    /// `.number(Double)` case rounds it. #2367's re-review found the generic
-    /// `start` on the wrong side of that line: it declared `meta: [String:
-    /// Any]` like `origin/main` but built a `StartWorkflowOptions` internally,
-    /// so the value was rounded with no signature change to warn anyone. This
-    /// pins both halves — the exactness that was restored, and the one lossy
-    /// form the docs tell readers to avoid for large integer IDs.
-    func testWorkflowMetaFidelityMatchesTheDocumentedTable() async throws {
-        let exact = "9007199254740993"
-        let started = #"{"runId":"r","runKey":"k","status":"queued"}"#
-
-        // 2^53+1: the smallest integer a `Double` cannot hold, which is the
-        // whole point of the lossy half of this test. Written as a `Double`
-        // literal the compiler warns that it "becomes 9007199254740992" — the
-        // rounding is deliberate here, so the conversion is made explicit and
-        // pinned instead of being spelled as a literal that warns (#3314).
-        let lossyId = Double(Int64(9_007_199_254_740_993))
-        XCTAssertEqual(
-            String(format: "%.0f", lossyId), "9007199254740992",
-            "a `Double` rounds 2^53+1 down; if it stops doing so, this test's premise is gone"
-        )
-
-        let positional = ScriptedTransport(json: started)
-        _ = try await WorkflowsAPI(transport: positional).start(
-            workflowKey: "k",
-            input: ["a": 1] as [String: Int],
-            meta: ["id": Int64(9_007_199_254_740_993)]
-        )
-        let positionalBody = String(
-            decoding: try XCTUnwrap(XCTUnwrap(positional.lastCall).body), as: UTF8.self
-        )
-        XCTAssertTrue(
-            positionalBody.contains(exact),
-            "a positional `meta` must reach the wire exactly; got \(positionalBody)"
-        )
-
-        let viaOptions = ScriptedTransport(json: started)
-        _ = try await WorkflowsAPI(transport: viaOptions).start(
-            StartWorkflowOptions(
-                workflowKey: "k",
-                input: ["a": .number(1)],
-                meta: ["id": .number(lossyId)]
-            )
-        )
-        let optionsBody = String(
-            decoding: try XCTUnwrap(XCTUnwrap(viaOptions.lastCall).body), as: UTF8.self
-        )
-        XCTAssertFalse(
-            optionsBody.contains(exact),
-            """
-            `StartWorkflowOptions.meta` is documented as the lossy form. If it \
-            is exact now, `JSONValue` gained an integer case — update the \
-            fidelity table in the CHANGELOG and the migration guide.
-            """
-        )
     }
 
     // MARK: - Converted call sites (behavior 3 grep assertion)
@@ -520,12 +457,9 @@ final class TransportSpineTests: XCTestCase {
         let converted = [
             "BlobBucketsAPI.swift",
             "CollectionsAPI.swift",
-            "CollectionTypeConfigsAPI.swift",
-            "CronTriggersAPI.swift",
             "DatabaseTypeConfigsAPI.swift",
             "DocumentsAPI.swift",
             "GroupsAPI.swift",
-            "GroupTypeConfigsAPI.swift",
             "InvitationsAPI.swift",
             "MeAPI.swift",
             "NotificationsAPI.swift",
@@ -580,29 +514,8 @@ final class TransportSpineTests: XCTestCase {
             // `API/DatabasesAPI.swift` (3, 2, 0: the `db.subscribe` /
             // `db.unsubscribe` frames it encoded) left with `client.databases`
             // in #3189, so its entry is gone rather than zeroed.
-            // Public `rootInput` / `meta` signatures. The two
-            // `JSONSerialization` uses are deliberate: `start`/`runSync`
-            // compose the opaque caller payload straight to request bytes,
-            // because routing it through `JSONValue` would collapse an
-            // `Int64` to `Double` and lose exactness past 2^53. #2367
-            // deliberately left this one surface untyped for that reason and
-            // recorded it in the CHANGELOG as the batch's one known remaining
-            // break; it took the count 11 -> 10 by typing
-            // `StartWorkflowOptions`.
-            // The re-review of this PR took it 10 -> 11: the three public
-            // `start` forms now funnel through one private `startRequest` body
-            // composer, whose `input: [String: Any]` parameter is the added
-            // line. That is what lets the generic `start<Input: Encodable>`
-            // hand its declared-`[String: Any]` `meta` straight to
-            // `JSONSerialization` instead of raising it into
-            // `StartWorkflowOptions` and back — a round trip that rounded an
-            // `Int64` past 2^53 on a signature that had not changed. The file
-            // set is net zero on this commit: `JsBaoClient.swift` gave one back
-            // (22 -> 21) below.
-            // #3188 took it 11 -> 7 and its `JSONSerialization` uses 2 -> 1:
-            // `runSync` (both overloads) is gone with its `input`, `meta` and
-            // `payload` composition, so `start` is the one composer left.
-            "API/WorkflowsAPI.swift": (7, 1, 0),
+            // `API/WorkflowsAPI.swift` (7, 1, 0) left with `client.workflows`
+            // in #3190, so its entry is gone rather than zeroed.
             // #3278 opened this at eleven because there were no per-key types
             // to express an invocation with; #3344 generated them and closed
             // the four sites that existed only for their absence. The untyped
@@ -687,7 +600,11 @@ final class TransportSpineTests: XCTestCase {
             // surface, and `documentRow` / `documentRows` (three spellings)
             // are the one lowering seam into `DocumentManager`'s rows until
             // #2579 retypes them.
-            "JsBaoClient.swift": (20, 7, 0),
+            // #3190 took the dictionary count 20 -> 18: the `workflowStatus`
+            // and `workflowStarted` frame handlers left with
+            // `client.workflows`, and with them their two `meta` casts.
+            // Removed surface, not a new lowering.
+            "JsBaoClient.swift": (18, 7, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP

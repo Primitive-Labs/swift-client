@@ -146,15 +146,17 @@ public struct AgentSessionTurnSummary: Codable, Sendable, Equatable {
 }
 
 /// One agent session, as `client.agents.sessions.get` answers it: who it
-/// belongs to, which agent it runs, its members, its status, and the document
-/// that holds its conversation. The conversation itself is read by opening
-/// `documentId` (or with `open`), never through this call.
+/// belongs to, which agent it runs, its members and its status. The
+/// conversation itself is read with `open`, never through this call.
 public struct AgentSessionInfo: Decodable, Sendable, Equatable {
     public let sessionId: String
     /// The agent prompt the session is bound to.
     public let agentKey: String
     /// The session's conversation document.
-    public let documentId: String
+    @available(*, deprecated, message: "Use sessionId and the session calls (attachments for files, artifact(of:) for artifacts); client.agents.sessions.inspect.storage(_:) answers it for diagnostics.")
+    public var documentId: String { storageDocumentId }
+    /// The session's document, for the SDK's own reads.
+    let storageDocumentId: String
     public let ownerUserId: String
     /// ISO-8601.
     public let createdAt: String
@@ -198,7 +200,7 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         sessionId = try c.decode(String.self, forKey: .sessionId)
         agentKey = try c.decode(String.self, forKey: .agentKey)
-        documentId = try c.decode(String.self, forKey: .documentId)
+        storageDocumentId = try c.decode(String.self, forKey: .documentId)
         ownerUserId = try c.decode(String.self, forKey: .ownerUserId)
         createdAt = try c.decode(String.self, forKey: .createdAt)
         title = try c.decodeIfPresent(String.self, forKey: .title)
@@ -231,7 +233,11 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
     public let sessionId: String
     public let agentKey: String
     public let scope: String?
-    public let documentId: String
+    /// The session's conversation document.
+    @available(*, deprecated, message: "Use sessionId and the session calls (attachments for files, artifact(of:) for artifacts); client.agents.sessions.inspect.storage(_:) answers it for diagnostics.")
+    public var documentId: String { storageDocumentId }
+    /// The session's document, for the SDK's own reads.
+    let storageDocumentId: String
     public let ownerUserId: String
     /// The listed user's role in the session.
     public let role: AgentSessionRole
@@ -265,7 +271,7 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         self.sessionId = sessionId
         self.agentKey = agentKey
         self.scope = scope
-        self.documentId = documentId
+        self.storageDocumentId = documentId
         self.ownerUserId = ownerUserId
         self.role = role
         self.title = title
@@ -281,7 +287,7 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         sessionId = try c.decode(String.self, forKey: .sessionId)
         agentKey = try c.decode(String.self, forKey: .agentKey)
         scope = try c.decodeIfPresent(String.self, forKey: .scope)
-        documentId = try c.decode(String.self, forKey: .documentId)
+        storageDocumentId = try c.decode(String.self, forKey: .documentId)
         ownerUserId = try c.decode(String.self, forKey: .ownerUserId)
         role = try c.decode(AgentSessionRole.self, forKey: .role)
         title = try c.decodeIfPresent(String.self, forKey: .title)
@@ -297,7 +303,7 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         try c.encode(sessionId, forKey: .sessionId)
         try c.encode(agentKey, forKey: .agentKey)
         try c.encode(scope, forKey: .scope)
-        try c.encode(documentId, forKey: .documentId)
+        try c.encode(storageDocumentId, forKey: .documentId)
         try c.encode(ownerUserId, forKey: .ownerUserId)
         try c.encode(role, forKey: .role)
         try c.encode(title, forKey: .title)
@@ -314,7 +320,7 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         status: PrimitiveSessionStatus?? = nil
     ) -> AgentSessionListItem {
         AgentSessionListItem(
-            sessionId: sessionId, agentKey: agentKey, scope: scope, documentId: documentId,
+            sessionId: sessionId, agentKey: agentKey, scope: scope, documentId: storageDocumentId,
             ownerUserId: ownerUserId, role: role, title: title,
             lastActivityAt: lastActivityAt ?? self.lastActivityAt, createdAt: createdAt,
             hasUnread: hasUnread ?? self.hasUnread, lastReadAt: lastReadAt ?? self.lastReadAt,
@@ -475,8 +481,68 @@ public struct AgentSessionMembersResult: Codable, Sendable, Equatable {
     public let members: AgentSessionMembers
 }
 
-/// A blob already uploaded to the session's document (an image or a PDF),
-/// named on a send.
+/// Where a session's conversation is stored: what
+/// `client.agents.sessions.inspect.storage(_:)` answers.
+public struct AgentSessionStorage: Sendable, Equatable {
+    /// The ordinary document that backs the session.
+    public let documentId: String
+
+    public init(documentId: String) {
+        self.documentId = documentId
+    }
+}
+
+/// A file to upload with `client.agents.sessions.uploadAttachment`.
+public struct AgentSessionAttachmentUpload: Sendable, Equatable {
+    /// The file's bytes, at most 10 MiB.
+    public var data: Data
+    /// The file's name, as downloads name it.
+    public var filename: String
+    /// The file's media type (default `application/octet-stream`). A
+    /// message's files must be an image (png, jpeg, webp, gif) or a PDF, so
+    /// pass the real type for a file you will send.
+    public var contentType: String?
+    /// How downloads serve the file by default: `.attachment` (the server's
+    /// default) or `.inline`.
+    public var disposition: BlobDisposition?
+
+    public init(data: Data, filename: String, contentType: String? = nil, disposition: BlobDisposition? = nil) {
+        self.data = data
+        self.filename = filename
+        self.contentType = contentType
+        self.disposition = disposition
+    }
+}
+
+/// What `client.agents.sessions.uploadAttachment` answers: the stored file.
+public struct AgentSessionAttachmentUploadResult: Decodable, Sendable, Equatable {
+    public let blobId: String
+    public let filename: String
+    public let contentType: String
+    public let numBytes: Int
+    /// ISO-8601.
+    public let createdAt: String
+    /// The bytes sent; 0 when the same id already held the same bytes.
+    public let bytesTransferred: Int
+}
+
+/// What `client.agents.sessions.attachmentHeaders` answers: the download's
+/// headers, names lower-cased.
+public struct AgentSessionAttachmentHeaders: Sendable, Equatable {
+    /// 200, or 304 when the file has not changed.
+    public let status: Int
+    /// `content-type`, `content-length`, `content-disposition`, `etag` and
+    /// `accept-ranges`.
+    public let headers: [String: String]
+
+    public init(status: Int, headers: [String: String]) {
+        self.status = status
+        self.headers = headers
+    }
+}
+
+/// A file uploaded to the session (an image or a PDF), named on a send:
+/// `view.attachments.upload` answers its `blobId`.
 public struct AgentSessionFileRef: Codable, Sendable, Equatable, Hashable {
     public let blobId: String
 
@@ -489,7 +555,8 @@ public struct AgentSessionFileRef: Codable, Sendable, Equatable, Hashable {
 /// only when given.
 public struct AgentSessionSendBody: Encodable, Sendable, Equatable {
     public var text: String?
-    /// Blobs already uploaded to the session's document: images or PDF.
+    /// Files uploaded to the session (`view.attachments.upload`): images or
+    /// PDF.
     public var files: [AgentSessionFileRef]?
     /// Your id for the message. A repeat with the same id and content answers
     /// the first send (`duplicate: true`); with other content it is refused

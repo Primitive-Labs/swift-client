@@ -1,0 +1,23 @@
+{
+  "name": "groups.update",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "PATCH",
+  "path": "/app/<appId>/api/groups/team/baseline",
+  "caller": "owner",
+  "request": {
+    "name": "Baseline Team Renamed"
+  },
+  "status": 200,
+  "body": {
+    "appId": "<appId>",
+    "groupType": "team",
+    "groupId": "baseline",
+    "name": "Baseline Team Renamed",
+    "description": "Compatibility baseline",
+    "memberCount": 0,
+    "createdAt": "<iso>",
+    "createdBy": "<ulid>",
+    "modifiedAt": "<iso>"
+  }
+}

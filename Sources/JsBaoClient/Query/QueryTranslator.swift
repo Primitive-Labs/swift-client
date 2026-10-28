@@ -47,19 +47,50 @@ public struct QueryTranslator {
         fieldTypes: [String: String]? = nil,
         tableName: String? = nil
     ) throws -> (String, [Any]) {
+        try translate(
+            filter, stringsetFields: stringsetFields, stringFields: stringFields,
+            fieldTypes: fieldTypes, tableName: tableName, viewTable: nil
+        )
+    }
+
+    /// Translate a filter over a format-3 document's `record_log_view` (the
+    /// view mode): the statement the room runs for the same filter, so a field
+    /// nobody declared answers too. A field is read from the record's JSON
+    /// (`json_extract(_data, '$.<field>')`, `id` as `_id` and `type` as
+    /// `_type`) and the stored JSON type decides a comparison: `["n": 5]`
+    /// matches a stored 5 and not a stored `"5"`. String-set membership
+    /// (`$contains`, `$all`, `$size`) reads the array the record holds with
+    /// `json_each`, so it matches nothing on a field that holds no array, and a
+    /// substring operator on an array matches its members. An array value is
+    /// `$in`. A field name that is not an identifier, or an operator the
+    /// grammar lacks, throws `JsBaoError(.invalidArgument)` before any SQL is
+    /// built. js-bao's `JsonQueryTranslator` with `stringSets: "json_each"`.
+    static func translateView(_ filter: DocumentFilter, table: String = "record_log_view") throws -> (String, [Any]) {
+        try translate(filter, stringsetFields: [], stringFields: nil, fieldTypes: nil, tableName: nil, viewTable: table)
+    }
+
+    /// `translate`, reading fields from `viewTable`'s `_data` when it is set.
+    private static func translate(
+        _ filter: DocumentFilter,
+        stringsetFields: Set<String>,
+        stringFields: Set<String>?,
+        fieldTypes: [String: String]?,
+        tableName: String?,
+        viewTable: String?
+    ) throws -> (String, [Any]) {
         var conditions: [String] = []
         var params: [Any] = []
 
         for (key, value) in filter {
             if key == "$and", let arr = subFilters(value) {
-                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " AND ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
             } else if key == "$or", let arr = subFilters(value) {
-                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " OR ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
@@ -92,11 +123,28 @@ public struct QueryTranslator {
                         stringsetFields: stringsetFields,
                         stringFields: stringFields,
                         fieldTypes: fieldTypes,
-                        tableName: tableName
+                        tableName: tableName,
+                        viewTable: viewTable
                     ) {
                         conditions.append(cond)
                         params.append(contentsOf: p)
                     }
+                }
+            } else if let viewTable {
+                // Simple equality over the record's JSON; an array is `$in`.
+                let field = try viewField(key)
+                if case let .array(items) = value {
+                    if let (cond, p) = try translateOperator(
+                        field: key, op: "$in", value: .array(items), viewTable: viewTable
+                    ) {
+                        conditions.append(cond)
+                        params.append(contentsOf: p)
+                    }
+                } else if value.isNull {
+                    conditions.append("\(field) IS NULL")
+                } else {
+                    conditions.append("\(field) = ?")
+                    params.append(sqlValue(value))
                 }
             } else {
                 // Simple equality: { "field": value }
@@ -127,9 +175,13 @@ public struct QueryTranslator {
         stringsetFields: Set<String> = [],
         stringFields: Set<String>? = nil,
         fieldTypes: [String: String]? = nil,
-        tableName: String? = nil
+        tableName: String? = nil,
+        viewTable: String? = nil
     ) throws -> (String, [Any])? {
-        let col = quoted(field)
+        let col = try viewTable == nil ? quoted(field) : viewField(field)
+        if let viewTable, let condition = try viewOperator(field: field, op: op, value: value, column: col, table: viewTable) {
+            return condition
+        }
 
         // Substring operators ($startsWith / $endsWith / $containsText)
         // share one validate-then-build path so the scalar and stringset
@@ -165,6 +217,16 @@ public struct QueryTranslator {
                 raw, mode: mode, field: field, op: op, fieldType: type
             ) else {
                 return nil
+            }
+            if let viewTable {
+                // The record's own JSON: a stored array matches on a member,
+                // any other stored value on itself.
+                let like = "LIKE ? ESCAPE '\\' COLLATE NOCASE"
+                let path = try viewDataPath(field, table: viewTable)
+                return (
+                    "((json_type(\(path)) <> 'array' AND \(col) \(like)) OR \(viewSetMember(path, "_set.value \(like)")))",
+                    [pattern, pattern]
+                )
             }
             if stringsetFields.contains(field) {
                 return stringsetSubstringSQL(
@@ -722,6 +784,114 @@ public struct QueryTranslator {
             row[groupRowKey] = .object(group)
             return row
         }
+    }
+
+    // MARK: - View mode
+
+    /// The operators whose view-mode SQL differs from the column mode's, or
+    /// that exist in the view mode only; `nil` for the shared ones. An
+    /// operator the grammar lacks throws rather than matching nothing.
+    private static func viewOperator(
+        field: String, op: String, value: JSONValue, column: String, table: String
+    ) throws -> (String, [Any])? {
+        switch op {
+        case "$eq" where value.isNull:
+            // The room binds the null, and `= NULL` matches nothing: `{ f: null }`
+            // is the spelling for absent or null (the null contract, rule 1).
+            return ("\(column) = ?", [NSNull()])
+        case "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$nin":
+            return nil
+        case "$in":
+            guard value.arrayValue != nil else {
+                throw viewOperatorError("$in operator requires an array value for field \(field)", field: field, op: op)
+            }
+            return nil
+        case "$exists":
+            guard let exists = value.boolValue else {
+                throw viewOperatorError("$exists operator requires a boolean value for field \(field)", field: field, op: op)
+            }
+            // A stored null exists; only a field the record lacks does not.
+            let probe = viewSystemFields.contains(field) ? column : "json_type(_data, '$.\(field)')"
+            return (exists ? "\(probe) IS NOT NULL" : "\(probe) IS NULL", [])
+        case "$contains":
+            guard let member = value.stringValue else {
+                throw viewOperatorError("$contains operator requires a string value for field \(field)", field: field, op: op)
+            }
+            return (viewSetMember(try viewDataPath(field, table: table), "_set.value = ?"), [member])
+        case "$all":
+            guard let members = value.arrayValue, members.allSatisfy({ $0.stringValue != nil }) else {
+                throw viewOperatorError("$all operator requires an array of strings for field \(field)", field: field, op: op)
+            }
+            if members.isEmpty { return ("0", []) }
+            let path = try viewDataPath(field, table: table)
+            return (
+                "(json_type(\(path)) = 'array' AND NOT EXISTS (SELECT 1 FROM json_each(?) AS _wanted "
+                    + "WHERE _wanted.value NOT IN (SELECT value FROM json_each(\(path)))))",
+                [RecordLogJSON.text(.array(members))]
+            )
+        case "$size":
+            let comparisons = ["$eq": "=", "$ne": "!=", "$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="]
+            let entries: [(String, JSONValue)] = value.numberValue != nil
+                ? [("$eq", value)]
+                : (value.objectValue ?? [:]).sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+            guard !entries.isEmpty,
+                  entries.allSatisfy({ comparisons[$0.0] != nil && ($0.1.numberValue?.isFinite ?? false) })
+            else {
+                throw viewOperatorError(
+                    "$size operator requires a number, or $eq/$ne/$gt/$gte/$lt/$lte with numbers, for field \(field)",
+                    field: field, op: op
+                )
+            }
+            let path = try viewDataPath(field, table: table)
+            let length = "json_array_length(\(path))"
+            let compared = entries.map { "\(length) \(comparisons[$0.0]!) ?" }.joined(separator: " AND ")
+            return ("(json_type(\(path)) = 'array' AND \(compared))", entries.map { sqlValue($0.1) })
+        case "$startsWith", "$endsWith", "$containsText":
+            return nil
+        default:
+            throw viewOperatorError("Unsupported operator: \(op) for field \(field)", field: field, op: op)
+        }
+    }
+
+    /// The fields a view row keeps in its own columns.
+    private static let viewSystemFields: Set<String> = ["id", "type"]
+
+    /// A field as the view mode reads it: `id` and `type` from their columns,
+    /// any other identifier from the record's JSON. Also what a view query
+    /// sorts and pages on.
+    static func viewField(_ field: String) throws -> String {
+        if viewSystemFields.contains(field) { return quoted("_\(field)") }
+        try requireViewIdentifier(field)
+        return "json_extract(_data, '$.\(field)')"
+    }
+
+    /// `<table>._data, '$.<field>'`: the arguments that address a field's stored JSON.
+    private static func viewDataPath(_ field: String, table: String) throws -> String {
+        try requireViewIdentifier(field)
+        return "\(table)._data, '$.\(field)'"
+    }
+
+    /// True only where the stored value is an array, and then when `members`
+    /// (a condition over its `json_each` rows, aliased `_set`) holds for one.
+    private static func viewSetMember(_ path: String, _ members: String) -> String {
+        "(json_type(\(path)) = 'array' AND EXISTS (SELECT 1 FROM json_each(\(path)) AS _set WHERE \(members)))"
+    }
+
+    /// A name goes into the statement as text, so it must be an identifier:
+    /// js-bao's `assertValidIdentifier` refusal, word for word (`context` is
+    /// `query field` or `query model`).
+    static func requireViewIdentifier(_ name: String, context: String = "query field") throws {
+        guard RecordLogSchema.isValidIdentifier(name) else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "\(context): Identifier \"\(name)\" must match ^[A-Za-z_][A-Za-z0-9_]*$",
+                details: [context == "query model" ? "model" : "field": .string(name)]
+            )
+        }
+    }
+
+    private static func viewOperatorError(_ message: String, field: String, op: String) -> JsBaoError {
+        JsBaoError(code: .invalidArgument, message: message, details: ["field": .string(field), "operator": .string(op)])
     }
 
     // MARK: - Helpers

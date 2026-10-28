@@ -62,13 +62,23 @@ func recordLogApplyGuess(_ table: RecordLogRowTable, _ entry: RecordLogPendingEn
 /// stamps and no rules: a create is `{ id, ...fields }` with its string-set
 /// deltas applied to empty sets; a patch sets its fields and applies its
 /// deltas on a record that shows a row and does nothing on one that does not;
-/// a delete removes the row. String sets are kept in code point order. The
+/// an increment adds each delta to the field (0 when not a number) on a
+/// record that shows a row; a delete removes the row. String sets are kept in
+/// code point order. The
 /// room vouches for a compact acknowledgement by this rule (js-bao's
 /// `plainRowAfter`).
 ///
 /// - Returns: the row after it, or `nil` when the record shows none.
 func recordLogPlainRowAfter(_ row: RecordLogRow?, _ mutation: RecordLogMutation) -> RecordLogRow? {
     if mutation.kind == .delete { return nil }
+    if mutation.kind == .increment {
+        // Each delta added to the field's value, 0 when it is not a number (#4797).
+        guard var next = row else { return nil }
+        for (field, delta) in mutation.fields ?? [:] {
+            next[field] = .number(recordLogNumeric(next[field]) + recordLogNumeric(delta))
+        }
+        return next
+    }
     let prior: RecordLogRow? = mutation.kind == .create ? ["id": .string(mutation.id)] : row
     guard var next = prior else { return nil }
     for (field, value) in mutation.fields ?? [:] { next[field] = value }
@@ -84,6 +94,19 @@ func recordLogPlainRowAfter(_ row: RecordLogRow?, _ mutation: RecordLogMutation)
         next[field] = .array(recordLogCanonicalStringSet(members).map { .string($0) })
     }
     return next
+}
+
+/// A value as an increment counts it: itself when a number, 0 otherwise.
+func recordLogNumeric(_ value: JSONValue?) -> Double {
+    if case .number(let number)? = value { return number }
+    return 0
+}
+
+/// Whether an entry's guess stays out of the view: one of its mutations
+/// carries a guard (`condition` or `ifNotExists`) and the room has not yet
+/// acknowledged it. Only the room judges a guard (js-bao's `guessHeld`).
+func recordLogGuessHeld(_ entry: RecordLogPendingEntry) -> Bool {
+    entry.acked == nil && entry.mutations.contains { $0.carriesGuard }
 }
 
 /// Apply one record's change from a result to a table of confirmed rows.

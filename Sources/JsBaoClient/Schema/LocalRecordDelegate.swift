@@ -13,9 +13,11 @@ protocol LocalRecordDelegate: AnyObject, Sendable {
 
     // Reads
     func row(id: String) throws -> [String: JSONValue]?
-    func requireProjection() throws
     func query(filter: DocumentFilter?, options: QueryOptions?) throws -> [[String: JSONValue]]
+    /// ``query(filter:options:)`` with `_related` attached, each leg read within this document.
+    func query(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> [[String: JSONValue]]
     func queryPaged(filter: DocumentFilter?, options: QueryOptions?) throws -> PagedQueryResult<PrimitiveRow>
+    func queryPaged(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> PagedQueryResult<PrimitiveRow>
     func count(filter: DocumentFilter?) throws -> Int
     func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]]
     func exists(id: String) throws -> Bool
@@ -46,8 +48,8 @@ protocol LocalRecordDelegate: AnyObject, Sendable {
     func publishDeclaration(doc: YDocument, schema: PrimitiveSchema)
     /// Whether the local uniqueness pre-check holds saves to this constraint.
     func constraintInForce(_ name: String) -> Bool
-    /// The engine the routed filtered reads run on.
-    var queryEngine: BaoModelQueryEngine { get }
+    /// The store whose connection a filtered read over several documents runs on.
+    var viewStore: RecordLogStore { get }
     /// Run `body` with the document's writes serialized: a save's read, its
     /// uniqueness check and its commit are one operation.
     func withOperation<T>(_ body: () throws -> T) throws -> T

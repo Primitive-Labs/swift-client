@@ -64,9 +64,13 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     // MARK: - GroupsAPI.list — byte-identical + boolean convention preserved
+    //
+    // The group pins below call the typed labels and `ListGroupsOptions.type`,
+    // deprecated since #4737, so they are deprecated test methods.
 
     /// A slug type filter and the `includeSystem=true`-only-when-true boolean
     /// convention are preserved byte-for-byte.
+    @available(*, deprecated)
     func test_groupsList_slugAndBoolean_areByteIdentical() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -77,6 +81,7 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     /// `includeSystem` defaulting to nil/false appends nothing (unchanged).
+    @available(*, deprecated)
     func test_groupsList_includeSystemFalse_isOmitted() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -89,6 +94,7 @@ final class URLConstructionParityTests: XCTestCase {
     /// The cursor is now percent-encoded. Before the fix `listMembers`
     /// interpolated it raw (`cursor=\(cursor)`), so a cursor containing a `+`
     /// or space produced a malformed query on page 2.
+    @available(*, deprecated)
     func test_groupsListMembers_cursor_isEncoded() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -104,6 +110,7 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     /// A plain cursor stays byte-identical.
+    @available(*, deprecated)
     func test_groupsListMembers_plainCursor_isByteIdentical() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -120,6 +127,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - GroupsAPI.removeMemberByEmail — plus email in the query
 
+    @available(*, deprecated)
     func test_groupsRemoveMemberByEmail_plusEmail_isEncoded() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -136,6 +144,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     /// A value containing `/` is now escaped to `%2F` (the old `.urlPathAllowed`
     /// left it literal, letting a value split into extra path segments).
+    @available(*, deprecated)
     func test_groupsDelete_slashInValue_isEscaped() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)

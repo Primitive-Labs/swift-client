@@ -33,6 +33,13 @@ let open = try notes?.query(["done": false])
 `subscribe` all work as they do on an ordinary document. A save returns once it
 is applied locally; reads answer from the local store, offline included.
 
+A filtered read answers as the room answers the same request: the stored JSON
+type decides a comparison (`["n": 5]` does not match a stored `"5"`), a page
+holds 100 records unless `limit` says otherwise (1 to 10,000), and a page ends
+early, with `hasMore` set, before the record that would take it past 8 MiB.
+Follow `nextCursor` to read on. An include resolves within the parent's own
+document, to three levels.
+
 A device that never saw the document learns its format from the documents API
 before it opens it, as long as it may use the network.
 
@@ -61,8 +68,8 @@ held by the room.
 
 The store belongs to the user it was written for. When another user signs in on
 the same client — or a relaunch over the same directory signs in as someone
-else — the store is reset: the previous user's rows, unsent writes and query
-rows are removed, and nothing is raised for those writes, which were theirs. The
+else — the store is reset: the previous user's rows and unsent writes are
+removed, and nothing is raised for those writes, which were theirs. The
 same user signing back in keeps everything, and their unsent writes are sent.
 
 ## When the room refuses a write

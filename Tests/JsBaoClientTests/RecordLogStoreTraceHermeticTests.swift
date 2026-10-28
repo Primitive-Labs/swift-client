@@ -3,15 +3,14 @@ import XCTest
 
 /// The golden traces replayed through the record-log STORE: a `RecordLogStore`
 /// over a real `SQLiteStorageProvider` on a temp file, driven through the
-/// commands a session drives it with, projecting into `Note`'s query tables as
-/// a save does. The Swift twin of js-bao's `record-log-traces-4308.test.ts`.
+/// commands a session drives it with. The Swift twin of js-bao's
+/// `record-log-traces-4308.test.ts`.
 ///
 /// Each trace starts from a fresh database whose store is seeded so its first
 /// snapshot is the trace's `init`. After every event the store's state must
 /// equal the trace's `after`, its `record.resume` frames the trace's `calls`,
-/// a write's `{seq, e, k}` its `ret` — and the projected `Note` rows must equal
-/// the view: a present `null`, a nested object (as its JSON) and a sorted set
-/// compared as values.
+/// and a write's `{seq, e, k}` its `ret`. (Until #4700 the projected `Note`
+/// rows were compared with the view too; a db3's rows live in the view only.)
 final class RecordLogStoreTraceHermeticTests: XCTestCase {
 
     private var directories: [String] = []
@@ -22,19 +21,6 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
         super.tearDown()
     }
 
-    /// The traces' scalar fields, each a string (`a`, `b` and `c` also carry
-    /// nested objects), and their string set `t`.
-    private static let scalars = ["a", "b", "c", "u", "v"]
-    private static let schema = PrimitiveSchema(
-        name: RecordLogTraceFixture.model,
-        fields: [
-            "id": FieldDescriptor(type: .id),
-            "a": FieldDescriptor(type: .string), "b": FieldDescriptor(type: .string),
-            "c": FieldDescriptor(type: .string), "u": FieldDescriptor(type: .string),
-            "v": FieldDescriptor(type: .string), "t": FieldDescriptor(type: .stringset),
-        ]
-    )
-
     private func makeProvider() async throws -> SQLiteStorageProvider {
         let directory = NSTemporaryDirectory() + "/record-log-traces-\(UUID().uuidString)"
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
@@ -44,26 +30,18 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
         return provider
     }
 
-    func testEveryClientReplaysThroughTheStoreWithItsProjectionEqualToTheView() async throws {
+    func testEveryClientReplaysThroughTheStore() async throws {
         let provider = try await makeProvider()
-        let engine = BaoModelQueryEngine(host: provider)
-        try RecordLogQueryProjection.prepare(schema: Self.schema, engine: engine, host: provider)
-        let spec = RecordLogProjectionSpec(schema: Self.schema)
-        XCTAssertEqual(spec.columns.map(\.name), Self.scalars)
-        XCTAssertEqual(spec.stringSets.map(\.field), ["t"])
-
         let traces = try RecordLogTraceFixture.load()
         var bad = 0
-        var projectedBad = 0
         var initBad = 0
         var events = 0
         var first = ""
         var sawNull = false
         var sawObject = false
         for trace in traces {
-            let result = try replay(trace, provider: provider, spec: spec)
+            let result = try replay(trace, provider: provider)
             bad += result.bad
-            projectedBad += result.projectedBad
             initBad += result.initSame ? 0 : 1
             events += trace.events.count
             sawNull = sawNull || result.sawNull
@@ -73,14 +51,12 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
         XCTAssertGreaterThan(events, 2000)
         XCTAssertEqual(initBad, 0, "every seeded store starts at its trace's init")
         XCTAssertEqual(bad, 0, first)
-        XCTAssertEqual(projectedBad, 0, first)
         XCTAssertTrue(sawNull, "the traces write a present null")
         XCTAssertTrue(sawObject, "the traces write a nested object")
     }
 
     private struct Replay {
         var bad = 0
-        var projectedBad = 0
         var initSame = false
         var first = ""
         var sawNull = false
@@ -88,14 +64,13 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
     }
 
     private func replay(
-        _ trace: RecordLogTraceFixture.Trace, provider: SQLiteStorageProvider, spec: RecordLogProjectionSpec
+        _ trace: RecordLogTraceFixture.Trace, provider: SQLiteStorageProvider
     ) throws -> Replay {
         typealias F = RecordLogTraceFixture
         let documentId = "trace-\(trace.id)-\(UUID().uuidString)"
         let writer = trace.id
         let store = RecordLogStore(host: provider, documentId: documentId, clientId: "trace-client")
         try store.initialize()
-        let project = [spec]
         let initial = trace.initial
 
         // The trace's starting state: its writer, its rows at its cursor, its epochs and constraints.
@@ -111,10 +86,9 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
             writer: writer,
             rows: (initial["confirmed"]?.arrayValue ?? []).map { row in
                 RecordLogCatchUpRow(model: F.model, id: row["id"]?.stringValue ?? "", row: row.objectValue ?? [:])
-            },
-            project: project
+            }
         )
-        _ = try store.completeCatchUp(writer: writer, lsn: Int(initial["cursor"]?.numberValue ?? 0), full: true, project: project)
+        _ = try store.completeCatchUp(writer: writer, lsn: Int(initial["cursor"]?.numberValue ?? 0), full: true)
         try store.setState(
             writer: writer,
             notice: (current: Int(initial["open"]?.numberValue ?? 1), next: Int(initial["grant"]?.numberValue ?? 2), entries: nil),
@@ -136,41 +110,8 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
                 "handedBack": .array(handedBack.map { .number(Double($0)) }),
             ]))
         }
-        // The query tables as the view projects: a column per scalar (a nested
-        // object as its JSON), the string set's members in its junction.
-        func projected() throws -> JSONValue {
-            try provider.withConnection { connection in
-                .array(try connection.query(
-                    "SELECT * FROM \"\(spec.table)\" WHERE _meta_doc_id = ? ORDER BY id", [.text(documentId)]
-                ).map { row in
-                    var object: [String: JSONValue] = ["id": .string(row["id"].stringValue ?? "")]
-                    for field in Self.scalars { object[field] = row[field].stringValue.map { .string($0) } ?? .null }
-                    let members = try connection.query(
-                        "SELECT value FROM \"\(spec.table)__t\" WHERE parent_id = ? AND _meta_doc_id = ? ORDER BY value",
-                        [row["id"], .text(documentId)]
-                    ).compactMap { $0["value"].stringValue }
-                    object["t"] = .array(members.map { .string($0) })
-                    return .object(object)
-                })
-            }
-        }
-        func viewed() throws -> JSONValue {
-            .array(try store.readRowsAfter(model: F.model, after: nil, limit: 1_000_000).map { row in
-                var object: [String: JSONValue] = ["id": row["id"] ?? .null]
-                for field in Self.scalars {
-                    switch row[field] {
-                    case .some(.object(let value)): object[field] = .string(RecordLogJSON.text(.object(value)))
-                    case .some(.array(let value)): object[field] = .string(RecordLogJSON.text(.array(value)))
-                    case .some(.null), .none: object[field] = .null
-                    case .some(let value): object[field] = value
-                    }
-                }
-                object["t"] = .array((row["t"]?.arrayValue ?? []).compactMap(\.stringValue).sorted().map { .string($0) })
-                return .object(object)
-            })
-        }
         func refuse(_ out: JSONValue, _ seq: Int, _ calls: inout [JSONValue]) throws {
-            let reply = try store.refused(writer: writer, refusal: F.refusal(out, seq: seq), project: project)
+            let reply = try store.refused(writer: writer, refusal: F.refusal(out, seq: seq))
             handedBack.append(contentsOf: reply.handedBack.map(\.seq))
             calls.append(contentsOf: F.calls(reply.frames))
         }
@@ -193,13 +134,12 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
                     writes: [RecordLogWrite(
                         mutations: [m] + (input["also"]?.arrayValue ?? []).map { F.mutation($0) },
                         upsertOn: input["upsertOn"]?.stringValue
-                    )],
-                    project: project
+                    )]
                 )
                 let entry = reply.entries[0]
                 ret = .object(["seq": .number(Double(entry.seq)), "e": .number(Double(entry.e)), "k": .number(Double(entry.k))])
             case "receive":
-                _ = try store.receive(writer: writer, items: [F.resultItem(input)], project: project)
+                _ = try store.receive(writer: writer, items: [F.resultItem(input)])
             case "refused":
                 try refuse(input["out"] ?? .null, Int(input["seq"]?.numberValue ?? 0), &calls)
             case "settled":
@@ -215,7 +155,7 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
                 let duplicates = try store.pendingOf(writer)
                     .filter { outcomes[String($0.seq)]?["status"]?.stringValue == "accepted" }
                     .map { RecordLogResultItem.duplicate(seq: $0.seq) }
-                if !duplicates.isEmpty { _ = try store.receive(writer: writer, items: duplicates, project: project) }
+                if !duplicates.isEmpty { _ = try store.receive(writer: writer, items: duplicates) }
                 let reload = input["reload"]?.boolValue == true
                 try store.beginCatchUp(writer: writer, full: reload)
                 if reload {
@@ -223,8 +163,7 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
                         writer: writer,
                         rows: (input["rows"]?.arrayValue ?? []).map { row in
                             RecordLogCatchUpRow(model: F.model, id: row["id"]?.stringValue ?? "", row: row.objectValue ?? [:])
-                        },
-                        project: project
+                        }
                     )
                 } else {
                     var rows: [RecordLogCatchUpRow] = []
@@ -237,11 +176,11 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
                             gone.append(RecordLogRecordKey(model: F.model, id: id))
                         }
                     }
-                    _ = try store.applyCatchUpPage(writer: writer, rows: rows, gone: gone, project: project)
+                    _ = try store.applyCatchUpPage(writer: writer, rows: rows, gone: gone)
                 }
                 _ = try store.completeCatchUp(
                     writer: writer, lsn: Int(input["lsn"]?.numberValue ?? 0),
-                    high: input["high"]?.numberValue.map { Int($0) }, full: reload, project: project
+                    high: input["high"]?.numberValue.map { Int($0) }, full: reload
                 )
                 try store.setState(
                     writer: writer, notice: (current: Int(input["current"]?.numberValue ?? 0), next: nil, entries: nil),
@@ -265,14 +204,6 @@ final class RecordLogStoreTraceHermeticTests: XCTestCase {
             let got = try snapshot()
             let want = F.comparable(event.after)
             let same = got == want && JSONValue.array(calls) == event.calls && ret == event.ret
-            let projectedRows = try projected()
-            let viewRows = try viewed()
-            if projectedRows != viewRows {
-                result.projectedBad += 1
-                if result.first.isEmpty {
-                    result.first = "client \(trace.id) event \(n) (\(event.t)): query tables \(F.text(projectedRows)) != view \(F.text(viewRows))"
-                }
-            }
             if !same {
                 result.bad += 1
                 if result.first.isEmpty {

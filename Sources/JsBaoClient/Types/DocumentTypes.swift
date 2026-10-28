@@ -126,7 +126,7 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         thumbnailBlobId = try c.decodeIfPresent(String.self, forKey: .thumbnailBlobId)
         metadata = try c.decodeIfPresent(JSONValue.self, forKey: .metadata)
         documentFormat = try c.decodeIfPresent(Int.self, forKey: .documentFormat)
-        accessSource = try c.decodeIfPresent(DocumentAccessSource.self, forKey: .accessSource)
+        accessSource = DocumentAccessSource.lenient(c, forKey: .accessSource)
         linkAccess = try c.decodeIfPresent(DocumentLinkAccessLevel.self, forKey: .linkAccess)
     }
 }
@@ -532,11 +532,35 @@ public enum DocumentLinkAccessLevel: String, Codable, Sendable {
 /// document's "anyone with the link" access floor rather than an explicit
 /// grant — a link-opened document does NOT appear in `me/shared-documents`, so
 /// an app that wants a "get back to it" affordance must track it itself.
+/// `.app` means the level came from the db3's app access, which grants every
+/// member of the app (`client.db3.setAppAccess(_:level:)`); only the `db3/*`
+/// routes answer it.
+/// `.resource` means the caller is a member of the platform resource that
+/// holds the db3, such as an agent session, and reads it as a `reader`; only
+/// the `db3/*` routes answer it.
+///
+/// A document or db3 answer whose `accessSource` names a value this client
+/// does not know decodes with `accessSource == nil`, so a later value never
+/// fails the rest of the decode:
+///
+/// ```swift
+/// let info = try await client.db3.get(db3Id)
+/// if info.accessSource == .app { print("every member of the app can read this") }
+/// ```
 public enum DocumentAccessSource: String, Codable, Sendable {
     case owner
     case grant
     case group
     case link
+    case app
+    case resource
+
+    /// The `accessSource` under `key`: `nil` when it is absent, null, or a
+    /// value this client does not know, rather than a decode failure.
+    static func lenient<Key: CodingKey>(_ container: KeyedDecodingContainer<Key>, forKey key: Key) -> DocumentAccessSource? {
+        guard let raw = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil else { return nil }
+        return DocumentAccessSource(rawValue: raw)
+    }
 }
 
 /// Result of `documents.setLinkAccess` / `clearLinkAccess` / `getLinkAccess`.
@@ -577,12 +601,21 @@ public struct DocumentGroupPermissionEntry: Decodable, Sendable, Equatable {
     public let grantedBy: String
 }
 
-/// Parameters for `grantGroupPermission`.
+/// Parameters for `grantGroupPermission`: the group, by id, and the
+/// permission it gets.
 public struct GrantGroupPermissionParams: Encodable, Sendable {
-    public var groupType: String
+    /// The group's stored type; sent only by the deprecated init.
+    @available(*, deprecated, message: "Groups are addressed by groupId alone; omit it. Removed by #4718.")
+    public var groupType: String?
     public var groupId: String
     public var permission: String
 
+    public init(groupId: String, permission: String) {
+        self.groupId = groupId
+        self.permission = permission
+    }
+
+    @available(*, deprecated, message: "Groups are addressed by groupId alone: use init(groupId:permission:). Removed by #4718.")
     public init(groupType: String, groupId: String, permission: String) {
         self.groupType = groupType
         self.groupId = groupId

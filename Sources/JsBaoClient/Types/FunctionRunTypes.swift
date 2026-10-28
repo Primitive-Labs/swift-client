@@ -30,7 +30,7 @@ public struct FunctionRunError: Decodable, Sendable, Equatable {
     public let name: String?
     /// What went wrong. A failure the client publishes is one it can describe,
     /// so this is never absent. A platform refusal leads its message with its
-    /// code (`OUTPUT_SCHEMA_VIOLATION: …`).
+    /// code (`FUNCTION_OUTPUT_INVALID: …`).
     public let message: String
     /// The platform's classification, when it made one. The same value as
     /// ``FunctionRunInfo/errorCode``.
@@ -101,9 +101,9 @@ public struct FunctionRunError: Decodable, Sendable, Equatable {
 ///
 /// `workflowId`, `workflowKey`, `revisionId`, `skipReason` and the three
 /// `failedStep*` fields are DSL vocabulary the server never sets for a function
-/// row, so they are not declared and do not reach a caller. `executionMode` is
-/// left out for a different reason: the row still stores the pre-#3482
-/// spelling of it, and phase 7 is where that moves.
+/// row, so they are not declared and do not reach a caller. The retired
+/// `executionMode` is not declared either: ``runtime`` is what the server
+/// sends in its place (#3190).
 public struct FunctionRunInfo: Decodable, Sendable, Equatable {
     public let runId: String
     public let runKey: String
@@ -113,6 +113,11 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
     /// surface, which is not refused — the route is shared by design.
     public let functionId: String?
     public let functionKey: String?
+    /// How the run executed: `"request"` for a run that answered within one
+    /// request (a webhook fire), `"task"` for a started run. `nil` when the
+    /// server did not report it. A plain `String` so a value the server adds
+    /// never turns a read into a decode failure.
+    public let runtime: String?
     /// Who the run executed AS — `sys:<appId>` for a trigger-fired root.
     public let executionPrincipal: String?
     /// The function that started this one, for a nested start.
@@ -135,7 +140,7 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case runId, runKey, instanceId, contextDocId
-        case functionId, functionKey, executionPrincipal
+        case functionId, functionKey, runtime, executionPrincipal
         case parentFunctionKey, parentRunId, nestDepth
         case status, startedAt, executionStartedAt, queueDelayMs
         case createCallDurationMs, endedAt
@@ -149,6 +154,7 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
         contextDocId: String? = nil,
         functionId: String? = nil,
         functionKey: String? = nil,
+        runtime: String? = nil,
         executionPrincipal: String? = nil,
         parentFunctionKey: String? = nil,
         parentRunId: String? = nil,
@@ -170,6 +176,7 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
         self.contextDocId = contextDocId
         self.functionId = functionId
         self.functionKey = functionKey
+        self.runtime = runtime
         self.executionPrincipal = executionPrincipal
         self.parentFunctionKey = parentFunctionKey
         self.parentRunId = parentRunId
@@ -188,15 +195,16 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        // The `WorkflowRunInfo` defaults, for the same reason: a run block the
-        // client cannot fully read is still a run block, and the three fields
-        // the server always fills default rather than throwing.
+        // A run block the client cannot fully read is still a run block, and
+        // the three fields the server always fills default rather than
+        // throwing.
         runId = try c.decodeIfPresent(String.self, forKey: .runId) ?? ""
         runKey = try c.decodeIfPresent(String.self, forKey: .runKey) ?? ""
         instanceId = try c.decodeIfPresent(String.self, forKey: .instanceId)
         contextDocId = try c.decodeIfPresent(String.self, forKey: .contextDocId)
         functionId = try c.decodeIfPresent(String.self, forKey: .functionId)
         functionKey = try c.decodeIfPresent(String.self, forKey: .functionKey)
+        runtime = try c.decodeIfPresent(String.self, forKey: .runtime)
         executionPrincipal = try c.decodeIfPresent(String.self, forKey: .executionPrincipal)
         parentFunctionKey = try c.decodeIfPresent(String.self, forKey: .parentFunctionKey)
         parentRunId = try c.decodeIfPresent(String.self, forKey: .parentRunId)
@@ -216,10 +224,8 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
 
 /// The raw shape every `status.error` arrives in, parsed once.
 ///
-/// OWNED BY THIS SURFACE, for the same reason ``FunctionRunSlice`` is: the
-/// workflow surface is being retired and this parser has to outlive it.
-/// ``WorkflowRunError`` reads through this until then, so deleting that type
-/// deletes a wrapper rather than the one parser for the field.
+/// OWNED BY THIS SURFACE, as ``FunctionRunSlice`` is: the workflow surface it
+/// once shared the field with retired with the DSL engine.
 ///
 /// NEVER throws and never fails the read around it — the #3449 rule. A value
 /// of another JSON kind, and an object whose `message` is not a string, are
@@ -265,11 +271,9 @@ struct RunErrorEnvelope {
 /// status `slice` field for field.
 ///
 /// OWNED BY THIS SURFACE. Only a function run has a slice record, so the block
-/// takes a function name and the retiring workflow surface reads it through
-/// `typealias WorkflowSliceInfo = FunctionRunSlice`. The custom `init(from:)`
-/// below is the reason this is a move and not a copy: its throw semantics —
-/// a non-numeric count drops the whole block rather than fabricating a `0` —
-/// are pinned by tests, and two copies of them would drift.
+/// takes a function name. The custom `init(from:)` below carries the throw
+/// semantics — a non-numeric count drops the whole block rather than
+/// fabricating a `0` — that tests pin.
 ///
 /// A task run executes as a series of SLICES: the engine runs the handler until
 /// it returns or hibernates, and each wake is a new slice with its own
@@ -509,18 +513,20 @@ public struct FunctionRunStatus: Decodable, Sendable, Equatable {
         slice = try? c.decodeIfPresent(FunctionRunSlice.self, forKey: .slice)
     }
 
-    /// The three statuses a function run can have SETTLED on.
+    /// The four statuses a function run can have SETTLED on. `denied` is a
+    /// webhook or cron fire the function's `authorize` refused before its
+    /// handler ran.
     ///
     /// `missing` is NOT one: that run's execution can no longer be resolved,
     /// which is a not-found rather than an ending. Neither are the DSL-only
     /// states, which a function run never enters.
     public static let terminalStatuses: Set<String> = [
-        "completed", "failed", "terminated",
+        "completed", "failed", "terminated", "denied",
     ]
 
     /// Every status a function run can report.
     public static let statusValues: Set<String> = [
-        "queued", "running", "completed", "failed", "terminated", "missing",
+        "queued", "running", "completed", "failed", "terminated", "missing", "denied",
     ]
 
     /// Has this run settled?
@@ -728,13 +734,9 @@ private struct Lossy<Value: Decodable>: Decodable {
 
 /// How long `functions.waitFor` may wait.
 ///
-/// Structurally what `WaitForWorkflowOptions` carries, and nominally its own:
-/// a function caller names a function type. The rename is declared in
-/// `swift-client/CHANGELOG.md`, which is the whole mitigation for a break on a
-/// client with no versions (its own words).
 public struct FunctionWaitOptions: Sendable {
     /// Maximum time to wait for the run to settle before throwing
-    /// `.workflowWaitTimeout`. Defaults to 15 minutes; `0` or a negative value
+    /// `.functionWaitTimeout`. Defaults to 15 minutes; `0` or a negative value
     /// waits indefinitely.
     public var timeout: TimeInterval?
 
@@ -747,7 +749,7 @@ public struct FunctionWaitOptions: Sendable {
 
 /// What a terminate 404 actually said.
 ///
-/// `POST /workflows/{key}/instances/{runKey}/terminate` answers
+/// `POST /functions/{key}/instances/{runKey}/terminate` answers
 /// `404 { status: "missing", error }` for THREE different things: a row that
 /// does not exist, a row with no instance id, and ANY exception out of
 /// `instance.terminate()` with the engine's own message as `error`. Folding
@@ -800,7 +802,7 @@ public enum FunctionTerminateClassifier {
 
 /// What a run-status 404 actually said.
 ///
-/// `GET /workflows/runs/{runId}/status` answers 404 for two unrelated facts,
+/// `GET /functions/runs/{runId}/status` answers 404 for two unrelated facts,
 /// and folding them together is what made `functions.waitFor` report a live
 /// run missing:
 ///

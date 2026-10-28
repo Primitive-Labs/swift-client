@@ -352,39 +352,28 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(replayed.output?["doubled"]?.numberValue, 42)
     }
 
-    // MARK: - Behavior 7: the envelope-shape backstop (#3482 retarget)
+    // MARK: - Behavior 7: no envelope backstop (#3190, M23)
     //
-    // These refused the wrong verb on a LOCKED version. There are no locks —
-    // the route says which runtime a call means and every function takes both
-    // — so what they pin now is the backstop against a server that PREDATES
-    // the routes, where one route's body field decided what it answered
-    // (D3482-008). A current server cannot produce either shape.
+    // These pinned the backstop against a server that predated the routes.
+    // The route is the runtime selector and the server refuses a body that
+    // names one, so `.functionModeMismatch` is gone: `invoke` hands back what
+    // the invoke route answered, and a start answer with no run identity is a
+    // decode failure rather than an invented run id.
 
-    func testInvokeOnAStartEnvelopeThrowsFunctionModeMismatchWithTheRunId() async throws {
+    func testInvokeOnAStartEnvelopeHandsBackTheAnswer() async throws {
         let (api, _) = makeApi(json: Self.startEnvelope)
-        do {
-            _ = try await api.invoke("order-sync", input: Self.noInput) as Dynamic
-            XCTFail("a start envelope must be refused by invoke")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertEqual(error.details?["functionKey"]?.stringValue, "order-sync")
-            XCTAssertEqual(error.details?["runId"]?.stringValue, "run-1")
-            XCTAssertTrue(error.message.contains("is a task function"), error.message)
-            XCTAssertTrue(error.message.contains("functions.start"), error.message)
-        }
+        let result = try await api.invoke("order-sync", input: Self.noInput) as Dynamic
+        XCTAssertNil(result.output)
     }
 
-    func testStartOnAResultEnvelopeThrowsFunctionModeMismatchWithTheStatus() async throws {
+    func testStartOnAResultEnvelopeIsADecodeFailure() async throws {
         let (api, _) = makeApi(json: Self.completedEnvelope)
         do {
             _ = try await api.start("greet", input: Self.noInput)
-            XCTFail("a result envelope must be refused by start")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertEqual(error.details?["functionKey"]?.stringValue, "greet")
-            XCTAssertEqual(error.details?["status"]?.stringValue, "completed")
-            XCTAssertTrue(error.message.contains("is a request function"), error.message)
-            XCTAssertTrue(error.message.contains("functions.invoke"), error.message)
+            XCTFail("a start answer with no run id must throw")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.serverCode, HttpError.decodingFailedCode)
+            XCTAssertTrue(error.message.contains("/functions/greet/start"), error.message)
         }
     }
 
@@ -398,7 +387,7 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         let status = try await api.getStatus(runId: "run/1")
         let call = try XCTUnwrap(transport.lastCall)
         XCTAssertEqual(call.method, .get)
-        XCTAssertEqual(call.path, "/workflows/runs/run%2F1/status")
+        XCTAssertEqual(call.path, "/functions/runs/run%2F1/status")
         XCTAssertEqual(status.status, "completed")
         XCTAssertEqual(status.output?["doubled"]?.numberValue, 42)
         XCTAssertEqual(status.run?.runKey, "rk-1")
@@ -431,13 +420,13 @@ final class FunctionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(call.method, .post)
         XCTAssertEqual(
             call.path,
-            "/workflows/order-sync/instances/rk%201/terminate?contextDocId=doc%2F1"
+            "/functions/order-sync/instances/rk%201/terminate?contextDocId=doc%2F1"
         )
         XCTAssertEqual(result.status, "terminated")
 
         // Without a contextDocId the query is omitted, as workflows.terminate does.
         _ = try await api.terminate(FunctionRunRef(functionKey: "order-sync", runKey: "rk-2"))
-        XCTAssertEqual(transport.lastCall?.path, "/workflows/order-sync/instances/rk-2/terminate")
+        XCTAssertEqual(transport.lastCall?.path, "/functions/order-sync/instances/rk-2/terminate")
 
         let typed: FunctionRunResult<[String: Int]> = try await api.terminate(
             FunctionRunRef(functionKey: "order-sync", runKey: "rk-2")

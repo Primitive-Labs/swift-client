@@ -74,9 +74,7 @@ final class RecordLogPrincipalLiveTests: XCTestCase {
     private func documentWithAnUnsentWriteOfA(_ client: JsBaoClient) async throws -> (String, String) {
         let created = try await client.createDocument(options: CreateDocumentOptions(title: "shared", documentFormat: 3))
         let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
-        try await eventually(timeout: 20, description: "the create to commit") {
-            client.documentManager.getLocalMetadata(documentId)?.pendingCreate != true
-        }
+        try await waitForCreateCommit(client, documentId)
         try await ctx.grantPermission(
             appId: testApp.appId, documentId: documentId, userId: userB.userId, permission: "read-write", jwt: testApp.ownerJWT
         )

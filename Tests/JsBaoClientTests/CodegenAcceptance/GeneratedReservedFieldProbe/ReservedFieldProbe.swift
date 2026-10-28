@@ -39,6 +39,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
             "hasOwnProperty":                   FieldDescriptor(type: .string),
             "hasUnsavedChanges":                FieldDescriptor(type: .string),
             "hash":                             FieldDescriptor(type: .string),
+            "increment":                        FieldDescriptor(type: .string),
             "isDirty":                          FieldDescriptor(type: .string),
             "isPrototypeOf":                    FieldDescriptor(type: .string),
             "markStringSetChange":              FieldDescriptor(type: .string),
@@ -155,6 +156,9 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
     }
     internal var hash: String? {
         didSet { _changedFields.insert("hash") }
+    }
+    internal var increment: String? {
+        didSet { _changedFields.insert("increment") }
     }
     internal var isDirty: String? {
         didSet { _changedFields.insert("isDirty") }
@@ -308,6 +312,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         hasOwnProperty: String? = nil,
         hasUnsavedChanges: String? = nil,
         hash: String? = nil,
+        increment: String? = nil,
         isDirty: String? = nil,
         isPrototypeOf: String? = nil,
         markStringSetChange: String? = nil,
@@ -363,6 +368,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.hasOwnProperty = hasOwnProperty
         self.hasUnsavedChanges = hasUnsavedChanges
         self.hash = hash
+        self.increment = increment
         self.isDirty = isDirty
         self.isPrototypeOf = isPrototypeOf
         self.markStringSetChange = markStringSetChange
@@ -426,6 +432,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         hasOwnProperty: String? = nil,
         hasUnsavedChanges: String? = nil,
         hash: String? = nil,
+        increment: String? = nil,
         isDirty: String? = nil,
         isPrototypeOf: String? = nil,
         markStringSetChange: String? = nil,
@@ -481,6 +488,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.hasOwnProperty = hasOwnProperty
         self.hasUnsavedChanges = hasUnsavedChanges
         self.hash = hash
+        self.increment = increment
         self.isDirty = isDirty
         self.isPrototypeOf = isPrototypeOf
         self.markStringSetChange = markStringSetChange
@@ -541,6 +549,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.hasOwnProperty = record["hasOwnProperty"]?.asString
         self.hasUnsavedChanges = record["hasUnsavedChanges"]?.asString
         self.hash = record["hash"]?.asString
+        self.increment = record["increment"]?.asString
         self.isDirty = record["isDirty"]?.asString
         self.isPrototypeOf = record["isPrototypeOf"]?.asString
         self.markStringSetChange = record["markStringSetChange"]?.asString
@@ -603,6 +612,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.hasOwnProperty = row["hasOwnProperty"]?.stringValue
         self.hasUnsavedChanges = row["hasUnsavedChanges"]?.stringValue
         self.hash = row["hash"]?.stringValue
+        self.increment = row["increment"]?.stringValue
         self.isDirty = row["isDirty"]?.stringValue
         self.isPrototypeOf = row["isPrototypeOf"]?.stringValue
         self.markStringSetChange = row["markStringSetChange"]?.stringValue
@@ -662,6 +672,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         if let hasOwnProperty { values["hasOwnProperty"] = .string(hasOwnProperty) }
         if let hasUnsavedChanges { values["hasUnsavedChanges"] = .string(hasUnsavedChanges) }
         if let hash { values["hash"] = .string(hash) }
+        if let increment { values["increment"] = .string(increment) }
         if let isDirty { values["isDirty"] = .string(isDirty) }
         if let isPrototypeOf { values["isPrototypeOf"] = .string(isPrototypeOf) }
         if let markStringSetChange { values["markStringSetChange"] = .string(markStringSetChange) }
@@ -724,6 +735,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.hasOwnProperty = try container.decodeIfPresent(String.self, forKey: .hasOwnProperty)
         self.hasUnsavedChanges = try container.decodeIfPresent(String.self, forKey: .hasUnsavedChanges)
         self.hash = try container.decodeIfPresent(String.self, forKey: .hash)
+        self.increment = try container.decodeIfPresent(String.self, forKey: .increment)
         self.isDirty = try container.decodeIfPresent(String.self, forKey: .isDirty)
         self.isPrototypeOf = try container.decodeIfPresent(String.self, forKey: .isPrototypeOf)
         self.markStringSetChange = try container.decodeIfPresent(String.self, forKey: .markStringSetChange)
@@ -753,7 +765,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
     }
 
     internal enum CodingKeys: String, CodingKey {
-        case id, aggregate, applyAutoStampsForSave, applyStringSetChangeToYMap, autoStampFields, clearLocalChanges, constructor, count, delete, deleteRecordLog, encode, ensureLocalChanges, find, findAll, findByUnique, getChangedFields, getCurrentJSState, getCurrentValue, getDocumentId, getFromYjs, getOrCreateStringSet, getOriginalValue, getStringSetCurrentValues, getStringSetFromYjs, getValue, hasFieldChanged, hasLocalChange, hasOwnProperty, hasUnsavedChanges, hash, isDirty, isPrototypeOf, markStringSetChange, modelName, normalizeNonStringSetValue, primitiveSchema, propertyIsEnumerable, query, queryOne, queryPaged, resolveUnresolvedFormat2Document, save, saveRecordLog, schemaDefaultFor, setValue, subscribe, syncState, toJSON, toLocaleString, toString, upsertByUnique, validateBeforeSave, validateFieldValue, valueOf
+        case id, aggregate, applyAutoStampsForSave, applyStringSetChangeToYMap, autoStampFields, clearLocalChanges, constructor, count, delete, deleteRecordLog, encode, ensureLocalChanges, find, findAll, findByUnique, getChangedFields, getCurrentJSState, getCurrentValue, getDocumentId, getFromYjs, getOrCreateStringSet, getOriginalValue, getStringSetCurrentValues, getStringSetFromYjs, getValue, hasFieldChanged, hasLocalChange, hasOwnProperty, hasUnsavedChanges, hash, increment, isDirty, isPrototypeOf, markStringSetChange, modelName, normalizeNonStringSetValue, primitiveSchema, propertyIsEnumerable, query, queryOne, queryPaged, resolveUnresolvedFormat2Document, save, saveRecordLog, schemaDefaultFor, setValue, subscribe, syncState, toJSON, toLocaleString, toString, upsertByUnique, validateBeforeSave, validateFieldValue, valueOf
     }
 
     internal static func == (lhs: ReservedFieldProbe, rhs: ReservedFieldProbe) -> Bool {
@@ -787,6 +799,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         lhs.hasOwnProperty == rhs.hasOwnProperty &&
         lhs.hasUnsavedChanges == rhs.hasUnsavedChanges &&
         lhs.hash == rhs.hash &&
+        lhs.increment == rhs.increment &&
         lhs.isDirty == rhs.isDirty &&
         lhs.isPrototypeOf == rhs.isPrototypeOf &&
         lhs.markStringSetChange == rhs.markStringSetChange &&
@@ -844,6 +857,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         hasher.combine(hasOwnProperty)
         hasher.combine(hasUnsavedChanges)
         hasher.combine(hash)
+        hasher.combine(increment)
         hasher.combine(isDirty)
         hasher.combine(isPrototypeOf)
         hasher.combine(markStringSetChange)
@@ -1114,5 +1128,62 @@ internal extension ReservedFieldProbe {
     /// Delete this record from document `documentId`. Throws if the doc isn't open.
     func delete(in documentId: String) throws {
         try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)
+    }
+
+    /// `save(in:)` with a db3 write's guards. On a db3 the room judges
+    /// them: `options.condition` (the record must match it, in the
+    /// query filter grammar) and `options.ifNotExists` (the save lands
+    /// only as a create, while no live record has this id). A guarded
+    /// save shows on this device only once the room accepts it. With
+    /// `options.confirm` the call returns once the room accepted the
+    /// save and throws its refusal: `.db3ConditionNotMet`, with the
+    /// record as it is now under `details["current"]`. While the db3
+    /// is not subscribed, a confirmed save waits for the next subscribe.
+    ///
+    /// Returns the record as this device then shows it, with no pending
+    /// changes left: with `confirm`, as saved; without it, a guarded
+    /// save's values are not shown yet. On a document that is not a db3
+    /// the options are ignored and it saves as `save(in:)` does.
+    @discardableResult
+    func save(in documentId: String, options: JsBaoClient.Db3WriteOptions) async throws -> ReservedFieldProbe {
+        let record = try await JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields, options: options)
+        guard var saved = ReservedFieldProbe(record: record) else {
+            var fallback = self
+            fallback.discardChanges()
+            return fallback
+        }
+        // Carried over, not persisted: query-time includes and the
+        // caller-pinned-id flag have no representation in the stored
+        // record, and this path never changes the record's id.
+        saved.related = related
+        saved._explicitId = _explicitId
+        return saved
+    }
+
+    /// Delete this record from db3 `documentId` only if it matches
+    /// `options.condition`, which the room judges. With
+    /// `options.confirm` the call returns once the room accepted the
+    /// delete and throws its refusal (`.db3ConditionNotMet`); while the
+    /// db3 is not subscribed, it waits for the next subscribe. With
+    /// neither, and on a document that is not a db3, it deletes as
+    /// `delete(in:)` does.
+    func delete(in documentId: String, options: JsBaoClient.Db3WriteOptions) async throws {
+        try await JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId, options: options)
+    }
+
+    /// Add each of `fields` to record `id`'s number fields in db3
+    /// `documentId`: a negative delta subtracts, and a missing field
+    /// starts at 0. Increments made offline or on several devices at
+    /// once all count. Answers each field's new value as this device
+    /// shows it; with `options.confirm` or an `options.condition`, the
+    /// room's values once it applied the increment, throwing its
+    /// refusal (`.db3ConditionNotMet`, or `.db3RecordNotFound` for a
+    /// record deleted meanwhile). A record this device does not hold
+    /// throws `.db3RecordNotFound` and nothing is sent; a document that
+    /// is not a db3 throws `.invalidArgument`. Mirrors the JS client's
+    /// `Model.increment(id, fields, options)`.
+    @discardableResult
+    static func increment(id: String, fields: [String: Double], in documentId: String, options: JsBaoClient.Db3WriteOptions = JsBaoClient.Db3WriteOptions()) async throws -> [String: Double] {
+        try await JsBaoClient.requireDefault().codegen.increment(primitiveSchema, id: id, fields: fields, in: documentId, options: options)
     }
 }

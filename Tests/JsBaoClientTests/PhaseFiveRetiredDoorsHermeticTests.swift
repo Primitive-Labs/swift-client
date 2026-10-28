@@ -28,10 +28,20 @@ final class PhaseFiveRetiredDoorsHermeticTests: XCTestCase {
         })
     }
 
-    func testWorkflowsApiCarriesNoRunSync() throws {
-        let source = try ClientSourceText.code("API/WorkflowsAPI.swift")
-        XCTAssertFalse(try declaredFunctions(source).contains("runSync"))
-        XCTAssertFalse(source.contains("/run-sync"), "no request reaches the retired route")
+    func testNoSourceReachesTheRunSyncRoute() throws {
+        // #3190 — `WorkflowsAPI` itself retired with the DSL engine, so no
+        // client file can declare `runSync`; what is pinned is that nothing
+        // left reaches the retired route.
+        let api = ClientSourceText.packageRoot.appendingPathComponent("Sources/JsBaoClient/API")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: api.appendingPathComponent("WorkflowsAPI.swift").path),
+            "WorkflowsAPI.swift retired with client.workflows (#3190)"
+        )
+        let sources = try ClientSourceText.allClientSources().map(ClientSourceText.stripComments)
+        XCTAssertFalse(sources.contains { $0.contains("/run-sync") }, "no request reaches the retired route")
+        for source in sources {
+            XCTAssertFalse(try declaredFunctions(source).contains("runSync"))
+        }
     }
 
     func testTheClientCarriesNoPromptsOrIntegrationsFacade() throws {

@@ -222,7 +222,7 @@ final class AgentSessionViewHermeticTests: XCTestCase {
             XCTAssertEqual(h.client.sharedModel(schema.name)?.schema, schema, "\(schema.name) is registered")
         }
         XCTAssertEqual(view.sessionId, "s1")
-        XCTAssertEqual(view.documentId, documentId)
+        XCTAssertEqual(view.storageDocumentId, documentId)
         XCTAssertEqual(view.info.role, .owner)
         XCTAssertTrue(view.messages.isEmpty)
 

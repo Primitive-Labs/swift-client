@@ -497,11 +497,16 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
             "wall-clock budget is not meaningful under ThreadSanitizer (~4× overhead)"
         )
         let queue = AnalyticsQueue(logger: Logger(level: .none, scope: "d3-perf"))
-        let start = DispatchTime.now().uptimeNanoseconds
+        // CPU time of this thread, not wall time: the loop runs on one thread
+        // and never blocks, so its CPU time is the work `prepared()` does. Wall
+        // time also counts the time the scheduler gives other processes, and on
+        // a fleet worker running other suites (load average 60) that alone
+        // pushed a ~10 ms loop past the budget.
+        let start = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
         for i in 0..<10_000 {
             _ = queue.prepared(["action": "bench", "feature": "perf", "i": i])
         }
-        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        let elapsedMs = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - start) / 1_000_000
         XCTAssertLessThan(
             elapsedMs, 50,
             "10,000 untyped analytics events took \(elapsedMs) ms — the conversion regressed the hot path"

@@ -6,6 +6,9 @@ import XCTest
 ///
 /// The live half — the server stamps the categories and an invalid entry fails
 /// the whole create — is in `InitialMetadataCreateTests`.
+///
+/// `CreateGroupParams` is deprecated with `groups.create` (a session cannot
+/// create a group, #4737), so these pins are deprecated test methods.
 final class GroupsCreateInitialMetadataHermeticTests: XCTestCase {
     private func encodedObject<T: Encodable>(_ params: T) throws -> [String: Any] {
         let data = try JSONEncoder().encode(params)
@@ -15,6 +18,7 @@ final class GroupsCreateInitialMetadataHermeticTests: XCTestCase {
 
     /// The initializer accepts `initialMetadata` and encodes it under the
     /// `initialMetadata` wire key as category → values.
+    @available(*, deprecated)
     func testGroupParamsEncodeInitialMetadata() throws {
         let dict = try encodedObject(
             CreateGroupParams(
@@ -31,12 +35,23 @@ final class GroupsCreateInitialMetadataHermeticTests: XCTestCase {
     }
 
     /// Omitting it leaves the key off the wire, so existing creates are
-    /// unchanged.
+    /// unchanged. No `groupId` goes on the wire either: the server mints it
+    /// (#4917).
+    @available(*, deprecated)
     func testGroupParamsOmitInitialMetadataWhenUnset() throws {
         let dict = try encodedObject(
-            CreateGroupParams(groupType: "team", groupId: "eng", name: "Engineering")
+            CreateGroupParams(groupType: "team", name: "Engineering")
         )
         XCTAssertNil(dict["initialMetadata"])
-        XCTAssertEqual(dict["groupId"] as? String, "eng")
+        XCTAssertNil(dict["groupId"])
+    }
+
+    /// The params carry no `groupId` at all, so a caller cannot name the new
+    /// group's id: the server mints it and answers it on `GroupInfo` (#4917).
+    @available(*, deprecated)
+    func testGroupParamsDeclareNoGroupId() {
+        let labels = Mirror(reflecting: CreateGroupParams(groupType: "team", name: "Engineering"))
+            .children.compactMap(\.label)
+        XCTAssertEqual(labels.sorted(), ["description", "groupType", "initialMetadata", "name"])
     }
 }

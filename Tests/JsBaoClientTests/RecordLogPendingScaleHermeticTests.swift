@@ -21,14 +21,6 @@ final class RecordLogPendingScaleHermeticTests: XCTestCase {
         super.tearDown()
     }
 
-    private static let schema = PrimitiveSchema(
-        name: "Note",
-        fields: [
-            "id": FieldDescriptor(type: .id),
-            "title": FieldDescriptor(type: .string),
-            "n": FieldDescriptor(type: .number),
-        ]
-    )
 
     private static let rows = 10_000
     private static let batch = 500
@@ -47,11 +39,8 @@ final class RecordLogPendingScaleHermeticTests: XCTestCase {
     private func makeStore(_ provider: SQLiteStorageProvider) throws -> (RecordLogStore, String) {
         let store = RecordLogStore(host: provider, documentId: "doc-4471", clientId: "client-1")
         try store.initialize()
-        try RecordLogQueryProjection.prepare(schema: Self.schema, engine: BaoModelQueryEngine(host: provider), host: provider)
         return (store, try store.mintWriter())
     }
-
-    private var spec: RecordLogProjectionSpec { RecordLogProjectionSpec(schema: Self.schema) }
 
     private func id(_ i: Int) -> String { "n" + String(format: "%05d", i) }
     private func fields(_ i: Int) -> [String: JSONValue] { ["title": .string("t\(i)"), "n": .number(Double(i))] }
@@ -70,7 +59,7 @@ final class RecordLogPendingScaleHermeticTests: XCTestCase {
         try elapsedMs {
             for at in stride(from: 1, through: Self.rows, by: Self.batch) {
                 let writes = (at..<(at + Self.batch)).map { RecordLogWrite(mutations: [create($0)]) }
-                _ = try store.commitEntries(writer: writer, writes: writes, project: [spec])
+                _ = try store.commitEntries(writer: writer, writes: writes)
             }
             try store.flush()
         }
@@ -99,7 +88,7 @@ final class RecordLogPendingScaleHermeticTests: XCTestCase {
                     l: seq, e: 1, changes: [RecordLogChange(model: "Note", id: id(seq), row: row)], w: writer, seq: seq
                 ))
             }
-            let took = try elapsedMs { _ = try store.receive(writer: writer, items: items, project: [spec]) }
+            let took = try elapsedMs { _ = try store.receive(writer: writer, items: items) }
             perFrame.append(took)
             total += took
             // Past the bound already: the rest of the frames cannot bring it back.

@@ -67,8 +67,11 @@ final class RecordLogEventShapeHermeticTests: XCTestCase {
             .filter { $0.hasPrefix("case ") }
             .compactMap { $0.dropFirst("case ".count).split(separator: " ").first.map(String.init) }
         XCTAssertGreaterThan(cases.count, 40)
+        // Codes appended after them later are allowed; these nine stay
+        // together, in this order.
+        let first = try XCTUnwrap(cases.firstIndex(of: "documentFormatUnsupported"))
         XCTAssertEqual(
-            Array(cases.suffix(9)),
+            Array(cases[first..<min(first + 9, cases.count)]),
             ["documentFormatUnsupported", "documentConstraintViolated", "documentEpochFrozen", "documentStorePurged",
              "documentEpochBudget", "documentEntryTooLarge", "documentEntryInvalid", "documentEpochNotOpen", "writeAccessDenied"]
         )

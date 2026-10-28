@@ -2,13 +2,13 @@ import Foundation
 import XCTest
 @testable import JsBaoClient
 
-/// Wire-shape tests for the declared-access manifest on the two type-config
-/// surfaces (#2926).
+/// Wire-shape tests for the declared-access manifest on the database
+/// type-config surface (#2926). The collection type-config surface was
+/// removed with its routes (#4731 on the server, #4737 in Swift).
 ///
 /// The JS client carries `metadataManifest: DeclaredMetadataManifest | null`
-/// on both the collection and database type-config get/create/update surfaces
-/// (`src/client/api/collectionTypeConfigsApi.ts`,
-/// `src/client/api/databaseTypeConfigsApi.ts`); these pin the Swift side to
+/// on the database type-config get/create/update surface
+/// (`src/client/api/databaseTypeConfigsApi.ts`); these pin the Swift side to
 /// the same wire shape without a server.
 final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
 
@@ -144,23 +144,6 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
         XCTAssertEqual(Set(object.keys), ["self"])
     }
 
-    // MARK: - CollectionTypeConfigsAPI
-
-    /// A collection type config row carrying the manifest, as the server
-    /// returns it.
-    static func collectionConfigJSON(manifest: String?) -> String {
-        """
-        {
-          "appId": "app1", "collectionType": "class-students",
-          "ruleSetId": "rs1",
-          "metadataManifest": \(manifest ?? "null"),
-          "createdAt": "2024-01-01T00:00:00Z",
-          "modifiedAt": "2024-01-01T00:00:00Z",
-          "createdBy": "u1"
-        }
-        """
-    }
-
     /// The request body as a JSON object, for wire-shape assertions.
     func bodyObject(_ transport: RecordingTransport) throws -> [String: JSONValue] {
         let json = try XCTUnwrap(transport.lastCall?.jsonBody, "Expected a request body")
@@ -169,99 +152,6 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
             return [:]
         }
         return object
-    }
-
-    func test_collectionTypeConfig_getDecodesManifest() async throws {
-        let transport = RecordingTransport(
-            json: Self.collectionConfigJSON(manifest: Self.manifestJSON)
-        )
-        let config = try await CollectionTypeConfigsAPI(transport: transport)
-            .get(collectionType: "class-students")
-
-        let manifest = try XCTUnwrap(config.metadataManifest)
-        XCTAssertEqual(manifest.selfCategories?.categories, ["billing", "membership", "profile"])
-        XCTAssertEqual(manifest.paths?.count, 2)
-        XCTAssertEqual(manifest.secrets, ["STRIPE_KEY"])
-        XCTAssertEqual(manifest.vars, ["TIER"])
-    }
-
-    /// `metadataManifest: null` is the "none set" case, not a decode failure.
-    func test_collectionTypeConfig_getDecodesNullManifestAsNil() async throws {
-        let transport = RecordingTransport(json: Self.collectionConfigJSON(manifest: nil))
-        let config = try await CollectionTypeConfigsAPI(transport: transport)
-            .get(collectionType: "class-students")
-        XCTAssertNil(config.metadataManifest)
-    }
-
-    func test_collectionTypeConfig_createSendsManifest() async throws {
-        let transport = RecordingTransport(
-            json: Self.collectionConfigJSON(manifest: Self.manifestJSON)
-        )
-        _ = try await CollectionTypeConfigsAPI(transport: transport).create(
-            params: CreateCollectionTypeConfigParams(
-                collectionType: "class-students",
-                ruleSetId: "rs1",
-                metadataManifest: DeclaredMetadataManifest(
-                    selfCategories: .init(categories: ["billing"]),
-                    paths: ["actor": .rootFrom(
-                        rootFrom: "user.userId", type: "user", categories: ["tier"]
-                    )]
-                )
-            )
-        )
-
-        let body = try bodyObject(transport)
-        XCTAssertEqual(
-            body["metadataManifest"],
-            try Self.json("""
-            {"self":{"categories":["billing"]},
-             "paths":{"actor":{"rootFrom":"user.userId","type":"user","categories":["tier"]}}}
-            """)
-        )
-    }
-
-    /// Create omits the key entirely when no manifest is passed — parity with
-    /// JS's optional `metadataManifest?`.
-    func test_collectionTypeConfig_createOmitsUnsetManifest() async throws {
-        let transport = RecordingTransport(json: Self.collectionConfigJSON(manifest: nil))
-        _ = try await CollectionTypeConfigsAPI(transport: transport).create(
-            params: CreateCollectionTypeConfigParams(collectionType: "class-students")
-        )
-        XCTAssertNil(try bodyObject(transport)["metadataManifest"])
-    }
-
-    func test_collectionTypeConfig_updateSetsClearsAndOmitsManifest() async throws {
-        let api = { CollectionTypeConfigsAPI(transport: $0) }
-
-        let setting = RecordingTransport(
-            json: Self.collectionConfigJSON(manifest: Self.manifestJSON)
-        )
-        _ = try await api(setting).update(
-            collectionType: "class-students",
-            params: UpdateCollectionTypeConfigParams(
-                metadataManifest: .value(
-                    DeclaredMetadataManifest(secrets: ["STRIPE_KEY"])
-                )
-            )
-        )
-        XCTAssertEqual(
-            try bodyObject(setting)["metadataManifest"],
-            try Self.json(#"{"secrets":["STRIPE_KEY"]}"#)
-        )
-
-        let clearing = RecordingTransport(json: Self.collectionConfigJSON(manifest: nil))
-        _ = try await api(clearing).update(
-            collectionType: "class-students",
-            params: UpdateCollectionTypeConfigParams(metadataManifest: .clear)
-        )
-        XCTAssertEqual(try bodyObject(clearing)["metadataManifest"], .null)
-
-        let omitting = RecordingTransport(json: Self.collectionConfigJSON(manifest: nil))
-        _ = try await api(omitting).update(
-            collectionType: "class-students",
-            params: UpdateCollectionTypeConfigParams(ruleSetId: .value("rs2"))
-        )
-        XCTAssertNil(try bodyObject(omitting)["metadataManifest"])
     }
 
     // MARK: - DatabaseTypeConfigsAPI

@@ -38,7 +38,7 @@ final class RecordLogDeveloperAdditionsHermeticTests: XCTestCase {
         let provider = SQLiteStorageProvider(path: directory + "/store.sqlite")
         try await provider.initialize(namespace: "test")
         let binding = try RecordLogDocumentBinding(
-            host: provider, documentId: "doc-1", clientId: "client-1", engine: BaoModelQueryEngine(host: provider)
+            host: provider, documentId: "doc-1", clientId: "client-1"
         )
         let doc = YDocument()
         let notes = MultiDocModel(schema: Self.note).connect(docId: "doc-1", doc: doc)

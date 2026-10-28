@@ -63,7 +63,7 @@ final class RecordLogStreamHermeticTests: XCTestCase {
         try await provider.initialize(namespace: "test")
         let binding = try RecordLogDocumentBinding(
             host: provider, documentId: "doc-1", clientId: "client-1",
-            engine: BaoModelQueryEngine(host: provider), logger: Logger(level: .none)
+            logger: Logger(level: .none)
         )
         try binding.registerModel(Self.schema)
         let connection = StreamConnection()

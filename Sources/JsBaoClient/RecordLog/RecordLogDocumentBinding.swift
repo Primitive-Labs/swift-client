@@ -1,7 +1,34 @@
 import Foundation
 
+/// Where a change to a db3's view rows came from: this client's commit
+/// (`local`), or what the room sent (`remote`).
+enum RecordLogChangeOrigin: String, Sendable, Equatable {
+    case local
+    case remote
+}
+
+/// The permissions a store's `permission` mark holds besides the room's own
+/// names: `read` (the room said this client may only read), `refused` (the
+/// room refused the document for access; js-bao's `"refused"`).
+enum RecordLogPermission {
+    static let read = "read"
+    static let refused = "refused"
+}
+
+/// One change to a db3's view rows, as a binding's change listeners hear it.
+struct RecordLogChangeNotice: Sendable, Equatable {
+    var origin: RecordLogChangeOrigin
+    /// Every record whose view row changed.
+    var records: [RecordLogRecordKey]
+    /// Of `records`, those the command that changed them answered a row for
+    /// (`row: nil` once the record shows none).
+    var changes: [RecordLogRowChange] = []
+    /// Models whose rows changed in bulk (a chunk): a listener re-reads them.
+    var models: [String] = []
+}
+
 /// One open format-3 document: its store, this client's writer, the models
-/// projected from its view, and what the app is waiting on — the entries the
+/// bound to it, and what the app is waiting on — the entries the
 /// room has not acknowledged, the saves that wait for it, and the writes it
 /// handed back. A port of the parts of js-bao's `facade.ts` and `binding.ts`
 /// the Swift client needs.
@@ -25,9 +52,6 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     let documentId: String
     let store: RecordLogStore
-    /// The engine every format-3 document's filtered reads run on.
-    let engine: BaoModelQueryEngine
-    private let host: any Format2SqlHost
     private let logger: Logger?
 
     private let operation = NSRecursiveLock()
@@ -36,8 +60,6 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     private var _writer: String
     private var _marks: RecordLogMarks
     private var schemas: [String: PrimitiveSchema] = [:]
-    private var specs: [String: RecordLogProjectionSpec] = [:]
-    private var projected: Set<String> = []
     /// This writer's entries the room has not acknowledged, with the records each touches.
     private var unacked: [Int: [RecordLogRecordKey]] = [:]
     /// This writer's entries handed back, by `seq`. A later save that takes
@@ -55,11 +77,23 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     private var _declarationVersion = 0
     /// Saves waiting for the room's acknowledgement, by `seq`.
     private var ackWaiters: [Int: [CheckedContinuation<Void, Error>]] = [:]
+    /// This writer's committed entries not yet settled.
+    private var unsettled: Set<Int> = []
+    /// The confirmed rows each recently settled entry left, by `seq`, the oldest first.
+    private var settlements: [Int: RecordLogSettlement] = [:]
+    private var settlementOrder: [Int] = []
+    /// Writes waiting for their entry to settle, by `seq`.
+    private var settleWaiters: [Int: [CheckedContinuation<RecordLogSettlement, Error>]] = [:]
+    /// How many settled entries' rows are kept for a write that asks after its entry settled.
+    private static let settlementsKept = 256
     /// Unique constraints the room keeps out of force: the local pre-check skips them.
     private var refusedConstraints: Set<String> = []
     private var closed = false
     private var modelListeners: [String: [UUID: @Sendable () -> Void]] = [:]
     private var commitListeners: [UUID: @Sendable ([RecordLogPendingEntry]) -> Void] = [:]
+    private var changeListeners: [UUID: @Sendable (RecordLogChangeNotice) -> Void] = [:]
+    private var pendingListeners: [UUID: @Sendable () -> Void] = [:]
+    private var _createdLocally = true
     private var errorListeners: [UUID: @Sendable (JsBaoError) -> Void] = [:]
     private var refusalReporter: (@Sendable (DocumentWriteRefusedEvent) -> Void)?
     /// Records this writer upserted under one id that the room applied to
@@ -70,13 +104,8 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     /// Open `documentId`'s store over `host`: create the tables, mint this
     /// client's writer (a ULID per document and client id), read the marks.
-    init(
-        host: any Format2SqlHost, documentId: String, clientId: String,
-        engine: BaoModelQueryEngine, logger: Logger? = nil
-    ) throws {
-        self.host = host
+    init(host: any Format2SqlHost, documentId: String, clientId: String, logger: Logger? = nil) throws {
         self.documentId = documentId
-        self.engine = engine
         self.logger = logger
         let store = RecordLogStore(host: host, documentId: documentId, clientId: clientId, logger: logger)
         try store.initialize()
@@ -95,11 +124,30 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     var marks: RecordLogMarks { state.withLock { _marks } }
 
     /// Whether the room said this client may only read.
-    var isReadOnly: Bool { marks.permission == "read" }
+    var isReadOnly: Bool { marks.permission == RecordLogPermission.read }
 
-    /// Every registered model's projection spec.
-    var projectionSpecs: [RecordLogProjectionSpec] {
-        state.withLock { specs.keys.sorted().compactMap { specs[$0] } }
+    /// Whether the room refused this document for access: its rows stay
+    /// readable, and a write is refused `WRITE_ACCESS_DENIED`.
+    var isAccessRefused: Bool { marks.permission == RecordLogPermission.refused }
+
+    /// The db3 was created on this device and bound before its room's copy
+    /// loaded (a pending create): it is readable at once. `true` for a binding
+    /// no room serves (js-bao's `createdLocally` default); the client sets it
+    /// at every bind.
+    var createdLocally: Bool {
+        get { state.withLock { _createdLocally } }
+        set { state.withLock { _createdLocally = newValue } }
+    }
+
+    /// Whether this document's store holds a readable copy (js-bao's
+    /// `isRecordLogResident`): created here, or a load completed and no
+    /// unstaged replacement is in progress. Answered from the mirrored marks;
+    /// they are read again only when they say no.
+    var isResident: Bool {
+        let createdLocally = self.createdLocally
+        if RecordLogStore.isResident(marks, createdLocally: createdLocally) { return true }
+        guard let fresh = try? refreshMarks() else { return false }
+        return RecordLogStore.isResident(fresh, createdLocally: createdLocally)
     }
 
     /// Every registered model's schema, by name.
@@ -112,40 +160,15 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     // MARK: - Models
 
-    /// Bind a model to this document: its query tables prepared, its view
-    /// lookup indexes built, and its query rows rebuilt from the view unless
-    /// they already hold it. Called off the provider's queue.
+    /// Bind a model to this document. Its reads answer from the document's
+    /// view; no index is built here (the store builds its indexes from the
+    /// room's list, which a declaration reaches through the room).
     func registerModel(_ schema: PrimitiveSchema) throws {
-        let already = state.withLock { () -> Bool in
-            if schemas[schema.name] == schema, projected.contains(schema.name) { return true }
+        state.withLock {
             if schemas[schema.name] != schema { _declarationVersion += 1 }
             schemas[schema.name] = schema
-            specs[schema.name] = RecordLogProjectionSpec(schema: schema)
-            return false
-        }
-        if already { return }
-        try RecordLogQueryProjection.prepare(schema: schema, engine: engine, host: host)
-        var fields: [String] = []
-        var sets: [String] = []
-        for (name, descriptor) in schema.fields.sorted(by: { $0.key < $1.key }) {
-            if descriptor.type == .stringset {
-                sets.append(name)
-            } else if name != "id", descriptor.indexed || descriptor.unique {
-                fields.append(name)
-            }
-        }
-        let constraints = schema.constraints.values.sorted { $0.name < $1.name }.map { ($0.name, $0.fields) }
-        store.ensureFieldIndexes(model: schema.name, fields: fields, constraints: constraints, stringSetFields: sets)
-        let spec = RecordLogProjectionSpec(schema: schema)
-        let rebuilt = try withOperation { try store.projectModel(spec: spec) }
-        state.withLock { _ = projected.insert(schema.name) }
-        if rebuilt {
-            logger?.debug("[record-log] rebuilt the query tables of", schema.name, "in", documentId, "from its view")
         }
     }
-
-    /// Whether `model`'s query tables hold this document's view.
-    func isProjected(_ model: String) -> Bool { state.withLock { projected.contains(model) } }
 
     /// Hear that `model`'s rows changed through the room. Returns a token for ``removeModelListener(_:_:)``.
     @discardableResult
@@ -160,17 +183,59 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     /// Tell each changed model's listeners, once per model: the models of
-    /// `records`, and `models` (those a chunk changed in bulk).
-    func notify(_ records: [RecordLogRecordKey], models bulk: [String] = []) {
+    /// `records`, and `models` (those a chunk changed in bulk); and the change
+    /// listeners, with `origin` and the rows `changes` answered, unless
+    /// `origin` is `nil` (a commit, which told them already).
+    func notify(
+        _ records: [RecordLogRecordKey], models bulk: [String] = [], origin: RecordLogChangeOrigin? = .remote,
+        changes: [RecordLogRowChange] = []
+    ) {
         let models = Set(records.map(\.model)).union(bulk)
         let listeners = state.withLock { models.flatMap { modelListeners[$0]?.values.map { $0 } ?? [] } }
         for listener in listeners { listener() }
+        guard let origin, !records.isEmpty || !bulk.isEmpty else { return }
+        noticeChange(RecordLogChangeNotice(origin: origin, records: records, changes: changes, models: bulk))
     }
 
     /// Tell the listeners of what a chunk of a load or a segment changed, once
     /// per model: reads go to the store, so a listener re-reads the rows.
     func notify(_ reply: RecordLogChunkReply) {
-        notify(reply.changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, models: reply.models)
+        notify(
+            reply.changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, models: reply.models,
+            changes: reply.changed
+        )
+    }
+
+    private func noticeChange(_ notice: RecordLogChangeNotice) {
+        let listeners = state.withLock { Array(changeListeners.values) }
+        for listener in listeners { listener(notice) }
+    }
+
+    /// Hear every change to the document's view rows, with where it came from.
+    /// Returns a token for ``removeChangeListener(_:)``.
+    @discardableResult
+    func onChange(_ listener: @escaping @Sendable (RecordLogChangeNotice) -> Void) -> UUID {
+        let token = UUID()
+        state.withLock { changeListeners[token] = listener }
+        return token
+    }
+
+    /// Hear every change to this writer's unjudged entries: an acknowledgement
+    /// or a hand-back, whether or not a row changed.
+    @discardableResult
+    func onPendingChanged(_ listener: @escaping @Sendable () -> Void) -> UUID {
+        let token = UUID()
+        state.withLock { pendingListeners[token] = listener }
+        return token
+    }
+
+    private func noticePending() {
+        let listeners = state.withLock { Array(pendingListeners.values) }
+        for listener in listeners { listener() }
+    }
+
+    func removeChangeListener(_ token: UUID) {
+        state.withLock { _ = changeListeners.removeValue(forKey: token) }
     }
 
     /// Hear this writer's entries once their group has committed: what the session sends.
@@ -230,11 +295,27 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     /// Commit local writes as one save each, inside the connection's group of
     /// saves. The entries count as unacknowledged at once; the session hears
-    /// them once their group commits. A save refused before it commits (the
-    /// epoch budget) is reported with its writes and thrown.
+    /// them once their group commits, and the change listeners hear the view
+    /// rows they changed as `local`. A save refused before it commits (the
+    /// epoch budget, or the room's access refusal: `WRITE_ACCESS_DENIED`) is
+    /// reported with its writes and thrown.
     @discardableResult
     func commit(_ writes: [RecordLogWrite]) throws -> [RecordLogPendingEntry] {
         try assertOpen()
+        if isAccessRefused {
+            let error = JsBaoError(
+                code: .writeAccessDenied,
+                message: "Cannot save to document `\(documentId)`: the room refused this client access to it; "
+                    + "the write was not applied.",
+                details: ["documentId": .string(documentId)]
+            )
+            logger?.warn("[record-log] write-refused", documentId, "— WRITE_ACCESS_DENIED: access to the document was refused")
+            let mutations = writes.flatMap(\.mutations)
+            if !mutations.isEmpty {
+                reportRefused(recordLogLocalRefusal(error, documentId: documentId, mutations: mutations))
+            }
+            throw error
+        }
         if isReadOnly {
             throw JsBaoError(
                 code: .accessDenied,
@@ -248,9 +329,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         let reply: RecordLogCommitReply
         do {
             reply = try withOperation {
-                try store.commitEntries(
-                    writer: writer, writes: writes, project: projectionSpecs
-                ) { [weak self] error in
+                try store.commitEntries(writer: writer, writes: writes) { [weak self] error in
                     if let entries = delivery.outcome(error) { self?.groupCommitted(entries, writer: writer, error: error) }
                 }
             }
@@ -265,6 +344,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         state.withLock {
             for entry in reply.entries {
                 unacked[entry.seq] = entry.keys
+                unsettled.insert(entry.seq)
                 // The number may have been an earlier save's whose group failed
                 // to commit: this save starts with none of that one's history.
                 handedBack[entry.seq] = nil
@@ -275,6 +355,12 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             _marks.cursor = reply.cursor
         }
         if let (entries, error) = delivery.entries(reply.entries) { groupCommitted(entries, writer: writer, error: error) }
+        if !reply.changed.isEmpty {
+            noticeChange(RecordLogChangeNotice(
+                origin: .local, records: reply.changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) },
+                changes: reply.changed
+            ))
+        }
         return reply.entries
     }
 
@@ -325,7 +411,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             let touched = handBack(entries.map(\.seq), error: failure)
             let listeners = state.withLock { Array(errorListeners.values) }
             for listener in listeners { listener(failure) }
-            notify(touched)
+            notify(touched, origin: .local)
             return
         }
         // Committed under a writer that has been re-minted since: the store
@@ -369,6 +455,47 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         }
     }
 
+    /// Returns once this writer's entry `seq` has left the pending log (its
+    /// result applied, or the room moved past it), with the confirmed rows of
+    /// the records it touched as they stood right after its result applied:
+    /// the room's values, before any later result and without the guesses of
+    /// other pending entries. Throws the hand-back's error when the entry was
+    /// refused, or when the document closes first. An entry this binding did
+    /// not commit, or one settled long before, answers at once with no rows.
+    func whenSettled(_ seq: Int) async throws -> RecordLogSettlement {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<RecordLogSettlement, Error>) in
+            let outcome: Result<RecordLogSettlement, Error>? = state.withLock {
+                if let refused = handedBack[seq] { return .failure(refused) }
+                if let settled = settlements[seq] { return .success(settled) }
+                if !unsettled.contains(seq) { return .success(RecordLogSettlement(rows: [])) }
+                if closed { return .failure(Self.closedError(documentId)) }
+                settleWaiters[seq, default: []].append(continuation)
+                return nil
+            }
+            if let outcome { continuation.resume(with: outcome) }
+        }
+    }
+
+    /// This writer's entries a reply settled: what waits on them returns with their rows.
+    func noteSettled(_ reply: RecordLogChangeReply) {
+        let own = writer
+        let waiters = state.withLock { () -> [(CheckedContinuation<RecordLogSettlement, Error>, RecordLogSettlement)] in
+            var out: [(CheckedContinuation<RecordLogSettlement, Error>, RecordLogSettlement)] = []
+            for ref in reply.settled where ref.writer == own {
+                unsettled.remove(ref.seq)
+                let settlement = reply.settlements[ref] ?? RecordLogSettlement(rows: [])
+                if settlements.updateValue(settlement, forKey: ref.seq) == nil { settlementOrder.append(ref.seq) }
+                // Kept for a write that asks after its entry settled; the oldest go first.
+                while settlementOrder.count > Self.settlementsKept {
+                    settlements[settlementOrder.removeFirst()] = nil
+                }
+                for waiter in settleWaiters.removeValue(forKey: ref.seq) ?? [] { out.append((waiter, settlement)) }
+            }
+            return out
+        }
+        for (waiter, settlement) in waiters { waiter.resume(returning: settlement) }
+    }
+
     /// The room acknowledged these entries of this writer: they stop being
     /// pending and what waits on them resolves. Answers the records they touched.
     @discardableResult
@@ -383,48 +510,65 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             return (touched, waiters)
         }
         for waiter in waiters { waiter.resume() }
+        if !seqs.isEmpty { noticePending() }
         return touched
     }
 
     /// These entries of this writer were handed back with `error`: what waits on them throws it.
     @discardableResult
     func handBack(_ seqs: [Int], error: JsBaoError) -> [RecordLogRecordKey] {
-        let (touched, waiters) = state.withLock { () -> ([RecordLogRecordKey], [CheckedContinuation<Void, Error>]) in
+        let (touched, waiters, settling) = state.withLock {
+            () -> ([RecordLogRecordKey], [CheckedContinuation<Void, Error>], [CheckedContinuation<RecordLogSettlement, Error>]) in
             var touched: [RecordLogRecordKey] = []
             var waiters: [CheckedContinuation<Void, Error>] = []
+            var settling: [CheckedContinuation<RecordLogSettlement, Error>] = []
             for seq in seqs {
                 if let keys = unacked.removeValue(forKey: seq) { touched.append(contentsOf: keys) }
+                unsettled.remove(seq)
                 handedBack[seq] = error
                 if let ticket = ticketOfSeq[seq] { refusedTickets.insert(ticket) }
                 waiters.append(contentsOf: ackWaiters.removeValue(forKey: seq) ?? [])
+                settling.append(contentsOf: settleWaiters.removeValue(forKey: seq) ?? [])
             }
-            return (touched, waiters)
+            return (touched, waiters, settling)
         }
         for waiter in waiters { waiter.resume(throwing: error) }
+        for waiter in settling { waiter.resume(throwing: error) }
+        if !seqs.isEmpty { noticePending() }
         return touched
     }
 
     /// This writer was re-minted: its entries were renumbered, and what waits
     /// on them follows them.
     func reminted(writer: String, renumbered: [(from: Int, to: Int)]) {
-        let orphaned = state.withLock { () -> [CheckedContinuation<Void, Error>] in
+        let (orphaned, orphanedSettling) = state.withLock {
+            () -> ([CheckedContinuation<Void, Error>], [CheckedContinuation<RecordLogSettlement, Error>]) in
             _writer = writer
             let oldUnacked = unacked
             var oldWaiters = ackWaiters
             let oldTickets = ticketOfSeq
+            let oldUnsettled = unsettled
+            var oldSettleWaiters = settleWaiters
             unacked = [:]
             ackWaiters = [:]
             handedBack = [:]
             ticketOfSeq = [:]
+            unsettled = []
+            settleWaiters = [:]
+            settlements = [:]
+            settlementOrder = []
             for (from, to) in renumbered {
                 if let keys = oldUnacked[from] { unacked[to] = keys }
+                if oldUnsettled.contains(from) { unsettled.insert(to) }
                 if let waiting = oldWaiters.removeValue(forKey: from) { ackWaiters[to] = waiting }
+                if let waiting = oldSettleWaiters.removeValue(forKey: from) { settleWaiters[to] = waiting }
                 if let ticket = oldTickets[from] { ticketOfSeq[to] = ticket }
             }
-            return oldWaiters.values.flatMap { $0 }
+            return (oldWaiters.values.flatMap { $0 }, oldSettleWaiters.values.flatMap { $0 })
         }
         // A waiter on a void marker has nothing left to wait for.
         for waiter in orphaned { waiter.resume() }
+        for waiter in orphanedSettling { waiter.resume(returning: RecordLogSettlement(rows: [])) }
     }
 
     /// The room applied an upsert of this writer's to an existing record.
@@ -468,6 +612,14 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         return marks
     }
 
+    /// Mark the copy of a db3 the server just created caught up, so it is
+    /// resident (#4806); a copy already marked keeps its mark.
+    func markCaughtUpAtCreate() throws {
+        let at = Int64(Date().timeIntervalSince1970 * 1000)
+        let marks = try withOperation { try store.markCaughtUpAtCreate(at: at) }
+        state.withLock { _marks = marks }
+    }
+
     /// Read the marks again.
     @discardableResult
     func refreshMarks() throws -> RecordLogMarks {
@@ -484,7 +636,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     private final class Staged {
         var depth = 0
         var order: [RecordLogRecordKey] = []
-        var writes: [RecordLogRecordKey: (mutation: RecordLogMutation, upsertOn: String?, row: RecordLogRow?)] = [:]
+        var writes: [RecordLogRecordKey: (held: RecordLogHeldWrites, upsertOn: String?, row: RecordLogRow?)] = [:]
     }
 
     private var staged: [UInt64: Staged] = [:]
@@ -517,14 +669,15 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             return current
         }
         if outer, let finished, !finished.order.isEmpty {
-            let mutations = finished.order.compactMap { finished.writes[$0]?.mutation }
+            // Each record's absolute write, then its increment of the fields that write does not assign.
+            let mutations = finished.order.flatMap { finished.writes[$0]?.held.mutations ?? [] }
             let upsertOn = finished.order.first.flatMap { finished.writes[$0]?.upsertOn }
             do {
-                try assertRecordLogEntry(documentId: documentId, mutations: mutations) { [weak self] event in
+                try assertRecordLogEntry(documentId: documentId, mutations: mutations, upsertOn: upsertOn) { [weak self] event in
                     self?.reportRefused(event)
                 }
                 let committed = try commit([RecordLogWrite(mutations: mutations, upsertOn: upsertOn)])
-                notify(committed.flatMap(\.keys))
+                notify(committed.flatMap(\.keys), origin: nil)
             } catch {
                 commitError = error
             }
@@ -539,8 +692,9 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     /// Hold `mutation` for the transaction open on this thread, if there is
-    /// one. `existing` is the record as the view (or the transaction so far)
-    /// holds it. Answers whether it was held.
+    /// one, folded per field into what the transaction holds of the record
+    /// (``foldRecordLogIncrement(_:_:)``). `existing` is the record as the
+    /// view (or the transaction so far) holds it. Answers whether it was held.
     func stage(_ mutation: RecordLogMutation, upsertOn: String?, existing: RecordLogRow?) -> Bool {
         let thread = Self.threadId
         return state.withLock {
@@ -551,10 +705,10 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             _ = try? recordLogApplyGuess(table, RecordLogPendingEntry(seq: 0, e: 0, k: 0, m: mutation))
             let row = table.row(key)
             if let held = current.writes[key] {
-                current.writes[key] = (mergeRecordLogMutations(held.mutation, mutation), held.upsertOn ?? upsertOn, row)
+                current.writes[key] = (foldRecordLogIncrement(held.held, mutation), held.upsertOn ?? upsertOn, row)
             } else {
                 current.order.append(key)
-                current.writes[key] = (mutation, upsertOn, row)
+                current.writes[key] = (foldRecordLogIncrement(RecordLogHeldWrites(), mutation), upsertOn, row)
             }
             return true
         }
@@ -587,19 +741,46 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         return state.withLock { staged[thread] != nil }
     }
 
+    /// The conversation with the room stopped without the document closing
+    /// (the session's release): no acknowledgement is coming on it, so what
+    /// waits on one throws. The entries stay, and a later open sends them.
+    func releaseAcknowledgementWaiters() {
+        let (waiters, settling) = state.withLock {
+            () -> ([CheckedContinuation<Void, Error>], [CheckedContinuation<RecordLogSettlement, Error>]) in
+            let all = ackWaiters.values.flatMap { $0 }
+            let settling = settleWaiters.values.flatMap { $0 }
+            ackWaiters = [:]
+            settleWaiters = [:]
+            return (all, settling)
+        }
+        guard !waiters.isEmpty || !settling.isEmpty else { return }
+        let error = JsBaoError(
+            code: .notFound,
+            message: "Document `\(documentId)` closed before the room acknowledged the write.",
+            details: ["documentId": .string(documentId)]
+        )
+        for waiter in waiters { waiter.resume(throwing: error) }
+        for waiter in settling { waiter.resume(throwing: error) }
+    }
+
     // MARK: - Closing
 
     /// Close: the open group commits, what waits on an acknowledgement throws,
     /// and nothing more is accepted. Removes nothing the store holds.
     func close() {
-        let waiters = state.withLock { () -> [CheckedContinuation<Void, Error>] in
-            guard !closed else { return [] }
+        let (waiters, settling) = state.withLock {
+            () -> ([CheckedContinuation<Void, Error>], [CheckedContinuation<RecordLogSettlement, Error>]) in
+            guard !closed else { return ([], []) }
             closed = true
             commitListeners = [:]
             modelListeners = [:]
+            changeListeners = [:]
+            pendingListeners = [:]
             let all = ackWaiters.values.flatMap { $0 }
+            let settling = settleWaiters.values.flatMap { $0 }
             ackWaiters = [:]
-            return all
+            settleWaiters = [:]
+            return (all, settling)
         }
         try? store.flush()
         let error = JsBaoError(
@@ -608,6 +789,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             details: ["documentId": .string(documentId)]
         )
         for waiter in waiters { waiter.resume(throwing: error) }
+        for waiter in settling { waiter.resume(throwing: error) }
     }
 
     var isClosed: Bool { state.withLock { closed } }

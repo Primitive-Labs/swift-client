@@ -17,7 +17,7 @@ import XCTest
 /// suites and don't need duplication here.
 ///
 /// Reference: `src/client/api/{invitationsApi,blobBucketsApi,
-/// cronTriggersApi,collectionTypeConfigsApi,databaseTypeConfigsApi,
+/// cronTriggersApi,databaseTypeConfigsApi,
 /// usersApi,databasesApi,documentsApi}.ts`.
 final class ApiParityTests: XCTestCase {
 
@@ -86,71 +86,6 @@ final class ApiParityTests: XCTestCase {
         ]
     }
 
-    // MARK: - CollectionTypeConfigsAPI
-
-    func test_collectionTypeConfigs_list_GET() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [[String: Any]]()
-        _ = try await api.list()
-        XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/collection-type-configs")
-    }
-
-    func test_collectionTypeConfigs_get_escapesType() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [
-            "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-            "createdBy": "u1",
-        ]
-        _ = try await api.get(collectionType: "my type/with slash")
-        XCTAssertEqual(r.method, "GET")
-        // #2076: a path-segment value now escapes `/` too (encodeURIComponent
-        // parity), so the type stays a single segment. The old `.urlPathAllowed`
-        // charset left `/` literal, splitting it into extra path segments.
-        XCTAssertEqual(r.path, "/collection-type-configs/my%20type%2Fwith%20slash")
-    }
-
-    func test_collectionTypeConfigs_create_POSTsParams() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [
-            "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-            "createdBy": "u1",
-        ]
-        _ = try await api.create(params: CreateCollectionTypeConfigParams(collectionType: "x", ruleSetId: "rs1"))
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/collection-type-configs")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["collectionType"] as? String, "x")
-        XCTAssertEqual(body?["ruleSetId"] as? String, "rs1")
-    }
-
-    func test_collectionTypeConfigs_update_PATCH() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [
-            "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-            "createdBy": "u1",
-        ]
-        _ = try await api.update(collectionType: "x", params: UpdateCollectionTypeConfigParams(ruleSetId: .clear))
-        XCTAssertEqual(r.method, "PATCH")
-        XCTAssertEqual(r.path, "/collection-type-configs/x")
-    }
-
-    func test_collectionTypeConfigs_delete_DELETE() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = ["success": true]
-        _ = try await api.delete(collectionType: "x")
-        XCTAssertEqual(r.method, "DELETE")
-        XCTAssertEqual(r.path, "/collection-type-configs/x")
-    }
-
     // MARK: - DatabaseTypeConfigsAPI
 
     func test_databaseTypeConfigs_routes() async throws {
@@ -180,58 +115,6 @@ final class ApiParityTests: XCTestCase {
         r.response = ["success": true]
         _ = try await api.delete(databaseType: "x")
         XCTAssertEqual(r.method, "DELETE")
-    }
-
-    // MARK: - CronTriggersAPI
-
-    /// A fully-populated `CronTriggerInfo` wire payload — every required
-    /// field present so a strict decode succeeds and a return-type
-    /// regression is what fails the test.
-    private func cronTriggerJSON() -> [String: Any] {
-        [
-            "triggerId": "abc", "triggerKey": "k", "displayName": "d",
-            "cron": "* * * * *", "timezone": "UTC", "workflowKey": "w",
-            "overlapPolicy": "skip", "status": "active",
-            "skippedCount": 0, "firedCount": 0,
-            "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
-            "modifiedAt": "2024-01-01T00:00:00Z",
-        ]
-    }
-
-    func test_cronTriggers_create_POST() async throws {
-        let r = CallRecorder()
-        let api = CronTriggersAPI(transport: r)
-        r.response = cronTriggerJSON()
-        _ = try await api.create(params: CreateCronTriggerParams(triggerKey: "k", displayName: "d", cron: "* * * * *", workflowKey: "w"))
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/cron-triggers")
-    }
-
-    func test_cronTriggers_update_PUT() async throws {
-        let r = CallRecorder()
-        let api = CronTriggersAPI(transport: r)
-        r.response = cronTriggerJSON()
-        _ = try await api.update(triggerId: "abc", params: UpdateCronTriggerParams(displayName: "renamed"))
-        XCTAssertEqual(r.method, "PUT")
-        XCTAssertEqual(r.path, "/cron-triggers/abc")
-    }
-
-    func test_cronTriggers_disable_enable_test_routes() async throws {
-        let r = CallRecorder()
-        let api = CronTriggersAPI(transport: r)
-
-        // #2803 — the uniform operational verb pair, replacing pause/resume.
-        r.response = cronTriggerJSON()
-        _ = try await api.disable(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/disable")
-        XCTAssertEqual(r.method, "POST")
-
-        _ = try await api.enable(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/enable")
-
-        r.response = ["started": true]
-        _ = try await api.test(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/test")
     }
 
     // MARK: - InvitationsAPI
@@ -501,6 +384,7 @@ final class ApiParityTests: XCTestCase {
 
     // MARK: - DocumentsAPI new methods
 
+    @available(*, deprecated)
     func test_documents_revokeGroupPermission_DELETE() async throws {
         let r = CallRecorder()
         // documentManager isn't needed for the HTTP-only path; pass nil.
@@ -557,57 +441,5 @@ final class ApiParityTests: XCTestCase {
 
         _ = try await api.denyAccessRequest(documentId: "d1", requestId: "r1")
         XCTAssertEqual(r.path, "/documents/d1/access-requests/r1/deny")
-    }
-
-    // MARK: - WorkflowsAPI options threading
-
-    func test_workflows_start_forceRerunSerializes() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.start(
-            workflowKey: "wf",
-            input: ["x": 1],
-            options: StartWorkflowOptions(forceRerun: true)
-        )
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["forceRerun"] as? Bool, true)
-    }
-
-    func test_workflows_terminate_contextDocId_appendsQS() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.terminate(workflowKey: "wf", runKey: "rk", contextDocId: "doc-1")
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/workflows/wf/instances/rk/terminate?contextDocId=doc-1")
-    }
-
-    func test_workflows_listStepRuns_path() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.listStepRuns(runId: "run-1")
-        XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/workflows/runs/run-1/steps")
-    }
-
-    func test_workflows_listRuns_forwardAndContextDocId() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.listRuns(options: ListWorkflowRunsOptions(
-            forward: false,
-            contextDocId: "doc-1"
-        ))
-        XCTAssertEqual(r.path, "/workflows/runs?forward=false&contextDocId=doc-1")
     }
 }

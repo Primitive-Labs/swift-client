@@ -1,5 +1,5 @@
 import XCTest
-import SQLite3
+import JsBaoSQLite
 import YSwift
 @testable import JsBaoClient
 
@@ -57,8 +57,7 @@ final class RecordLogLatencyHermeticTests: XCTestCase {
 
     private func model(_ host: any Format2SqlHost, provider: SQLiteStorageProvider) throws -> (DynamicModel, RecordLogDocumentBinding) {
         let binding = try RecordLogDocumentBinding(
-            host: host, documentId: "doc-\(UUID().uuidString.prefix(6))", clientId: "client",
-            engine: BaoModelQueryEngine(host: provider)
+            host: host, documentId: "doc-\(UUID().uuidString.prefix(6))", clientId: "client"
         )
         let member = MultiDocModel(schema: Self.schema).connect(docId: binding.documentId, doc: YDocument())
         try member.bindRecordLog(binding)

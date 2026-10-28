@@ -298,37 +298,6 @@ final class FunctionsLiveTests: XCTestCase {
         XCTAssertEqual(typed.slice, slice)
     }
 
-    /// The block is additive: a DSL workflow run is not a function run, so its
-    /// status carries no `slice` key and the Swift result reads `nil`.
-    func testAWorkflowRunsStatusCarriesNoSlice() async throws {
-        let workflowKey = "swift-slice-dsl-\(Int(Date().timeIntervalSince1970))"
-        try await ctx.setupWorkflow(
-            appId: testApp.appId,
-            workflowKey: workflowKey,
-            steps: [["id": "n", "kind": "noop", "message": "hi", "saveAs": "output"]],
-            requiresClientApply: false
-        )
-        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
-
-        // Started and waited for: the synchronous door this case used
-        // retired with #3188. The wait polls the runId route (shared by DSL
-        // runs): `workflows.waitFor` settles on a socket frame, and this
-        // suite's client never connects its socket.
-        let started = try await client.workflows.start(StartWorkflowOptions(
-            workflowKey: workflowKey,
-            runKey: "swift-slice-dsl-run",
-            contextDocId: docId
-        ))
-        let settled = try await client.functions.waitFor(
-            runId: started.runId,
-            options: FunctionWaitOptions(timeout: 60)
-        )
-        XCTAssertEqual(settled.status, "completed")
-
-        let status = try await client.functions.getStatus(runId: started.runId)
-        XCTAssertNil(status.slice, "a DSL run has no slice record")
-    }
-
     // MARK: - #3454: the runner is chosen at call time
 
     /// An `any` function — the DEFAULT since #3454 — takes both verbs, and

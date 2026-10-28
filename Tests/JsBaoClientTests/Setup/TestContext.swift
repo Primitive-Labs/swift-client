@@ -315,6 +315,14 @@ final class TestContext: @unchecked Sendable {
     /// or payload still carries `mode` or `durable`. The helper pushes what
     /// the JS helper pushes. `inputSchema` / `outputSchema` are the JSON
     /// schemas the server validates against, when the case is about them.
+    ///
+    /// #4738 — the create writes no `access` (the server refuses the key), and
+    /// a push of a bare handler is refused `FUNCTION_AUTHORIZE_REQUIRED`. As
+    /// the JS helper does, a bundle with `authorize` lands through the admin
+    /// route, and a bare one is re-sent unchanged to the local-only legacy
+    /// seed route `POST /test/function-legacy-config/{appId}/{key}/push`,
+    /// which runs the same push with the break off and writes `access` as the
+    /// header's rule.
     @discardableResult
     func pushFunction(
         appId: String,
@@ -328,10 +336,7 @@ final class TestContext: @unchecked Sendable {
         outputSchema: [String: Any]? = nil
     ) async throws -> PushedFunction {
         let base = "/admin/api/apps/\(appId)/functions"
-        var header: [String: Any] = [
-            "functionKey": functionKey,
-            "access": access,
-        ]
+        var header: [String: Any] = ["functionKey": functionKey]
         if let inputSchema { header["inputSchema"] = inputSchema }
         if let outputSchema { header["outputSchema"] = outputSchema }
         let created = try await adminPost(base, body: header)
@@ -352,7 +357,19 @@ final class TestContext: @unchecked Sendable {
             "bundle": bundleData.base64EncodedString(),
             "contentHash": contentHash,
         ]
-        let pushed = try await adminPost("\(base)/\(functionId)/configs", body: config)
+        var (status, pushed) = try await jsonRequest(
+            method: "POST", path: "\(base)/\(functionId)/configs", body: config, jwt: superuserJWT
+        )
+        if status == 400, pushed["code"] as? String == "FUNCTION_AUTHORIZE_REQUIRED" {
+            var seed = config
+            seed["access"] = access
+            (status, pushed) = try await jsonRequest(
+                method: "POST", path: "/test/function-legacy-config/\(appId)/\(functionKey)/push", body: seed, jwt: nil
+            )
+        }
+        guard (200..<300).contains(status) else {
+            throw TestSetupError("Failed to push function \(functionKey): HTTP \(status) \(pushed)")
+        }
         return PushedFunction(
             functionId: functionId,
             functionKey: functionKey,
@@ -489,8 +506,61 @@ final class TestContext: @unchecked Sendable {
         try await adminRequest(method: "POST", path: path, body: body)
     }
 
+    /// Create a group through the admin API's
+    /// `POST /admin/api/apps/{appId}/groups` (#4737). On the app routes only a
+    /// server function creates a group, and a session's `groups.create` is
+    /// refused, so live suites make their groups here: the Swift twin of
+    /// `tests/helpers/create-group-4735.ts`.
+    ///
+    /// `custodian` defaults to `user:<ownerUserId>`, the app owner who was the
+    /// caller of the session creates this replaces. A suite whose subject is
+    /// the role table passes an ordinary member instead, because the app
+    /// owner's session holds app authority and is admitted before the role
+    /// table is read. `initialMembers` are `(userId, role)` pairs, `role`
+    /// `manager` or `member`. The server mints the group's id (#4917): read it
+    /// from the returned `GroupInfo`.
+    @discardableResult
+    func createGroup(
+        app: TestApp,
+        name: String,
+        custodian: String? = nil,
+        initialMembers: [(userId: String, role: String)] = [],
+        initialMetadata: [String: Any]? = nil,
+        settings: [String: Any]? = nil
+    ) async throws -> GroupInfo {
+        var body: [String: Any] = ["name": name, "custodian": custodian ?? "user:\(app.ownerUserId)"]
+        if !initialMembers.isEmpty {
+            body["initialMembers"] = initialMembers.map { ["userId": $0.userId, "role": $0.role] }
+        }
+        if let initialMetadata { body["initialMetadata"] = initialMetadata }
+        if let settings { body["settings"] = settings }
+        let data = try await adminData(method: "POST", path: "/admin/api/apps/\(app.appId)/groups", body: body)
+        return try JSONDecoder().decode(GroupInfo.self, from: data)
+    }
+
     @discardableResult
     private func adminRequest(method: String, path: String, body: [String: Any]?) async throws -> [String: Any] {
+        let data = try await adminData(method: method, path: path, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// A request whose refusal the caller reads: the status and the JSON body,
+    /// never a throw on a non-2xx answer.
+    private func jsonRequest(method: String, path: String, body: [String: Any]?, jwt: String?) async throws -> (Int, [String: Any]) {
+        var request = URLRequest(url: URL(string: "\(TestConfig.httpUrl)\(path)")!)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let jwt { request.setValue("Bearer \(jwt)", forHTTPHeaderField: "Authorization") }
+        request.setValue(TestConfig.globalAdminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
+        if let body { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TestSetupError("Non-HTTP response")
+        }
+        return (httpResponse.statusCode, (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:])
+    }
+
+    private func adminData(method: String, path: String, body: [String: Any]?) async throws -> Data {
         let url = URL(string: "\(TestConfig.httpUrl)\(path)")!
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -512,7 +582,7 @@ final class TestContext: @unchecked Sendable {
             throw TestSetupError("HTTP \(httpResponse.statusCode) \(method) \(path): \(text)")
         }
 
-        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        return data
     }
 
     @discardableResult

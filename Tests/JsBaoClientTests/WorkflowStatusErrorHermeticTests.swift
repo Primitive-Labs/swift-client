@@ -29,13 +29,15 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
     ///
     /// THE helper of D3449-005: paste the body the hosted twin logged and this
     /// answers whether Swift decodes it, with no server and no client.
-    static func decodeStatusBytes(_ json: String) throws -> WorkflowStatusResult {
-        try JSONDecoder().decode(WorkflowStatusResult.self, from: Data(json.utf8))
+    ///
+    /// #3190 — the workflow status type retired with `client.workflows`, so
+    /// this decodes the FUNCTION run status, the one type a status route's
+    /// body is read into now.
+    static func decodeStatusBytes(_ json: String) throws -> FunctionRunStatus {
+        try decodeFunctionRunStatusBytes(json)
     }
 
-    /// The same helper for the FUNCTION type — #3565. The two surfaces read
-    /// one wire and answer different shapes, so a body a hosted twin logged is
-    /// worth asking both questions of.
+    /// The same helper under its #3565 name.
     static func decodeFunctionRunStatusBytes(_ json: String) throws -> FunctionRunStatus {
         try JSONDecoder().decode(FunctionRunStatus.self, from: Data(json.utf8))
     }
@@ -46,10 +48,6 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
             FunctionsAPI(transport: transport),
             transport
         )
-    }
-
-    private func makeWorkflows(json: String, status: Int = 200) -> WorkflowsAPI {
-        WorkflowsAPI(transport: RecordingTransport(status: status, json: json))
     }
 
     // MARK: - Fixtures, as the routes really answer
@@ -97,7 +95,7 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
 
         let status = try await api.getStatus(runId: "run-1")
 
-        XCTAssertEqual(transport.lastCall?.path, "/workflows/runs/run-1/status")
+        XCTAssertEqual(transport.lastCall?.path, "/functions/runs/run-1/status")
         XCTAssertEqual(status.status, "failed")
         // #3565 — the FUNCTION surface answers one structured `error`, so
         // this is where the message is and there is no second field beside it.
@@ -119,8 +117,8 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
         let status = try Self.decodeStatusBytes(Self.failedTask)
 
         XCTAssertEqual(status.status, "failed")
-        XCTAssertEqual(status.failure?.name, "Error")
-        XCTAssertTrue(status.error?.hasPrefix("OUTPUT_SCHEMA_VIOLATION") == true)
+        XCTAssertEqual(status.error?.name, "Error")
+        XCTAssertTrue(status.error?.message.hasPrefix("OUTPUT_SCHEMA_VIOLATION") == true)
         XCTAssertEqual(status.run?.runKey, "rk-1")
     }
 
@@ -147,30 +145,6 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
     }
 
     private struct Empty: Decodable, Sendable, Equatable {}
-
-    func testTheTypedOverloadAndTheWorkflowSurfacesCarryAnEqualFailure() async throws {
-        let json = statusJSON(#"{"name":"Error","message":"boom","code":"FUNCTION_THREW"}"#)
-
-        let (api, _) = makeApi(json: json)
-        let untyped = try await api.getStatus(runId: "run-x")
-
-        let (typedApi, _) = makeApi(json: json)
-        let typed: FunctionRunResult<Empty> = try await typedApi.getStatus(runId: "run-x")
-        XCTAssertEqual(typed.error, untyped.error)
-
-        // A function run IS a run row: the same wire rides the workflow
-        // surfaces the run can also be read through — which is where every
-        // failed DSL run has been throwing too, not only function ones. Those
-        // surfaces keep their own shape (#3565 moved neither), so the two are
-        // compared on the fact they must agree about.
-        let viaWorkflows = try await makeWorkflows(json: json)
-            .getStatus(workflowKey: "fn", runKey: "rk-x")
-        XCTAssertEqual(viaWorkflows.failure?.message, untyped.error?.message)
-
-        let viaTerminate = try await makeWorkflows(json: json)
-            .terminate(workflowKey: "fn", runKey: "rk-x")
-        XCTAssertEqual(viaTerminate.failure?.message, untyped.error?.message)
-    }
 
     // MARK: - Behavior 8: the string form, and the absent one
 
@@ -266,49 +240,6 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
         )
     }
 
-    /// `workflows.waitFor(runId:as:)` — the OTHER typed wait, and the one a
-    /// failed DSL run settles through.
-    ///
-    /// Asserted with a structured error carrying extra keys on purpose. The
-    /// memberwise init rebuilds a message-only failure out of `error` when the
-    /// caller passes none, so a typed overload that forgets to forward still
-    /// answers a `failure` with the right MESSAGE — and silently nil for the
-    /// name and the details. Only an error with something besides its message
-    /// can tell the two apart.
-    func testTheTypedWorkflowWaitForwardsTheWholeFailure() async throws {
-        let json = statusJSON(
-            #"{"name":"WorkflowError","message":"step `charge` failed","stepId":"charge","attempt":3}"#,
-            runId: "run-w"
-        )
-        let transport = RecordingTransport(status: 200, json: json)
-        let api = WorkflowsAPI(
-            transport: transport,
-            getConnectionId: { "conn-test" },
-            events: EventEmitter()
-        )
-
-        // Already terminal when the wait starts, so the subscribe-time
-        // reconcile settles it and no frame is needed.
-        let untyped = try await api.waitFor(
-            runId: "run-w",
-            options: WaitForWorkflowOptions(timeout: 5)
-        )
-        let typed = try await api.waitFor(
-            runId: "run-w",
-            as: Empty.self,
-            options: WaitForWorkflowOptions(timeout: 5)
-        )
-
-        XCTAssertEqual(typed.status, "failed")
-        XCTAssertEqual(typed.failure, untyped.failure)
-        XCTAssertEqual(typed.failure?.name, "WorkflowError")
-        XCTAssertEqual(typed.error, typed.failure?.message)
-        XCTAssertEqual(
-            typed.failure?.details,
-            .object(["stepId": .string("charge"), "attempt": .number(3)])
-        )
-    }
-
     /// The finalization window: the record already reads terminal while the
     /// status block still reports the execution in flight. The wait settles
     /// from the record after the bounded re-check, and must carry the failure
@@ -330,27 +261,6 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
     }
 
     // MARK: - Behavior 11: the WS-frame path builds a failure by the same rule
-
-    func testTheWorkflowFrameBuildsAFailureFromItsStringError() throws {
-        // `workflows.waitFor` settles from the terminal `workflowStatus` frame
-        // with zero HTTP, and the frame carries a STRING error. Built by the
-        // same rule, the frame path and the poll path report the same thing
-        // about the same failed run.
-        let fromFrame = WorkflowRunError.read(JSONValue.string("frame failed"))
-        XCTAssertEqual(
-            fromFrame,
-            WorkflowRunError(name: nil, message: "frame failed", details: nil)
-        )
-
-        let built = WaitForWorkflowResult(
-            status: "failed",
-            output: nil,
-            error: "frame failed",
-            failure: fromFrame
-        )
-        XCTAssertTrue(built.isFailure)
-        XCTAssertEqual(built.error, built.failure?.message)
-    }
 
     // MARK: - Edge 19: a value of another JSON kind
 
@@ -421,16 +331,16 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
 
     // MARK: - Edge 22: the type is Equatable and Sendable
 
-    func testWorkflowRunErrorIsEquatableAndSendable() {
-        let a = WorkflowRunError(name: "Error", message: "boom", details: nil)
-        let b = WorkflowRunError(name: "Error", message: "boom", details: nil)
-        let c = WorkflowRunError(name: nil, message: "boom", details: nil)
+    func testFunctionRunErrorIsEquatableAndSendable() {
+        let a = FunctionRunError(name: "Error", message: "boom", code: nil, details: nil)
+        let b = FunctionRunError(name: "Error", message: "boom", code: nil, details: nil)
+        let c = FunctionRunError(name: nil, message: "boom", code: nil, details: nil)
         XCTAssertEqual(a, b)
         XCTAssertNotEqual(a, c)
 
         // `Sendable` is a compile-time claim, so it is made at compile time:
         // this closure would not build if the type were not.
-        let sendable: @Sendable () -> WorkflowRunError = { a }
+        let sendable: @Sendable () -> FunctionRunError = { a }
         XCTAssertEqual(sendable(), a)
     }
 
@@ -485,8 +395,8 @@ final class WorkflowStatusErrorHermeticTests: XCTestCase {
         // rather than moving it into `details`.
         XCTAssertNil(status.error?.name)
         XCTAssertNil(status.error?.details)
-        // …and the WORKFLOW surface still answers it, unchanged.
-        let viaWorkflows = try Self.decodeStatusBytes(Self.workflowError)
-        XCTAssertEqual(viaWorkflows.failure?.name, "WorkflowError")
+        // …and the bytes decode the same with no client at all.
+        let viaBytes = try Self.decodeStatusBytes(Self.workflowError)
+        XCTAssertEqual(viaBytes, status)
     }
 }

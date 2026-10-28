@@ -64,8 +64,6 @@ final class JsBaoEventPayloadTests: XCTestCase {
         MeUpdatedEvent(value: ["name": "Ada"]),
         MeUpdateFailedEvent(reason: "conflict"),
         NotificationEvent(notificationId: "n1", title: "t", body: "b", createdAt: "2026-01-01"),
-        WorkflowStatusEvent(workflowKey: "w", workflowId: "wid", runKey: "rk", runId: "rid", status: "completed"),
-        WorkflowStartedEvent(workflowKey: "w", runId: "rid"),
         ChannelMessageEvent(channel: "orders:1", payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
         ChannelSubscribeFailedEvent(channel: "orders:1", message: "refused"),
         DirectMessageEvent(payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
@@ -80,6 +78,20 @@ final class JsBaoEventPayloadTests: XCTestCase {
         BlobsQueueDrainedEvent(),
         CacheUpdatedEvent(key: "k", updatedAt: "2026-01-01", value: 1),
         CacheUpdateFailedEvent(key: "k", error: "boom"),
+        Db3StateEvent(state: Db3State(
+            id: "d1", resident: true, subscribed: true, phase: .live, progress: nil, cursor: 3, rows: 2,
+            lastSyncAt: nil, pendingWrites: 0, permission: .owner, error: nil
+        )),
+        Db3ReadyEvent(id: "d1"),
+        Db3RowsEvent(id: "d1", changes: [Db3RowChange(model: "Note", id: "r1", row: ["title": "t"])], origin: .local, models: nil),
+        Db3WriteRefusedEvent(DocumentWriteRefusedEvent(
+            documentId: "d1", model: "Note", recordId: "r1", error: JsBaoError(code: .writeAccessDenied, message: "no")
+        )),
+        Db3EvictedEvent(id: "d1", reason: .explicit),
+        Db3GoneEvent(id: "d1"),
+        Db3ErrorEvent(id: "d1", code: "OPEN_FAILED", message: "boom"),
+        Db3CreatedEvent(id: "d1"),
+        Db3CreateFailedEvent(code: "DB3_ID_EXISTS", message: "taken", title: "Orders", type: nil, id: "d1"),
     ]
 
     private static let blobProgress = BlobUploadProgressEvent(

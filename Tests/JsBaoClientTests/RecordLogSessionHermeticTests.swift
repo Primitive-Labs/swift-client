@@ -79,7 +79,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         if let existing { provider = existing } else { provider = try await makeProvider() }
         let binding = try RecordLogDocumentBinding(
             host: provider, documentId: documentId, clientId: clientId,
-            engine: BaoModelQueryEngine(host: provider), logger: Logger(level: .none)
+            logger: Logger(level: .none)
         )
         try binding.registerModel(Self.schema)
         let connection = RecordingConnection()
@@ -253,7 +253,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
     func testAnEarlierWritersEntriesAreDrainedBeforeTheOwnWriterOpens() async throws {
         let provider = try await makeProvider()
         let earlier = try RecordLogDocumentBinding(
-            host: provider, documentId: "doc-1", clientId: "earlier", engine: BaoModelQueryEngine(host: provider)
+            host: provider, documentId: "doc-1", clientId: "earlier"
         )
         try write(earlier, "o1")
         try write(earlier, "o2")
@@ -281,7 +281,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
     func testATakenOrphanIsSkipped() async throws {
         let provider = try await makeProvider()
         let earlier = try RecordLogDocumentBinding(
-            host: provider, documentId: "doc-1", clientId: "earlier", engine: BaoModelQueryEngine(host: provider)
+            host: provider, documentId: "doc-1", clientId: "earlier"
         )
         try write(earlier, "o1")
         let fixture = try await makeFixture(provider: provider, clientId: "now")
@@ -311,7 +311,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
     func testADrainTheRoomDoesNotAnswerMovesOnAfterItsWait() async throws {
         let provider = try await makeProvider()
         let earlier = try RecordLogDocumentBinding(
-            host: provider, documentId: "doc-1", clientId: "earlier", engine: BaoModelQueryEngine(host: provider)
+            host: provider, documentId: "doc-1", clientId: "earlier"
         )
         try write(earlier, "o1")
         let fixture = try await makeFixture(provider: provider, clientId: "now")
@@ -621,7 +621,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         let provider = try await makeProvider()
         let binding = try RecordLogDocumentBinding(
             host: provider, documentId: "doc-1", clientId: "client-1",
-            engine: BaoModelQueryEngine(host: provider), logger: Logger(level: .none)
+            logger: Logger(level: .none)
         )
         try binding.registerModel(Self.schema)
         let connection = RecordingConnection()
@@ -925,7 +925,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
     func testTheOwnWriterOpenedAfterAnOrphanDrainSendsItsOpenAlone() async throws {
         let provider = try await makeProvider()
         let earlier = try RecordLogDocumentBinding(
-            host: provider, documentId: "doc-1", clientId: "earlier", engine: BaoModelQueryEngine(host: provider)
+            host: provider, documentId: "doc-1", clientId: "earlier"
         )
         try write(earlier, "o1")
         let fixture = try await makeFixture(provider: provider, clientId: "now")
@@ -1112,7 +1112,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
     func testTheDocumentClosedAndOpenedAgainBetweenAnOrphanDrainAndTheOwnOpenedSendsNothingAhead() async throws {
         let provider = try await makeProvider()
         let earlier = try RecordLogDocumentBinding(
-            host: provider, documentId: "doc-1", clientId: "earlier", engine: BaoModelQueryEngine(host: provider)
+            host: provider, documentId: "doc-1", clientId: "earlier"
         )
         try write(earlier, "o1")
         let history = RecordLogWriterHistory()
@@ -1146,7 +1146,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         // the own writer's 1 with the orphan's duplicate.
         let provider = try await makeProvider()
         let earlier = try RecordLogDocumentBinding(
-            host: provider, documentId: "doc-1", clientId: "earlier", engine: BaoModelQueryEngine(host: provider)
+            host: provider, documentId: "doc-1", clientId: "earlier"
         )
         try write(earlier, "o1")
         let fixture = try await makeFixture(provider: provider, clientId: "now")

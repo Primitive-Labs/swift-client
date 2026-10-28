@@ -1,5 +1,5 @@
 import XCTest
-import SQLite3
+import JsBaoSQLite
 @testable import JsBaoClient
 
 /// The record-log store's durability and its group commit, on a real
@@ -20,10 +20,6 @@ final class RecordLogGroupCommitHermeticTests: XCTestCase {
         super.tearDown()
     }
 
-    private static let schema = PrimitiveSchema(
-        name: "Note",
-        fields: ["id": FieldDescriptor(type: .id), "title": FieldDescriptor(type: .string)]
-    )
 
     private func makeProvider() async throws -> SQLiteStorageProvider {
         let directory = NSTemporaryDirectory() + "/record-log-group-\(UUID().uuidString)"
@@ -37,11 +33,8 @@ final class RecordLogGroupCommitHermeticTests: XCTestCase {
     private func makeStore(_ host: any Format2SqlHost, provider: SQLiteStorageProvider) throws -> (RecordLogStore, String) {
         let store = RecordLogStore(host: host, documentId: "doc-1", clientId: "client-1")
         try store.initialize()
-        try RecordLogQueryProjection.prepare(schema: Self.schema, engine: BaoModelQueryEngine(host: provider), host: provider)
         return (store, try store.mintWriter())
     }
-
-    private var spec: RecordLogProjectionSpec { RecordLogProjectionSpec(schema: Self.schema) }
 
     @discardableResult
     private func save(_ store: RecordLogStore, _ writer: String, _ id: String,
@@ -49,7 +42,7 @@ final class RecordLogGroupCommitHermeticTests: XCTestCase {
         try store.commitEntries(
             writer: writer,
             writes: [RecordLogWrite(mutations: [RecordLogMutation(model: "Note", id: id, kind: .create, fields: ["title": .string(id)])])],
-            project: [spec], listener: listener
+            listener: listener
         ).entries[0]
     }
 
@@ -198,14 +191,13 @@ final class RecordLogGroupCommitHermeticTests: XCTestCase {
         let hooks = Hooks()
         try install(hooks, on: provider)
         let failures = LockedBox<[String]>([])
-        let spec = spec
         DispatchQueue.concurrentPerform(iterations: 2) { thread in
             for index in 0..<25 {
                 let id = "t\(thread)-\(index)"
                 let write = RecordLogWrite(mutations: [
                     RecordLogMutation(model: "Note", id: id, kind: .create, fields: ["title": .string(id)]),
                 ])
-                do { _ = try store.commitEntries(writer: writer, writes: [write], project: [spec]) } catch {
+                do { _ = try store.commitEntries(writer: writer, writes: [write]) } catch {
                     failures.withValue { $0.append("\(error)") }
                 }
             }
@@ -246,7 +238,7 @@ final class RecordLogGroupCommitHermeticTests: XCTestCase {
         XCTAssertEqual(provider.recordLogGroupCommit.groupsCommitted, groups + 1)
 
         try save(store, writer, "b")
-        _ = try store.receive(writer: writer, items: [.void(seq: 99)], project: [spec])
+        _ = try store.receive(writer: writer, items: [.void(seq: 99)])
         XCTAssertEqual(provider.recordLogGroupCommit.groupsCommitted, groups + 2, "a session command closed the group before it ran")
         XCTAssertEqual(hooks.commits, 4, "the group, then the command's own transaction")
         XCTAssertFalse(try groupOpen(provider))
@@ -342,8 +334,6 @@ final class RecordLogGroupCommitHermeticTests: XCTestCase {
         XCTAssertEqual(try synchronous(provider), 2, "the setting is put back after a rollback too")
         XCTAssertEqual(try store.pendingOf(writer), [], "the group's pending entries are gone")
         XCTAssertNil(try store.read(model: "Note", id: "a"), "and so is the view's guess")
-        let projected = try provider.withConnection { try $0.query("SELECT COUNT(*) AS n FROM \"Note\"").first?["n"].intValue }
-        XCTAssertEqual(projected, 0)
 
         // The store carries on.
         try save(store, writer, "b")

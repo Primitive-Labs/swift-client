@@ -1,0 +1,13 @@
+{
+  "name": "databases.revokeGroupPermission",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "DELETE",
+  "path": "/app/<appId>/api/databases/<ulid>/group-permissions/team/baseline",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "success": true
+  }
+}

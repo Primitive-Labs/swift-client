@@ -55,8 +55,8 @@ final class ListEnvelopeNoCursorAliasHermeticTests: XCTestCase {
         try assertEnvelope(InvitationListResult.self, next: { $0.nextCursor }, hasMore: { $0.hasMore })
     }
 
-    func testListWorkflowRunsResult() throws {
-        try assertEnvelope(ListWorkflowRunsResult.self, next: { $0.nextCursor }, hasMore: { $0.hasMore })
+    func testFunctionRunPage() throws {
+        try assertEnvelope(FunctionRunPage.self, next: { $0.nextCursor }, hasMore: { $0.hasMore })
     }
 
     func testPaginatedResultOfCollections() throws {

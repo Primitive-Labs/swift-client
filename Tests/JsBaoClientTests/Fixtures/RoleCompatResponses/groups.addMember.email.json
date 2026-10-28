@@ -1,0 +1,23 @@
+{
+  "name": "groups.addMember.email",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/groups/team/baseline/members",
+  "caller": "owner",
+  "request": {
+    "email": "<email>"
+  },
+  "status": 200,
+  "body": {
+    "status": "pending_signup",
+    "email": "<email>",
+    "appInvitationCreated": true,
+    "deferredId": "<ulid>",
+    "expiresAt": "<iso>",
+    "groupType": "team",
+    "groupId": "baseline",
+    "invitationId": "<ulid>",
+    "inviteToken": "<token>"
+  }
+}

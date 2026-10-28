@@ -294,8 +294,21 @@ public final class DocumentManager: @unchecked Sendable {
     /// metadata. Wired by `JsBaoClient`; `nil` in a manager driven without
     /// one, which has no record-log storage to purge either.
     var purgeLocalStoreData: ((String) async -> Void)?
+    /// The retention sweep's door for a db3 (a format-3 document): removed
+    /// unforced through `client.db3`'s lifecycle, which keeps one subscribed
+    /// or holding unjudged writes. Answers whether it was removed. Wired by
+    /// `JsBaoClient`; `nil` sweeps a db3 as any other document.
+    var evictDb3ForRetention: ((String) async -> Bool)?
     var fetchDocumentInfo: ((String) async throws -> DocumentInfo)?
     var createRemoteDocument: (([String: Any]) async throws -> [String: Any])?
+    /// #4921 — commit a pending db3 create through `POST db3`; answers the db3.
+    var createRemoteDb3: ((JSONValue) async throws -> Db3Info)?
+    /// #4921 — a pending db3 create committed: adopt the server's answer and announce it.
+    var onDb3CreateCommitted: ((String, Db3Info) async -> Void)?
+    /// #4921 — the server refused a pending db3 create for good: announce it.
+    var onDb3CreateRefused: ((String, Db3CreateFailedEvent) -> Void)?
+    /// The pending creates whose commit attempt is running now: one at a time per id (#4921).
+    private var commitAttemptsInFlight: Set<String> = []
     /// Fires once a `pendingCreate` document exists server-side. The
     /// syncStep1 sent before the commit landed gets no `syncComplete` back
     /// (the server had no such document), so its in-flight claim is released
@@ -1819,43 +1832,48 @@ public final class DocumentManager: @unchecked Sendable {
             guard let documentId = docData["documentId"] as? String else { continue }
             seenIds.insert(documentId)
 
-            var entry = getLocalMetadata(documentId) ?? LocalMetadataEntry(documentId: documentId)
-            if let title = docData["title"] as? String { entry.title = title }
-            if let perm = docData["permission"] as? String { entry.permission = perm }
-            if let createdBy = docData["createdBy"] as? String { entry.createdBy = createdBy }
-            if let createdAt = docData["createdAt"] as? String { entry.createdAt = createdAt }
-            if let modifiedAt = docData["modifiedAt"] as? String { entry.modifiedAt = modifiedAt }
-            if let tags = docData["tags"] as? [String] { entry.tags = tags }
-            // A key the server sends as null is a *clear*, not "unchanged" —
-            // js-bao's `{...existing, ...incoming}` merge overwrites with the
-            // null. Assigning only on a `String` would keep a thumbnail alive
-            // locally forever after another client removed it.
-            if let thumbnailBlobId = docData["thumbnailBlobId"] {
-                entry.thumbnailBlobId = thumbnailBlobId as? String
-            }
-            if let grantedAt = docData["grantedAt"] { entry.grantedAt = grantedAt as? String }
-            if let lastModified = docData["lastModified"] as? String {
-                entry.lastSyncedAt = lastModified
-            }
-            entry.metadataSyncedAt = nowIso
-
-            if let permStr = docData["permission"] as? String {
-                entry.lastKnownPermission = permStr
-                entry.permissionCachedAt = nowIso
-            }
-
             let perm = (docData["permission"] as? String).flatMap(DocumentPermission.init(rawValue:))
-            let owner: String? = lock.withLock {
+            // The merge reads the cached entry and writes it back under one
+            // lock. Read outside it, a commit that cleared `pendingCreate` in
+            // between was overwritten with the stale `pendingCreate: true`,
+            // and the create never settled: the create's HTTP answer and the
+            // server's word on the new document arrive together.
+            let written: (owner: String, entry: LocalMetadataEntry)? = lock.withLock {
                 if sessionEnded() { return nil }
+                var entry = metadataIndex[documentId] ?? LocalMetadataEntry(documentId: documentId)
+                if let title = docData["title"] as? String { entry.title = title }
+                if let perm = docData["permission"] as? String { entry.permission = perm }
+                if let createdBy = docData["createdBy"] as? String { entry.createdBy = createdBy }
+                if let createdAt = docData["createdAt"] as? String { entry.createdAt = createdAt }
+                if let modifiedAt = docData["modifiedAt"] as? String { entry.modifiedAt = modifiedAt }
+                if let tags = docData["tags"] as? [String] { entry.tags = tags }
+                // A key the server sends as null is a *clear*, not "unchanged" —
+                // js-bao's `{...existing, ...incoming}` merge overwrites with the
+                // null. Assigning only on a `String` would keep a thumbnail alive
+                // locally forever after another client removed it.
+                if let thumbnailBlobId = docData["thumbnailBlobId"] {
+                    entry.thumbnailBlobId = thumbnailBlobId as? String
+                }
+                if let grantedAt = docData["grantedAt"] { entry.grantedAt = grantedAt as? String }
+                if let lastModified = docData["lastModified"] as? String {
+                    entry.lastSyncedAt = lastModified
+                }
+                entry.metadataSyncedAt = nowIso
+
+                if let permStr = docData["permission"] as? String {
+                    entry.lastKnownPermission = permStr
+                    entry.permissionCachedAt = nowIso
+                }
+
                 metadataIndex[documentId] = entry
                 noteMetadataTouchLocked(documentId)
                 // The doc is present again; a prior delete no longer suppresses
                 // a future one.
                 deletedMetadataIds.remove(documentId)
                 if let perm { docPermissions[documentId] = perm }
-                return userId
+                return (userId, entry)
             }
-            guard let owner else { return }
+            guard let (owner, entry) = written else { return }
 
             // Persist
             _ = try? await putMetadataTracked(entry, userId: owner)
@@ -1937,11 +1955,14 @@ public final class DocumentManager: @unchecked Sendable {
         ifUnconfirmedSince candidate: EvictionCandidate? = nil,
         sessionEnded: () -> Bool = { false }
     ) async {
+        // A db3 is kept too: a revoked one keeps its rows and the writes the
+        // room has not judged (`client.db3.evict` removes it).
         let exempt = lock.withLock {
             pendingCreates.contains(documentId)
                 || localOnlyDocs.contains(documentId)
                 || metadataIndex[documentId]?.pendingCreate == true
                 || metadataIndex[documentId]?.localOnly == true
+                || metadataIndex[documentId]?.documentFormat == 3
         }
         guard !exempt else { return }
 
@@ -2010,6 +2031,9 @@ public final class DocumentManager: @unchecked Sendable {
                 if localOnlyDocs.contains(documentId) { return false }
                 if metadataIndex[documentId]?.localOnly == true { return false }
                 if metadataIndex[documentId]?.pendingCreate == true { return false }
+                // A db3 the listing does not mention is kept (a revoked one
+                // keeps its rows and unjudged writes).
+                if metadataIndex[documentId]?.documentFormat == 3 { return false }
                 if let eligible {
                     // Not in the snapshot: it entered the cache after the
                     // caller started fetching, so the fetch says nothing about
@@ -2093,6 +2117,10 @@ public final class DocumentManager: @unchecked Sendable {
 
         guard let metadata = metadata else {
             // metadata: null — the document was deleted or access was revoked.
+            // A db3 is kept: a revoked one keeps its rows and the writes the
+            // room has not judged, and turns `gone` at its room's refusal
+            // (`client.db3.evict` removes it), as the listing keeps it.
+            if lock.withLock({ metadataIndex[documentId]?.documentFormat }) == 3 { return }
             await evictLocalData(documentId: documentId)
             let alreadyDeleted = lock.withLock { !deletedMetadataIds.insert(documentId).inserted }
             if alreadyDeleted { return }
@@ -2106,49 +2134,58 @@ public final class DocumentManager: @unchecked Sendable {
             return
         }
 
-        let existing = getLocalMetadata(documentId)
-        var next = existing ?? LocalMetadataEntry(documentId: documentId)
-
-        // Present key → assign; present-but-null → clear. That is what js-bao's
-        // `{...existing, ...incoming}` merge does, and it is the difference
-        // between a cleared thumbnail disappearing locally and surviving every
-        // later sync. An absent key leaves the cached value alone.
-        if let title = metadata["title"] { next.title = title.stringValue }
-        if let createdBy = metadata["createdBy"] { next.createdBy = createdBy.stringValue }
-        if let createdAt = metadata["createdAt"] { next.createdAt = createdAt.stringValue }
-        if let modifiedAt = metadata["modifiedAt"] { next.modifiedAt = modifiedAt.stringValue }
-        if let thumbnailBlobId = metadata["thumbnailBlobId"] {
-            next.thumbnailBlobId = thumbnailBlobId.stringValue
-        }
-        if let grantedAt = metadata["grantedAt"] { next.grantedAt = grantedAt.stringValue }
-        if let createCommittedAt = metadata["createCommittedAt"] {
-            next.createCommittedAt = createCommittedAt.stringValue
-        }
-        if let tags = metadata["tags"] {
-            next.tags = tags.arrayValue?.compactMap { $0.stringValue }
-        }
-        // The server's opaque per-document blob is cached under `docMetadata`
-        // so it cannot collide with the envelope's own fields — same split JS
-        // makes.
-        if let docMetadata = metadata["metadata"] { next.docMetadata = docMetadata }
-
         let nowIso = ISO8601DateFormatter().string(from: Date())
-        if source == "server" {
-            next.metadataSyncedAt = nowIso
-            if let lastModified = metadata["lastModified"]?.stringValue {
-                next.lastSyncedAt = lastModified
-            }
-        }
-
         let permissionString = metadata["permission"]?.stringValue
-        if let permissionString = permissionString {
-            next.permission = permissionString
-            next.lastKnownPermission = permissionString
-            next.permissionCachedAt = nowIso
-        }
+        // Merged and written under one lock, for the reason given in
+        // `handleServerDocuments`: the `created` frame for this client's own
+        // create lands together with the create's HTTP answer, and a merge
+        // read outside the lock put back the `pendingCreate: true` the commit
+        // had just cleared.
+        let (existing, next): (LocalMetadataEntry?, LocalMetadataEntry) = lock.withLock {
+            let existing = metadataIndex[documentId]
+            var next = existing ?? LocalMetadataEntry(documentId: documentId)
 
-        setMetadata(documentId, entry: next)
-        lock.withLock { _ = deletedMetadataIds.remove(documentId) }
+            // Present key → assign; present-but-null → clear. That is what js-bao's
+            // `{...existing, ...incoming}` merge does, and it is the difference
+            // between a cleared thumbnail disappearing locally and surviving every
+            // later sync. An absent key leaves the cached value alone.
+            if let title = metadata["title"] { next.title = title.stringValue }
+            if let createdBy = metadata["createdBy"] { next.createdBy = createdBy.stringValue }
+            if let createdAt = metadata["createdAt"] { next.createdAt = createdAt.stringValue }
+            if let modifiedAt = metadata["modifiedAt"] { next.modifiedAt = modifiedAt.stringValue }
+            if let thumbnailBlobId = metadata["thumbnailBlobId"] {
+                next.thumbnailBlobId = thumbnailBlobId.stringValue
+            }
+            if let grantedAt = metadata["grantedAt"] { next.grantedAt = grantedAt.stringValue }
+            if let createCommittedAt = metadata["createCommittedAt"] {
+                next.createCommittedAt = createCommittedAt.stringValue
+            }
+            if let tags = metadata["tags"] {
+                next.tags = tags.arrayValue?.compactMap { $0.stringValue }
+            }
+            // The server's opaque per-document blob is cached under `docMetadata`
+            // so it cannot collide with the envelope's own fields — same split JS
+            // makes.
+            if let docMetadata = metadata["metadata"] { next.docMetadata = docMetadata }
+
+            if source == "server" {
+                next.metadataSyncedAt = nowIso
+                if let lastModified = metadata["lastModified"]?.stringValue {
+                    next.lastSyncedAt = lastModified
+                }
+            }
+
+            if let permissionString = permissionString {
+                next.permission = permissionString
+                next.lastKnownPermission = permissionString
+                next.permissionCachedAt = nowIso
+            }
+
+            metadataIndex[documentId] = next
+            noteMetadataTouchLocked(documentId)
+            deletedMetadataIds.remove(documentId)
+            return (existing, next)
+        }
         _ = try? await putMetadataTracked(next)
 
         // A server `created` for a document we already knew about is an
@@ -2242,7 +2279,9 @@ public final class DocumentManager: @unchecked Sendable {
         localOnly: Bool,
         tags: [String]? = nil,
         docMetadata: JSONValue? = nil,
-        documentFormat: Int? = nil
+        documentFormat: Int? = nil,
+        db3Create: Bool = false,
+        db3Type: String? = nil
     ) async throws -> LocalMetadataEntry {
         // The one combination that can never work, refused before anything
         // moves: no entry built, no lock taken, no classification registered,
@@ -2269,6 +2308,12 @@ public final class DocumentManager: @unchecked Sendable {
         // `commitOfflineCreate` can replay it into the server POST body
         // rather than dropping it. Mirrors js-bao (#673).
         metadata.docMetadata = docMetadata
+        // #4921 — a db3 `client.db3.create` made here commits through `POST db3`, with its type.
+        if db3Create {
+            metadata.db3Create = true
+            metadata.db3Type = db3Type
+            metadata.createdBy = userId
+        }
 
         // The sync protocol, the awareness entry and the update observer are
         // all built by `_openDocumentImpl`, which is now the only writer of
@@ -2462,6 +2507,8 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         let metadata = getLocalMetadata(documentId)
+        // #4921 — a db3 created by `client.db3.create` commits through `POST db3`.
+        if metadata?.db3Create == true { return try await commitDb3Create(documentId: documentId, metadata: metadata) }
 
         do {
             var body: [String: Any] = ["documentId": documentId]
@@ -2553,6 +2600,112 @@ public final class DocumentManager: @unchecked Sendable {
         }
     }
 
+    /// Whether a failed db3 commit is retried (#4921): a transport failure (any
+    /// error that is not an HTTP answer), a 5xx, 408, 429, or 409
+    /// `DB3_CREATE_IN_PROGRESS`. Any other refusal is terminal.
+    static func isRetryableDb3CommitFailure(_ error: Error) -> Bool {
+        guard let http = error as? HttpError else { return true }
+        if http.status >= 500 || http.status == 408 || http.status == 429 { return true }
+        return http.status == 409 && http.serverCode == "DB3_CREATE_IN_PROGRESS"
+    }
+
+    /// Commit a db3 `client.db3.create` made on this device (#4921): `POST db3`
+    /// with `{ id, title, tags?, metadata?, type? }`. Committed (201, or 200
+    /// for this caller's own create whose first answer was lost), it settles
+    /// as a documents commit does and hands the server's row to
+    /// `onDb3CreateCommitted`. A retryable failure is thrown for the backoff
+    /// to retry. Any other refusal is terminal: the create stays pending and
+    /// readable, marked `commitRefused` with the refusal in `commitError`, and
+    /// `onDb3CreateRefused` announces it once. A taken id is a refusal, never
+    /// "already committed". An answer that arrives once the create is no
+    /// longer pending here, or after another user signed in, belongs to no one
+    /// on this device: nothing is settled, refused, announced or adopted.
+    private func commitDb3Create(documentId: String, metadata: LocalMetadataEntry?) async throws -> [String: Any] {
+        var body: [String: JSONValue] = ["id": .string(documentId)]
+        if let title = metadata?.title { body["title"] = .string(title) }
+        if let tags = metadata?.tags, !tags.isEmpty { body["tags"] = .array(tags.map(JSONValue.string)) }
+        if let docMetadata = metadata?.docMetadata { body["metadata"] = docMetadata }
+        // Whatever type the create named, an empty one included, so the
+        // server judges it as it would have online.
+        if let type = metadata?.db3Type { body["type"] = .string(type) }
+        guard let createRemoteDb3 else {
+            throw JsBaoError(code: .unavailable, message: "Remote db3 create not configured")
+        }
+        let owner = lock.withLock { userId }
+        let ownerChanged = { [unowned self] in self.lock.withLock { self.userId != owner } }
+        let stale = { [unowned self] in ownerChanged() || !self.isPendingCreate(documentId) }
+        let answer: Db3Info
+        do {
+            answer = try await createRemoteDb3(.object(body))
+        } catch {
+            if stale() { return ["reason": "not_pending"] }
+            let message = (error as? HttpError)?.serverMessage ?? error.localizedDescription
+            emitter?.emit(PendingCreateFailedEvent(documentId: documentId, error: message))
+            if Self.isRetryableDb3CommitFailure(error) { throw error }
+            let code = (error as? HttpError)?.serverCode ?? "DB3_CREATE_FAILED"
+            let refused: LocalMetadataEntry? = lock.withLock {
+                pendingCreateRetryTimers[documentId]?.cancel()
+                pendingCreateRetryTimers.removeValue(forKey: documentId)
+                guard var meta = metadataIndex[documentId] else { return nil }
+                meta.commitRefused = true
+                meta.commitError = CommitError(message: message, at: ISO8601DateFormatter().string(from: Date()), code: code)
+                meta.nextCommitAttemptAt = nil
+                metadataIndex[documentId] = meta
+                return meta
+            }
+            if let refused { _ = try? await putMetadataTracked(refused) }
+            onDb3CreateRefused?(documentId, Db3CreateFailedEvent(
+                code: code, message: message, title: metadata?.title, type: metadata?.db3Type, id: documentId
+            ))
+            return ["refused": true, "reason": message]
+        }
+        if stale() { return ["reason": "not_pending"] }
+        let settled: LocalMetadataEntry? = lock.withLock {
+            pendingCreates.remove(documentId)
+            pendingCreateRetryTimers[documentId]?.cancel()
+            pendingCreateRetryTimers.removeValue(forKey: documentId)
+            guard var meta = metadataIndex[documentId] else { return nil }
+            meta.pendingCreate = false
+            meta.commitError = nil
+            meta.commitRefused = nil
+            meta.commitRetryCount = nil
+            meta.nextCommitAttemptAt = nil
+            metadataIndex[documentId] = meta
+            noteMetadataTouchLocked(documentId)
+            return meta
+        }
+        guard let settled else { return ["reason": "not_pending"] }
+        _ = try? await putMetadataTracked(settled)
+        emitter?.emit(PendingCreateCommittedEvent(documentId: documentId))
+        applyPostCommitPolicy(documentId)
+        // Adopted only into the account that made it.
+        if ownerChanged() { return ["created": true] }
+        await onDb3CreateCommitted?(documentId, answer)
+        return ["created": true]
+    }
+
+    /// An explicit retry of a pending db3 create (#4921), as js-bao's
+    /// `retryPendingCreate`: a fresh round through the backoff scheduler. The
+    /// refusal mark and the retry bookkeeping go and a waiting timer is
+    /// replaced, so a transient failure on this attempt is retried by the
+    /// backoff; an attempt already running is joined, not doubled.
+    func retryDb3Create(documentId: String) async -> [String: Any] {
+        let cleared: LocalMetadataEntry? = lock.withLock {
+            pendingCreateRetryTimers[documentId]?.cancel()
+            pendingCreateRetryTimers.removeValue(forKey: documentId)
+            guard var meta = metadataIndex[documentId] else { return nil }
+            meta.commitRefused = nil
+            meta.commitError = nil
+            meta.commitRetryCount = nil
+            meta.nextCommitAttemptAt = nil
+            metadataIndex[documentId] = meta
+            return meta
+        }
+        if let cleared { _ = try? await putMetadataTracked(cleared) }
+        scheduleCommitRetry(documentId: documentId)
+        return ["scheduled": true]
+    }
+
     /// Background commit with exponential-backoff retry. Mirrors js-bao's
     /// `DocumentManager.scheduleCommitRetry` (`documentManager.ts`): attempts
     /// `commitOfflineCreate(onExists: "fail")`; on a transient failure it
@@ -2564,14 +2717,27 @@ public final class DocumentManager: @unchecked Sendable {
     func scheduleCommitRetry(documentId: String, attempt: Int = 0) {
         if let isOnlineProvider, !isOnlineProvider() { return }
         let backoff = commitRetryBackoff
+        // #4921 — one active attempt per id, and a db3 create the server
+        // refused waits for an explicit `commitOfflineCreate`.
+        let start: Bool = lock.withLock {
+            if metadataIndex[documentId]?.db3Create == true && metadataIndex[documentId]?.commitRefused == true { return false }
+            if commitAttemptsInFlight.contains(documentId) { return false }
+            if attempt == 0 && pendingCreateRetryTimers[documentId] != nil { return false }
+            commitAttemptsInFlight.insert(documentId)
+            return true
+        }
+        guard start else { return }
 
         Task { [weak self] in
             guard let self else { return }
+            defer { self.lock.withLock { _ = self.commitAttemptsInFlight.remove(documentId) } }
             do {
                 let result = try await self.commitOfflineCreate(documentId: documentId, onExists: "fail")
                 // created / linked / already-exists → committed, no retry.
                 if result["created"] != nil || result["linked"] != nil { return }
                 if (result["reason"] as? String) == "exists" { return }
+                // A refused db3 create is not retried.
+                if result["refused"] != nil { return }
             } catch {
                 // Doc is no longer pending (committed or cancelled mid-flight) → stop.
                 guard self.isPendingCreate(documentId) else { return }
@@ -2639,8 +2805,11 @@ public final class DocumentManager: @unchecked Sendable {
                     return
                 }
 
-                // Schedule the next attempt.
+                // Schedule the next attempt. This attempt ends in the same
+                // lock the timer is set in, so the timer's attempt is never
+                // turned away as a second one, and a re-drive sees the timer.
                 self.lock.withLock {
+                    self.commitAttemptsInFlight.remove(documentId)
                     self.pendingCreateRetryTimers[documentId]?.cancel()
                     let timer = Task { [weak self] in
                         try? await Task.sleep(nanoseconds: UInt64(max(0, delayMs)) * 1_000_000)
@@ -3015,6 +3184,17 @@ public final class DocumentManager: @unchecked Sendable {
     /// long-lived open document hold the local store over its byte budget
     /// indefinitely. Order of enforcement matches JS: TTL first, then maxDocs,
     /// then maxBytes.
+    /// One document the retention sweep removes: a db3 through its lifecycle's
+    /// door (which may keep it), any other by its local data. Answers whether it went.
+    @discardableResult
+    private func retentionEvict(_ meta: LocalMetadataEntry) async -> Bool {
+        if meta.documentFormat == 3, let evictDb3 = evictDb3ForRetention {
+            return await evictDb3(meta.documentId)
+        }
+        await evictLocalData(documentId: meta.documentId)
+        return true
+    }
+
     public func enforceRetentionPolicy(
         ttlMs: Int? = nil,
         maxDocs: Int? = nil,
@@ -3035,7 +3215,7 @@ public final class DocumentManager: @unchecked Sendable {
                       let date = formatter.date(from: lastOpenedAt) else { continue }
                 let ageMs = nowMs - (date.timeIntervalSince1970 * 1000)
                 if ageMs > Double(ttlMs) {
-                    await evictLocalData(documentId: meta.documentId)
+                    await retentionEvict(meta)
                 }
             }
         }
@@ -3050,11 +3230,13 @@ public final class DocumentManager: @unchecked Sendable {
             return aTs < bTs
         }
 
-        // maxDocs: drop the oldest until count fits.
+        // maxDocs: drop the oldest until count fits. A db3 its lifecycle keeps
+        // does not count: the walk goes on to the next oldest.
         if let maxDocs, evictable.count > maxDocs {
-            let toEvict = evictable.prefix(evictable.count - maxDocs)
-            for meta in toEvict {
-                await evictLocalData(documentId: meta.documentId)
+            var owed = evictable.count - maxDocs
+            for meta in evictable {
+                if owed <= 0 { break }
+                if await retentionEvict(meta) { owed -= 1 }
             }
         }
 
@@ -3070,8 +3252,7 @@ public final class DocumentManager: @unchecked Sendable {
             var total = after.reduce(0) { $0 + ($1.localBytes ?? 0) }
             for meta in after {
                 if total <= maxBytes { break }
-                await evictLocalData(documentId: meta.documentId)
-                total -= (meta.localBytes ?? 0)
+                if await retentionEvict(meta) { total -= (meta.localBytes ?? 0) }
             }
         }
     }
@@ -3605,7 +3786,10 @@ public final class DocumentManager: @unchecked Sendable {
         lock.withLock {
             for entry in entries {
                 metadataIndex[entry.documentId] = entry
-                if entry.pendingCreate == true {
+                // #4921 — a db3 create names the user who made it; another
+                // user's is neither listed nor committed under this user's token.
+                let anotherUsersDb3 = entry.db3Create == true && entry.createdBy != nil && entry.createdBy != userId
+                if entry.pendingCreate == true && !anotherUsersDb3 {
                     pendingCreates.insert(entry.documentId)
                 }
                 if entry.localOnly == true {

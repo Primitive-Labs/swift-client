@@ -22,15 +22,23 @@ import Foundation
 ///   write (`upsert` marks the value it upserts on).
 /// - `record_log_handled`: per writer and record, the refusals it acted on.
 /// - `record_log_epoch_counts`: the entries seen applied per epoch.
-/// - `record_log_projection`: the models whose query tables hold a document's view.
 /// - `record_log_load_keys`: per receipt attempt, the records a bulk load's
 ///   chunks named, kept until the attempt applied its last chunk or a full
 ///   replacement made it right, so a refresh removes the others.
+/// - `record_log_indexes`: per document, the room's index list as the store
+///   last read it, from which the view's lookup indexes are built
+///   (``RecordLogIndexes``).
+/// - `record_log_staged_base`: per document and record, the previous
+///   completed generation's confirmed row (`_data` NULL when it had none) of
+///   each record a staged full replacement has rewritten: the base a view
+///   refresh guesses over until the replacement commits.
 ///
-/// One table is this client's alone: `record_log_owner`, the authenticated
-/// user the tables belong to. The browser's store is scoped by user through
-/// its file's namespace; this provider's file is one per app, so the owner is
-/// written down and a sign-in as someone else resets the store.
+/// `record_log_owner` is this client's alone: the authenticated user the tables
+/// belong to (the browser's store is scoped by user through its file's
+/// namespace; this provider's file is one per app, so the owner is written down
+/// and a sign-in as someone else resets the store). `record_log_meta` is
+/// store-wide, as js-bao's: the storage version (``storageVersion``); a store
+/// without it is version 1.
 enum RecordLogSchema {
     /// Every table the JS store keeps, in its order.
     static let clientTables = [
@@ -43,8 +51,9 @@ enum RecordLogSchema {
         "record_log_pending_values",
         "record_log_handled",
         "record_log_epoch_counts",
-        "record_log_projection",
         "record_log_load_keys",
+        "record_log_indexes",
+        "record_log_staged_base",
     ]
 
     /// The columns a store created by an earlier version lacks, with the
@@ -53,10 +62,18 @@ enum RecordLogSchema {
     static let addedColumns: [(table: String, column: String, add: String)] = [
         ("record_log_state", "receipt", "ALTER TABLE record_log_state ADD COLUMN receipt TEXT"),
         ("record_log_state", "segment", "ALTER TABLE record_log_state ADD COLUMN segment TEXT"),
+        ("record_log_state", "staged", "ALTER TABLE record_log_state ADD COLUMN staged INTEGER"),
     ]
 
     /// The table naming the user the record-log tables belong to.
     static let ownerTable = "record_log_owner"
+
+    /// The storage version a store is brought to at open (#4700): a db3's rows
+    /// live in its view only, its indexes come from the room's list. Version 1
+    /// kept the query projection (model tables with `_meta_doc_id`, their
+    /// marks and rule, and indexes built from declarations). A build that
+    /// changes the tables raises it: a store at the version runs no DDL at open.
+    static let storageVersion = 2
 
     /// The statements that create the tables. Each is idempotent.
     static let ddl: [String] = [
@@ -92,7 +109,8 @@ enum RecordLogSchema {
           rows_gen INTEGER NOT NULL DEFAULT 0,
           replacing INTEGER,
           receipt TEXT,
-          segment TEXT
+          segment TEXT,
+          staged INTEGER
         )
         """,
         """
@@ -176,13 +194,6 @@ enum RecordLogSchema {
         )
         """,
         """
-        CREATE TABLE IF NOT EXISTS record_log_projection (
-          doc_id TEXT NOT NULL,
-          model TEXT NOT NULL,
-          PRIMARY KEY (doc_id, model)
-        )
-        """,
-        """
         CREATE TABLE IF NOT EXISTS record_log_load_keys (
           doc_id TEXT NOT NULL,
           attempt TEXT NOT NULL,
@@ -191,18 +202,28 @@ enum RecordLogSchema {
           PRIMARY KEY (doc_id, attempt, _type, _id)
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_indexes (
+          doc_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          fields TEXT NOT NULL,
+          is_unique INTEGER NOT NULL DEFAULT 0,
+          room_name TEXT,
+          PRIMARY KEY (doc_id, model, fields)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_staged_base (
+          doc_id TEXT NOT NULL,
+          _type TEXT NOT NULL,
+          _id TEXT NOT NULL,
+          _data TEXT,
+          PRIMARY KEY (doc_id, _type, _id)
+        )
+        """,
         "CREATE TABLE IF NOT EXISTS record_log_owner (user_id TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS record_log_meta (key TEXT PRIMARY KEY, value TEXT)",
     ]
-
-    /// The name of a field-lookup index on the view (or the confirmed rows):
-    /// one per model and field (or compound constraint), the JS name.
-    static func fieldIndexName(kind: FieldIndexKind, model: String, name: String, table: IndexedTable = .view) -> String {
-        let tag = kind == .field ? "f" : "u"
-        return "idx_record_log_\(table.rawValue)_\(tag)\(model.utf16.count)_\(model.lowercased())_\(name.lowercased())"
-    }
-
-    enum FieldIndexKind { case field, constraint }
-    enum IndexedTable: String { case view, rows }
 
     /// The identifier policy names must pass to be written into SQL as literals.
     static func isValidIdentifier(_ name: String) -> Bool {

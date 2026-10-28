@@ -226,6 +226,7 @@ final class AgentSessionListHermeticTests: XCTestCase {
         // The session the next page held is gone: that page comes back empty.
         w.remove("s1")
         try await list.loadMore()
+        try await eventually { count.value >= 1 }
         try await settle()
         XCTAssertEqual(ids(list), ["s2"])
         XCTAssertFalse(list.hasMore)
@@ -243,6 +244,7 @@ final class AgentSessionListHermeticTests: XCTestCase {
         // A page filtered by scope after it is read can be empty with more behind it.
         w.answerNext(PaginatedResult(items: [], nextCursor: "next", hasMore: true))
         try await list.refresh()
+        try await eventually { count.value >= 1 }
         try await settle()
         XCTAssertTrue(list.items.isEmpty)
         XCTAssertTrue(list.hasMore)

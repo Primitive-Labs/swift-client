@@ -86,29 +86,12 @@ public final class DocumentIngestsAPI: @unchecked Sendable {
         sessionId: String,
         chunk: DocumentIngestChunk
     ) async throws -> DocumentIngestChunkUploadResult {
-        let boundary = "JsBaoIngest-\(UUID().uuidString)"
-        var payload = Data()
-        func append(_ text: String) { payload.append(contentsOf: text.utf8) }
-        let fields: [(String, String)] = [
-            ("model", chunk.model), ("index", String(chunk.index)), ("rows", String(chunk.rows)),
-            ("bytes", String(chunk.bytes)), ("rawBytes", String(chunk.rawBytes)), ("sha256", chunk.sha256),
-            ("firstId", chunk.firstId), ("lastId", chunk.lastId),
-        ]
-        for (name, value) in fields {
-            append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
-        }
-        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"chunk\"; filename=\"\(chunk.index).ndjson.gz\"\r\n")
-        append("Content-Type: application/gzip\r\n\r\n")
-        payload.append(chunk.body)
-        append("\r\n--\(boundary)--\r\n")
+        let boundary = DocumentIngestMultipart.boundary()
         return try await transport.request(
             method: .post,
             path: path(documentId, sessionId, "chunks"),
-            bodyData: payload,
-            options: RequestOptions(
-                rawBody: true,
-                customHeaders: ["Content-Type": "multipart/form-data; boundary=\(boundary)"]
-            )
+            bodyData: DocumentIngestMultipart.body(chunk: chunk, boundary: boundary),
+            options: DocumentIngestMultipart.options(boundary: boundary)
         )
     }
 
@@ -138,5 +121,36 @@ public final class DocumentIngestsAPI: @unchecked Sendable {
         if let limit { query.append("limit", limit) }
         query.appendIfPresent("cursor", cursor)
         return try await transport.request(method: .get, path: path(documentId) + query.queryString)
+    }
+}
+
+/// The multipart body a chunk upload sends, shared by `client.documents.ingests`
+/// and `client.db3.ingests`: the descriptor's fields, then the chunk's bytes.
+enum DocumentIngestMultipart {
+    /// A fresh boundary for one upload.
+    static func boundary() -> String { "JsBaoIngest-\(UUID().uuidString)" }
+
+    /// The body for `chunk`, framed by `boundary`.
+    static func body(chunk: DocumentIngestChunk, boundary: String) -> Data {
+        var payload = Data()
+        func append(_ text: String) { payload.append(contentsOf: text.utf8) }
+        let fields: [(String, String)] = [
+            ("model", chunk.model), ("index", String(chunk.index)), ("rows", String(chunk.rows)),
+            ("bytes", String(chunk.bytes)), ("rawBytes", String(chunk.rawBytes)), ("sha256", chunk.sha256),
+            ("firstId", chunk.firstId), ("lastId", chunk.lastId),
+        ]
+        for (name, value) in fields {
+            append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
+        }
+        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"chunk\"; filename=\"\(chunk.index).ndjson.gz\"\r\n")
+        append("Content-Type: application/gzip\r\n\r\n")
+        payload.append(chunk.body)
+        append("\r\n--\(boundary)--\r\n")
+        return payload
+    }
+
+    /// The request options an upload goes out with: the body as it is, and its boundary.
+    static func options(boundary: String) -> RequestOptions {
+        RequestOptions(rawBody: true, customHeaders: ["Content-Type": "multipart/form-data; boundary=\(boundary)"])
     }
 }

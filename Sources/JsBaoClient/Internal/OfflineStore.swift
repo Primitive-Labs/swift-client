@@ -230,6 +230,88 @@ public actor OfflineStore {
         return record?.value
     }
 
+    // MARK: - Blob upload queue
+
+    /// The upload records of one app and user: one `PersistedUploadRecord`
+    /// per queue id. The Swift counterpart of the JS client's
+    /// `js-bao:blobs:<app>:<user>` database and its `uploads` store.
+    static func blobUploadsStore(appId: String, userId: String) -> String {
+        "blobUploads:\(appId):\(userId)"
+    }
+
+    /// The queued bytes of one app and user, keyed `<documentId>::<blobId>`.
+    static func blobUploadBytesStore(appId: String, userId: String) -> String {
+        "blobUploadBytes:\(appId):\(userId)"
+    }
+
+    static func blobUploadBytesKey(documentId: String, blobId: String) -> String {
+        "\(documentId)::\(blobId)"
+    }
+
+    /// Bind the database for an upload write or read without re-binding it.
+    ///
+    /// The stores name their app and user, so a write for an upload's owner
+    /// does not need the database bound to that owner, and it must not move
+    /// it: `MemoryStorageProvider.initialize` empties every store, so a
+    /// re-bind for another user would take the signed-in user's rows with it.
+    private func ensureBlobUploadDb(appId: String, userId: String) async throws {
+        if isInitialized { return }
+        try await ensureMetadataDb(appId: appId, userId: userId)
+    }
+
+    /// Write an upload's record, and its bytes when given. The bytes go
+    /// first, so a record is never stored without them.
+    func putBlobUpload(appId: String, userId: String, record: PersistedUploadRecord, bytes: Data?) async throws {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return }
+        if let bytes {
+            try await provider.put(
+                store: Self.blobUploadBytesStore(appId: appId, userId: userId),
+                key: Self.blobUploadBytesKey(documentId: record.documentId, blobId: record.blobId),
+                value: bytes,
+                metadata: nil
+            )
+        }
+        try await provider.put(
+            store: Self.blobUploadsStore(appId: appId, userId: userId), key: record.queueId, value: record, metadata: nil
+        )
+    }
+
+    /// Delete an upload's record, then its bytes.
+    func deleteBlobUpload(appId: String, userId: String, queueId: String, documentId: String, blobId: String) async throws {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return }
+        try await provider.delete(store: Self.blobUploadsStore(appId: appId, userId: userId), key: queueId)
+        try await provider.delete(
+            store: Self.blobUploadBytesStore(appId: appId, userId: userId),
+            key: Self.blobUploadBytesKey(documentId: documentId, blobId: blobId)
+        )
+    }
+
+    /// Every upload record of one app and user. A row that does not decode
+    /// as a record is skipped; the rest load.
+    func loadBlobUploads(appId: String, userId: String) async throws -> [PersistedUploadRecord] {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return [] }
+        let store = Self.blobUploadsStore(appId: appId, userId: userId)
+        var records: [PersistedUploadRecord] = []
+        for key in try await provider.keys(store: store) {
+            let row: StorageRecord<PersistedUploadRecord>? = try? await provider.get(store: store, key: key)
+            if let record = row?.value { records.append(record) }
+        }
+        return records
+    }
+
+    func loadBlobUploadBytes(appId: String, userId: String, documentId: String, blobId: String) async throws -> Data? {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return nil }
+        let row: StorageRecord<Data>? = try await provider.get(
+            store: Self.blobUploadBytesStore(appId: appId, userId: userId),
+            key: Self.blobUploadBytesKey(documentId: documentId, blobId: blobId)
+        )
+        return row?.value
+    }
+
     // MARK: - JWT Persistence
 
     public func loadPersistedJwt(appId: String, namespace: String) async throws -> PersistedJwtRecord? {
@@ -369,6 +451,15 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// js-bao's `hasIndexedDbSnapshot`; Swift's local store is SQLite, and the
     /// field keeps the JS name so cross-platform consumers read one vocabulary.
     public var hasIndexedDbSnapshot: Bool?
+    /// #4921 — a db3 `client.db3.create` made on this device: its pending
+    /// create commits through `POST db3` under its id, not `POST /documents`.
+    public var db3Create: Bool?
+    /// #4921 — the db3 type that commit asks the server to install.
+    public var db3Type: String?
+    /// #4921 — the server refused this pending db3 create for good (the
+    /// refusal is in `commitError`): reconnects do not repeat it, and
+    /// `commitOfflineCreate(documentId:)` tries again.
+    public var commitRefused: Bool?
 
     public init(
         documentId: String,
@@ -394,7 +485,10 @@ public struct LocalMetadataEntry: Codable, Sendable {
         thumbnailBlobId: String? = nil,
         grantedAt: String? = nil,
         createCommittedAt: String? = nil,
-        hasIndexedDbSnapshot: Bool? = nil
+        hasIndexedDbSnapshot: Bool? = nil,
+        db3Create: Bool? = nil,
+        db3Type: String? = nil,
+        commitRefused: Bool? = nil
     ) {
         self.documentId = documentId
         self.title = title
@@ -420,16 +514,22 @@ public struct LocalMetadataEntry: Codable, Sendable {
         self.grantedAt = grantedAt
         self.createCommittedAt = createCommittedAt
         self.hasIndexedDbSnapshot = hasIndexedDbSnapshot
+        self.db3Create = db3Create
+        self.db3Type = db3Type
+        self.commitRefused = commitRefused
     }
 }
 
 public struct CommitError: Codable, Sendable {
     public var message: String
     public var at: String
+    /// The server's refusal code, for a pending db3 create the server refused (#4921).
+    public var code: String?
 
-    public init(message: String, at: String) {
+    public init(message: String, at: String, code: String? = nil) {
         self.message = message
         self.at = at
+        self.code = code
     }
 }
 
@@ -451,6 +551,121 @@ public struct PersistedJwtRecord: Codable, Sendable {
     public var storedAt: String?
     public var userId: String?
     public var version: Int?
+}
+
+/// One queued upload as the client keeps it across launches: the JS client's
+/// `UploadRecord` (`src/client/internal/blobManager.ts`), field for field, so
+/// both clients describe an upload the same way. Times are ms since the
+/// epoch. `status` is `pending`, `uploading`, `paused` or `failed`;
+/// `uploaded` is never written. `destination` is set for a session upload
+/// and a db3 upload only, and a record without one is a document upload.
+struct PersistedUploadRecord: Codable, Sendable, Equatable {
+    var queueId: String
+    var documentId: String
+    var blobId: String
+    var filename: String
+    var contentType: String
+    var sha256Base64: String
+    var disposition: String?
+    var retainLocal: Bool?
+    var numBytes: Int
+    var status: String
+    var attempts: Int
+    var nextAttemptAt: Double
+    var createdAt: Double
+    var updatedAt: Double
+    var lastError: String?
+    var lastErrorCode: String?
+    var destination: UploadDestination?
+
+    init(
+        queueId: String, documentId: String, blobId: String, filename: String, contentType: String,
+        sha256Base64: String, disposition: String?, retainLocal: Bool?, numBytes: Int, status: String,
+        attempts: Int, nextAttemptAt: Double, createdAt: Double, updatedAt: Double,
+        lastError: String?, lastErrorCode: String?, destination: UploadDestination?
+    ) {
+        self.queueId = queueId
+        self.documentId = documentId
+        self.blobId = blobId
+        self.filename = filename
+        self.contentType = contentType
+        self.sha256Base64 = sha256Base64
+        self.disposition = disposition
+        self.retainLocal = retainLocal
+        self.numBytes = numBytes
+        self.status = status
+        self.attempts = attempts
+        self.nextAttemptAt = nextAttemptAt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.lastError = lastError
+        self.lastErrorCode = lastErrorCode
+        self.destination = destination
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case queueId, documentId, blobId, filename, contentType, sha256Base64, disposition, retainLocal
+        case numBytes, status, attempts, nextAttemptAt, createdAt, updatedAt, lastError, lastErrorCode, destination
+    }
+
+    /// Tolerant, as JS `hydrateUploadsForIdentity` is: unknown keys are
+    /// ignored, and a missing field takes the default JS gives it.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let now = (Date().timeIntervalSince1970 * 1000).rounded()
+        blobId = try c.decode(String.self, forKey: .blobId)
+        queueId = try c.decodeIfPresent(String.self, forKey: .queueId) ?? blobId
+        documentId = try c.decode(String.self, forKey: .documentId)
+        filename = try c.decodeIfPresent(String.self, forKey: .filename) ?? blobId
+        contentType = try c.decodeIfPresent(String.self, forKey: .contentType) ?? "application/octet-stream"
+        sha256Base64 = try c.decodeIfPresent(String.self, forKey: .sha256Base64) ?? ""
+        disposition = try c.decodeIfPresent(String.self, forKey: .disposition)
+        retainLocal = try c.decodeIfPresent(Bool.self, forKey: .retainLocal)
+        numBytes = try c.decodeIfPresent(Int.self, forKey: .numBytes) ?? 0
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
+        attempts = try c.decodeIfPresent(Int.self, forKey: .attempts) ?? 0
+        nextAttemptAt = try c.decodeIfPresent(Double.self, forKey: .nextAttemptAt) ?? now
+        createdAt = try c.decodeIfPresent(Double.self, forKey: .createdAt) ?? now
+        updatedAt = try c.decodeIfPresent(Double.self, forKey: .updatedAt) ?? now
+        lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        lastErrorCode = try c.decodeIfPresent(String.self, forKey: .lastErrorCode)
+        destination = try? c.decodeIfPresent(UploadDestination.self, forKey: .destination)
+    }
+}
+
+/// The JS record's `destination`: `{ kind: "agent-session", sessionId }` for
+/// a session upload, `{ kind: "db3", documentId }` for a db3 upload. A
+/// `document` destination is read but never written, and an unknown kind
+/// reads as one.
+extension UploadDestination: Codable {
+    private enum CodingKeys: String, CodingKey { case kind, sessionId, documentId }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try c.decode(String.self, forKey: .kind)
+        switch kind {
+        case "agent-session":
+            self = .agentSession(try c.decode(String.self, forKey: .sessionId))
+        case "db3":
+            self = .db3(try c.decode(String.self, forKey: .documentId))
+        default:
+            self = .document
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .document:
+            try c.encode("document", forKey: .kind)
+        case .db3(let documentId):
+            try c.encode("db3", forKey: .kind)
+            try c.encode(documentId, forKey: .documentId)
+        case .agentSession(let sessionId):
+            try c.encode("agent-session", forKey: .kind)
+            try c.encode(sessionId, forKey: .sessionId)
+        }
+    }
 }
 
 public struct AnalyticsMetadataRecord: Codable, Sendable {

@@ -44,7 +44,7 @@ final class RecordLogReceiptBindingHermeticTests: XCTestCase {
         let documentId = "rl-\(UUID().uuidString.prefix(8))"
         let binding = try RecordLogDocumentBinding(
             host: provider, documentId: documentId, clientId: "client-1",
-            engine: BaoModelQueryEngine(host: provider), logger: Logger(level: .none)
+            logger: Logger(level: .none)
         )
         let doc = YDocument()
         let note = MultiDocModel(schema: Self.note).connect(docId: documentId, doc: doc)
@@ -71,7 +71,7 @@ final class RecordLogReceiptBindingHermeticTests: XCTestCase {
         let lines = (1...50).map { RecordLogLoadLine(id: "n\($0)", patch: ["title": .string("t\($0)"), "n": .number(Double($0))]) }
         let reply = try binding.withOperation {
             try binding.store.applyLoadChunk(
-                writer: writer, sessionId: "S1", attempt: attempt, model: "Note", lines: lines, project: binding.projectionSpecs
+                writer: writer, sessionId: "S1", attempt: attempt, model: "Note", lines: lines
             )
         }
         XCTAssertEqual(reply.models, ["Note"])
@@ -87,7 +87,7 @@ final class RecordLogReceiptBindingHermeticTests: XCTestCase {
         let refreshed = try binding.withOperation {
             try binding.store.applyLoadChunk(
                 writer: writer, sessionId: "S1", attempt: attempt, model: "Note",
-                lines: [RecordLogLoadLine(id: "n7", patch: ["title": "loaded", "n": 70])], project: binding.projectionSpecs
+                lines: [RecordLogLoadLine(id: "n7", patch: ["title": "loaded", "n": 70])]
             )
         }
         XCTAssertEqual(refreshed.changed.map(\.id), ["n7"])
@@ -115,5 +115,66 @@ final class RecordLogReceiptBindingHermeticTests: XCTestCase {
         XCTAssertEqual(reported.value.first?.writes?.map(\.recordId), ["n1"])
         _ = try note.create(id: "n2", values: ["title": .string("fine")])
         XCTAssertEqual(try binding.store.pendingOf(binding.writer).count, 1)
+    }
+
+    // MARK: - #4701 behaviour 8: a write under a refused permission
+
+    func testACommitUnderARefusedPermissionIsRefusedWriteAccessDeniedAndReportedAndUnderReadAccessDenied() async throws {
+        let (binding, note, _) = try await makeBinding()
+        let reported = LockedBox<[DocumentWriteRefusedEvent]>([])
+        binding.setRefusalReporter { event in reported.withValue { $0.append(event) } }
+        _ = try note.create(id: "kept", values: ["title": .string("queued before")])
+        try binding.store.flush()
+        try binding.setState(permission: .some("refused"))
+
+        XCTAssertThrowsError(try note.create(id: "n1", values: ["title": .string("after the revocation")])) { error in
+            XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
+        }
+        XCTAssertEqual(reported.value.count, 1)
+        XCTAssertEqual(reported.value.first?.error.code, .writeAccessDenied)
+        XCTAssertEqual(reported.value.first?.documentId, binding.documentId)
+        XCTAssertEqual(reported.value.first?.writes?.map(\.recordId), ["n1"])
+        XCTAssertEqual(try binding.store.pendingOf(binding.writer).map(\.m.id), ["kept"], "the queued write stays; nothing new is minted")
+        XCTAssertNil(note.find(id: "n1"))
+        XCTAssertNotNil(note.find(id: "kept"), "the rows stay readable")
+
+        try binding.setState(permission: .some("read"))
+        XCTAssertThrowsError(try note.create(id: "n2", values: ["title": .string("as a reader")])) { error in
+            XCTAssertEqual((error as? JsBaoError)?.code, .accessDenied)
+        }
+        XCTAssertEqual(reported.value.count, 1, "a reader's refusal is thrown, not reported")
+    }
+
+    // MARK: - #4701 behaviour 9: where a change came from
+
+    func testACommitAndATransactionNoticeLocalChangesAndWhatTheRoomSentNoticesRemoteWithItsModels() async throws {
+        let (binding, note, _) = try await makeBinding()
+        let notices = LockedBox<[RecordLogChangeNotice]>([])
+        binding.onChange { notice in notices.withValue { $0.append(notice) } }
+
+        _ = try note.create(id: "n1", values: ["title": .string("one")])
+        XCTAssertEqual(notices.value.count, 1)
+        XCTAssertEqual(notices.value.last?.origin, .local)
+        XCTAssertEqual(notices.value.last?.records, [RecordLogRecordKey(model: "Note", id: "n1")])
+        XCTAssertEqual(notices.value.last?.changes.first?.row?["title"], "one")
+
+        try note.transact {
+            _ = try note.create(id: "t1", values: ["title": .string("a")])
+            _ = try note.create(id: "t2", values: ["title": .string("b")])
+        }
+        XCTAssertEqual(notices.value.count, 2, "a transaction is one entry and one notice")
+        XCTAssertEqual(notices.value.last?.origin, .local)
+        XCTAssertEqual(notices.value.last?.records.map(\.id).sorted(), ["t1", "t2"])
+
+        binding.notify([RecordLogRecordKey(model: "Note", id: "r1")])
+        XCTAssertEqual(notices.value.last?.origin, .remote)
+        XCTAssertEqual(notices.value.last?.records.map(\.id), ["r1"])
+
+        var chunk = RecordLogChunkReply()
+        chunk.models = ["Note"]
+        binding.notify(chunk)
+        XCTAssertEqual(notices.value.last?.origin, .remote)
+        XCTAssertEqual(notices.value.last?.models, ["Note"])
+        XCTAssertEqual(notices.value.count, 4)
     }
 }

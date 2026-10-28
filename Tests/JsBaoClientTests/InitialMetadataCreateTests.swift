@@ -102,15 +102,18 @@ final class InitialMetadataCreateTests: XCTestCase {
         XCTAssertFalse(list.items.contains { $0.name == name })
     }
 
-    /// `groups.create` stamps the named category on the new group.
+    /// A group create stamps the named category on the new group. A session
+    /// cannot create a group (#4735), so the group is created through the
+    /// admin API (`TestContext.createGroup`, #4737), with the app owner as its
+    /// custodian.
     func testGroupCreateStampsInitialMetadata() async throws {
         try await createCategory(resourceType: "group", category: "classLink", field: "classId")
 
-        let created = try await client.groups.create(params: CreateGroupParams(
-            groupType: "class-reading-group",
+        let created = try await ctx.createGroup(
+            app: testApp,
             name: "Reading group",
-            initialMetadata: ["classLink": ["classId": .string("class-A")]]
-        ))
+            initialMetadata: ["classLink": ["classId": "class-A"]]
+        )
         XCTAssertFalse(created.groupId.isEmpty)
 
         let stamped = try await readMetadata(
@@ -121,21 +124,21 @@ final class InitialMetadataCreateTests: XCTestCase {
         XCTAssertEqual(stamped["classId"] as? String, "class-A")
     }
 
-    /// An unknown category fails the whole group create — the Swift call throws
-    /// and no group is left behind.
+    /// An unknown category fails the whole group create and no group is left
+    /// behind: the Swift client's list does not find it.
     func testGroupCreateWithUnknownCategoryFailsAtomically() async throws {
-        let groupId = "orphan-\(Int(Date().timeIntervalSince1970))"
+        // The id is minted on success only (#4917), so the check is by name.
+        let name = "Orphan-\(Int(Date().timeIntervalSince1970))"
         await XCTAssertThrowsErrorAsync(
-            try await self.client.groups.create(params: CreateGroupParams(
-                groupType: "class-reading-group",
-                groupId: groupId,
-                name: "Orphan",
-                initialMetadata: ["nonexistent": ["x": .string("1")]]
-            )),
+            try await self.ctx.createGroup(
+                app: self.testApp,
+                name: name,
+                initialMetadata: ["nonexistent": ["x": "1"]]
+            ),
             "create with an unknown metadata category should fail"
         )
 
-        let list = try await client.groups.list(options: ListGroupsOptions(type: "class-reading-group"))
-        XCTAssertFalse(list.items.contains { $0.groupId == groupId })
+        let list = try await client.groups.list()
+        XCTAssertFalse(list.items.contains { $0.name == name })
     }
 }

@@ -1,0 +1,22 @@
+{
+  "name": "collections.listCollectionsForDocument",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/documents/<ulid>/collections",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "items": [
+      {
+        "collectionId": "<ulid>",
+        "documentId": "<ulid>",
+        "name": "Baseline Collection Renamed",
+        "addedAt": "<iso>",
+        "addedBy": "<ulid>"
+      }
+    ],
+    "hasMore": false
+  }
+}

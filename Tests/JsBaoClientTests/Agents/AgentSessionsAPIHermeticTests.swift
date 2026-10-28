@@ -137,7 +137,7 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(transport.lastCall?.method, .get)
         XCTAssertEqual(transport.lastCall?.path, "/agent-sessions/s1")
         XCTAssertEqual(info.agentKey, "helper")
-        XCTAssertEqual(info.documentId, "d1")
+        XCTAssertEqual(info.storageDocumentId, "d1")
         XCTAssertEqual(info.title, "Plans")
         XCTAssertEqual(info.scope, "team")
         XCTAssertEqual(info.members, AgentSessionMembers(viewers: ["u-v"], participants: ["u-p1", "u-p2"]))
@@ -482,5 +482,156 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
             _ = try await sessions.recordEvent(sessionId: "", event: AgentSessionEvent(kind: "k", data: .null))
         }
         assertNoRequest(transport)
+    }
+
+    // MARK: - #4588 behavior 21 and edge 43: inspect.storage
+
+    func testInspectStorageIsGetsDocumentIdAndPassesItsRefusalsThrough() async throws {
+        let (sessions, transport) = api(Self.memberInfo)
+        let storage = try await sessions.inspect.storage("s1")
+        XCTAssertEqual(storage, AgentSessionStorage(documentId: "d1"))
+        XCTAssertEqual(transport.calls.map(\.path), ["/agent-sessions/s1"])
+        XCTAssertEqual(transport.lastCall?.method, .get)
+
+        for (status, code) in [(404, "AGENT_SESSION_NOT_FOUND"), (410, "AGENT_SESSION_DOCUMENT_MISSING")] {
+            let (refusing, _) = api(status: status, #"{"error":"refused","code":"\#(code)"}"#)
+            do {
+                _ = try await refusing.inspect.storage("s1")
+                XCTFail("\(code) passes through")
+            } catch let error as HttpError {
+                XCTAssertEqual(error.status, status)
+                XCTAssertEqual(error.serverCode, code)
+            }
+        }
+
+        let (empty, emptyTransport) = api(Self.memberInfo)
+        await assertInvalidArgument { _ = try await empty.inspect.storage("") }
+        assertNoRequest(emptyTransport)
+    }
+
+    // MARK: - #4588 behavior 22: the attachment calls
+
+    func testUploadAttachmentPutsTheBytesWithTheBlobHeadersAndDecodesTheStoredFile() async throws {
+        let (sessions, transport) = api(status: 201, #"""
+        {"blobId":"b 1","filename":"dot.png","contentType":"image/png","numBytes":3,
+         "createdAt":"2026-10-20T00:00:00.000Z","bytesTransferred":3}
+        """#)
+        let bytes = Data([1, 2, 3])
+        let result = try await sessions.uploadAttachment(
+            sessionId: "s/1", blobId: "b 1",
+            AgentSessionAttachmentUpload(data: bytes, filename: "dot.png", contentType: "image/png", disposition: .inline)
+        )
+        XCTAssertEqual(result.blobId, "b 1")
+        XCTAssertEqual(result.numBytes, 3)
+        XCTAssertEqual(result.createdAt, "2026-10-20T00:00:00.000Z")
+        XCTAssertEqual(result.bytesTransferred, 3)
+        let call = try XCTUnwrap(transport.lastCall)
+        XCTAssertEqual(call.method, .put)
+        XCTAssertEqual(call.path, "/agent-sessions/s%2F1/attachments/b%201")
+        XCTAssertEqual(call.body, bytes)
+        XCTAssertEqual(call.options?.customHeaders, [
+            "Content-Type": "image/png", "X-Blob-Filename": "dot.png", "X-Blob-Size": "3",
+            "X-Blob-Sha256": BlobManager.sha256Base64(bytes), "X-Blob-Disposition": "inline",
+        ])
+
+        let (defaults, defaultsTransport) = api(status: 201, #"""
+        {"blobId":"b2","filename":"x","contentType":"application/octet-stream","numBytes":1,
+         "createdAt":"2026-10-20T00:00:00.000Z","bytesTransferred":0}
+        """#)
+        _ = try await defaults.uploadAttachment(sessionId: "s1", blobId: "b2", AgentSessionAttachmentUpload(data: Data([9]), filename: "x"))
+        XCTAssertEqual(defaultsTransport.lastCall?.options?.customHeaders["Content-Type"], "application/octet-stream")
+        XCTAssertNil(defaultsTransport.lastCall?.options?.customHeaders["X-Blob-Disposition"])
+
+        let (refusing, _) = api(status: 403, #"{"error":"viewers read","code":"AGENT_SESSION_PARTICIPANT_ONLY"}"#)
+        do {
+            _ = try await refusing.uploadAttachment(sessionId: "s1", blobId: "b1", AgentSessionAttachmentUpload(data: bytes, filename: "f"))
+            XCTFail("a refusal throws")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.status, 403)
+            XCTAssertEqual(error.serverCode, "AGENT_SESSION_PARTICIPANT_ONLY")
+        }
+    }
+
+    func testDownloadAttachmentGetsTheBytesWithTheDispositionAndCarriesARefusalsCode() async throws {
+        let bytes = Data([0xFF, 0x00, 0x10])
+        let transport = RecordingTransport(status: 200, contentType: "image/png", body: bytes)
+        let sessions = AgentSessionsAPI(transport: transport)
+        let plain = try await sessions.downloadAttachment(sessionId: "s1", blobId: "b1")
+        XCTAssertEqual(plain, bytes, "the bytes untouched")
+        XCTAssertEqual(transport.lastCall?.path, "/agent-sessions/s1/attachments/b1/download")
+        XCTAssertEqual(transport.lastCall?.method, .get)
+        _ = try await sessions.downloadAttachment(sessionId: "s1", blobId: "b1", disposition: .attachment)
+        XCTAssertEqual(transport.lastCall?.path, "/agent-sessions/s1/attachments/b1/download?disposition=attachment")
+
+        let (refusing, _) = api(status: 404, #"{"error":"no such file","code":"AGENT_SESSION_ATTACHMENT_NOT_FOUND"}"#)
+        do {
+            _ = try await refusing.downloadAttachment(sessionId: "s1", blobId: "b9")
+            XCTFail("a refusal throws")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.status, 404)
+            XCTAssertEqual(error.serverCode, "AGENT_SESSION_ATTACHMENT_NOT_FOUND")
+        }
+        let (empty, emptyTransport) = api("{}")
+        await assertInvalidArgument { _ = try await empty.downloadAttachment(sessionId: "s1", blobId: "") }
+        await assertInvalidArgument {
+            _ = try await empty.uploadAttachment(sessionId: "", blobId: "b", AgentSessionAttachmentUpload(data: Data(), filename: "f"))
+        }
+        assertNoRequest(emptyTransport)
+    }
+
+    func testAttachmentHeadersSendsHeadAndAnswersLowerCasedHeadersOrAStatusOnlyRefusal() async throws {
+        let server = try LoopbackAPIServer { request in
+            guard request.method == "HEAD" else { return .status(405, "head only") }
+            if request.apiPathOnly == "/agent-sessions/s1/attachments/b1/download" {
+                return LoopbackAPIServer.Response(status: 200, body: "abc", headers: [
+                    "Content-Type": "image/png", "ETag": "\"v1\"", "Content-Disposition": "inline; filename=\"dot.png\"",
+                ])
+            }
+            return .status(404, "no such file")
+        }
+        let baseUrl = try server.start()
+        defer { server.stop() }
+        let client = JsBaoClient(options: JsBaoClientOptions(
+            apiUrl: baseUrl, wsUrl: "ws://127.0.0.1:1", appId: "agent-session-heads",
+            token: "test-token", offline: false, logLevel: .none,
+            storageConfig: .memory, autoNetwork: false
+        ))
+        defer { Task { await client.destroy() } }
+
+        let answer = try await client.agents.sessions.attachmentHeaders(
+            sessionId: "s1", blobId: "b1", disposition: .inline
+        )
+        XCTAssertEqual(answer.status, 200)
+        XCTAssertEqual(answer.headers["content-type"], "image/png")
+        XCTAssertEqual(answer.headers["etag"], "\"v1\"")
+        XCTAssertEqual(answer.headers["content-disposition"], "inline; filename=\"dot.png\"")
+        XCTAssertTrue(answer.headers.keys.allSatisfy { $0 == $0.lowercased() })
+        XCTAssertEqual(server.requests.last?.method, "HEAD")
+        XCTAssertEqual(server.requests.last?.apiPath, "/agent-sessions/s1/attachments/b1/download?disposition=inline")
+
+        do {
+            _ = try await client.agents.sessions.attachmentHeaders(sessionId: "s1", blobId: "b9")
+            XCTFail("a refusal throws")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.status, 404)
+            XCTAssertNil(error.serverCode, "a HEAD refusal carries no code")
+        }
+    }
+
+    // MARK: - #4588 edge 38: a sessions API with no client
+
+    func testASessionsAPIWithNoClientObservesNothingAndStillThrowsTheNotFound() async throws {
+        let (sessions, transport) = api(status: 404, #"{"error":"No such agent session in this app","code":"AGENT_SESSION_NOT_FOUND"}"#)
+        XCTAssertNil(sessions.client)
+        do {
+            _ = try await sessions.get(sessionId: "s1")
+            XCTFail("the not-found throws")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.serverCode, "AGENT_SESSION_NOT_FOUND")
+        }
+        let (deleting, _) = api(#"{"deleted":true,"sessionId":"s1","documentId":"d1"}"#)
+        let deleted = try await deleting.delete(sessionId: "s1")
+        XCTAssertTrue(deleted.deleted)
+        XCTAssertEqual(transport.calls.count, 1)
     }
 }

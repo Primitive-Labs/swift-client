@@ -149,6 +149,9 @@ struct RecordLogReceiveOutcome: Sendable {
     var acknowledged: [RecordLogEntryRef] = []
     /// Writer entries that left the pending log.
     var settled: [RecordLogEntryRef] = []
+    /// Those entries with the confirmed rows of their records as each settled,
+    /// right after the result that settled it applied.
+    var settlements: [RecordLogEntryRef: RecordLogSettlement] = [:]
     /// A compact acknowledgement at the cursor that could not be derived, which holds every later result back.
     var underivable: RecordLogUnderivableAck?
 }
@@ -269,7 +272,7 @@ final class RecordLogRules {
         case .void(let seq):
             if let entry = try tables.pendingEntry(writer, seq) {
                 try tables.deletePending(writer, seq)
-                out.settled.append(RecordLogEntryRef(writer: writer, seq: seq))
+                try settle(&out, writer: writer, entry)
                 if !entry.isVoid { out.touched.append(contentsOf: entry.keys) }
             }
             return out
@@ -279,7 +282,7 @@ final class RecordLogRules {
             out.acknowledged.append(RecordLogEntryRef(writer: writer, seq: seq))
             if let entry {
                 try tables.deletePending(writer, seq)
-                out.settled.append(RecordLogEntryRef(writer: writer, seq: seq))
+                try settle(&out, writer: writer, entry)
                 if !entry.isVoid { out.touched.append(contentsOf: entry.keys) }
             }
             return out
@@ -348,10 +351,27 @@ final class RecordLogRules {
         for ref in try tables.acknowledgedThrough(try tables.cursor()) {
             guard let entry = try tables.pendingEntry(ref.writer, ref.seq) else { continue }
             try tables.deletePending(ref.writer, ref.seq)
-            out.settled.append(ref)
+            try settle(&out, writer: ref.writer, entry)
             out.touched.append(contentsOf: entry.keys)
             if let alias = entry.alias { try renamePending(writer: ref.writer, alias: alias, &out.touched) }
         }
+    }
+
+    /// An entry left the pending log: it is settled, with the confirmed rows
+    /// of the records it touched (an upsert's holder included) as they are
+    /// now, right after the result that settled it applied.
+    private func settle(_ out: inout RecordLogReceiveOutcome, writer: String, _ entry: RecordLogPendingEntry) throws {
+        let ref = RecordLogEntryRef(writer: writer, seq: entry.seq)
+        out.settled.append(ref)
+        var keys = entry.isVoid ? [] : entry.keys
+        if !entry.isVoid, let alias = entry.alias { keys.append(RecordLogRecordKey(model: alias.model, id: alias.to)) }
+        var seen = Set<RecordLogRecordKey>()
+        let confirmed = try tables.confirmed()
+        var rows: [RecordLogCurrentRecord] = []
+        for key in keys where seen.insert(key).inserted {
+            rows.append(RecordLogCurrentRecord(model: key.model, id: key.id, row: try confirmed.row(key)))
+        }
+        out.settlements[ref] = RecordLogSettlement(rows: rows)
     }
 
     /// What the room made of an accepted entry of a writer of this store: it and
@@ -363,7 +383,9 @@ final class RecordLogRules {
     ) throws {
         for entry in try tables.pendingThrough(writer, seq) {
             try tables.deletePending(writer, entry.seq)
-            out.settled.append(RecordLogEntryRef(writer: writer, seq: entry.seq))
+            var settled = entry
+            if entry.seq == seq, let alias { settled.alias = alias }
+            try settle(&out, writer: writer, settled)
             if !entry.isVoid { out.touched.append(contentsOf: entry.keys) }
         }
         if let alias { try renamePending(writer: writer, alias: alias, &out.touched) }
@@ -531,6 +553,7 @@ final class RecordLogRules {
             out.touched.append(contentsOf: replay.touched)
             out.acknowledged.append(contentsOf: replay.acknowledged)
             out.settled.append(contentsOf: replay.settled)
+            out.settlements.merge(replay.settlements) { _, new in new }
             if let underivable = replay.underivable { out.underivable = underivable }
         }
         try settleAcknowledged(&out)

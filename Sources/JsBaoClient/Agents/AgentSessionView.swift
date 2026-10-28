@@ -85,11 +85,14 @@ public struct AgentSessionSyncedMessage: Sendable, Equatable {
 /// One of your messages the view shows before its row is synced, or that the
 /// server refused. It exists only in the view that sent it.
 public struct AgentSessionPendingMessage: Sendable, Equatable {
-    /// `.sending` until its row is in the window (the entry then leaves);
-    /// `.failed` when refused.
+    /// `.waiting` while a session upload the message names is still in
+    /// `attachments.uploads()`; `.sending` until its row is in the window
+    /// (the entry then leaves); `.failed` when refused, or when an upload it
+    /// waited on failed.
     public enum State: Sendable, Equatable {
         case sending
         case failed
+        case waiting
     }
 
     public let clientMessageId: String
@@ -216,6 +219,14 @@ public final class AgentSessionView: @unchecked Sendable {
     private var reconcileAgain = false
     /// The reconnect's reads of `info`, cancelled by `close()` (CSO-4380-015).
     private var reconcileTask: Task<Void, Never>?
+    /// `attachments`, built on first use.
+    private var attachmentsOf: AgentSessionAttachments?
+    /// The waits of waiting sends, by client message id: a newer send under
+    /// the id ends its wait.
+    private var waitingSends: [String: (attempt: UUID, task: Task<Void, Error>)] = [:]
+    /// Artifact reads in flight, by blob id, shared by every `artifact(of:)`
+    /// call that asks meanwhile and forgotten once settled.
+    private var artifactReads: [String: (id: UUID, read: Task<Data, Error>)] = [:]
 
     private struct ClientToolRegistration: Sendable {
         let id: UUID
@@ -252,7 +263,29 @@ public final class AgentSessionView: @unchecked Sendable {
     public var sessionId: String { info.sessionId }
 
     /// The session's document.
-    public var documentId: String { info.documentId }
+    @available(*, deprecated, message: "Use sessionId and the session calls (attachments for files, artifact(of:) for artifacts); client.agents.sessions.inspect.storage(_:) answers it for diagnostics.")
+    public var documentId: String { storageDocumentId }
+
+    /// The session's document, for the view's own queries and reads.
+    var storageDocumentId: String { info.storageDocumentId }
+
+    /// The session's files: upload them, follow and control the upload
+    /// queue, and read any file of the session, by `blobId`. Send an uploaded
+    /// file with `send(text:files:)`. Queued uploads outlive the view; after
+    /// `close()`, `upload` and `read` throw `.invalidArgument`.
+    public var attachments: AgentSessionAttachments {
+        lock.withLock {
+            if let attachmentsOf { return attachmentsOf }
+            let made = client.blobManager.forAgentSession(
+                sessionId: _info.sessionId, documentId: _info.storageDocumentId,
+                isClosed: { [weak self] in self?.isClosed ?? true }
+            )
+            attachmentsOf = made
+            return made
+        }
+    }
+
+    private var isClosed: Bool { lock.withLock { closed } }
 
     /// The session row, decoded; `nil` until it has synced or when it does not
     /// decode.
@@ -299,6 +332,13 @@ public final class AgentSessionView: @unchecked Sendable {
     /// becomes `.failed` with the server's code and the call throws the same
     /// error. A `clientMessageId` is generated when none is given, so a
     /// `retry` is deduplicated.
+    ///
+    /// A message whose `files` name uploads still in `attachments.uploads()`
+    /// is `.waiting` until they land, and is sent then, even after `close()`;
+    /// when one fails, the message fails with the upload's error, the call
+    /// throws it, and nothing is sent. Other messages go out at once. A newer
+    /// send under the same `clientMessageId` replaces a waiting one, whose
+    /// call throws `.invalidArgument`.
     @discardableResult
     public func send(
         text: String,
@@ -325,8 +365,9 @@ public final class AgentSessionView: @unchecked Sendable {
 
     /// Send a failed message again, with the same text, files, context,
     /// timezone, locale and client message id, so a first attempt that did
-    /// land answers as a duplicate. Throws `.invalidArgument` when no failed
-    /// message has that id.
+    /// land answers as a duplicate. It waits again for any upload it names
+    /// that is still queued (`attachments.resume` retries a failed one).
+    /// Throws `.invalidArgument` when no failed message has that id.
     @discardableResult
     public func retry(clientMessageId: String) async throws -> AgentSessionSendResult {
         let failed = lock.withLock {
@@ -386,7 +427,8 @@ public final class AgentSessionView: @unchecked Sendable {
     /// A tool call's artifact: the same value whether the server stored it
     /// inline or, being large, as a blob on the session's document, which is
     /// read only now. `nil` when the call has none or `part` is not a tool
-    /// call; `.null` for a stored JSON null.
+    /// call; `.null` for a stored JSON null. Calls made while a read of the
+    /// same blob is in flight share it, each decoding its own value.
     ///
     /// Throws `.invalidArgument` on a closed view, the blob read's error for
     /// a download that fails, and a `DecodingError` for a blob that is not
@@ -397,7 +439,27 @@ public final class AgentSessionView: @unchecked Sendable {
         }
         guard case .toolCall(let call) = part.content else { return nil }
         guard let blobId = call.artifactBlobId, !blobId.isEmpty else { return call.artifact }
-        return try await client.documents.blobs(documentId: documentId).read(blobId: blobId, as: JSONValue.self)
+        let read: Task<Data, Error> = lock.withLock {
+            if let inFlight = artifactReads[blobId] { return inFlight.read }
+            let id = UUID()
+            let blobs = client.blobManager
+            let documentId = _info.storageDocumentId
+            let read = Task { [weak self] in
+                // Forgotten once settled: a later call reads again (the blob
+                // cache answers it).
+                defer { self?.forgetArtifactRead(blobId, id: id) }
+                return try await blobs.read(documentId: documentId, blobId: blobId)
+            }
+            artifactReads[blobId] = (id, read)
+            return read
+        }
+        return try JSONCoding.decoder.decode(JSONValue.self, from: try await read.value)
+    }
+
+    private func forgetArtifactRead(_ blobId: String, id: UUID) {
+        lock.withLock {
+            if artifactReads[blobId]?.id == id { artifactReads[blobId] = nil }
+        }
     }
 
     /// The presentations an agent message carries: each `tool_call` part in
@@ -576,7 +638,7 @@ public final class AgentSessionView: @unchecked Sendable {
         signals.release()
         for unsubscribe in closing.unsubscribes { unsubscribe() }
         for task in closing.tasks { task.cancel() }
-        await client.documents.close(documentId)
+        _ = await client.closeDocument(storageDocumentId)
     }
 
     // MARK: - Internals
@@ -588,7 +650,7 @@ public final class AgentSessionView: @unchecked Sendable {
         for schema in AgentSessionModels.schemas {
             unsubs.append(client.codegen.subscribe(schema) { [weak self] in self?.scheduleRefresh() })
         }
-        let documentId = self.documentId
+        let documentId = storageDocumentId
         let syncs = Self.syncEvents(of: client)
         let sync = Task { [weak self] in
             for await event in syncs where event.documentId == documentId && event.synced {
@@ -804,7 +866,7 @@ public final class AgentSessionView: @unchecked Sendable {
     }
 
     private func options(sort: [String: Int]? = nil, limit: Int? = nil) -> QueryOptions {
-        QueryOptions(sort: sort, limit: limit, documents: [documentId])
+        QueryOptions(sort: sort, limit: limit, documents: [storageDocumentId])
     }
 
     /// The session row, the window's messages from its oldest on, and their
@@ -1087,25 +1149,87 @@ public final class AgentSessionView: @unchecked Sendable {
     }
 
     private func deliver(_ entry: AgentSessionPendingMessage) async throws -> AgentSessionSendResult {
-        lock.withLock {
-            // An earlier entry under the same id gives way to this one.
-            pendingEntries.removeAll { $0.clientMessageId == entry.clientMessageId }
-            pendingEntries.append(entry)
-            _ = rebuildLocked()
+        // Its own references to session uploads still in the queue.
+        var waitFor: [String] = []
+        if !entry.files.isEmpty {
+            let queued = Set(await attachments.uploads().map(\.blobId))
+            var seen = Set<String>()
+            waitFor = entry.files.map(\.blobId).filter { queued.contains($0) && seen.insert($0).inserted }
         }
+        var current = waitFor.isEmpty ? entry : entry.with(state: .waiting)
+        let displaced: Task<Void, Error>? = lock.withLock {
+            // An earlier entry under the same id gives way to this one; a
+            // waiting one stops waiting.
+            let displaced = waitingSends.removeValue(forKey: entry.clientMessageId)?.task
+            pendingEntries.removeAll { $0.clientMessageId == entry.clientMessageId }
+            pendingEntries.append(current)
+            _ = rebuildLocked()
+            return displaced
+        }
+        displaced?.cancel()
         notify()
+        if !waitFor.isEmpty {
+            let outcome = await wait(for: waitFor, of: entry)
+            let next: AgentSessionPendingMessage
+            switch outcome {
+            case .failure(let error): next = current.with(state: .failed, error: Self.sendError(of: error))
+            case .success: next = current.with(state: .sending)
+            }
+            // The check that it was not displaced and its move out of
+            // `.waiting` are one step, so a send that displaces it at any
+            // point leaves it unsent.
+            guard replace(current, with: next) else {
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "The message \"\(entry.clientMessageId)\" was replaced by a newer send with the same clientMessageId",
+                    details: ["clientMessageId": .string(entry.clientMessageId)]
+                )
+            }
+            if case .failure(let error) = outcome { throw error }
+            current = next
+        }
         let result: AgentSessionSendResult
         do {
             result = try await api.send(sessionId: sessionId, body: entry.body)
         } catch {
-            replace(entry, with: entry.with(state: .failed, error: Self.sendError(of: error)))
+            replace(current, with: current.with(state: .failed, error: Self.sendError(of: error)))
             throw error
         }
-        replace(entry, with: entry.with(state: .sending, messageId: result.messageId))
+        replace(current, with: current.with(state: .sending, messageId: result.messageId))
         return result
     }
 
-    private func replace(_ entry: AgentSessionPendingMessage, with next: AgentSessionPendingMessage) {
+    /// Wait until every upload `blobIds` names lands, or the first fails. The
+    /// wait is kept by client message id, so a newer send under that id ends
+    /// it at once; nothing else does, `close()` included.
+    private func wait(for blobIds: [String], of entry: AgentSessionPendingMessage) async -> Result<Void, Error> {
+        let attachments = self.attachments
+        let waiting = Task {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for blobId in blobIds {
+                    group.addTask { _ = try await attachments.waitUntilUploaded(blobId: blobId) }
+                }
+                for try await _ in group {}
+            }
+        }
+        let kept: Bool = lock.withLock {
+            guard pendingEntries.contains(where: { $0.attempt == entry.attempt }) else { return false }
+            waitingSends[entry.clientMessageId] = (entry.attempt, waiting)
+            return true
+        }
+        if !kept { waiting.cancel() }
+        let outcome = await waiting.result
+        lock.withLock {
+            if waitingSends[entry.clientMessageId]?.attempt == entry.attempt {
+                waitingSends[entry.clientMessageId] = nil
+            }
+        }
+        return outcome
+    }
+
+    /// Whether `entry` was still pending, and so replaced.
+    @discardableResult
+    private func replace(_ entry: AgentSessionPendingMessage, with next: AgentSessionPendingMessage) -> Bool {
         let replaced: Bool = lock.withLock {
             guard let at = pendingEntries.firstIndex(where: { $0.attempt == entry.attempt }) else { return false }
             pendingEntries[at] = next
@@ -1113,6 +1237,7 @@ public final class AgentSessionView: @unchecked Sendable {
             return true
         }
         if replaced { notify() }
+        return replaced
     }
 
     /// A refusal's code, message and `retryAfter`.
@@ -1272,8 +1397,8 @@ extension AgentSessionsAPI {
                 }
             }
             client.registerModels(AgentSessionModels.schemas)
-            _ = try await client.documents.open(
-                info.documentId,
+            _ = try await client.openDocument(
+                info.storageDocumentId,
                 options: options.open ?? OpenDocumentOptions(waitForLoad: .network, enableNetworkSync: true)
             )
         } catch {

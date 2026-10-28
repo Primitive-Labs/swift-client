@@ -348,14 +348,6 @@ extension NotificationEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .notification }
 }
 
-extension WorkflowStatusEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .workflowStatus }
-}
-
-extension WorkflowStartedEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .workflowStarted }
-}
-
 extension ChannelMessageEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .channelMessage }
 }
@@ -447,8 +439,6 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     MeUpdatedEvent.self,
     MeUpdateFailedEvent.self,
     NotificationEvent.self,
-    WorkflowStatusEvent.self,
-    WorkflowStartedEvent.self,
     ChannelMessageEvent.self,
     ChannelSubscribeFailedEvent.self,
     DirectMessageEvent.self,
@@ -461,6 +451,15 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     BlobsQueueDrainedEvent.self,
     CacheUpdatedEvent.self,
     CacheUpdateFailedEvent.self,
+    Db3StateEvent.self,
+    Db3ReadyEvent.self,
+    Db3RowsEvent.self,
+    Db3WriteRefusedEvent.self,
+    Db3EvictedEvent.self,
+    Db3GoneEvent.self,
+    Db3ErrorEvent.self,
+    Db3CreatedEvent.self,
+    Db3CreateFailedEvent.self,
 ]
 
 /// The event keys that have no payload type, and why.

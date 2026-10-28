@@ -18,28 +18,27 @@ final class GroupsListMembersIncludeTests: XCTestCase {
     func test_listMembers_includeProfiles_serializesQueryParam() async throws {
         let transport = emptyPage()
         let api = GroupsAPI(transport: transport)
-        _ = try await api.listMembers(groupType: "team", groupId: "eng", include: .profiles)
+        _ = try await api.listMembers(groupId: "eng", include: .profiles)
         XCTAssertEqual(transport.lastCall?.method, .get)
-        XCTAssertEqual(transport.lastCall?.path, "/groups/team/eng/members?include=profiles")
+        XCTAssertEqual(transport.lastCall?.path, "/groups/eng/members?include=profiles")
     }
 
     func test_listMembers_limitAndInclude_serializesBoth() async throws {
         let transport = emptyPage()
         let api = GroupsAPI(transport: transport)
         _ = try await api.listMembers(
-            groupType: "team",
             groupId: "eng",
             options: PaginationOptions(limit: 25),
             include: .profiles
         )
-        XCTAssertEqual(transport.lastCall?.path, "/groups/team/eng/members?limit=25&include=profiles")
+        XCTAssertEqual(transport.lastCall?.path, "/groups/eng/members?limit=25&include=profiles")
     }
 
     func test_listMembers_noInclude_omitsQueryParam() async throws {
         let transport = emptyPage()
         let api = GroupsAPI(transport: transport)
-        _ = try await api.listMembers(groupType: "team", groupId: "eng")
-        XCTAssertEqual(transport.lastCall?.path, "/groups/team/eng/members")
+        _ = try await api.listMembers(groupId: "eng")
+        XCTAssertEqual(transport.lastCall?.path, "/groups/eng/members")
         XCTAssertFalse(transport.lastCall?.path.contains("include") ?? true)
     }
 
@@ -52,7 +51,7 @@ final class GroupsListMembersIncludeTests: XCTestCase {
                    "avatarUrl":"https://example.com/a.png"}]}
         """)
         let api = GroupsAPI(transport: transport)
-        let result = try await api.listMembers(groupType: "team", groupId: "eng", include: .profiles)
+        let result = try await api.listMembers(groupId: "eng", include: .profiles)
         XCTAssertEqual(result.items.first?.avatarUrl, "https://example.com/a.png")
     }
 
@@ -62,7 +61,7 @@ final class GroupsListMembersIncludeTests: XCTestCase {
                    "userEmail":"b@example.com","avatarUrl":null}]}
         """)
         let api = GroupsAPI(transport: transport)
-        let result = try await api.listMembers(groupType: "team", groupId: "eng", include: .profiles)
+        let result = try await api.listMembers(groupId: "eng", include: .profiles)
         XCTAssertNil(result.items.first?.avatarUrl)
     }
 
@@ -70,7 +69,7 @@ final class GroupsListMembersIncludeTests: XCTestCase {
         // The default (no-`include`) response omits avatarUrl entirely.
         let transport = RecordingTransport(json: #"{"items":[{"userId":"u1","addedBy":"owner"}]}"#)
         let api = GroupsAPI(transport: transport)
-        let result = try await api.listMembers(groupType: "team", groupId: "eng")
+        let result = try await api.listMembers(groupId: "eng")
         XCTAssertNil(result.items.first?.avatarUrl)
         XCTAssertEqual(result.items.first?.userId, "u1")
     }

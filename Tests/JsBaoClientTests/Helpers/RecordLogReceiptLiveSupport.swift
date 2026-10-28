@@ -98,11 +98,18 @@ extension RecordLogLiveApp {
         return out
     }
 
-    /// The client's rows of `model` as a query answers them, by id.
+    /// The client's rows of `model` as a query answers them, by id: every page,
+    /// 10,000 at a time, the largest page a db3 answers since #4700 (a single
+    /// read of a million rows is refused under the db3 limits).
     func localRows(_ client: JsBaoClient, _ documentId: String, _ model: String) throws -> [String: [String: JSONValue]] {
-        let rows = try member(client, documentId, model).query(nil, options: QueryOptions(limit: 1_000_000))
+        let member = try member(client, documentId, model)
         var out: [String: [String: JSONValue]] = [:]
-        for row in rows { if let id = row["id"]?.stringValue { out[id] = row } }
+        var cursor: String?
+        repeat {
+            let page = try member.queryPaged(nil, options: QueryOptions(limit: 10_000, cursor: cursor))
+            for row in page.data { if let id = row.raw["id"]?.stringValue { out[id] = row.raw } }
+            cursor = page.hasMore ? page.nextCursor : nil
+        } while cursor != nil
         return out
     }
 

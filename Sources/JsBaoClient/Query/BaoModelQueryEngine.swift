@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import JsBaoSQLite
 
 /// SQLite-backed query engine that mirrors Y.Map model data for fast queries.
 ///
@@ -138,15 +138,14 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// An engine over a storage provider's own connection (#3436).
     ///
     /// The tables are the same tables, in the provider's database file rather
-    /// than in memory, so the rows survive the session — which is what makes
-    /// reopening a record-log document cheap — and every statement is serialized
-    /// with the record store's and the key-value store's on the provider's
-    /// queue. No PRAGMA is issued here: the connection belongs to the
-    /// provider, which has already configured it.
+    /// than in memory, so the rows survive the session, and every statement is
+    /// serialized with the key-value store's on the provider's queue. No PRAGMA
+    /// is issued here: the connection belongs to the provider, which has already
+    /// configured it. The client no longer uses it: a db3 is read from its view
+    /// (#4700), and a format-1 document from the in-memory engine.
     ///
     /// **Lock order.** A read takes `lock` and then enters the provider's
-    /// queue. Nothing that runs ON that queue may take `lock` — the projection
-    /// writes (`RecordLogQueryProjection`) deliberately do not, which is what
+    /// queue. Nothing that runs ON that queue may take `lock`, which is what
     /// keeps the two from closing a cycle.
     public convenience init(host: any Format2SqlHost) {
         self.init(host: host, logger: nil)
@@ -993,28 +992,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// (CursorManager.ts:184-197, 222-225). Ensures stable
     /// pagination on ties when sorting by a non-unique field.
     private func resolveSort(options: QueryOptions?) -> ResolvedSort {
-        var fields: [String]
-        var dirs: [Int]
-
-        if let ordered = options?.sortOrder, !ordered.isEmpty {
-            fields = ordered.map { $0.0 }
-            dirs = ordered.map { $0.1 == -1 ? -1 : 1 }
-        } else if let sort = options?.sort, !sort.isEmpty {
-            fields = sort.keys.sorted()
-            dirs = fields.map { sort[$0] == -1 ? -1 : 1 }
-        } else {
-            fields = []
-            dirs = []
-        }
-
-        // Append `id ASC` as an implicit tiebreaker if not already in
-        // the sort — makes pagination stable on non-unique sort keys.
-        if !fields.contains("id") {
-            fields.append("id")
-            dirs.append(1)
-        }
-
-        return ResolvedSort(fields: fields, directions: dirs)
+        let sort = (options ?? QueryOptions()).pagingSort
+        return ResolvedSort(fields: sort.fields, directions: sort.directions)
     }
 
     private func buildSelectSQL(

@@ -9,7 +9,8 @@ import XCTest
 /// `applySegmentCorrections`, `applyCatchUpPage` and `completeCatchUp` with
 /// their generation and receipt, as js-bao's `replayLoadTraceThroughStore`
 /// drives its store. After every event the store's state must equal the
-/// trace's `after`, and the projected `Note` rows the view.
+/// trace's `after`. (Until #4700 the projected `Note` rows were compared with
+/// the view too; a db3's rows live in the view only.)
 final class RecordLogLoadTraceStoreHermeticTests: XCTestCase {
 
     private var directories: [String] = []
@@ -29,23 +30,17 @@ final class RecordLogLoadTraceStoreHermeticTests: XCTestCase {
         return provider
     }
 
-    func testEveryReceiptTraceReplaysThroughTheStoreWithItsProjectionEqualToTheView() async throws {
+    func testEveryReceiptTraceReplaysThroughTheStore() async throws {
         let provider = try await makeProvider()
-        let engine = BaoModelQueryEngine(host: provider)
-        let schema = RecordLogStoreLoadTraceReplay.schema
-        try RecordLogQueryProjection.prepare(schema: schema, engine: engine, host: provider)
-        let traceSpec = RecordLogProjectionSpec(schema: schema)
         let traces = try RecordLogTraceFixture.loadReceiptSchedules().flatMap(\.clients)
         var bad = 0
-        var projectedBad = 0
         var events = 0
         var first = ""
         var kept = 0
         var mismatched = 0
         for trace in traces {
-            let result = try RecordLogStoreLoadTraceReplay.replayLoadTrace(trace, provider: provider, spec: traceSpec)
+            let result = try RecordLogStoreLoadTraceReplay.replayLoadTrace(trace, provider: provider)
             bad += result.bad
-            projectedBad += result.checkedBad
             kept += result.kept
             mismatched += result.mismatched
             events += trace.events.count
@@ -53,7 +48,6 @@ final class RecordLogLoadTraceStoreHermeticTests: XCTestCase {
         }
         XCTAssertGreaterThan(events, 700)
         XCTAssertEqual(bad, 0, first)
-        XCTAssertEqual(projectedBad, 0, first)
         // Every chunk the model kept is kept by the store (#4394).
         XCTAssertGreaterThan(kept, 0)
         XCTAssertEqual(mismatched, 0, first)
@@ -62,30 +56,17 @@ final class RecordLogLoadTraceStoreHermeticTests: XCTestCase {
 
 /// The receipt traces through the store: the Swift twin of js-bao's
 /// `replayLoadTraceThroughStore`. Each trace starts from a fresh document whose
-/// store is seeded at its `init`; after every event the projected `Note` rows
-/// must equal the view.
+/// store is seeded at its `init`.
 enum RecordLogStoreLoadTraceReplay {
     typealias F = RecordLogTraceFixture
 
-    static let scalars = ["a", "b", "c", "u", "v"]
-    static let schema = PrimitiveSchema(
-        name: F.model,
-        fields: [
-            "id": FieldDescriptor(type: .id),
-            "a": FieldDescriptor(type: .string), "b": FieldDescriptor(type: .string),
-            "c": FieldDescriptor(type: .string), "u": FieldDescriptor(type: .string),
-            "v": FieldDescriptor(type: .string), "t": FieldDescriptor(type: .stringset),
-        ]
-    )
-
     static func replayLoadTrace(
-        _ trace: F.Trace, provider: SQLiteStorageProvider, spec: RecordLogProjectionSpec
+        _ trace: F.Trace, provider: SQLiteStorageProvider
     ) throws -> RecordLogLoadTraceReplay.Result {
         let documentId = "trace-\(trace.id)-\(UUID().uuidString)"
         let writer = trace.id
         let store = RecordLogStore(host: provider, documentId: documentId, clientId: "trace-client")
         try store.initialize()
-        let project = [spec]
         let initial = trace.initial
         try provider.withConnection { connection in
             try connection.execute("INSERT OR IGNORE INTO record_log_state (doc_id) VALUES (?)", [.text(documentId)])
@@ -100,10 +81,10 @@ enum RecordLogStoreLoadTraceReplay {
             rows: (initial["confirmed"]?.arrayValue ?? []).map { row in
                 RecordLogCatchUpRow(model: F.model, id: row["id"]?.stringValue ?? "", row: row.objectValue ?? [:])
             },
-            generation: seed, project: project
+            generation: seed
         )
         _ = try store.completeCatchUp(
-            writer: writer, lsn: Int(initial["cursor"]?.numberValue ?? 0), full: true, generation: seed, project: project
+            writer: writer, lsn: Int(initial["cursor"]?.numberValue ?? 0), full: true, generation: seed
         )
         try store.setState(
             writer: writer,
@@ -113,50 +94,17 @@ enum RecordLogStoreLoadTraceReplay {
         func fresh(_ stale: Bool, _ what: String) throws {
             if stale { throw JsBaoError(code: .unavailable, message: "\(what) of \(trace.id) answered stale") }
         }
-        // The query tables as the view projects: a column per scalar (a nested
-        // object as its JSON), the string set's members in its junction.
-        func projected() throws -> JSONValue {
-            try provider.withConnection { connection in
-                .array(try connection.query(
-                    "SELECT * FROM \"\(spec.table)\" WHERE _meta_doc_id = ? ORDER BY id", [.text(documentId)]
-                ).map { row in
-                    var object: [String: JSONValue] = ["id": .string(row["id"].stringValue ?? "")]
-                    for field in scalars { object[field] = row[field].stringValue.map { .string($0) } ?? .null }
-                    let members = try connection.query(
-                        "SELECT value FROM \"\(spec.table)__t\" WHERE parent_id = ? AND _meta_doc_id = ? ORDER BY value",
-                        [row["id"], .text(documentId)]
-                    ).compactMap { $0["value"].stringValue }
-                    object["t"] = .array(members.map { .string($0) })
-                    return .object(object)
-                })
-            }
-        }
-        func viewed() throws -> JSONValue {
-            .array(try store.readRowsAfter(model: F.model, after: nil, limit: 1_000_000).map { row in
-                var object: [String: JSONValue] = ["id": row["id"] ?? .null]
-                for field in scalars {
-                    switch row[field] {
-                    case .some(.object(let value)): object[field] = .string(RecordLogJSON.text(.object(value)))
-                    case .some(.array(let value)): object[field] = .string(RecordLogJSON.text(.array(value)))
-                    case .some(.null), .none: object[field] = .null
-                    case .some(let value): object[field] = value
-                    }
-                }
-                object["t"] = .array((row["t"]?.arrayValue ?? []).compactMap(\.stringValue).sorted().map { .string($0) })
-                return .object(object)
-            })
-        }
         return try RecordLogLoadTraceReplay.replay(trace, RecordLogLoadTraceReplay.Ops(
             cursor: { try store.marks().cursor },
             pending: { try store.pendingOf(writer) },
             write: { mutations, upsertOn in
                 try store.commitEntries(
-                    writer: writer, writes: [RecordLogWrite(mutations: mutations, upsertOn: upsertOn)], project: project
+                    writer: writer, writes: [RecordLogWrite(mutations: mutations, upsertOn: upsertOn)]
                 ).entries[0]
             },
-            receive: { items in _ = try store.receive(writer: writer, items: items, project: project) },
+            receive: { items in _ = try store.receive(writer: writer, items: items) },
             refused: { refusal in
-                let reply = try store.refused(writer: writer, refusal: refusal, project: project)
+                let reply = try store.refused(writer: writer, refusal: refusal)
                 return (reply.handedBack, reply.frames)
             },
             settled: { seq in try store.settled(writer: writer, seq: seq) },
@@ -166,34 +114,33 @@ enum RecordLogStoreLoadTraceReplay {
             beginCatchUp: { full in try store.beginFencedCatchUp(writer: writer, full: full) },
             page: { rows, gone, generation in
                 try fresh(try store.applyCatchUpPage(
-                    writer: writer, rows: rows, gone: gone, generation: generation, project: project
+                    writer: writer, rows: rows, gone: gone, generation: generation
                 ).stale, "a page")
             },
             complete: { lsn, high, full, generation, receipt, segment in
                 try fresh(try store.completeCatchUp(
-                    writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment,
-                    project: project
+                    writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment
                 ).stale, "a completion")
             },
             beginReceipt: { kind, id in try store.beginReceipt(writer: writer, kind: kind, id: id).attempt },
             loadLines: { attempt, model, lines in
                 try fresh(try store.applyLoadChunk(
-                    writer: writer, sessionId: "trace", attempt: attempt, model: model, lines: lines, project: project
+                    writer: writer, sessionId: "trace", attempt: attempt, model: model, lines: lines
                 ).stale, "a load chunk")
             },
             completeLoad: { attempt, mode, models in
                 try fresh(try store.completeLoad(
-                    writer: writer, sessionId: "trace", attempt: attempt, mode: mode, models: models, project: project
+                    writer: writer, sessionId: "trace", attempt: attempt, mode: mode, models: models
                 ).stale, "a load completion")
             },
             segmentRows: { generation, attempt, rows in
                 try fresh(try store.applySegmentChunk(
-                    writer: writer, generation: generation, attempt: attempt, rows: rows, project: project
+                    writer: writer, generation: generation, attempt: attempt, rows: rows
                 ).stale, "a segment chunk")
             },
             segmentCorrections: { generation, attempt, lines in
                 try fresh(try store.applySegmentCorrections(
-                    writer: writer, generation: generation, attempt: attempt, lines: lines, project: project
+                    writer: writer, generation: generation, attempt: attempt, lines: lines
                 ).stale, "the corrections")
             },
             keep: { generation, attempt, segmentId, chunk in
@@ -218,11 +165,6 @@ enum RecordLogStoreLoadTraceReplay {
                     "handedBack": .array(handedBack.map { .number(Double($0)) }),
                 ]))
             }
-        ), check: { _, _ in
-            let projectedRows = try projected()
-            let viewRows = try viewed()
-            return projectedRows == viewRows
-                ? nil : "query tables \(F.text(projectedRows)) != view \(F.text(viewRows))"
-        })
+        ))
     }
 }

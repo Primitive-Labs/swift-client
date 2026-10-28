@@ -171,3 +171,22 @@ func XCTAssertThrowsErrorAsync<T>(
         // expected
     }
 }
+
+/// The `HttpError` an async call is refused with, failing the test when the
+/// call succeeds or throws something else. The role suites (#4737) assert a
+/// refusal's `status` and `serverCode` on what this returns.
+func httpRefusal<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async -> HttpError? {
+    do {
+        _ = try await expression()
+        XCTFail("expected an HTTP refusal, the call succeeded", file: file, line: line)
+    } catch let error as HttpError {
+        return error
+    } catch {
+        XCTFail("expected an HttpError, got \(error)", file: file, line: line)
+    }
+    return nil
+}

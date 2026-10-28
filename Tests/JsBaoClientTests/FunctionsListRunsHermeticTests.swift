@@ -21,7 +21,7 @@ final class FunctionsListRunsHermeticTests: XCTestCase {
     private static let wireRun = """
     {"runId":"run-1","runKey":"run-1","instanceId":"inst-1","workflowId":null,
      "workflowKey":"fn-a","revisionId":null,"contextDocId":"doc-1","status":"completed",
-     "runKind":"function","functionId":"fid-1","functionKey":"fn-a","executionMode":"durable",
+     "runKind":"function","functionId":"fid-1","functionKey":"fn-a","runtime":"task",
      "executionPrincipal":"sys:app","parentFunctionKey":null,"parentRunId":null,"nestDepth":0,
      "errorMessage":null,"errorCode":null,"errorTitle":null,
      "startedAt":"2026-10-03T00:00:00.000Z","executionStartedAt":"2026-10-03T00:00:00.100Z",
@@ -74,6 +74,30 @@ final class FunctionsListRunsHermeticTests: XCTestCase {
         XCTAssertEqual(run.status, "completed")
         XCTAssertEqual(run.nestDepth, 0)
         XCTAssertEqual(run.meta, ["source": "test"])
+    }
+
+    /// #3190 CR3190-104: the run block's `runtime` (`request` | `task`) is
+    /// the discriminator that replaced `executionMode`, and it must reach a
+    /// caller on the listing and on a status read alike. A block from a
+    /// server that sends none decodes it as `nil`, never as a guess.
+    func testListRunsAndStatusReadsKeepTheRuntime() async throws {
+        let requestRun = Self.wireRun.replacingOccurrences(
+            of: #""runtime":"task""#, with: #""runtime":"request""#)
+        let (api, _) = makeApi(json: """
+        {"items":[\(requestRun),\(Self.wireRun)],"hasMore":false}
+        """)
+        let page = try await api.listRuns()
+        XCTAssertEqual(page.items.map(\.runtime), ["request", "task"])
+
+        let status = try JSONDecoder().decode(
+            FunctionRunStatus.self,
+            from: Data(#"{"status":{"status":"completed"},"run":\#(requestRun)}"#.utf8))
+        XCTAssertEqual(status.run?.runtime, "request")
+
+        let withoutRuntime = Self.wireRun.replacingOccurrences(
+            of: #""runtime":"task","#, with: "")
+        let bare = try JSONDecoder().decode(FunctionRunInfo.self, from: Data(withoutRuntime.utf8))
+        XCTAssertNil(bare.runtime)
     }
 
     func testHasMoreFollowsTheCursorWhenAbsentAndScannedIsOptional() async throws {

@@ -1,5 +1,5 @@
 import XCTest
-import SQLite3
+import JsBaoSQLite
 @testable import JsBaoClient
 
 /// `SQLiteFormat2Connection` compiles a SQL text once and runs the compiled

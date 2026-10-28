@@ -333,8 +333,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
     func testASegmentReplacesTheTableWithItsChunksAndCorrectionsCompletesAtTheLastPageAndKeepsAnOwnGuess() async throws {
         let h = try await harness()
         _ = try h.binding.store.applyCatchUpPage(
-            writer: h.binding.writer, rows: [RecordLogCatchUpRow(model: "Note", id: "x", row: ["id": "x", "title": "only here"])],
-            project: h.binding.projectionSpecs
+            writer: h.binding.writer, rows: [RecordLogCatchUpRow(model: "Note", id: "x", row: ["id": "x", "title": "only here"])]
         )
         try h.save("mine", ["title": "pending"])
         let segment = h.publishSegment(
@@ -584,7 +583,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         let attempt = try first.binding.store.beginReceipt(writer: writer, kind: .load, id: Self.session1).attempt
         _ = try first.binding.store.applyLoadChunk(
             writer: writer, sessionId: Self.session1, attempt: attempt, model: "Note",
-            lines: [RecordLogLoadLine(id: "refused", patch: ["t": 1])], project: first.binding.projectionSpecs
+            lines: [RecordLogLoadLine(id: "refused", patch: ["t": 1])]
         )
         // A second session over the same database: a restart.
         let h = try await harness(provider: first.provider, clientId: "client-b")
@@ -774,7 +773,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
             await h.session.close()
             h.binding.close()
             if purge {
-                _ = try h.binding.store.purge(force: true, project: h.binding.projectionSpecs)
+                _ = try h.binding.store.purge(force: true)
             }
             let before = try h.provider.withConnection { try $0.query("SELECT COUNT(*) AS n FROM record_log_rows", []).first?["n"].intValue }
             gate.open()

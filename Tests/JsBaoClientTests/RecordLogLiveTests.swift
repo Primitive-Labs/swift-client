@@ -64,9 +64,7 @@ final class RecordLogLiveTests: XCTestCase {
     private func createDocument(_ client: JsBaoClient) async throws -> String {
         let created = try await client.createDocument(options: CreateDocumentOptions(title: "swift record log", documentFormat: 3))
         let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
-        try await eventually(timeout: 20, description: "the create to commit") {
-            client.documentManager.getLocalMetadata(documentId)?.pendingCreate != true
-        }
+        try await waitForCreateCommit(client, documentId)
         return documentId
     }
 
@@ -282,7 +280,7 @@ final class RecordLogLiveTests: XCTestCase {
         try await eventually(timeout: 20, description: "acknowledged") { try unacknowledged(client, documentId) == 0 }
 
         _ = await client.closeDocument(documentId)
-        XCTAssertFalse(client.isRecordLogDocument(documentId))
+        XCTAssertTrue(client.isRecordLogDocument(documentId), "a db3's close keeps its store bound (#4701)")
         try await open(client, documentId, wait: .local)
         XCTAssertEqual(try member(client, documentId).find(id: "k1")?["title"], .string("kept"), "an ordinary close keeps everything")
         try await waitForSync(client: client, documentId: documentId, timeout: 20)
@@ -306,8 +304,6 @@ final class RecordLogLiveTests: XCTestCase {
                 let n = try connection.query("SELECT COUNT(*) AS n FROM \(table) WHERE doc_id = ?", [.text(documentId)]).first?["n"].intValue
                 XCTAssertEqual(n, 0, table)
             }
-            XCTAssertEqual(try connection.query("SELECT COUNT(*) AS n FROM \"Note\" WHERE _meta_doc_id = ?", [.text(documentId)])
-                .first?["n"].intValue, 0, "and its projected rows")
         }
     }
 }

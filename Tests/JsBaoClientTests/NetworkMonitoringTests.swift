@@ -352,13 +352,22 @@ final class NetworkMonitoringTests: XCTestCase {
                 client.isConnected
             }
 
-            // Fire the loss disconnect and the restore handoff concurrently so
-            // they contend on the connect/disconnect serialization.
-            async let loss: Void = client.setShouldConnect(false)
-            async let restore: Void = client.runOnlineAuthHandoff(
+            // The loss reaches the manager first, as it does in the client (a
+            // restore follows the loss it undoes), and the restore handoff is
+            // fired while the loss's disconnect may still be in flight, so
+            // they contend on the connect/disconnect serialization. Fired as
+            // two unordered `async let`s, the restore could reach the manager
+            // first; the loss then landed last and, by the manager's
+            // last-caller-wins rule, rightly left it disconnected. Under load
+            // that happened in about one run in six.
+            let loss = Task { await client.setShouldConnect(false) }
+            while await client.wsManager.shouldConnectFlag {
+                await Task.yield()
+            }
+            await client.runOnlineAuthHandoff(
                 cause: JsBaoClient.OnlineHandoffCause.reachabilityRestore
             )
-            _ = await (loss, restore)
+            await loss.value
 
             // The restore must win — after both settle the client is connected
             // in .auto with reconnect enabled, never stranded offline.
@@ -404,8 +413,12 @@ final class NetworkMonitoringTests: XCTestCase {
         let elapsed = try XCTUnwrap(latchedAfter, "initial reachability never latched")
         // Fails (~0.3 s) if the first snapshot is put through the restore
         // debounce; the undebounced path latches inside the poll granularity.
+        // The bound sits below the 0.3 s debounce with room for a loaded
+        // machine: 0.15 s failed on a busy fleet worker running the Swift
+        // suites in parallel (#4806), while the bug this guards against
+        // still lands at or past 0.3 s.
         XCTAssertLessThan(
-            elapsed, 0.15,
+            elapsed, 0.25,
             "first reachability snapshot waited out the debounce (\(elapsed)s)"
         )
 

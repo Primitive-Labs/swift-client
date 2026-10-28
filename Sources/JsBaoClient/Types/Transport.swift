@@ -110,6 +110,12 @@ final class NetworkGatedTransport: Transport, @unchecked Sendable {
         lock.withLock { offlineCheck = check }
     }
 
+    /// Whether networking is allowed right now: the installed check passes.
+    /// `true` until a check is installed.
+    var networkingAllowed: Bool {
+        lock.withLock({ offlineCheck })?(.get, "") == nil
+    }
+
     /// Throw the `.offline` error when networking is not allowed right now.
     func requireNetworking(method: HTTPMethod, path: String) throws {
         if let error = lock.withLock({ offlineCheck })?(method, path) {
@@ -263,7 +269,7 @@ public extension Transport {
     ///
     /// For the handful of endpoints whose request body is an opaque,
     /// caller-supplied JSON graph the client is not allowed to interpret
-    /// (`workflows.start` `rootInput` and `meta`). Re-encoding
+    /// (`functions.start` `rootInput` and `meta`). Re-encoding
     /// such a graph through `JSONValue` would collapse every number to
     /// `Double` and silently lose exactness past 2^53, so the caller composes
     /// the bytes itself and they go out untouched.

@@ -1031,6 +1031,34 @@ internal struct TaskRecord: PrimitiveModel, Equatable, Hashable, Codable {
 }
 ```
 
+The file also extends the struct with the app-facing facade: static reads
+(`query`, `queryPaged`, `count`, `find`, `findAll`, `findByUnique`,
+`queryOne`, `subscribe`, `aggregate`) and instance writes (`save(in:)`,
+`save(in:upsertOn:)`, `upsertByUnique`, `delete(in:)`). For a db3 it adds
+the write guards and counters, each calling `client.codegen` on the default
+client:
+
+```swift
+// Write only if the record still matches; confirm waits for the room's answer.
+task = try await task.save(in: db3Id, options: Db3WriteOptions(condition: ["category": "open"], confirm: true))
+try await Task(id: "daily-standup", title: "Standup").save(in: db3Id, options: Db3WriteOptions(ifNotExists: true))
+try await task.delete(in: db3Id, options: Db3WriteOptions(condition: ["completed": true]))
+
+// Add to number fields; answers the new values.
+let values = try await Post.increment(id: postId, fields: ["views": 1], in: db3Id)
+```
+
+A failed guard is refused `.db3ConditionNotMet` (the record as it is now
+under `details["current"]`), and an increment of a record the device does not
+hold `.db3RecordNotFound`. On a document that is not a db3 the options are
+ignored and `increment` throws `.invalidArgument`.
+
+The generated members spell the options type `JsBaoClient.Db3WriteOptions`
+(a public alias of `Db3WriteOptions`), so a schema that names a model
+`Db3WriteOptions` still compiles: that model shadows the bare name in the
+app's module, not the qualified one. App code where such a model exists
+passes `JsBaoClient.Db3WriteOptions(...)`.
+
 ### Change tracking (`_changedFields`)
 
 Every stored property carries a `didSet` that records the assignment in

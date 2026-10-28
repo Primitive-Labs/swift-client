@@ -257,7 +257,9 @@ public struct OpenDocumentOptions: Sendable {
     public var enableNetworkSync: Bool
     public var retainLocal: Bool
     /// Maximum time to wait for the document to become available from the
-    /// network. When the open needs server state — `waitForLoad: .network`,
+    /// network. A large document's open waits this long without any of the
+    /// document arriving, however long the whole download takes. When the
+    /// open needs server state — `waitForLoad: .network`,
     /// or `.localIfAvailableElseNetwork` with no local copy — and the budget
     /// runs out, `openDocument` throws `JsBaoError(.networkTimeout)` rather
     /// than returning a possibly-empty document; `0` means "don't wait for
@@ -467,7 +469,7 @@ public struct NetworkStatus: Sendable {
     }
 }
 
-// MARK: - Workflow Options
+// MARK: - Client Options
 
 /// Options for `client.setNetworkMode(_:options:)`. Matches the JS
 /// client's options bag passed as the second argument.
@@ -556,96 +558,6 @@ public struct SyncMetadataOptions: Sendable {
         self.payloadType = payloadType
         self.background = background
         self.authoritative = authoritative
-    }
-}
-
-public struct StartWorkflowOptions: Sendable {
-    /// The workflow key identifying which workflow to start. Carried here so
-    /// the single-object `start(_:)` overload mirrors js-bao's
-    /// `start({ workflowKey, input, ... })`. Defaults to `""` for the
-    /// positional `start(workflowKey:input:options:)` form, which sources
-    /// the key from its own parameter and ignores this field.
-    public var workflowKey: String
-    /// Input data passed to the workflow (the server's opaque `rootInput`).
-    /// Used by the single-object `start(_:)` overload; ignored by the
-    /// positional form, which takes its own `input` parameter.
-    public var input: [String: JSONValue]
-    public var runKey: String?
-    public var contextDocId: String?
-    public var meta: [String: JSONValue]?
-    /// When true, re-runs a workflow even if a prior run with the same
-    /// `runKey` exists. Matches js-bao's `StartWorkflowOptions.forceRerun`.
-    public var forceRerun: Bool?
-
-    public init(
-        workflowKey: String = "",
-        input: [String: JSONValue] = [:],
-        runKey: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: JSONValue]? = nil,
-        forceRerun: Bool? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.input = input
-        self.runKey = runKey
-        self.contextDocId = contextDocId
-        self.meta = meta
-        self.forceRerun = forceRerun
-    }
-}
-
-/// Options for terminating a workflow run. Mirrors js-bao's
-/// `TerminateWorkflowOptions` so the single-object `terminate(_:)` call
-/// lines up field-for-field. `contextDocId` rides here rather than as a
-/// positional parameter.
-public struct TerminateWorkflowOptions: Sendable {
-    /// The workflow key identifying which workflow this run belongs to.
-    public var workflowKey: String
-    /// The run key identifying this workflow run.
-    public var runKey: String
-    /// Document ID the workflow is scoped to. Uses the user's root document
-    /// when not provided.
-    public var contextDocId: String?
-
-    public init(
-        workflowKey: String,
-        runKey: String,
-        contextDocId: String? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.runKey = runKey
-        self.contextDocId = contextDocId
-    }
-}
-
-public struct ListWorkflowRunsOptions: Sendable {
-    public var workflowKey: String?
-    public var status: String?
-    public var limit: Int?
-    public var cursor: String?
-    /// Walk-direction for cursor pagination. `true` = forward (default),
-    /// `false` = backward. Matches js-bao's `forward` flag on the same
-    /// options object.
-    public var forward: Bool?
-    /// Restrict to runs scoped to a particular document (multi-doc
-    /// workflows fan out per `contextDocId`). Matches js-bao's
-    /// `ListWorkflowRunsOptions.contextDocId`.
-    public var contextDocId: String?
-
-    public init(
-        workflowKey: String? = nil,
-        status: String? = nil,
-        limit: Int? = nil,
-        cursor: String? = nil,
-        forward: Bool? = nil,
-        contextDocId: String? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.status = status
-        self.limit = limit
-        self.cursor = cursor
-        self.forward = forward
-        self.contextDocId = contextDocId
     }
 }
 

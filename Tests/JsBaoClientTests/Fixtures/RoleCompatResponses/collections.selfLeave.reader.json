@@ -1,0 +1,13 @@
+{
+  "name": "collections.selfLeave.reader",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "DELETE",
+  "path": "/app/<appId>/api/collections/<ulid>/members/<ulid>",
+  "caller": "reader",
+  "request": null,
+  "status": 200,
+  "body": {
+    "success": true
+  }
+}

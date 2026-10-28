@@ -1,7 +1,7 @@
 import XCTest
 @testable import JsBaoClient
 import YSwift
-import SQLite3
+import JsBaoSQLite
 
 /// The client's format-3 front door without a server: the storage refusal,
 /// how frames are classified, the existing format-mismatch arm, and the store
@@ -69,11 +69,18 @@ final class RecordLogClientHermeticTests: XCTestCase {
         try probe(path, "SELECT user_id FROM record_log_owner LIMIT 1")
     }
 
+    /// How long the test's own connection waits for the client's connection to
+    /// release its lock. The client writes on its own schedule (a flush, the
+    /// analytics buffer), and without a busy timeout a statement that lands
+    /// during one of those writes fails at once with "database is locked".
+    private static let busyTimeoutMs: Int32 = 5_000
+
     /// Run one statement on the file through a connection of the test's own.
     private func execute(_ path: String, _ sql: String) throws {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+              sqlite3_busy_timeout(db, Self.busyTimeoutMs) == SQLITE_OK,
               sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK
         else { throw JsBaoError(code: .unavailable, message: String(cString: sqlite3_errmsg(db))) }
     }
@@ -85,6 +92,7 @@ final class RecordLogClientHermeticTests: XCTestCase {
             throw JsBaoError(code: .unavailable, message: "cannot open \(path)")
         }
         defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, Self.busyTimeoutMs)
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
             throw JsBaoError(code: .unavailable, message: String(cString: sqlite3_errmsg(db)))
@@ -167,7 +175,6 @@ final class RecordLogClientHermeticTests: XCTestCase {
         XCTAssertEqual(try count(path, "SELECT COUNT(*) AS n FROM record_log_pending"), 0)
         XCTAssertEqual(try count(path, "SELECT COUNT(*) AS n FROM record_log_view"), 0)
         XCTAssertEqual(try count(path, "SELECT COUNT(*) AS n FROM record_log_writers"), 0)
-        XCTAssertEqual(try count(path, "SELECT COUNT(*) AS n FROM \"Note\" WHERE _meta_doc_id = '\(documentId)'"), 0)
         XCTAssertEqual(try owner(path), "user-b")
         XCTAssertEqual(refusals.value, 0, "user A's writes are theirs; nothing is handed to user B")
     }
@@ -261,7 +268,6 @@ final class RecordLogClientHermeticTests: XCTestCase {
         for table in RecordLogSchema.clientTables {
             XCTAssertEqual(try count(path, "SELECT COUNT(*) AS n FROM \(table) WHERE doc_id = '\(documentId)'"), 0, table)
         }
-        XCTAssertEqual(try count(path, "SELECT COUNT(*) AS n FROM \"Note\" WHERE _meta_doc_id = '\(documentId)'"), 0)
     }
 
     // MARK: - Behavior 29: an offline open with no format
@@ -279,5 +285,77 @@ final class RecordLogClientHermeticTests: XCTestCase {
         _ = await client.closeDocument(documentId)
         try await openLocally(client, documentId)
         XCTAssertTrue(client.isRecordLogDocument(documentId), "bound once the row names format 3")
+    }
+
+    // MARK: - A sync that lands before the open binds
+
+    /// The sync a create's commit schedules can reach the handshake while the
+    /// open is between opening the Y.Doc and binding the store. The row names
+    /// format 3, so the handshake is the session's `record.open` once the open
+    /// binds — never a `syncStep1`, which the room refuses by tearing the
+    /// document down. (A db3 created here is bound at its create since #4701,
+    /// so the row here is one whose format was learned after it was written.)
+    func testADocumentWhoseRowNamesThreeDoesNotHandshakeUntilItIsBound() async throws {
+        let client = await makeClient(user: "user-a", storage: .sqlite(directory: newDatabasePath()))
+        defer { Task { await client.destroy() } }
+        let created = try await client.createDocument(options: CreateDocumentOptions())
+        let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
+        client.documentManager.noteDocumentFormat(documentId, 3)
+        client.documentManager.handlePendingCreateCommitted(documentId)
+        XCTAssertEqual(client.documentManager.documentFormat(documentId), 3)
+        XCTAssertFalse(client.isRecordLogDocument(documentId))
+
+        let early = await client.resolveRecordLogBeforeHandshake(documentId)
+        XCTAssertFalse(early, "no Yjs handshake for a format-3 document the open has not bound yet")
+
+        try await openLocally(client, documentId)
+        XCTAssertTrue(client.isRecordLogDocument(documentId))
+        let bound = await client.resolveRecordLogBeforeHandshake(documentId)
+        XCTAssertTrue(bound, "once bound, its session handshakes")
+    }
+
+    // MARK: - #4701 edge 49: releasing a db3's session under a transaction on another thread
+
+    /// What a door close of a db3 does to its store (#4701 C2): the session is
+    /// released, the open group of saves commits, and the binding stays, so a
+    /// transaction another thread holds commits its entry after the release.
+    func testReleasingTheSessionFlushesTheGroupAndKeepsTheBindingForAPendingTransaction() async throws {
+        let path = newDatabasePath()
+        let client = await makeClient(user: "user-a", storage: .sqlite(directory: path))
+        defer { Task { await client.destroy() } }
+        let documentId = try await createFormatThree(client)
+        try await openLocally(client, documentId)
+        let member = try XCTUnwrap(client.sharedModel("Note")?.member(docId: documentId))
+        _ = try member.create(id: "n0", values: ["title": .string("before the release")])
+
+        let started = DispatchSemaphore(value: 0)
+        let proceed = DispatchSemaphore(value: 0)
+        let outcome = LockedBox<Result<Void, Error>?>(nil)
+        let thread = Thread {
+            outcome.value = Result {
+                try member.transact {
+                    _ = try member.create(id: "t1", values: ["title": .string("held by the transaction")])
+                    started.signal()
+                    proceed.wait()
+                }
+            }
+        }
+        thread.start()
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async { started.wait(); done.resume() }
+        }
+
+        await client.releaseRecordLogSession(documentId)
+        XCTAssertEqual(try count(path, "SELECT COUNT(*) AS n FROM record_log_pending"), 1, "the open group committed")
+        proceed.signal()
+        let deadline = Date().addingTimeInterval(5)
+        while outcome.value == nil && Date() < deadline { try? await Task.sleep(nanoseconds: 5_000_000) }
+
+        XCTAssertNoThrow(try XCTUnwrap(outcome.value).get(), "the transaction's commit lands after the release")
+        let binding = try XCTUnwrap(client.recordLogBinding(documentId), "the binding stays")
+        XCTAssertFalse(binding.isClosed)
+        try binding.store.flush()
+        XCTAssertEqual(try binding.store.pendingOf(binding.writer).map(\.m.id), ["n0", "t1"])
+        XCTAssertNotNil(member.find(id: "t1"))
     }
 }

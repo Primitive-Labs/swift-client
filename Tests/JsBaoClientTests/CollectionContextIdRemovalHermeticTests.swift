@@ -10,13 +10,15 @@ import XCTest
 /// `initialMetadata` (a resource metadata category) instead.
 ///
 /// Server-free (`*HermeticTests`): the types are read with `Mirror`, and the
-/// payloads are literals.
+/// payloads are literals. `collectionType` is deprecated since #4737, so
+/// the tests that read or send it are deprecated test methods.
 final class CollectionContextIdRemovalHermeticTests: XCTestCase {
 
     private func storedProperties(of value: Any) -> [String] {
         Mirror(reflecting: value).children.compactMap { $0.label }
     }
 
+    @available(*, deprecated)
     func testCollectionInfoDeclaresNoContextId() throws {
         let json = """
         {
@@ -38,6 +40,7 @@ final class CollectionContextIdRemovalHermeticTests: XCTestCase {
         XCTAssertFalse(labels.contains("contextId"), "\(labels)")
     }
 
+    @available(*, deprecated)
     func testCreateCollectionParamsDeclaresNoContextIdAndBindsWithInitialMetadata() throws {
         let params = CreateCollectionParams(
             name: "Class 42",

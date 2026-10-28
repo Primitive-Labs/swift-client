@@ -17,7 +17,11 @@ final class ChannelSubscribeHermeticTests: XCTestCase {
     /// A bare client on a closed API port: nothing reaches an HTTP server.
     /// `autoNetwork: false` so nothing connects until a test asks.
     private func makeClient(wsUrl: String) -> JsBaoClient {
-        JsBaoClient(options: JsBaoClientOptions(
+        JsBaoClient(options: clientOptions(wsUrl: wsUrl))
+    }
+
+    private func clientOptions(wsUrl: String) -> JsBaoClientOptions {
+        JsBaoClientOptions(
             apiUrl: "http://127.0.0.1:1",
             wsUrl: wsUrl,
             appId: "channels-hermetic",
@@ -26,7 +30,25 @@ final class ChannelSubscribeHermeticTests: XCTestCase {
             logLevel: .none,
             storageConfig: .memory,
             autoNetwork: false
-        ))
+        )
+    }
+
+    /// Holds a client's storage setup until released.
+    private final class StorageSetupHold: Sendable {
+        private let stream: AsyncStream<Void>
+        private let continuation: AsyncStream<Void>.Continuation
+
+        init() {
+            (stream, continuation) = AsyncStream.makeStream()
+        }
+
+        func wait() async {
+            for await _ in stream {}
+        }
+
+        func release() {
+            continuation.finish()
+        }
     }
 
     private func wsBase(_ url: URL) -> String {
@@ -394,6 +416,40 @@ final class ChannelSubscribeHermeticTests: XCTestCase {
         try await delay(0.3)
         XCTAssertEqual(subscribeFrames(server, channel: "orders:1").count, 1, "sent once: the open flush, not the flush plus a re-issue")
         XCTAssertFalse(join.isSettled)
+
+        await deliver(["type": "channel.subscribed", "channel": "orders:1", "expiresAt": 7], to: client)
+        let subscription = try await join.task.value
+        XCTAssertEqual(subscription.expiresAt, 7)
+    }
+
+    /// A join made before the client's storage has bound opens a socket that
+    /// storage setup must not rebuild afterwards. Storage setup raises the
+    /// socket's receive limit, and a raise on a live socket rebuilds it, so
+    /// the join's own connect has to settle the limit first — otherwise the
+    /// rebuild's close rejects the join before its ack can arrive. This is
+    /// the window the test above lands in when it runs first in its process.
+    func testAJoinMadeBeforeStorageBindsIsNotRejectedWhenStorageSetupFinishes() async throws {
+        let server = try LoopbackWebSocketServer()
+        let url = try server.start()
+        let hold = StorageSetupHold()
+        let client = JsBaoClient(
+            options: clientOptions(wsUrl: wsBase(url)),
+            connectivityMonitor: nil,
+            storageSetupHoldForTest: { await hold.wait() }
+        )
+        defer { hold.release(); server.stop(); Task { await client.destroy() } }
+
+        let join = Join(client, "orders:1", grant: "grant-1")
+        try await waitUntil("the socket to open") { client.isConnected }
+        try await waitUntil("the held-back frame") { !self.subscribeFrames(server, channel: "orders:1").isEmpty }
+
+        hold.release()
+        let storageReady = await client.waitForStorageReady()
+        XCTAssertTrue(storageReady)
+        try await delay(0.3)
+        XCTAssertFalse(join.isSettled, "storage setup must not take the join's socket down: \(String(describing: join.failureMessage()))")
+        XCTAssertEqual(subscribeFrames(server, channel: "orders:1").count, 1, "sent once, on the socket the join opened")
+        XCTAssertTrue(client.isConnected)
 
         await deliver(["type": "channel.subscribed", "channel": "orders:1", "expiresAt": 7], to: client)
         let subscription = try await join.task.value

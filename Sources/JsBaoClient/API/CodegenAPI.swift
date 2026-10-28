@@ -232,6 +232,23 @@ public final class CodegenAPI: @unchecked Sendable {
             .save(id: id, values: values, changedFields: changedFields, confirm: confirm)
     }
 
+    /// ``save(_:id:values:in:changedFields:)`` with a db3 write's guards: on a
+    /// record-log (format-3) document `options.condition` and
+    /// `options.ifNotExists` ride the save and the room judges them, and with
+    /// `options.confirm` it returns once the room acknowledged the save,
+    /// throwing its refusal. On any other document the options are ignored.
+    /// See `DynamicModel.save(id:values:changedFields:options:)`.
+    @discardableResult
+    public func save(
+        _ schema: PrimitiveSchema, id: String,
+        values: [String: PrimitiveValue], in docId: String,
+        changedFields: Set<String>? = nil,
+        options: Db3WriteOptions
+    ) async throws -> PrimitiveRecord {
+        try await requireClient("save").requireMember(schema, in: docId, source: "save")
+            .save(id: id, values: values, changedFields: changedFields, options: options)
+    }
+
     /// Insert-or-update a record in document `docId`, matched by the
     /// single-field unique constraint on `field` — mirrors js-bao's
     /// `save({ upsertOn: field })`. Throws if the doc isn't open.
@@ -311,6 +328,32 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Delete a record from document `docId`. Throws if the doc isn't open.
     public func delete(_ schema: PrimitiveSchema, id: String, in docId: String) throws {
         try requireClient("delete").requireMember(schema, in: docId).delete(id: id)
+    }
+
+    /// Delete a record from document `docId` with a db3 write's
+    /// `options.condition` and `options.confirm`; with neither, it deletes as
+    /// ``delete(_:id:in:)`` does. See `DynamicModel.delete(id:options:)`.
+    public func delete(
+        _ schema: PrimitiveSchema, id: String, in docId: String,
+        options: Db3WriteOptions
+    ) async throws {
+        try await requireClient("delete").requireMember(schema, in: docId, source: "delete")
+            .delete(id: id, options: options)
+    }
+
+    /// Add each of `fields` to record `id`'s number fields in db3 `docId`,
+    /// answering each field's new value — the room's, once it applied the
+    /// increment, with `options.confirm` or an `options.condition`. A record
+    /// the document's view does not hold throws `.db3RecordNotFound`; a
+    /// document that is not a db3 throws `.invalidArgument`. See
+    /// `DynamicModel.increment(id:fields:options:)`.
+    @discardableResult
+    public func increment(
+        _ schema: PrimitiveSchema, id: String, fields: [String: Double], in docId: String,
+        options: Db3WriteOptions = Db3WriteOptions()
+    ) async throws -> [String: Double] {
+        try await requireClient("increment").requireMember(schema, in: docId, source: "increment")
+            .increment(id: id, fields: fields, options: options)
     }
 
     // MARK: - Cross-document relationship traversal
@@ -472,6 +515,26 @@ public final class CodegenAPI: @unchecked Sendable {
             prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
         )
     }
+}
+
+// The generated db3 writes name their options `JsBaoClient.Db3WriteOptions`,
+// never bare `Db3WriteOptions`: a generated model is a type in the app's own
+// module, so one a schema names `Db3WriteOptions` (`class_name`, or a model
+// `db3_write_options`) would shadow the imported type in every generated file.
+// Generated code already depends on the name `JsBaoClient`, so reaching the
+// type through it adds no name a model could take. The module name cannot
+// qualify it (`JsBaoClient` resolves to the class first), and a member alias
+// cannot name its own target, hence the hop through `CodegenAPI`.
+extension CodegenAPI {
+    /// ``Db3WriteOptions``, under a second name so `JsBaoClient.Db3WriteOptions`
+    /// can refer to it.
+    public typealias WriteOptions = Db3WriteOptions
+}
+
+extension JsBaoClient {
+    /// ``Db3WriteOptions``, reachable through the client's name: the spelling
+    /// generated models use, which no model of that name shadows.
+    public typealias Db3WriteOptions = CodegenAPI.WriteOptions
 }
 
 /// What ``CodegenAPI/includeTarget(for:)`` answers with once its owning client

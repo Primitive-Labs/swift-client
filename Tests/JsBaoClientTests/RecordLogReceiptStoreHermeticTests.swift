@@ -7,12 +7,12 @@ import XCTest
 ///
 /// - `applyLoadChunk` writes the confirmed rows and, set-based, the view rows
 ///   of every key no unjudged entry touches and no unjudged upsert's value
-///   lands on; the rest go through the per-record refresh. The chunk's ids are
-///   projected into the query tables, all in one transaction. A 10,000-row
+///   lands on; the rest go through the per-record refresh, all in one
+///   transaction (a db3's rows live in its view only since #4700). A 10,000-row
 ///   chunk applies in under 2 s, and its reply names the model rather than
 ///   10,000 changed rows.
 /// - `completeLoad` of a refresh removes the covered rows no line named, in the
-///   view and the query tables too, keeps other models' rows and the client's
+///   view too, keeps other models' rows and the client's
 ///   own pending create.
 /// - The receipt marker is persisted in `record_log_state.receipt`; only a
 ///   receipt's or a full replacement's completion clears it. A chunk of an
@@ -32,16 +32,6 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         super.tearDown()
     }
 
-    private static let schema = PrimitiveSchema(
-        name: "Note",
-        fields: [
-            "id": FieldDescriptor(type: .id),
-            "title": FieldDescriptor(type: .string),
-            "slug": FieldDescriptor(type: .string, unique: true),
-            "n": FieldDescriptor(type: .number),
-        ]
-    )
-    private var spec: RecordLogProjectionSpec { RecordLogProjectionSpec(schema: Self.schema) }
 
     private func newDatabasePath() -> String {
         let directory = NSTemporaryDirectory() + "/record-log-receipt-\(UUID().uuidString)"
@@ -56,16 +46,12 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         return provider
     }
 
-    /// A store with its tables, the `Note` query tables (unless `prepared` is
-    /// false), and a minted writer.
+    /// A store with its tables and a minted writer.
     private func opened(
-        _ provider: SQLiteStorageProvider, clientId: String = "client-a", prepared: Bool = true, logger: Logger? = nil
+        _ provider: SQLiteStorageProvider, clientId: String = "client-a", logger: Logger? = nil
     ) throws -> (store: RecordLogStore, writer: String) {
         let store = RecordLogStore(host: provider, documentId: "doc-1", clientId: clientId, logger: logger)
         try store.initialize()
-        if prepared {
-            try RecordLogQueryProjection.prepare(schema: Self.schema, engine: BaoModelQueryEngine(host: provider), host: provider)
-        }
         return (store, try store.mintWriter())
     }
 
@@ -95,17 +81,16 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         try provider.withConnection { try $0.query(sql, []).first?["n"].intValue ?? -1 }
     }
 
-    /// The `Note` query row: id, title, slug, n (a number as its value).
+    /// The `Note` row a query reads, from the view (the query tables until
+    /// #4700): id, title, slug, n, a field the row lacks as null.
     private func queryRow(_ provider: SQLiteStorageProvider, _ id: String) throws -> [String: JSONValue]? {
         try provider.withConnection { connection in
-            try connection.query("SELECT id, title, slug, n FROM \"\(spec.table)\" WHERE id = ?", [.text(id)]).first.map { row in
+            try connection.query(
+                "SELECT _data FROM record_log_view WHERE doc_id = 'doc-1' AND _type = 'Note' AND _id = ?", [.text(id)]
+            ).first.map { row in
+                let stored = RecordLogJSON.row(row["_data"].stringValue)
                 var out: [String: JSONValue] = [:]
-                for column in ["id", "title", "slug"] { out[column] = row[column].stringValue.map { .string($0) } ?? .null }
-                switch row["n"] {
-                case .integer(let value): out["n"] = .number(Double(value))
-                case .real(let value): out["n"] = .number(value)
-                default: out["n"] = .null
-                }
+                for column in ["id", "title", "slug", "n"] { out[column] = stored[column] ?? .null }
                 return out
             }
         }
@@ -154,11 +139,10 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
         _ = try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(2),
-            project: [spec]
+            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(2)
         )
         XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_load_keys"), 2)
-        XCTAssertTrue(try store.purge(force: true, project: [spec]).purged)
+        XCTAssertTrue(try store.purge(force: true).purged)
         XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_load_keys"), 0)
         XCTAssertNil(try store.marks().receipt)
     }
@@ -169,8 +153,7 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let (store, writer) = try opened(provider)
         XCTAssertNil(try store.marks().receipt)
         _ = try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(2),
-            project: [spec]
+            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(2)
         )
         await provider.close()
 
@@ -221,10 +204,9 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
     func testAChunkWritesTheConfirmedRowsTheViewAndTheQueryTablesAndNamesTheModel() async throws {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
-        _ = try store.applyCatchUpPage(writer: writer, rows: [row("n00001", ["title": "old", "slug": "keep"])], project: [spec])
+        _ = try store.applyCatchUpPage(writer: writer, rows: [row("n00001", ["title": "old", "slug": "keep"])])
         let reply = try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(3),
-            project: [spec]
+            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(3)
         )
         XCTAssertEqual(reply.applied, 3)
         XCTAssertEqual(reply.removed, 0)
@@ -244,11 +226,10 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
         let a = try attempt(store, writer)
-        _ = try store.applyLoadChunk(writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: lines(2), project: [spec])
+        _ = try store.applyLoadChunk(writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: lines(2))
         let reply = try store.applyLoadChunk(
             writer: writer, sessionId: Self.session, attempt: a, model: "Note",
-            lines: [RecordLogLoadLine(id: "n00001", patch: ["_deleted": true]), RecordLogLoadLine(id: "absent", patch: ["_deleted": true])],
-            project: [spec]
+            lines: [RecordLogLoadLine(id: "n00001", patch: ["_deleted": true]), RecordLogLoadLine(id: "absent", patch: ["_deleted": true])]
         )
         XCTAssertEqual(reply.applied, 0)
         XCTAssertEqual(reply.removed, 1)
@@ -260,13 +241,12 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
     func testAChunkKeepsAPendingPatchsGuessOnTopOfTheLoadedRow() async throws {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
-        _ = try store.applyCatchUpPage(writer: writer, rows: [row("n00001", ["title": "old", "n": 0])], project: [spec])
+        _ = try store.applyCatchUpPage(writer: writer, rows: [row("n00001", ["title": "old", "n": 0])])
         _ = try store.commitEntries(
-            writer: writer, writes: [RecordLogWrite(mutations: [mutation("n00001", .patch, ["title": "mine"])])], project: [spec]
+            writer: writer, writes: [RecordLogWrite(mutations: [mutation("n00001", .patch, ["title": "mine"])])]
         )
         let reply = try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(2),
-            project: [spec]
+            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: lines(2)
         )
         XCTAssertEqual(try store.read(model: "Note", id: "n00001"), ["id": "n00001", "title": "mine", "n": 1])
         XCTAssertEqual(try queryRow(provider, "n00001")?["title"], "mine")
@@ -279,13 +259,12 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let (store, writer) = try opened(provider)
         _ = try store.commitEntries(
             writer: writer,
-            writes: [RecordLogWrite(mutations: [mutation("guess", .create, ["slug": "shared", "title": "mine"])], upsertOn: "slug")],
-            project: [spec]
+            writes: [RecordLogWrite(mutations: [mutation("guess", .create, ["slug": "shared", "title": "mine"])], upsertOn: "slug")]
         )
         XCTAssertEqual(try store.read(model: "Note", id: "guess")?["slug"], "shared")
         let reply = try store.applyLoadChunk(
             writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note",
-            lines: [RecordLogLoadLine(id: "n00007", patch: ["slug": "shared", "title": "loaded", "n": 7])], project: [spec]
+            lines: [RecordLogLoadLine(id: "n00007", patch: ["slug": "shared", "title": "loaded", "n": 7])]
         )
         XCTAssertNil(try store.read(model: "Note", id: "guess"))
         XCTAssertEqual(try store.read(model: "Note", id: "n00007"), ["id": "n00007", "slug": "shared", "title": "mine", "n": 7])
@@ -296,12 +275,20 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
 
     func testAChunkThatThrowsMidWayLeavesNoRowOfIt() async throws {
         let provider = try await makeProvider()
-        // No query tables: projecting the chunk's rows fails after its rows were written.
-        let (store, writer) = try opened(provider, prepared: false)
+        let (store, writer) = try opened(provider)
         let a = try attempt(store, writer)
+        // The chunk's fourth view row is refused after its confirmed rows were
+        // written (until #4700 the missing query tables failed it there).
+        try provider.withConnection { connection in
+            try connection.executeScript("""
+                CREATE TRIGGER refuse_fourth BEFORE INSERT ON record_log_view WHEN NEW._id = 'n00004'
+                BEGIN SELECT RAISE(ABORT, 'the chunk fails mid-way'); END
+                """)
+        }
         XCTAssertThrowsError(try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: lines(5), project: [spec]
+            writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: lines(5)
         ))
+        try provider.withConnection { try $0.executeScript("DROP TRIGGER refuse_fourth") }
         XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_rows"), 0)
         XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_view"), 0)
         XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_load_keys"), 0)
@@ -315,7 +302,7 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
         let reply = try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: [], project: [spec]
+            writer: writer, sessionId: Self.session, attempt: try attempt(store, writer), model: "Note", lines: []
         )
         XCTAssertEqual(reply.applied, 0)
         XCTAssertEqual(reply.removed, 0)
@@ -330,22 +317,22 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let a = try attempt(store, writer)
         // Older values of every twentieth id, and a pending patch on one of them.
         _ = try store.applyCatchUpPage(
-            writer: writer, rows: (0..<500).map { k in row(Self.id(k * 20 + 1), ["title": .string("old\(k)")]) }, project: [spec]
+            writer: writer, rows: (0..<500).map { k in row(Self.id(k * 20 + 1), ["title": .string("old\(k)")]) }
         )
         _ = try store.commitEntries(
-            writer: writer, writes: [RecordLogWrite(mutations: [mutation("n00021", .patch, ["title": "mine"])])], project: [spec]
+            writer: writer, writes: [RecordLogWrite(mutations: [mutation("n00021", .patch, ["title": "mine"])])]
         )
         let chunk = lines(10_000)
         let started = Date()
         let reply = try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: chunk, project: [spec]
+            writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: chunk
         )
         let ms = Date().timeIntervalSince(started) * 1000
         FileHandle.standardError.write(Data("[4312] a 10,000-row chunk applied in \(Int(ms)) ms on the Swift store\n".utf8))
         XCTAssertLessThan(ms, 2_000)
         XCTAssertEqual(reply.applied, 10_000)
         XCTAssertLessThan(reply.changed.count, 5)
-        XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM \"\(spec.table)\""), 10_000)
+        XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_view WHERE _type = 'Note'"), 10_000)
         XCTAssertEqual(try store.read(model: "Note", id: "n00021")?["title"], "mine")
         XCTAssertEqual(try store.read(model: "Note", id: "n00021")?["n"], 21)
         XCTAssertEqual(try store.read(model: "Note", id: "n09999"), ["id": "n09999", "title": "t9999", "n": 9999])
@@ -359,13 +346,13 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let a = try attempt(store, writer)
         _ = try store.applyCatchUpPage(writer: writer, rows: [
             row("n00001", ["title": "a"]), row("stale", ["title": "b"]), row("t1", ["title": "task"], model: "Task"),
-        ], project: [spec])
+        ])
         _ = try store.commitEntries(
-            writer: writer, writes: [RecordLogWrite(mutations: [mutation("mine", .create, ["title": "pending"])])], project: [spec]
+            writer: writer, writes: [RecordLogWrite(mutations: [mutation("mine", .create, ["title": "pending"])])]
         )
-        _ = try store.applyLoadChunk(writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: lines(1), project: [spec])
+        _ = try store.applyLoadChunk(writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: lines(1))
         let reply = try store.completeLoad(
-            writer: writer, sessionId: Self.session, attempt: a, mode: .refresh, models: ["Note"], project: [spec]
+            writer: writer, sessionId: Self.session, attempt: a, mode: .refresh, models: ["Note"]
         )
         XCTAssertEqual(reply.removed, 1)
         XCTAssertEqual(reply.models, ["Note"])
@@ -380,23 +367,23 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
     func testTwoStoresAttemptsOfOneRefreshKeepTheirKeysApart() async throws {
         let provider = try await makeProvider()
         let (a, wa) = try opened(provider)
-        _ = try a.applyCatchUpPage(writer: wa, rows: [row("stale", ["title": "b"])], project: [spec])
+        _ = try a.applyCatchUpPage(writer: wa, rows: [row("stale", ["title": "b"])])
         let (b, wb) = try opened(provider, clientId: "client-b")
         let attemptA = try attempt(a, wa)
         let attemptB = try attempt(b, wb)
-        _ = try a.applyLoadChunk(writer: wa, sessionId: Self.session, attempt: attemptA, model: "Note", lines: lines(2), project: [spec])
-        _ = try b.applyLoadChunk(writer: wb, sessionId: Self.session, attempt: attemptB, model: "Note", lines: lines(2), project: [spec])
+        _ = try a.applyLoadChunk(writer: wa, sessionId: Self.session, attempt: attemptA, model: "Note", lines: lines(2))
+        _ = try b.applyLoadChunk(writer: wb, sessionId: Self.session, attempt: attemptB, model: "Note", lines: lines(2))
         XCTAssertEqual(try a.completeLoad(
-            writer: wa, sessionId: Self.session, attempt: attemptA, mode: .refresh, models: ["Note"], project: [spec]
+            writer: wa, sessionId: Self.session, attempt: attemptA, mode: .refresh, models: ["Note"]
         ).removed, 1)
         // B's refresh completes after A forgot its keys: B's own are still there.
         let second = try b.completeLoad(
-            writer: wb, sessionId: Self.session, attempt: attemptB, mode: .refresh, models: ["Note"], project: [spec]
+            writer: wb, sessionId: Self.session, attempt: attemptB, mode: .refresh, models: ["Note"]
         )
         XCTAssertFalse(second.stale)
         XCTAssertEqual(second.removed, 0)
-        _ = try a.completeCatchUp(writer: wa, lsn: 4, receipt: attemptA, project: [spec])
-        _ = try b.completeCatchUp(writer: wb, lsn: 4, receipt: attemptB, project: [spec])
+        _ = try a.completeCatchUp(writer: wa, lsn: 4, receipt: attemptA)
+        _ = try b.completeCatchUp(writer: wb, lsn: 4, receipt: attemptB)
         XCTAssertEqual(try rowIds(provider), ["n00001", "n00002"])
         XCTAssertEqual(try queryRow(provider, "n00002")?["title"], "t2")
         XCTAssertNil(try b.marks().receipt)
@@ -407,22 +394,22 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
         let old = try attempt(store, writer)
-        _ = try store.applyLoadChunk(writer: writer, sessionId: Self.session, attempt: old, model: "Note", lines: lines(1), project: [spec])
+        _ = try store.applyLoadChunk(writer: writer, sessionId: Self.session, attempt: old, model: "Note", lines: lines(1))
         XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_load_keys"), 1)
         // The recovery walks the room's table, which does not have n00001.
         let generation = try XCTUnwrap(try store.beginFencedCatchUp(writer: writer, full: true))
-        _ = try store.applyCatchUpPage(writer: writer, rows: [row("kept", [:])], generation: generation, project: [spec])
-        _ = try store.completeCatchUp(writer: writer, lsn: 7, full: true, generation: generation, project: [spec])
+        _ = try store.applyCatchUpPage(writer: writer, rows: [row("kept", [:])], generation: generation)
+        _ = try store.completeCatchUp(writer: writer, lsn: 7, full: true, generation: generation)
         XCTAssertNil(try store.marks().receipt)
         XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_load_keys"), 0)
         // The ended attempt's chunk arrives late: nothing changes.
         let late = try store.applyLoadChunk(
-            writer: writer, sessionId: Self.session, attempt: old, model: "Note", lines: lines(1), project: [spec]
+            writer: writer, sessionId: Self.session, attempt: old, model: "Note", lines: lines(1)
         )
         XCTAssertTrue(late.stale)
         XCTAssertEqual(late.applied, 0)
         XCTAssertTrue(try store.completeLoad(
-            writer: writer, sessionId: Self.session, attempt: old, mode: .refresh, models: ["Note"], project: [spec]
+            writer: writer, sessionId: Self.session, attempt: old, mode: .refresh, models: ["Note"]
         ).stale)
         XCTAssertEqual(try rowIds(provider), ["kept"])
         XCTAssertNil(try queryRow(provider, "n00001"))
@@ -436,15 +423,15 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
     func testASegmentAppliesUnderItsGenerationAndAnOlderGenerationIsAnsweredStale() async throws {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
-        _ = try store.applyCatchUpPage(writer: writer, rows: [row("x1", ["title": "only here"]), row("n00001", ["title": "old"])], project: [spec])
+        _ = try store.applyCatchUpPage(writer: writer, rows: [row("x1", ["title": "only here"]), row("n00001", ["title": "old"])])
         _ = try store.commitEntries(
-            writer: writer, writes: [RecordLogWrite(mutations: [mutation("mine", .create, ["title": "pending"])])], project: [spec]
+            writer: writer, writes: [RecordLogWrite(mutations: [mutation("mine", .create, ["title": "pending"])])]
         )
         _ = try store.beginReceipt(writer: writer, kind: .segment, id: "G1")
         let first = try XCTUnwrap(try store.beginFencedCatchUp(writer: writer, full: true))
         let rows = try store.applySegmentChunk(
             writer: writer, generation: first,
-            rows: [row("n00001", ["title": "at B"]), row("n00002", ["title": "at B"])], project: [spec]
+            rows: [row("n00001", ["title": "at B"]), row("n00002", ["title": "at B"])]
         )
         XCTAssertEqual(rows.applied, 2)
         XCTAssertEqual(rows.models, ["Note"])
@@ -454,8 +441,7 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
             lines: [
                 RecordLogCorrection(model: "Note", id: "n00002", row: nil),
                 RecordLogCorrection(model: "Note", id: "n00003", row: ["id": "n00003", "title": "after B"]),
-            ],
-            project: [spec]
+            ]
         )
         XCTAssertEqual(corrections.applied, 1)
         XCTAssertEqual(corrections.removed, 1)
@@ -465,10 +451,10 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         XCTAssertGreaterThan(second, first)
         let before = try provider.withConnection { try $0.query("SELECT _id, _data FROM record_log_rows ORDER BY _id", []) }
             .map { "\($0["_id"].stringValue ?? "")=\($0["_data"].stringValue ?? "")" }
-        XCTAssertTrue(try store.applySegmentChunk(writer: writer, generation: first, rows: [row("z", [:])], project: [spec]).stale)
-        XCTAssertTrue(try store.applySegmentCorrections(writer: writer, generation: first, lines: [], project: [spec]).stale)
-        XCTAssertTrue(try store.applyCatchUpPage(writer: writer, rows: [row("z", [:])], generation: first, project: [spec]).stale)
-        XCTAssertTrue(try store.completeCatchUp(writer: writer, lsn: 30, full: true, generation: first, project: [spec]).stale)
+        XCTAssertTrue(try store.applySegmentChunk(writer: writer, generation: first, rows: [row("z", [:])]).stale)
+        XCTAssertTrue(try store.applySegmentCorrections(writer: writer, generation: first, lines: []).stale)
+        XCTAssertTrue(try store.applyCatchUpPage(writer: writer, rows: [row("z", [:])], generation: first).stale)
+        XCTAssertTrue(try store.completeCatchUp(writer: writer, lsn: 30, full: true, generation: first).stale)
         let after = try provider.withConnection { try $0.query("SELECT _id, _data FROM record_log_rows ORDER BY _id", []) }
             .map { "\($0["_id"].stringValue ?? "")=\($0["_data"].stringValue ?? "")" }
         XCTAssertEqual(after, before)
@@ -477,9 +463,9 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         // The surviving replacement puts its rows and completes.
         _ = try store.applySegmentChunk(
             writer: writer, generation: second,
-            rows: [row("n00001", ["title": "at B"]), row("n00003", ["title": "after B"])], project: [spec]
+            rows: [row("n00001", ["title": "at B"]), row("n00003", ["title": "after B"])]
         )
-        let done = try store.completeCatchUp(writer: writer, lsn: 30, high: 3, full: true, generation: second, project: [spec])
+        let done = try store.completeCatchUp(writer: writer, lsn: 30, high: 3, full: true, generation: second)
         XCTAssertFalse(done.stale)
         let marks = try store.marks()
         XCTAssertEqual(marks.cursor, 30)
@@ -494,21 +480,18 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
 
     // MARK: - A model never registered (edge 005)
 
-    func testARefreshOfAModelNeverRegisteredFillsTheViewAndItsQueryTablesAreRebuiltWhenItIsRegistered() async throws {
+    /// A model's rows are in the view whether or not a model was ever
+    /// registered for it; until #4700 its query tables were rebuilt from the
+    /// view when it was (a projection pin the retirement moved).
+    func testARefreshOfAModelNeverRegisteredFillsTheView() async throws {
         let provider = try await makeProvider()
         let (store, writer) = try opened(provider)
-        XCTAssertTrue(try store.projectModel(spec: spec))
         let a = try attempt(store, writer)
-        // The session binds no spec for `Note` yet: the chunk fills the view only.
         _ = try store.applyLoadChunk(writer: writer, sessionId: Self.session, attempt: a, model: "Note", lines: lines(3))
         _ = try store.completeLoad(writer: writer, sessionId: Self.session, attempt: a, mode: .refresh, models: ["Note"])
         XCTAssertEqual(try store.read(model: "Note", id: "n00002")?["title"], "t2")
-        XCTAssertFalse(try store.isProjected(model: "Note"))
-        XCTAssertNil(try queryRow(provider, "n00002"))
-        // Registering the model rebuilds its query tables from the view.
-        XCTAssertTrue(try store.projectModel(spec: spec))
         XCTAssertEqual(try queryRow(provider, "n00002"), ["id": "n00002", "title": "t2", "slug": .null, "n": 2])
-        XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM \"\(spec.table)\""), 3)
+        XCTAssertEqual(try count(provider, "SELECT COUNT(*) AS n FROM record_log_view WHERE _type = 'Note'"), 3)
     }
 
     // MARK: - Results held ahead of the cursor (behavior 31, the store's line)

@@ -129,13 +129,15 @@ enum RecordLogReceiptHarness {
         let synced = LockedBox(0)
         let progress = LockedBox(0)
         let failed = LockedBox<[String]>([])
+        /// Every status the session reported, in order.
+        let statuses = LockedBox<[RecordLogSessionStatus]>([])
         private var grants = 0
 
         init(provider: SQLiteStorageProvider, clientId: String, fetches: Bool, timings: RecordLogSessionTimings) async throws {
             self.provider = provider
             binding = try RecordLogDocumentBinding(
                 host: provider, documentId: RecordLogReceiptHarness.documentId, clientId: clientId,
-                engine: BaoModelQueryEngine(host: provider), logger: Logger(level: .none)
+                logger: Logger(level: .none)
             )
             try binding.registerModel(RecordLogReceiptHarness.schema)
             let connection = Connection(fetches: fetches)
@@ -143,6 +145,7 @@ enum RecordLogReceiptHarness {
             let synced = self.synced
             let progress = self.progress
             let failed = self.failed
+            let statuses = self.statuses
             session = RecordLogSession(
                 documentId: RecordLogReceiptHarness.documentId, binding: binding,
                 host: RecordLogSessionHost(
@@ -150,7 +153,8 @@ enum RecordLogReceiptHarness {
                     declarations: { [:] },
                     synced: { _ in synced.withValue { $0 += 1 } },
                     syncFailed: { _, reason in failed.withValue { $0.append(reason) } },
-                    progress: { _ in progress.withValue { $0 += 1 } }
+                    progress: { _ in progress.withValue { $0 += 1 } },
+                    status: { _, status in statuses.withValue { $0.append(status) } }
                 ),
                 timings: timings, logger: Logger(level: .verbose)
             )

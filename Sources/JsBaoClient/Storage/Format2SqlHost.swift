@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import JsBaoSQLite
 
 /// Direct, serialized SQL access to a storage provider's own database
 /// connection (#3436).
@@ -82,6 +82,16 @@ public protocol Format2SqlConnection: AnyObject {
 extension Format2SqlConnection {
     public func execute(_ sql: String) throws { try execute(sql, []) }
     public func query(_ sql: String) throws -> [Format2SqlRow] { try query(sql, []) }
+
+    /// Each row of `sql` in turn until `row` answers `false`: streamed off the
+    /// real connection, collected first on a connection that wraps one.
+    func eachRow(_ sql: String, _ bindings: [Format2SqlValue], _ row: (Format2SqlRow) throws -> Bool) throws {
+        if let real = self as? SQLiteFormat2Connection {
+            try real.forEachRow(sql, bindings, row)
+            return
+        }
+        for each in try query(sql, bindings) where try !row(each) { return }
+    }
 }
 
 /// The real connection over a raw SQLite handle.
@@ -200,6 +210,45 @@ public final class SQLiteFormat2Connection: Format2SqlConnection {
         }
         release(statement)
         return rows
+    }
+
+    /// ``query(_:_:)`` one row at a time: `row` answers whether to read on,
+    /// so a reader that has what it needs (a db3 page at its byte budget, an
+    /// include leg at its cap) stops the statement there rather than holding
+    /// every row it would have answered.
+    func forEachRow(
+        _ sql: String, _ bindings: [Format2SqlValue], _ row: (Format2SqlRow) throws -> Bool
+    ) throws {
+        let statement = try prepare(sql, bindings)
+        var names: [String?] = []
+        var count: Int32 = 0
+        var first = true
+        var stepFailed = false
+        do {
+            while true {
+                let rc = sqlite3_step(statement)
+                if rc == SQLITE_DONE { break }
+                guard rc == SQLITE_ROW else {
+                    stepFailed = true
+                    throw failed(sql)
+                }
+                if first {
+                    first = false
+                    count = sqlite3_column_count(statement)
+                    names = (0..<count).map { sqlite3_column_name(statement, $0).map { String(cString: $0) } }
+                }
+                var columns = [String: Format2SqlValue](minimumCapacity: names.count)
+                for index in 0..<count {
+                    if let name = names[Int(index)] { columns[name] = Self.value(of: statement, at: index) }
+                }
+                if try !row(Format2SqlRow(columns: columns)) { break }
+            }
+        } catch {
+            // A failed step finalized the statement; nothing is left to reset.
+            if !stepFailed { release(statement) }
+            throw error
+        }
+        release(statement)
     }
 
     /// Run several statements separated by semicolons — DDL only, so nothing

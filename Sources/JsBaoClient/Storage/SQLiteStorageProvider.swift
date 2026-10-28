@@ -1,9 +1,11 @@
 import Foundation
-import SQLite3
+import JsBaoSQLite
 
 /// SQLite-backed implementation of ``StorageProvider``.
 ///
-/// Uses the raw SQLite3 C API available on all Apple platforms.
+/// Uses the SQLite C API of the package's bundled SQLite (`JsBaoSQLite`, the
+/// release sqlite-wasm carries), not the OS's, so every supported OS runs the
+/// same SQL.
 /// Thread safety is achieved via an internal serial `DispatchQueue`
 /// that serializes all database access.
 public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {

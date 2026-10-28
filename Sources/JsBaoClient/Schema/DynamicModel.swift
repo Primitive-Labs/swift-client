@@ -60,6 +60,33 @@ import Yniffi
 /// on separate queues with no cross-paradigm ordering guarantee: never split
 /// one logical batch across `transact` and `transactSync`. That is a review
 /// invariant, not a compiler-checked one.
+/// The guards and confirmation of a db3 write on the model API
+/// (`save(id:values:changedFields:options:)`, `delete(id:options:)`,
+/// `increment(id:fields:options:)`).
+public struct Db3WriteOptions: Sendable {
+    /// The record must be live and match this filter (the query filter
+    /// grammar, e.g. `["version": 3]`) when the room applies the write;
+    /// otherwise the room refuses it `.db3ConditionNotMet` and hands it back
+    /// with the record's current row (`details["current"]`). The write shows
+    /// on this device only once the room accepts it. Ignored on a format-1
+    /// document.
+    public var condition: DocumentFilter?
+    /// `save` only: save the whole state as a create that lands only when no
+    /// live record has the id; otherwise the room refuses it
+    /// `.db3ConditionNotMet`. Ignored on a format-1 document.
+    public var ifNotExists: Bool
+    /// Return only once the room has acknowledged the write (an increment:
+    /// applied it, answering the values it left), throwing its refusal.
+    /// Ignored inside `transact`, and on a format-1 document.
+    public var confirm: Bool
+
+    public init(condition: DocumentFilter? = nil, ifNotExists: Bool = false, confirm: Bool = false) {
+        self.condition = condition
+        self.ifNotExists = ifNotExists
+        self.confirm = confirm
+    }
+}
+
 public final class DynamicModel: @unchecked Sendable {
     public let schema: PrimitiveSchema
     /// #3719 — the sentence every write of this model is refused with when its
@@ -117,6 +144,31 @@ public final class DynamicModel: @unchecked Sendable {
 
     /// The record-log delegate, or `nil` for any other document.
     var recordLog: RecordLogModelDelegate? { local as? RecordLogModelDelegate }
+
+    /// Hears a save of this model into a format-1 document (the model, the
+    /// document): the client logs the deprecation warning through it. Set by
+    /// the client's shared store before the member is handed out; guarded by
+    /// `observerLock`.
+    private var format1SaveWarning: (@Sendable (String, String) -> Void)?
+    /// Whether this member has warned already: once per model per document.
+    private var warnedFormat1Save = false
+
+    /// Install the format-1 save warning (the client's shared store does).
+    func setFormat1SaveWarning(_ hook: (@Sendable (String, String) -> Void)?) {
+        observerLock.withLock { format1SaveWarning = hook }
+    }
+
+    /// A save, create or update into a format-1 document (records nested in
+    /// the Y.Doc): warn once for this model in this document. What the save
+    /// writes, returns and throws is unchanged.
+    private func warnFormat1Save() {
+        let hook = observerLock.withLock { () -> (@Sendable (String, String) -> Void)? in
+            guard localStorage == nil, !warnedFormat1Save, let hook = format1SaveWarning else { return nil }
+            warnedFormat1Save = true
+            return hook
+        }
+        hook?(schema.name, docId)
+    }
 
     /// Point this member at a record-log (format-3) document's store. Called by
     /// the client right after `connect`, for a document resolved as format 3;
@@ -650,6 +702,8 @@ public final class DynamicModel: @unchecked Sendable {
             )
             return PrimitiveRecord(modelName: schema.name, id: id, model: self, recordLogSeq: seq)
         }
+        // Format 1: a model saved here is deprecated (records belong in a db3).
+        warnFormat1Save()
         try withThrowingTx { [self] txn in
             let root = txn.transactionGetOrInsertMap(name: self.schema.name)
             let isUpdate = root.getMap(tx: txn, key: id) != nil
@@ -679,6 +733,87 @@ public final class DynamicModel: @unchecked Sendable {
         guard confirm, let recordLog, let seq = record.recordLogSeq else { return record }
         try await recordLog.binding.whenAcknowledged(seq)
         return record
+    }
+
+    /// `save` with a db3 write's guards (`options.condition`,
+    /// `options.ifNotExists`) and `options.confirm`. On a record-log (format-3)
+    /// document the guards ride the entry and the room judges them: a refused
+    /// save is handed back as a `DocumentWriteRefusedEvent` carrying
+    /// `current`, and with `confirm` thrown as `.db3ConditionNotMet` with
+    /// `details["current"]`. `ifNotExists` saves the whole state as a create.
+    /// On any other document the options are ignored and it saves as
+    /// `save(id:values:changedFields:)` does.
+    @discardableResult
+    public func save(
+        id: String,
+        values: [String: PrimitiveValue],
+        changedFields: Set<String>? = nil,
+        options: Db3WriteOptions
+    ) async throws -> PrimitiveRecord {
+        guard let recordLog else { return try save(id: id, values: values, changedFields: changedFields) }
+        try refuseUniqueStringsetDeclaration()
+        let guards = RecordLogWriteGuards(condition: options.condition.map { .object($0) }, ifNotExists: options.ifNotExists)
+        let seq = try applyLocalWrite(
+            recordLog, id: id, values: values,
+            isUpdate: options.ifNotExists ? false : nil, changedFields: changedFields, guards: guards
+        )
+        let record = PrimitiveRecord(modelName: schema.name, id: id, model: self, recordLogSeq: seq)
+        if options.confirm, let seq { try await recordLog.binding.whenAcknowledged(seq) }
+        return record
+    }
+
+    /// Add each of `fields` to a db3 record's field: a missing or non-numeric
+    /// field starts at 0, and two increments of one field, made offline or
+    /// concurrently on two devices, both count. Answers each field's new value
+    /// as this device now shows it. Inside `transact` the increment joins the
+    /// transaction's entry after the writes made before it, folded per field.
+    /// A record neither the view nor the transaction holds throws
+    /// `.db3RecordNotFound` and nothing is sent. Only a record-log (format-3)
+    /// document takes an increment: any other throws `.invalidArgument`.
+    /// `options.condition` rides the entry; for the room's values, or
+    /// `options.confirm`, use the `async` form.
+    @discardableResult
+    public func increment(
+        id: String, fields: [String: Double], options: Db3WriteOptions = Db3WriteOptions()
+    ) throws -> [String: Double] {
+        let recordLog = try incrementTarget()
+        let (values, _) = try recordLog.increment(id: id, fields: fields, condition: options.condition.map { .object($0) })
+        notifyListenersAfterWrite()
+        return values
+    }
+
+    /// `increment` as a db3 write the room judges: with `options.confirm` or
+    /// an `options.condition`, returns once the room applied it, with the
+    /// values it left (never those of other writes still pending here), and
+    /// throws its refusal: `.db3ConditionNotMet`, or `.db3RecordNotFound` for
+    /// a record deleted meanwhile, each with `details["current"]`.
+    ///
+    /// ```swift
+    /// let views = try await posts.increment(id: postId, fields: ["views": 1])
+    /// ```
+    @discardableResult
+    public func increment(
+        id: String, fields: [String: Double], options: Db3WriteOptions = Db3WriteOptions()
+    ) async throws -> [String: Double] {
+        let recordLog = try incrementTarget()
+        let (values, seq) = try recordLog.increment(id: id, fields: fields, condition: options.condition.map { .object($0) })
+        notifyListenersAfterWrite()
+        guard let seq, options.confirm || options.condition != nil else { return values }
+        let settlement = try await recordLog.binding.whenSettled(seq)
+        guard let row = settlement.rows.first(where: { $0.model == schema.name && $0.id == id })?.row else { return values }
+        return Dictionary(uniqueKeysWithValues: fields.keys.map { ($0, recordLogNumeric(row[$0])) })
+    }
+
+    /// The record-log delegate an increment writes through, or the refusal of a document that is not a db3.
+    private func incrementTarget() throws -> RecordLogModelDelegate {
+        guard let recordLog else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "`\(schema.name).increment` writes to a db3; document `\(docId)` is not one. Nothing was written.",
+                details: ["documentId": .string(docId)]
+            )
+        }
+        return recordLog
     }
 
     /// Add a single member to a stringset field WITHOUT replacing the
@@ -1038,7 +1173,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// callers always see the latest state.
     public func query(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> [[String: JSONValue]] {
         // A record-log document's records are not in this engine's mirror;
-        // they are in the query tables its own store projects into.
+        // they are in its own store's view.
         if let local { return try local.query(filter: filter, options: options) }
         awaitObserverDrain()
         return try queryEngine.query(
@@ -1067,6 +1202,8 @@ public final class DynamicModel: @unchecked Sendable {
         options: QueryOptions? = nil,
         include: [Include]
     ) throws -> [[String: JSONValue]] {
+        // A db3's includes resolve within its own view, by the reader's statements.
+        if let local { return try local.query(filter: filter, options: options, include: include) }
         var rows = try query(filter, options: options)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
         return rows
@@ -1082,6 +1219,7 @@ public final class DynamicModel: @unchecked Sendable {
         options: QueryOptions? = nil,
         include: [Include]
     ) throws -> PagedQueryResult<PrimitiveRow> {
+        if let local { return try local.queryPaged(filter: filter, options: options, include: include) }
         let base = try localPaged(filter: filter, options: options)
         // Unwrap → resolve includes (which mutates the rows in place) → rewrap.
         var rows = base.data.map(\.raw)
@@ -1662,6 +1800,21 @@ public final class DynamicModel: @unchecked Sendable {
 
     // MARK: - Delete
 
+    /// Delete with a db3 write's `options.condition` and `options.confirm`. On
+    /// a record-log (format-3) document the condition rides the delete and
+    /// the room judges it; with `confirm` it returns once the room
+    /// acknowledged the delete, throwing its refusal. With neither, and on any
+    /// other document, it deletes as `delete(id:)` does.
+    public func delete(id: String, options: Db3WriteOptions) async throws {
+        guard let recordLog, options.condition != nil || options.confirm else {
+            delete(id: id)
+            return
+        }
+        let seq = try recordLog.delete(id: id, condition: options.condition.map { .object($0) })
+        notifyListenersAfterWrite()
+        if options.confirm, let seq { try await recordLog.binding.whenAcknowledged(seq) }
+    }
+
     public func delete(id: String) {
         if let local {
             // The tombstone is a write like any other: it commits with a
@@ -1730,6 +1883,8 @@ public final class DynamicModel: @unchecked Sendable {
                 isUpdate: isUpdate, changedFields: changedFields, upsertOn: upsertOn
             )
         }
+        // Format 1: a model saved here is deprecated (records belong in a db3).
+        warnFormat1Save()
         try withThrowingTx { [self] txn in
             try self.applyWriteInternal(
                 id: id,
@@ -1928,13 +2083,18 @@ public final class DynamicModel: @unchecked Sendable {
     /// save means, and a second copy of this would be a second answer to
     /// "does this save pass validation".
     ///
+    /// - Parameter keepUnchanged: keep the fields the caller assigned even
+    ///   when they equal what is persisted, and skip the dirty check: a
+    ///   guarded db3 save is the room's to judge, so it travels unchanged
+    ///   (js-bao sends the fields a guarded save touched the same way).
     /// - Returns: `nil` when the dirty check finds nothing to do.
     private func preparedWrite(
         id: String,
         values: [String: PrimitiveValue],
         isUpdate: Bool,
         changedFields: Set<String>?,
-        oldData: [String: PrimitiveValue]
+        oldData: [String: PrimitiveValue],
+        keepUnchanged: Bool = false
     ) throws -> PreparedWrite? {
         var newValues = values
         // Stage 1 of js-bao's two-stage narrowing — `_localChanges` (#2459).
@@ -2005,7 +2165,7 @@ public final class DynamicModel: @unchecked Sendable {
         // AFTER the stamp block so an explicitly-supplied auto_stamp value
         // still counts as explicit (js-bao stamps off `_localChanges`, then
         // diffs), and on the UPDATE path only for the same reason as stage 1.
-        if isUpdate {
+        if isUpdate, !keepUnchanged {
             newValues = newValues.filter { oldData[$0.key] != $0.value }
         }
 
@@ -2127,7 +2287,7 @@ public final class DynamicModel: @unchecked Sendable {
         // pre-transact stamp lands in `_localChanges` before the diff. A
         // pure no-op update of an `auto_stamp = "create"`-only model
         // stays clean (create doesn't fire on update) and is skipped.
-        if isUpdate, dataToSave == oldData {
+        if isUpdate, dataToSave == oldData, !(keepUnchanged && !newValues.isEmpty) {
             return nil
         }
 
@@ -2164,7 +2324,8 @@ public final class DynamicModel: @unchecked Sendable {
         values: [String: PrimitiveValue],
         isUpdate requestedIsUpdate: Bool?,
         changedFields: Set<String>?,
-        upsertOn: String? = nil
+        upsertOn: String? = nil,
+        guards: RecordLogWriteGuards? = nil
     ) throws -> Int? {
         guard !id.isEmpty else {
             throw FieldValidationError.requiredFieldMissing(
@@ -2180,7 +2341,8 @@ public final class DynamicModel: @unchecked Sendable {
             let oldData = try localCurrentValues(delegate, id: id)
             guard let prepared = try preparedWrite(
                 id: id, values: values, isUpdate: isUpdate,
-                changedFields: changedFields, oldData: oldData
+                changedFields: changedFields, oldData: oldData,
+                keepUnchanged: guards?.condition != nil
             ) else { return (false, nil) }
 
             // Uniqueness against the VIEW, which is the whole document — not
@@ -2213,7 +2375,12 @@ public final class DynamicModel: @unchecked Sendable {
                     toWrite[name] = value
                 }
             }
-            let seq = try delegate.write(id: id, values: toWrite, isUpdate: isUpdate, upsertOn: upsertOn)
+            let seq: Int?
+            if let guards, let recordLog = delegate as? RecordLogModelDelegate {
+                seq = try recordLog.write(id: id, values: toWrite, isUpdate: isUpdate, upsertOn: upsertOn, guards: guards)
+            } else {
+                seq = try delegate.write(id: id, values: toWrite, isUpdate: isUpdate, upsertOn: upsertOn)
+            }
 
             // The model's declaration, published the way the document's format
             // publishes it. A record-log (format-3) document declares its models
@@ -2311,6 +2478,10 @@ public final class DynamicModel: @unchecked Sendable {
         }
         // If the schema knows the type, decode using it.
         if let type = schema.fields[field]?.type {
+            // On a format-3 document a value that misfits its declared type
+            // reads as missing, as its query-table projection does (#4624):
+            // a number in a boolean field is a boolean on format 1 only (#2825).
+            if local != nil, type == .boolean, raw != "true", raw != "false" { return nil }
             return PrimitiveValue.decode(yrsString: raw, as: type)
         }
         // Otherwise, best-effort inference.

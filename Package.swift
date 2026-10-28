@@ -22,6 +22,17 @@ let package = Package(
             name: "JsBaoClient",
             targets: ["JsBaoClient"]
         ),
+        // The SQLite every connection in this package opens (#4700): the
+        // release sqlite-wasm carries for the JS client, built from source, so
+        // the store answers the same SQL on every OS it runs on. A product so
+        // a package that reads the client's database file (the debug
+        // inspector in PrimitiveApp) opens it with the same library: two
+        // SQLite builds on one file in one process do not see each other's
+        // locks.
+        .library(
+            name: "JsBaoSQLite",
+            targets: ["JsBaoSQLite"]
+        ),
         // Build-time codegen tool that turns a TOML schema (same shape
         // `TomlSchemaLoader` accepts) into one Swift file per model. Use
         // standalone, or via the SwiftPM plugin below to run on every
@@ -67,9 +78,41 @@ let package = Package(
         .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
     ],
     targets: [
+        // The SQLite amalgamation, vendored unmodified beside `Sources/` as
+        // `yswift-fork` is (`Vendor/JsBaoSQLite/VERSION` names the release and
+        // its SHA3-256). `BundledSQLiteHermeticTests` holds its version to
+        // `@sqlite.org/sqlite-wasm`'s in packages/js-bao/package.json.
+        //
+        // SQLite's options are `.define`s. JSON functions are built in since
+        // 3.38; the double-quoted-string default is left as SQLite ships it,
+        // as the room's engine has it.
+        .target(
+            name: "JsBaoSQLite",
+            path: "Vendor/JsBaoSQLite",
+            exclude: ["VERSION"],
+            sources: ["sqlite3.c"],
+            publicHeadersPath: "include",
+            cSettings: [
+                .define("SQLITE_THREADSAFE", to: "1"),
+                .define("SQLITE_OMIT_LOAD_EXTENSION"),
+                .define("SQLITE_ENABLE_MATH_FUNCTIONS"),
+                .define("SQLITE_OMIT_DEPRECATED"),
+                // A debug build compiles C at -O0, which makes SQLite's JSON
+                // functions about 2.7 times slower than the OS's optimized
+                // build (an unindexed `json_extract` scan of 100,000 rows: 92
+                // ms against 34 ms), so an app's debug build would read its
+                // store far slower than it ships. Optimized in every
+                // configuration instead. `unsafeFlags` bars a dependency
+                // resolved by version, and this package has none: apps depend
+                // on a branch of the mirror or on a path (CHANGELOG.md, "How
+                // this package is versioned"), and SwiftPM allows both.
+                .unsafeFlags(["-O2"], .when(configuration: .debug)),
+            ]
+        ),
         .target(
             name: "JsBaoClient",
             dependencies: [
+                "JsBaoSQLite",
                 .product(name: "YSwift", package: "yswift-fork"),
                 .product(name: "TOMLKit", package: "TOMLKit"),
             ],
@@ -86,9 +129,6 @@ let package = Package(
             // `--require-zero`. `run-tests.sh` runs it that way before the
             // suite. Its first check is that the committed mode is still `.v6`
             // — a silent revert would otherwise read as "zero sites".
-            linkerSettings: [
-                .linkedLibrary("sqlite3"),
-            ]
         ),
         .executableTarget(
             name: "swift-bao-codegen",
@@ -114,16 +154,22 @@ let package = Package(
         ),
         .testTarget(
             name: "JsBaoClientTests",
-            dependencies: ["JsBaoClient"],
+            dependencies: ["JsBaoClient", "JsBaoSQLite"],
             path: "Tests/JsBaoClientTests",
             // The cross-language E2E mini-app lives under this test
             // target's path tree but compiles as its own executable
             // target (`E2EMiniApp`) — exclude here so SwiftPM
             // doesn't pull the same Swift sources into both target
-            // compilations. The session-row fixtures (#3802) and the bulk-load
-            // chunk fixtures (#4475) are JSON the JS and Swift suites both
-            // read by path, not bundle resources.
-            exclude: ["CrossPlatform/E2E", "Fixtures/AgentSessionRows", "Fixtures/DocumentIngestChunks"]
+            // compilations. The session-row fixtures (#3802), the bulk-load
+            // chunk fixtures (#4475) and the role-compatibility response
+            // fixtures (#4727) are JSON the JS and Swift suites both read by
+            // path, not bundle resources.
+            exclude: [
+                "CrossPlatform/E2E",
+                "Fixtures/AgentSessionRows",
+                "Fixtures/DocumentIngestChunks",
+                "Fixtures/RoleCompatResponses",
+            ]
         ),
         .testTarget(
             name: "SwiftBaoCodegenTests",

@@ -418,6 +418,41 @@ public final class DocumentsAPI: @unchecked Sendable {
         )
     }
 
+    // MARK: - Model-free records
+
+    /// The records of the open format-3 document `documentId` by model name,
+    /// with no model class: write, read, query, count and subscribe to any
+    /// model, declared or not. Every call of the handle resolves the document
+    /// when it runs, so the handle may be kept: it throws `.notFound` while the
+    /// document is not open, and `.documentFormatMismatch` for a document that
+    /// is not format 3.
+    ///
+    /// ```swift
+    /// let records = client.documents.records(documentId)
+    /// try records.put("Note", ["title": "Groceries", "tags": ["home"]])
+    /// let open = try records.query("Note", ["done": false])
+    /// ```
+    public func records(_ documentId: String) -> DocumentRecords {
+        DocumentRecords(
+            documentId: documentId, logger: logger,
+            readable: { [weak client] in
+                guard let client else { throw JsBaoClient.documentNotOpenForRecords(documentId) }
+                return try client.readableModelFreeBinding(documentId)
+            }
+        ) { [weak client] in
+            guard let client else { throw JsBaoClient.documentNotOpenForRecords(documentId) }
+            return try client.modelFreeBinding(documentId)
+        }
+    }
+
+    /// What `documentId` holds by model: `GET /documents/{id}/schema`. Each
+    /// model's declaration and, on a format-3 document, what the room observed
+    /// written (`schema.models[name]["observed"]`: each field's kinds, and
+    /// per-kind counts after a segment export).
+    public func schema(_ documentId: String) async throws -> DocumentSchemaAnswer {
+        try await transport.request(method: .get, path: "/documents/\(documentId)/schema")
+    }
+
     /// Get a document by ID.
     public func get(documentId: String) async throws -> DocumentInfo {
         try await transport.request(method: .get, path: "/documents/\(documentId)")
@@ -794,7 +829,17 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     // MARK: - Group permissions
 
-    /// Revoke a group's permission on a document.
+    /// Revoke a group's permission on a document, the group named by id.
+    public func revokeGroupPermission(documentId: String, groupId: String) async throws -> SuccessResult {
+        try await transport.request(
+            method: .delete,
+            path: "/documents/\(documentId)/group-permissions/\(URLEncoding.encodeComponent(groupId))"
+        )
+    }
+
+    /// Revoke a group's permission on a document, the group named by type
+    /// and id.
+    @available(*, deprecated, message: "Groups are addressed by groupId alone: use revokeGroupPermission(documentId:groupId:). Removed by #4718.")
     public func revokeGroupPermission(
         documentId: String,
         groupType: String,
@@ -1176,7 +1221,7 @@ public final class DocumentsAPI: @unchecked Sendable {
                 message: "DocumentsAPI.open requires a wired JsBaoClient"
             )
         }
-        let doc = try await client.openDocument(documentId, options: options)
+        let doc = try await client.openDocument(documentId, options: options, door: .documentsOpen)
         let metadata = documentManager?.getLocalMetadata(documentId)
         return OpenDocumentResult(doc: doc, metadata: metadata)
     }
@@ -1220,7 +1265,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         // 500ms/100ms state-vector poll here as well would double the round trip
         // on every eviction, so this forwards and reports what close decided.
         guard let client else { return CloseDocumentResult(evicted: false) }
-        return await client.closeDocument(documentId, options: options)
+        return await client.closeDocument(documentId, options: options, door: .documentsClose)
     }
 
     /// Resolve an alias and open the document it points at, in one call.
@@ -1315,7 +1360,9 @@ public final class DocumentsAPI: @unchecked Sendable {
         documentId: String,
         options: EvictDocumentOptions = EvictDocumentOptions()
     ) async throws {
-        if !options.force, documentManager?.hasUnsyncedLocalChanges(documentId) == true {
+        // A db3's unjudged writes are unsynced local changes too.
+        let db3Pending = await client?.db3PendingWrites(documentId) ?? 0
+        if !options.force, documentManager?.hasUnsyncedLocalChanges(documentId) == true || db3Pending > 0 {
             // Mirror js-bao's `documentManager.evictLocalDocument`
             // (`src/client/internal/documentManager.ts`), which throws a plain
             // `Error("Cannot evict …: has unsynced local changes …")` with no
@@ -1327,7 +1374,10 @@ public final class DocumentsAPI: @unchecked Sendable {
                 message: "Cannot evict \(documentId): has unsynced local changes (use force to override)"
             )
         }
+        let wasDb3 = client?.isRecordLogDocument(documentId) == true
         await client?.evictLocalDocument(documentId)
+        // A db3 removed through this door has left the device: its state says so.
+        if wasDb3 { client?._db3Lifecycle.evictedElsewhere(documentId) }
     }
 
     /// Evict every doc's local data. Walks the metadata index and evicts
@@ -1604,9 +1654,11 @@ public final class DocumentBlobContext: @unchecked Sendable {
     }
 
     /// The current status of all tracked uploads for this document, newest
-    /// first. Mirrors JS `uploads()` (scoped to this document's id).
+    /// first. Mirrors JS `uploads()` (scoped to this document's id). The
+    /// queue verbs of this context reach its documents uploads only: a db3
+    /// upload of the same id is `client.db3.blobs(_:)`'s.
     public func uploadsAsync() async -> [BlobUploadStatus] {
-        return await blobManager.listUploads(documentId: documentId)
+        return await blobManager.listUploads(documentId: documentId, family: .documents)
     }
 
     /// Pause an in-progress upload for this document by blob ID. Returns `false`
@@ -1621,7 +1673,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// if no matching, pausable upload is tracked. Mirrors JS `pauseUpload`.
     @discardableResult
     public func pauseUploadAsync(blobId: String) async -> Bool {
-        return await blobManager.pauseUpload(blobId, documentId: documentId)
+        return await blobManager.pauseUpload(blobId, documentId: documentId, family: .documents)
     }
 
     /// Resume a paused upload for this document by blob ID. Returns `false` if
@@ -1636,19 +1688,19 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// no matching, paused upload is tracked. Mirrors JS `resumeUpload`.
     @discardableResult
     public func resumeUploadAsync(blobId: String) async -> Bool {
-        return await blobManager.resumeUpload(blobId, documentId: documentId)
+        return await blobManager.resumeUpload(blobId, documentId: documentId, family: .documents)
     }
 
     /// Pause all in-progress uploads for this document, returning once they
     /// are paused. Mirrors JS `pauseAll`.
     public func pauseAllAsync() async {
-        await blobManager.pauseAll(documentId: documentId)
+        await blobManager.pauseAll(documentId: documentId, family: .documents)
     }
 
     /// Resume all paused uploads for this document, returning once they are
     /// back in the retry rotation. Mirrors JS `resumeAll`.
     public func resumeAllAsync() async {
-        await blobManager.resumeAll(documentId: documentId)
+        await blobManager.resumeAll(documentId: documentId, family: .documents)
     }
 }
 
@@ -1719,4 +1771,24 @@ private struct DocumentBlobListResponse: Decodable, Sendable {
         }
         result = try DocumentBlobListResult(from: decoder)
     }
+}
+
+/// `GET /documents/{id}/schema`: each model's declaration and, on a format-3
+/// document, what the room observed written.
+public struct DocumentSchemaAnswer: Codable, Sendable, Equatable {
+    /// The models by name.
+    public struct Models: Codable, Sendable, Equatable {
+        /// Each model's entry: its declared `fields` and `constraints`, and on
+        /// a format-3 document its `observed` section.
+        public let models: [String: JSONValue]
+    }
+
+    /// Every model, by name: declared, and (on a format-3 document) observed.
+    public let schema: Models
+    /// The declared and live models' names.
+    public let modelNames: [String]
+    /// How many names `modelNames` holds.
+    public let modelCount: Int
+    /// The models with query tables.
+    public let tableModels: [String]
 }

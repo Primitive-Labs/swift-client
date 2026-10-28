@@ -37,6 +37,42 @@ struct RecordLogSessionHost: Sendable {
     /// A receipt of chunks or a catch-up page made progress: the client's open
     /// watchdog waits longer.
     var progress: @Sendable (String) -> Void = { _ in }
+    /// The room acknowledged this session's declarations (`record.declared`):
+    /// an index it created for them is in its list from now.
+    var declared: @Sendable (String) -> Void = { _ in }
+    /// The session's status changed: its phase, or a progress step.
+    var status: @Sendable (String, RecordLogSessionStatus) -> Void = { _, _ in }
+}
+
+/// Where a db3's session is in its conversation with the room: `idle` (no
+/// open, or released), `opening` (`record.open` unanswered), `loading` (a
+/// cold load, a receipt of chunks or a full replacement), `catchingUp`
+/// (paged changes applying from the cursor), `live` (open as this client's
+/// writer). js-bao's `RecordLogSessionPhase`.
+enum RecordLogSessionPhase: String, Sendable, Equatable {
+    case idle
+    case opening
+    case loading
+    case catchingUp = "catching-up"
+    case live
+}
+
+/// How far a load or a catch-up is: chunks of a receipt, or entries of a paged catch-up.
+struct RecordLogSessionProgress: Sendable, Equatable {
+    enum Unit: String, Sendable, Equatable {
+        case chunks
+        case entries
+    }
+
+    var done: Int
+    var total: Int
+    var unit: Unit
+}
+
+/// A session's phase, with its progress while it loads or catches up.
+struct RecordLogSessionStatus: Sendable, Equatable {
+    var phase: RecordLogSessionPhase
+    var progress: RecordLogSessionProgress? = nil
 }
 
 /// How long the session waits, in milliseconds: the JS client's numbers by
@@ -213,6 +249,10 @@ actor RecordLogSession {
         var streamed = false
         /// Pages with `next` applied, counted for credits.
         var pages = 0
+        /// The entries the room said the catch-up carries (`catchUp.count`), when it did.
+        var total: Int?
+        /// The rows and removals applied so far, for the status's progress.
+        var applied = 0
     }
 
     /// Streamed catch-ups: pages applied, pages ignored as another stream's, credits sent.
@@ -246,6 +286,8 @@ actor RecordLogSession {
         var segment: RecordLogHeldSegment?
         /// A `record.released` arrived while its chunks were fetched: it stops after the one in flight.
         var released = false
+        /// Its chunks applied or kept so far, for the status's progress.
+        var applied = 0
         var task: Task<Void, Never>?
 
         init(kind: RecordLogReceiptKind, id: String, live: Bool, connection: Int, writer: String, rows: Int, chunks: Int) {
@@ -329,6 +371,9 @@ actor RecordLogSession {
     /// start then has no answer out; an older room answers it with an
     /// unmarked page.
     private var roomStreams = false
+    /// The room refused this client's wire version (`DB3_CLIENT_OUTDATED`):
+    /// the session does not open the document again.
+    private var outdated = false
     /// When the first of the `building` answers in a row arrived; `nil` when the last answer was another form.
     private var buildingSince: Date?
     /// This session's stream ids: a prefix of its own and a count.
@@ -336,6 +381,8 @@ actor RecordLogSession {
     private var streamSeq = 0
     /// Streamed catch-ups, for the tests.
     private(set) var streamCounters = StreamCounters()
+    /// The status last reported; a report that changes nothing is not made.
+    private var reported = RecordLogSessionStatus(phase: .idle)
 
     init(
         documentId: String, binding: RecordLogDocumentBinding, host: RecordLogSessionHost,
@@ -440,6 +487,52 @@ actor RecordLogSession {
     private func run(_ armed: Int, _ body: @Sendable (isolated RecordLogSession) -> Void) {
         guard armed == generation, phase != .closed else { return }
         body(self)
+        reportStatus()
+    }
+
+    // MARK: - Status
+
+    /// Where the session is: its phase, with chunk progress while a receipt's
+    /// chunks arrive and entry progress while paged changes apply. js-bao's
+    /// `status()`.
+    func status() -> RecordLogSessionStatus {
+        switch phase {
+        case .open: return RecordLogSessionStatus(phase: .live)
+        case .opening: return RecordLogSessionStatus(phase: .opening)
+        case .idle, .closed: return RecordLogSessionStatus(phase: .idle)
+        case .catchingUp, .loading, .draining: break
+        }
+        if let receipt, paging == nil || paging?.receipt === receipt {
+            let done = paging != nil ? receipt.chunks : min(receipt.applied, receipt.chunks)
+            return RecordLogSessionStatus(
+                phase: .loading, progress: RecordLogSessionProgress(done: done, total: receipt.chunks, unit: .chunks)
+            )
+        }
+        // A full walk, a replacement's pages or a store's first load is a load;
+        // paged changes from a cursor the store caught up to are a catch-up.
+        let cold = paging.map { $0.cursor == 0 && binding.marks.lastCatchUpAt == nil } ?? false
+        let loading = phase == .loading || (paging.map { $0.full || $0.generation != nil || cold } ?? false)
+        let reportedPhase: RecordLogSessionPhase = loading ? .loading : .catchingUp
+        guard let paging, let total = paging.total else { return RecordLogSessionStatus(phase: reportedPhase) }
+        return RecordLogSessionStatus(
+            phase: reportedPhase,
+            progress: RecordLogSessionProgress(done: paging.applied, total: max(total, paging.applied), unit: .entries)
+        )
+    }
+
+    /// Tell the host the status when it changed since it was last told.
+    private func reportStatus() {
+        let now = status()
+        guard now != reported else { return }
+        reported = now
+        host.status(documentId, now)
+    }
+
+    /// A receipt or a catch-up made progress: the client's open watchdog
+    /// waits longer, and the status is reported.
+    private func progressed() {
+        host.progress(documentId)
+        reportStatus()
     }
 
     // MARK: - Opening
@@ -448,6 +541,11 @@ actor RecordLogSession {
     /// done (a done one is reported again). Writers an earlier session left
     /// entries under are opened first.
     func start() {
+        open()
+        reportStatus()
+    }
+
+    private func open() {
         if phase == .open {
             host.synced(documentId)
             return
@@ -467,6 +565,11 @@ actor RecordLogSession {
             return
         }
         guard phase == .idle else { return }
+        if outdated {
+            // The room refused this client's wire version: opening again is refused again.
+            logger?.debug("[record-log]", documentId, "— not opened: the room needs a newer client (DB3_CLIENT_OUTDATED)")
+            return
+        }
         guard connected() else {
             host.syncFailed(documentId, "not connected")
             return
@@ -546,6 +649,8 @@ actor RecordLogSession {
             // Own entries the room applied as written come back as {l, e, w, seq}:
             // the store derives their rows from its pending entries.
             "acks": "compact",
+            // A room past this client's wire version refuses the open (DB3_CLIENT_OUTDATED).
+            "wireVersion": .number(Double(recordLogWireVersion)),
         ]
         if host.connection()?.fetchesArtifacts == true {
             let waited = buildingSince.map { Date().timeIntervalSince($0) * 1000 >= Double(timings.buildingMaxWaitMs) } ?? false
@@ -639,6 +744,7 @@ actor RecordLogSession {
             "formats": [3],
             "documentFormat": 3,
             "acks": "compact",
+            "wireVersion": .number(Double(recordLogWireVersion)),
         ]))
     }
 
@@ -693,6 +799,7 @@ actor RecordLogSession {
         loadInProgress = nil
         reopenAfterCatchUp = false
         clearGap()
+        reportStatus()
     }
 
     /// The receipt in progress stops: its task is cancelled, and nothing it
@@ -700,6 +807,16 @@ actor RecordLogSession {
     private func stopReceipt() {
         receipt?.task?.cancel()
         receipt = nil
+    }
+
+    /// Stop the conversation without a socket loss: the session goes idle as
+    /// on a disconnect, nothing more is sent, and the next ``start()`` opens
+    /// from the store's cursor. The caller tells the room it unsubscribed.
+    func release() {
+        guard phase != .closed else { return }
+        disconnected()
+        // No answer is coming on this conversation: a caller waiting for one is told.
+        binding.releaseAcknowledgementWaiters()
     }
 
     /// The document closed: stop, and stop hearing its commits.
@@ -772,6 +889,7 @@ actor RecordLogSession {
     /// One frame the room sent about this document.
     func receive(_ frame: [String: JSONValue]) {
         guard phase != .closed else { return }
+        defer { reportStatus() }
         let type = frame["type"]?.stringValue ?? ""
         switch type {
         case "record.opened": attempt("record.opened") { try opened(frame) }
@@ -793,6 +911,7 @@ actor RecordLogSession {
                 try binding.setState(notice: (current, frame["next"]?.wholeNumber ?? current + 1, frame["entries"]?.wholeNumber))
             }
         case "record.declared":
+            host.declared(documentId)
             let refused = (frame["refused"]?.arrayValue ?? []).compactMap(\.stringValue)
             guard !refused.isEmpty else { return }
             logger?.warn(
@@ -819,13 +938,19 @@ actor RecordLogSession {
         }
         takenRetryMs = timings.writerTakenRetryMs
         roomStreams = frame["streams"]?.boolValue == true
+        if let version = frame["wireVersion"]?.wholeNumber {
+            logger?.debug("[record-log]", documentId, "— the room speaks wire version", version, "; this client", recordLogWireVersion)
+        }
         let epochs = frame["epochs"]?.objectValue ?? [:]
         let currentEpoch = epochs["current"]?.wholeNumber ?? RecordLogTransport.firstEpoch
         let high = epochs["high"]?.wholeNumber ?? currentEpoch
         let constraints = frame["constraints"]?.arrayValue?.compactMap { RecordLogConstraint(json: $0) }
         let marks = try binding.setState(
             notice: (currentEpoch, epochs["next"]?.wholeNumber ?? currentEpoch + 1, epochs["entries"]?.wholeNumber),
-            constraints: constraints.map { list in list.filter { binding.constraintInForce($0.name) } }
+            constraints: constraints.map { list in list.filter { binding.constraintInForce($0.name) } },
+            // The room opened the document for this client's writer: an access
+            // refusal it answered before is over.
+            permission: !current.orphan && binding.marks.permission == RecordLogPermission.refused ? .some(nil) : nil
         )
         lastSeq = frame["lastSeq"]?.wholeNumber ?? 0
         if !current.orphan && lastSeq >= marks.nextSeq {
@@ -882,7 +1007,7 @@ actor RecordLogSession {
             let replacing = try binding.withOperation { try binding.store.beginFencedCatchUp(writer: current.writer, full: full) }
             beginPaging(Paging(
                 cursor: catchUp["cursor"]?.wholeNumber ?? 0, upTo: catchUp["upTo"]?.wholeNumber ?? 0, full: full, high: high,
-                generation: replacing
+                generation: replacing, total: catchUp["count"]?.wholeNumber
             ))
             return
         }
@@ -928,7 +1053,7 @@ actor RecordLogSession {
             "for this open; opening again in", retryMs, "ms"
         )
         phase = .opening
-        host.progress(documentId)
+        progressed()
         let waiting = opens
         retryTimer?.cancel()
         retryTimer = after(retryMs) { session in
@@ -959,7 +1084,7 @@ actor RecordLogSession {
         let gone = (page["gone"]?.arrayValue ?? []).compactMap(RecordLogRecordKey.init(json:))
         let reply = try binding.withOperation {
             try binding.store.applyCatchUpPage(
-                writer: writer, rows: rows, gone: gone, lsn: lsn, generation: generation, project: binding.projectionSpecs
+                writer: writer, rows: rows, gone: gone, lsn: lsn, generation: generation
             )
         }
         notify(reply.changed)
@@ -972,17 +1097,17 @@ actor RecordLogSession {
     ) throws -> RecordLogChangeReply {
         let reply = try binding.withOperation {
             try binding.store.completeCatchUp(
-                writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment,
-                project: binding.projectionSpecs
+                writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment
             )
         }
         notify(reply.changed)
+        binding.noteSettled(reply)
         return reply
     }
 
     private func notify(_ changed: [RecordLogRowChange]) {
         guard !changed.isEmpty else { return }
-        binding.notify(changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) })
+        binding.notify(changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, changes: changed)
     }
 
     /// Another client of this store applied results past the log number the
@@ -1026,7 +1151,7 @@ actor RecordLogSession {
                 let now = try session.binding.refreshMarks()
                 let other = now.replacing && now.replacement != replacing
                 if other && Date() < deadline {
-                    session.host.progress(session.documentId)
+                    session.progressed()
                     session.waitForReplacement(replacing, opens: waiting, deadline: deadline)
                     return
                 }
@@ -1081,7 +1206,11 @@ actor RecordLogSession {
         let lsn = frame["lsn"]?.wholeNumber ?? 0
         let page = try applyPage(frame, lsn: lsn, writer: current.writer, generation: paging.generation)
         if page.stale { return try overtaken(lsn: lsn, cursor: page.cursor, replacing: paging.generation) }
-        receipt?.remainderRows += (frame["rows"]?.arrayValue?.count ?? 0) + (frame["gone"]?.arrayValue?.count ?? 0)
+        let carried = (frame["rows"]?.arrayValue?.count ?? 0) + (frame["gone"]?.arrayValue?.count ?? 0)
+        paging.applied += carried
+        self.paging = paging
+        receipt?.remainderRows += carried
+        // The status is reported once the frame is handled.
         host.progress(documentId)
         if let next = frame["next"], let stream = paging.stream {
             // The room pushes on; the credit lets it run past the window.
@@ -1289,7 +1418,7 @@ actor RecordLogSession {
     private func applyResults(_ items: [RecordLogResultItem]) throws -> RecordLogUnderivableAck? {
         let writer = current?.writer ?? binding.writer
         let reply = try binding.withOperation {
-            try binding.store.receive(writer: writer, items: items, project: binding.projectionSpecs)
+            try binding.store.receive(writer: writer, items: items)
         }
         notify(reply.changed)
         // Every number the room answered is one its frame no longer owes.
@@ -1303,6 +1432,7 @@ actor RecordLogSession {
         for seq in seqs { sender?.acknowledged(seq) }
         answered(seqs)
         settleAcknowledged(reply.acknowledged)
+        binding.noteSettled(reply)
         watchGap(cursor: reply.cursor, items: items)
         return reply.underivable
     }
@@ -1353,7 +1483,7 @@ actor RecordLogSession {
         guard let current else { return }
         let writer = current.writer
         let reply = try binding.withOperation {
-            try binding.store.refused(writer: writer, refusal: refusal, project: binding.projectionSpecs)
+            try binding.store.refused(writer: writer, refusal: refusal)
         }
         notify(reply.changed)
         let sender = senderOf(writer)
@@ -1390,6 +1520,8 @@ actor RecordLogSession {
         ]
         if let constraint = refusal.constraint { details["constraint"] = .string(constraint) }
         if let conflicting = refusal.conflicting { details["conflicting"] = conflicting.json }
+        if let current = refusal.current { details["current"] = current.json }
+        if let reason = refusal.reason { details["reason"] = .string(reason) }
         let error = JsBaoError(
             code: code, message: refusal.message ?? Self.message(code: code, documentId: documentId), details: details
         )
@@ -1405,7 +1537,7 @@ actor RecordLogSession {
         guard let first = writes.first else { return }
         binding.reportRefused(DocumentWriteRefusedEvent(
             documentId: documentId, model: first.model, recordId: first.recordId, error: error,
-            writes: writes, conflictingRecord: refusal.conflicting
+            writes: writes, conflictingRecord: refusal.conflicting, current: refusal.current
         ))
     }
 
@@ -1425,6 +1557,14 @@ actor RecordLogSession {
             return "This client was away from '\(documentId)' longer than its offline window; its unsent writes were not applied."
         case .documentEpochFrozen:
             return "The writes to '\(documentId)' were made in an epoch the room has frozen; they were not applied."
+        case .db3ConditionNotMet:
+            return "A write to '\(documentId)' carried a condition the record did not meet; it was not applied."
+        case .db3RecordNotFound:
+            return "An increment in '\(documentId)' named a record that does not exist or was deleted; it was not applied."
+        case .db3TriggerRefused:
+            return "A write to '\(documentId)' was refused by one of the db3's triggers; it was not applied."
+        case .db3ModelNotDeclared:
+            return "A write to '\(documentId)' names a model its type does not declare; it was not applied."
         default:
             return "Writes to '\(documentId)' were refused (\(code.rawValue))."
         }
@@ -1481,13 +1621,60 @@ actor RecordLogSession {
         try sendOpen()
     }
 
+    /// The access refusal the connection sends for a record frame of a document the user may no longer read.
+    private static let accessRefusedMessage = "Access denied to document"
+    /// The codes of a terminal access refusal. `DB3_SYNC_OFF`: the db3's sync
+    /// is off, so no socket reaches it until it is on again (#4806, js-bao's #4799).
+    private static let accessRefusedCodes: Set<String> = ["ACCESS_DENIED", "DOC_ACCESS_DENIED", "DB3_SYNC_OFF"]
+
+    /// Whether an `error` frame is the room's access refusal of a record frame:
+    /// an access code, or the connection's code-less access-denied message,
+    /// answering any `record.*` frame.
+    static func isAccessRefusal(_ frame: [String: JSONValue]) -> Bool {
+        if let type = frame["messageType"], type.stringValue?.hasPrefix("record.") != true { return false }
+        let code = frame["code"]?.stringValue ?? ""
+        if !code.isEmpty { return accessRefusedCodes.contains(code) }
+        return frame["message"]?.stringValue == accessRefusedMessage
+    }
+
+    /// The room refused a record frame because the user may no longer read
+    /// the document: whatever the frame was, the conversation stops. The store
+    /// is marked `permission: "refused"` (local writes are refused from now),
+    /// its unjudged entries stay for the room to judge once access returns,
+    /// nothing more is sent, and the open is reported failed with
+    /// `ACCESS_DENIED`, or `DB3_SYNC_OFF` when the db3's sync was turned off.
+    /// The own writer's next `record.opened` lifts the mark.
+    private func accessRefused(_ frame: [String: JSONValue]) throws {
+        guard phase != .closed else { return }
+        let syncOff = frame["code"]?.stringValue == JsBaoErrorCode.db3SyncOff.rawValue
+        logger?.warn(
+            "[record-log] \(documentId): the room refused \(frame["messageType"]?.stringValue ?? "a record frame")"
+                + (syncOff ? " because its sync is off;" : " for access;")
+                + " the document stays readable here, its unsent writes are kept, and nothing more is sent"
+        )
+        disconnected()
+        try binding.setState(permission: .some(RecordLogPermission.refused))
+        host.syncFailed(documentId, syncOff ? JsBaoErrorCode.db3SyncOff.rawValue : "ACCESS_DENIED")
+    }
+
     private func error(_ frame: [String: JSONValue]) throws {
         let code = frame["code"]?.stringValue ?? ""
         let messageType = frame["messageType"]?.stringValue
+        if code == "DB3_DECLARATION_REFUSED_TYPED" && messageType == "record.declare" {
+            // A typed db3's type is its declaration: the room declared nothing
+            // and judges every write by the type. The declaration is answered.
+            logger?.warn(
+                "[record-log]", documentId, "— the db3 is typed by", frame["db3Type"]?.stringValue ?? "its type",
+                "; the room keeps the type's declarations, and this client's models are judged against them"
+            )
+            host.declared(documentId)
+            return
+        }
         logger?.warn(
             "[record-log]", documentId, "—", frame["messageType"]?.stringValue ?? "record frame", "answered", code,
             ":", frame["message"]?.stringValue ?? ""
         )
+        if Self.isAccessRefusal(frame) { return try accessRefused(frame) }
         if history.stale != nil && barrier {
             // The room would not open the old id again: no subscription of it on
             // this connection is left to queue answers on.
@@ -1538,6 +1725,20 @@ actor RecordLogSession {
                 // again after the catch-up, as every other open sends them.
                 ahead?.refused = true
             }
+        case "DB3_CLIENT_OUTDATED":
+            // The room needs a newer wire version than this client declares:
+            // the open ends, and this session does not open the document again.
+            guard messageType == "record.open" else { return }
+            logger?.warn(
+                "[record-log]", documentId, "— the room speaks wire version", frame["wireVersion"]?.wholeNumber ?? 0,
+                "; this client declares", recordLogWireVersion, ". Update the client to sync this db3."
+            )
+            outdated = true
+            phase = .idle
+            self.current = nil
+            held = []
+            ahead = nil
+            host.syncFailed(documentId, code)
         case "WRITE_ACCESS_DENIED":
             try binding.setState(permission: .some("read"))
             let pending = try binding.store.pendingOf(current.writer).filter { !$0.isVoid && $0.acked == nil }
@@ -1547,7 +1748,7 @@ actor RecordLogSession {
                 message: "This document is read-only for you now; the writes were not applied."
             )
             let reply = try binding.withOperation {
-                try binding.store.refused(writer: current.writer, refusal: refusal, project: binding.projectionSpecs)
+                try binding.store.refused(writer: current.writer, refusal: refusal)
             }
             notify(reply.changed)
             let sender = senderOf(current.writer)
@@ -1661,7 +1862,7 @@ actor RecordLogSession {
                 + "(\(live ? "live" : "on reconnect")), from cursor \(cursor)"
         )
         let remainder = (cursor: cursor, upTo: live ? (pointer.lastLsn ?? cursor) : upTo, high: live ? pointer.epoch : high)
-        host.progress(documentId)
+        progressed()
         receipt.task = spawnLoadReceipt(receipt, pointer, remainder)
     }
 
@@ -1679,7 +1880,7 @@ actor RecordLogSession {
             "[record-log] segment receipt \(documentId): \(segment.segmentId) \(segment.rows) rows in \(segment.chunks.count) "
                 + "chunks at \(segment.lsn), corrections to \(segment.completedLsn)"
         )
-        host.progress(documentId)
+        progressed()
         receipt.task = spawnSegmentReceipt(receipt, segment, upTo: upTo, high: high)
     }
 
@@ -1798,11 +1999,17 @@ actor RecordLogSession {
     private func spawnLoadReceipt(
         _ receipt: Receipt, _ pointer: RecordLogLoadPointer, _ remainder: (cursor: Int, upTo: Int, high: Int)
     ) -> Task<Void, Never> {
-        Task { await self.receiveLoadChunks(receipt, pointer, remainder) }
+        Task {
+            await self.receiveLoadChunks(receipt, pointer, remainder)
+            self.reportStatus()
+        }
     }
 
     private func spawnSegmentReceipt(_ receipt: Receipt, _ segment: RecordLogSegmentPointer, upTo: Int, high: Int) -> Task<Void, Never> {
-        Task { await self.receiveSegment(receipt, segment, upTo: upTo, high: high) }
+        Task {
+            await self.receiveSegment(receipt, segment, upTo: upTo, high: high)
+            self.reportStatus()
+        }
     }
 
     private func receiveLoadChunks(
@@ -1823,7 +2030,7 @@ actor RecordLogSession {
                     throw RecordLogReceiptFailure("fetching the manifest failed: \(Self.describe(error))")
                 }
                 guard receiving(receipt) else { return }
-                host.progress(documentId)
+                progressed()
                 let manifest = try recordLogLoadManifest(bytes, pointer: pointer)
                 if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
                 let attempt = try binding.withOperation {
@@ -1839,7 +2046,7 @@ actor RecordLogSession {
                         try session.binding.withOperation {
                             try session.binding.store.applyLoadChunk(
                                 writer: writer, sessionId: pointer.sessionId, attempt: attempt, model: chunk.model,
-                                lines: lines, project: session.binding.projectionSpecs
+                                lines: lines
                             )
                         }
                     })
@@ -1848,14 +2055,15 @@ actor RecordLogSession {
                         return try abandonReceipt(receipt, "the store ended it: another client's catch-up made its rows right")
                     }
                     binding.notify(reply)
-                    host.progress(documentId)
+                    receipt.applied += 1
+                    progressed()
                     logger?.debug("[record-log] \(documentId): load \(pointer.sessionId) chunk \(chunk.place) applied (\(chunk.rows) rows)")
                     if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
                 }
                 let completed = try binding.withOperation {
                     try binding.store.completeLoad(
                         writer: receipt.writer, sessionId: pointer.sessionId, attempt: attempt, mode: pointer.mode,
-                        models: pointer.models, project: binding.projectionSpecs
+                        models: pointer.models
                     )
                 }
                 if completed.stale {
@@ -1926,7 +2134,8 @@ actor RecordLogSession {
                     }
                     if !reply.mismatch {
                         receipt.kept = (receipt.kept ?? 0) + 1
-                        host.progress(documentId)
+                        receipt.applied += 1
+                        progressed()
                         if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
                         continue
                     }
@@ -1937,8 +2146,7 @@ actor RecordLogSession {
                 }, apply: { session, rows in
                     try session.binding.withOperation {
                         try session.binding.store.applySegmentChunk(
-                            writer: writer, generation: generation, attempt: attempt, rows: rows,
-                            project: session.binding.projectionSpecs
+                            writer: writer, generation: generation, attempt: attempt, rows: rows
                         )
                     }
                 })
@@ -1947,7 +2155,8 @@ actor RecordLogSession {
                     return try abandonReceipt(receipt, "another client of the store began replacing it", replacing: generation)
                 }
                 binding.notify(reply)
-                host.progress(documentId)
+                receipt.applied += 1
+                progressed()
                 if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
             }
             let corrections = segment.corrections
@@ -1956,8 +2165,7 @@ actor RecordLogSession {
             }, apply: { session, lines in
                 try session.binding.withOperation {
                     try session.binding.store.applySegmentCorrections(
-                        writer: writer, generation: generation, attempt: attempt, lines: lines,
-                        project: session.binding.projectionSpecs
+                        writer: writer, generation: generation, attempt: attempt, lines: lines
                     )
                 }
             })
@@ -1966,7 +2174,7 @@ actor RecordLogSession {
                 return try abandonReceipt(receipt, "another client of the store began replacing it", replacing: generation)
             }
             binding.notify(reply)
-            host.progress(documentId)
+            progressed()
             // The pages from `C` belong to the replacement and to the receipt: it
             // completes at the last of them (so no result held meanwhile is
             // replayed over rows older than it), and a page that fails fails it.
@@ -2001,10 +2209,10 @@ actor RecordLogSession {
             guard receiving(receipt) else { return nil }
             // Each step of a chunk is progress: a long receipt keeps the
             // client's handshake watchdog from timing out between chunks.
-            host.progress(documentId)
+            progressed()
             let decoded = await Self.decode(bytes, read)
             guard receiving(receipt) else { return nil }
-            host.progress(documentId)
+            progressed()
             switch decoded {
             case .success(let item):
                 return try apply(self, item)

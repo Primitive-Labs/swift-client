@@ -1,0 +1,27 @@
+{
+  "name": "groups.create",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "note": "Recorded from a client session. Phase 2 makes app-route group creation function-only and stores the type `group` on new groups, so this entry replays only against a legacy `team` row (override the `groups.create` step).",
+  "method": "POST",
+  "path": "/app/<appId>/api/groups",
+  "caller": "owner",
+  "request": {
+    "groupType": "team",
+    "groupId": "baseline",
+    "name": "Baseline Team",
+    "description": "Compatibility baseline"
+  },
+  "status": 201,
+  "body": {
+    "appId": "<appId>",
+    "groupType": "team",
+    "groupId": "baseline",
+    "name": "Baseline Team",
+    "description": "Compatibility baseline",
+    "memberCount": 0,
+    "createdAt": "<iso>",
+    "createdBy": "<ulid>",
+    "modifiedAt": "<iso>"
+  }
+}

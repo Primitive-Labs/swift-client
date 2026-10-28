@@ -3,7 +3,7 @@ import XCTest
 
 /// The task run's `slice` block on the status envelope — #3388.
 ///
-/// `GET /workflows/runs/{runId}/status` carries `slice` beside `status` and
+/// `GET /functions/runs/{runId}/status` carries `slice` beside `status` and
 /// `run` for a task run that has a record (#3381) — the route path is the
 /// wire's, not a statement about which client surface owns the block. These
 /// pin it field for field on the FUNCTIONS result, typed and untyped, and
@@ -44,7 +44,7 @@ final class FunctionsSliceHermeticTests: XCTestCase {
 
         let status = try await api.getStatus(runId: "run-1")
 
-        XCTAssertEqual(transport.lastCall?.path, "/workflows/runs/run-1/status")
+        XCTAssertEqual(transport.lastCall?.path, "/functions/runs/run-1/status")
         XCTAssertEqual(status.status, "completed")
         let slice = try XCTUnwrap(status.slice, "a task run with a record carries the block")
         XCTAssertEqual(slice.sliceId, "slice-abc")

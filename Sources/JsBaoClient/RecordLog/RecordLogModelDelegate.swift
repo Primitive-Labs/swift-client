@@ -2,9 +2,9 @@ import Foundation
 import YSwift
 
 /// What a model's reads and writes do when its document is a record-log
-/// (format-3) one: reads answer from the document's view, filtered reads from
-/// the query tables the view is projected into, and every write is an entry
-/// the store commits with its guess on the view.
+/// (format-3) one: reads answer from the document's view, filtered reads too
+/// (with the room's statement, ``RecordLogViewReader``), and every write is an
+/// entry the store commits with its guess on the view.
 ///
 /// Values are spelled as format 1 spells them (`PrimitiveValue.encodedForYrs`
 /// and `PrimitiveValue.decode`), so one schema and one decoder describe every
@@ -50,65 +50,48 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         return try row(id: target)
     }
 
-    func requireProjection() throws {
-        guard binding.isProjected(modelName) else {
-            throw JsBaoError(
-                code: .format2ModelNotHydrated,
-                message: "`\(modelName)` in document `\(binding.documentId)` is not projected into the query "
-                    + "tables, so a filtered read cannot answer from them. Reopen the document; `find(id:)` and "
-                    + "`findAll()` read the document's own store.",
-                details: ["model": .string(modelName), "documentId": .string(binding.documentId)]
-            )
-        }
-    }
-
-    /// This document, narrowed by what the caller asked for: the query tables
-    /// hold every document's rows, so this one is the ceiling.
+    /// This document, narrowed by what the caller asked for.
     private func scope(narrowedTo requested: [String]?) -> [String] {
         guard let requested else { return [binding.documentId] }
         return requested.contains(binding.documentId) ? [binding.documentId] : []
     }
 
-    private static func scoped(_ options: QueryOptions?, to documents: [String]) -> QueryOptions {
-        var scoped = options ?? QueryOptions()
-        scoped.documents = documents
-        return scoped
+    /// The reader over this document's view, narrowed to `requested`.
+    private func reader(_ requested: [String]?) -> RecordLogViewReader {
+        RecordLogViewReader(store: store, documents: scope(narrowedTo: requested))
     }
 
+    /// How the model API answers a record: declared sets as arrays, the document tagged.
+    private var shape: RecordLogViewReader.RowShape { .model(setFields: Set(stringSetFields)) }
+
+    // The filtered reads answer from the document's view with the room's
+    // statement and the db3 limits (``RecordLogViewReader``).
+
     func query(filter: DocumentFilter?, options: QueryOptions?) throws -> [[String: JSONValue]] {
-        try requireProjection()
-        return try binding.engine.query(
-            modelName: modelName, filter: filter,
-            options: Self.scoped(options, to: scope(narrowedTo: options?.documents)),
-            stringsetFields: Set(stringSetFields)
-        )
+        try query(filter: filter, options: options, include: nil)
+    }
+
+    func query(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> [[String: JSONValue]] {
+        try reader(options?.documentScope()).page(modelName, filter ?? [:], options: options, shape: shape, include: include).rows
     }
 
     func queryPaged(filter: DocumentFilter?, options: QueryOptions?) throws -> PagedQueryResult<PrimitiveRow> {
-        try requireProjection()
-        return try binding.engine.queryPaged(
-            modelName: modelName, filter: filter,
-            options: Self.scoped(options, to: scope(narrowedTo: options?.documents)),
-            stringsetFields: Set(stringSetFields)
+        try queryPaged(filter: filter, options: options, include: nil)
+    }
+
+    func queryPaged(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> PagedQueryResult<PrimitiveRow> {
+        RecordLogViewReader.paged(
+            try reader(options?.documentScope()).page(modelName, filter ?? [:], options: options, shape: shape, include: include)
         )
     }
 
     func count(filter: DocumentFilter?) throws -> Int {
-        try requireProjection()
-        return try binding.engine.count(
-            modelName: modelName, filter: filter,
-            stringsetFields: Set(stringSetFields), documents: [binding.documentId]
-        )
+        try reader(nil).count(modelName, filter ?? [:])
     }
 
     func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
-        try requireProjection()
-        var narrowed = options
-        narrowed.documents = scope(narrowedTo: options.documents)
-        return try binding.engine.aggregate(
-            modelName: modelName, options: narrowed,
-            stringsetFields: Set(stringSetFields), documents: narrowed.documents
-        )
+        try reader(resolvedDocumentScope(documents: options.documents, db3: options.db3))
+            .aggregate(modelName, options, setFields: Set(stringSetFields))
     }
 
     func exists(id: String) throws -> Bool { try row(id: id) != nil }
@@ -170,6 +153,16 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     /// name it).
     @discardableResult
     func write(id: String, values: [String: PrimitiveValue], isUpdate: Bool, upsertOn: String?) throws -> Int? {
+        try write(id: id, values: values, isUpdate: isUpdate, upsertOn: upsertOn, guards: RecordLogWriteGuards())
+    }
+
+    /// ``write(id:values:isUpdate:upsertOn:)`` carrying the write's guards:
+    /// `condition` rides the mutation, `ifNotExists` makes it a create of the
+    /// whole state whatever the view holds. The room judges both.
+    @discardableResult
+    func write(
+        id: String, values: [String: PrimitiveValue], isUpdate: Bool, upsertOn: String?, guards: RecordLogWriteGuards
+    ) throws -> Int? {
         var dataToSave: [String: JSONValue] = ["id": .string(id)]
         var stringSetChanges: [String: (additions: [String], removals: [String])] = [:]
         let existing = isUpdate ? try row(id: id) : nil
@@ -190,9 +183,48 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         let mutation = planRecordLogSave(RecordLogSaveInput(
             model: modelName, recordId: id, existing: isUpdate ? (existing ?? ["id": .string(id)]) : nil,
             dataToSave: dataToSave, touchedFields: values.keys.filter { $0 != "id" },
-            stringSetChanges: stringSetChanges, stringSetFieldNames: Set(stringSetFields)
+            stringSetChanges: stringSetChanges, stringSetFieldNames: Set(stringSetFields), guards: guards
         ))
         return try commit([mutation], upsertOn: isUpdate ? nil : upsertOn, existing: existing)
+    }
+
+    /// Add each of `fields` to the record's field (0 when not a number), as one
+    /// increment entry, inside the document's operation — or, inside a
+    /// `transact` on this thread, folded into the transaction's entry. A
+    /// record neither the view nor the transaction holds is refused
+    /// `.db3RecordNotFound`, and a result that would not be finite
+    /// `.documentEntryInvalid`, both before anything is sent and both reported
+    /// as `DocumentWriteRefusedEvent`. Answers each field's new value as this
+    /// device now shows it, and the entry's `seq` (`nil` when a transaction
+    /// holds it).
+    func increment(id: String, fields: [String: Double], condition: JSONValue?) throws -> (values: [String: Double], seq: Int?) {
+        let mutation = planRecordLogIncrement(
+            model: modelName, recordId: id, fields: fields.mapValues { .number($0) }, condition: condition
+        )
+        let report: (DocumentWriteRefusedEvent) -> Void = { [binding] event in binding.reportRefused(event) }
+        func refuse(_ code: JsBaoErrorCode, _ message: String) -> JsBaoError {
+            let error = JsBaoError(code: code, message: message, details: ["documentId": .string(binding.documentId), "scope": "local"])
+            report(recordLogLocalRefusal(error, documentId: binding.documentId, mutations: [mutation]))
+            return error
+        }
+        return try binding.withOperation {
+            try assertRecordLogEntry(documentId: binding.documentId, mutations: [mutation], report: report)
+            guard let existing = try row(id: id) else {
+                throw refuse(
+                    .db3RecordNotFound,
+                    "Cannot increment \(modelName) \(id) in `\(binding.documentId)`: no such record here (never created, or deleted). Nothing was sent."
+                )
+            }
+            for (field, delta) in fields.sorted(by: { $0.key < $1.key })
+            where !(recordLogNumeric(existing[field]) + delta).isFinite {
+                throw refuse(.documentEntryInvalid, "Cannot increment \(modelName) \(id): increment of `\(field)` overflows. Nothing was sent.")
+            }
+            let after = recordLogPlainRowAfter(existing, mutation) ?? existing
+            let values = Dictionary(uniqueKeysWithValues: fields.keys.map { ($0, recordLogNumeric(after[$0])) })
+            if binding.stage(mutation, upsertOn: nil, existing: existing) { return (values, nil) }
+            let seq = try binding.commit([RecordLogWrite(mutations: [mutation])]).first?.seq
+            return (values, seq)
+        }
     }
 
     /// Clear one field: `null` for a scalar, every member removed for a string set.
@@ -243,6 +275,12 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         try commit([planRecordLogDelete(model: modelName, recordId: id)])
     }
 
+    /// A delete carrying `condition`, which the room judges; answers the entry's `seq`.
+    @discardableResult
+    func delete(id: String, condition: JSONValue?) throws -> Int? {
+        try commit([planRecordLogDelete(model: modelName, recordId: id, condition: condition)])
+    }
+
     /// Run a mutation whose public entry point cannot throw. A refusal has
     /// already been reported as a `DocumentWriteRefusedEvent` where it was
     /// made, so nothing is lost by swallowing it here.
@@ -259,7 +297,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
 
     func constraintInForce(_ name: String) -> Bool { binding.constraintInForce(name) }
 
-    var queryEngine: BaoModelQueryEngine { binding.engine }
+    var viewStore: RecordLogStore { binding.store }
 
     func withOperation<T>(_ body: () throws -> T) throws -> T {
         try binding.withOperation(body)
@@ -274,7 +312,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         let base: RecordLogRow?
         if let existing { base = existing } else { base = try row(id: mutations[0].id) }
         if binding.stage(mutations[0], upsertOn: upsertOn, existing: base) { return nil }
-        try assertRecordLogEntry(documentId: binding.documentId, mutations: mutations) { [binding] event in
+        try assertRecordLogEntry(documentId: binding.documentId, mutations: mutations, upsertOn: upsertOn) { [binding] event in
             binding.reportRefused(event)
         }
         return try binding.commit([RecordLogWrite(mutations: mutations, upsertOn: upsertOn)]).first?.seq

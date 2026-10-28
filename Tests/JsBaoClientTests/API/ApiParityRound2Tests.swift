@@ -303,6 +303,7 @@ final class ApiParityRound2Tests: XCTestCase {
 
     // MARK: - GroupsAPI new list helpers
 
+    @available(*, deprecated)
     func test_groups_listDatabases_GET() async throws {
         let r = CallRecorder()
         let api = GroupsAPI(transport: r)
@@ -312,6 +313,7 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(r.path, "/groups/team/g1/databases")
     }
 
+    @available(*, deprecated)
     func test_groups_listPendingInvitations_unwrapsItems() async throws {
         let r = CallRecorder()
         let api = GroupsAPI(transport: r)

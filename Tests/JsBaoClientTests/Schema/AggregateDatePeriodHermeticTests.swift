@@ -194,14 +194,13 @@ final class AggregateDatePeriodHermeticTests: XCTestCase {
     /// store, as above.
     private func twoRecordLogDocuments() async throws -> (MultiDocModel, [String]) {
         let provider = try await makeProvider()
-        let engine = BaoModelQueryEngine(host: provider)
         let shared = MultiDocModel(schema: Self.schema)
         var ids: [String] = []
         for suffix in ["a", "b"] {
             let documentId = "aggperiod-\(suffix)-\(UUID().uuidString.prefix(8))"
             let binding = try RecordLogDocumentBinding(
                 host: provider, documentId: documentId, clientId: "client-1",
-                engine: engine, logger: Logger(level: .none)
+                logger: Logger(level: .none)
             )
             try shared.connect(docId: documentId, doc: YDocument()).bindRecordLog(binding)
             ids.append(documentId)

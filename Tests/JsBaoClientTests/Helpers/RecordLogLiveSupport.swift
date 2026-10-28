@@ -20,7 +20,16 @@ extension TestContext {
         request.setValue(ProcessInfo.processInfo.environment["TEST_ADMIN_TOKEN"] ?? "local-test-secret", forHTTPHeaderField: "X-Test-Auth")
         request.setValue(TestConfig.globalAdminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        // A pooled connection the dev server closed while it sat idle fails the
+        // next request on it with "the network connection was lost" before the
+        // request is read. URLSession sends an idempotent method again on its
+        // own but not a POST, so this sends it once more on a fresh connection.
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError where error.code == .networkConnectionLost {
+            (data, response) = try await URLSession.shared.data(for: request)
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else {
             throw TestSetupError("\(action) answered \(status): \(String(data: data, encoding: .utf8) ?? "")")
@@ -42,6 +51,33 @@ extension TestContext {
     }
 }
 
+/// Wait for a create to leave `pendingCreate`. On a timeout the failure names
+/// what the client knows about the commit (its last error, the retry count, the
+/// next attempt, whether networking is allowed and the socket is up), so a
+/// stalled commit says why instead of only that it timed out.
+func waitForCreateCommit(
+    _ client: JsBaoClient, _ documentId: String, timeout: TimeInterval = 20,
+    file: StaticString = #filePath, line: UInt = #line
+) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if client.documentManager.getLocalMetadata(documentId)?.pendingCreate != true { return }
+        try await Task.sleep(nanoseconds: 50_000_000)
+    }
+    let meta = client.documentManager.getLocalMetadata(documentId)
+    guard meta?.pendingCreate == true else { return }
+    XCTFail(
+        "Timeout waiting for the create of \(documentId) to commit: "
+            + "commitError=\(meta?.commitError?.message ?? "nil") "
+            + "retries=\(meta?.commitRetryCount ?? 0) "
+            + "nextAttemptAt=\(meta?.nextCommitAttemptAt ?? "nil") "
+            + "networkingAllowed=\(client.networkingAllowed()) "
+            + "connected=\(client.isConnected) "
+            + "pendingCreates=\(client.documentManager.listPendingCreates())",
+        file: file, line: line
+    )
+}
+
 /// A live format-3 app: clients over their own databases, documents created
 /// as `documentFormat: 3`, and what each client's store holds.
 final class RecordLogLiveApp {
@@ -57,10 +93,13 @@ final class RecordLogLiveApp {
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
     }
 
-    func client(_ name: String, models: [PrimitiveSchema], token: String? = nil) async throws -> JsBaoClient {
+    /// A file of this app's directory, for clients that share one store (one at a time).
+    func file(_ name: String) -> String { directory + "/\(name).sqlite" }
+
+    func client(_ name: String, models: [PrimitiveSchema], token: String? = nil, file: String? = nil) async throws -> JsBaoClient {
         let client = createTestClient(
             appId: app.appId, token: token ?? app.ownerJWT,
-            storageConfig: .sqlite(directory: directory + "/\(name)-\(UUID().uuidString.prefix(4)).sqlite"), autoNetwork: true
+            storageConfig: .sqlite(directory: file ?? directory + "/\(name)-\(UUID().uuidString.prefix(4)).sqlite"), autoNetwork: true
         )
         client.registerModels(models)
         clients.append(client)
@@ -73,9 +112,7 @@ final class RecordLogLiveApp {
     func createDocument(_ client: JsBaoClient) async throws -> String {
         let created = try await client.createDocument(options: CreateDocumentOptions(title: "record log", documentFormat: 3))
         let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
-        try await eventually(timeout: 20, description: "the create to commit") {
-            client.documentManager.getLocalMetadata(documentId)?.pendingCreate != true
-        }
+        try await waitForCreateCommit(client, documentId)
         return documentId
     }
 
