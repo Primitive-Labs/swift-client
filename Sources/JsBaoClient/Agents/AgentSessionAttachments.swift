@@ -8,8 +8,8 @@ import Foundation
 // destination: the bytes are kept locally first, each attempt PUTs to
 // `/agent-sessions/{sessionId}/attachments/{blobId}`, and a queued upload
 // survives the view's close and, with SQLite storage, the process: the next
-// client for the same app and user restores it. Nothing here names the
-// session's document.
+// client for the same app and user restores it. The files are blobs of the
+// session's db3, whose id is the session's.
 
 /// A file uploaded to a session: what `files: [AgentSessionFileRef(blobId:)]`
 /// on a send names.
@@ -117,8 +117,8 @@ public struct AgentSessionUploadStatus: Sendable, Equatable {
 public final class AgentSessionAttachments: Sendable {
     private let manager: BlobManager
     private let sessionId: String
-    /// The binding's document: the local store's key and the `blobs:upload-*`
-    /// events' `documentId`, never a route.
+    /// The session's db3 (its id the session's): the local store's key and the
+    /// `blobs:upload-*` events' `documentId`, never a route.
     private let documentId: String
     private let isClosed: @Sendable () -> Bool
 

@@ -777,6 +777,80 @@ extension EventEmitter {
         }
     }
 
+    /// Wait until a pending db3 create (#5000) has committed: resolved by its
+    /// `PendingCreateCommittedEvent`, or at once when `stillPending` answers
+    /// false. Throws `refusal()`'s error once the server refused the create
+    /// (its `Db3CreateFailedEvent`, or a refusal already recorded), and
+    /// `JsBaoError(.pendingCreate)` (`details["db3Id"]`) when `isOffline`
+    /// answers true, a `NetworkModeEvent` reports `.offline`, or `timeout`
+    /// elapses; `CancellationError` when the calling task is cancelled.
+    /// `commit` runs once the listeners are on, to join or start the commit.
+    func waitForPendingDb3Create(
+        db3Id: String,
+        timeout: TimeInterval,
+        stillPending: @escaping @Sendable () -> Bool,
+        isOffline: @escaping @Sendable () -> Bool,
+        refusal: @escaping @Sendable () -> Error?,
+        commit: @escaping @Sendable () -> Void
+    ) async throws {
+        let wait = SubscriptionHolder()
+        let cancellation = CancellationBridge()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                cancellation.onCancelResume {
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: CancellationError())
+                }
+                let fail: @Sendable (Error) -> Void = { error in
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: error)
+                }
+                let pendingCreate = JsBaoError(
+                    code: .pendingCreate,
+                    message: "The db3's create has not reached the server yet",
+                    details: ["db3Id": .string(db3Id)]
+                )
+                wait.set(subscribe(PendingCreateCommittedEvent.self) { payload in
+                    guard payload.documentId == db3Id, wait.claim() else { return }
+                    continuation.resume()
+                })
+                let failedSubscription = subscribe(Db3CreateFailedEvent.self) { payload in
+                    guard payload.id == db3Id else { return }
+                    fail(refusal() ?? pendingCreate)
+                }
+                let modeSubscription = subscribe(NetworkModeEvent.self) { payload in
+                    if payload.mode == .offline { fail(pendingCreate) }
+                }
+                wait.set(onSettled: {
+                    failedSubscription.cancel()
+                    modeSubscription.cancel()
+                })
+
+                if !stillPending() {
+                    guard wait.claim() else { return }
+                    continuation.resume()
+                    return
+                }
+                if isOffline() {
+                    fail(pendingCreate)
+                    return
+                }
+                // A refused create is not retried by the backoff: its refusal ends the wait.
+                if let refused = refusal() {
+                    fail(refused)
+                    return
+                }
+                wait.set(timeoutTask: Task {
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    fail(pendingCreate)
+                })
+                commit()
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
     private func timeoutTask<T>(
         wait: SubscriptionHolder,
         timeout: TimeInterval,

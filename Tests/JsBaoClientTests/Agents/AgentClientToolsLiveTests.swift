@@ -94,11 +94,11 @@ final class AgentClientToolsLiveTests: XCTestCase {
         throw TestSetupError("the model did not call the tool")
     }
 
-    private func pick(_ view: AgentSessionView, _ callId: String) -> PrimitivePart? {
+    private func pick(_ view: AgentSessionView, _ callId: String) -> AgentSessionToolCallRecord? {
         view.toolCall(callId)
     }
 
-    private func newestPick(_ view: AgentSessionView) -> PrimitivePart? {
+    private func newestPick(_ view: AgentSessionView) -> AgentSessionToolCallRecord? {
         view.toolCalls.filter { $0.toolName == "pick" }.last
     }
 
@@ -141,7 +141,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
         offPick()
         gate.open()
         try await h.poll(timeout: 30, "the call is answered") {
-            self.pick(view, callId)?.state == "output-available"
+            self.pick(view, callId)?.state == .outputAvailable
         }
         XCTAssertEqual(pick(view, callId)?.output, ["count": 2])
         try await h.settled(s)
@@ -194,7 +194,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
         let heard = changes.all.count
 
         gate.open()
-        try await h.poll(timeout: 30, "the output lands") { self.pick(view, call.callId)?.state == "output-available" }
+        try await h.poll(timeout: 30, "the output lands") { self.pick(view, call.callId)?.state == .outputAvailable }
         let landed = try XCTUnwrap(pick(view, call.callId))
         XCTAssertEqual(landed.output, ["count": 3])
         XCTAssertEqual(landed.artifact, ["note": "first"])
@@ -213,7 +213,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
         }])
         try await goUntilCalled(s, view) { !typedCalls.all.isEmpty }
         let typedId = try XCTUnwrap(typedCalls.all.first)
-        try await h.poll(timeout: 30, "the typed output lands") { self.pick(view, typedId)?.state == "output-available" }
+        try await h.poll(timeout: 30, "the typed output lands") { self.pick(view, typedId)?.state == .outputAvailable }
         XCTAssertEqual(pick(view, typedId)?.output, ["count": .number(Double("How many?".count))])
         XCTAssertNil(pick(view, typedId)?.artifact)
         try await h.settled(s)
@@ -240,13 +240,13 @@ final class AgentClientToolsLiveTests: XCTestCase {
             let before = seen
             let failedPick = {
                 view.toolCalls.first {
-                    $0.toolName == "pick" && $0.state == "output-error" && !before.contains($0.toolCallId ?? "")
+                    $0.toolName == "pick" && $0.state == .outputError && !before.contains($0.id)
                 }
             }
             // The undecodable case never reaches its closure: watch the part.
             try await goUntilCalled(s, view) { failedPick() != nil }
             let landed = try XCTUnwrap(failedPick())
-            seen.insert(landed.toolCallId ?? "")
+            seen.insert(landed.id)
             XCTAssertEqual(landed.errorCode, "AGENT_CLIENT_TOOL_FAILED", "case \(index)")
             XCTAssertTrue(matches(landed.errorText), "case \(index): \(landed.errorText ?? "nil")")
             XCTAssertEqual(landed.resolvedByUserId, h.part.userId)
@@ -279,23 +279,23 @@ final class AgentClientToolsLiveTests: XCTestCase {
         try owner.handleClientTools(["sign": elsewhere, "pick": elsewhere])
 
         let (_, turn) = try await h.pausedTurn(s, sender: partC, toolNames: ["sign", "pick"])
-        try await h.poll(timeout: 30, "both calls sync") { view.toolCalls.filter { $0.state != nil }.count >= 2 }
+        try await h.poll(timeout: 30, "both calls sync") { view.toolCalls.count >= 2 }
         let sign = try XCTUnwrap(view.toolCalls.first { $0.toolName == "sign" })
         let pickCall = try XCTUnwrap(view.toolCalls.first { $0.toolName == "pick" })
-        XCTAssertTrue(turn.pause?.callIds.contains(sign.toolCallId ?? "") == true)
+        XCTAssertTrue(turn.pause?.callIds.contains(sign.id) == true)
         try await Task.sleep(nanoseconds: 1_500_000_000)
         XCTAssertEqual(signs.all, [])
-        XCTAssertEqual(view.toolCall(sign.toolCallId!)?.state, "approval-requested")
-        XCTAssertEqual(view.toolCall(pickCall.toolCallId!)?.state, "input-available")
+        XCTAssertEqual(view.toolCall(sign.id)?.state, .approvalRequested)
+        XCTAssertEqual(view.toolCall(pickCall.id)?.state, .inputAvailable)
 
-        _ = try await view.answer(callId: sign.toolCallId!, .approval(approved: true))
+        _ = try await view.answer(callId: sign.id, .approval(approved: true))
         try await h.poll(timeout: 30, "the approved call runs") {
-            view.toolCall(sign.toolCallId!)?.state == "output-available"
+            view.toolCall(sign.id)?.state == .outputAvailable
         }
-        XCTAssertEqual(signs.all, [sign.toolCallId!])
-        XCTAssertEqual(view.toolCall(sign.toolCallId!)?.output, ["signed": true])
-        XCTAssertEqual(view.toolCall(pickCall.toolCallId!)?.state, "input-available")
-        _ = try await view.answer(callId: pickCall.toolCallId!, .output(["count": 2]))
+        XCTAssertEqual(signs.all, [sign.id])
+        XCTAssertEqual(view.toolCall(sign.id)?.output, ["signed": true])
+        XCTAssertEqual(view.toolCall(pickCall.id)?.state, .inputAvailable)
+        _ = try await view.answer(callId: pickCall.id, .output(["count": 2]))
         try await h.settled(s)
         XCTAssertEqual(strangers.all, [], "only the initiator's views run")
     }
@@ -330,7 +330,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
         gateB.open()
         try await h.settled(s)
         try await h.poll(timeout: 30, "both views see one answer") {
-            a.toolCall(callId)?.state == "output-available" && b.toolCall(callId)?.state == "output-available"
+            a.toolCall(callId)?.state == .outputAvailable && b.toolCall(callId)?.state == .outputAvailable
                 && a.runningClientToolCalls.isEmpty && b.runningClientToolCalls.isEmpty
         }
         let output = try XCTUnwrap(a.toolCall(callId)?.output)
@@ -366,15 +366,15 @@ final class AgentClientToolsLiveTests: XCTestCase {
             let turn = try await partC.agents.sessions.get(sessionId: s.sessionId).turn
             return !(turn?.pause?.callIds.contains(callId) ?? false)
         }
-        XCTAssertEqual(view.toolCall(callId)?.state, "input-available")
+        XCTAssertEqual(view.toolCall(callId)?.state, .inputAvailable)
         // Force an evaluation over the unsynced part.
         try view.handleClientTools(["sign": AgentClientToolHandler { _ in AgentClientToolResult(output: ["signed": true]) }])
         try await Task.sleep(nanoseconds: 1_000_000_000)
-        XCTAssertEqual(view.toolCall(callId)?.state, "input-available")
+        XCTAssertEqual(view.toolCall(callId)?.state, .inputAvailable)
         XCTAssertEqual(runs.all.count, 1)
         XCTAssertEqual(view.runningClientToolCalls, [])
         await partC.setShouldConnect(true)
-        try await h.poll(timeout: 60, "the answer syncs") { view.toolCall(callId)?.state == "output-available" }
+        try await h.poll(timeout: 60, "the answer syncs") { view.toolCall(callId)?.state == .outputAvailable }
         XCTAssertEqual(view.toolCall(callId)?.output, ["count": 7])
         try await h.settled(s)
         XCTAssertEqual(runs.all.count, 1)
@@ -400,7 +400,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
         XCTAssertFalse(refused.message.isEmpty)
         XCTAssertTrue(refused.error is HttpError)
         try await h.poll(timeout: 30, "the part syncs") { view.toolCall(refused.callId) != nil }
-        XCTAssertEqual(view.toolCall(refused.callId)?.state, "input-available")
+        XCTAssertEqual(view.toolCall(refused.callId)?.state, .inputAvailable)
         try view.handleClientTools(["other": AgentClientToolHandler { _ in AgentClientToolResult(output: [:]) }])
         try await Task.sleep(nanoseconds: 1_000_000_000)
         XCTAssertEqual(runs.all.count, 1)
@@ -438,7 +438,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
         XCTAssertEqual(runs.all.count, 1)
         await partC.goOnline()
         try await h.poll(timeout: 60, "the re-sync runs it again") { runs.all.count == 2 }
-        try await h.poll(timeout: 60, "the output lands") { view.toolCall(callId)?.state == "output-available" }
+        try await h.poll(timeout: 60, "the output lands") { view.toolCall(callId)?.state == .outputAvailable }
         XCTAssertEqual(view.toolCall(callId)?.output, ["count": 8])
         try await h.settled(s)
         XCTAssertEqual(errors.all.count, 1)
@@ -477,7 +477,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
 
     // MARK: - Resume (behavior 11)
 
-    func testACallPendingAtRegistrationRunsFoundInTheDocumentNotTheWindow() async throws {
+    func testACallPendingAtRegistrationRunsFoundInTheDb3NotTheWindow() async throws {
         let s = try await h.createSession(h.tools, participants: [h.part])
         let partC = try await h.client(h.part)
         let (_, turn) = try await h.pausedTurn(s, sender: partC, toolNames: ["sign", "pick"])
@@ -487,7 +487,7 @@ final class AgentClientToolsLiveTests: XCTestCase {
         )
         let view = try await h.open(partC, s, pageSize: 1)
         try await h.poll(timeout: 30, "the window holds the event") {
-            view.syncedMessages.count == 1 && view.syncedMessages[0].parts.map(\.kind) == [.event]
+            view.syncedMessages.count == 1 && view.syncedMessages[0].parts.map { $0.eventPart != nil } == [true]
         }
         let runs = Recorder<String>()
         try view.handleClientTools(["pick": AgentClientToolHandler { call in

@@ -7,11 +7,11 @@ import XCTest
 /// upload's failure fails the message and nothing is sent; a newer send under
 /// the id displaces it; the view's close does not end it.
 ///
-/// A real `JsBaoClient` over `LoopbackAPIServer` with a local-only session
-/// document; the server answers each POST of a message with a fresh id.
+/// A real `JsBaoClient` over `LoopbackAPIServer`, with the session's db3 on
+/// the device (`SessionDb3`, #4884); the server answers each POST of a
+/// message with a fresh id.
 final class AgentSessionWaitingSendsHermeticTests: XCTestCase {
     private static let bytes = Data("waiting bytes".utf8)
-    private static let created = "2026-10-20T00:00:00.000Z"
 
     private final class Script: @unchecked Sendable {
         let put = LockedBox<@Sendable (SessionUploadServer.Request) -> SessionUploadServer.Response>({ _ in
@@ -25,7 +25,7 @@ final class AgentSessionWaitingSendsHermeticTests: XCTestCase {
                 return .json(Self.sendResult(sent.withValue { $0 += 1; return $0 }))
             }
             if request.method == "DELETE", request.apiPathOnly == "/agent-sessions/s1" {
-                return .json(#"{"deleted":true,"sessionId":"s1","documentId":"d1"}"#)
+                return .json(#"{"deleted":true,"sessionId":"s1"}"#)
             }
             return SessionUploadServer.acceptAll(request)
         }
@@ -40,7 +40,7 @@ final class AgentSessionWaitingSendsHermeticTests: XCTestCase {
         let client: JsBaoClient
         let script: Script
         let view: AgentSessionView
-        let documentId: String
+        let db3: SessionDb3
 
         var posts: [SessionUploadServer.Request] {
             server.requests.filter { $0.method == "POST" && $0.apiPathOnly == "/agent-sessions/s1/messages" }
@@ -54,6 +54,7 @@ final class AgentSessionWaitingSendsHermeticTests: XCTestCase {
             await view.close()
             await client.destroy()
             server.stop()
+            db3.cleanup()
         }
     }
 
@@ -61,8 +62,8 @@ final class AgentSessionWaitingSendsHermeticTests: XCTestCase {
         let script = Script()
         let server = try SessionUploadServer()
         let client = makeSessionUploadClient(server)
-        let (view, documentId) = try await openLocalSessionView(client, server) { request in script.route(request) }
-        return Fixture(server: server, client: client, script: script, view: view, documentId: documentId)
+        let (view, db3) = try await openLocalSessionView(client, server) { request in script.route(request) }
+        return Fixture(server: server, client: client, script: script, view: view, db3: db3)
     }
 
     /// An upload answered 503, then paused when asked: queued until resumed.
@@ -322,10 +323,7 @@ final class AgentSessionWaitingSendsHermeticTests: XCTestCase {
         XCTAssertEqual(body["locale"] as? String, "en")
 
         // The entry leaves once its row is in the window.
-        try f.client.codegen.save(PrimitiveMessage.primitiveSchema, id: result.messageId, values: [
-            "seq": .number(1), "authorKind": .string("user"), "clientMessageId": .string("c-retry"),
-            "createdAt": .date(Self.created),
-        ], in: f.documentId)
+        try f.db3.write("Message", SessionRows.message(result.messageId, seq: 1, clientMessageId: "c-retry"))
         try await eventually(timeout: 5, description: "the entry leaves") { f.pending("c-retry") == nil }
         let unknown = await thrown { _ = try await view.retry(clientMessageId: "c-nobody") }
         XCTAssertEqual((unknown as? JsBaoError)?.code, .invalidArgument)

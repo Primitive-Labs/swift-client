@@ -82,6 +82,13 @@ public final class AuthAPI: @unchecked Sendable {
     let _passkeyDelete: ((_ passkeyId: String) async throws -> PasskeyDeleteResult)?
     let _passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> PasskeyUpdateResult)?
 
+    // The sign-in helpers. Optional for source compatibility: an unwired
+    // request or callback throws, and an unwired target applies the rule with
+    // no `oauthRedirectUri` and no `links.appBaseURL`.
+    private let _emailSignInRequestWithTarget: ((_ email: String, _ target: EmailSignInTarget) async throws -> Bool)?
+    private let _emailSignInLinkTarget: ((_ target: EmailSignInTarget) -> String?)?
+    private let _handleSignInCallback: ((_ url: URL, _ inviteToken: String?) async throws -> SignInCallbackResult)?
+
     public init(
         getUserId: @escaping () -> String?,
         getToken: @escaping () -> String?,
@@ -109,7 +116,10 @@ public final class AuthAPI: @unchecked Sendable {
         passkeyRegisterFinish: ((_ credential: JSONValue, _ challengeToken: String, _ deviceName: String?, _ inviteToken: String?) async throws -> PasskeyRegistrationResult)? = nil,
         passkeyList: (() async throws -> PasskeyListResult)? = nil,
         passkeyDelete: ((_ passkeyId: String) async throws -> PasskeyDeleteResult)? = nil,
-        passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> PasskeyUpdateResult)? = nil
+        passkeyUpdate: ((_ passkeyId: String, _ deviceName: String) async throws -> PasskeyUpdateResult)? = nil,
+        emailSignInRequestWithTarget: ((_ email: String, _ target: EmailSignInTarget) async throws -> Bool)? = nil,
+        emailSignInLinkTarget: ((_ target: EmailSignInTarget) -> String?)? = nil,
+        handleSignInCallback: ((_ url: URL, _ inviteToken: String?) async throws -> SignInCallbackResult)? = nil
     ) {
         self._getUserId = getUserId
         self._getToken = getToken
@@ -138,6 +148,9 @@ public final class AuthAPI: @unchecked Sendable {
         self._passkeyList = passkeyList
         self._passkeyDelete = passkeyDelete
         self._passkeyUpdate = passkeyUpdate
+        self._emailSignInRequestWithTarget = emailSignInRequestWithTarget
+        self._emailSignInLinkTarget = emailSignInLinkTarget
+        self._handleSignInCallback = handleSignInCallback
     }
 
     // MARK: - Identity / token accessors
@@ -185,12 +198,15 @@ public final class AuthAPI: @unchecked Sendable {
     /// and, when the app allow-lists the redirect target, a magic link. The
     /// user finishes by typing the code or tapping the link; nothing here
     /// picks a method. Mirrors JS
-    /// `auth.emailSignInRequest({ email, redirectUri })`.
+    /// `emailSignInRequest(email, { redirectUri })`.
     ///
-    /// Omitting `redirectUri` is how a code-only email is requested: the
-    /// server issues one from the same template, consulting no allow-list. A
-    /// supplied target must match the app's non-empty `emailRedirectUris`, or
-    /// the request is rejected 400 `Invalid redirect URI` (#2967).
+    /// The link lands on `emailSignInLinkTarget(.uri(redirectUri))`: with no
+    /// `redirectUri` (nil or empty), `options.auth.oauthRedirectUri`, else
+    /// `links.appBaseURL`'s origin + `/oauth/callback`, else no link. Ask for
+    /// a code-only email with `emailSignInRequest(email:target: .codeOnly)`.
+    /// A target that is sent must match the app's non-empty
+    /// `emailRedirectUris`, or the request is rejected 400
+    /// `Invalid redirect URI` (#2967); the client does not retry without it.
     public func emailSignInRequest(
         _ params: EmailSignInRequestParams
     ) async throws -> EmailSignInRequestResult {
@@ -212,6 +228,74 @@ public final class AuthAPI: @unchecked Sendable {
         try await emailSignInRequest(
             EmailSignInRequestParams(email: email, redirectUri: redirectUri)
         )
+    }
+
+    /// Request one sign-in email whose link lands on `target`, or none for
+    /// `.codeOnly`. Mirrors JS `emailSignInRequest(email, { redirectUri })`,
+    /// where `redirectUri: null` is `.codeOnly`.
+    public func emailSignInRequest(
+        email: String,
+        target: EmailSignInTarget
+    ) async throws -> EmailSignInRequestResult {
+        guard let request = _emailSignInRequestWithTarget else {
+            throw JsBaoError(
+                code: .unavailable,
+                message: "emailSignInRequest(email:target:) is not wired on this AuthAPI instance"
+            )
+        }
+        return EmailSignInRequestResult(success: try await request(email, target))
+    }
+
+    /// The target `emailSignInRequest(email:target:)` would ask the link to
+    /// land on, or `nil` for a code-only email. Sends nothing. Mirrors JS
+    /// `emailSignInLinkTarget(redirectUri)`. The first that applies:
+    ///
+    /// 1. `.uri` with a non-empty string, or `nil` for `.codeOnly`.
+    /// 2. `options.auth.oauthRedirectUri`.
+    /// 3. `links.appBaseURL`'s http(s) origin + `/oauth/callback`, read at
+    ///    call time.
+    /// 4. `nil`: a code-only email.
+    public func emailSignInLinkTarget(_ target: EmailSignInTarget = .automatic) -> String? {
+        if let linkTarget = _emailSignInLinkTarget { return linkTarget(target) }
+        return SignInRules.emailSignInLinkTarget(target, oauthRedirectUri: nil, appBaseURL: nil)
+    }
+
+    /// Finish a sign-in from the URL an emailed link or an OAuth redirect
+    /// opened: a `magic_token` is verified with `magicLinkVerify`, a `code` +
+    /// `state` pair is exchanged with the OAuth callback. Returns once the
+    /// client is signed in. Mirrors JS `handleSignInCallback(url, { inviteToken })`.
+    ///
+    /// Only this grammar is accepted; anything else throws `AuthError` with
+    /// code `.invalidToken` and a message starting `Sign-in callback refused:`
+    /// that names the failed rule, before any request is made:
+    ///
+    /// 1. A URL is given.
+    /// 2. Its scheme is http(s), or the scheme of a non-http(s)
+    ///    `options.auth.oauthRedirectUri`.
+    /// 3. An http(s) URL is on `links.appBaseURL`'s origin.
+    /// 4. Its path is `oauthRedirectUri`'s when it has the URL's kind, else
+    ///    `/oauth/callback`, compared percent-encoded.
+    /// 5. `magic_token`, `code` and `state` each appear at most once, never
+    ///    empty.
+    /// 6. Not both `magic_token` and `code`.
+    /// 7. `code` comes with `state`.
+    /// 8. It carries `magic_token`, or `code` with `state`.
+    /// 9. A `state` decodes as base64 JSON to an object.
+    ///
+    /// A `state` beside `magic_token` is the app's own bag: its `continueUrl`
+    /// is returned, and its `inviteToken` is used when `inviteToken` is nil. A
+    /// failed verify or exchange throws that call's own error.
+    public func handleSignInCallback(
+        _ url: URL,
+        inviteToken: String? = nil
+    ) async throws -> SignInCallbackResult {
+        guard let handle = _handleSignInCallback else {
+            throw JsBaoError(
+                code: .unavailable,
+                message: "handleSignInCallback is not wired on this AuthAPI instance"
+            )
+        }
+        return try await handle(url, inviteToken)
     }
 
     // MARK: - Magic link

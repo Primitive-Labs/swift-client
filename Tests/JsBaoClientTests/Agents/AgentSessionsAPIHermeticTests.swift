@@ -3,7 +3,9 @@ import XCTest
 
 /// `client.agents.sessions`: every operation's path, method, query, body and
 /// decode, on a recording transport (#3810, plan behaviors 1–9 and edge cases
-/// 28–30, 35, 37). The JS client's `AgentSessionsAPI` is the reference.
+/// 28–30, 35, 37). The JS client's `AgentSessionsAPI` is the reference. Since
+/// #4884 the answers are the phase-2 server's: a session is named by its id
+/// alone, and there is no `inspect`.
 final class AgentSessionsAPIHermeticTests: XCTestCase {
 
     // MARK: - Fixture
@@ -16,7 +18,7 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
     }
 
     private static let memberInfo = #"""
-    {"sessionId":"s1","agentKey":"helper","documentId":"d1","ownerUserId":"u-owner",
+    {"sessionId":"s1","agentKey":"helper","ownerUserId":"u-owner",
      "createdAt":"2026-10-01T00:00:00.000Z","title":"Plans","scope":"team",
      "lastActivityAt":"2026-10-02T00:00:00.000Z",
      "members":{"viewers":["u-v"],"participants":["u-p1","u-p2"]},
@@ -28,7 +30,7 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
     """#
 
     private static let adminInfo = #"""
-    {"sessionId":"s1","agentKey":"helper","documentId":"d1","ownerUserId":"u-owner",
+    {"sessionId":"s1","agentKey":"helper","ownerUserId":"u-owner",
      "createdAt":"2026-10-01T00:00:00.000Z","title":null,"scope":null,"lastActivityAt":null,
      "members":{"viewers":[],"participants":[]},"role":"admin","status":"warming_up",
      "turn":null,
@@ -88,9 +90,9 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
 
     func testListSendsTheQueryInTheJsOrderAndDecodesThePage() async throws {
         let body = #"""
-        {"items":[{"sessionId":"s1","agentKey":"helper","scope":null,"documentId":"d1","ownerUserId":"u1",
+        {"items":[{"sessionId":"s1","agentKey":"helper","scope":null,"ownerUserId":"u1",
                    "role":"owner","title":"A","lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null},
-                  {"sessionId":"s2","agentKey":"helper","scope":"x","documentId":"d2","ownerUserId":"u2",
+                  {"sessionId":"s2","agentKey":"helper","scope":"x","ownerUserId":"u2",
                    "role":"guest","title":null,"lastActivityAt":"2026-10-01T00:00:00.000Z","createdAt":"2026-09-01T00:00:00.000Z"}],
          "hasMore":true,"nextCursor":"cur-2"}
         """#
@@ -119,7 +121,7 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
 
     func testListAcceptsABareArrayAsOnePage() async throws {
         let (sessions, _) = api(#"""
-        [{"sessionId":"s1","agentKey":"helper","scope":null,"documentId":"d1","ownerUserId":"u1",
+        [{"sessionId":"s1","agentKey":"helper","scope":null,"ownerUserId":"u1",
           "role":"viewer","title":null,"lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null}]
         """#)
         let page = try await sessions.list()
@@ -137,7 +139,7 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(transport.lastCall?.method, .get)
         XCTAssertEqual(transport.lastCall?.path, "/agent-sessions/s1")
         XCTAssertEqual(info.agentKey, "helper")
-        XCTAssertEqual(info.storageDocumentId, "d1")
+        XCTAssertEqual(info.sessionId, "s1")
         XCTAssertEqual(info.title, "Plans")
         XCTAssertEqual(info.scope, "team")
         XCTAssertEqual(info.members, AgentSessionMembers(viewers: ["u-v"], participants: ["u-p1", "u-p2"]))
@@ -209,13 +211,13 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
         XCTAssertEqual(renameTransport.lastCall?.jsonBody, ["title": "New"])
         XCTAssertEqual(renamed.title, "New")
 
-        let (deleting, deleteTransport) = api(#"{"deleted":true,"sessionId":"s1","documentId":"d1"}"#)
+        let (deleting, deleteTransport) = api(#"{"deleted":true,"sessionId":"s1"}"#)
         let deleted = try await deleting.delete(sessionId: "s1")
         XCTAssertEqual(deleteTransport.lastCall?.method, .delete)
         XCTAssertEqual(deleteTransport.lastCall?.path, "/agent-sessions/s1")
         XCTAssertNil(deleteTransport.lastCall?.body)
         XCTAssertEqual(deleted, try JSONCoding.decodeData(
-            AgentSessionDeleteResult.self, from: Data(#"{"deleted":true,"sessionId":"s1","documentId":"d1"}"#.utf8)))
+            AgentSessionDeleteResult.self, from: Data(#"{"deleted":true,"sessionId":"s1"}"#.utf8)))
         XCTAssertTrue(deleted.deleted)
 
         let members = #"{"members":{"viewers":["u2"],"participants":["u3"]}}"#
@@ -366,13 +368,13 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
 
     func testListItemsDecodeTheUnreadDotWithAndWithoutTheFieldsAndRoundTrip() async throws {
         let (sessions, _) = api(#"""
-        {"items":[{"sessionId":"s1","agentKey":"helper","scope":null,"documentId":"d1","ownerUserId":"u1",
+        {"items":[{"sessionId":"s1","agentKey":"helper","scope":null,"ownerUserId":"u1",
                    "role":"owner","title":"A","lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null,
                    "hasUnread":true,"lastReadAt":null},
-                  {"sessionId":"s2","agentKey":"helper","scope":null,"documentId":"d2","ownerUserId":"u1",
+                  {"sessionId":"s2","agentKey":"helper","scope":null,"ownerUserId":"u1",
                    "role":"viewer","title":null,"lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null,
                    "hasUnread":false,"lastReadAt":"2026-10-02T00:00:05.000Z"},
-                  {"sessionId":"s3","agentKey":"helper","scope":null,"documentId":"d3","ownerUserId":"u1",
+                  {"sessionId":"s3","agentKey":"helper","scope":null,"ownerUserId":"u1",
                    "role":"viewer","title":null,"lastActivityAt":"2026-10-02T00:00:00.000Z","createdAt":null}],
          "hasMore":false}
         """#)
@@ -482,31 +484,6 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
             _ = try await sessions.recordEvent(sessionId: "", event: AgentSessionEvent(kind: "k", data: .null))
         }
         assertNoRequest(transport)
-    }
-
-    // MARK: - #4588 behavior 21 and edge 43: inspect.storage
-
-    func testInspectStorageIsGetsDocumentIdAndPassesItsRefusalsThrough() async throws {
-        let (sessions, transport) = api(Self.memberInfo)
-        let storage = try await sessions.inspect.storage("s1")
-        XCTAssertEqual(storage, AgentSessionStorage(documentId: "d1"))
-        XCTAssertEqual(transport.calls.map(\.path), ["/agent-sessions/s1"])
-        XCTAssertEqual(transport.lastCall?.method, .get)
-
-        for (status, code) in [(404, "AGENT_SESSION_NOT_FOUND"), (410, "AGENT_SESSION_DOCUMENT_MISSING")] {
-            let (refusing, _) = api(status: status, #"{"error":"refused","code":"\#(code)"}"#)
-            do {
-                _ = try await refusing.inspect.storage("s1")
-                XCTFail("\(code) passes through")
-            } catch let error as HttpError {
-                XCTAssertEqual(error.status, status)
-                XCTAssertEqual(error.serverCode, code)
-            }
-        }
-
-        let (empty, emptyTransport) = api(Self.memberInfo)
-        await assertInvalidArgument { _ = try await empty.inspect.storage("") }
-        assertNoRequest(emptyTransport)
     }
 
     // MARK: - #4588 behavior 22: the attachment calls
@@ -629,7 +606,7 @@ final class AgentSessionsAPIHermeticTests: XCTestCase {
         } catch let error as HttpError {
             XCTAssertEqual(error.serverCode, "AGENT_SESSION_NOT_FOUND")
         }
-        let (deleting, _) = api(#"{"deleted":true,"sessionId":"s1","documentId":"d1"}"#)
+        let (deleting, _) = api(#"{"deleted":true,"sessionId":"s1"}"#)
         let deleted = try await deleting.delete(sessionId: "s1")
         XCTAssertTrue(deleted.deleted)
         XCTAssertEqual(transport.calls.count, 1)

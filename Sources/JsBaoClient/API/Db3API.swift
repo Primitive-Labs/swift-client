@@ -212,6 +212,17 @@ public final class Db3Subscription: @unchecked Sendable {
 /// alias, sync, type, app access and custody), its sharing and blobs,
 /// subscribing to it, and its copy on this device.
 ///
+/// A db3 you create is on this device before the server has it. A call that
+/// asks the server about it by its id (`get`, the sync, type, app-access and
+/// custody calls, sharing, indexes and bulk loads) waits for that commit
+/// first, so it can follow `create` at once. The wait throws the create's
+/// refusal (its `HttpError`, `details.db3Id` in the body) when the server
+/// refused it, and `JsBaoError(.pendingCreate)` (`details["db3Id"]`) instead
+/// of waiting when the network mode is `.offline`, becomes `.offline`, or the
+/// commit has not landed within 30 seconds. `subscribe(_:)`, `state(_:)`,
+/// `evict(_:)`, `blobs(_:)` and `delete(_:)` do not wait; an upload made
+/// before the commit lands stays queued until it does.
+///
 /// ```swift
 /// let created = try await client.db3.create(title: "Orders", type: "orders")
 /// let sub = try client.db3.subscribe(created.id)
@@ -239,8 +250,18 @@ public final class Db3API: @unchecked Sendable {
         self.transport = transport
         self.client = client
         self.blobManager = blobManager ?? BlobManager(logger: createLogger(level: .error, scope: "db3"), transport: transport)
-        self.indexes = Db3IndexesAPI(transport: transport)
-        self.ingests = Db3IngestsAPI(transport: transport)
+        let awaitCreate: @Sendable (String) async throws -> Void = { [weak client] db3Id in
+            try await client?.awaitPendingDb3Create(db3Id)
+        }
+        self.indexes = Db3IndexesAPI(transport: transport, awaitCreate: awaitCreate)
+        self.ingests = Db3IngestsAPI(transport: transport, awaitCreate: awaitCreate)
+    }
+
+    /// #5000 — before a request naming `db3Id`, wait for a pending create of
+    /// it to commit (`JsBaoClient.awaitPendingDb3Create`); a `Db3API` with no
+    /// wired client has none to wait for.
+    private func awaitCreate(_ db3Id: String) async throws {
+        try await client?.awaitPendingDb3Create(db3Id)
     }
 
     /// Subscribe to a db3: this client keeps it up to date with its room
@@ -312,31 +333,40 @@ public final class Db3API: @unchecked Sendable {
         "/db3/\(URLEncoding.encodeComponent(db3Id))\(rest)"
     }
 
-    /// Create a db3 and answer it. The call waits for the server: with
-    /// `type`, the type's current revision is installed before it answers,
-    /// so the first write already meets the type. A refusal throws the
-    /// route's `HttpError` and nothing is created, here or on the server.
-    /// `Db3CreatedEvent` fires before it returns; a refusal fires
-    /// `Db3CreateFailedEvent`.
+    /// Create a db3 and answer it.
     ///
-    /// A synced db3 is on this device from the answer on: `stored()` lists
-    /// it, its models save and query before any subscribe, and the first
-    /// `subscribe(_:)` sends those writes. A sync-off db3 is never stored
-    /// here. If the signed-in account changed while the request was out, the
-    /// answer is returned and nothing is stored for the new account.
+    /// A db3 you hold with sync on and no `custodian` is created on this
+    /// device: the client mints its id and the call returns at once, with
+    /// networking on or off, `state.pendingCreate` true. Its models save and
+    /// query right away, `stored()` lists it, and the first `subscribe(_:)`
+    /// sends those writes. The client commits it to the server in the
+    /// background (at once with networking on, otherwise when it is back),
+    /// retried with backoff, and `Db3CreatedEvent` fires once the server has
+    /// it; with `type`, the type's current revision is installed then. A
+    /// refusal only the server can decide (`DB3_TYPE_NOT_FOUND`,
+    /// `DB3_TYPE_REFUSED`, a quota, a taken id) does not throw: it arrives as
+    /// `Db3CreateFailedEvent` naming the db3's `id`, and the rows stay
+    /// readable until `commitOfflineCreate(documentId:)` succeeds or a forced
+    /// evict removes them.
     ///
-    /// A db3 you hold with sync on and no `custodian` works with networking
-    /// stopped too: the client mints its id, and offline (or when the request
-    /// cannot reach the server) the call returns at once with the db3 created
-    /// here, `state.pendingCreate` true. It commits when networking is back,
-    /// retried with backoff; `Db3CreatedEvent` fires then, or
-    /// `Db3CreateFailedEvent` with its `id` when the server refuses it, which
-    /// keeps its rows until `commitOfflineCreate(documentId:)` succeeds or a
-    /// forced evict removes it. Sync-off and custodian-naming creates need
-    /// the server.
+    /// To wait for the server's answer, call
+    /// `client.documents.commitOfflineCreate(documentId:)`. It answers
+    /// `created: true` once the server has the db3, `refused: true` with the
+    /// `reason` when the server refused it, and `reason: "not_pending"` when
+    /// the commit had already landed; a failure the client keeps retrying
+    /// throws. `client.isPendingCreate(_:)` tells whether it has landed. The
+    /// `client.db3` calls that ask the server about the db3 wait for the
+    /// commit on their own.
+    ///
+    /// A sync-off create (an app owner or admin) or one naming a `custodian`
+    /// waits for the server: it answers the route's db3, fires
+    /// `Db3CreatedEvent` before it returns, and a refusal throws the route's
+    /// `HttpError` and fires `Db3CreateFailedEvent`. A sync-off db3 is never
+    /// stored here.
     ///
     /// ```swift
     /// let orders = try await client.db3.create(title: "Orders", type: "orders")
+    /// let answer = try await client.documents.commitOfflineCreate(documentId: orders.id)
     /// let archive = try await client.db3.create(title: "Archive", sync: false) // an app owner or admin only
     /// ```
     ///
@@ -349,8 +379,10 @@ public final class Db3API: @unchecked Sendable {
     ///     admin only); omitted means the caller.
     ///   - tags: Its tags.
     ///   - metadata: An opaque metadata blob (at most 4 KB).
-    /// - Throws: `HttpError`, its `serverCode` naming why: 403 for a member's
-    ///   sync-off create, 404 `DB3_TYPE_NOT_FOUND`, 409 `DB3_TYPE_REFUSED` or
+    /// - Throws: `JsBaoError(.invalidArgument)` with no signed-in user. A
+    ///   sync-off or custodian-naming create throws the route's `HttpError`,
+    ///   its `serverCode` naming why: 403 for a member's sync-off create, 404
+    ///   `DB3_TYPE_NOT_FOUND`, 409 `DB3_TYPE_REFUSED` or
     ///   `DB3_TYPE_REVISION_CONFLICT`.
     public func create(
         title: String,
@@ -382,40 +414,30 @@ public final class Db3API: @unchecked Sendable {
         return info
     }
 
-    /// A create of the caller's own synced db3 (#4921): under an id minted
-    /// here, one `POST db3` when networking is allowed, answered as `create`
-    /// answers it; a request that cannot reach the server or a retryable
-    /// answer (5xx, 408, 429, `DB3_CREATE_IN_PROGRESS`), or no network at all,
-    /// keeps the db3 here as a pending create, committed later. Only within
-    /// the metadata session the create began in: once the user signed out or
-    /// another signed in during the request, the failure is reported and
-    /// nothing is kept.
+    /// A create of the caller's own synced db3 (#4921, #5000): kept here under
+    /// an id minted here as a pending create, networking on or off, and
+    /// answered at once. Its `POST db3` starts now when networking is allowed,
+    /// otherwise when it is back, and retries with backoff. A `Db3API` with no
+    /// wired client has nowhere to keep it: it sends the `POST db3` under the
+    /// minted id and answers as `create` answers.
     private func createLocalFirst(title: String, type: String?, tags: [String]?, metadata: JSONValue?) async throws -> Db3Info {
-        if let client, (client.authController.getUserId() ?? "").isEmpty {
-            throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
-        }
         let id = ULID.generate()
-        if let client, !client.networkingAllowed() {
-            return try await client.createPendingDb3(id, title: title, type: type, tags: tags, metadata: metadata, commitNow: false)
+        if let client {
+            if (client.authController.getUserId() ?? "").isEmpty {
+                throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
+            }
+            return try await client.createPendingDb3(id, title: title, type: type, tags: tags, metadata: metadata, commitNow: true)
         }
         var body: [String: JSONValue] = ["title": .string(title), "id": .string(id)]
         if let type { body["type"] = .string(type) }
         if let tags { body["tags"] = .array(tags.map(JSONValue.string)) }
         if let metadata { body["metadata"] = metadata }
-        let session = client?.metadataSessionToken
-        let info: Db3Info
         do {
-            info = try await transport.request(method: .post, path: "/db3", body: JSONValue.object(body))
+            return try await transport.request(method: .post, path: "/db3", body: JSONValue.object(body))
         } catch {
-            if let client, DocumentManager.isRetryableDb3CommitFailure(error), session == client.metadataSessionToken {
-                return try await client.createPendingDb3(id, title: title, type: type, tags: tags, metadata: metadata, commitNow: true)
-            }
             createFailed(error, title: title, type: type, id: id)
             throw error
         }
-        await adopt(info, session: session)
-        client?.eventEmitter.emit(Db3CreatedEvent(id: info.id))
-        return info
     }
 
     /// A refused create's `Db3CreateFailedEvent`; `id` names a client-minted id.
@@ -445,6 +467,9 @@ public final class Db3API: @unchecked Sendable {
     /// A db3, with the caller's `permission`, `accessSource` and `grantedAt`
     /// when they hold it through a grant.
     ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
     /// ```swift
     /// let info = try await client.db3.get(db3Id)
     /// if info.accessSource == .app { print("shared with every member") }
@@ -454,7 +479,8 @@ public final class Db3API: @unchecked Sendable {
     /// - Throws: `HttpError` 404 for no db3 of this app, 409 `NOT_A_DB3` for a
     ///   document that is not a db3, 403 `DOC_ACCESS_DENIED`.
     public func get(_ db3Id: String) async throws -> Db3Info {
-        try await transport.request(method: .get, path: Self.path(db3Id))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .get, path: Self.path(db3Id))
     }
 
     /// Delete a db3 with its records, grants and blobs. Its owner deletes it,
@@ -536,18 +562,25 @@ public final class Db3API: @unchecked Sendable {
 
     /// Whether a db3 syncs over a socket.
     ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
     /// ```swift
     /// let state = try await client.db3.getSync(db3Id)
     /// ```
     ///
     /// - Parameter db3Id: The db3.
     public func getSync(_ db3Id: String) async throws -> Db3SyncState {
-        try await transport.request(method: .get, path: Self.path(db3Id, "/sync"))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .get, path: Self.path(db3Id, "/sync"))
     }
 
     /// Turn a db3's sync on or off. Off, every subscribed client hears the db3
     /// gone (`Db3GoneEvent` with `.syncOff`) and only its records routes reach
     /// it; on again, clients subscribe as before. An app owner or admin only.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// ```swift
     /// let change = try await client.db3.setSync(db3Id, sync: false)
@@ -557,11 +590,15 @@ public final class Db3API: @unchecked Sendable {
     ///   - db3Id: The db3.
     ///   - sync: The state to set.
     public func setSync(_ db3Id: String, sync: Bool) async throws -> Db3SyncChange {
-        try await transport.request(method: .put, path: Self.path(db3Id, "/sync"), body: JSONValue.object(["sync": .bool(sync)]))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .put, path: Self.path(db3Id, "/sync"), body: JSONValue.object(["sync": .bool(sync)]))
     }
 
     /// A db3's type: the type its row names with that type's current
     /// revision, and the revision its room holds.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// ```swift
     /// let type = try await client.db3.getType(db3Id)
@@ -569,11 +606,15 @@ public final class Db3API: @unchecked Sendable {
     ///
     /// - Parameter db3Id: The db3.
     public func getType(_ db3Id: String) async throws -> Db3TypeState {
-        try await transport.request(method: .get, path: Self.path(db3Id, "/type"))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .get, path: Self.path(db3Id, "/type"))
     }
 
     /// Attach a type to a db3, installing its current revision whole or not
     /// at all. An app owner or admin only; a type is never detached.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// ```swift
     /// let change = try await client.db3.setType(db3Id, type: "orders")
@@ -585,10 +626,14 @@ public final class Db3API: @unchecked Sendable {
     /// - Throws: `HttpError` 409 `DB3_TYPE_REFUSED` (`details.reasons`) when
     ///   the db3's records break the type, `DB3_TYPED` when it has another type.
     public func setType(_ db3Id: String, type: String) async throws -> Db3TypeChange {
-        try await transport.request(method: .put, path: Self.path(db3Id, "/type"), body: JSONValue.object(["type": .string(type)]))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .put, path: Self.path(db3Id, "/type"), body: JSONValue.object(["type": .string(type)]))
     }
 
     /// The level a db3's app access grants every member of the app, or `nil`.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// ```swift
     /// let access = try await client.db3.getAppAccess(db3Id)
@@ -596,12 +641,16 @@ public final class Db3API: @unchecked Sendable {
     ///
     /// - Parameter db3Id: The db3.
     public func getAppAccess(_ db3Id: String) async throws -> Db3AppAccess {
-        try await transport.request(method: .get, path: Self.path(db3Id, "/app-access"))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .get, path: Self.path(db3Id, "/app-access"))
     }
 
     /// Grant every current and future member of the app a level on a db3, or
     /// remove that grant with `nil`. An app owner or admin only; refused on a
     /// sync-off db3 (`DB3_SYNC_OFF_NO_SHARING`).
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// ```swift
     /// _ = try await client.db3.setAppAccess(db3Id, level: .readWrite)
@@ -612,12 +661,16 @@ public final class Db3API: @unchecked Sendable {
     ///   - db3Id: The db3.
     ///   - level: The level, or `nil` to remove the grant.
     public func setAppAccess(_ db3Id: String, level: Db3AppAccessLevel?) async throws -> Db3AppAccessChange {
+        try await awaitCreate(db3Id)
         let value: JSONValue = level.map { .string($0.rawValue) } ?? .null
         return try await transport.request(method: .put, path: Self.path(db3Id, "/app-access"), body: JSONValue.object(["level": value]))
     }
 
     /// Move who holds a db3: to `app`, or to `user:<userId>`. Its owner row
     /// moves with it; the answer is the db3 as it now is.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// ```swift
     /// let moved = try await client.db3.transfer(db3Id, to: "app")
@@ -627,7 +680,8 @@ public final class Db3API: @unchecked Sendable {
     ///   - db3Id: The db3.
     ///   - custodian: `app` or `user:<userId>`.
     public func transfer(_ db3Id: String, to custodian: String) async throws -> Db3Info {
-        try await transport.request(method: .post, path: Self.path(db3Id, "/transfer"), body: JSONValue.object(["to": .string(custodian)]))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .post, path: Self.path(db3Id, "/transfer"), body: JSONValue.object(["to": .string(custodian)]))
     }
 
     // MARK: - Sharing
@@ -643,14 +697,16 @@ public final class Db3API: @unchecked Sendable {
     ///
     /// - Parameter db3Id: The db3.
     public func permissions(_ db3Id: String) -> Db3PermissionsAPI {
-        Db3PermissionsAPI(db3Id: db3Id, transport: transport)
+        Db3PermissionsAPI(db3Id: db3Id, transport: transport) { [weak self] id in try await self?.awaitCreate(id) }
     }
 
     // MARK: - Blobs
 
     /// A db3's blobs: upload, list, read, download URLs, delete, and its
-    /// upload queue. An upload made offline is queued and answered at once
-    /// (`bytesTransferred == 0`), and sent once the client is online.
+    /// upload queue. An upload made offline, or to a db3 created here whose
+    /// create the server does not have yet, is queued and answered at once
+    /// (`bytesTransferred == 0`), and sent once the client is online and the
+    /// server has the db3.
     ///
     /// ```swift
     /// let blobs = client.db3.blobs(db3Id)
@@ -666,6 +722,9 @@ public final class Db3API: @unchecked Sendable {
     /// Remove or restore the owner row of a db3 a user holds, while they stay
     /// its custodian. An app owner or admin only.
     ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
     /// ```swift
     /// _ = try await client.db3.setOwnerRow(db3Id, present: false)
     /// ```
@@ -674,7 +733,8 @@ public final class Db3API: @unchecked Sendable {
     ///   - db3Id: The db3.
     ///   - present: Whether the owner row should exist.
     public func setOwnerRow(_ db3Id: String, present: Bool) async throws -> Db3OwnerRowChange {
-        try await transport.request(method: .put, path: Self.path(db3Id, "/owner-row"), body: JSONValue.object(["present": .bool(present)]))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .put, path: Self.path(db3Id, "/owner-row"), body: JSONValue.object(["present": .bool(present)]))
     }
 }
 
@@ -764,9 +824,12 @@ public struct Db3IndexRegistration: Sendable, Encodable {
 /// ```
 public final class Db3IndexesAPI: Sendable {
     private let transport: any Transport
+    /// The wait for a pending create of the db3 a call names (#5000).
+    private let awaitCreate: @Sendable (String) async throws -> Void
 
-    init(transport: any Transport) {
+    init(transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void = { _ in }) {
         self.transport = transport
+        self.awaitCreate = awaitCreate
     }
 
     private struct Listed: Decodable, Sendable { let indexes: [Db3Index] }
@@ -777,8 +840,12 @@ public final class Db3IndexesAPI: Sendable {
     }
 
     /// Every index on the db3's records, sorted by name. Needs read access.
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
     /// - Parameter db3Id: The db3.
     public func list(_ db3Id: String) async throws -> [Db3Index] {
+        try await awaitCreate(db3Id)
         let listed: Listed = try await transport.request(method: .get, path: Self.path(db3Id))
         return listed.indexes
     }
@@ -786,10 +853,14 @@ public final class Db3IndexesAPI: Sendable {
     /// Register an index and answer it as it now is. Registering an index a
     /// declaration already keeps adds your origin to it. Needs the db3's
     /// owner, or an app owner or admin.
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - registration: The model and its field or fields.
     public func register(_ db3Id: String, _ registration: Db3IndexRegistration) async throws -> Db3Index {
+        try await awaitCreate(db3Id)
         let registered: Registered = try await transport.request(method: .post, path: Self.path(db3Id), body: registration)
         return registered.index
     }
@@ -797,10 +868,14 @@ public final class Db3IndexesAPI: Sendable {
     /// Remove your registration of an index. The index is dropped when no
     /// origin keeps it; one a declaration still keeps is refused
     /// `DB3_INDEX_IN_USE`.
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - name: The index's name, as `list(_:)` answers it.
     public func drop(_ db3Id: String, name: String) async throws {
-        try await transport.send(method: .delete, path: "\(Self.path(db3Id))/\(URLEncoding.encodeComponent(name))")
+        try await awaitCreate(db3Id)
+        return try await transport.send(method: .delete, path: "\(Self.path(db3Id))/\(URLEncoding.encodeComponent(name))")
     }
 }

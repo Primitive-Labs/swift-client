@@ -1,0 +1,34 @@
+{
+  "model": "ToolCall",
+  "row": {
+    "id": "call_01K6CALL0000000000000000009",
+    "messageId": "01K6MESSAGE0000000000000000",
+    "seq": 4,
+    "turnId": "turn_1",
+    "callNumber": 3,
+    "toolName": "present",
+    "state": "output-available",
+    "input": "{\"show\":[1],\"suggestions\":[\"Compare last year\"]}",
+    "output": "{\"delivered\":true}",
+    "createdAt": "2026-10-14T12:00:00.000Z"
+  },
+  "expect": {
+    "state": "output-available",
+    "toolName": "present",
+    "input": {
+      "show": [
+        1
+      ],
+      "suggestions": [
+        "Compare last year"
+      ]
+    },
+    "output": {
+      "delivered": true
+    },
+    "callNumber": 3,
+    "errorCode": {
+      "$absent": true
+    }
+  }
+}

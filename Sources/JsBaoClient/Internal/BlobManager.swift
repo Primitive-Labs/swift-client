@@ -74,6 +74,9 @@ public actor BlobManager {
     /// db3 read refuses a download without it; document uploads do not
     /// consult it.
     nonisolated let networkingAllowed: (@Sendable () -> Bool)?
+    /// Whether a db3 is one created here whose create the server does not
+    /// have yet (#5000): its uploads wait in the queue until it does.
+    nonisolated let pendingDb3Create: (@Sendable (String) -> Bool)?
     /// Where the queue is kept across launches: the client's own database,
     /// one record and one bytes row per upload in the stores of the app and
     /// the upload's user (`OfflineStore.blobUploadsStore`). `nil` keeps the
@@ -159,6 +162,7 @@ public actor BlobManager {
         emit: (@Sendable (any JsBaoEventPayload) -> Void)? = nil,
         currentIdentity: (@Sendable () -> UploadIdentity)? = nil,
         networkingAllowed: (@Sendable () -> Bool)? = nil,
+        pendingDb3Create: (@Sendable (String) -> Bool)? = nil,
         offlineStore: OfflineStore? = nil
     ) {
         self.logger = logger.forScope(scope: "blob")
@@ -173,6 +177,7 @@ public actor BlobManager {
         self.emit = emit
         self.currentIdentity = currentIdentity
         self.networkingAllowed = networkingAllowed
+        self.pendingDb3Create = pendingDb3Create
         self.offlineStore = offlineStore
     }
 
@@ -379,8 +384,10 @@ public actor BlobManager {
 
         if family == .db3 {
             emitUploadProgress(begun.task, status: "queued")
-            // JS `runUploadTask`: no attempt while the network is not allowed.
-            guard networkingAllowed?() ?? true else {
+            // JS `runUploadTask`: no attempt while the network is not allowed,
+            // or while the server does not have the db3 yet (#5000): its route
+            // would answer 404, and that answer drops the upload.
+            guard networkingAllowed?() ?? true, !isHeldForDb3Create(documentId) else {
                 var task = begun.task
                 task.nextAttemptAt = Date().timeIntervalSince1970
                 let queued = await queueForRetry(task)
@@ -891,12 +898,14 @@ public actor BlobManager {
     /// alike, so the timer is armed only for work selection can take: not
     /// paused and not in flight; for a document task with a user, owned by the
     /// signed-in user under the current generation, and for a db3 task only
-    /// while the client may use the network (JS); for a session task also
-    /// not failed, owned, and only while the client may use the network.
+    /// while the client may use the network (JS) and the server has the db3
+    /// (#5000); for a session task also not failed, owned, and only while the
+    /// client may use the network.
     private func isRunnable(_ task: UploadTask, in context: RunContext) -> Bool {
         guard !task.paused, !task.uploading else { return false }
         guard task.isSession else {
-            return isAvailable(task, to: context.identity) && (task.family != .db3 || context.networking)
+            return isAvailable(task, to: context.identity)
+                && (task.family != .db3 || (context.networking && !isHeldForDb3Create(task.documentId)))
         }
         return !task.failed && context.networking && isOwned(task, by: context.identity)
     }
@@ -1530,6 +1539,18 @@ public actor BlobManager {
 
     /// The client's networking may be allowed again: arm the timer for
     /// whatever is runnable now (the session and db3 uploads that waited).
+    /// Whether an upload to `db3Id` waits for that db3's create to commit (#5000).
+    private nonisolated func isHeldForDb3Create(_ db3Id: String) -> Bool {
+        pendingDb3Create?(db3Id) ?? false
+    }
+
+    /// The create of `db3Id` committed (#5000): its uploads, held while the
+    /// server did not have the db3, go now.
+    func db3Committed(_ db3Id: String) {
+        guard uploadQueue.values.contains(where: { $0.family == .db3 && $0.documentId == db3Id }) else { return }
+        scheduleQueueProcessing()
+    }
+
     func networkingChanged() {
         let context = runContext()
         guard uploadQueue.values.contains(where: { isRunnable($0, in: context) }) else { return }

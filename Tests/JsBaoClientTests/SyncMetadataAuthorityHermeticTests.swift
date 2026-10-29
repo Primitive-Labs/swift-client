@@ -51,8 +51,9 @@ final class SyncMetadataAuthorityHermeticTests: XCTestCase {
     }
 
     /// A server that answers `GET /documents/<id>` from `documents` (a status
-    /// for the ones it no longer has) and any whole-scope listing with
-    /// `listing`.
+    /// for the ones it no longer has) and the whole scope with `listing`: the
+    /// owned list answers it as one `{ items, hasMore }` page and the shared
+    /// list is empty.
     private func makeClient(
         listing: String = "[]",
         documents: [String: LoopbackAPIServer.Response]
@@ -63,7 +64,10 @@ final class SyncMetadataAuthorityHermeticTests: XCTestCase {
                 let id = String(path.dropFirst("/documents/".count))
                 return documents[id] ?? .status(404, "unscripted document \(id)")
             }
-            if path == "/documents" { return .json(listing) }
+            if path == "/me/owned-documents" {
+                return .json(#"{"items":\#(listing),"hasMore":false}"#)
+            }
+            if path == "/me/shared-documents" { return .json(#"{"items":[],"hasMore":false}"#) }
             return .status(404, "unscripted path \(path)")
         }
     }

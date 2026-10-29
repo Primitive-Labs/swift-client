@@ -76,7 +76,7 @@ final class RecordLogEventShapeHermeticTests: XCTestCase {
              "documentEpochBudget", "documentEntryTooLarge", "documentEntryInvalid", "documentEpochNotOpen", "writeAccessDenied"]
         )
         XCTAssertLessThan(
-            try XCTUnwrap(cases.firstIndex(of: "agentSessionModelNameTaken")), try XCTUnwrap(cases.firstIndex(of: "documentFormatUnsupported"))
+            try XCTUnwrap(cases.firstIndex(of: "agentSessionNoActiveTurn")), try XCTUnwrap(cases.firstIndex(of: "documentFormatUnsupported"))
         )
     }
 

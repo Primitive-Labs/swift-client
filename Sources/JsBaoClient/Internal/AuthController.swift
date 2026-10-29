@@ -1451,25 +1451,50 @@ public final class AuthController: @unchecked Sendable {
 
     // MARK: - Email sign-in (#2884)
 
-    /// Request one sign-in email carrying a 6-digit code — and, when a
-    /// redirect target is supplied and allow-listed, a magic link too. The
-    /// user finishes with whichever one suits them; nothing here selects a
-    /// method.
+    /// `links.appBaseURL`, read at call time by the sign-in rules. Wired once
+    /// by `JsBaoClient` while it constructs itself, like
+    /// `setClientNetworkMode`; `nil` when the controller runs standalone.
+    var appBaseURLProvider: (@Sendable () -> URL?)?
+
+    /// The target `emailSignInRequest(email:target:)` would ask the link to
+    /// land on, or `nil` for a code-only email: `.uri` with a non-empty
+    /// string, else `persistConfig.oauthRedirectUri`, else
+    /// `links.appBaseURL`'s origin + `/oauth/callback`. Sends nothing.
+    public func emailSignInLinkTarget(_ target: EmailSignInTarget = .automatic) -> String? {
+        SignInRules.emailSignInLinkTarget(
+            target,
+            oauthRedirectUri: persistConfig.oauthRedirectUri,
+            appBaseURL: appBaseURLProvider?()
+        )
+    }
+
+    /// Request one sign-in email carrying a 6-digit code — and, when
+    /// `redirectUri` resolves to a target the app allow-lists, a magic link
+    /// too. The user finishes with whichever one suits them; nothing here
+    /// selects a method.
     ///
-    /// `redirectUri` is optional, and that is how a code-only email is asked
-    /// for: OMIT it and the server issues one from the same template, with no
-    /// allow-list involved. A target that IS supplied must match the app's
-    /// non-empty `emailRedirectUris` allow-list, or the request is rejected
-    /// 400 `Invalid redirect URI` — the server does not fall back to a
-    /// code-only email for an un-allow-listed target (#2967).
+    /// The link lands on `emailSignInLinkTarget(.uri(redirectUri))`, so a nil
+    /// or empty `redirectUri` takes the configured default. A target that is
+    /// sent must match the app's non-empty `emailRedirectUris` allow-list, or
+    /// the request is rejected 400 `Invalid redirect URI`; the client does not
+    /// retry without it (#2967).
     public func emailSignInRequest(
         email: String,
         redirectUri: String? = nil
     ) async throws -> Bool {
+        try await emailSignInRequest(email: email, target: redirectUri.map { .uri($0) } ?? .automatic)
+    }
+
+    /// Request one sign-in email whose link lands on
+    /// `emailSignInLinkTarget(target)`, or none for `.codeOnly`.
+    public func emailSignInRequest(
+        email: String,
+        target: EmailSignInTarget
+    ) async throws -> Bool {
         let transport = try requireTransport()
 
         var body: [String: JSONValue] = ["email": .string(email)]
-        if let redirectUri = redirectUri, !redirectUri.isEmpty {
+        if let redirectUri = emailSignInLinkTarget(target) {
             body["redirectUri"] = .string(redirectUri)
         }
         let response: SuccessResponse? = try await transport.requestOptional(
@@ -1478,6 +1503,48 @@ public final class AuthController: @unchecked Sendable {
             body: body
         )
         return response?.success ?? false
+    }
+
+    // MARK: - Sign-in callback
+
+    /// Finish a sign-in from a callback URL: a `magic_token` is verified with
+    /// `magicLinkVerify`, a `code` + `state` pair is exchanged with
+    /// `handleOAuthCallback`. Any URL outside the grammar
+    /// (`SignInRules.parseSignInCallbackURL`) throws `AuthError(.invalidToken)`
+    /// before a request, logged once at warn without its query. A failed
+    /// verify or exchange throws that call's own error.
+    public func handleSignInCallback(
+        _ url: URL,
+        inviteToken: String? = nil
+    ) async throws -> SignInCallbackResult {
+        let parsed: SignInRules.ParsedSignInCallback
+        do {
+            parsed = try SignInRules.parseSignInCallbackURL(
+                url,
+                appBaseURL: appBaseURLProvider?(),
+                oauthRedirectUri: persistConfig.oauthRedirectUri
+            )
+        } catch {
+            logger.warn("[Auth] sign-in callback refused", [
+                "reason": (error as? AuthError)?.message ?? "\(error)",
+                "origin": SignInRules.httpOrigin(of: url) ?? "\(url.scheme ?? ""):",
+                "path": SignInRules.callbackPath(of: url),
+            ])
+            throw error
+        }
+
+        switch parsed.credential {
+        case .magicToken(let token):
+            let verified = try await magicLinkVerify(
+                token: token,
+                inviteToken: SignInRules.resolveInviteToken(parameter: inviteToken, bag: parsed.stateBag)
+            )
+            return SignInRules.callbackResult(from: verified, parsed: parsed)
+        case .oauth(let code, let state):
+            try await handleOAuthCallback(code: code, state: state)
+            let userId = try SignInRules.requireSignedInUserId(getUserId())
+            return SignInRules.callbackResult(oauthUserId: userId, parsed: parsed)
+        }
     }
 
     // MARK: - Magic Link

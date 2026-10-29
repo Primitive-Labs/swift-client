@@ -26,7 +26,8 @@ final class AgentSessionAttachmentsHermeticTests: XCTestCase {
         let client = makeSessionUploadClient(server, token: token)
         let events = BlobEventLog(client)
         defer { events.cancel() }
-        let (view, documentId) = try await openLocalSessionView(client, server)
+        let (view, db3) = try await openLocalSessionView(client, server)
+        defer { db3.cleanup() }
 
         XCTAssertTrue(view.attachments === view.attachments, "one attachments object per view")
         let attachment = try await within(10, "the upload") {
@@ -56,9 +57,10 @@ final class AgentSessionAttachmentsHermeticTests: XCTestCase {
 
         let remaining = await view.attachments.uploads()
         XCTAssertEqual(remaining, [], "a completed upload leaves the list")
-        // Edge 41: the events carry the binding's document, as JS's do.
-        XCTAssertEqual(events.completed(attachment.blobId).map(\.documentId), [documentId])
-        XCTAssertTrue(events.progress(attachment.blobId).allSatisfy { $0.documentId == documentId })
+        // Edge 41: the events carry the binding's document, as JS's do: the
+        // session's db3, whose id is the session's (#4884).
+        XCTAssertEqual(events.completed(attachment.blobId).map(\.documentId), [view.sessionId])
+        XCTAssertTrue(events.progress(attachment.blobId).allSatisfy { $0.documentId == view.sessionId })
         await view.close()
         await client.destroy()
     }
@@ -394,7 +396,8 @@ final class AgentSessionAttachmentsHermeticTests: XCTestCase {
         let server = try SessionUploadServer()
         defer { server.stop() }
         let client = makeSessionUploadClient(server)
-        let (view, _) = try await openLocalSessionView(client, server)
+        let (view, db3) = try await openLocalSessionView(client, server)
+        defer { db3.cleanup() }
         let attachments = view.attachments
         client.setNetworkMode(.offline)
         let attachment = try await within(10, "the upload") { try await attachments.upload(Self.bytes) }

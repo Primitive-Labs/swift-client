@@ -45,7 +45,7 @@ final class Db3BlobOfflineLiveTests: XCTestCase {
 
     func testAnOfflineUploadIsQueuedWithNoRequestAndCompletesOnceOnline() async throws {
         let owner = try await live.client("owner", models: [])
-        let db3Id = try await owner.db3.create(title: "Offline").id
+        let db3Id = try await createdOnServer(owner, title: "Offline").id
         let events = Db3BlobEventLog(owner)
         defer { events.cancel() }
         let blobs = owner.db3.blobs(db3Id)
@@ -101,7 +101,7 @@ final class Db3BlobOfflineLiveTests: XCTestCase {
 
     func testAnOfflineUploadCompletesWhenTheModeFlipsBack() async throws {
         let owner = try await live.client("owner", models: [])
-        let db3Id = try await owner.db3.create(title: "Flip").id
+        let db3Id = try await createdOnServer(owner, title: "Flip").id
         let blobs = owner.db3.blobs(db3Id)
         owner.setNetworkMode(.offline)
         let queued = try await blobs.upload(data: Data("flip".utf8))
@@ -132,7 +132,7 @@ final class Db3BlobOfflineLiveTests: XCTestCase {
     func testTheDb3FamilysLocalCopiesAreItsOwn() async throws {
         let owner = try await live.client("owner", models: [])
         let other = try await live.client("owner-other", models: [])
-        let db3Id = try await owner.db3.create(title: "Copies").id
+        let db3Id = try await createdOnServer(owner, title: "Copies").id
         let plain = try await ctx.createDocument(appId: live.app.appId, jwt: live.app.ownerJWT, title: "format-1")
         let blobs = owner.db3.blobs(db3Id)
 

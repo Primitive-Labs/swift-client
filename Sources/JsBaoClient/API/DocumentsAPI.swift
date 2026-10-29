@@ -997,6 +997,12 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// into the create POST. Namespaced to match js-bao's
     /// `documents.commitOfflineCreate(documentId, { onExists })` (Swift also
     /// keeps the top-level `client.commitOfflineCreate` this forwards to).
+    ///
+    /// For a db3 created with `client.db3.create`, it waits for the server's
+    /// answer: `created: true` once the server has it, `refused: true` with
+    /// the `reason` when the server refused it, and `reason: "not_pending"`
+    /// when its create had already landed. A failure the client keeps
+    /// retrying throws.
     public func commitOfflineCreate(
         documentId: String,
         options: CommitOfflineCreateOptions = CommitOfflineCreateOptions()
@@ -1014,6 +1020,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         return CommitOfflineCreateResult(
             created: (result["created"] as? Bool) ?? false,
             linked: result["linked"] as? Bool,
+            refused: result["refused"] as? Bool,
             reason: result["reason"] as? String
         )
     }

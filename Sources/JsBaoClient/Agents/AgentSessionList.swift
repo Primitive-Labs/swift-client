@@ -255,7 +255,9 @@ public final class AgentSessionList: @unchecked Sendable {
         }
         try await serial { [weak self] in
             guard let self else { return }
-            try await self.reading {
+            // No listener can be added before watch returns, and one added then
+            // reads the first page from `items`: it is no change to them.
+            try await self.reading(notify: false) {
                 let page = try await self.host.list(self.pageOptions(cursor: nil))
                 self.lock.withLock {
                     guard !self.closed else { return }
@@ -286,7 +288,7 @@ public final class AgentSessionList: @unchecked Sendable {
     }
 
     /// Read pages with events held back, then apply the events in arrival order.
-    private func reading(_ body: @escaping @Sendable () async throws -> Void) async throws {
+    private func reading(notify: Bool = true, _ body: @escaping @Sendable () async throws -> Void) async throws {
         lock.withLock { buffered = [] }
         var thrown: Error?
         do {
@@ -301,7 +303,7 @@ public final class AgentSessionList: @unchecked Sendable {
             for event in held { _ = applyLocked(event) }
             return rebuildLocked()
         }
-        if changed { scheduleNotify() }
+        if changed && notify { scheduleNotify() }
         if let thrown { throw thrown }
     }
 
@@ -412,7 +414,7 @@ public final class AgentSessionList: @unchecked Sendable {
         let lastReadAt = Self.laterOf(held.item.lastReadAt, item.lastReadAt)
         // An event older than the last one applied adds only its instants.
         let newer = held.at == nil || at >= held.at!
-        let status: PrimitiveSessionStatus? = item.status ?? held.item.status
+        let status: AgentSessionStatus? = item.status ?? held.item.status
         let base = newer ? item.with(status: .some(status)) : held.item.item
         let merged = base.with(lastActivityAt: lastActivityAt, lastReadAt: lastReadAt, hasUnread: Self.unread(lastActivityAt, lastReadAt))
         entries[event.sessionId] = Entry(
@@ -515,7 +517,7 @@ extension AgentSessionsAPI {
     /// Watch your sessions: the first page of `list`, kept current as sessions
     /// change — new activity and the unread dot, read marks from your other
     /// devices, renames, status, members, removals and deletes — without
-    /// opening any document. Items are ordered by last activity, newest
+    /// opening any session. Items are ordered by last activity, newest
     /// first; `loadMore()` reads the next page, `onChange` hears every
     /// change, and the list reads its pages again after a reconnect. Call
     /// `close()` when done. Throws as `list` does; a `userId` throws

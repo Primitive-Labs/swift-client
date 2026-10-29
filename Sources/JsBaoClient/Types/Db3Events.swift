@@ -95,7 +95,8 @@ public struct Db3State: Sendable, Equatable {
     /// server refused a create made on this device (`Db3CreateFailedEvent`).
     public let error: Db3StateError?
     /// Whether it was created on this device and the server does not have it
-    /// yet: `client.db3.create` with networking stopped, until the create commits.
+    /// yet: a `client.db3.create` of your own synced db3, until its commit
+    /// lands (and while the server refuses it, `error` naming why).
     public let pendingCreate: Bool
 
     public init(
@@ -283,8 +284,8 @@ public struct Db3ErrorEvent: Sendable, Equatable {
 }
 
 /// Payload for `.db3Created`: the server has the db3 `client.db3.create` (or
-/// the alias call) created. A create made with networking stopped fires it
-/// when its commit succeeds.
+/// the alias call) created. A create of your own synced db3 fires it when its
+/// commit lands.
 public struct Db3CreatedEvent: Sendable, Equatable {
     public let id: String
 
@@ -294,9 +295,11 @@ public struct Db3CreatedEvent: Sendable, Equatable {
 }
 
 /// Payload for `.db3CreateFailed`: the server refused a `client.db3.create`
-/// (or the alias call). Online, nothing was created. For a create made on
-/// this device, `id` names it: its rows stay readable until
-/// `commitOfflineCreate(documentId:)` succeeds or a forced evict removes it.
+/// (or the alias call). For a create of your own synced db3, `id` names it:
+/// `create` had already returned, and the db3's rows stay readable, with
+/// `state.pendingCreate` true, until `commitOfflineCreate(documentId:)`
+/// succeeds or a forced evict removes them. A create the server mints the id
+/// of (sync off, or naming a custodian) created nothing, and its call threw.
 public struct Db3CreateFailedEvent: Sendable, Equatable {
     /// The refusal's code, as the thrown error carries it.
     public let code: String

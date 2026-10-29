@@ -23,10 +23,6 @@ public enum JsBaoErrorCode: String, Sendable {
     /// `functions.waitFor` gave up after its timeout without the run reaching
     /// a terminal state. Mirrors the JS client's `FUNCTION_WAIT_TIMEOUT`.
     case functionWaitTimeout = "FUNCTION_WAIT_TIMEOUT"
-    /// `locks.acquire` reached its `timeoutMs` deadline without winning the
-    /// key. Mirrors the JS client's `LockTimeoutError` (`LOCK_TIMEOUT`); the
-    /// error's `details` carry `key` and `timeoutMs`.
-    case lockTimeout = "LOCK_TIMEOUT"
     /// `openDocument` waited out its `availabilityWait` budget without the
     /// document's sync completing — the server never answered. Mirrors JS
     /// `waitForAvailability`'s `NETWORK_TIMEOUT` (#2667, parity C8).
@@ -99,10 +95,6 @@ public enum JsBaoErrorCode: String, Sendable {
     /// named, the session row names none and `get` answers none. Nothing was
     /// sent. The JS client's code, verbatim.
     case agentSessionNoActiveTurn = "AGENT_SESSION_NO_ACTIVE_TURN"
-    /// Opening an agent session view found a model registered under a
-    /// platform model name with a different schema; nothing was registered or
-    /// opened. `details` carry `model`. The JS client's code, verbatim.
-    case agentSessionModelNameTaken = "AGENT_SESSION_MODEL_NAME_TAKEN"
     // The record-log (`documentFormat: 3`) codes, appended for the reason given
     // above `documentFormatMismatch`. Each is the JS client's string verbatim.
     /// The platform no longer serves this document's format — a large

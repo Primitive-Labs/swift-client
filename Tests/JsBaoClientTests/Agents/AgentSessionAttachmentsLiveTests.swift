@@ -2,12 +2,13 @@ import XCTest
 @testable import JsBaoClient
 
 /// A session driven from Swift with `sessionId` alone, files included,
-/// against the dev server (#4588, plan behaviors 25, 1, 3, 4, 5, 7, 9, 12, 14
-/// and 21, their live halves; intent criteria 1, 3, 4 and 5).
+/// against the dev server (#4588, plan behaviors 25, 1, 3, 4, 5, 7, 9, 12 and
+/// 14, their live halves; intent criteria 1, 3, 4 and 5; #4884 behavior 15:
+/// the session is its own db3, and its files are that db3's blobs).
 ///
-/// Every call goes through `client.agents.sessions` and the view; the test
-/// reads a document only to check what the server stored. Two model turns in
-/// all: one paused on client tools and answered, one plain reply.
+/// Every call goes through `client.agents.sessions` and the view; nothing
+/// names a document. Two model turns in all: one paused on client tools and
+/// answered, one plain reply.
 final class AgentSessionAttachmentsLiveTests: XCTestCase {
     private static let harnessTask = LockedBox<Task<AgentSessionScenarioHarness, Error>?>(nil)
     private var h: AgentSessionScenarioHarness!
@@ -85,20 +86,10 @@ final class AgentSessionAttachmentsLiveTests: XCTestCase {
         await expectServerCode("AGENT_SESSION_ATTACHMENT_NOT_FOUND") {
             _ = try await viewerView.attachments.read(blobId: "01J0000000000000000000NONE")
         }
-        await viewerView.close()
-
-        // inspect.storage answers get's document; it grants nothing.
-        let storage = try await partC.agents.sessions.inspect.storage(s.sessionId)
-        XCTAssertEqual(storage.documentId, s.documentId)
+        // A stranger is refused the session's files.
         await expectServerCode("AGENT_SESSION_NOT_FOUND") {
-            _ = try await strangerC.agents.sessions.inspect.storage(s.sessionId)
+            _ = try await strangerC.agents.sessions.downloadAttachment(sessionId: s.sessionId, blobId: attachment.blobId)
         }
-        // The file is a blob of the session's document.
-        let listed = try await h.ctx.appRequest(
-            method: "GET", appId: h.appId, path: "/documents/\(s.documentId)/blobs", body: nil, jwt: h.owner.jwt
-        )
-        let items = (listed["items"] as? [[String: Any]]) ?? []
-        XCTAssertTrue(items.contains { $0["blobId"] as? String == attachment.blobId }, "\(listed)")
 
         // Send it: one turn that pauses on the two client tools.
         var turnId: String?
@@ -120,10 +111,16 @@ final class AgentSessionAttachmentsLiveTests: XCTestCase {
         }
         let paused = try XCTUnwrap(turnId, "the model paused on both tools")
         try await h.poll(timeout: 30, "the message carries the file") {
-            view.syncedMessages.contains { message in
-                message.parts.contains { $0.kind == .file && $0.blobId == attachment.blobId }
-            }
+            view.syncedMessages.contains { message in message.parts.contains { $0.filePart?.blobId == attachment.blobId } }
         }
+        // A viewer's view shows the file part, with its blob, and reads its bytes through the session.
+        let viewerSees = try await h.open(viewerC, s)
+        try await h.poll(timeout: 30, "the viewer sees the file part") {
+            viewerSees.syncedMessages.contains { message in message.parts.contains { $0.filePart?.blobId == attachment.blobId } }
+        }
+        let viewerBytes = try await viewerSees.attachments.read(blobId: attachment.blobId)
+        XCTAssertEqual(viewerBytes, Self.png)
+        await viewerSees.close()
         try await h.poll(timeout: 30, "the calls are in the window") { callIds.allSatisfy { view.toolCall($0) != nil } }
         for callId in callIds {
             let call = try XCTUnwrap(view.toolCall(callId))
@@ -144,8 +141,7 @@ final class AgentSessionAttachmentsLiveTests: XCTestCase {
         XCTAssertFalse(recorded.messageId.isEmpty)
         _ = try await view.markRead()
         XCTAssertFalse(view.info.hasUnread)
-        // Its own client: two views on one client share one document, and
-        // closing either closes it for both.
+        // Its own client, paging back two at a time.
         let pager = try await h.open(try await h.client(h.part), s, pageSize: 2)
         XCTAssertTrue(pager.hasOlder, "the turn left more than one page")
         let older = try await pager.loadOlder()
@@ -263,30 +259,7 @@ final class AgentSessionAttachmentsLiveTests: XCTestCase {
         }
         let mine = reader.syncedMessages.filter { $0.clientMessageId == clientMessageId }
         XCTAssertEqual(mine.count, 1)
-        XCTAssertTrue(mine[0].parts.contains { $0.kind == .file && $0.blobId == attachment.blobId })
+        XCTAssertTrue(mine[0].parts.contains { $0.filePart?.blobId == attachment.blobId })
         await reader.close()
-    }
-
-    // MARK: - Behavior 21: a document deleted directly
-
-    func testInspectStorageAnswersDocumentMissingOnceTheDocumentIsDeletedDirectly() async throws {
-        let s = try await h.createSession(h.plain, participants: [h.part])
-        let partC = try await h.client(h.part)
-        _ = try await h.ctx.appRequest(
-            method: "DELETE", appId: h.appId, path: "/documents/\(s.documentId)", body: nil, jwt: h.owner.jwt
-        )
-        do {
-            _ = try await partC.agents.sessions.inspect.storage(s.sessionId)
-            XCTFail("a missing document is refused")
-        } catch let error as HttpError {
-            XCTAssertEqual(error.status, 410)
-            XCTAssertEqual(error.serverCode, "AGENT_SESSION_DOCUMENT_MISSING")
-        }
-        do {
-            _ = try await h.ctx.appRequest(
-                method: "GET", appId: h.appId, path: "/documents/\(s.documentId)", body: nil, jwt: h.owner.jwt
-            )
-            XCTFail("the document stays absent")
-        } catch {}
     }
 }

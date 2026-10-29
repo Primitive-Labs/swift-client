@@ -20,6 +20,134 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: an agent session is its own db3, and the view reads it
+
+- A session's conversation is a db3 whose id is the session's. `open(sessionId:)`
+  runs `get`, subscribes to that db3 and reads it by model name from its local
+  copy; it opens no document, registers no model and makes no `documents`
+  request. `close()` gives the view's subscription up and keeps the copy.
+- Removed: `AgentSessionInfo.documentId`, `AgentSessionListItem.documentId`
+  and `AgentSessionDeleteResult.documentId` (the delete answers
+  `{ deleted, sessionId }`), `client.agents.sessions.inspect`,
+  `AgentSessionInspectAPI`, `AgentSessionStorage`, `AgentSessionView.documentId`,
+  `OpenAgentSessionOptions.open`, `AgentSessionModels.schemas` and
+  `JsBaoErrorCode.agentSessionModelNameTaken`.
+- The format-1 models are gone: `PrimitiveSession`, `PrimitiveMessage`,
+  `PrimitivePart`, `PrimitiveStep`, their `Primitive*PartContent` types and
+  their vocabularies. The records of the session's seven models replace them:
+  `AgentSessionRecord`, `AgentSessionMemberRecord`, `AgentSessionTurnRecord`,
+  `AgentSessionMessageRecord`, `AgentSessionPartRecord` (its `content` by kind),
+  `AgentSessionToolCallRecord` and `AgentSessionStepRecord`, each with
+  `init?(row:)` and the row it was read from, and their open enums
+  (`AgentSessionStatus`, `AgentSessionTurnStatus`, `AgentSessionPartKind`,
+  `AgentSessionTextState`, `AgentSessionToolCallState`,
+  `AgentSessionAuthorKind`, `AgentSessionStepKind`, `AgentSessionStepStatus`;
+  a member's role is `AgentSessionRole`). `AgentSessionModels` keeps
+  `schemaVersion` (now 2) and adds `modelNames`.
+- Retyped: `AgentSessionInfo.status` and `AgentSessionListItem.status` are
+  `AgentSessionStatus`; `AgentCallAnswerResult.state` is
+  `AgentSessionToolCallState`; `view.session` is `AgentSessionRecord?` and
+  `view.status` `AgentSessionStatus?`; a synced message's `message` is an
+  `AgentSessionMessageRecord`, its `parts` `[AgentSessionViewPart]` (its `Part`
+  records and its calls in one list by `seq`, a call as `.toolCall`) and its
+  `steps` `[AgentSessionStepRecord]`, and it gains `turn`;
+  `presentations(of:names:)` takes a synced message; `artifact(of:)` takes an
+  `AgentSessionToolCallRecord` and reads a stored artifact through the
+  session's attachment route; `AgentPresentation.part` and `call(_:)` answer
+  call records.
+- Added: `view.members` (the `Member` rows, in the order added) and `view.gone`
+  (`Db3GoneEvent?`). `view.queue` is read from the messages' `queueSeq`.
+- A member removed while the view is open loses the session: running client
+  tools stop, the view empties, the subscription ends, the local copy is
+  evicted and `gone` reports `.permission`. A removal that lands while `open`
+  waits for the db3 makes `open` throw `DB3_ACCESS_REFUSED` and evicts the
+  copy. A removal that lands after the db3 is ready, while `open` is still
+  starting the view, gives you a view that has already lost the session.
+  `loadOlder()` returns `{ loaded: 0, hasOlder: false }` when the session is
+  lost during its read. `.syncOff` and `.clientOutdated` set `gone` and keep
+  the copy.
+- Client tools run only when the active turn's `Turn` row names you as its
+  initiator, over the turn's `ToolCall` rows; a call whose answer failed to go
+  out runs again once the db3 is live after a reconnect.
+- `client.agents.sessions.watch` no longer calls an `onChange` listener for
+  the first page: the page is already in `items` when `watch` returns.
+
+### Breaking: `client.db3.create` returns before the server answers
+
+A create of a db3 you hold, with sync on and no `custodian`, now returns at
+once with networking on too: the db3 is created on the device and committed
+with `POST db3` in the background, retried with backoff. `Db3CreatedEvent`
+fires once the server has it. A refusal only the server can decide
+(`DB3_TYPE_NOT_FOUND`, `DB3_TYPE_REFUSED`, a quota, a taken id) no longer
+throws: it arrives as `Db3CreateFailedEvent` with the db3's `id`, and its
+records stay on the device.
+
+```swift
+let db = try await client.db3.create(title: "Orders", type: "orders")
+let answer = try await client.documents.commitOfflineCreate(documentId: db.id)
+if answer.refused == true { print(answer.reason ?? "") }
+```
+
+- `commitOfflineCreate(documentId:)` on a db3 create waits for the server's
+  answer, joining a commit already out, instead of answering
+  `["scheduled": true]`: `["created": true]`, `["refused": true, "reason":
+  …]`, or `["created": false, "reason": "not_pending"]` once the commit had
+  landed (it no longer throws `.invalidArgument` for that db3). A failure the
+  client keeps retrying throws.
+- `CommitOfflineCreateResult.refused`, filled by
+  `documents.commitOfflineCreate`; the initializer's `refused:` parameter
+  defaults to `nil`.
+- Every `client.db3` call that asks the server about a db3 by its id (`get`,
+  the sync, type, app-access and custody calls, `permissions(_:)`, `indexes`
+  and `ingests`) waits for that db3's pending create to commit first. It
+  throws the create's refusal (`HttpError`, `details.db3Id` in its body), or
+  `JsBaoError(.pendingCreate)` (`details["db3Id"]`) offline or after 30
+  seconds. `subscribe(_:)`, `state(_:)`, `evict(_:)`, `blobs(_:)` and
+  `delete(_:)` do not wait.
+- An upload through `blobs(_:)` made before the create has committed stays
+  queued (`bytesTransferred` 0) and is sent once the server has the db3,
+  instead of being refused 404 and dropped.
+- Sync-off and custodian-naming creates, and `getOrCreateWithAlias`, still
+  wait for the server and throw on a refusal. A `Db3API` with no wired client
+  keeps sending the create itself.
+
+### Breaking: an emailed sign-in link lands on the app's callback by default
+
+- `client.auth.emailSignInRequest(email:)` with no `redirectUri` (nil or
+  empty) now asks for a link to `options.auth.oauthRedirectUri` when set, else
+  to `links.appBaseURL`'s origin + `/oauth/callback` when `appBaseURL` is set,
+  where it sent a code-only email. The public `AuthController` call does the
+  same. Add that URL to `[auth].emailRedirectUris` and run
+  `primitive config push`, or pass `target: .codeOnly`. An app with neither
+  configured, or one that passes a `redirectUri`, is unaffected.
+
+### Added: sign-in helpers on `client.auth`
+
+- `emailSignInRequest(email:target:)` with `EmailSignInTarget`
+  (`.automatic`, `.codeOnly`, `.uri(_:)`), and `emailSignInLinkTarget(_:)`,
+  which returns the target a request would carry without sending it.
+- `handleSignInCallback(_:inviteToken:)` finishes a sign-in from an emailed
+  link (`magic_token`) or an OAuth redirect (`code` + `state`) and returns a
+  `SignInCallbackResult`. A URL off `links.appBaseURL`'s origin or the scheme
+  `oauthRedirectUri` registers, off the callback path, or outside the grammar
+  throws `AuthError` with code `.invalidToken` before any request.
+- `AuthConfig.oauthRedirectUri`.
+
+### Breaking: `client.locks` and `.lockTimeout` are removed
+
+- Named locks are server-function-only. `client.locks`, `LocksAPI`, the lock
+  types (`LockHandle`, `LockContention`, `LockAcquireResponse`,
+  `LockReleaseResult`, `LockRenewResult`, `LockStatus`, `LockListEntry`,
+  `LockListResult`) and `JsBaoErrorCode.lockTimeout` are gone, and a direct
+  call to `locks/acquire`, `locks/renew` or `locks/release` is refused 403
+  `FUNCTION_ROUTE_FUNCTION_ONLY`.
+- Take the lock in a server function with `ctx.locks.withLock`, decide who may
+  lock which key in its `authorize`, and call it from the app with
+  `client.functions.invoke`. A `withLock` that cannot take the key in time
+  throws an error whose `code` is `LOCK_TIMEOUT`.
+- App admins inspect and free locks with `primitive locks list`,
+  `locks status <key>` and `locks force-release <key>`.
+
 ### Breaking: the server assigns every group's id
 
 - `CreateGroupParams` loses `groupId` and its initializer parameter: a

@@ -22,10 +22,19 @@ import Foundation
 /// ```
 public final class Db3IngestsAPI: @unchecked Sendable {
     private let transport: any Transport
+    /// The wait for a pending create of the db3 a call names (#5000).
+    private let awaitCreate: @Sendable (String) async throws -> Void
 
     /// Designated initializer — the typed transport spine.
     public init(transport: any Transport) {
         self.transport = transport
+        self.awaitCreate = { _ in }
+    }
+
+    /// `client.db3.ingests`: each call waits first for a pending create of its db3 (#5000).
+    init(transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void) {
+        self.transport = transport
+        self.awaitCreate = awaitCreate
     }
 
     private func path(_ db3Id: String, _ sessionId: String? = nil, _ verb: String? = nil) -> String {
@@ -51,10 +60,14 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     /// carries no body and the server applies its defaults (`.merge`,
     /// `.open`). A second session while one is running is refused
     /// `"DOCUMENT_INGEST_ACTIVE"`.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     public func create(
         db3Id: String,
         options: DocumentIngestCreateOptions? = nil
     ) async throws -> DocumentIngestSession {
+        try await awaitCreate(db3Id)
         if let options, !options.isEmpty {
             return try await transport.request(method: .post, path: path(db3Id), body: options)
         }
@@ -64,11 +77,15 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     /// Upload one chunk as the multipart body the server takes. The server
     /// checks the body's length and SHA-256 against the descriptor before
     /// anything is stored. Answers for the chunk, not for the session.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     public func uploadChunk(
         db3Id: String,
         sessionId: String,
         chunk: DocumentIngestChunk
     ) async throws -> DocumentIngestChunkUploadResult {
+        try await awaitCreate(db3Id)
         let boundary = DocumentIngestMultipart.boundary()
         return try await transport.request(
             method: .post,
@@ -80,23 +97,39 @@ public final class Db3IngestsAPI: @unchecked Sendable {
 
     /// Freeze the session's chunks and start the load; poll `get` until it
     /// reads `complete` or `failed`.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     public func commit(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
-        try await transport.request(method: .post, path: path(db3Id, sessionId, "commit"))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .post, path: path(db3Id, sessionId, "commit"))
     }
 
     /// Give up on a session and sweep what it uploaded. A session that has
     /// finished is refused `"INGEST_SESSION_NOT_ABORTABLE"`.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     public func abort(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
-        try await transport.request(method: .post, path: path(db3Id, sessionId, "abort"))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .post, path: path(db3Id, sessionId, "abort"))
     }
 
     /// One session's state and progress.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     public func get(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
-        try await transport.request(method: .get, path: path(db3Id, sessionId))
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .get, path: path(db3Id, sessionId))
     }
 
     /// A db3's bulk-load sessions, newest first.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     public func list(db3Id: String, limit: Int? = nil, cursor: String? = nil) async throws -> DocumentIngestPage {
+        try await awaitCreate(db3Id)
         var query = URLQuery()
         if let limit { query.append("limit", limit) }
         query.appendIfPresent("cursor", cursor)

@@ -147,6 +147,7 @@ extension JsBaoClient {
     func db3CreateCommitted(_ db3Id: String, info: Db3Info) async {
         await adoptServerCreatedDb3(db3Id, info: info, session: metadataSessionToken)
         _db3Lifecycle.createChanged(db3Id)
+        await blobManager.db3Committed(db3Id)
         eventEmitter.emit(Db3CreatedEvent(id: db3Id))
     }
 

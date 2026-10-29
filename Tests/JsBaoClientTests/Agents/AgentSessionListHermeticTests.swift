@@ -27,10 +27,10 @@ final class AgentSessionListHermeticTests: XCTestCase {
     private static func row(
         _ sessionId: String, agentKey: String = "advisor", scope: String? = nil, role: AgentSessionRole = .owner,
         title: String? = nil, lastActivityAt: Int = 0, hasUnread: Bool = false, lastReadAt: Int? = 0,
-        status: PrimitiveSessionStatus? = .idle, createdAt: Int = 0
+        status: AgentSessionStatus? = .idle, createdAt: Int = 0
     ) -> AgentSessionListItem {
         AgentSessionListItem(
-            sessionId: sessionId, agentKey: agentKey, scope: scope, documentId: "doc-\(sessionId)",
+            sessionId: sessionId, agentKey: agentKey, scope: scope,
             ownerUserId: "u1", role: role, title: title ?? "Title \(sessionId)",
             lastActivityAt: at(lastActivityAt), createdAt: at(createdAt), hasUnread: hasUnread,
             lastReadAt: lastReadAt.map(at), status: status
@@ -211,6 +211,22 @@ final class AgentSessionListHermeticTests: XCTestCase {
         // Edge 31: no further page, no request.
         try await list.loadMore()
         XCTAssertEqual(w.calls.count, 2)
+    }
+
+    // MARK: - The first page is no change: it is in `items` when watch returns
+
+    func testAListenerAddedWhenWatchReturnsHearsNothingUntilSomethingChanges() async throws {
+        let w = World([Self.row("s1"), Self.row("s2")])
+        let list = try await AgentSessionList.watch(host: w.host, options: WatchAgentSessionsOptions(limit: 1))
+        defer { list.close() }
+        let count = LockedBox(0)
+        list.onChange { count.add(1) }
+        try await settle()
+        XCTAssertEqual(ids(list), ["s2"])
+        XCTAssertTrue(list.hasMore)
+        // A late call for the first page would land on a listener added after it,
+        // and a test counting the next change would count two.
+        XCTAssertEqual(count.value, 0)
     }
 
     // MARK: - CSO-4380-008: a change to hasMore alone is a change
@@ -582,7 +598,7 @@ final class AgentSessionListHermeticTests: XCTestCase {
         )
         await client.handleWebSocketMessage(#"""
         {"type":"agentSession","action":"upsert","change":"telepathy","at":"2026-10-12T12:00:01.000Z","sessionId":"s1",
-         "item":{"sessionId":"s1","agentKey":"advisor","documentId":"d1","ownerUserId":"u1","createdAt":"2026-10-12T11:00:00.000Z",
+         "item":{"sessionId":"s1","agentKey":"advisor","ownerUserId":"u1","createdAt":"2026-10-12T11:00:00.000Z",
                  "scope":null,"title":"Budget","lastActivityAt":"2026-10-12T12:00:01.000Z","status":"daydreaming",
                  "role":"co-owner","hasUnread":true,"lastReadAt":null},
          "members":{"viewers":["v1"],"participants":["p1"]}}
@@ -605,7 +621,7 @@ final class AgentSessionListHermeticTests: XCTestCase {
     }
 
     func testAListItemDecodesItsStatusOpenAndAnOlderOneAsNil() throws {
-        let base = #"{"sessionId":"s1","agentKey":"a","documentId":"d","ownerUserId":"u","role":"owner","title":null,"scope":null,"lastActivityAt":"2026-10-12T12:00:00.000Z","createdAt":null,"hasUnread":false,"lastReadAt":null"#
+        let base = #"{"sessionId":"s1","agentKey":"a","ownerUserId":"u","role":"owner","title":null,"scope":null,"lastActivityAt":"2026-10-12T12:00:00.000Z","createdAt":null,"hasUnread":false,"lastReadAt":null"#
         let idle = try JSONCoding.decodeData(AgentSessionListItem.self, from: Data((base + #","status":"idle"}"#).utf8))
         XCTAssertEqual(idle.status, .idle)
         let unknown = try JSONCoding.decodeData(AgentSessionListItem.self, from: Data((base + #","status":"pondering"}"#).utf8))

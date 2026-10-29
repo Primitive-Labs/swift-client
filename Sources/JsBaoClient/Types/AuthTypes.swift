@@ -27,10 +27,11 @@ public struct AuthUser: Decodable, Sendable, Equatable {
 /// Parameters for `auth.emailSignInRequest(...)` (#2884). Mirrors JS
 /// `emailSignInRequest({ email, redirectUri })`.
 ///
-/// `redirectUri` is optional, and omitting it is how a code-only email is
-/// requested — the server issues one from the same unified template. A target
-/// that IS supplied must match the app's non-empty `emailRedirectUris`
-/// allow-list, or the request is rejected 400 `Invalid redirect URI` (#2967).
+/// `redirectUri` is where the link lands. `nil` (or an empty string) lets
+/// `emailSignInLinkTarget` choose; ask for a code-only email with
+/// `emailSignInRequest(email:target: .codeOnly)`. A target that is sent must
+/// match the app's non-empty `emailRedirectUris` allow-list, or the request is
+/// rejected 400 `Invalid redirect URI` (#2967).
 public struct EmailSignInRequestParams: Sendable {
     public var email: String
     public var redirectUri: String?
@@ -44,6 +45,66 @@ public struct EmailSignInRequestParams: Sendable {
 /// Result of `auth.emailSignInRequest(...)`. Mirrors JS `{ success: boolean }`.
 public struct EmailSignInRequestResult: Decodable, Sendable, Equatable {
     public let success: Bool
+}
+
+/// Where an emailed sign-in link should land. Mirrors JS
+/// `emailSignInRequest(email, { redirectUri })`, where `null` asks for code only.
+public enum EmailSignInTarget: Sendable, Equatable {
+    /// Let `emailSignInLinkTarget` choose: `options.auth.oauthRedirectUri`,
+    /// else `links.appBaseURL`'s origin + `/oauth/callback`, else code only.
+    case automatic
+    /// An email that carries the 6-digit code alone.
+    case codeOnly
+    /// This target. An empty string counts as `.automatic`.
+    case uri(String)
+}
+
+/// What `auth.handleSignInCallback(_:inviteToken:)` returns once the client is
+/// signed in from a callback URL. Mirrors JS `SignInCallbackResult`.
+public struct SignInCallbackResult: Sendable, Equatable {
+    /// How the URL signed the user in.
+    public enum Method: String, Sendable {
+        /// An emailed link's `magic_token`.
+        case magicLink = "magic-link"
+        /// An OAuth redirect's `code` + `state`.
+        case oauth
+    }
+
+    public let method: Method
+    /// The signed-in user's id.
+    public let userId: String
+    /// Magic link only: the user the verify call returned.
+    public let user: AuthUser?
+    /// Magic link only: whether the verify call created the user.
+    public let isNewUser: Bool?
+    /// Magic link only: whether the server suggests adding a passkey.
+    public let promptAddPasskey: Bool?
+    /// `"login-add-passkey"` when the URL carries `purpose=login-add-passkey`.
+    public let purpose: String?
+    /// The state bag's `continueUrl`, when it holds a string there.
+    public let continueUrl: String?
+    /// The decoded `state` bag, when the URL carries one.
+    public let state: [String: JSONValue]?
+
+    public init(
+        method: Method,
+        userId: String,
+        user: AuthUser? = nil,
+        isNewUser: Bool? = nil,
+        promptAddPasskey: Bool? = nil,
+        purpose: String? = nil,
+        continueUrl: String? = nil,
+        state: [String: JSONValue]? = nil
+    ) {
+        self.method = method
+        self.userId = userId
+        self.user = user
+        self.isNewUser = isNewUser
+        self.promptAddPasskey = promptAddPasskey
+        self.purpose = purpose
+        self.continueUrl = continueUrl
+        self.state = state
+    }
 }
 
 // MARK: Magic link

@@ -249,7 +249,7 @@ Local writes are detected via `YDocument.observeUpdate()` (our yswift fork addit
 5. Events emitted: authSuccess, authFailed, authState, authRefreshDeferred
 ```
 
-Additional auth methods: OAuth (`startOAuthFlow` / `handleOAuthCallback`), email sign-in (`auth.emailSignInRequest`, finished with `magicLinkVerify` or `otpVerify`).
+Additional auth methods: OAuth (`startOAuthFlow` / `handleOAuthCallback`), email sign-in (`auth.emailSignInRequest`, whose link target `auth.emailSignInLinkTarget` reports, finished with `otpVerify` or with `auth.handleSignInCallback` on the link's URL).
 
 ## Offline-First Design
 

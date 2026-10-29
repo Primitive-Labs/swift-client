@@ -2,49 +2,35 @@ import XCTest
 @testable import JsBaoClient
 
 /// `view.artifact(of:)` downloads a blob-stored artifact only when asked
-/// (#4466, plan behavior 7, the download half).
+/// (#4466, plan behavior 7, the download half; #4884: through the session's
+/// attachment route).
 ///
 /// A real `JsBaoClient` runs against `LoopbackAPIServer`, which records every
 /// request on the client's real `BlobManager` download route and refuses each
-/// download with a 500; it answers no blob content. The session document is
-/// local-only, its rows saved with `codegen.save`.
+/// download with a 500; it answers no blob content. The session's db3 is a
+/// real binding and lifecycle (`SessionDb3`), its rows written as the room's.
 final class AgentSessionArtifactsLoopbackHermeticTests: XCTestCase {
-    private static let localOpen = OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: false)
-    private static let created = "2026-10-13T00:00:00.000Z"
-
-    private static func info(_ sessionId: String, documentId: String) -> String {
-        #"""
-        {"sessionId":"\#(sessionId)","agentKey":"helper","documentId":"\#(documentId)","ownerUserId":"u1",
-         "createdAt":"2026-10-13T00:00:00.000Z","title":null,"scope":null,"lastActivityAt":null,
-         "members":{"viewers":[],"participants":[]},"role":"owner","status":"idle","turn":null}
-        """#
-    }
-
     private static func isDownload(_ request: LoopbackAPIServer.Request) -> Bool {
-        request.apiPathOnly.contains("/blobs/") && request.apiPathOnly.hasSuffix("/download")
+        request.apiPathOnly.contains("/attachments/") && request.apiPathOnly.hasSuffix("/download")
     }
 
-    /// One agent message at `seq` with one tool-call part naming `blobId`.
-    private func seedCall(_ client: JsBaoClient, in documentId: String, seq: Int, blobId: String) throws {
+    /// One agent message at `seq` with one call `p<seq>` naming `blobId`.
+    private func seedCall(_ db3: SessionDb3, seq: Int, blobId: String) throws {
         let messageId = "m\(seq)"
-        try client.codegen.save(PrimitiveMessage.primitiveSchema, id: messageId, values: [
-            "seq": .number(Double(seq)), "authorKind": .string("agent"), "createdAt": .date(Self.created),
-        ], in: documentId)
-        try client.codegen.save(PrimitivePart.primitiveSchema, id: "p\(seq)", values: [
-            "messageId": .string(messageId), "seq": .number(1), "kind": .string("tool_call"),
-            "state": .string("output-available"), "toolCallId": .string("call-\(seq)"),
-            "toolName": .string("chart"), "artifactBlobId": .string(blobId), "createdAt": .date(Self.created),
-        ], in: documentId)
+        try db3.write([
+            ("Message", SessionRows.message(messageId, seq: Double(seq), turnId: "t\(seq)", authorKind: "agent")),
+            ("ToolCall", SessionRows.call(
+                "p\(seq)", messageId: messageId, seq: 1, turnId: "t\(seq)", toolName: "chart",
+                state: "output-available", artifactBlobId: blobId
+            )),
+        ])
     }
 
     func testOpenARefreshAndLoadOlderDownloadNothingAndArtifactDownloadsOnce() async throws {
         let sessionId = "s-artifacts"
-        let documentBox = LockedBox<String?>(nil)
         let server = try LoopbackAPIServer { request in
             if Self.isDownload(request) { return .status(500, "downloads are refused in this test") }
-            if request.apiPathOnly == "/agent-sessions/\(sessionId)", let documentId = documentBox.value {
-                return .json(Self.info(sessionId, documentId: documentId))
-            }
+            if request.apiPathOnly == "/agent-sessions/\(sessionId)" { return .json(agentSessionInfoJSON(sessionId)) }
             return .status(404, "not here")
         }
         let baseUrl = try server.start()
@@ -54,25 +40,19 @@ final class AgentSessionArtifactsLoopbackHermeticTests: XCTestCase {
             token: "test-token", offline: false, logLevel: .none,
             storageConfig: .memory, autoNetwork: false
         ))
-        client.documentManager.createRemoteDocument = { _ in
-            throw JsBaoError(code: .unavailable, message: "no server in this test")
-        }
-        let created = try await client.createDocument(options: CreateDocumentOptions(localOnly: true))
-        let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
-        documentBox.value = documentId
-        client.registerModels(AgentSessionModels.schemas)
-        _ = try await client.documents.open(documentId, options: Self.localOpen)
-        for seq in 1...4 { try seedCall(client, in: documentId, seq: seq, blobId: "blob-\(seq)") }
+        let db3 = try await SessionDb3.make(id: sessionId)
+        defer { db3.cleanup() }
+        for seq in 1...4 { try seedCall(db3, seq: seq, blobId: "blob-\(seq)") }
         let downloads = { server.requests.filter(Self.isDownload).map(\.apiPathOnly) }
 
         let view = try await client.agents.sessions.open(
-            sessionId: sessionId, options: OpenAgentSessionOptions(pageSize: 2, open: Self.localOpen)
+            sessionId: sessionId, options: OpenAgentSessionOptions(pageSize: 2), db3: db3
         )
         XCTAssertEqual(view.toolCalls.map(\.id), ["p3", "p4"])
         XCTAssertTrue(view.hasOlder)
 
         // A row write refreshes the view.
-        try seedCall(client, in: documentId, seq: 5, blobId: "blob-5")
+        try seedCall(db3, seq: 5, blobId: "blob-5")
         try await eventually(description: "the new call reaches the window") {
             view.toolCalls.map(\.id) == ["p3", "p4", "p5"]
         }
@@ -89,7 +69,7 @@ final class AgentSessionArtifactsLoopbackHermeticTests: XCTestCase {
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 500)
         }
-        XCTAssertEqual(downloads(), ["/documents/\(documentId)/blobs/blob-2/download"])
+        XCTAssertEqual(downloads(), ["/agent-sessions/\(sessionId)/attachments/blob-2/download"])
         await view.close()
         await client.destroy()
     }

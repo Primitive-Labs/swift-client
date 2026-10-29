@@ -24,45 +24,50 @@ final class AgentCodegenAcceptanceHermeticTests: XCTestCase {
         XCTAssertEqual(ConciergeAgent.presentationNames, [])
     }
 
-    /// #4549 — a presentation row decodes through the generated enum, its
-    /// struct carrying the input the model sent.
-    func testAPresentationRowDecodesThroughTheGeneratedEnum() throws {
-        let message = try XCTUnwrap(PrimitiveMessage(row: [
+    /// One agent message of turn `t1` in a session's db3.
+    private func agentMessage() throws -> AgentSessionMessageRecord {
+        try XCTUnwrap(AgentSessionMessageRecord(row: [
             "id": .string("m1"), "seq": .number(4), "turnId": .string("t1"), "authorKind": .string("agent"),
             "createdAt": .string("2026-10-14T12:00:00.000Z"),
         ]))
-        let row: [String: JSONValue] = [
-            "id": .string("p1"), "messageId": .string("m1"), "seq": .number(5), "kind": .string("tool_call"),
-            "state": .string("output-available"), "toolCallId": .string("call_1"), "toolName": .string("present"),
-            "input": .string(#"{"show":[1,2],"suggestions":["Compare last year"]}"#),
-            "output": .string(#"{"delivered":true}"#), "callNumber": .number(3),
+    }
+
+    /// A `ToolCall` row of that message: the call `call_1` of `toolName` with `input`.
+    private func call(_ toolName: String, input: String, callNumber: Double) throws -> AgentSessionToolCallRecord {
+        try XCTUnwrap(AgentSessionToolCallRecord(row: [
+            "id": .string("call_1"), "messageId": .string("m1"), "seq": .number(5), "turnId": .string("t1"),
+            "state": .string("output-available"), "toolName": .string(toolName), "input": .string(input),
+            "output": .string(#"{"delivered":true}"#), "callNumber": .number(callNumber),
             "createdAt": .string("2026-10-14T12:00:00.000Z"),
-        ]
-        let part = try XCTUnwrap(PrimitivePart(row: row))
+        ]))
+    }
+
+    /// #4549 — a presentation call decodes through the generated enum, its
+    /// struct carrying the input the model sent (#4884: the call is a
+    /// `ToolCall` row of the session's db3).
+    func testAPresentationCallDecodesThroughTheGeneratedEnum() throws {
+        let call = try call("present", input: #"{"show":[1,2],"suggestions":["Compare last year"]}"#, callNumber: 3)
         let presentation = try XCTUnwrap(
-            AgentPresentation.collect(message: message, parts: [part], turnParts: [part], names: AdvisorAgent.presentationNames).first
+            AgentPresentation.collect(
+                message: try agentMessage(), parts: [.toolCall(call)], turnParts: [.toolCall(call)],
+                names: AdvisorAgent.presentationNames
+            ).first
         )
         guard case let .present(input) = try XCTUnwrap(AdvisorAgentPresentation(presentation)) else {
             return XCTFail("expected the present case")
         }
         XCTAssertEqual(input, AdvisorPresentationPresent(show: [1, 2], suggestions: ["Compare last year"]))
-        XCTAssertEqual(presentation.call(3)?.id, "p1")
+        XCTAssertEqual(presentation.call(3)?.id, "call_1")
     }
 
     /// The `scribe` presentation named `name` with `input`, read off one agent message.
     private func scribePresentation(_ name: String, input: String) throws -> AgentPresentation {
-        let message = try XCTUnwrap(PrimitiveMessage(row: [
-            "id": .string("m1"), "seq": .number(4), "turnId": .string("t1"), "authorKind": .string("agent"),
-            "createdAt": .string("2026-10-14T12:00:00.000Z"),
-        ]))
-        let part = try XCTUnwrap(PrimitivePart(row: [
-            "id": .string("p1"), "messageId": .string("m1"), "seq": .number(5), "kind": .string("tool_call"),
-            "state": .string("output-available"), "toolCallId": .string("call_1"), "toolName": .string(name),
-            "input": .string(input), "output": .string(#"{"delivered":true}"#), "callNumber": .number(2),
-            "createdAt": .string("2026-10-14T12:00:00.000Z"),
-        ]))
+        let call = try call(name, input: input, callNumber: 2)
         return try XCTUnwrap(
-            AgentPresentation.collect(message: message, parts: [part], turnParts: [part], names: ScribeAgent.presentationNames).first
+            AgentPresentation.collect(
+                message: try agentMessage(), parts: [.toolCall(call)], turnParts: [.toolCall(call)],
+                names: ScribeAgent.presentationNames
+            ).first
         )
     }
 

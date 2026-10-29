@@ -1,31 +1,29 @@
 import Foundation
 
 // A presentation an agent handed the client with its answer — the Swift half
-// of the JS client's `src/client/agents/presentations.ts`, rule for rule.
+// of the JS client's `view.presentations()`, rule for rule.
 
 /// A presentation an agent handed the client with its final answer: a call to
 /// a tool the agent declares with `runs = "presentation"`, from the agent
-/// message's `tool_call` part. Read them with
-/// `view.presentations(of:names:)`, and decode one with the generated
-/// `<Key>AgentPresentation(_:)`.
+/// message's call. Read them with `view.presentations(of:names:)`, and decode
+/// one with the generated `<Key>AgentPresentation(_:)`.
 ///
 /// A presentation's input can name earlier calls of its turn by number (the
-/// tool's `references`); `call(_:)` resolves such a number to that call's part.
+/// tool's `references`); `call(_:)` resolves such a number to that call.
 public struct AgentPresentation: Sendable, Equatable {
     /// The presentation tool's name.
     public let name: String
     /// The call's input, checked by the platform against the tool's
     /// `inputSchema`.
     public let input: JSONValue
-    /// The call's `tool_call` part.
-    public let part: PrimitivePart
-    /// The turn's `tool_call` parts in the view's window, by call number.
-    let turnCalls: [Int: PrimitivePart]
+    /// The call.
+    public let part: AgentSessionToolCallRecord
+    /// The turn's calls in the view's window, by call number.
+    let turnCalls: [Int: AgentSessionToolCallRecord]
 
-    /// The `tool_call` part of the call numbered `number` in this
-    /// presentation's turn; `nil` for a number no call of the turn in the
-    /// view's window carries.
-    public func call(_ number: Int) -> PrimitivePart? {
+    /// The call numbered `number` in this presentation's turn; `nil` for a
+    /// number no call of the turn in the view's window carries.
+    public func call(_ number: Int) -> AgentSessionToolCallRecord? {
         turnCalls[number]
     }
 
@@ -35,28 +33,28 @@ public struct AgentPresentation: Sendable, Equatable {
         try JSONDecoder().decode(T.self, from: JSONEncoder().encode(input))
     }
 
-    /// The presentations of an agent message: each of its `tool_call` parts
-    /// in `output-available` state whose tool is one of `names`, in part
-    /// order. `turnParts` are the parts of the message's turn the caller
-    /// holds, which `call(_:)` resolves numbers against.
+    /// The presentations of an agent message: each of its calls in
+    /// `output-available` state whose tool is one of `names`, in part order.
+    /// `turnParts` are the parts of the message's turn the caller holds, whose
+    /// numbered calls `call(_:)` resolves numbers against.
     static func collect(
-        message: PrimitiveMessage,
-        parts: [PrimitivePart],
-        turnParts: [PrimitivePart],
+        message: AgentSessionMessageRecord,
+        parts: [AgentSessionViewPart],
+        turnParts: [AgentSessionViewPart],
         names: [String]
     ) -> [AgentPresentation] {
         guard message.authorKind == .agent else { return [] }
         let wanted = Set(names)
-        var calls: [Int: PrimitivePart] = [:]
-        for part in turnParts where part.kind == .toolCall {
-            guard let number = part.callNumber, number.rounded() == number else { continue }
-            calls[Int(number)] = part
+        var calls: [Int: AgentSessionToolCallRecord] = [:]
+        for case let .toolCall(call) in turnParts {
+            guard let number = call.callNumber, number.rounded() == number else { continue }
+            calls[Int(number)] = call
         }
         return parts.compactMap { part in
-            guard part.kind == .toolCall, part.state == "output-available",
-                  let name = part.toolName, wanted.contains(name)
-            else { return nil }
-            return AgentPresentation(name: name, input: part.input ?? .null, part: part, turnCalls: calls)
+            guard case let .toolCall(call) = part, call.state == .outputAvailable, wanted.contains(call.toolName) else {
+                return nil
+            }
+            return AgentPresentation(name: call.toolName, input: call.input ?? .null, part: call, turnCalls: calls)
         }
     }
 }

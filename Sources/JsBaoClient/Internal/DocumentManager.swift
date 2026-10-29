@@ -59,6 +59,8 @@ public final class DocumentManager: @unchecked Sendable {
     /// the provider is itself one of the claim's conditions (#2664, C14).
     private var localCopyClaimedAtOpen: Set<String> = []
     private var docPermissions: [String: DocumentPermission] = [:]
+    /// Db3s a resource holds (`noteResourceHeld`): their open reads no document info.
+    private var resourceHeld: Set<String> = []
     private var docOpenStartTime: [String: CFAbsoluteTime] = [:]
     private var docServerBytes: [String: Int] = [:]
 
@@ -309,6 +311,9 @@ public final class DocumentManager: @unchecked Sendable {
     var onDb3CreateRefused: ((String, Db3CreateFailedEvent) -> Void)?
     /// The pending creates whose commit attempt is running now: one at a time per id (#4921).
     private var commitAttemptsInFlight: Set<String> = []
+    /// The `POST db3` of each pending db3 create that is out now (#5000): a
+    /// second commit of the id waits for it instead of sending another.
+    private var db3CommitsInFlight: [String: Task<Db3CommitAnswer, Error>] = [:]
     /// Fires once a `pendingCreate` document exists server-side. The
     /// syncStep1 sent before the commit landed gets no `syncComplete` back
     /// (the server had no such document), so its in-flight claim is released
@@ -868,6 +873,18 @@ public final class DocumentManager: @unchecked Sendable {
     /// only when nothing is known — a stale-but-real `reader` grant is a
     /// better answer than the optimistic default.
     private func bootstrapPermission(documentId: String) {
+        // A db3 a resource holds (an agent session's, #4884) is read with
+        // `reader` by every caller who may open it, app authority included:
+        // that is the permission, and its open asks the documents API nothing.
+        if lock.withLock({ resourceHeld.contains(documentId) }) {
+            let changed: Bool = lock.withLock {
+                defer { docPermissions[documentId] = .reader }
+                return docPermissions[documentId] != .reader
+            }
+            if changed { emitter?.emit(PermissionEvent(documentId: documentId, permission: .reader)) }
+            Task { [weak self] in await self?.cachePermission(documentId: documentId, permission: .reader) }
+            return
+        }
         let seeded: Bool = lock.withLock {
             guard docPermissions[documentId] == nil else { return false }
             docPermissions[documentId] = .readWrite
@@ -1706,6 +1723,12 @@ public final class DocumentManager: @unchecked Sendable {
         emitter?.emit(PermissionEvent(documentId: documentId, permission: permission))
     }
 
+    /// Note a db3 a resource holds (an agent session's, #4884): its open takes
+    /// `reader` and runs no `fetchDocumentInfo`.
+    func noteResourceHeld(_ documentId: String) {
+        lock.withLock { _ = resourceHeld.insert(documentId) }
+    }
+
     public func isReadOnly(_ documentId: String) -> Bool {
         lock.withLock { docPermissions[documentId] == .reader }
     }
@@ -2507,8 +2530,9 @@ public final class DocumentManager: @unchecked Sendable {
         }
 
         let metadata = getLocalMetadata(documentId)
-        // #4921 — a db3 created by `client.db3.create` commits through `POST db3`.
-        if metadata?.db3Create == true { return try await commitDb3Create(documentId: documentId, metadata: metadata) }
+        // #4921 — a db3 created by `client.db3.create` commits through `POST db3`;
+        // #5000 — a commit already out for it is joined, not sent again.
+        if metadata?.db3Create == true { return try await joinDb3Commit(documentId: documentId, metadata: metadata).dictionary }
 
         do {
             var body: [String: Any] = ["documentId": documentId]
@@ -2620,7 +2644,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// "already committed". An answer that arrives once the create is no
     /// longer pending here, or after another user signed in, belongs to no one
     /// on this device: nothing is settled, refused, announced or adopted.
-    private func commitDb3Create(documentId: String, metadata: LocalMetadataEntry?) async throws -> [String: Any] {
+    private func commitDb3Create(documentId: String, metadata: LocalMetadataEntry?) async throws -> Db3CommitAnswer {
         var body: [String: JSONValue] = ["id": .string(documentId)]
         if let title = metadata?.title { body["title"] = .string(title) }
         if let tags = metadata?.tags, !tags.isEmpty { body["tags"] = .array(tags.map(JSONValue.string)) }
@@ -2638,7 +2662,7 @@ public final class DocumentManager: @unchecked Sendable {
         do {
             answer = try await createRemoteDb3(.object(body))
         } catch {
-            if stale() { return ["reason": "not_pending"] }
+            if stale() { return .notPending }
             let message = (error as? HttpError)?.serverMessage ?? error.localizedDescription
             emitter?.emit(PendingCreateFailedEvent(documentId: documentId, error: message))
             if Self.isRetryableDb3CommitFailure(error) { throw error }
@@ -2648,7 +2672,9 @@ public final class DocumentManager: @unchecked Sendable {
                 pendingCreateRetryTimers.removeValue(forKey: documentId)
                 guard var meta = metadataIndex[documentId] else { return nil }
                 meta.commitRefused = true
-                meta.commitError = CommitError(message: message, at: ISO8601DateFormatter().string(from: Date()), code: code)
+                var refusal = CommitError(message: message, at: ISO8601DateFormatter().string(from: Date()), code: code)
+                refusal.status = (error as? HttpError)?.status
+                meta.commitError = refusal
                 meta.nextCommitAttemptAt = nil
                 metadataIndex[documentId] = meta
                 return meta
@@ -2657,9 +2683,9 @@ public final class DocumentManager: @unchecked Sendable {
             onDb3CreateRefused?(documentId, Db3CreateFailedEvent(
                 code: code, message: message, title: metadata?.title, type: metadata?.db3Type, id: documentId
             ))
-            return ["refused": true, "reason": message]
+            return Db3CommitAnswer(created: false, refused: true, reason: message)
         }
-        if stale() { return ["reason": "not_pending"] }
+        if stale() { return .notPending }
         let settled: LocalMetadataEntry? = lock.withLock {
             pendingCreates.remove(documentId)
             pendingCreateRetryTimers[documentId]?.cancel()
@@ -2674,26 +2700,55 @@ public final class DocumentManager: @unchecked Sendable {
             noteMetadataTouchLocked(documentId)
             return meta
         }
-        guard let settled else { return ["reason": "not_pending"] }
+        guard let settled else { return .notPending }
         _ = try? await putMetadataTracked(settled)
         emitter?.emit(PendingCreateCommittedEvent(documentId: documentId))
         applyPostCommitPolicy(documentId)
         // Adopted only into the account that made it.
-        if ownerChanged() { return ["created": true] }
+        if ownerChanged() { return .created }
         await onDb3CreateCommitted?(documentId, answer)
-        return ["created": true]
+        return .created
     }
 
-    /// An explicit retry of a pending db3 create (#4921), as js-bao's
-    /// `retryPendingCreate`: a fresh round through the backoff scheduler. The
-    /// refusal mark and the retry bookkeeping go and a waiting timer is
-    /// replaced, so a transient failure on this attempt is retried by the
-    /// backoff; an attempt already running is joined, not doubled.
-    func retryDb3Create(documentId: String) async -> [String: Any] {
+    /// The db3 create's commit that is out now, or a new one (#5000): a caller
+    /// arriving while the backoff's attempt is in flight (an explicit
+    /// `commitOfflineCreate`, a `client.db3` call waiting for the create) gets
+    /// that attempt's answer, and one `POST db3` is sent. With none out, a new
+    /// one starts only for a create still pending and not refused, judged
+    /// under the same lock: a caller arriving after the last attempt landed
+    /// gets `not_pending`, and one arriving after a refusal gets the refusal
+    /// without repeating it (an explicit retry clears the refusal first).
+    func joinDb3Commit(documentId: String, metadata: LocalMetadataEntry?) async throws -> Db3CommitAnswer {
+        let picked: (attempt: Task<Db3CommitAnswer, Error>?, answer: Db3CommitAnswer?) = lock.withLock {
+            if let running = db3CommitsInFlight[documentId] { return (running, nil) }
+            guard pendingCreates.contains(documentId) else { return (nil, .notPending) }
+            if let meta = metadataIndex[documentId], meta.commitRefused == true {
+                return (nil, Db3CommitAnswer(created: false, refused: true, reason: meta.commitError?.message))
+            }
+            let started = Task { try await self.commitDb3Create(documentId: documentId, metadata: metadata) }
+            db3CommitsInFlight[documentId] = started
+            return (started, nil)
+        }
+        if let answer = picked.answer { return answer }
+        guard let attempt = picked.attempt else { return .notPending }
+        defer {
+            lock.withLock {
+                if db3CommitsInFlight[documentId] == attempt { db3CommitsInFlight.removeValue(forKey: documentId) }
+            }
+        }
+        return try await attempt.value
+    }
+
+    /// Commit a pending db3 create now and answer its outcome (#4921, #5000),
+    /// for `commitOfflineCreate(documentId:)`. A refusal mark goes first, so a
+    /// create the server refused is tried again; an attempt already in flight
+    /// is joined, not doubled. A transient failure throws, and the backoff
+    /// keeps trying it.
+    func commitDb3CreateNow(documentId: String) async throws -> [String: Any] {
         let cleared: LocalMetadataEntry? = lock.withLock {
+            guard var meta = metadataIndex[documentId], meta.commitRefused == true else { return nil }
             pendingCreateRetryTimers[documentId]?.cancel()
             pendingCreateRetryTimers.removeValue(forKey: documentId)
-            guard var meta = metadataIndex[documentId] else { return nil }
             meta.commitRefused = nil
             meta.commitError = nil
             meta.commitRetryCount = nil
@@ -2702,8 +2757,12 @@ public final class DocumentManager: @unchecked Sendable {
             return meta
         }
         if let cleared { _ = try? await putMetadataTracked(cleared) }
-        scheduleCommitRetry(documentId: documentId)
-        return ["scheduled": true]
+        do {
+            return try await joinDb3Commit(documentId: documentId, metadata: getLocalMetadata(documentId)).dictionary
+        } catch {
+            if isPendingCreate(documentId) { scheduleCommitRetry(documentId: documentId) }
+            throw error
+        }
     }
 
     /// Background commit with exponential-backoff retry. Mirrors js-bao's
@@ -2734,7 +2793,7 @@ public final class DocumentManager: @unchecked Sendable {
             do {
                 let result = try await self.commitOfflineCreate(documentId: documentId, onExists: "fail")
                 // created / linked / already-exists → committed, no retry.
-                if result["created"] != nil || result["linked"] != nil { return }
+                if result["created"] as? Bool == true || result["linked"] != nil { return }
                 if (result["reason"] as? String) == "exists" { return }
                 // A refused db3 create is not retried.
                 if result["refused"] != nil { return }
@@ -3846,5 +3905,24 @@ public final class YjsSQLitePersistence: @unchecked Sendable {
 
     public func deleteDocument() async throws {
         try await storageProvider.delete(store: Self.store, key: documentId)
+    }
+}
+
+/// One db3 commit attempt's answer (#5000), shared by every caller that
+/// joined the attempt: `created`, `refused` with the server's message, or
+/// `not_pending` once the create belongs to no one pending here.
+struct Db3CommitAnswer: Sendable {
+    let created: Bool
+    let refused: Bool
+    let reason: String?
+
+    static let created = Db3CommitAnswer(created: true, refused: false, reason: nil)
+    static let notPending = Db3CommitAnswer(created: false, refused: false, reason: "not_pending")
+
+    /// As `commitOfflineCreate` answers it.
+    var dictionary: [String: Any] {
+        if created { return ["created": true] }
+        if refused { return ["refused": true, "reason": reason ?? ""] }
+        return ["created": false, "reason": reason ?? "not_pending"]
     }
 }

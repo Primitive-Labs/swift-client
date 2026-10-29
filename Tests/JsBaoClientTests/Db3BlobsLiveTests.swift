@@ -37,7 +37,7 @@ final class Db3BlobsLiveTests: XCTestCase {
 
     func testUploadListGetReadDownloadAndDeleteOverTheDb3Routes() async throws {
         let owner = try await live.client("owner", models: [])
-        let db3Id = try await owner.db3.create(title: "Files").id
+        let db3Id = try await createdOnServer(owner, title: "Files").id
         let blobs = owner.db3.blobs(db3Id)
         let text = "hello from a db3 \(UUID().uuidString)"
         let uploaded = try await blobs.upload(
@@ -143,7 +143,7 @@ final class Db3BlobsLiveTests: XCTestCase {
 
     func testTheUploadEventsCarryTheDb3IdAndAnUnretainedUploadIsFetchedAgain() async throws {
         let owner = try await live.client("owner", models: [])
-        let db3Id = try await owner.db3.create(title: "Events").id
+        let db3Id = try await createdOnServer(owner, title: "Events").id
         let events = Db3BlobEventLog(owner)
         defer { events.cancel() }
         let blobs = owner.db3.blobs(db3Id)

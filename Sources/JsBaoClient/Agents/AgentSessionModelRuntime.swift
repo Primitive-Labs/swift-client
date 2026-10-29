@@ -1,7 +1,7 @@
 import Foundation
 
-/// One author waiting in a session's queue, with their batch in order (§D5).
-/// The queue is the one platform-shaped JSON column of a session row.
+/// One author waiting in a session's queue, with their waiting messages in
+/// order: what `view.queue` lists, read from the messages' `queueSeq`.
 public struct PrimitiveQueueEntry: Sendable, Equatable, Hashable {
     public var userId: String
     public var messageIds: [String]
@@ -25,15 +25,14 @@ public struct PrimitiveQueueEntry: Sendable, Equatable, Hashable {
     }
 }
 
-/// The read rules the generated platform session models share (#3802) — the
+/// The read rules the generated session records share (#3802; #4884) — the
 /// Swift half of `src/client/agents/sessionModelRuntime.ts`.
 ///
 /// `AgentSessionModels.generated.swift` calls through here so each rule is
 /// written once:
 ///
-/// - A stringset reads as its string members. An empty one is `nil`, as an
-///   absent one is: the store's query path hands back every declared
-///   stringset as an array, so the two cannot be told apart there.
+/// - A stringset reads as its string members; an absent one is empty, as the
+///   JS client reads it.
 /// - Numbers must be finite; nothing is coerced from a string. Booleans read
 ///   through `rowBoolValue` (`0` is false, any other number true), as the JS
 ///   client reads them.
@@ -44,9 +43,9 @@ public struct PrimitiveQueueEntry: Sendable, Equatable, Hashable {
 ///   empty collection where the column says so.
 enum AgentSessionJSON {
 
-    static func members(_ value: JSONValue?) -> Set<String>? {
-        guard let members = value?.stringArrayValue, !members.isEmpty else { return nil }
-        return Set(members)
+    /// A stringset column: its string members, empty when absent.
+    static func stringset(_ value: JSONValue?) -> Set<String> {
+        Set(value?.stringArrayValue ?? [])
     }
 
     static func number(_ value: JSONValue?) -> Double? {
@@ -67,33 +66,11 @@ enum AgentSessionJSON {
         return value.objectValue ?? (emptyOnWrongType ? [:] : nil)
     }
 
-    /// The queue column: its well-formed entries, in order.
-    static func queue(_ column: JSONValue?, emptyOnWrongType: Bool) -> [PrimitiveQueueEntry]? {
-        guard let value = parse(column) else { return nil }
-        guard let items = value.arrayValue else { return emptyOnWrongType ? [] : nil }
-        return items.compactMap(PrimitiveQueueEntry.init(json:))
-    }
-
     /// The canonical text of a JSON column: compact, keys sorted.
     static func text(_ value: JSONValue) -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         guard let data = try? encoder.encode(value) else { return "null" }
         return String(decoding: data, as: UTF8.self)
-    }
-
-    /// A stored record read back as the row `init?(row:)` takes.
-    static func row(from record: PrimitiveRecord) -> [String: JSONValue] {
-        var row: [String: JSONValue] = ["id": .string(record.id)]
-        for (field, value) in record.snapshot() {
-            switch value {
-            case let .string(s), let .id(s), let .date(s): row[field] = .string(s)
-            case let .number(n): row[field] = .number(n)
-            case let .boolean(b): row[field] = .bool(b)
-            case let .json(data): row[field] = .string(String(decoding: data, as: UTF8.self))
-            case let .stringset(set): row[field] = .array(set.sorted().map { .string($0) })
-            }
-        }
-        return row
     }
 }

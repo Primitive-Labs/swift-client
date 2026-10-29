@@ -1,5 +1,5 @@
 {
-  "model": "PrimitiveStep",
+  "model": "Step",
   "row": {
     "id": "01K6STEP00000000000000000000",
     "turnId": "turn_1",

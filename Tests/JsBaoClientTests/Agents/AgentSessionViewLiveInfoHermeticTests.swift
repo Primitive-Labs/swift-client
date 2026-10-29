@@ -2,17 +2,22 @@ import XCTest
 @testable import JsBaoClient
 
 /// An open `AgentSessionView`'s live `info` (#4380, behavior 19 and the
-/// hermetic halves of 14, 15, 35 and 37): the session's change frames update
-/// it, a reconnect reads it again, and `markRead: .whileOpen` keeps the
-/// session read. Frames go through the client's own WebSocket dispatch and
-/// connection states through its status path, over local-only documents and
-/// a recording transport. The JS client's `sessionView.ts` is the reference.
+/// hermetic halves of 14, 15, 35 and 37; #4884 behavior 20): the session's
+/// change frames update it, a reconnect reads it again, and `markRead:
+/// .whileOpen` keeps the session read, over the session's db3 subscription.
+/// Frames go through the client's own WebSocket dispatch and connection states
+/// through its status path; the db3 is a real binding and lifecycle
+/// (`SessionDb3`), the session calls a recording transport. The JS client's
+/// `sessionView.ts` is the reference.
 final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
     private var clients: [JsBaoClient] = []
+    private var db3s: [SessionDb3] = []
 
     override func tearDown() async throws {
         for client in clients { await client.destroy() }
         clients = []
+        for db3 in db3s { db3.cleanup() }
+        db3s = []
     }
 
     // MARK: - Fixture
@@ -62,9 +67,9 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
         let sessions: AgentSessionsAPI
         let transport: RecordingTransport
         let script: Script
+        /// Each session's db3, by session id.
+        let db3s: LockedBox<[String: SessionDb3]>
     }
-
-    private static let localOpen = OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: false)
 
     private func harness(_ name: String) -> Harness {
         let client = JsBaoClient(options: JsBaoClientOptions(
@@ -80,16 +85,16 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
         let transport = RecordingTransport { await script.answer($0) }
         return Harness(
             client: client, sessions: AgentSessionsAPI(transport: transport, client: client),
-            transport: transport, script: script
+            transport: transport, script: script, db3s: LockedBox([:])
         )
     }
 
     private static func info(
-        _ sessionId: String, documentId: String, role: String = "participant", hasUnread: Bool = true,
+        _ sessionId: String, role: String = "participant", hasUnread: Bool = true,
         lastActivityAt: String = "2026-10-12T12:00:00.000Z", title: String = "Budget"
     ) -> String {
         #"""
-        {"sessionId":"\#(sessionId)","agentKey":"advisor","documentId":"\#(documentId)","ownerUserId":"u1",
+        {"sessionId":"\#(sessionId)","agentKey":"advisor","ownerUserId":"u1",
          "createdAt":"2026-10-12T11:00:00.000Z","title":"\#(title)","scope":null,"lastActivityAt":"\#(lastActivityAt)",
          "hasUnread":\#(hasUnread),"lastReadAt":null,
          "members":{"viewers":[],"participants":["u2"]},"role":"\#(role)","status":"idle","turn":null}
@@ -97,7 +102,7 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
     }
 
     private static func frame(
-        _ sessionId: String, documentId: String, at: String, change: String = "activity",
+        _ sessionId: String, at: String, change: String = "activity",
         title: String = "Budget", lastActivityAt: String, hasUnread: Bool = true, lastReadAt: String? = nil,
         status: String = "thinking", participants: [String] = ["u2", "u3"]
     ) -> String {
@@ -105,7 +110,7 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
         let members = participants.map { "\"\($0)\"" }.joined(separator: ",")
         return #"""
         {"type":"agentSession","action":"upsert","change":"\#(change)","at":"\#(at)","sessionId":"\#(sessionId)",
-         "item":{"sessionId":"\#(sessionId)","agentKey":"advisor","documentId":"\#(documentId)","ownerUserId":"u1",
+         "item":{"sessionId":"\#(sessionId)","agentKey":"advisor","ownerUserId":"u1",
                  "createdAt":"2026-10-12T11:00:00.000Z","scope":null,"title":"\#(title)","lastActivityAt":"\#(lastActivityAt)",
                  "status":"\#(status)","role":"participant","hasUnread":\#(hasUnread),"lastReadAt":\#(read)},
          "members":{"viewers":[],"participants":[\#(members)]}}
@@ -116,25 +121,21 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
         #"{"type":"agentSession","action":"removed","change":"removed","at":"\#(at)","sessionId":"\#(sessionId)","item":null,"members":null}"#
     }
 
-    /// A local-only document with the platform models registered, open, and
-    /// `get` scripted to name it.
+    /// The session's db3 on this device, and `get` scripted to answer the session.
     private func session(
         _ h: Harness, _ sessionId: String, role: String = "participant", scripted: Bool = true
-    ) async throws -> String {
-        let created = try await h.client.createDocument(options: CreateDocumentOptions(localOnly: true))
-        let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
-        h.client.registerModels(AgentSessionModels.schemas)
-        _ = try await h.client.documents.open(documentId, options: Self.localOpen)
+    ) async throws {
+        let db3 = try await SessionDb3.make(id: sessionId)
+        db3s.append(db3)
+        h.db3s.withValue { $0[sessionId] = db3 }
         if scripted {
-            h.script.on(.get, "/agent-sessions/\(sessionId)", Self.info(sessionId, documentId: documentId, role: role))
+            h.script.on(.get, "/agent-sessions/\(sessionId)", Self.info(sessionId, role: role))
         }
-        return documentId
     }
 
     private func open(_ h: Harness, _ sessionId: String, markRead: AgentSessionMarkRead? = nil) async throws -> AgentSessionView {
-        try await h.sessions.open(
-            sessionId: sessionId, options: OpenAgentSessionOptions(open: Self.localOpen, markRead: markRead)
-        )
+        let db3 = try XCTUnwrap(h.db3s.value[sessionId])
+        return try await h.sessions.open(sessionId: sessionId, options: OpenAgentSessionOptions(markRead: markRead), db3: db3)
     }
 
     private func reads(_ h: Harness, _ sessionId: String) -> Int {
@@ -164,15 +165,15 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testFramesUpdateInfoAndARemovedFrameChangesNothing() async throws {
         let h = harness("frames")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         let view = try await open(h, "s1")
         let changes = LockedBox(0)
         view.onChange { changes.add(1) }
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:20.000Z", lastActivityAt: "2026-10-12T12:00:20.000Z"
+            "s1", at: "2026-10-12T12:00:20.000Z", lastActivityAt: "2026-10-12T12:00:20.000Z"
         ))
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:21.000Z", change: "title", title: "Rent",
+            "s1", at: "2026-10-12T12:00:21.000Z", change: "title", title: "Rent",
             lastActivityAt: "2026-10-12T12:00:20.000Z"
         ))
         try await eventually { view.info.title == "Rent" }
@@ -184,11 +185,11 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
         let before = view.info
         // Another session's frame, a removal, and an upsert older than the removal change nothing.
         await h.client.handleWebSocketMessage(Self.frame(
-            "s2", documentId: "other", at: "2026-10-12T12:01:30.000Z", title: "Other", lastActivityAt: "2026-10-12T12:01:30.000Z"
+            "s2", at: "2026-10-12T12:01:30.000Z", title: "Other", lastActivityAt: "2026-10-12T12:01:30.000Z"
         ))
         await h.client.handleWebSocketMessage(Self.removedFrame("s1", at: "2026-10-12T12:01:35.000Z"))
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:01:34.000Z", title: "Stale", lastActivityAt: "2026-10-12T12:01:34.000Z"
+            "s1", at: "2026-10-12T12:01:34.000Z", title: "Stale", lastActivityAt: "2026-10-12T12:01:34.000Z"
         ))
         try await settle()
         XCTAssertEqual(view.info, before)
@@ -199,13 +200,13 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testAMarkReadAnswerKeepsActivityThatArrivedAfterItsMarker() async throws {
         let h = harness("late-read")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         let client = h.client
         let view = try await open(h, "s1")
         h.script.set(.post, "/agent-sessions/s1/read", #"{"sessionId":"s1","lastReadAt":"2026-10-12T12:00:05.000Z"}"#)
         // Activity after the marker is heard, and applied, while the call answers.
         let frame = Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:20.000Z", lastActivityAt: "2026-10-12T12:00:20.000Z"
+            "s1", at: "2026-10-12T12:00:20.000Z", lastActivityAt: "2026-10-12T12:00:20.000Z"
         )
         h.script.during(.post, "/agent-sessions/s1/read") {
             await client.handleWebSocketMessage(frame)
@@ -232,11 +233,11 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testAViewOpenedBeforeTheSocketReadsInfoAgainOnTheFirstConnected() async throws {
         let h = harness("reconnect")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         let view = try await open(h, "s1")
         XCTAssertEqual(gets(h, "s1"), 1)
         h.script.set(.get, "/agent-sessions/s1", Self.info(
-            "s1", documentId: doc, lastActivityAt: "2026-10-12T12:05:00.000Z", title: "Done offline"
+            "s1", lastActivityAt: "2026-10-12T12:05:00.000Z", title: "Done offline"
         ))
         h.client.webSocketManagerOnStatusChange(.connected)
         h.client.webSocketManagerOnStatusChange(.connected)
@@ -255,10 +256,10 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testAChangeThatArrivesWhileTheViewOpensReachesInfo() async throws {
         let h = harness("during-open")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         let client = h.client
         let frame = Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:30.000Z", change: "title", title: "Rent",
+            "s1", at: "2026-10-12T12:00:30.000Z", change: "title", title: "Rent",
             lastActivityAt: "2026-10-12T12:00:30.000Z"
         )
         h.script.during(.get, "/agent-sessions/s1") { await client.handleWebSocketMessage(frame) }
@@ -271,11 +272,11 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testAFirstConnectionWhileTheViewOpensReadsInfoAgain() async throws {
         let h = harness("connect-during-open")
-        let doc = try await session(h, "s1", scripted: false)
+        try await session(h, "s1", scripted: false)
         let client = h.client
-        h.script.on(.get, "/agent-sessions/s1", Self.info("s1", documentId: doc))
+        h.script.on(.get, "/agent-sessions/s1", Self.info("s1"))
         h.script.on(.get, "/agent-sessions/s1", Self.info(
-            "s1", documentId: doc, lastActivityAt: "2026-10-12T12:05:00.000Z", title: "Done offline"
+            "s1", lastActivityAt: "2026-10-12T12:05:00.000Z", title: "Done offline"
         ))
         h.script.during(.get, "/agent-sessions/s1") { client.webSocketManagerOnStatusChange(.connected) }
         let view = try await open(h, "s1")
@@ -286,11 +287,11 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testAReconnectReadNeverUndoesAFrameThatArrivedDuringIt() async throws {
         let h = harness("frame-during-get")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         let view = try await open(h, "s1")
         let client = h.client
         let frame = Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:40.000Z", change: "title", title: "Rent",
+            "s1", at: "2026-10-12T12:00:40.000Z", change: "title", title: "Rent",
             lastActivityAt: "2026-10-12T12:00:40.000Z"
         )
         // The reconnect read answers the info as it was before this rename,
@@ -316,11 +317,11 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testAReconnectReadAnsweringAfterCloseChangesNothingAndNoReadFollows() async throws {
         let h = harness("reconnect-close")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         let view = try await open(h, "s1")
         let before = view.info
         h.script.set(.get, "/agent-sessions/s1", Self.info(
-            "s1", documentId: doc, lastActivityAt: "2026-10-12T12:05:00.000Z", title: "After close"
+            "s1", lastActivityAt: "2026-10-12T12:05:00.000Z", title: "After close"
         ))
         let inFlight = LockedBox(0)
         let release = LockedBox(0)
@@ -354,7 +355,7 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testWhileOpenMarksReadAtOpenAfterAnUnreadFrameAndAfterAReconnect() async throws {
         let h = harness("while-open")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         h.script.on(.post, "/agent-sessions/s1/read", #"{"sessionId":"s1","lastReadAt":"2026-10-12T12:00:01.000Z"}"#)
         h.script.on(.post, "/agent-sessions/s1/read", #"{"sessionId":"s1","lastReadAt":"2026-10-12T12:00:31.000Z"}"#)
         h.script.on(.post, "/agent-sessions/s1/read", #"{"sessionId":"s1","lastReadAt":"2026-10-12T12:06:00.000Z"}"#)
@@ -362,19 +363,19 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
         try await eventually { self.reads(h, "s1") == 1 }
         try await eventually { !view.info.hasUnread }
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z",
+            "s1", at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z",
             lastReadAt: "2026-10-12T12:00:01.000Z"
         ))
         try await eventually { self.reads(h, "s1") == 2 }
         // A frame already read sends nothing.
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:32.000Z", change: "read", lastActivityAt: "2026-10-12T12:00:30.000Z",
+            "s1", at: "2026-10-12T12:00:32.000Z", change: "read", lastActivityAt: "2026-10-12T12:00:30.000Z",
             hasUnread: false, lastReadAt: "2026-10-12T12:00:31.000Z"
         ))
         try await settle()
         XCTAssertEqual(reads(h, "s1"), 2)
         // A reconnect that finds it unread marks it again.
-        h.script.set(.get, "/agent-sessions/s1", Self.info("s1", documentId: doc, lastActivityAt: "2026-10-12T12:05:00.000Z"))
+        h.script.set(.get, "/agent-sessions/s1", Self.info("s1", lastActivityAt: "2026-10-12T12:05:00.000Z"))
         h.client.webSocketManagerOnStatusChange(.connected)
         try await eventually { self.reads(h, "s1") == 3 }
         try await eventually { !view.info.hasUnread }
@@ -383,27 +384,27 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testWhileOpenStopsOnNotFoundAndSendsNothingAfterCloseOrForAnAdmin() async throws {
         let h = harness("while-open-stop")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         h.script.on(.post, "/agent-sessions/s1/read", status: 404, #"{"code":"AGENT_SESSION_NOT_FOUND","error":"No such agent session in this app"}"#)
         let view = try await open(h, "s1", markRead: .whileOpen)
         try await eventually { self.reads(h, "s1") == 1 }
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z"
+            "s1", at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z"
         ))
         try await settle()
         XCTAssertEqual(reads(h, "s1"), 1)
         await view.close()
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:40.000Z", lastActivityAt: "2026-10-12T12:00:40.000Z"
+            "s1", at: "2026-10-12T12:00:40.000Z", lastActivityAt: "2026-10-12T12:00:40.000Z"
         ))
         try await settle()
         XCTAssertEqual(reads(h, "s1"), 1)
 
         let a = harness("while-open-admin")
-        let adminDoc = try await session(a, "s9", role: "admin")
+        try await session(a, "s9", role: "admin")
         let admin = try await open(a, "s9", markRead: .whileOpen)
         await a.client.handleWebSocketMessage(Self.frame(
-            "s9", documentId: adminDoc, at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z"
+            "s9", at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z"
         ))
         try await settle()
         XCTAssertEqual(reads(a, "s9"), 0)
@@ -412,13 +413,13 @@ final class AgentSessionViewLiveInfoHermeticTests: XCTestCase {
 
     func testAFailedMarkIsRetriedOnTheNextFrame() async throws {
         let h = harness("while-open-retry")
-        let doc = try await session(h, "s1")
+        try await session(h, "s1")
         h.script.on(.post, "/agent-sessions/s1/read", status: 503, #"{"code":"AGENT_SESSION_UNAVAILABLE","error":"try again"}"#)
         h.script.on(.post, "/agent-sessions/s1/read", #"{"sessionId":"s1","lastReadAt":"2026-10-12T12:00:31.000Z"}"#)
         let view = try await open(h, "s1", markRead: .whileOpen)
         try await eventually { self.reads(h, "s1") == 1 }
         await h.client.handleWebSocketMessage(Self.frame(
-            "s1", documentId: doc, at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z"
+            "s1", at: "2026-10-12T12:00:30.000Z", lastActivityAt: "2026-10-12T12:00:30.000Z"
         ))
         try await eventually { self.reads(h, "s1") == 2 }
         try await eventually { !view.info.hasUnread }

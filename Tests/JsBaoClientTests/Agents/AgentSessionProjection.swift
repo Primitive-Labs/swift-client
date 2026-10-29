@@ -4,13 +4,16 @@ import Foundation
 /// Decoded session rows as the shared fixtures spell them (#3802), and as the
 /// JS client's decode is projected by `CrossPlatform/harness/agent-session-decode.mjs`
 /// (#3810): one definition the fixture suite and the live parity suite both
-/// hold the two clients to.
+/// hold the two clients to. Since #4884 the rows are the seven models of a
+/// session's db3, each projected as every column its record represents.
 ///
 /// - An open enum is its known value, or `"unknown"`.
 /// - `{"$absent": true}` is "no value" — distinct from JSON `null`, which an
 ///   `any` column can hold.
 /// - A stringset is its members, sorted; an absent one is `[]`.
 /// - JSON columns are their values.
+/// - A `Part` carries its kind's columns; one of a kind this client does not
+///   know is `kind: "unknown"` with its `rawKind`.
 enum AgentSessionProjection {
     static let absent: JSONValue = ["$absent": true]
 
@@ -24,78 +27,81 @@ enum AgentSessionProjection {
     static func value(_ v: JSONValue?) -> JSONValue { v ?? absent }
     static func value(_ v: [String: JSONValue]?) -> JSONValue { v.map { .object($0) } ?? absent }
     static func members(_ v: Set<String>?) -> JSONValue { .array((v ?? []).sorted().map { .string($0) }) }
-    static func queue(_ v: [PrimitiveQueueEntry]?) -> JSONValue { v.map { .array($0.map(\.jsonValue)) } ?? absent }
 
-    static func project(_ s: PrimitiveSession) -> [String: JSONValue] {
+    // MARK: - The db3's records (#4884)
+
+    static func project(_ s: AgentSessionRecord) -> [String: JSONValue] {
         [
             "id": .string(s.id),
-            "schemaVersion": .number(s.schemaVersion),
             "agentKey": .string(s.agentKey),
             "configId": value(s.configId),
-            "status": open(s.status.rawValue, known: s.status.isKnown),
-            "activeTurnId": value(s.activeTurnId),
-            "activeTurnInitiatorUserId": value(s.activeTurnInitiatorUserId),
-            "activeTurnStartedAt": value(s.activeTurnStartedAt),
-            "activeTurnMessageIds": members(s.activeTurnMessageIds),
-            "queue": queue(s.queue),
             "title": value(s.title),
             "scope": value(s.scope),
+            "status": open(s.status.rawValue, known: s.status.isKnown),
+            "activeTurnId": value(s.activeTurnId),
             "variables": value(s.variables),
-            "viewerUserIds": members(s.viewerUserIds),
-            "participantUserIds": members(s.participantUserIds),
-            "ownerUserId": value(s.ownerUserId),
             "lastErrorCode": value(s.lastErrorCode),
             "lastErrorMessage": value(s.lastErrorMessage),
-            "createdAt": .string(s.createdAt),
+            "createdAt": value(s.createdAt),
             "modifiedAt": value(s.modifiedAt),
         ]
     }
 
-    static func project(_ m: PrimitiveMessage) -> [String: JSONValue] {
+    /// A member's role is known when it is one of the IR's member roles.
+    static func project(_ m: AgentSessionMemberRecord) -> [String: JSONValue] {
+        [
+            "id": .string(m.id),
+            "role": open(m.role.rawValue, known: [AgentSessionRole.owner, .participant, .viewer].contains(m.role)),
+            "addedAt": .string(m.addedAt),
+        ]
+    }
+
+    static func project(_ t: AgentSessionTurnRecord) -> [String: JSONValue] {
+        [
+            "id": .string(t.id),
+            "seq": .number(t.seq),
+            "status": open(t.status.rawValue, known: t.status.isKnown),
+            "initiatorUserId": value(t.initiatorUserId),
+            "startedAt": value(t.startedAt),
+            "endedAt": value(t.endedAt),
+            "errorCode": value(t.errorCode),
+            "errorMessage": value(t.errorMessage),
+            "inputTokens": value(t.inputTokens),
+            "outputTokens": value(t.outputTokens),
+            "totalTokens": value(t.totalTokens),
+            "reasoningTokens": value(t.reasoningTokens),
+            "cachedInputTokens": value(t.cachedInputTokens),
+            "cost": value(t.cost),
+        ]
+    }
+
+    static func project(_ m: AgentSessionMessageRecord) -> [String: JSONValue] {
         [
             "id": .string(m.id),
             "seq": .number(m.seq),
-            "turnId": value(m.turnId),
             "authorKind": open(m.authorKind.rawValue, known: m.authorKind.isKnown),
             "authorUserId": value(m.authorUserId),
             "clientMessageId": value(m.clientMessageId),
+            "turnId": value(m.turnId),
+            "queueSeq": value(m.queueSeq),
             "createdAt": .string(m.createdAt),
         ]
     }
 
-    static func project(_ p: PrimitivePart) -> [String: JSONValue] {
+    static func project(_ p: AgentSessionPartRecord) -> [String: JSONValue] {
         var out: [String: JSONValue] = [
             "id": .string(p.id),
             "messageId": .string(p.messageId),
             "seq": .number(p.seq),
-            "createdAt": .string(p.createdAt),
+            "createdAt": value(p.createdAt),
             "modifiedAt": value(p.modifiedAt),
         ]
         switch p.content {
         case let .text(c), let .reasoning(c):
             out["kind"] = .string(p.kind.rawValue)
-            out["state"] = c.state.map { open($0.rawValue, known: $0.isKnown) } ?? absent
             out["text"] = value(c.text)
+            out["textState"] = c.textState.map { open($0.rawValue, known: $0.isKnown) } ?? absent
             out["providerMetadata"] = value(c.providerMetadata)
-        case let .toolCall(c):
-            out["kind"] = "tool_call"
-            out["state"] = c.state.map { open($0.rawValue, known: $0.isKnown) } ?? absent
-            out["toolCallId"] = value(c.toolCallId)
-            out["toolName"] = value(c.toolName)
-            out["input"] = value(c.input)
-            out["output"] = value(c.output)
-            out["errorText"] = value(c.errorText)
-            out["errorCode"] = value(c.errorCode)
-            out["statusText"] = value(c.statusText)
-            out["approvalApproved"] = value(c.approvalApproved)
-            out["approvalReason"] = value(c.approvalReason)
-            out["approvalUserId"] = value(c.approvalUserId)
-            out["approvalRespondedAt"] = value(c.approvalRespondedAt)
-            out["resolvedByUserId"] = value(c.resolvedByUserId)
-            out["artifact"] = value(c.artifact)
-            out["artifactBlobId"] = value(c.artifactBlobId)
-            out["providerMetadata"] = value(c.providerMetadata)
-            out["callNumber"] = value(c.callNumber)
         case let .file(c):
             out["kind"] = "file"
             out["mediaType"] = value(c.mediaType)
@@ -115,7 +121,35 @@ enum AgentSessionProjection {
         return out
     }
 
-    static func project(_ s: PrimitiveStep) -> [String: JSONValue] {
+    static func project(_ c: AgentSessionToolCallRecord) -> [String: JSONValue] {
+        [
+            "id": .string(c.id),
+            "messageId": .string(c.messageId),
+            "seq": .number(c.seq),
+            "turnId": .string(c.turnId),
+            "callNumber": value(c.callNumber),
+            "toolName": .string(c.toolName),
+            "state": open(c.state.rawValue, known: c.state.isKnown),
+            "input": value(c.input),
+            "output": value(c.output),
+            "outputBlobId": value(c.outputBlobId),
+            "errorText": value(c.errorText),
+            "errorCode": value(c.errorCode),
+            "statusText": value(c.statusText),
+            "approvalApproved": value(c.approvalApproved),
+            "approvalReason": value(c.approvalReason),
+            "approvalUserId": value(c.approvalUserId),
+            "approvalRespondedAt": value(c.approvalRespondedAt),
+            "resolvedByUserId": value(c.resolvedByUserId),
+            "artifact": value(c.artifact),
+            "artifactBlobId": value(c.artifactBlobId),
+            "providerMetadata": value(c.providerMetadata),
+            "createdAt": value(c.createdAt),
+            "modifiedAt": value(c.modifiedAt),
+        ]
+    }
+
+    static func project(_ s: AgentSessionStepRecord) -> [String: JSONValue] {
         [
             "id": .string(s.id),
             "turnId": .string(s.turnId),
@@ -139,33 +173,37 @@ enum AgentSessionProjection {
             "cachedInputTokens": value(s.cachedInputTokens),
             "cost": value(s.cost),
             "historyMessageIds": members(s.historyMessageIds),
-            "errorCode": value(s.errorCode),
-            "errorMessage": value(s.errorMessage),
             "historyMode": value(s.historyMode),
             "historySelection": value(s.historySelection),
             "providerDurationMs": value(s.providerDurationMs),
+            "errorCode": value(s.errorCode),
+            "errorMessage": value(s.errorMessage),
             "resolvedByUserId": value(s.resolvedByUserId),
         ]
     }
 
     /// Decode `row` as `model` and project it; `nil` when the row does not
-    /// decode (or the model is not a platform model).
+    /// decode (or the model is not one of the db3's seven).
     static func decode(model: String, row: [String: JSONValue]) -> [String: JSONValue]? {
         switch model {
-        case "PrimitiveSession": return PrimitiveSession(row: row).map(project)
-        case "PrimitiveMessage": return PrimitiveMessage(row: row).map(project)
-        case "PrimitivePart": return PrimitivePart(row: row).map(project)
-        case "PrimitiveStep": return PrimitiveStep(row: row).map(project)
+        case "Session": return AgentSessionRecord(row: row).map(project)
+        case "Member": return AgentSessionMemberRecord(row: row).map(project)
+        case "Turn": return AgentSessionTurnRecord(row: row).map(project)
+        case "Message": return AgentSessionMessageRecord(row: row).map(project)
+        case "Part": return AgentSessionPartRecord(row: row).map(project)
+        case "ToolCall": return AgentSessionToolCallRecord(row: row).map(project)
+        case "Step": return AgentSessionStepRecord(row: row).map(project)
         default: return nil
         }
     }
 }
 
 // Whether an open value is one of the vocabulary's known values.
-extension PrimitiveSessionStatus { var isKnown: Bool { Self.known.contains(self) } }
-extension PrimitiveToolCallState { var isKnown: Bool { Self.known.contains(self) } }
-extension PrimitiveTextState { var isKnown: Bool { Self.known.contains(self) } }
-extension PrimitivePartKind { var isKnown: Bool { Self.known.contains(self) } }
-extension PrimitiveAuthorKind { var isKnown: Bool { Self.known.contains(self) } }
-extension PrimitiveStepKind { var isKnown: Bool { Self.known.contains(self) } }
-extension PrimitiveStepStatus { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionStatus { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionTurnStatus { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionToolCallState { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionTextState { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionPartKind { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionAuthorKind { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionStepKind { var isKnown: Bool { Self.known.contains(self) } }
+extension AgentSessionStepStatus { var isKnown: Bool { Self.known.contains(self) } }

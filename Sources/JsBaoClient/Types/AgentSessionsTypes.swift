@@ -7,9 +7,8 @@ import Foundation
 // a call state — decodes open: a value this client does not know reads
 // `.unknown(raw)` instead of failing the whole answer.
 
-/// A member's role in an agent session. A `viewer` reads the session and
-/// holds a `reader` grant on its document; a `participant` also sends
-/// messages and holds a `read-write` grant.
+/// A member's role in an agent session. A `viewer` reads the session; a
+/// `participant` also sends messages, answers calls and uploads files.
 public enum AgentSessionMemberRole: String, Codable, Sendable, Equatable {
     case viewer
     case participant
@@ -152,11 +151,6 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
     public let sessionId: String
     /// The agent prompt the session is bound to.
     public let agentKey: String
-    /// The session's conversation document.
-    @available(*, deprecated, message: "Use sessionId and the session calls (attachments for files, artifact(of:) for artifacts); client.agents.sessions.inspect.storage(_:) answers it for diagnostics.")
-    public var documentId: String { storageDocumentId }
-    /// The session's document, for the SDK's own reads.
-    let storageDocumentId: String
     public let ownerUserId: String
     /// ISO-8601.
     public let createdAt: String
@@ -179,7 +173,7 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
     /// Decided from the session object, never the session row. Open: a status
     /// outside the vocabulary reads `.unknown(raw)`. An open view keeps it
     /// current.
-    public internal(set) var status: PrimitiveSessionStatus
+    public internal(set) var status: AgentSessionStatus
     /// The active turn, or `nil` when none runs.
     public let turn: AgentSessionTurnSummary?
     /// For app owners and admins only: what only the session object knows
@@ -192,7 +186,7 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
     public let lastTurn: JSONValue?
 
     private enum CodingKeys: String, CodingKey {
-        case sessionId, agentKey, documentId, ownerUserId, createdAt, title, scope
+        case sessionId, agentKey, ownerUserId, createdAt, title, scope
         case lastActivityAt, hasUnread, lastReadAt, members, role, status, turn, object, turnContexts, lastTurn
     }
 
@@ -200,7 +194,6 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         sessionId = try c.decode(String.self, forKey: .sessionId)
         agentKey = try c.decode(String.self, forKey: .agentKey)
-        storageDocumentId = try c.decode(String.self, forKey: .documentId)
         ownerUserId = try c.decode(String.self, forKey: .ownerUserId)
         createdAt = try c.decode(String.self, forKey: .createdAt)
         title = try c.decodeIfPresent(String.self, forKey: .title)
@@ -210,7 +203,7 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
         lastReadAt = try c.decodeIfPresent(String.self, forKey: .lastReadAt)
         members = try c.decode(AgentSessionMembers.self, forKey: .members)
         role = try c.decode(AgentSessionRole.self, forKey: .role)
-        status = PrimitiveSessionStatus(rawValue: try c.decode(String.self, forKey: .status))
+        status = AgentSessionStatus(rawValue: try c.decode(String.self, forKey: .status))
         turn = try c.decodeIfPresent(AgentSessionTurnSummary.self, forKey: .turn)
         object = try Self.present(c, .object)
         turnContexts = try Self.present(c, .turnContexts)
@@ -228,16 +221,11 @@ public struct AgentSessionInfo: Decodable, Sendable, Equatable {
 }
 
 /// One entry of `client.agents.sessions.list`: what an app shows in a session
-/// list without opening any document.
+/// list without opening the session.
 public struct AgentSessionListItem: Codable, Sendable, Equatable {
     public let sessionId: String
     public let agentKey: String
     public let scope: String?
-    /// The session's conversation document.
-    @available(*, deprecated, message: "Use sessionId and the session calls (attachments for files, artifact(of:) for artifacts); client.agents.sessions.inspect.storage(_:) answers it for diagnostics.")
-    public var documentId: String { storageDocumentId }
-    /// The session's document, for the SDK's own reads.
-    let storageDocumentId: String
     public let ownerUserId: String
     /// The listed user's role in the session.
     public let role: AgentSessionRole
@@ -256,22 +244,21 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
     /// entry written before the status was listed. A watched list (`watch`)
     /// and its change events carry every status change as it happens. Open: a
     /// status outside the vocabulary reads `.unknown(raw)`.
-    public let status: PrimitiveSessionStatus?
+    public let status: AgentSessionStatus?
 
     private enum CodingKeys: String, CodingKey {
-        case sessionId, agentKey, scope, documentId, ownerUserId, role, title
+        case sessionId, agentKey, scope, ownerUserId, role, title
         case lastActivityAt, createdAt, hasUnread, lastReadAt, status
     }
 
     init(
-        sessionId: String, agentKey: String, scope: String?, documentId: String, ownerUserId: String,
+        sessionId: String, agentKey: String, scope: String?, ownerUserId: String,
         role: AgentSessionRole, title: String?, lastActivityAt: String, createdAt: String?,
-        hasUnread: Bool, lastReadAt: String?, status: PrimitiveSessionStatus?
+        hasUnread: Bool, lastReadAt: String?, status: AgentSessionStatus?
     ) {
         self.sessionId = sessionId
         self.agentKey = agentKey
         self.scope = scope
-        self.storageDocumentId = documentId
         self.ownerUserId = ownerUserId
         self.role = role
         self.title = title
@@ -287,7 +274,6 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         sessionId = try c.decode(String.self, forKey: .sessionId)
         agentKey = try c.decode(String.self, forKey: .agentKey)
         scope = try c.decodeIfPresent(String.self, forKey: .scope)
-        storageDocumentId = try c.decode(String.self, forKey: .documentId)
         ownerUserId = try c.decode(String.self, forKey: .ownerUserId)
         role = try c.decode(AgentSessionRole.self, forKey: .role)
         title = try c.decodeIfPresent(String.self, forKey: .title)
@@ -295,7 +281,7 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
         hasUnread = try c.decodeIfPresent(Bool.self, forKey: .hasUnread) ?? false
         lastReadAt = try c.decodeIfPresent(String.self, forKey: .lastReadAt)
-        status = try c.decodeIfPresent(String.self, forKey: .status).map(PrimitiveSessionStatus.init(rawValue:))
+        status = try c.decodeIfPresent(String.self, forKey: .status).map(AgentSessionStatus.init(rawValue:))
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -303,7 +289,6 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
         try c.encode(sessionId, forKey: .sessionId)
         try c.encode(agentKey, forKey: .agentKey)
         try c.encode(scope, forKey: .scope)
-        try c.encode(storageDocumentId, forKey: .documentId)
         try c.encode(ownerUserId, forKey: .ownerUserId)
         try c.encode(role, forKey: .role)
         try c.encode(title, forKey: .title)
@@ -317,10 +302,10 @@ public struct AgentSessionListItem: Codable, Sendable, Equatable {
     /// This item with some fields replaced.
     func with(
         lastActivityAt: String? = nil, lastReadAt: String?? = nil, hasUnread: Bool? = nil,
-        status: PrimitiveSessionStatus?? = nil
+        status: AgentSessionStatus?? = nil
     ) -> AgentSessionListItem {
         AgentSessionListItem(
-            sessionId: sessionId, agentKey: agentKey, scope: scope, documentId: storageDocumentId,
+            sessionId: sessionId, agentKey: agentKey, scope: scope,
             ownerUserId: ownerUserId, role: role, title: title,
             lastActivityAt: lastActivityAt ?? self.lastActivityAt, createdAt: createdAt,
             hasUnread: hasUnread ?? self.hasUnread, lastReadAt: lastReadAt ?? self.lastReadAt,
@@ -473,23 +458,11 @@ public struct AgentSessionRenameResult: Codable, Sendable, Equatable {
 public struct AgentSessionDeleteResult: Codable, Sendable, Equatable {
     public let deleted: Bool
     public let sessionId: String
-    public let documentId: String
 }
 
 /// What the member calls answer: the members after the change.
 public struct AgentSessionMembersResult: Codable, Sendable, Equatable {
     public let members: AgentSessionMembers
-}
-
-/// Where a session's conversation is stored: what
-/// `client.agents.sessions.inspect.storage(_:)` answers.
-public struct AgentSessionStorage: Sendable, Equatable {
-    /// The ordinary document that backs the session.
-    public let documentId: String
-
-    public init(documentId: String) {
-        self.documentId = documentId
-    }
 }
 
 /// A file to upload with `client.agents.sessions.uploadAttachment`.
@@ -651,14 +624,14 @@ public enum AgentCallAnswer: Encodable, Sendable, Equatable {
 /// What `answer` answers: the call's new state (open).
 public struct AgentCallAnswerResult: Decodable, Sendable, Equatable {
     public let callId: String
-    public let state: PrimitiveToolCallState
+    public let state: AgentSessionToolCallState
 
     private enum CodingKeys: String, CodingKey { case callId, state }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         callId = try c.decode(String.self, forKey: .callId)
-        state = PrimitiveToolCallState(rawValue: try c.decode(String.self, forKey: .state))
+        state = AgentSessionToolCallState(rawValue: try c.decode(String.self, forKey: .state))
     }
 }
 
@@ -721,9 +694,10 @@ public struct AgentSessionEventResult: Codable, Sendable, Equatable {
 public struct AgentClientToolCall<Input: Sendable>: Sendable {
     public let sessionId: String
     public let turnId: String
-    /// The call, the tool call part's `toolCallId`.
+    /// The call: its `ToolCall` row's id.
     public let callId: String
     public let messageId: String
+    /// The call's row id, the same as `callId`.
     public let partId: String
     public let toolName: String
     public let input: Input
@@ -763,7 +737,7 @@ public struct AgentClientToolResult<Output: Sendable>: Sendable {
 public struct AgentClientToolHandler: Sendable {
     private let run: @Sendable (AgentClientToolCall<JSONValue>) async throws -> AgentCallAnswer
 
-    /// A handler over the part's `input` as `JSONValue`, answering with a
+    /// A handler over the call's `input` as `JSONValue`, answering with a
     /// `JSONValue` output.
     public init(
         _ run: @escaping @Sendable (AgentClientToolCall<JSONValue>) async throws -> AgentClientToolResult<JSONValue>

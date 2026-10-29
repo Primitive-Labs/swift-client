@@ -208,28 +208,37 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - JsBaoClient.syncMetadata — query
 
-    /// No options → bare `/documents`, no trailing `?`.
-    func test_syncMetadataPath_noOptions_isBare() {
+    /// The whole scope is the pair that replaced `GET /documents` (#4830):
+    /// the first page of each list asks only for a full page.
+    func test_syncMetadataPagePath_firstPage_asksForAFullPage() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(payloadType: nil),
-            "/documents"
+            JsBaoClient.syncMetadataPagePath(owned: true, payloadType: nil, cursor: nil),
+            "/me/owned-documents?limit=100"
+        )
+        XCTAssertEqual(
+            JsBaoClient.syncMetadataPagePath(owned: false, payloadType: "full", cursor: nil),
+            "/me/shared-documents?limit=100"
         )
     }
 
-    /// `payloadType` was previously appended unescaped; it now routes through
-    /// `URLQuery`.
-    func test_syncMetadataPath_payloadType_isEncoded() {
+    /// An ids sync asks the owned list for ids, as js-bao does; the shared
+    /// list takes no such option.
+    func test_syncMetadataPagePath_ids_asksOnlyTheOwnedList() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(payloadType: "full/ids"),
-            "/documents?payloadType=full%2Fids"
+            JsBaoClient.syncMetadataPagePath(owned: true, payloadType: "ids", cursor: nil),
+            "/me/owned-documents?fields=ids&limit=100"
+        )
+        XCTAssertEqual(
+            JsBaoClient.syncMetadataPagePath(owned: false, payloadType: "ids", cursor: nil),
+            "/me/shared-documents?limit=100"
         )
     }
 
-    /// Plain values stay byte-identical.
-    func test_syncMetadataPath_plainValues_areByteIdentical() {
+    /// The server's cursor is raw JSON; it routes through `URLQuery`.
+    func test_syncMetadataPagePath_cursor_isEncoded() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(payloadType: "full"),
-            "/documents?payloadType=full"
+            JsBaoClient.syncMetadataPagePath(owned: false, payloadType: nil, cursor: #"{"k":"a b"}"#),
+            "/me/shared-documents?limit=100&cursor=%7B%22k%22%3A%22a%20b%22%7D"
         )
     }
 

@@ -63,7 +63,10 @@ final class CodegenDb3WritesHermeticTests: XCTestCase {
          "modifiedAt": "2026-10-27T00:00:00.000Z", "custodian": "user:user-a", "sync": true, "type": null, "tags": []}
         """
         let transport = RecordingTransport(status: 201, json: answer)
-        _ = try await Db3API(lifecycle: client._db3Lifecycle, transport: transport, client: client).create(title: "Tasks")
+        // Request-first (it names the custodian), so the db3 is adopted from the
+        // answer; since #5000 a create naming none is a pending create.
+        _ = try await Db3API(lifecycle: client._db3Lifecycle, transport: transport, client: client)
+            .create(title: "Tasks", custodian: "user:user-a")
         XCTAssertTrue(try XCTUnwrap(client.recordLogBinding(Self.db3Id)).isResident)
         return client
     }

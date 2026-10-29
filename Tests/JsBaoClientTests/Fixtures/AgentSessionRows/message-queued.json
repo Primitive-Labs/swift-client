@@ -1,0 +1,22 @@
+{
+  "model": "Message",
+  "row": {
+    "id": "01K6MESSAGE0000000000000003",
+    "seq": 4,
+    "authorKind": "user",
+    "authorUserId": "u_2",
+    "queueSeq": 2,
+    "createdAt": "2026-09-28T12:00:00.000Z"
+  },
+  "expect": {
+    "id": "01K6MESSAGE0000000000000003",
+    "seq": 4,
+    "authorKind": "user",
+    "authorUserId": "u_2",
+    "turnId": {
+      "$absent": true
+    },
+    "queueSeq": 2,
+    "createdAt": "2026-09-28T12:00:00.000Z"
+  }
+}

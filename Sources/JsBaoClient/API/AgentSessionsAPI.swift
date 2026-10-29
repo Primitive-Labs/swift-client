@@ -45,9 +45,6 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     private let transport: any Transport
     weak var client: JsBaoClient?
 
-    /// Diagnostics for a session: `inspect.storage(_:)`.
-    public let inspect: AgentSessionInspectAPI
-
     /// Designated initializer — the typed transport spine. Without a client,
     /// `open` throws `.unavailable`.
     public convenience init(transport: any Transport) {
@@ -57,8 +54,6 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     init(transport: any Transport, client: JsBaoClient?) {
         self.transport = transport
         self.client = client
-        self.inspect = AgentSessionInspectAPI()
-        inspect.attach(self)
     }
 
     // MARK: - Sessions
@@ -88,8 +83,8 @@ public final class AgentSessionsAPI: @unchecked Sendable {
         }
     }
 
-    /// Rename a session (owner only). The title changes on the session, in
-    /// every member's list, and on the document.
+    /// Rename a session (owner only). The title changes on the session and in
+    /// every member's list.
     public func rename(sessionId: String, title: String) async throws -> AgentSessionRenameResult {
         try Self.require(title, "title")
         return try await observed(sessionId) {
@@ -99,8 +94,10 @@ public final class AgentSessionsAPI: @unchecked Sendable {
         }
     }
 
-    /// Delete a session and its document (the owner, an app owner or an
-    /// admin). Deleting a session that is already deleted succeeds again.
+    /// Delete a session with its conversation and files (the owner, an app
+    /// owner or an admin). A repeated delete finishes one that was
+    /// interrupted and answers as the first did; once the session is gone it
+    /// is refused `AGENT_SESSION_NOT_FOUND`.
     /// Once it returns, this client's queued uploads to the session, and the
     /// messages waiting on them, fail with `AGENT_SESSION_NOT_FOUND`.
     public func delete(sessionId: String) async throws -> AgentSessionDeleteResult {
@@ -133,9 +130,10 @@ public final class AgentSessionsAPI: @unchecked Sendable {
         }
     }
 
-    /// Remove a member (owner only): their grant on the document is revoked
-    /// and the session leaves their list. Removing someone who is not a
-    /// member succeeds with the members unchanged.
+    /// Remove a member (owner only): the session leaves their list, and an
+    /// open view of theirs loses the session and its copy on their device.
+    /// Removing someone who is not a member succeeds with the members
+    /// unchanged.
     public func removeMember(sessionId: String, userId: String) async throws -> AgentSessionMembersResult {
         try Self.require(userId, "userId")
         return try await observed(sessionId) {
@@ -228,7 +226,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// transfers nothing; with other bytes it is refused. A refusal throws
     /// `HttpError` with the server's code: `AGENT_SESSION_PARTICIPANT_ONLY`
     /// for a viewer, `AGENT_SESSION_NOT_FOUND` without standing,
-    /// `AGENT_SESSION_ATTACHMENT_NOT_FOUND` for an id another document holds.
+    /// `AGENT_SESSION_ATTACHMENT_NOT_FOUND` for an id another session holds.
     /// `view.attachments.upload` queues and retries for you; this is the one
     /// request.
     public func uploadAttachment(
@@ -344,33 +342,5 @@ public final class AgentSessionsAPI: @unchecked Sendable {
                 details: ["field": .string(name)]
             )
         }
-    }
-}
-
-// MARK: - AgentSessionInspectAPI
-
-/// Diagnostics for a session, available as `client.agents.sessions.inspect`.
-/// Each call reads what the session calls already answer and grants nothing.
-public final class AgentSessionInspectAPI: @unchecked Sendable {
-    /// Set once, by the sessions API that owns this one, before either is
-    /// published; only read after.
-    private weak var sessions: AgentSessionsAPI?
-
-    init() {}
-
-    func attach(_ sessions: AgentSessionsAPI) {
-        self.sessions = sessions
-    }
-
-    /// The document that backs the session, from `get`: for support and
-    /// diagnostics, not for driving the session. Throws as `get` does,
-    /// `AGENT_SESSION_DOCUMENT_MISSING` once the document is gone (nothing is
-    /// recreated).
-    public func storage(_ sessionId: String) async throws -> AgentSessionStorage {
-        guard let sessions else {
-            throw JsBaoError(code: .unavailable, message: "inspect.storage needs its sessions API")
-        }
-        let info = try await sessions.get(sessionId: sessionId)
-        return AgentSessionStorage(documentId: info.storageDocumentId)
     }
 }

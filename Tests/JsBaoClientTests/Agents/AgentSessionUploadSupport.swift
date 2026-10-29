@@ -112,10 +112,10 @@ final class SessionUploadServer: @unchecked Sendable {
     }
 }
 
-/// The JSON `get` answers for a session over `documentId`.
-func sessionInfoJSON(_ sessionId: String, documentId: String, role: String = "owner") -> String {
+/// The JSON `get` answers for a session.
+func sessionInfoJSON(_ sessionId: String, role: String = "owner") -> String {
     #"""
-    {"sessionId":"\#(sessionId)","agentKey":"helper","documentId":"\#(documentId)","ownerUserId":"u-a",
+    {"sessionId":"\#(sessionId)","agentKey":"helper","ownerUserId":"u-a",
      "createdAt":"2026-10-13T00:00:00.000Z","title":null,"scope":null,"lastActivityAt":null,
      "members":{"viewers":[],"participants":[]},"role":"\#(role)","status":"idle","turn":null}
     """#
@@ -133,29 +133,23 @@ func makeSessionUploadClient(
     ))
 }
 
-/// A session view over a local-only document: the route answers `get` for
-/// `sessionId` with that document, everything else as `fallback` does.
+/// A session view over the session's db3 on this device (`SessionDb3`, a
+/// real binding and lifecycle): the route answers `get` for `sessionId`,
+/// everything else as `fallback` does. The caller cleans the db3 up.
 func openLocalSessionView(
     _ client: JsBaoClient, _ server: SessionUploadServer, sessionId: String = "s1",
     fallback: @escaping @Sendable (SessionUploadServer.Request) -> SessionUploadServer.Response
         = SessionUploadServer.acceptAll
-) async throws -> (view: AgentSessionView, documentId: String) {
-    client.documentManager.createRemoteDocument = { _ in
-        throw JsBaoError(code: .unavailable, message: "no server in this test")
-    }
-    let localOpen = OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: false)
-    let created = try await client.createDocument(options: CreateDocumentOptions(localOnly: true))
-    let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
+) async throws -> (view: AgentSessionView, db3: SessionDb3) {
+    let db3 = try await SessionDb3.make(id: sessionId)
     server.answer { request in
         if request.method == "GET", request.apiPathOnly == "/agent-sessions/\(sessionId)" {
-            return .json(sessionInfoJSON(sessionId, documentId: documentId))
+            return .json(sessionInfoJSON(sessionId))
         }
         return fallback(request)
     }
-    let view = try await client.agents.sessions.open(
-        sessionId: sessionId, options: OpenAgentSessionOptions(open: localOpen)
-    )
-    return (view, documentId)
+    let view = try await client.agents.sessions.open(sessionId: sessionId, db3: db3)
+    return (view, db3)
 }
 
 struct BoundedWaitTimeout: Error, CustomStringConvertible {

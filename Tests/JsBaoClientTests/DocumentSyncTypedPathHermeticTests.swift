@@ -47,6 +47,19 @@ final class DocumentSyncTypedPathHermeticTests: XCTestCase {
         return (client, server)
     }
 
+    /// A server whose whole document scope is `listing`: the owned list
+    /// answers it as one `{ items, hasMore }` page and the shared list is
+    /// empty. Everything else is a 404.
+    private func makeClient(listing: String) throws -> (JsBaoClient, LoopbackAPIServer) {
+        try makeClient { request in
+            switch request.apiPathOnly {
+            case "/me/owned-documents": return .json(#"{"items":\#(listing),"hasMore":false}"#)
+            case "/me/shared-documents": return .json(#"{"items":[],"hasMore":false}"#)
+            default: return .status(404)
+            }
+        }
+    }
+
     private func seedLocal(
         _ client: JsBaoClient,
         _ id: String,
@@ -80,13 +93,10 @@ final class DocumentSyncTypedPathHermeticTests: XCTestCase {
     // MARK: - Metadata sync
 
     func test_wholeScopeListing_upsertsListedRowsAndEvictsTheUnlistedOne() async throws {
-        let (client, server) = try makeClient { request in
-            guard request.apiPathOnly == "/documents" else { return .status(404) }
-            return .json("""
+        let (client, server) = try makeClient(listing: """
             [{"documentId":"doc-a","title":"Alpha","permission":"read-write"},
              {"documentId":"doc-b","title":"Beta","permission":"reader"}]
             """)
-        }
         await seedLocal(client, "doc-stale", "Deleted while offline")
         let (events, subscription) = sink(client)
         defer { subscription.cancel() }
@@ -98,13 +108,15 @@ final class DocumentSyncTypedPathHermeticTests: XCTestCase {
         XCTAssertNil(client.documentManager.getLocalMetadata("doc-stale"))
         XCTAssertNotNil(events.deleted("doc-stale"))
         XCTAssertTrue(
-            server.paths.contains { $0.hasPrefix("/documents") },
-            "the listing must come from GET /documents; saw \(server.paths)"
+            server.paths.contains { $0.hasPrefix("/me/owned-documents") },
+            "the listing must come from GET /me/owned-documents; saw \(server.paths)"
         )
     }
 
     func test_listingThatIsAnObject_isIgnored() async throws {
-        let (client, _) = try makeClient { _ in .json(#"{"documents":[]}"#) }
+        let (client, _) = try makeClient { request in
+            request.apiPathOnly.hasPrefix("/me/") ? .json(#"{"documents":[]}"#) : .status(404)
+        }
         await seedLocal(client, "doc-kept", "Kept")
         let (events, subscription) = sink(client)
         defer { subscription.cancel() }
@@ -116,9 +128,9 @@ final class DocumentSyncTypedPathHermeticTests: XCTestCase {
     }
 
     func test_listingWithANonObjectElement_isIgnoredAsAWhole() async throws {
-        let (client, _) = try makeClient { _ in
-            .json(#"[{"documentId":"doc-new","title":"New","permission":"read-write"}, 1]"#)
-        }
+        let (client, _) = try makeClient(
+            listing: #"[{"documentId":"doc-new","title":"New","permission":"read-write"}, 1]"#
+        )
         await seedLocal(client, "doc-kept", "Kept")
         let (events, subscription) = sink(client)
         defer { subscription.cancel() }
@@ -134,9 +146,9 @@ final class DocumentSyncTypedPathHermeticTests: XCTestCase {
     }
 
     func test_nullThumbnailInAListing_clearsTheCachedThumbnail() async throws {
-        let (client, _) = try makeClient { _ in
-            .json(#"[{"documentId":"doc-a","title":"Alpha","permission":"read-write","thumbnailBlobId":null}]"#)
-        }
+        let (client, _) = try makeClient(
+            listing: #"[{"documentId":"doc-a","title":"Alpha","permission":"read-write","thumbnailBlobId":null}]"#
+        )
         await seedLocal(client, "doc-a", "Alpha", thumbnailBlobId: "blob-old")
         XCTAssertEqual(client.documentManager.getLocalMetadata("doc-a")?.thumbnailBlobId, "blob-old")
 

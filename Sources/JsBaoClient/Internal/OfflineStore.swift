@@ -525,6 +525,9 @@ public struct CommitError: Codable, Sendable {
     public var at: String
     /// The server's refusal code, for a pending db3 create the server refused (#4921).
     public var code: String?
+    /// The refusal's HTTP status (#5000), which a `client.db3` call waiting
+    /// for the create throws with.
+    var status: Int?
 
     public init(message: String, at: String, code: String? = nil) {
         self.message = message

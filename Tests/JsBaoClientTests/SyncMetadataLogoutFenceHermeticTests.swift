@@ -76,8 +76,8 @@ final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
     }
 
     /// A client signed in as A whose first `GET <heldPath>` is answered with
-    /// `heldAnswer` only on `held.release()`. B's owned-documents list is
-    /// empty; everything else is a 404.
+    /// `heldAnswer` only on `held.release()`. Otherwise both document lists
+    /// are empty; everything else is a 404.
     private func makeClient(
         appId: String,
         heldPath: String,
@@ -92,8 +92,8 @@ final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
                 held.hold { respond(heldAnswer) }
                 return
             }
-            if path == "/me/owned-documents" {
-                respond(.json("[]"))
+            if path == "/me/owned-documents" || path == "/me/shared-documents" {
+                respond(.json(Self.page("")))
                 return
             }
             respond(.status(404, "unscripted path \(path)"))
@@ -117,6 +117,11 @@ final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
         XCTAssertTrue(storageReady)
         XCTAssertEqual(client.documentManager.userId, Self.userA)
         return (client, held)
+    }
+
+    /// One page of the `{ items, hasMore }` envelope the document lists answer.
+    private static func page(_ rows: String) -> String {
+        #"{"items":[\#(rows)],"hasMore":false}"#
     }
 
     private static func ownedRow(_ id: String, _ title: String) -> String {
@@ -182,8 +187,8 @@ final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
     func test_listingAnsweredAfterSignOut_neverReachesTheNextUser() async throws {
         let (client, held) = try await makeClient(
             appId: "sync-fence-listing-signout",
-            heldPath: "/documents",
-            heldAnswer: .json("[\(Self.ownedRow(Self.docA, "A's document"))]")
+            heldPath: "/me/owned-documents",
+            heldAnswer: .json(Self.page(Self.ownedRow(Self.docA, "A's document")))
         )
 
         try await client.syncMetadata(options: SyncMetadataOptions(background: true))
@@ -200,8 +205,8 @@ final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
     func test_listingAnsweredAfterNextSignIn_neverReachesTheNextUser() async throws {
         let (client, held) = try await makeClient(
             appId: "sync-fence-listing-signin",
-            heldPath: "/documents",
-            heldAnswer: .json("[\(Self.ownedRow(Self.docA, "A's document"))]")
+            heldPath: "/me/owned-documents",
+            heldAnswer: .json(Self.page(Self.ownedRow(Self.docA, "A's document")))
         )
 
         try await client.syncMetadata(options: SyncMetadataOptions(background: true))
@@ -221,8 +226,8 @@ final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
     func test_idsListingAnsweredAfterNextSignIn_neverEvictsTheNextUsersDocuments() async throws {
         let (client, held) = try await makeClient(
             appId: "sync-fence-ids-signin",
-            heldPath: "/documents",
-            heldAnswer: .json(#"[{"documentId":"\#(Self.docA)"}]"#)
+            heldPath: "/me/owned-documents",
+            heldAnswer: .json(Self.page(#"{"documentId":"\#(Self.docA)"}"#))
         )
 
         try await client.syncMetadata(
@@ -251,9 +256,9 @@ final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
         let docA2 = "doc-a-owned-2"
         let (client, held) = try await makeClient(
             appId: "sync-fence-listing-mid-merge",
-            heldPath: "/documents",
+            heldPath: "/me/owned-documents",
             heldAnswer: .json(
-                "[\(Self.ownedRow(Self.docA, "A's document")),\(Self.ownedRow(docA2, "A's other document"))]"
+                Self.page("\(Self.ownedRow(Self.docA, "A's document")),\(Self.ownedRow(docA2, "A's other document"))")
             )
         )
         held.release()

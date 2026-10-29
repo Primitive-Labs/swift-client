@@ -55,10 +55,6 @@ public final class JsBaoClient: @unchecked Sendable {
     /// listDevices / unregisterDevice). Live in-app notifications arrive as
     /// the `.notification` event. Mirrors JS `client.notifications.*`.
     public let notifications: NotificationsAPI
-    /// Sub-API for the named lock service (tryAcquire / acquire / release /
-    /// renew / status / list). Leases are mandatory-TTL and the opaque
-    /// `handleId` proves holder identity. Mirrors JS `client.locks.*`.
-    public let locks: LocksAPI
     /// Sub-API for typed resource metadata values (get / set / getBatch /
     /// list / delete). Category definitions are admin-scoped and are not
     /// exposed here. Mirrors JS `client.resourceMetadata.*`.
@@ -685,6 +681,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // gate the API namespaces' transport applies. The queue is kept in
         // the offline store's database so it survives the process (#4592).
         let authController = self.authController
+        let documentManager = self.documentManager
         self.blobManager = BlobManager(
             logger: logger,
             uploadConcurrency: options.blobUploadConcurrency,
@@ -699,6 +696,7 @@ public final class JsBaoClient: @unchecked Sendable {
                 return UploadIdentity(token: identity.token, userId: identity.userId, epoch: identity.epoch)
             },
             networkingAllowed: { [weak gatedTransport] in gatedTransport?.networkingAllowed ?? true },
+            pendingDb3Create: { [weak documentManager] db3Id in documentManager?.isPendingCreate(db3Id) ?? false },
             offlineStore: offlineStore
         )
 
@@ -744,7 +742,6 @@ public final class JsBaoClient: @unchecked Sendable {
         self.ruleSets = RuleSetsAPI(transport: gatedTransport)
         self.invitations = InvitationsAPI(transport: gatedTransport)
         self.notifications = NotificationsAPI(transport: gatedTransport)
-        self.locks = LocksAPI(transport: gatedTransport)
         self.resourceMetadata = ResourceMetadataAPI(transport: gatedTransport)
         // Blob upload/download go through `Transport.requestData`, which
         // returns the untouched response bytes.
@@ -4166,6 +4163,48 @@ public final class JsBaoClient: @unchecked Sendable {
         )
     }
 
+    /// Wait, before a request naming `db3Id`, for a db3 created here whose
+    /// create the server does not have yet (#5000), as
+    /// `awaitPendingCreateCommit` waits for a document's. The wait joins the
+    /// commit in flight, or starts one, and returns once the server has the
+    /// db3. It throws the create's refusal (an `HttpError` with the server's
+    /// status and code, `details.db3Id` in its body) once the server refused
+    /// it, and `JsBaoError(.pendingCreate)` (`details["db3Id"]`) when the
+    /// network mode is or becomes `.offline` or the commit has not landed
+    /// within `DocumentsAPI.pendingCreateWaitSeconds`. A transient failure does
+    /// not end it: the backoff tries again.
+    func awaitPendingDb3Create(_ db3Id: String) async throws {
+        let documentManager = self.documentManager
+        guard documentManager.isPendingCreate(db3Id) else { return }
+        try await eventEmitter.waitForPendingDb3Create(
+            db3Id: db3Id,
+            timeout: DocumentsAPI.pendingCreateWaitSeconds,
+            stillPending: { documentManager.isPendingCreate(db3Id) },
+            isOffline: { [weak self] in self?.networkMode == .offline },
+            refusal: { Self.db3CreateRefusalError(db3Id, documentManager.getLocalMetadata(db3Id)) },
+            commit: {
+                Task {
+                    _ = try? await documentManager.joinDb3Commit(documentId: db3Id, metadata: documentManager.getLocalMetadata(db3Id))
+                    // A transient failure: make sure the backoff tries again.
+                    if documentManager.isPendingCreate(db3Id) { documentManager.scheduleCommitRetry(documentId: db3Id) }
+                }
+            }
+        )
+    }
+
+    /// The refusal a db3 create met at its last commit, as a call waiting
+    /// for the create throws it, or `nil` while it was not refused.
+    static func db3CreateRefusalError(_ db3Id: String, _ meta: LocalMetadataEntry?) -> HttpError? {
+        guard let meta, meta.commitRefused == true, let refusal = meta.commitError else { return nil }
+        let code = refusal.code ?? "DB3_CREATE_FAILED"
+        let status = refusal.status ?? 409
+        let body: JSONValue = .object([
+            "error": .string(refusal.message), "code": .string(code), "details": .object(["db3Id": .string(db3Id)]),
+        ])
+        let text = (try? JSONEncoder().encode(body)).flatMap { String(data: $0, encoding: .utf8) }
+        return HttpError(status: status, message: "HTTP \(status)", body: text, serverCode: code, serverMessage: refusal.message)
+    }
+
     /// Check if a document is local-only (never syncs to server)
     public func isLocalOnly(_ documentId: String) -> Bool {
         documentManager.isLocalOnly(documentId)
@@ -4182,14 +4221,18 @@ public final class JsBaoClient: @unchecked Sendable {
     ///   - documentId: The document to commit.
     ///   - onExists: Behavior when document already exists on server: "fail" (default) or "link".
     ///
-    /// A db3 `client.db3.create` made on this device (#4921) is retried as a
-    /// fresh round through the backoff scheduler instead: its refusal is
-    /// cleared, a transient failure is retried, and the answer is
-    /// `["scheduled": true]`; `Db3CreatedEvent` or `Db3CreateFailedEvent`
-    /// reports the outcome.
+    /// A db3 `client.db3.create` made on this device commits through
+    /// `POST db3`, and the call waits for the server's answer: an attempt
+    /// already in flight is joined, a refusal is cleared and tried again. It
+    /// answers `["created": true]` when the server has it now,
+    /// `["refused": true, "reason": …]` when the server refused it (also
+    /// `Db3CreateFailedEvent`), and `["created": false, "reason":
+    /// "not_pending"]` when its create had already landed. A transient
+    /// failure throws, and the client keeps retrying it with backoff.
     public func commitOfflineCreate(documentId: String, onExists: String = "fail") async throws -> [String: Any] {
-        if documentManager.isPendingCreate(documentId), documentManager.getLocalMetadata(documentId)?.db3Create == true {
-            return await documentManager.retryDb3Create(documentId: documentId)
+        if documentManager.getLocalMetadata(documentId)?.db3Create == true {
+            guard documentManager.isPendingCreate(documentId) else { return ["created": false, "reason": "not_pending"] }
+            return try await documentManager.commitDb3CreateNow(documentId: documentId)
         }
         return try await documentManager.commitOfflineCreate(documentId: documentId, onExists: onExists)
     }
@@ -4249,6 +4292,13 @@ public final class JsBaoClient: @unchecked Sendable {
             // silently swallows the caller's request for up to the 10s
             // staleness window.
             documentManager.completePendingSyncOperation(documentId)
+        }
+        // #5000 — a db3 `client.db3.create` made here whose create the server
+        // does not have yet has no room to open: a `record.open` now would be
+        // refused. Its commit starts the sync (`onPendingCreateCommitted`).
+        if documentManager.isPendingCreate(documentId), documentManager.getLocalMetadata(documentId)?.db3Create == true {
+            logger.debug("startNetworkSync: db3 create not committed yet, holding its open:", documentId)
+            return
         }
         // A syncStep1 can only go out on a live transport. JS gates the same
         // way — `sendSyncStep1` returns early unless
@@ -4943,15 +4993,24 @@ public final class JsBaoClient: @unchecked Sendable {
         ]
     }
 
-    /// Build the whole-scope `syncMetadata` request path, routing the query
-    /// value through the shared `URLQuery` builder (#2076); `payloadType` was
-    /// previously appended unescaped. A scoped sync does not come through
-    /// here — it asks about its document by path (`documentMetadataPath`), as
-    /// js-bao does. `internal` for unit testing.
-    static func syncMetadataPath(payloadType: String?) -> String {
+    /// Documents per page of the whole-scope `syncMetadata` walk. The server
+    /// caps `limit` at 100 (`parseListLimitParam`), so asking for more buys
+    /// nothing.
+    static let syncMetadataPageSize = 100
+
+    /// One page of the whole-scope `syncMetadata` walk: `GET
+    /// /me/owned-documents` or `GET /me/shared-documents`, the pair that
+    /// replaced the legacy `GET /documents` union list. An ids sync asks the
+    /// owned list for `fields=ids`, as js-bao does; the shared list takes no
+    /// such option. A scoped sync does not come through here — it asks about
+    /// its document by path (`documentMetadataPath`). `internal` for unit
+    /// testing.
+    static func syncMetadataPagePath(owned: Bool, payloadType: String?, cursor: String?) -> String {
         var query = URLQuery()
-        query.appendIfPresent("payloadType", payloadType)
-        return "/documents\(query.queryString)"
+        if owned, payloadType == "ids" { query.append("fields", "ids") }
+        query.append("limit", syncMetadataPageSize)
+        if let cursor, !cursor.isEmpty { query.append("cursor", cursor) }
+        return "/me/\(owned ? "owned" : "shared")-documents\(query.queryString)"
     }
 
     /// The single-document fetch a scoped sync answers from, mirroring
@@ -4983,7 +5042,9 @@ public final class JsBaoClient: @unchecked Sendable {
         return rows
     }
 
-    /// Sync metadata. With no options, refreshes the full doc list.
+    /// Sync metadata. With no options, refreshes the user's whole document
+    /// scope — the documents they own plus the ones shared with them, each
+    /// list read to the end. A failed request throws and changes nothing.
     /// `options.documentId` restricts to one doc;
     /// `options.payloadType` (`"ids"` | `"full"`) controls the wire
     /// shape; `options.background` runs without blocking. Matches
@@ -5029,12 +5090,27 @@ public final class JsBaoClient: @unchecked Sendable {
             return
         }
 
-        let path = Self.syncMetadataPath(payloadType: options.payloadType)
-        let listing: JSONValue? = try await gatedTransport.requestOptional(method: .get, path: path)
-        guard let docs = Self.documentRows(listing), !sessionEnded() else { return }
+        // The app root is not part of the owned list unless asked for, so its
+        // absence from the scope is not news. Only the documents cached before
+        // the walk starts may be evicted, each still carrying the stamp it had
+        // then: the walk spans several round trips, and a document confirmed
+        // while it runs can be absent from a page that had already gone by.
+        var retainIds: Set<String> = []
+        if let rootDocId { retainIds.insert(rootDocId) }
+        let candidates = documentManager.evictionCandidateSnapshot(
+            seenIds: [], retainIds: retainIds
+        )
+        let listing = try await fetchWholeScopeListing(
+            payloadType: options.payloadType, sessionEnded: sessionEnded
+        )
+        guard let listing, let docs = Self.documentRows(.array(listing)), !sessionEnded() else {
+            return
+        }
         await documentManager.handleServerDocuments(
             docs,
             authoritative: Self.listingIsAuthoritative(options),
+            retainIds: retainIds,
+            evictOnly: candidates,
             sessionEnded: sessionEnded
         )
 
@@ -5048,6 +5124,57 @@ public final class JsBaoClient: @unchecked Sendable {
             if let documentId = doc["documentId"] as? String { seenIds.insert(documentId) }
         }
         await verifyThenEvictUnlistedDocuments(seenIds: seenIds, sessionEnded: sessionEnded)
+    }
+
+    /// The caller's whole document scope: `GET /me/owned-documents` and `GET
+    /// /me/shared-documents`, each followed to exhaustion, concatenated and
+    /// deduplicated by id (the owned row wins). Mirrors js-bao's whole-scope
+    /// `syncMetadata`.
+    ///
+    /// A failed request throws. Anything else short of reaching the end of
+    /// both lists returns `nil`, which syncs nothing: a page that is not the
+    /// `{ items, hasMore, nextCursor }` envelope, a page that says more rows
+    /// remain but gives no cursor, a cursor already followed (a list that
+    /// cycles never ends), or a session that ended mid-walk. There is no page
+    /// budget: a valid list is followed however long it is. A listing that saw
+    /// only the owned half would read every shared document as evictable.
+    private func fetchWholeScopeListing(
+        payloadType: String?,
+        sessionEnded: () -> Bool
+    ) async throws -> [JSONValue]? {
+        var union: [JSONValue] = []
+        var unionIds: Set<String> = []
+
+        for owned in [true, false] {
+            var cursor: String? = nil
+            var followedCursors: Set<String> = []
+
+            while true {
+                guard !sessionEnded() else { return nil }
+                let page: JSONValue = try await gatedTransport.request(
+                    method: .get,
+                    path: Self.syncMetadataPagePath(
+                        owned: owned, payloadType: payloadType, cursor: cursor
+                    )
+                )
+                guard let items = page["items"]?.arrayValue else { return nil }
+                for item in items {
+                    if let documentId = item["documentId"]?.stringValue,
+                       !unionIds.insert(documentId).inserted {
+                        continue
+                    }
+                    union.append(item)
+                }
+
+                guard let next = page["nextCursor"]?.stringValue, !next.isEmpty else {
+                    guard page["hasMore"]?.boolValue != true else { return nil }
+                    break
+                }
+                guard followedCursors.insert(next).inserted else { return nil }
+                cursor = next
+            }
+        }
+        return union
     }
 
     /// Sync one document's metadata, which is the call an app makes to ask
@@ -6094,8 +6221,25 @@ public final class JsBaoClient: @unchecked Sendable {
                 return try await self.authController.passkeyUpdate(
                     passkeyId: passkeyId, deviceName: deviceName
                 )
+            },
+            emailSignInRequestWithTarget: { [weak self] email, target in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.emailSignInRequest(email: email, target: target)
+            },
+            emailSignInLinkTarget: { [weak self] target in
+                self?.authController.emailSignInLinkTarget(target)
+            },
+            handleSignInCallback: { [weak self] url, inviteToken in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                let result = try await self.authController.handleSignInCallback(url, inviteToken: inviteToken)
+                // As `handleOAuthCallback` does: return with the connection
+                // attempt the new token started finished.
+                if result.method == .oauth { await self.awaitPendingTokenConnect() }
+                return result
             }
         )
+        // The sign-in rules read `links.appBaseURL` at call time.
+        authController.appBaseURLProvider = { [weak self] in self?.links.appBaseURL }
         // logout(waitForDisconnect:) tears down networking via this hook.
         authController.onLogoutDisconnect = { [weak self] in await self?.disconnect() }
         // Every logout — wipe or not — closes the signed-out user's documents
@@ -8381,4 +8525,21 @@ private struct ChannelSubscribeFrame: Encodable, Sendable {
 private struct ChannelUnsubscribeFrame: Encodable, Sendable {
     let type = "channel.unsubscribe"
     let channel: String
+}
+
+// MARK: - Resource-held db3s
+
+extension JsBaoClient {
+    /// Note that `id` names a db3 a resource holds (an agent session's,
+    /// #4884), before it is subscribed, so its subscribe asks the documents
+    /// API nothing: its format is 3 (a db3), so no format lookup is made, and
+    /// its open takes `reader`, the permission every caller who may open it
+    /// holds, instead of reading the document's info. The session's `get`
+    /// has already refused a caller who may not read it, and the room's open
+    /// answers the rest.
+    func noteResourceHeldDb3(_ id: String) {
+        recordLogState.noteResolvedFormat(id, RecordLogTransport.documentFormat)
+        documentManager.noteDocumentFormat(id, RecordLogTransport.documentFormat)
+        documentManager.noteResourceHeld(id)
+    }
 }

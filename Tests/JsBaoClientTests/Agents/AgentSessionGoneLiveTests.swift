@@ -5,7 +5,8 @@ import XCTest
 /// the messages waiting on them fail with `AGENT_SESSION_NOT_FOUND`, against
 /// the dev server (#4588, plan behaviors 16, 17 and 18, their live halves;
 /// intent criterion 9). No model turn: every message here waits on an upload
-/// that never lands.
+/// that never lands. Since #4884 each view is open over the session's db3 and
+/// each upload goes to the session's attachment route (behavior 16).
 final class AgentSessionGoneLiveTests: XCTestCase {
     private static let harnessTask = LockedBox<Task<AgentSessionScenarioHarness, Error>?>(nil)
     private var h: AgentSessionScenarioHarness!

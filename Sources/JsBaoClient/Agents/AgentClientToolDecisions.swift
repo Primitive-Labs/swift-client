@@ -1,9 +1,9 @@
 import Foundation
 
 // The small rules of `view.handleClientTools` (#4263) — the Swift half of the
-// JS client's `src/client/agents/clientToolDecisions.ts`: which tool-call
-// part a handler may run, how a failed answer is read, and an error's
-// message as an answer. Internal; the view applies them.
+// JS client's `src/client/agents/clientToolDecisions.ts`: which call a handler
+// may run, how a failed answer is read, and an error's message as an answer.
+// Internal; the view applies them.
 
 enum AgentClientToolDecisions {
     /// The longest error message an answer carries, in characters.
@@ -17,7 +17,7 @@ enum AgentClientToolDecisions {
     /// `HttpError` codes the client sets itself, which no server sent.
     static let clientSentinels: Set<String> = [HttpError.emptyBodyCode, HttpError.decodingFailedCode]
     /// The tool-call states after which a call takes no answer.
-    static let terminalStates: Set<String> = ["output-available", "output-error", "output-denied"]
+    static let terminalStates: Set<AgentSessionToolCallState> = [.outputAvailable, .outputError, .outputDenied]
 
     /// A call a registered handler may run.
     struct EligibleCall: Sendable, Equatable {
@@ -27,23 +27,19 @@ enum AgentClientToolDecisions {
         let messageId: String
         let partId: String
         /// The state it was found in: `input-available` or `approval-responded`.
-        let state: String
+        let state: AgentSessionToolCallState
     }
 
-    /// The call a part holds when a handler may run it: a tool call of a
-    /// registered name with a call id, waiting for its result
-    /// (`input-available`, or `approval-responded` once approved).
-    static func eligibleCall(part: PrimitivePart, registered: Set<String>) -> EligibleCall? {
-        guard part.kind == .toolCall,
-              let callId = part.toolCallId, !callId.isEmpty,
-              let toolName = part.toolName, registered.contains(toolName),
-              let state = part.state
-        else { return nil }
-        let waiting = state == "input-available" || (state == "approval-responded" && part.approvalApproved == true)
+    /// The call a `ToolCall` record holds when a handler may run it: a call of
+    /// a registered tool, waiting for its result (`input-available`, or
+    /// `approval-responded` once approved). Its part id is the call's id.
+    static func eligibleCall(call: AgentSessionToolCallRecord, registered: Set<String>) -> EligibleCall? {
+        guard !call.id.isEmpty, !call.toolName.isEmpty, registered.contains(call.toolName) else { return nil }
+        let waiting = call.state == .inputAvailable || (call.state == .approvalResponded && call.approvalApproved == true)
         guard waiting else { return nil }
         return EligibleCall(
-            callId: callId, toolName: toolName, input: part.input, messageId: part.messageId,
-            partId: part.id, state: state
+            callId: call.id, toolName: call.toolName, input: call.input, messageId: call.messageId,
+            partId: call.id, state: call.state
         )
     }
 

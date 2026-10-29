@@ -1,0 +1,8 @@
+{
+  "model": "Member",
+  "row": {
+    "id": "u_2",
+    "role": "participant"
+  },
+  "invalid": "addedAt"
+}

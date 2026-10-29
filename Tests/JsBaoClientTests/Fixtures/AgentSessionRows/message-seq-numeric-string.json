@@ -1,5 +1,5 @@
 {
-  "model": "PrimitiveMessage",
+  "model": "Message",
   "row": {
     "id": "01K6MESSAGE0000000000000000",
     "seq": "3",

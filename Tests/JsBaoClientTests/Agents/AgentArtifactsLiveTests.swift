@@ -3,11 +3,12 @@ import XCTest
 @testable import JsBaoClient
 
 /// `view.artifact(of:)` on live Swift clients over real blobs (#4466, plan
-/// behavior 8; edge cases 11 and 15). A writer uploads blobs to the session's
-/// document through the client's blob API and saves tool-call parts that name
-/// them; a fresh reader client (an empty blob cache) reads them through its
-/// view. The large case is a real client-tool answer, which the server stores
-/// as a blob.
+/// behavior 8; edge cases 11 and 15; #4884 behavior 14). The owner uploads
+/// blobs through the session's attachment route, and calls naming them are
+/// written into the session's db3 through the session object's binding (the
+/// local probe: only the session writes its db3); a fresh reader client (an
+/// empty blob cache) reads them through its view, through the session's
+/// attachment route, never a document's.
 final class AgentArtifactsLiveTests: XCTestCase {
     private static let harnessTask = LockedBox<Task<AgentSessionScenarioHarness, Error>?>(nil)
     private var h: AgentSessionScenarioHarness!
@@ -33,83 +34,86 @@ final class AgentArtifactsLiveTests: XCTestCase {
         super.tearDown()
     }
 
-    private struct Question: Codable, Sendable { let question: String }
-    private struct Count: Codable, Sendable { let count: Int }
-
+    /// `data` uploaded to the session through its attachment route, as the owner.
     private func upload(_ client: JsBaoClient, _ s: AgentSessionScenarioHarness.Session, _ data: Data, _ filename: String) async throws -> String {
-        try await client.documents.blobs(documentId: s.documentId).upload(
-            data: data, options: BlobUploadSourceOptions(filename: filename, contentType: "application/json")
+        try await client.agents.sessions.uploadAttachment(
+            sessionId: s.sessionId, blobId: ULID.generate(),
+            AgentSessionAttachmentUpload(data: data, filename: filename, contentType: "application/json")
         ).blobId
     }
 
     func testAFreshClientReadsBlobStoredInlineAndAbsentArtifactsAndThrowsForBadBlobs() async throws {
         let s = try await h.createSession(h.plain, participants: [h.part])
         let writer = try await h.client(h.owner)
-        writer.registerModels(AgentSessionModels.schemas)
-        _ = try await writer.documents.open(s.documentId, options: OpenDocumentOptions(waitForLoad: .network))
         let stored: JSONValue = ["rows": .array((0..<50).map { ["i": .number(Double($0)), "label": .string("row \($0)")] })]
         let jsonBlob = try await upload(writer, s, try JSONCoding.encodeData(stored), "artifact.json")
         let badBlob = try await upload(writer, s, Data("{ this is not json".utf8), "bad.json")
-        let missing = PrimitiveSchemaRegistry.generateULID()
+        let missing = ULID.generate()
 
         let created = "2026-10-13T12:00:00.000Z"
-        let calls: [(name: String, columns: [String: PrimitiveValue])] = [
-            ("blob", ["artifactBlobId": .string(jsonBlob)]),
-            ("inline", ["artifact": .string(#"{"inline":true,"n":7}"#)]),
+        let calls: [(name: String, columns: [String: Any])] = [
+            ("blob", ["artifactBlobId": jsonBlob]),
+            ("inline", ["artifact": #"{"inline":true,"n":7}"#]),
             ("none", [:]),
-            ("both", ["artifact": .string(#"{"from":"inline"}"#), "artifactBlobId": .string(jsonBlob)]),
-            ("bad", ["artifactBlobId": .string(badBlob)]),
-            ("missing", ["artifactBlobId": .string(missing)]),
+            ("both", ["artifact": #"{"from":"inline"}"#, "artifactBlobId": jsonBlob]),
+            ("bad", ["artifactBlobId": badBlob]),
+            ("missing", ["artifactBlobId": missing]),
         ]
-        var partIds: [String: String] = [:]
+        var callIds: [String: String] = [:]
+        var operations: [[String: Any]] = []
         for (n, call) in calls.enumerated() {
-            let messageId = PrimitiveSchemaRegistry.generateULID()
-            let partId = PrimitiveSchemaRegistry.generateULID()
-            partIds[call.name] = partId
-            try writer.codegen.save(PrimitiveMessage.primitiveSchema, id: messageId, values: [
-                "seq": .number(Double(n + 1)), "authorKind": .string("agent"), "createdAt": .date(created),
-            ], in: s.documentId)
-            var values: [String: PrimitiveValue] = [
-                "messageId": .string(messageId), "seq": .number(1), "kind": .string("tool_call"),
-                "state": .string("output-available"), "toolCallId": .string("call-\(partId)"),
-                "toolName": .string("chart"), "createdAt": .date(created),
+            let messageId = ULID.generate()
+            let callId = "call_\(ULID.generate())"
+            callIds[call.name] = callId
+            operations.append([
+                "model": "Message", "action": "create", "id": messageId,
+                "data": ["seq": n + 1, "authorKind": "agent", "turnId": "t_seed", "createdAt": created],
+            ])
+            var data: [String: Any] = [
+                "messageId": messageId, "seq": 1, "turnId": "t_seed", "state": "output-available", "toolName": "chart",
+                "input": "{}", "output": #"{"ok":true}"#, "createdAt": created,
             ]
-            values.merge(call.columns) { _, new in new }
-            try writer.codegen.save(PrimitivePart.primitiveSchema, id: partId, values: values, in: s.documentId)
+            data.merge(call.columns) { _, new in new }
+            operations.append(["model": "ToolCall", "action": "create", "id": callId, "data": data])
         }
+        try await h.seed(s, operations: operations)
 
         // A fresh client: nothing of these blobs is cached.
         let reader = try await h.client(h.part)
         let view = try await h.open(reader, s)
-        try await h.poll(timeout: 120, "the seeded parts reach the reader") { view.toolCalls.count == calls.count }
-        func part(_ name: String) throws -> PrimitivePart {
-            try XCTUnwrap(view.toolCalls.first { $0.id == partIds[name] }, name)
+        try await h.poll(timeout: 120, "the seeded calls reach the reader") { view.toolCalls.count == calls.count }
+        func call(_ name: String) throws -> AgentSessionToolCallRecord {
+            try XCTUnwrap(view.toolCall(callIds[name] ?? ""), name)
         }
 
-        XCTAssertNil(try part("blob").artifact)
-        let blobValue = try await view.artifact(of: part("blob"))
+        XCTAssertNil(try call("blob").artifact)
+        let blobValue = try await view.artifact(of: call("blob"))
         XCTAssertEqual(blobValue, stored)
-        let inline = try await view.artifact(of: part("inline"))
+        let inline = try await view.artifact(of: call("inline"))
         XCTAssertEqual(inline, ["inline": true, "n": 7])
-        let none = try await view.artifact(of: part("none"))
+        let none = try await view.artifact(of: call("none"))
         XCTAssertNil(none)
         // Edge 11: the blob wins over an inline value beside it.
-        XCTAssertEqual(try part("both").artifact, ["from": "inline"])
-        let both = try await view.artifact(of: part("both"))
+        XCTAssertEqual(try call("both").artifact, ["from": "inline"])
+        let both = try await view.artifact(of: call("both"))
         XCTAssertEqual(both, stored)
 
         // Edge 15: bytes that are not JSON, and a blob that does not exist.
         do {
-            _ = try await view.artifact(of: part("bad"))
+            _ = try await view.artifact(of: call("bad"))
             XCTFail("a blob that is not JSON throws")
         } catch is DecodingError {}
         do {
-            _ = try await view.artifact(of: part("missing"))
+            _ = try await view.artifact(of: call("missing"))
             XCTFail("a missing blob throws")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 404)
         }
+        await view.close()
     }
+
+    private struct Question: Codable, Sendable { let question: String }
+    private struct Count: Codable, Sendable { let count: Int }
 
     func testATypedHandlersLargeArtifactReadsBackFromItsBlob() async throws {
         let s = try await h.createSession(h.initiator, participants: [h.part])
@@ -131,14 +135,14 @@ final class AgentArtifactsLiveTests: XCTestCase {
         }
         let callId = try XCTUnwrap(calls.all.first, "the model called the tool")
         try await h.poll(timeout: 60, "the answer lands as a blob") {
-            view.toolCall(callId)?.state == "output-available" && view.toolCall(callId)?.artifactBlobId != nil
+            view.toolCall(callId)?.state == .outputAvailable && view.toolCall(callId)?.artifactBlobId != nil
         }
         XCTAssertNil(view.toolCall(callId)?.artifact)
 
         // A fresh client: the blob is not cached.
         let reader = try await h.client(h.part)
         let readerView = try await h.open(reader, s)
-        try await h.poll(timeout: 60, "the part reaches the reader") {
+        try await h.poll(timeout: 60, "the call reaches the reader") {
             readerView.toolCall(callId)?.artifactBlobId != nil
         }
         let value = try await readerView.artifact(of: XCTUnwrap(readerView.toolCall(callId)))

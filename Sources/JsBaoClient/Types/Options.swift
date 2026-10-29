@@ -177,17 +177,29 @@ public struct AuthConfig: Sendable {
     /// the server rejects an unconfigured one with
     /// `PASSKEY_RP_NOT_CONFIGURED` rather than substituting another.
     public let passkeyRpId: String?
+    /// Where an emailed sign-in link lands when a request names no target,
+    /// ahead of `links.appBaseURL`'s origin + `/oauth/callback`. Mirrors the
+    /// JS client's `oauthRedirectUri`.
+    ///
+    /// Set it to `<scheme>://oauth/callback` for links that open the app
+    /// through its registered URL scheme; `client.auth.handleSignInCallback`
+    /// then accepts that scheme. An http(s) value sets the callback path only:
+    /// web callbacks are accepted on `links.appBaseURL`'s origin alone. The
+    /// value must be in the app's `emailRedirectUris`.
+    public let oauthRedirectUri: String?
 
     public init(
         persistJwtInStorage: Bool = false,
         storageKeyPrefix: String? = nil,
         refreshProxy: RefreshProxyConfig? = nil,
-        passkeyRpId: String? = nil
+        passkeyRpId: String? = nil,
+        oauthRedirectUri: String? = nil
     ) {
         self.persistJwtInStorage = persistJwtInStorage
         self.storageKeyPrefix = storageKeyPrefix
         self.refreshProxy = refreshProxy
         self.passkeyRpId = passkeyRpId
+        self.oauthRedirectUri = oauthRedirectUri
     }
 }
 
@@ -521,8 +533,8 @@ public struct RetentionPolicy: Sendable {
 /// Options for `client.syncMetadata(options:)`. Matches the JS
 /// client's options bag.
 public struct SyncMetadataOptions: Sendable {
-    /// Restrict the sync to a single document. `nil` syncs all open
-    /// docs (default).
+    /// Restrict the sync to a single document. `nil` syncs the user's whole
+    /// document scope, owned and shared (default).
     public var documentId: String?
     /// `"full"` (default) syncs every doc's full metadata blob; `"ids"` syncs
     /// only the doc ID list. js-bao name parity.

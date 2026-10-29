@@ -442,13 +442,17 @@ public struct CommitOfflineCreateResult: Sendable, Equatable {
     /// `true` when the local doc was linked to a pre-existing server doc
     /// (`onExists: .link`).
     public let linked: Bool?
+    /// `true` when the server refused a pending db3 create (`reason` holds
+    /// its message, and `Db3CreateFailedEvent` fired); `nil` otherwise.
+    public let refused: Bool?
     /// Failure / no-op reason: `"not_pending"`, `"exists"`, or a server
     /// error message. `nil` on success.
     public let reason: String?
 
-    public init(created: Bool, linked: Bool? = nil, reason: String? = nil) {
+    public init(created: Bool, linked: Bool? = nil, refused: Bool? = nil, reason: String? = nil) {
         self.created = created
         self.linked = linked
+        self.refused = refused
         self.reason = reason
     }
 }

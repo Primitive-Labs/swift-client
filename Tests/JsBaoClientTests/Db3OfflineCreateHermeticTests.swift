@@ -12,9 +12,10 @@ import XCTest
 /// `Db3CreatedEvent`. `DB3_CREATE_IN_PROGRESS` and a 503 are retried by the
 /// backoff; `DB3_ID_EXISTS` leaves it pending with one `Db3CreateFailedEvent`,
 /// skipped by the next reconnect, and `commitOfflineCreate(documentId:)`
-/// tries again as a backoff round. A commit or an online create answered
-/// after another user signed in leaves nothing for that user, and an empty
-/// `type` is sent at commit (second opinion 4921-SO-002, -005, -007).
+/// tries again and answers the attempt (#5000). A commit answered after
+/// another user signed in leaves nothing for that user, and an empty `type`
+/// is sent at commit (second opinion 4921-SO-002, -005, -007). Since #5000
+/// an online create is a pending create too.
 final class Db3OfflineCreateHermeticTests: XCTestCase {
 
     private var directories: [String] = []
@@ -224,26 +225,85 @@ final class Db3OfflineCreateHermeticTests: XCTestCase {
         XCTAssertTrue(heard.createdEvents.isEmpty)
     }
 
-    /// 4921-SO-005: an explicit retry after a refusal is a backoff round, so a
-    /// transient failure on it is retried without another call or reconnect.
-    func testAnExplicitRetryAfterARefusalIsRetriedByTheBackoff() async throws {
-        let unavailable: Answer = { _ in throw HttpError(status: 503, message: "unavailable") }
+    /// 4921-SO-005, as #5000 made it: `commitOfflineCreate(documentId:)` after
+    /// a refusal clears it and commits now, answering the attempt's outcome;
+    /// a transient failure of that attempt throws and the backoff retries it
+    /// without another call or reconnect.
+    func testAnExplicitRetryAfterARefusalAnswersTheAttemptAndATransientFailureIsRetriedByTheBackoff() async throws {
         let ok: Answer = { body in Self.row(body) }
-        let (client, commits, heard, subs) = try await offlineClient(answers: [Self.taken, unavailable, ok])
+        let (client, commits, heard, subs) = try await offlineClient(answers: [Self.taken, ok])
         defer { subs.forEach { $0.cancel() } }
         let info = try await client.db3.create(title: "Refused then retried")
         await client.goOnline()
         try await eventually(description: "Db3CreateFailedEvent") { heard.failedEvents.count == 1 }
-
         let answer = try await client.commitOfflineCreate(documentId: info.id)
-        XCTAssertEqual(answer["scheduled"] as? Bool, true)
-        try await eventually(description: "Db3CreatedEvent after the backoff") { heard.createdEvents.count == 1 }
-        try await Task.sleep(nanoseconds: 200_000_000)
-        XCTAssertEqual(commits.db3Bodies.count, 3)
-        XCTAssertEqual(heard.createdEvents.map(\.id), [info.id])
-        XCTAssertEqual(heard.failedEvents.count, 1)
+        XCTAssertEqual(answer["created"] as? Bool, true)
+        XCTAssertNil(answer["scheduled"])
+        try await eventually(description: "Db3CreatedEvent") { heard.createdEvents.count == 1 }
+        XCTAssertEqual(commits.db3Bodies.count, 2)
         XCTAssertFalse(client.documentManager.isPendingCreate(info.id))
         XCTAssertNil(client.documentManager.getLocalMetadata(info.id)?.commitRefused)
+
+        let unavailable: Answer = { _ in throw HttpError(status: 503, message: "unavailable") }
+        let (second, secondCommits, secondHeard, secondSubs) = try await offlineClient(answers: [Self.taken, unavailable, ok])
+        defer { secondSubs.forEach { $0.cancel() } }
+        let retried = try await second.db3.create(title: "Refused, then a blip")
+        await second.goOnline()
+        try await eventually(description: "Db3CreateFailedEvent") { secondHeard.failedEvents.count == 1 }
+        do {
+            _ = try await second.commitOfflineCreate(documentId: retried.id)
+            XCTFail("a transient failure of the explicit attempt throws")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.status, 503)
+        }
+        try await eventually(description: "Db3CreatedEvent after the backoff") { secondHeard.createdEvents.count == 1 }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(secondCommits.db3Bodies.count, 3)
+        XCTAssertEqual(secondHeard.createdEvents.map(\.id), [retried.id])
+        XCTAssertEqual(secondHeard.failedEvents.count, 1)
+        XCTAssertFalse(second.documentManager.isPendingCreate(retried.id))
+    }
+
+    /// #5000: a waiting call whose commit start runs after the last attempt
+    /// finished sends nothing: a refused create answers its refusal and a
+    /// landed one `not_pending`, and neither is posted again.
+    func testAJoinAfterTheLastAttemptFinishedSendsNothing() async throws {
+        let ok: Answer = { body in Self.row(body) }
+        let (client, commits, heard, subs) = try await offlineClient(answers: [Self.taken, ok])
+        defer { subs.forEach { $0.cancel() } }
+        let manager = client.documentManager
+        let refused = try await client.db3.create(title: "Refused")
+        await client.goOnline()
+        try await eventually(description: "Db3CreateFailedEvent") { heard.failedEvents.count == 1 }
+        let late = try await manager.joinDb3Commit(documentId: refused.id, metadata: manager.getLocalMetadata(refused.id))
+        XCTAssertTrue(late.refused)
+        XCTAssertFalse(late.created)
+        XCTAssertEqual(commits.db3Bodies.count, 1, "a refusal is not repeated by a late join")
+        XCTAssertEqual(heard.failedEvents.count, 1)
+        XCTAssertEqual(manager.getLocalMetadata(refused.id)?.commitRefused, true)
+
+        let landed = try await client.db3.create(title: "Landed")
+        try await eventually(description: "Db3CreatedEvent") { heard.createdEvents.map(\.id) == [landed.id] }
+        let after = try await manager.joinDb3Commit(documentId: landed.id, metadata: manager.getLocalMetadata(landed.id))
+        XCTAssertFalse(after.created)
+        XCTAssertEqual(after.reason, "not_pending")
+        XCTAssertEqual(commits.db3Bodies.count, 2, "a landed create is not posted again")
+        XCTAssertEqual(heard.createdEvents.count, 1)
+    }
+
+    /// #5000 (5000-SO-001): `documents.commitOfflineCreate` carries the
+    /// refusal in the public result; the initializer as it was still compiles.
+    func testTheDocumentsCommitResultCarriesTheRefusal() async throws {
+        let (client, _, heard, subs) = try await offlineClient(answers: [Self.taken])
+        defer { subs.forEach { $0.cancel() } }
+        let info = try await client.db3.create(title: "Refused")
+        await client.goOnline()
+        try await eventually(description: "Db3CreateFailedEvent") { heard.failedEvents.count == 1 }
+        let answer = try await client.documents.commitOfflineCreate(documentId: info.id)
+        XCTAssertEqual(answer, CommitOfflineCreateResult(created: false, refused: true, reason: "A document of this app holds this id"))
+        XCTAssertEqual(CommitOfflineCreateResult(created: true, linked: nil, reason: nil), CommitOfflineCreateResult(created: true))
+        XCTAssertNil(CommitOfflineCreateResult(created: true).refused)
+        XCTAssertNotEqual(CommitOfflineCreateResult(created: false), CommitOfflineCreateResult(created: false, refused: true))
     }
 
     /// 4921-SO-007: an empty type is sent at commit as the online create sends it.
@@ -279,35 +339,19 @@ final class Db3OfflineCreateHermeticTests: XCTestCase {
         XCTAssertNil(client.recordLogBinding(info.id), "nor bound for user-b")
     }
 
-    func testAnOnlineCreateFailingAfterAnotherUsersSignInKeepsNothing() async throws {
-        for switched in [false, true] {
-            let (client, _, heard, subs) = try await offlineClient()
-            defer { subs.forEach { $0.cancel() } }
-            await client.goOnline()
-            let transport = RecordingTransport(responder: { _ in
-                if switched {
-                    client.updateToken(makeTestJwt(userId: "user-b"))
-                    await client.rebindUserScopedStorage()
-                }
-                return TransportResponse(status: 503, headers: ["Content-Type": "application/json"], body: Data("{}".utf8))
-            })
-            let api = Db3API(lifecycle: client._db3Lifecycle, transport: transport, client: client)
-            if !switched {
-                let info = try await api.create(title: "Kept")
-                XCTAssertTrue(client.listPendingCreates().contains(info.id))
-                continue
-            }
-            do {
-                _ = try await api.create(title: "Not kept")
-                XCTFail("the create rejects once another user signed in")
-            } catch {}
-            XCTAssertEqual(heard.failedEvents.count, 1)
-            XCTAssertNotNil(heard.failedEvents.first?.id)
-            XCTAssertTrue(client.listPendingCreates().isEmpty)
-            if let id = heard.failedEvents.first?.id {
-                XCTAssertNil(client.documentManager.getLocalMetadata(id))
-            }
-        }
+    /// #5000: online, a create of your own synced db3 through a `Db3API`
+    /// with a wired client is a pending create too, committed through the
+    /// hook: its transport is not asked. (The account fence of that commit is
+    /// `testACommitAnsweredAfterAnotherUsersSignInIsNotAdopted`.)
+    func testAnOnlineCreateIsAPendingCreateCommittedThroughTheHook() async throws {
+        let (client, commits, heard, subs) = try await offlineClient()
+        defer { subs.forEach { $0.cancel() } }
+        await client.goOnline()
+        let transport = RecordingTransport(status: 503, json: "{}")
+        let info = try await Db3API(lifecycle: client._db3Lifecycle, transport: transport, client: client).create(title: "Kept")
+        XCTAssertTrue(transport.calls.isEmpty, "no request through the transport")
+        try await eventually(description: "Db3CreatedEvent") { heard.createdEvents.map(\.id) == [info.id] }
+        XCTAssertEqual(commits.db3Bodies.first?["id"]?.stringValue, info.id)
     }
 
     // MARK: - Edge case E14

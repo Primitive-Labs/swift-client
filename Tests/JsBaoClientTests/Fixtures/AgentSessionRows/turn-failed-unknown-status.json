@@ -1,0 +1,20 @@
+{
+  "model": "Turn",
+  "row": {
+    "id": "turn_2",
+    "seq": 2,
+    "status": "paused",
+    "errorCode": "AGENT_MODEL_FAILED",
+    "errorMessage": "upstream 502"
+  },
+  "expect": {
+    "id": "turn_2",
+    "seq": 2,
+    "status": "unknown",
+    "initiatorUserId": {
+      "$absent": true
+    },
+    "errorCode": "AGENT_MODEL_FAILED",
+    "errorMessage": "upstream 502"
+  }
+}

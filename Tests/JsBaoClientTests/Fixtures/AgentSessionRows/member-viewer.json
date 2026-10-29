@@ -1,0 +1,13 @@
+{
+  "model": "Member",
+  "row": {
+    "id": "u_3",
+    "role": "viewer",
+    "addedAt": "2026-09-28T12:00:01.000Z"
+  },
+  "expect": {
+    "id": "u_3",
+    "role": "viewer",
+    "addedAt": "2026-09-28T12:00:01.000Z"
+  }
+}

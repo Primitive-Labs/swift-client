@@ -3,23 +3,24 @@ import XCTest
 @testable import JsBaoClient
 
 /// The decision rules of `view.handleClientTools` in the Swift client
-/// (#4263, plan behavior 14): which tool-call part a handler may run, how a
-/// failed answer is classified by error class, an error's message as an
-/// answer, and what a handler's result becomes. The same tables as the JS
-/// client's `agent-client-tools-4263.test.ts`, fed decoded rows, refusals
-/// parsed from recorded response bodies and the client's own error values;
-/// no transport.
+/// (#4263, plan behavior 14; #4884 behavior 10's rule over call records):
+/// which call a handler may run, how a failed answer is classified by error
+/// class, an error's message as an answer, and what a handler's result
+/// becomes. The same tables as the JS client's `agent-client-tools-4263.test.ts`,
+/// fed decoded `ToolCall` rows, refusals parsed from recorded response bodies
+/// and the client's own error values; no transport.
 final class AgentClientToolDecisionsHermeticTests: XCTestCase {
     private static let createdAt = "2026-10-06T12:00:00.000Z"
 
-    private func toolCall(_ fields: [String: JSONValue]) throws -> PrimitivePart {
+    /// A `ToolCall` row of turn `t1`, decoded; its id is the call's.
+    private func toolCall(_ fields: [String: JSONValue]) throws -> AgentSessionToolCallRecord {
         var row: [String: JSONValue] = [
-            "id": "part-1", "messageId": "msg-1", "seq": 2, "kind": "tool_call",
-            "toolCallId": "call-1", "toolName": "pick", "input": "{\"question\":\"how many\"}",
+            "id": "call-1", "messageId": "msg-1", "seq": 2, "turnId": "t1",
+            "toolName": "pick", "input": "{\"question\":\"how many\"}",
             "createdAt": .string(Self.createdAt),
         ]
         for (key, value) in fields { row[key] = value }
-        return try XCTUnwrap(PrimitivePart(row: row))
+        return try XCTUnwrap(AgentSessionToolCallRecord(row: row))
     }
 
     /// A refusal as the HTTP client reads it from the server's error body.
@@ -34,43 +35,42 @@ final class AgentClientToolDecisionsHermeticTests: XCTestCase {
 
     func testTakesAnInputAvailableCallOfARegisteredToolWithItsIdsAndInput() throws {
         let call = AgentClientToolDecisions.eligibleCall(
-            part: try toolCall(["state": "input-available"]), registered: registered
+            call: try toolCall(["state": "input-available"]), registered: registered
         )
         XCTAssertEqual(call, AgentClientToolDecisions.EligibleCall(
             callId: "call-1", toolName: "pick", input: ["question": "how many"],
-            messageId: "msg-1", partId: "part-1", state: "input-available"
+            messageId: "msg-1", partId: "call-1", state: .inputAvailable
         ))
     }
 
     func testTakesAnApprovedCallOnly() throws {
         let approved = try toolCall(["state": "approval-responded", "approvalApproved": true])
-        XCTAssertEqual(AgentClientToolDecisions.eligibleCall(part: approved, registered: registered)?.state, "approval-responded")
+        XCTAssertEqual(AgentClientToolDecisions.eligibleCall(call: approved, registered: registered)?.state, .approvalResponded)
         let denied = try toolCall(["state": "approval-responded", "approvalApproved": false])
-        XCTAssertNil(AgentClientToolDecisions.eligibleCall(part: denied, registered: registered))
+        XCTAssertNil(AgentClientToolDecisions.eligibleCall(call: denied, registered: registered))
         let unsaid = try toolCall(["state": "approval-responded"])
-        XCTAssertNil(AgentClientToolDecisions.eligibleCall(part: unsaid, registered: registered))
+        XCTAssertNil(AgentClientToolDecisions.eligibleCall(call: unsaid, registered: registered))
     }
 
     func testNeverTakesAWaitingTerminalStreamingOrUnknownState() throws {
         for state: JSONValue in [
-            "input-streaming", "approval-requested", "output-available", "output-error", "output-denied",
-            "dreaming", .null,
+            "input-streaming", "approval-requested", "output-available", "output-error", "output-denied", "dreaming",
         ] {
             XCTAssertNil(
-                AgentClientToolDecisions.eligibleCall(part: try toolCall(["state": state]), registered: registered),
+                AgentClientToolDecisions.eligibleCall(call: try toolCall(["state": state]), registered: registered),
                 "\(state)"
             )
         }
+        var stateless = try toolCall(["state": "input-available"]).row
+        stateless["state"] = nil
+        XCTAssertNil(AgentSessionToolCallRecord(row: stateless), "a call with no state does not decode")
     }
 
-    func testNeverTakesAnUnregisteredNameAMissingCallIdOrAnotherKind() throws {
-        for fields: [String: JSONValue] in [
-            ["toolName": "lookup"], ["toolName": .null], ["toolCallId": .null], ["toolCallId": ""],
-            ["kind": "text"],
-        ] {
+    func testNeverTakesAnUnregisteredNameOrAnEmptyId() throws {
+        for fields: [String: JSONValue] in [["toolName": "lookup"], ["toolName": ""], ["id": ""]] {
             var row = fields
             row["state"] = "input-available"
-            XCTAssertNil(AgentClientToolDecisions.eligibleCall(part: try toolCall(row), registered: registered), "\(fields)")
+            XCTAssertNil(AgentClientToolDecisions.eligibleCall(call: try toolCall(row), registered: registered), "\(fields)")
         }
     }
 
@@ -199,29 +199,5 @@ final class AgentClientToolDecisionsHermeticTests: XCTestCase {
                 XCTFail("a non-finite \(label) throws")
             } catch is EncodingError {}
         }
-    }
-
-    // MARK: - The view's sync stream (spec rule 2)
-
-    /// The view filters `SyncEvent` to its document after the stream buffers
-    /// it, so the buffer must keep the session's sync through a burst of
-    /// other documents' syncs that lands before the view drains it.
-    func testTheSessionsSyncSurvivesABurstOfOtherDocumentsSyncs() async throws {
-        let client = JsBaoClient(options: JsBaoClientOptions(
-            apiUrl: "http://127.0.0.1:1", wsUrl: "ws://127.0.0.1:1", appId: "test-app", token: "test-token",
-            offline: false, logLevel: .error, storageConfig: .memory, autoNetwork: false
-        ))
-        let syncs = AgentSessionView.syncEvents(of: client)
-        client.eventEmitter.emit(SyncEvent(documentId: "doc-session", synced: true))
-        for index in 0..<40 {
-            client.eventEmitter.emit(SyncEvent(documentId: "doc-other-\(index)", synced: true))
-        }
-        client.eventEmitter.emit(SyncEvent(documentId: "doc-last", synced: true))
-        var sawSession = false
-        for await event in syncs {
-            if event.documentId == "doc-session" { sawSession = true }
-            if event.documentId == "doc-last" { break }
-        }
-        XCTAssertTrue(sawSession, "the session's sync is still buffered after 40 other documents' syncs")
     }
 }

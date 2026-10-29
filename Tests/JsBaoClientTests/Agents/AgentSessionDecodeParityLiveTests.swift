@@ -3,14 +3,15 @@ import XCTest
 
 /// Live session rows decode the same in Swift and in the JS client (#3810,
 /// plan behavior 26; intent criterion 23, "decoding checked against the JS
-/// client's").
+/// client's"; #4884 behavior 17: the seven models of a session's db3).
 ///
 /// The suite provisions its own corpus through `AgentSessionScenarioHarness`
 /// — it runs under its own checkpoint filter, so it cannot lean on the live
-/// suite having run — then reads every raw row of the four models from its
-/// own store, as document sync delivered them, and holds the Swift decode and
-/// the JS client's decode (`CrossPlatform/harness/agent-session-decode.mjs`)
-/// to one projection (`AgentSessionProjection`, the #3802 fixture rules).
+/// suite having run — then reads every raw row of the seven models from its
+/// client's local copy of each session's db3, by model name, as the room
+/// synced them, and holds the Swift decode and the JS client's decode
+/// (`CrossPlatform/harness/agent-session-decode.mjs`) to one projection
+/// (`AgentSessionProjection`, the shared fixtures' rules).
 final class AgentSessionDecodeParityLiveTests: XCTestCase {
 
     func testLiveRowsDecodeTheSameInSwiftAndInTheJsClient() async throws {
@@ -34,14 +35,20 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
     }
 
     private func compare(_ h: AgentSessionScenarioHarness, node: String) async throws {
-        let (client, documents) = try await provision(h)
+        let (client, sessions) = try await provision(h)
 
-        // Every raw row of the four models, from this client's store.
+        // Every raw row of the seven models, from this client's copy of each
+        // session's db3, held subscribed while it is read.
+        let subscriptions = try sessions.map { try client.db3.subscribe($0) }
+        defer { subscriptions.forEach { $0.dispose() } }
+        for subscription in subscriptions { try await subscription.ready() }
         var rows: [(model: String, row: [String: JSONValue])] = []
         try await h.poll(timeout: 60, "the corpus syncs with its coverage") {
-            rows = try AgentSessionModels.schemas.flatMap { schema in
-                try client.codegen.query(schema, filter: nil, options: QueryOptions(documents: documents))
-                    .map { (model: schema.name, row: $0) }
+            rows = try sessions.flatMap { sessionId in
+                try AgentSessionModels.modelNames.flatMap { model in
+                    try client.documents.records(sessionId).query(model, nil, options: QueryOptions(limit: 10_000)).data
+                        .map { (model: model, row: $0.raw) }
+                }
             }
             return Coverage(rows).missing.isEmpty
         }
@@ -69,7 +76,7 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
     /// One TOOLS session (approved, denied and superseded calls, a Swift event
     /// and a `note` function event), one SERVER session (request and task
     /// tools, a file) and one PRESENT session (#4549: numbered calls and a
-    /// presentation). Answers the reading client and the three documents.
+    /// presentation). Answers the reading client and the three sessions.
     private func provision(_ h: AgentSessionScenarioHarness) async throws -> (JsBaoClient, [String]) {
         let partC = try await h.client(h.part)
         let part2C = try await h.client(h.part2)
@@ -131,7 +138,7 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
             try await h.settled(presenting)
             try? await h.poll(timeout: 30, "the presentation syncs") {
                 presented = presentView.syncedMessages
-                    .flatMap { presentView.presentations(of: $0.message, names: ["present"]) }
+                    .flatMap { presentView.presentations(of: $0, names: ["present"]) }
                     .first
                 return presented != nil
             }
@@ -140,7 +147,7 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
         let shown = try XCTUnwrap(presentation.input["show"]?.arrayValue?.first?.wholeNumber)
         XCTAssertEqual(presentation.call(shown)?.toolName, "lookup")
         XCTAssertNotNil(presentation.part.callNumber)
-        return (partC, [tools.documentId, server.documentId, presenting.documentId])
+        return (partC, [tools.sessionId, server.sessionId, presenting.sessionId])
     }
 
     /// What the corpus must hold before the comparison means anything.
@@ -152,31 +159,33 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
                 Set(rows.filter { $0.model == model }.compactMap { $0.row[name]?.stringValue })
             }
             var missing: [String] = []
-            let sessions = rows.filter { $0.model == "PrimitiveSession" }.compactMap { PrimitiveSession(row: $0.row) }
-            if !sessions.contains(where: { $0.title != nil && ($0.participantUserIds?.count ?? 0) > 1 && $0.viewerUserIds != nil }) {
-                missing.append("a session with members and a title")
+            for model in AgentSessionModels.modelNames where !rows.contains(where: { $0.model == model }) {
+                missing.append("a \(model) row")
             }
-            for author in ["user", "agent", "app"] where !column("PrimitiveMessage", "authorKind").contains(author) {
+            if !rows.contains(where: { $0.model == "Session" && $0.row["title"]?.stringValue != nil }) {
+                missing.append("a session with a title")
+            }
+            for role in ["owner", "participant", "viewer"] where !column("Member", "role").contains(role) {
+                missing.append("a \(role) member")
+            }
+            for author in ["user", "agent", "app"] where !column("Message", "authorKind").contains(author) {
                 missing.append("a \(author) message")
             }
-            for kind in ["text", "file", "event", "tool_call"] where !column("PrimitivePart", "kind").contains(kind) {
+            for kind in ["text", "file", "event"] where !column("Part", "kind").contains(kind) {
                 missing.append("a \(kind) part")
             }
-            let toolStates = Set(rows.filter { $0.model == "PrimitivePart" && $0.row["kind"]?.stringValue == "tool_call" }
-                .compactMap { $0.row["state"]?.stringValue })
-            for state in ["output-available", "output-denied", "output-error"] where !toolStates.contains(state) {
-                missing.append("a tool_call part \(state)")
+            for state in ["output-available", "output-denied", "output-error"] where !column("ToolCall", "state").contains(state) {
+                missing.append("a call \(state)")
             }
-            for kind in ["model_call", "tool_call"] where !column("PrimitiveStep", "kind").contains(kind) {
+            for kind in ["model_call", "tool_call"] where !column("Step", "kind").contains(kind) {
                 missing.append("a \(kind) step")
             }
+            if !column("Turn", "status").contains("completed") { missing.append("a completed turn") }
             // #4549: numbered calls, a presentation among them.
-            let numbered = rows.filter {
-                $0.model == "PrimitivePart" && $0.row["kind"]?.stringValue == "tool_call" && $0.row["callNumber"] != nil
-            }
-            if numbered.isEmpty { missing.append("a numbered tool_call part") }
+            let numbered = rows.filter { $0.model == "ToolCall" && $0.row["callNumber"] != nil }
+            if numbered.isEmpty { missing.append("a numbered call") }
             if !numbered.contains(where: { $0.row["toolName"]?.stringValue == "present" && $0.row["state"]?.stringValue == "output-available" }) {
-                missing.append("a presentation part")
+                missing.append("a presentation call")
             }
             self.missing = missing
         }

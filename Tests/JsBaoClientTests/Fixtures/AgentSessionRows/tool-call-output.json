@@ -1,0 +1,69 @@
+{
+  "model": "ToolCall",
+  "row": {
+    "id": "call_01K6CALL0000000000000000000",
+    "messageId": "01K6MESSAGE0000000000000000",
+    "seq": 1,
+    "turnId": "turn_1",
+    "toolName": "record_expense",
+    "state": "output-available",
+    "input": "{\"amount\":12.5,\"currency\":\"EUR\"}",
+    "output": "{\"recorded\":true,\"id\":\"exp_1\",\"tags\":[\"travel\",null]}",
+    "statusText": "Recording your expense",
+    "approvalApproved": true,
+    "approvalUserId": "u_owner",
+    "approvalRespondedAt": "2026-09-28T12:00:00.000Z",
+    "resolvedByUserId": "u_owner",
+    "artifact": "{\"rows\":[{\"a\":1}]}",
+    "providerMetadata": "{\"google\":{\"thoughtSignature\":\"sig\"}}",
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "modifiedAt": "2026-09-28T12:00:00.000Z"
+  },
+  "expect": {
+    "state": "output-available",
+    "toolName": "record_expense",
+    "input": {
+      "amount": 12.5,
+      "currency": "EUR"
+    },
+    "output": {
+      "recorded": true,
+      "id": "exp_1",
+      "tags": [
+        "travel",
+        null
+      ]
+    },
+    "statusText": "Recording your expense",
+    "approvalApproved": true,
+    "approvalReason": {
+      "$absent": true
+    },
+    "approvalUserId": "u_owner",
+    "approvalRespondedAt": "2026-09-28T12:00:00.000Z",
+    "resolvedByUserId": "u_owner",
+    "artifact": {
+      "rows": [
+        {
+          "a": 1
+        }
+      ]
+    },
+    "artifactBlobId": {
+      "$absent": true
+    },
+    "providerMetadata": {
+      "google": {
+        "thoughtSignature": "sig"
+      }
+    },
+    "errorText": {
+      "$absent": true
+    },
+    "errorCode": {
+      "$absent": true
+    },
+    "modifiedAt": "2026-09-28T12:00:00.000Z",
+    "id": "call_01K6CALL0000000000000000000"
+  }
+}

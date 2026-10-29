@@ -156,3 +156,71 @@ final class RecordLogLiveApp {
         try? FileManager.default.removeItem(atPath: directory)
     }
 }
+
+/// #5000 — a live client's db3 commits, held. The client's
+/// `documentManager.createRemoteDb3` (the hook that sends a pending db3
+/// create's `POST db3`) is wrapped: each commit is recorded, waits until
+/// `open()`, and is then forwarded to the original hook, which sends it to
+/// the server. `failNext(_:)` makes the next forwarded commit throw that error
+/// instead of being sent (once).
+final class HeldDb3Commit: @unchecked Sendable {
+    private let gate = RecordLogReceiptHarness.Gate()
+    private let sent = LockedBox<[[String: JSONValue]]>([])
+    private let failure = LockedBox<Error?>(nil)
+
+    /// Every commit body the client handed the hook, in order.
+    var bodies: [[String: JSONValue]] { sent.value }
+
+    /// Let every held commit, and every later one, through to the server.
+    func open() { gate.open() }
+
+    /// Answer the next forwarded commit with `error`, sending nothing.
+    func failNext(_ error: Error) { failure.value = error }
+
+    fileprivate func record(_ body: JSONValue) { sent.withValue { $0.append(body.objectValue ?? [:]) } }
+    fileprivate func waitOpen() async { await gate.wait() }
+    fileprivate func takeFailure() -> Error? { failure.withValue { error in defer { error = nil }; return error } }
+}
+
+/// Hold `client`'s db3 commits until the answer's `open()` (see ``HeldDb3Commit``).
+func heldDb3Commit(_ client: JsBaoClient) -> HeldDb3Commit {
+    let held = HeldDb3Commit()
+    let original = client.documentManager.createRemoteDb3
+    client.documentManager.createRemoteDb3 = { body in
+        held.record(body)
+        await held.waitOpen()
+        if let error = held.takeFailure() { throw error }
+        guard let original else { throw JsBaoError(code: .unavailable, message: "no db3 commit hook") }
+        return try await original(body)
+    }
+    return held
+}
+
+/// #5000 — `client.db3.create`, returning once the server has the db3. A
+/// local-first create returns before its commit lands, so a test that reads
+/// the server's copy right after one waits here. It asks
+/// `commitOfflineCreate(documentId:)` for the verdict: `created`, or
+/// `not_pending` once the create is no longer pending (the commit landed
+/// first), returns; `refused` throws; a transient failure waits for the
+/// backoff's commit, until `timeout`.
+func createdOnServer(
+    _ client: JsBaoClient, title: String, type: String? = nil, tags: [String]? = nil, timeout: TimeInterval = 10
+) async throws -> Db3Info {
+    let info = try await client.db3.create(title: title, type: type, tags: tags)
+    let verdict: [String: Any]
+    do {
+        verdict = try await client.commitOfflineCreate(documentId: info.id)
+    } catch {
+        verdict = [:]
+    }
+    if verdict["created"] as? Bool == true { return info }
+    if verdict["refused"] as? Bool == true {
+        throw TestSetupError("the server refused \(info.id): \(verdict["reason"] as? String ?? "")")
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    while client.isPendingCreate(info.id) {
+        guard Date() < deadline else { throw TestSetupError("timed out waiting for \(info.id) on the server (last: \(verdict))") }
+        try await Task.sleep(nanoseconds: 100_000_000)
+    }
+    return info
+}

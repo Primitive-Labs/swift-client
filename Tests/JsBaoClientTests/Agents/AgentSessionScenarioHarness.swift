@@ -13,6 +13,12 @@ import XCTest
 /// checkpoint runs one class alone. Assertions built on it are on shapes and
 /// codes, never on the model's words; a turn whose model answered without the
 /// calls it was told to make is sent once more (the #3807/#3809 pattern).
+///
+/// #4884: a session is its own db3, named by the session's id. Clients store
+/// on SQLite (a db3 needs a persistent store), uploads go through the session
+/// attachment route, and rows only the session writes are seeded through the
+/// session object's local probe (`seed`), since no client writes a
+/// resource-held db3.
 final class AgentSessionScenarioHarness: @unchecked Sendable {
     static let model = "anthropic/claude-sonnet-4.5"
     /// A 1×1 PNG.
@@ -47,6 +53,8 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
 
     private let clientsBox = LockedBox([JsBaoClient]())
     private let viewsBox = LockedBox([AgentSessionView]())
+    /// Where the clients' stores live; removed by `cleanup`.
+    private let storeDirectory = NSTemporaryDirectory() + "agent-session-harness-\(UUID().uuidString)"
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 60
@@ -235,13 +243,14 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
             await client.destroy()
         }
         await ctx.cleanup()
+        try? FileManager.default.removeItem(atPath: storeDirectory)
     }
 
     // MARK: - Sessions
 
+    /// A session: its id names its db3 too.
     struct Session: Sendable {
         let sessionId: String
-        let documentId: String
     }
 
     /// A session created by the pushed `create` function, as the owner.
@@ -261,10 +270,9 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
         )
         guard result["status"] as? String == "completed",
               let output = result["output"] as? [String: Any],
-              let sessionId = output["sessionId"] as? String,
-              let documentId = output["documentId"] as? String
+              let sessionId = output["sessionId"] as? String
         else { throw TestSetupError("createSession failed: \(result)") }
-        return Session(sessionId: sessionId, documentId: documentId)
+        return Session(sessionId: sessionId)
     }
 
     /// The pushed `note` function, invoked over HTTP by `user`: an event the
@@ -283,10 +291,16 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
 
     // MARK: - Clients and views
 
-    /// A connected client for `user` in `app` (this harness's app by default).
+    /// A connected client for `user` in `app` (this harness's app by default),
+    /// storing on its own SQLite file.
     func client(_ user: TestUser, app: String? = nil) async throws -> JsBaoClient {
-        let client = createTestClient(appId: app ?? appId, token: user.jwt)
+        try FileManager.default.createDirectory(atPath: storeDirectory, withIntermediateDirectories: true)
+        let client = createTestClient(
+            appId: app ?? appId, token: user.jwt,
+            storageConfig: .sqlite(directory: storeDirectory + "/\(UUID().uuidString.prefix(8)).sqlite")
+        )
         clientsBox.withValue { $0.append(client) }
+        _ = await client.waitForStorageReady()
         try await client.connect()
         try await waitForConnection(client: client, timeout: 15)
         return client
@@ -300,11 +314,47 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
         return view
     }
 
-    /// Upload the PNG to the session's document as `client`'s user.
+    /// Upload the PNG to the session through its attachment route, as `client`'s user.
     func uploadPng(_ client: JsBaoClient, _ s: Session) async throws -> String {
-        try await client.documents.blobs(documentId: s.documentId).upload(
-            data: Self.png, options: BlobUploadSourceOptions(filename: "dot.png", contentType: "image/png")
+        let blobId = ULID.generate()
+        return try await client.agents.sessions.uploadAttachment(
+            sessionId: s.sessionId, blobId: blobId,
+            AgentSessionAttachmentUpload(data: Self.png, filename: "dot.png", contentType: "image/png")
         ).blobId
+    }
+
+    /// Rows only the session writes, written through its object's local probe
+    /// (`write`): each `{ model, action: "create" | "patch", id, data }`.
+    func seed(_ s: Session, operations: [[String: Any]]) async throws {
+        try await probe(s, "write", body: ["operations": operations])
+    }
+
+    /// Calls `client` makes to the documents API for a document's info or
+    /// format, counted at the client's two hooks; each call still answers.
+    final class DocumentsCalls: @unchecked Sendable {
+        private let lock = NSLock()
+        private var calls: [String] = []
+        var all: [String] { lock.withLock { calls } }
+        func note(_ call: String) { lock.withLock { calls.append(call) } }
+    }
+
+    func documentsCalls(of client: JsBaoClient) -> DocumentsCalls {
+        let counted = DocumentsCalls()
+        let fetch = client.documentManager.fetchDocumentInfo
+        client.documentManager.fetchDocumentInfo = { [weak client] documentId in
+            counted.note("info \(documentId)")
+            if let fetch { return try await fetch(documentId) }
+            guard let client else { throw JsBaoError(code: .unavailable) }
+            return try await client.documents.get(documentId: documentId)
+        }
+        let lookup = client.documentFormatLookupForTest
+        client.documentFormatLookupForTest = { [weak client] documentId in
+            counted.note("format \(documentId)")
+            if let lookup { return try await lookup(documentId) }
+            guard let client else { throw JsBaoError(code: .unavailable) }
+            return try await client.documents.get(documentId: documentId).documentFormat
+        }
+        return counted
     }
 
     // MARK: - The local probe
@@ -405,19 +455,42 @@ extension AgentSessionView {
         messages.compactMap { if case let .pending(m) = $0 { return m } else { return nil } }
     }
 
-    /// Every tool call part in the window.
-    var toolCalls: [PrimitivePart] {
-        syncedMessages.flatMap(\.parts).filter { $0.kind == .toolCall }
+    /// Every tool call in the window: its `ToolCall` records.
+    var toolCalls: [AgentSessionToolCallRecord] {
+        syncedMessages.flatMap(\.parts).compactMap { if case let .toolCall(call) = $0 { return call } else { return nil } }
     }
 
-    func toolCall(_ callId: String) -> PrimitivePart? {
-        toolCalls.first { $0.toolCallId == callId }
+    func toolCall(_ callId: String) -> AgentSessionToolCallRecord? {
+        toolCalls.first { $0.id == callId }
     }
 
     /// Every step of the window's turns, once each.
-    var allSteps: [PrimitiveStep] {
+    var allSteps: [AgentSessionStepRecord] {
         var seen = Set<String>()
         return syncedMessages.flatMap(\.steps).filter { seen.insert($0.id).inserted }
+    }
+}
+
+extension AgentSessionViewPart {
+    /// The text or reasoning columns of a `Part`, or `nil`.
+    var textPart: AgentSessionTextPart? {
+        guard case let .part(part) = self else { return nil }
+        switch part.content {
+        case let .text(text), let .reasoning(text): return text
+        default: return nil
+        }
+    }
+
+    /// The file columns of a `Part`, or `nil`.
+    var filePart: AgentSessionFilePart? {
+        guard case let .part(part) = self, case let .file(file) = part.content else { return nil }
+        return file
+    }
+
+    /// The event columns of a `Part`, or `nil`.
+    var eventPart: AgentSessionEventPart? {
+        guard case let .part(part) = self, case let .event(event) = part.content else { return nil }
+        return event
     }
 }
 

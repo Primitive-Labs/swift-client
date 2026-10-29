@@ -1,8 +1,9 @@
 import XCTest
 @testable import JsBaoClient
 
-/// #4806 behaviors 12 to 15 and edge case 034 — `client.db3`'s lifecycle
-/// calls against the dev server.
+/// #4806 behaviors 12 to 15 — `client.db3`'s lifecycle calls against the
+/// dev server. (Edge case 034, a refused type, is a refusal event since #5000:
+/// `Db3LocalFirstCreateLiveTests`, behavior 14.)
 ///
 /// - 12: `create(title:type:)` answers the typed db3 held by its creator and
 ///   is resident at once: `stored()` lists it, a declared model saves and
@@ -130,17 +131,6 @@ final class Db3LifecycleApiLiveTests: XCTestCase {
         XCTAssertEqual(after, before)
         let storedNow = try await client.db3.stored()
         XCTAssertEqual(storedNow, [])
-    }
-
-    /// Edge case 034.
-    func testACreateNamingNoTypeOfTheAppIsRefused() async throws {
-        let owner = try await live.client("owner", models: [Self.note])
-        let before = try await owner.db3.listMine().items.count
-        let refused = await status { _ = try await owner.db3.create(title: "Typed", type: "no-such-type-\(UUID().uuidString.prefix(6))") }
-        XCTAssertEqual(refused.0, 404)
-        XCTAssertEqual(refused.1, "DB3_TYPE_NOT_FOUND")
-        let after = try await owner.db3.listMine().items.count
-        XCTAssertEqual(after, before)
     }
 
     // MARK: - Behavior 13

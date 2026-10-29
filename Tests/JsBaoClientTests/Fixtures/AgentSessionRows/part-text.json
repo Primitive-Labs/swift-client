@@ -1,18 +1,17 @@
 {
-  "model": "PrimitivePart",
+  "model": "Part",
   "row": {
     "id": "01K6PART00000000000000000000",
     "messageId": "01K6MESSAGE0000000000000000",
     "seq": 1,
-    "createdAt": "2026-09-28T12:00:00.000Z",
     "kind": "text",
-    "state": "done",
     "text": "Here is your refund.",
-    "providerMetadata": "{\"openrouter\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"gAAAAB\",\"index\":0},{\"type\":\"reasoning.summary\",\"summary\":null,\"index\":1}]},\"google\":{\"thoughtSignature\":\"c2lnbmF0dXJl\"}}"
+    "textState": "done",
+    "providerMetadata": "{\"openrouter\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"gAAAAB\",\"index\":0},{\"type\":\"reasoning.summary\",\"summary\":null,\"index\":1}]},\"google\":{\"thoughtSignature\":\"c2lnbmF0dXJl\"}}",
+    "createdAt": "2026-09-28T12:00:00.000Z"
   },
   "expect": {
     "kind": "text",
-    "state": "done",
     "text": "Here is your refund.",
     "providerMetadata": {
       "openrouter": {
@@ -32,6 +31,7 @@
       "google": {
         "thoughtSignature": "c2lnbmF0dXJl"
       }
-    }
+    },
+    "textState": "done"
   }
 }

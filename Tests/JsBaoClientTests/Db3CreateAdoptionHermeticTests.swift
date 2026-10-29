@@ -5,7 +5,9 @@ import XCTest
 /// the server is resident here from its answer on, and only for the account
 /// that asked.
 ///
-/// `client.db3.create` waits for `POST db3`. A synced db3 is then adopted: its
+/// A request-first `client.db3.create` (one naming a custodian; since #5000 a
+/// create of the caller's own synced db3 naming none is a pending create that
+/// never waits for the route) waits for `POST db3`. A synced db3 is then adopted: its
 /// metadata row is written from the answer, its fresh store is marked caught
 /// up at cursor 0 (the room's log is empty at create), and it is bound with no
 /// pending create and no commit, so it answers reads and takes writes before
@@ -81,7 +83,7 @@ final class Db3CreateAdoptionHermeticTests: XCTestCase {
     func testASyncedCreateIsResidentAtOnceWithNoPendingCreateAndNoCommit() async throws {
         let (client, commits) = try await client()
         let transport = RecordingTransport(status: 201, json: Self.answer())
-        let info = try await api(client, transport).create(title: "Orders")
+        let info = try await api(client, transport).create(title: "Orders", custodian: "user:user-a")
         XCTAssertEqual(info.id, Self.db3Id)
         XCTAssertEqual(transport.calls.map(\.path), ["/db3"])
 
@@ -119,20 +121,18 @@ final class Db3CreateAdoptionHermeticTests: XCTestCase {
         XCTAssertEqual(commits.value, 0, "no POST /documents for a db3 the server created")
     }
 
-    /// #4921 behavior 35: online, a create of your own synced db3 sends the id
-    /// it minted and is adopted from the answer; a sync-off or custodian-naming
-    /// create sends no id.
-    func testAnOnlineCreateSendsAClientMintedIdOnlyWhenItHoldsTheDb3() async throws {
+    /// #4921 behavior 35, as #5000 made it: online, a create of your own
+    /// synced db3 mints its id and is a pending create, asking the transport
+    /// nothing; a sync-off or custodian-naming create sends no id, and its
+    /// refusal throws and writes nothing.
+    func testOnlyACreateOfYourOwnSyncedDb3MintsItsIdAndItAsksTheTransportNothing() async throws {
         let (client, commits) = try await client()
         let minted = RecordingTransport(status: 201, json: Self.answer())
         let info = try await api(client, minted).create(title: "Orders", tags: ["t"])
-        let body = try XCTUnwrap(minted.lastCall(to: "/db3")?.jsonBody)
-        let id = try XCTUnwrap(body["id"]?.stringValue)
-        XCTAssertNotNil(id.range(of: "^[0-7][0-9A-HJKMNP-TV-Z]{25}$", options: .regularExpression), id)
-        XCTAssertEqual(body["title"]?.stringValue, "Orders")
-        XCTAssertEqual(info.id, Self.db3Id, "the answer is adopted")
-        XCTAssertNotNil(client.recordLogBinding(Self.db3Id))
-        XCTAssertFalse(client.documentManager.isPendingCreate(id))
+        XCTAssertNotNil(info.id.range(of: "^[0-7][0-9A-HJKMNP-TV-Z]{25}$", options: .regularExpression), info.id)
+        XCTAssertTrue(minted.calls.isEmpty, "a pending create, committed through the hook")
+        XCTAssertTrue(client.documentManager.isPendingCreate(info.id))
+        XCTAssertNotNil(client.recordLogBinding(info.id))
 
         let off = RecordingTransport(status: 201, json: Self.answer(sync: false))
         _ = try await api(client, off).create(title: "Orders", sync: false)
@@ -144,7 +144,7 @@ final class Db3CreateAdoptionHermeticTests: XCTestCase {
         let refused = RecordingTransport(status: 404, json: #"{"error":"No db3 type","code":"DB3_TYPE_NOT_FOUND"}"#)
         let before = client.documentManager.getMetadataIndex().count
         do {
-            _ = try await api(client, refused).create(title: "Missing", type: "missing")
+            _ = try await api(client, refused).create(title: "Missing", type: "missing", custodian: "user:user-a")
             XCTFail("a refused create should throw")
         } catch let error as HttpError {
             XCTAssertEqual(error.serverCode, "DB3_TYPE_NOT_FOUND")
@@ -187,7 +187,7 @@ final class Db3CreateAdoptionHermeticTests: XCTestCase {
     func testAdoptingAgainKeepsTheCatchUpMarkAndTheRows() async throws {
         let (client, _) = try await client()
         let transport = RecordingTransport(status: 201, json: Self.answer())
-        let info = try await api(client, transport).create(title: "Orders")
+        let info = try await api(client, transport).create(title: "Orders", custodian: "user:user-a")
         let notes = try XCTUnwrap(client.sharedModel("Note")?.member(docId: Self.db3Id))
         _ = try notes.save(id: "n1", values: ["title": .string("kept")])
         let binding = try XCTUnwrap(client.recordLogBinding(Self.db3Id))
@@ -225,7 +225,7 @@ final class Db3CreateAdoptionHermeticTests: XCTestCase {
         let (client, _) = try await client()
         let (transport, gate) = holding(Self.answer())
         let db3 = api(client, transport)
-        let pending = Task { try await db3.create(title: "Orders") }
+        let pending = Task { try await db3.create(title: "Orders", custodian: "user:user-a") }
         try await eventually(description: "the request out") { !transport.calls.isEmpty }
         client.updateToken(makeTestJwt(userId: "user-b"))
         gate.open()
@@ -262,7 +262,7 @@ final class Db3CreateAdoptionHermeticTests: XCTestCase {
             await release.wait()
         }
         let db3 = api(client, RecordingTransport(status: 201, json: Self.answer()))
-        let pending = Task { try await db3.create(title: "Orders") }
+        let pending = Task { try await db3.create(title: "Orders", custodian: "user:user-a") }
         await reached.wait()
         client.updateToken(makeTestJwt(userId: "user-b"))
         await client.rebindUserScopedStorage()
@@ -283,7 +283,7 @@ final class Db3CreateAdoptionHermeticTests: XCTestCase {
         let (client, _) = try await client()
         let (transport, gate) = holding(Self.answer())
         let db3 = api(client, transport)
-        let pending = Task { try await db3.create(title: "Orders") }
+        let pending = Task { try await db3.create(title: "Orders", custodian: "user:user-a") }
         try await eventually(description: "the request out") { !transport.calls.isEmpty }
         try? await client.logout()
         gate.open()

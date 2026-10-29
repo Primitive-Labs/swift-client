@@ -1,23 +1,24 @@
 import Foundation
 
-// A live view of one agent session over its synced document (#3810) — the
-// Swift half of the JS client's `src/client/agents/sessionView.ts`, rule for
-// rule.
+// A live view of one agent session over its db3 (#3810; #4884) — the Swift
+// half of the JS client's `src/client/agents/sessionView.ts`, rule for rule.
 //
-// `client.agents.sessions.open` reads the session (`get`), registers the
-// platform models, opens the session's document and keeps a window of the
-// latest messages by `seq` with their parts and steps; `loadOlder()` pages
-// back. Every query names the session's document, so a client with several
-// sessions open never mixes them. Your own messages appear at once as pending
-// entries, keyed by a client message id, and leave once the row the server
-// accepted is in the window; a refused send stays as `.failed`.
+// `client.agents.sessions.open` reads the session (`get`), subscribes to the
+// session's db3 (its id the session's) and keeps a window of the latest
+// messages by `seq` with their parts, calls, steps and turns, read by model
+// name from the db3's local copy; `loadOlder()` pages back. Your own messages
+// appear at once as pending entries, keyed by a client message id, and leave
+// once the row the server accepted is in the window; a refused send stays as
+// `.failed`.
 //
 // Swift carries no `uiMessages()`: the AI SDK adapter is the JS client's.
 // Read a part's typed `content` instead.
 //
 // `info` follows the server's `AgentSessionChangedEvent`s for the session, and
 // is read again after a reconnect; `markRead: .whileOpen` keeps the session
-// read while the view is open.
+// read while the view is open. When the room refuses you the session, or the
+// session's `removed` event comes first (you were removed, or it was deleted),
+// the view evicts its local copy and `gone` says so.
 
 /// When an open view marks its session read by itself.
 public enum AgentSessionMarkRead: Sendable, Equatable {
@@ -33,16 +34,12 @@ public enum AgentSessionMarkRead: Sendable, Equatable {
 public struct OpenAgentSessionOptions: Sendable {
     /// Messages per page, 1 to 500: the first window and each `loadOlder()`.
     public var pageSize: Int
-    /// How to open the document. `nil` opens it with
-    /// `waitForLoad: .network, enableNetworkSync: true`.
-    public var open: OpenDocumentOptions?
     /// `.whileOpen` keeps the session read while the view is open; `nil`
     /// marks it read only when you call `markRead()`.
     public var markRead: AgentSessionMarkRead?
 
-    public init(pageSize: Int = 50, open: OpenDocumentOptions? = nil, markRead: AgentSessionMarkRead? = nil) {
+    public init(pageSize: Int = 50, markRead: AgentSessionMarkRead? = nil) {
         self.pageSize = pageSize
-        self.open = open
         self.markRead = markRead
     }
 }
@@ -62,10 +59,38 @@ public struct AgentSessionSendError: Sendable, Equatable {
     }
 }
 
-/// A message in the view's window, synced from the document.
+/// One of a message's parts in the view: a `Part` record, or one of its calls
+/// (a `ToolCall` record, its id the call's).
+public enum AgentSessionViewPart: Sendable, Equatable {
+    case part(AgentSessionPartRecord)
+    case toolCall(AgentSessionToolCallRecord)
+
+    public var id: String {
+        switch self {
+        case let .part(record): return record.id
+        case let .toolCall(record): return record.id
+        }
+    }
+
+    public var messageId: String {
+        switch self {
+        case let .part(record): return record.messageId
+        case let .toolCall(record): return record.messageId
+        }
+    }
+
+    /// Its position among the message's parts.
+    public var seq: Double {
+        switch self {
+        case let .part(record): return record.seq
+        case let .toolCall(record): return record.seq
+        }
+    }
+}
+
+/// A message in the view's window, synced from the session's db3.
 public struct AgentSessionSyncedMessage: Sendable, Equatable {
-    /// `.queued` while the session's queue names the message, waiting for its
-    /// turn.
+    /// `.queued` while the message waits for a turn (its `queueSeq` is set).
     public enum State: Sendable, Equatable {
         case synced
         case queued
@@ -74,11 +99,13 @@ public struct AgentSessionSyncedMessage: Sendable, Equatable {
     public let messageId: String
     public let seq: Double
     public let clientMessageId: String?
-    public let message: PrimitiveMessage
-    /// The message's parts, by `seq` then id.
-    public let parts: [PrimitivePart]
+    public let message: AgentSessionMessageRecord
+    /// The message's `Part` records and its calls, in one list by `seq`, then id.
+    public let parts: [AgentSessionViewPart]
     /// The steps of the message's turn, by `seq`; `[]` when it has none.
-    public let steps: [PrimitiveStep]
+    public let steps: [AgentSessionStepRecord]
+    /// The message's turn, once its `Turn` row has synced.
+    public let turn: AgentSessionTurnRecord?
     public let state: State
 }
 
@@ -130,7 +157,7 @@ public struct AgentSessionPendingMessage: Sendable, Equatable {
     }
 }
 
-/// A message in the view: synced from the document, or pending.
+/// A message in the view: synced from the session's db3, or pending.
 public enum AgentSessionViewMessage: Sendable, Equatable {
     case synced(AgentSessionSyncedMessage)
     case pending(AgentSessionPendingMessage)
@@ -151,22 +178,25 @@ public struct AgentSessionLoadOlderResult: Sendable, Equatable {
 
 /// A live view of one agent session, from `client.agents.sessions.open`.
 ///
-/// Read its state through the properties (they change as the document
+/// Read its state through the properties (they change as the session's db3
 /// syncs), and call `onChange` to hear about every change. `close()` when
-/// done.
+/// done: it gives up the view's subscription, and the local copy stays.
 ///
-/// Opening the same session twice on one client gives two views over one
-/// open document; closing either closes the document for both.
+/// Opening the same session twice on one client gives two views, each with
+/// its own subscription; closing one leaves the other live.
 public final class AgentSessionView: @unchecked Sendable {
     static let defaultPageSize = 50
     static let maxPageSize = 500
     /// Ids per `$in` query.
     static let inChunk = 100
+    /// The most records one local records query answers.
+    static let recordsPageMax = 10_000
     /// How long a change waits for others before the view reads them.
     static let refreshCoalesceWindow: DispatchTimeInterval = .milliseconds(15)
 
-    private let api: AgentSessionsAPI
-    private let client: JsBaoClient
+    private let host: AgentSessionViewHost
+    private let subscription: Db3Subscription
+    private let records: DocumentRecords
     private let pageSize: Int
     /// Every refresh and page load runs here, one at a time.
     private let work = DispatchQueue(label: "agent-session-view")
@@ -174,16 +204,23 @@ public final class AgentSessionView: @unchecked Sendable {
 
     // Guarded by `lock`.
     private var _info: AgentSessionInfo
-    private var window: [String: PrimitiveMessage] = [:]
-    private var partsByMessage: [String: [PrimitivePart]] = [:]
-    private var steps: [PrimitiveStep] = []
+    private var window: [String: AgentSessionMessageRecord] = [:]
+    private var partsByMessage: [String: [AgentSessionViewPart]] = [:]
+    private var steps: [AgentSessionStepRecord] = []
+    private var turns: [String: AgentSessionTurnRecord] = [:]
+    private var memberRecords: [AgentSessionMemberRecord] = []
+    private var queueEntries: [PrimitiveQueueEntry] = []
     private var olderRemain = false
-    private var sessionRecord: PrimitiveSession?
-    private var sessionRow: [String: JSONValue]?
+    private var sessionRecord: AgentSessionRecord?
+    private var goneEvent: Db3GoneEvent?
+    /// Set once you lost the session (the room refused you, or its `removed`
+    /// event came first): nothing more is read into the view.
+    private var lost = false
     private var pendingEntries: [AgentSessionPendingMessage] = []
     private var view: [AgentSessionViewMessage] = []
     private var listeners: [UUID: @Sendable () -> Void] = [:]
     private var unsubscribes: [@Sendable () -> Void] = []
+    private var observations: [EventSubscription] = []
     private var refreshQueued = false
     private var olderInFlight: Task<AgentSessionLoadOlderResult, Error>?
     private var closed = false
@@ -196,9 +233,11 @@ public final class AgentSessionView: @unchecked Sendable {
     private var answeredCalls: [String: String] = [:]
     /// Calls the server refused an answer for, by call id: their turn and the
     /// state they were in.
-    private var failedCalls: [String: (turnId: String, state: String)] = [:]
+    private var failedCalls: [String: (turnId: String, state: AgentSessionToolCallState)] = [:]
     private var evaluateQueued = false
-    private var syncTask: Task<Void, Never>?
+    /// Whether the subscription left `.live` since the calls were last
+    /// evaluated for it: its return evaluates them again.
+    private var leftLive = false
     /// The change events and connection states, heard since before `get`.
     private let signals: AgentSessionViewSignals
     /// For each `get` in flight, the changes made to `info` since it was
@@ -240,16 +279,17 @@ public final class AgentSessionView: @unchecked Sendable {
     }
 
     init(
-        api: AgentSessionsAPI, client: JsBaoClient, info: AgentSessionInfo, pageSize: Int,
+        host: AgentSessionViewHost, info: AgentSessionInfo, subscription: Db3Subscription, pageSize: Int,
         markWhileOpen: Bool = false, connectedAtOpen: Bool = false, signals: AgentSessionViewSignals? = nil
     ) {
-        self.api = api
-        self.client = client
+        self.host = host
         self._info = info
+        self.subscription = subscription
+        self.records = host.db3.records(info.sessionId)
         self.pageSize = pageSize
         self.markWhileOpen = markWhileOpen
         self.live = connectedAtOpen
-        self.signals = signals ?? AgentSessionViewSignals(client: client)
+        self.signals = signals ?? host.signals()
     }
 
     // MARK: - State
@@ -259,15 +299,8 @@ public final class AgentSessionView: @unchecked Sendable {
     /// again after a reconnect; `refreshInfo()` reads it again on demand.
     public var info: AgentSessionInfo { lock.withLock { _info } }
 
-    /// The session's id.
+    /// The session's id: also its db3's.
     public var sessionId: String { info.sessionId }
-
-    /// The session's document.
-    @available(*, deprecated, message: "Use sessionId and the session calls (attachments for files, artifact(of:) for artifacts); client.agents.sessions.inspect.storage(_:) answers it for diagnostics.")
-    public var documentId: String { storageDocumentId }
-
-    /// The session's document, for the view's own queries and reads.
-    var storageDocumentId: String { info.storageDocumentId }
 
     /// The session's files: upload them, follow and control the upload
     /// queue, and read any file of the session, by `blobId`. Send an uploaded
@@ -276,10 +309,7 @@ public final class AgentSessionView: @unchecked Sendable {
     public var attachments: AgentSessionAttachments {
         lock.withLock {
             if let attachmentsOf { return attachmentsOf }
-            let made = client.blobManager.forAgentSession(
-                sessionId: _info.sessionId, documentId: _info.storageDocumentId,
-                isClosed: { [weak self] in self?.isClosed ?? true }
-            )
+            let made = host.attachments(_info.sessionId) { [weak self] in self?.isClosed ?? true }
             attachmentsOf = made
             return made
         }
@@ -287,20 +317,30 @@ public final class AgentSessionView: @unchecked Sendable {
 
     private var isClosed: Bool { lock.withLock { closed } }
 
-    /// The session row, decoded; `nil` until it has synced or when it does not
-    /// decode.
-    public var session: PrimitiveSession? { lock.withLock { sessionRecord } }
+    /// The `Session` row, decoded; `nil` until it has synced or when it does
+    /// not decode.
+    public var session: AgentSessionRecord? { lock.withLock { sessionRecord } }
 
-    /// The session row's status; `nil` until it has synced. A status outside
+    /// The `Session` row's status; `nil` until it has synced. A status outside
     /// the vocabulary reads `.unknown(raw)`.
-    public var status: PrimitiveSessionStatus? { session?.status }
+    public var status: AgentSessionStatus? { session?.status }
 
-    /// The active turn the session row names, or `nil`.
+    /// The active turn the `Session` row names, or `nil`.
     public var activeTurnId: String? { session?.activeTurnId }
 
-    /// The authors waiting behind the active turn, with their messages, from
-    /// the session row.
-    public var queue: [PrimitiveQueueEntry] { session?.queue ?? [] }
+    /// The authors waiting behind the active turn, with their messages: the
+    /// messages whose `queueSeq` is set, in its order, one entry per author.
+    public var queue: [PrimitiveQueueEntry] { lock.withLock { queueEntries } }
+
+    /// The session's members, the owner included: its `Member` rows, in the
+    /// order they were added.
+    public var members: [AgentSessionMemberRecord] { lock.withLock { memberRecords } }
+
+    /// Why the room stopped syncing the session with this client, or `nil`.
+    /// On `.permission` you are no longer a member: the view has evicted its
+    /// local copy, shows nothing and runs no client tool. On `.syncOff` and
+    /// `.clientOutdated` the copy is kept.
+    public var gone: Db3GoneEvent? { lock.withLock { goneEvent } }
 
     /// The window's synced messages, oldest first, then your pending ones.
     public var messages: [AgentSessionViewMessage] { lock.withLock { view } }
@@ -400,9 +440,9 @@ public final class AgentSessionView: @unchecked Sendable {
 
     // MARK: - Paging
 
-    /// Load the page of messages before the window's oldest, with their parts
-    /// and steps. Calls made while one is loading share its page; at the start
-    /// of the session, or after `close()`, it answers `{ 0, false }`.
+    /// Load the page of messages before the window's oldest, with their parts,
+    /// calls, steps and turns. Calls made while one is loading share its page;
+    /// at the start of the session, or after `close()`, it answers `{ 0, false }`.
     public func loadOlder() async throws -> AgentSessionLoadOlderResult {
         let task: Task<AgentSessionLoadOlderResult, Error> = lock.withLock {
             if let olderInFlight { return olderInFlight }
@@ -421,34 +461,33 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Answer a call the active turn waits on.
     @discardableResult
     public func answer(callId: String, _ answer: AgentCallAnswer) async throws -> AgentCallAnswerResult {
-        try await api.answer(sessionId: sessionId, callId: callId, answer)
+        try await host.sessions.answer(sessionId: sessionId, callId: callId, answer)
     }
 
     /// A tool call's artifact: the same value whether the server stored it
-    /// inline or, being large, as a blob on the session's document, which is
-    /// read only now. `nil` when the call has none or `part` is not a tool
-    /// call; `.null` for a stored JSON null. Calls made while a read of the
-    /// same blob is in flight share it, each decoding its own value.
+    /// inline or, being large, as a blob of the session's db3, which is read
+    /// only now, through the session's attachment route. `nil` when the call
+    /// has none; `.null` for a stored JSON null. Calls made while a read of
+    /// the same blob is in flight share it, each decoding its own value.
     ///
     /// Throws `.invalidArgument` on a closed view, the blob read's error for
     /// a download that fails, and a `DecodingError` for a blob that is not
     /// JSON.
-    public func artifact(of part: PrimitivePart) async throws -> JSONValue? {
+    public func artifact(of call: AgentSessionToolCallRecord) async throws -> JSONValue? {
         if lock.withLock({ closed }) {
             throw JsBaoError(code: .invalidArgument, message: "The session view is closed")
         }
-        guard case .toolCall(let call) = part.content else { return nil }
         guard let blobId = call.artifactBlobId, !blobId.isEmpty else { return call.artifact }
         let read: Task<Data, Error> = lock.withLock {
             if let inFlight = artifactReads[blobId] { return inFlight.read }
             let id = UUID()
-            let blobs = client.blobManager
-            let documentId = _info.storageDocumentId
+            let readBlob = host.readBlob
+            let sessionId = _info.sessionId
             let read = Task { [weak self] in
                 // Forgotten once settled: a later call reads again (the blob
                 // cache answers it).
                 defer { self?.forgetArtifactRead(blobId, id: id) }
-                return try await blobs.read(documentId: documentId, blobId: blobId)
+                return try await readBlob(sessionId, blobId)
             }
             artifactReads[blobId] = (id, read)
             return read
@@ -462,40 +501,39 @@ public final class AgentSessionView: @unchecked Sendable {
         }
     }
 
-    /// The presentations an agent message carries: each `tool_call` part in
+    /// The presentations an agent message carries: each of its calls in
     /// `output-available` state whose tool is one of `names`, in part order.
-    /// A part alone does not say whether its tool is a presentation, so pass
+    /// A call alone does not say whether its tool is a presentation, so pass
     /// the generated `<Key>Agent.presentationNames`. A refused presentation
     /// (`output-error`) and a message that is not the agent's yield none.
-    /// `call(_:)` on each resolves numbers against the turn's parts in the
+    /// `call(_:)` on each resolves numbers against the turn's calls in the
     /// window.
-    public func presentations(of message: PrimitiveMessage, names: [String]) -> [AgentPresentation] {
+    public func presentations(of message: AgentSessionSyncedMessage, names: [String]) -> [AgentPresentation] {
         lock.withLock {
-            let turnParts: [PrimitivePart] = message.turnId.map { turnId in
+            let parts = partsByMessage[message.messageId] ?? message.parts
+            let turnParts: [AgentSessionViewPart] = message.message.turnId.map { turnId in
                 window.values
                     .filter { $0.turnId == turnId }
                     .flatMap { partsByMessage[$0.id] ?? [] }
             } ?? []
-            return AgentPresentation.collect(
-                message: message, parts: partsByMessage[message.id] ?? [], turnParts: turnParts, names: names
-            )
+            return AgentPresentation.collect(message: message.message, parts: parts, turnParts: turnParts, names: names)
         }
     }
 
     /// Record an event on the session.
     @discardableResult
     public func recordEvent(_ event: AgentSessionEvent) async throws -> AgentSessionEventResult {
-        try await api.recordEvent(sessionId: sessionId, event: event)
+        try await host.sessions.recordEvent(sessionId: sessionId, event: event)
     }
 
-    /// Cancel the active turn: the one named, else the one the session row
+    /// Cancel the active turn: the one named, else the one the `Session` row
     /// names, else the one `get` answers. With no turn at all, throws
     /// `.agentSessionNoActiveTurn` and sends no cancel.
     @discardableResult
     public func cancel(turnId: String? = nil) async throws -> AgentSessionCancelResult {
         var target = turnId ?? activeTurnId
         if target == nil {
-            target = try await api.get(sessionId: sessionId).turn?.turnId
+            target = try await host.sessions.get(sessionId: sessionId).turn?.turnId
         }
         guard let target else {
             throw JsBaoError(
@@ -503,7 +541,7 @@ public final class AgentSessionView: @unchecked Sendable {
                 message: "There is no active turn to cancel: the session is idle."
             )
         }
-        return try await api.cancel(sessionId: sessionId, turnId: target)
+        return try await host.sessions.cancel(sessionId: sessionId, turnId: target)
     }
 
     /// Mark the session read for the signed-in user (`sessions.markRead`):
@@ -513,7 +551,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// returns to the session.
     @discardableResult
     public func markRead() async throws -> AgentSessionReadResult {
-        let result = try await api.markRead(sessionId: sessionId)
+        let result = try await host.sessions.markRead(sessionId: sessionId)
         let read: @Sendable (AgentSessionInfo) -> AgentSessionInfo = { info in
             var info = info
             info.lastReadAt = AgentSessionList.laterOf(info.lastReadAt, result.lastReadAt)
@@ -537,8 +575,8 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Run client tools for this member: when the active turn is yours, each
     /// call of a named tool that waits for its result (`input-available`, or
     /// approved) runs its handler and is answered with the result. Calls
-    /// waiting when you register, or found again when the document re-syncs,
-    /// run too. Every one of your open views runs a call and the first answer
+    /// waiting when you register, or found again when the session's db3 is
+    /// live again after a reconnect, run too. Every one of your open views runs a call and the first answer
     /// wins, so keep handlers free of side effects. Approvals stay with your
     /// UI.
     ///
@@ -598,7 +636,7 @@ public final class AgentSessionView: @unchecked Sendable {
         guard start else { return nil }
         let answered: AgentSessionInfo
         do {
-            answered = try await api.get(sessionId: sessionId)
+            answered = try await host.sessions.get(sessionId: sessionId)
         } catch {
             _ = lock.withLock { infoReads.removeValue(forKey: id) }
             throw error
@@ -614,62 +652,67 @@ public final class AgentSessionView: @unchecked Sendable {
         return next
     }
 
-    /// Stop listening and close the session's document. Running client-tool
-    /// handlers are cancelled and their answers never sent. Idempotent.
+    /// Stop listening and give up the view's subscription to the session's
+    /// db3; its local copy stays. Running client-tool handlers are cancelled
+    /// and their answers never sent. Idempotent.
     public func close() async {
-        let closing: (unsubscribes: [@Sendable () -> Void], tasks: [Task<Void, Never>])? = lock.withLock {
-            guard !closed else { return nil }
-            closed = true
-            listeners.removeAll()
-            var tasks = runningCalls.values.compactMap(\.task)
-            if let syncTask { tasks.append(syncTask) }
-            syncTask = nil
-            if let reconcileTask { tasks.append(reconcileTask) }
-            reconcileTask = nil
-            runningCalls.removeAll()
-            runningOrder.removeAll()
-            toolHandlers.removeAll()
-            answeredCalls.removeAll()
-            failedCalls.removeAll()
-            defer { unsubscribes.removeAll() }
-            return (unsubscribes, tasks)
-        }
+        let closing: (unsubscribes: [@Sendable () -> Void], observations: [EventSubscription], tasks: [Task<Void, Never>])? =
+            lock.withLock {
+                guard !closed else { return nil }
+                closed = true
+                listeners.removeAll()
+                var tasks = runningCalls.values.compactMap(\.task)
+                if let reconcileTask { tasks.append(reconcileTask) }
+                reconcileTask = nil
+                runningCalls.removeAll()
+                runningOrder.removeAll()
+                toolHandlers.removeAll()
+                answeredCalls.removeAll()
+                failedCalls.removeAll()
+                defer {
+                    unsubscribes.removeAll()
+                    observations.removeAll()
+                }
+                return (unsubscribes, observations, tasks)
+            }
         guard let closing else { return }
         signals.release()
         for unsubscribe in closing.unsubscribes { unsubscribe() }
+        for observation in closing.observations { observation.cancel() }
         for task in closing.tasks { task.cancel() }
-        _ = await client.closeDocument(storageDocumentId)
+        subscription.dispose()
     }
 
     // MARK: - Internals
 
-    /// Subscribe to the four models and the document's syncs, and load the
-    /// first window.
+    /// Listen to the db3's models and its going, and load the first window.
     func start() async throws {
         var unsubs: [@Sendable () -> Void] = []
-        for schema in AgentSessionModels.schemas {
-            unsubs.append(client.codegen.subscribe(schema) { [weak self] in self?.scheduleRefresh() })
-        }
-        let documentId = storageDocumentId
-        let syncs = Self.syncEvents(of: client)
-        let sync = Task { [weak self] in
-            for await event in syncs where event.documentId == documentId && event.synced {
-                self?.scheduleEvaluate()
-            }
+        for model in AgentSessionModels.modelNames {
+            unsubs.append(try records.subscribe(model) { [weak self] in self?.scheduleRefresh() })
         }
         let alreadyClosed: Bool = lock.withLock {
-            if !closed {
-                unsubscribes.append(contentsOf: unsubs)
-                syncTask = sync
-            }
+            if !closed { unsubscribes.append(contentsOf: unsubs) }
             return closed
         }
-        if alreadyClosed {
-            unsubs.forEach { $0() }
-            sync.cancel()
-            signals.release()
+        if alreadyClosed { unsubs.forEach { $0() } }
+        let observation = subscription.observe { [weak self] event in
+            switch event {
+            case let .state(state): self?.onSubscriptionState(state)
+            case let .gone(gone): self?.onGone(gone)
+            default: break
+            }
         }
-        // What arrived while the session was read and its document opened, then the rest.
+        let observed: Bool = lock.withLock {
+            if !closed { observations.append(observation) }
+            return !closed
+        }
+        if !observed { observation.cancel() }
+        // A loss the room delivered after `ready()` and before this observer
+        // is not replayed: the subscription's state still says it.
+        let state = subscription.state
+        if observed && state.phase == .gone { onGone(Db3GoneEvent(id: sessionId, reason: Self.goneReason(state.error?.code))) }
+        // What arrived while the session was read and its db3 subscribed, then the rest.
         signals.attach { [weak self] signal in
             switch signal {
             case .change(let event): self?.onSessionChanged(event)
@@ -680,15 +723,100 @@ public final class AgentSessionView: @unchecked Sendable {
         if markWhileOpen { readWhileOpen() }
     }
 
+    /// The room stopped syncing the db3 with this client. On `.permission` the
+    /// member was removed: running handlers stop, the local copy is evicted
+    /// and the view empties; otherwise the copy is kept and `gone` says why.
+    private func onGone(_ event: Db3GoneEvent) {
+        if event.reason == .permission {
+            loseSession()
+            return
+        }
+        let changed: Bool = lock.withLock {
+            guard !closed, !lost else { return false }
+            goneEvent = event
+            return true
+        }
+        if changed { notify() }
+    }
+
+    /// The reason a `gone` state's error code names; a refusal by default.
+    private static func goneReason(_ code: String?) -> Db3GoneEvent.Reason {
+        switch code {
+        case JsBaoErrorCode.db3SyncOff.rawValue: return .syncOff
+        case JsBaoErrorCode.db3ClientOutdated.rawValue: return .clientOutdated
+        default: return .permission
+        }
+    }
+
+    /// You no longer have the session: the room refused you, or its `removed`
+    /// event came first. Running handlers stop, the subscription is given up,
+    /// the local copy is evicted and the view empties; once only. Your own
+    /// messages still waiting or sending stay: each fails on its own answer.
+    private func loseSession() {
+        let tasks: [Task<Void, Never>]? = lock.withLock {
+            guard !closed, !lost else { return nil }
+            lost = true
+            goneEvent = Db3GoneEvent(id: _info.sessionId, reason: .permission)
+            let tasks = runningCalls.values.compactMap(\.task)
+            runningCalls.removeAll()
+            runningOrder.removeAll()
+            toolHandlers.removeAll()
+            answeredCalls.removeAll()
+            failedCalls.removeAll()
+            window = [:]
+            partsByMessage = [:]
+            steps = []
+            turns = [:]
+            memberRecords = []
+            queueEntries = []
+            sessionRecord = nil
+            olderRemain = false
+            _ = rebuildLocked()
+            return tasks
+        }
+        guard let tasks else { return }
+        tasks.forEach { $0.cancel() }
+        subscription.dispose()
+        let evict = host.db3.evict
+        let sessionId = self.sessionId
+        let logger = host.logger
+        Task {
+            do {
+                try await evict(sessionId)
+            } catch {
+                logger?.warn("[agents] evicting the lost session", sessionId, "failed:", error.localizedDescription)
+            }
+        }
+        notify()
+    }
+
+    /// The subscription's state: live again after a reconnect, a call whose
+    /// answer failed to go out runs again. The lifecycle may deliver two
+    /// states out of order, so the phase now, not the event's order, says
+    /// whether it is live again.
+    private func onSubscriptionState(_ state: Db3State) {
+        let live = subscription.state.phase == .live
+        let again: Bool = lock.withLock {
+            guard !closed else { return false }
+            if state.phase != .live { leftLive = true }
+            guard live, leftLive else { return false }
+            leftLive = false
+            return true
+        }
+        if again { scheduleEvaluate() }
+    }
+
     /// A change event: this session's upsert merged into `info`; a removal
     /// changes nothing.
     private func onSessionChanged(_ event: AgentSessionChangedEvent) {
+        var lose = false
         let (changed, unread): (Bool, Bool) = lock.withLock {
             guard !closed, event.sessionId == _info.sessionId else { return (false, false) }
             let at = AgentSessionList.ms(event.at) ?? 0
             switch event.action {
             case .removed:
                 removedAt = max(at, removedAt ?? 0)
+                lose = infoAt.map { at >= $0 } ?? true
                 return (false, false)
             case .unknown:
                 return (false, false)
@@ -704,6 +832,7 @@ public final class AgentSessionView: @unchecked Sendable {
             amendInfoReadsLocked { Self.merged($0, event, item, newer: newer) }
             return (true, _info.hasUnread)
         }
+        if lose { loseSession() }
         guard changed else { return }
         notify()
         if markWhileOpen && unread { readWhileOpen() }
@@ -829,13 +958,6 @@ public final class AgentSessionView: @unchecked Sendable {
         }
     }
 
-    /// Every document's `SyncEvent`, unbounded: the stream is filtered to the
-    /// session's document only after buffering, so a bounded buffer would let
-    /// a reconnect burst of other documents' syncs evict this one's.
-    static func syncEvents(of client: JsBaoClient) -> AsyncStream<SyncEvent> {
-        client.stream(for: SyncEvent.self, buffering: .unbounded)
-    }
-
     private func onWorkQueue<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
             work.async { continuation.resume(with: Result { try body() }) }
@@ -848,7 +970,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// coalescing.
     private func scheduleRefresh() {
         let schedule: Bool = lock.withLock {
-            guard !closed, !refreshQueued else { return false }
+            guard !closed, !lost, !refreshQueued else { return false }
             refreshQueued = true
             return true
         }
@@ -865,57 +987,156 @@ public final class AgentSessionView: @unchecked Sendable {
         for listener in current { listener() }
     }
 
-    private func options(sort: [String: Int]? = nil, limit: Int? = nil) -> QueryOptions {
-        QueryOptions(sort: sort, limit: limit, documents: [storageDocumentId])
+    /// Decoded rows of `model` matching `filter`, from the db3's local copy:
+    /// one page of `limit`, or with none every match (the records API answers
+    /// 100 unless told otherwise), in pages of its most followed through their
+    /// cursor. Runs on `work`.
+    private func rowsOf<R>(
+        _ model: String, _ decode: ([String: JSONValue]) -> R?, _ filter: DocumentFilter? = nil,
+        sort: [(String, Int)]? = nil, limit: Int? = nil
+    ) throws -> (records: [R], hasMore: Bool) {
+        var out: [R] = []
+        // The eviction of a lost session can unbind the store under a read:
+        // its error is the loss.
+        func query(_ options: QueryOptions) throws -> PagedQueryResult<PrimitiveRow> {
+            do {
+                return try records.query(model, filter, options: options)
+            } catch {
+                if lock.withLock({ lost }) { throw SessionLostDuringRead() }
+                throw error
+            }
+        }
+        func take(_ rows: [PrimitiveRow]) throws {
+            if lock.withLock({ lost }) { throw SessionLostDuringRead() }
+            for row in rows {
+                if let record = decode(row.raw) { out.append(record) }
+            }
+        }
+        if let limit {
+            let page = try query(QueryOptions(sortOrder: sort, limit: limit))
+            try take(page.data)
+            return (out, page.hasMore)
+        }
+        var cursor: String?
+        repeat {
+            let page = try query(QueryOptions(sortOrder: sort, limit: Self.recordsPageMax, cursor: cursor))
+            try take(page.data)
+            cursor = page.hasMore ? page.nextCursor : nil
+        } while cursor != nil
+        return (out, false)
     }
 
-    /// The session row, the window's messages from its oldest on, and their
-    /// parts and steps; listeners hear of it only when something changed.
+    /// The `Session` row, the members, the queue, the window's messages from
+    /// its oldest on, and their parts, calls, steps and turns; listeners hear
+    /// of it only when something changed. Runs on `work`.
     private func refreshNow(notify shouldNotify: Bool) throws {
-        let (isClosed, oldest) = lock.withLock { (closed, Self.oldestSeq(window)) }
+        do {
+            try refreshRows(notify: shouldNotify)
+        } catch is SessionLostDuringRead {
+            // Lost while the rows were read: the emptied view takes none of them.
+        }
+    }
+
+    private func refreshRows(notify shouldNotify: Bool) throws {
+        let (isClosed, oldest) = lock.withLock { (closed || lost, Self.oldestSeq(window)) }
         guard !isClosed else { return }
-        let codegen = client.codegen
-        let sessionRow = try codegen.query(
-            PrimitiveSession.primitiveSchema, filter: nil, options: options(limit: 1)
-        ).first
-        var nextWindow: [String: PrimitiveMessage] = [:]
+        let session = try rowsOf("Session", AgentSessionRecord.init(row:), ["id": .string(sessionId)], limit: 1).records.first
+        let members = try rowsOf("Member", AgentSessionMemberRecord.init(row:)).records
+            .sorted { ($0.addedAt, $0.id) < ($1.addedAt, $1.id) }
+        let waiting = try rowsOf("Message", AgentSessionMessageRecord.init(row:), ["queueSeq": ["$exists": true]]).records
+        let queue = Self.queueOf(waiting)
+        var nextWindow: [String: AgentSessionMessageRecord] = [:]
         var nextOlder: Bool?
         if let oldest {
-            let rows = try codegen.query(
-                PrimitiveMessage.primitiveSchema, filter: ["seq": ["$gte": .number(oldest)]],
-                options: options(sort: ["seq": 1])
+            let page = try rowsOf(
+                "Message", AgentSessionMessageRecord.init(row:), ["seq": ["$gte": .number(oldest)]], sort: [("seq", 1)]
             )
-            for row in rows { if let message = PrimitiveMessage(row: row) { nextWindow[message.id] = message } }
+            for message in page.records { nextWindow[message.id] = message }
         } else {
-            let page = try codegen.queryPaged(
-                PrimitiveMessage.primitiveSchema, filter: nil,
-                options: options(sort: ["seq": -1], limit: pageSize)
-            )
-            for row in page.data { if let message = PrimitiveMessage(row: row.raw) { nextWindow[message.id] = message } }
+            let page = try rowsOf("Message", AgentSessionMessageRecord.init(row:), nil, sort: [("seq", -1)], limit: pageSize)
+            for message in page.records { nextWindow[message.id] = message }
             nextOlder = page.hasMore
         }
-        let (parts, nextSteps) = try loadRows(for: nextWindow)
+        let loaded = try loadRows(for: nextWindow)
         let changed: Bool = lock.withLock {
-            guard !closed else { return false }
+            guard !closed, !lost else { return false }
             var changed = false
-            if sessionRow != self.sessionRow {
-                self.sessionRow = sessionRow
-                sessionRecord = sessionRow.flatMap(PrimitiveSession.init(row:))
+            if session != sessionRecord {
+                sessionRecord = session
+                changed = true
+            }
+            if members != memberRecords {
+                memberRecords = members
+                changed = true
+            }
+            if queue != queueEntries {
+                queueEntries = queue
                 changed = true
             }
             let olderBefore = olderRemain
             if let nextOlder { olderRemain = nextOlder }
             window = nextWindow
-            partsByMessage = parts
-            steps = nextSteps
+            partsByMessage = loaded.parts
+            steps = loaded.steps
+            turns = loaded.turns
             return rebuildLocked() || changed || olderBefore != olderRemain
         }
         if changed && shouldNotify { notify() }
-        evaluateClientTools(session: sessionRow.flatMap(PrimitiveSession.init(row:)))
+        evaluateClientTools(session: session)
+    }
+
+    /// The waiting messages, in queue order, as one entry per author in the
+    /// order of each author's first. A taken message's `queueSeq` is cleared
+    /// to null, which the local query still matches: it is no longer waiting.
+    static func queueOf(_ waiting: [AgentSessionMessageRecord]) -> [PrimitiveQueueEntry] {
+        var entries: [PrimitiveQueueEntry] = []
+        var index: [String: Int] = [:]
+        let queued = waiting.compactMap { message in message.queueSeq.map { (seq: $0, message: message) } }
+        for (_, message) in queued.sorted(by: { ($0.seq, $0.message.id) < ($1.seq, $1.message.id) }) {
+            let userId = message.authorUserId ?? ""
+            if let at = index[userId] {
+                entries[at].messageIds.append(message.id)
+            } else {
+                index[userId] = entries.count
+                entries.append(PrimitiveQueueEntry(userId: userId, messageIds: [message.id]))
+            }
+        }
+        return entries
+    }
+
+    /// The parts and calls of the window's messages, and the steps and turns
+    /// of its turns. Runs on `work`.
+    private func loadRows(for window: [String: AgentSessionMessageRecord]) throws -> (
+        parts: [String: [AgentSessionViewPart]], steps: [AgentSessionStepRecord], turns: [String: AgentSessionTurnRecord]
+    ) {
+        var parts: [String: [AgentSessionViewPart]] = [:]
+        for chunk in Self.chunks(window.keys.sorted(), Self.inChunk) {
+            let filter: DocumentFilter = ["messageId": ["$in": .array(chunk.map { .string($0) })]]
+            for part in try rowsOf("Part", AgentSessionPartRecord.init(row:), filter).records {
+                parts[part.messageId, default: []].append(.part(part))
+            }
+            for call in try rowsOf("ToolCall", AgentSessionToolCallRecord.init(row:), filter).records {
+                parts[call.messageId, default: []].append(.toolCall(call))
+            }
+        }
+        for (id, list) in parts {
+            parts[id] = list.sorted { ($0.seq, $0.id) < ($1.seq, $1.id) }
+        }
+        let turnIds = Set(window.values.compactMap(\.turnId)).sorted()
+        var steps: [AgentSessionStepRecord] = []
+        var turns: [String: AgentSessionTurnRecord] = [:]
+        for chunk in Self.chunks(turnIds, Self.inChunk) {
+            let ids: JSONValue = .array(chunk.map { .string($0) })
+            steps.append(contentsOf: try rowsOf("Step", AgentSessionStepRecord.init(row:), ["turnId": ["$in": ids]]).records)
+            for turn in try rowsOf("Turn", AgentSessionTurnRecord.init(row:), ["id": ["$in": ids]]).records {
+                turns[turn.id] = turn
+            }
+        }
+        return (parts, steps.sorted { ($0.seq, $0.id) < ($1.seq, $1.id) }, turns)
     }
 
     /// At most one evaluation waits behind the running work, so a burst of
-    /// sync events is read once.
+    /// state changes is read once.
     private func scheduleEvaluate() {
         let schedule: Bool = lock.withLock {
             guard !closed, !toolHandlers.isEmpty, !evaluateQueued else { return false }
@@ -930,63 +1151,48 @@ public final class AgentSessionView: @unchecked Sendable {
         }
     }
 
-    /// `evaluateClientTools(session:)` over the session row read now. Runs on
-    /// `work`.
+    /// `evaluateClientTools(session:)` over the `Session` row read now. Runs
+    /// on `work`.
     private func evaluateClientTools() {
-        guard lock.withLock({ !closed && !toolHandlers.isEmpty }) else { return }
-        let row = try? client.codegen.query(
-            PrimitiveSession.primitiveSchema, filter: nil, options: options(limit: 1)
-        ).first
-        evaluateClientTools(session: row.flatMap(PrimitiveSession.init(row:)))
+        guard lock.withLock({ !closed && !lost && !toolHandlers.isEmpty }) else { return }
+        guard let page = try? rowsOf("Session", AgentSessionRecord.init(row:), ["id": .string(sessionId)], limit: 1) else {
+            return
+        }
+        evaluateClientTools(session: page.records.first)
     }
 
     /// Start a handler for each call of the active turn that waits on this
-    /// member, read from the document rather than the window. Runs only when
-    /// the session row names the current user as the turn's initiator. Runs
+    /// member, read from the db3 rather than the window. Runs only when the
+    /// active turn's `Turn` row names the current user as its initiator. Runs
     /// on `work`.
-    private func evaluateClientTools(session: PrimitiveSession?) {
+    private func evaluateClientTools(session: AgentSessionRecord?) {
         let turnId = session?.activeTurnId
         let proceed: Bool = lock.withLock {
-            guard !closed, !toolHandlers.isEmpty else { return false }
+            guard !closed, !lost, !toolHandlers.isEmpty else { return false }
             answeredCalls = answeredCalls.filter { $0.value == turnId }
             failedCalls = failedCalls.filter { $0.value.turnId == turnId }
             return true
         }
-        guard proceed, let turnId, let userId = client.userId,
-              session?.activeTurnInitiatorUserId == userId
+        guard proceed, let turnId, let userId = host.currentUserId() else { return }
+        guard let turn = try? rowsOf("Turn", AgentSessionTurnRecord.init(row:), ["id": .string(turnId)], limit: 1).records.first,
+              turn.initiatorUserId == userId,
+              let calls = try? rowsOf("ToolCall", AgentSessionToolCallRecord.init(row:), ["turnId": .string(turnId)]).records
         else { return }
-        let codegen = client.codegen
-        guard let messages = try? codegen.query(
-            PrimitiveMessage.primitiveSchema, filter: ["turnId": .string(turnId)], options: options()
-        ) else { return }
-        let messageIds = messages.compactMap(PrimitiveMessage.init(row:)).map(\.id).sorted()
-        var parts: [PrimitivePart] = []
-        for chunk in Self.chunks(messageIds, Self.inChunk) {
-            guard let rows = try? codegen.query(
-                PrimitivePart.primitiveSchema,
-                filter: ["messageId": ["$in": .array(chunk.map { .string($0) })], "kind": "tool_call"],
-                options: options()
-            ) else { return }
-            parts.append(contentsOf: rows.compactMap(PrimitivePart.init(row:)))
-        }
         let starts: [(AgentClientToolDecisions.EligibleCall, ClientToolRegistration, UUID)] = lock.withLock {
-            guard !closed else { return [] }
+            guard !closed, !lost else { return [] }
             var starts: [(AgentClientToolDecisions.EligibleCall, ClientToolRegistration, UUID)] = []
             let registered = Set(toolHandlers.keys)
-            for part in parts.sorted(by: { ($0.seq, $0.id) < ($1.seq, $1.id) }) {
-                guard let callId = part.toolCallId else { continue }
-                if let state = part.state, AgentClientToolDecisions.terminalStates.contains(state) {
-                    answeredCalls[callId] = nil
-                }
-                if let failed = failedCalls[callId], failed.state != part.state { failedCalls[callId] = nil }
-                guard let call = AgentClientToolDecisions.eligibleCall(part: part, registered: registered),
-                      runningCalls[callId] == nil, answeredCalls[callId] == nil, failedCalls[callId] == nil,
-                      let registration = toolHandlers[call.toolName]
+            for call in calls.sorted(by: { ($0.seq, $0.id) < ($1.seq, $1.id) }) {
+                if AgentClientToolDecisions.terminalStates.contains(call.state) { answeredCalls[call.id] = nil }
+                if let failed = failedCalls[call.id], failed.state != call.state { failedCalls[call.id] = nil }
+                guard let eligible = AgentClientToolDecisions.eligibleCall(call: call, registered: registered),
+                      runningCalls[call.id] == nil, answeredCalls[call.id] == nil, failedCalls[call.id] == nil,
+                      let registration = toolHandlers[eligible.toolName]
                 else { continue }
                 let runId = UUID()
-                runningCalls[callId] = RunningClientTool(id: runId, task: nil)
-                runningOrder.append(callId)
-                starts.append((call, registration, runId))
+                runningCalls[call.id] = RunningClientTool(id: runId, task: nil)
+                runningOrder.append(call.id)
+                starts.append((eligible, registration, runId))
             }
             return starts
         }
@@ -1022,7 +1228,7 @@ public final class AgentSessionView: @unchecked Sendable {
             }
             guard let self, !Task.isCancelled, !self.lock.withLock({ self.closed }) else { return }
             do {
-                _ = try await self.api.answer(sessionId: self.sessionId, callId: call.callId, answer)
+                _ = try await self.host.sessions.answer(sessionId: self.sessionId, callId: call.callId, answer)
                 self.lock.withLock { self.answeredCalls[call.callId] = turnId }
             } catch {
                 guard !self.lock.withLock({ self.closed }) else { return }
@@ -1055,74 +1261,51 @@ public final class AgentSessionView: @unchecked Sendable {
         }
     }
 
+    /// The page of messages below the window's oldest `seq`, with their rows.
+    /// Runs on `work`.
     private func loadOlderNow() throws -> AgentSessionLoadOlderResult {
-        let (isClosed, remain, oldest) = lock.withLock { (closed, olderRemain, Self.oldestSeq(window)) }
+        do {
+            return try loadOlderRows()
+        } catch is SessionLostDuringRead {
+            return AgentSessionLoadOlderResult(loaded: 0, hasOlder: false)
+        }
+    }
+
+    private func loadOlderRows() throws -> AgentSessionLoadOlderResult {
+        let (isClosed, remain, oldest) = lock.withLock { (closed || lost, olderRemain, Self.oldestSeq(window)) }
         guard !isClosed, remain else { return AgentSessionLoadOlderResult(loaded: 0, hasOlder: false) }
-        let page = try client.codegen.queryPaged(
-            PrimitiveMessage.primitiveSchema,
-            filter: oldest.map { ["seq": ["$lt": .number($0)]] },
-            options: options(sort: ["seq": -1], limit: pageSize)
+        let page = try rowsOf(
+            "Message", AgentSessionMessageRecord.init(row:), oldest.map { ["seq": ["$lt": .number($0)]] },
+            sort: [("seq", -1)], limit: pageSize
         )
         var nextWindow = lock.withLock { window }
         var loaded = 0
-        for row in page.data {
-            guard let message = PrimitiveMessage(row: row.raw), nextWindow[message.id] == nil else { continue }
+        for message in page.records where nextWindow[message.id] == nil {
             nextWindow[message.id] = message
             loaded += 1
         }
-        let (parts, nextSteps) = try loadRows(for: nextWindow)
-        let (changed, hasOlder): (Bool, Bool) = lock.withLock {
-            guard !closed else { return (false, false) }
+        let rows = try loadRows(for: nextWindow)
+        let (taken, changed, hasOlder): (Bool, Bool, Bool) = lock.withLock {
+            guard !closed, !lost else { return (false, false, false) }
             let olderBefore = olderRemain
             olderRemain = page.hasMore
             window = nextWindow
-            partsByMessage = parts
-            steps = nextSteps
-            return (rebuildLocked() || olderBefore != olderRemain, olderRemain)
+            partsByMessage = rows.parts
+            steps = rows.steps
+            turns = rows.turns
+            return (true, rebuildLocked() || olderBefore != olderRemain, olderRemain)
         }
+        // Closed or lost before the page went in: nothing was loaded.
+        guard taken else { return AgentSessionLoadOlderResult(loaded: 0, hasOlder: false) }
         if changed { notify() }
         return AgentSessionLoadOlderResult(loaded: loaded, hasOlder: hasOlder)
-    }
-
-    /// The parts of the window's messages and the steps of its turns, each
-    /// query scoped to the document.
-    private func loadRows(
-        for window: [String: PrimitiveMessage]
-    ) throws -> ([String: [PrimitivePart]], [PrimitiveStep]) {
-        let codegen = client.codegen
-        var parts: [String: [PrimitivePart]] = [:]
-        for chunk in Self.chunks(window.keys.sorted(), Self.inChunk) {
-            let rows = try codegen.query(
-                PrimitivePart.primitiveSchema,
-                filter: ["messageId": ["$in": .array(chunk.map { .string($0) })]],
-                options: options()
-            )
-            for row in rows {
-                guard let part = PrimitivePart(row: row) else { continue }
-                parts[part.messageId, default: []].append(part)
-            }
-        }
-        for (id, list) in parts {
-            parts[id] = list.sorted { ($0.seq, $0.id) < ($1.seq, $1.id) }
-        }
-        let turnIds = Set(window.values.compactMap(\.turnId)).sorted()
-        var steps: [PrimitiveStep] = []
-        for chunk in Self.chunks(turnIds, Self.inChunk) {
-            let rows = try codegen.query(
-                PrimitiveStep.primitiveSchema,
-                filter: ["turnId": ["$in": .array(chunk.map { .string($0) })]],
-                options: options()
-            )
-            steps.append(contentsOf: rows.compactMap(PrimitiveStep.init(row:)))
-        }
-        return (parts, steps.sorted { ($0.seq, $0.id) < ($1.seq, $1.id) })
     }
 
     /// The messages the properties answer. Whether any entry changed. Caller
     /// holds `lock`.
     private func rebuildLocked() -> Bool {
-        let queued = Set((sessionRecord?.queue ?? []).flatMap(\.messageIds))
-        var stepsByTurn: [String: [PrimitiveStep]] = [:]
+        let queued = Set(queueEntries.flatMap(\.messageIds))
+        var stepsByTurn: [String: [AgentSessionStepRecord]] = [:]
         for step in steps { stepsByTurn[step.turnId, default: []].append(step) }
         let synced = window.values
             .sorted { ($0.seq, $0.id) < ($1.seq, $1.id) }
@@ -1134,7 +1317,8 @@ public final class AgentSessionView: @unchecked Sendable {
                     message: message,
                     parts: partsByMessage[message.id] ?? [],
                     steps: message.turnId.flatMap { stepsByTurn[$0] } ?? [],
-                    state: queued.contains(message.id) ? .queued : .synced
+                    turn: message.turnId.flatMap { turns[$0] },
+                    state: queued.contains(message.id) || message.queueSeq != nil ? .queued : .synced
                 )
             }
         // A pending entry leaves once the row its accepted id names is in the
@@ -1190,7 +1374,7 @@ public final class AgentSessionView: @unchecked Sendable {
         }
         let result: AgentSessionSendResult
         do {
-            result = try await api.send(sessionId: sessionId, body: entry.body)
+            result = try await host.sessions.send(sessionId: sessionId, body: entry.body)
         } catch {
             replace(current, with: current.with(state: .failed, error: Self.sendError(of: error)))
             throw error
@@ -1260,7 +1444,7 @@ public final class AgentSessionView: @unchecked Sendable {
         return AgentSessionSendError(code: "AGENT_SESSION_SEND_FAILED", message: String(describing: error))
     }
 
-    private static func oldestSeq(_ window: [String: PrimitiveMessage]) -> Double? {
+    private static func oldestSeq(_ window: [String: AgentSessionMessageRecord]) -> Double? {
         window.values.map(\.seq).min()
     }
 
@@ -1274,6 +1458,10 @@ public final class AgentSessionView: @unchecked Sendable {
         return formatter.string(from: Date())
     }
 }
+
+/// A local read finished after you lost the session: its rows are not taken
+/// into the emptied view.
+private struct SessionLostDuringRead: Error {}
 
 // MARK: - Signals
 
@@ -1352,61 +1540,68 @@ final class AgentSessionViewSignals: @unchecked Sendable {
 
 extension AgentSessionsAPI {
     /// Open a session as a live view: its info, the latest page of messages
-    /// with their parts and steps (older pages with `loadOlder()`), your own
-    /// messages shown at once while they send, and `onChange` on every change.
-    /// `info` stays current as the session changes; `markRead: .whileOpen`
-    /// keeps the session read while the view is open.
+    /// with their parts, calls, steps and turns (older pages with
+    /// `loadOlder()`), its members and queue, your own messages shown at once
+    /// while they send, and `onChange` on every change. `info` stays current
+    /// as the session changes; `markRead: .whileOpen` keeps the session read
+    /// while the view is open.
     ///
-    /// Runs `get` first (a refusal throws before anything is opened), then
-    /// registers the four platform models — throwing
-    /// `.agentSessionModelNameTaken` when a model under a platform name
-    /// carries a different schema, with nothing registered or opened — then
-    /// opens the session's document and loads the first window. Call
-    /// `close()` when done. A `pageSize` outside 1…500 throws
-    /// `.invalidArgument` before any request.
+    /// Runs `get` first (a refusal throws before anything is subscribed), then
+    /// subscribes to the session's db3, whose id is the session's, waits until
+    /// it is live, and reads the first window from its local copy; nothing
+    /// opens a document or registers a model. When the subscription cannot go
+    /// live (`DB3_ACCESS_REFUSED`, `DB3_READY_TIMEOUT`, `NOT_A_DB3`), `open`
+    /// throws that error with nothing left subscribed; on `DB3_ACCESS_REFUSED`
+    /// the session's copy on this device is evicted too. Call `close()` when
+    /// done. A `pageSize` outside 1…500 throws `.invalidArgument` before any
+    /// request.
     public func open(
         sessionId: String, options: OpenAgentSessionOptions = OpenAgentSessionOptions()
     ) async throws -> AgentSessionView {
-        guard (1...AgentSessionView.maxPageSize).contains(options.pageSize) else {
-            throw JsBaoError(
-                code: .invalidArgument,
-                message: "pageSize must be an integer from 1 to \(AgentSessionView.maxPageSize)",
-                details: ["field": .string("pageSize")]
-            )
-        }
-        try Self.require(sessionId, "sessionId")
+        try Self.validateOpen(sessionId, options)
         guard let client else {
             throw JsBaoError(code: .unavailable, message: "agents.sessions.open requires a wired JsBaoClient")
         }
+        return try await open(host: AgentSessionViewHost(client: client, sessions: self), sessionId: sessionId, options: options)
+    }
+
+    /// `open` over `host`: what the client's own `open` runs.
+    func open(
+        host: AgentSessionViewHost, sessionId: String, options: OpenAgentSessionOptions = OpenAgentSessionOptions()
+    ) async throws -> AgentSessionView {
+        try Self.validateOpen(sessionId, options)
         // Heard from before `get`: a change or the first connection while the
-        // session is read or its document opens reaches the view (CSO-4380-001).
-        let signals = AgentSessionViewSignals(client: client)
+        // session is read or its db3 subscribed reaches the view (CSO-4380-001).
+        let signals = host.signals()
         // A connection already up when `get` is read hears every change since.
-        let connectedAtOpen = client.isConnected
+        let connectedAtOpen = host.isConnected()
         let info: AgentSessionInfo
+        let subscription: Db3Subscription
         do {
             info = try await get(sessionId: sessionId)
-            for schema in AgentSessionModels.schemas {
-                if let existing = client.sharedModel(schema.name), existing.schema != schema {
-                    throw JsBaoError(
-                        code: .agentSessionModelNameTaken,
-                        message: "A model named \(schema.name) is already registered with a different schema; " +
-                            "the platform's session models need the name.",
-                        details: ["model": .string(schema.name)]
-                    )
-                }
-            }
-            client.registerModels(AgentSessionModels.schemas)
-            _ = try await client.openDocument(
-                info.storageDocumentId,
-                options: options.open ?? OpenDocumentOptions(waitForLoad: .network, enableNetworkSync: true)
-            )
+            subscription = try host.db3.subscribe(info.sessionId)
         } catch {
             signals.release()
             throw error
         }
+        do {
+            try await subscription.ready()
+        } catch {
+            subscription.dispose()
+            signals.release()
+            // The room refused you the session (you were removed after `get`
+            // answered): a copy kept from an earlier view does not outlive it.
+            if (error as? JsBaoError)?.code == .db3AccessRefused {
+                do {
+                    try await host.db3.evict(info.sessionId)
+                } catch let evictError {
+                    host.logger?.warn("[agents] evicting the refused session", info.sessionId, "failed:", evictError.localizedDescription)
+                }
+            }
+            throw error
+        }
         let view = AgentSessionView(
-            api: self, client: client, info: info, pageSize: options.pageSize,
+            host: host, info: info, subscription: subscription, pageSize: options.pageSize,
             markWhileOpen: options.markRead == .whileOpen, connectedAtOpen: connectedAtOpen, signals: signals
         )
         do {
@@ -1416,5 +1611,16 @@ extension AgentSessionsAPI {
             throw error
         }
         return view
+    }
+
+    private static func validateOpen(_ sessionId: String, _ options: OpenAgentSessionOptions) throws {
+        guard (1...AgentSessionView.maxPageSize).contains(options.pageSize) else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "pageSize must be an integer from 1 to \(AgentSessionView.maxPageSize)",
+                details: ["field": .string("pageSize")]
+            )
+        }
+        try require(sessionId, "sessionId")
     }
 }

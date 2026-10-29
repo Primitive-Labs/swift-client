@@ -36,9 +36,9 @@ final class AgentSessionGoneHermeticTests: XCTestCase {
                 return SessionUploadServer.refused(404, "AGENT_SESSION_NOT_FOUND", "No such agent session in this app")
             }
             if request.method == "DELETE", path == "/agent-sessions/s1" {
-                return .json(#"{"deleted":true,"sessionId":"s1","documentId":"d1"}"#)
+                return .json(#"{"deleted":true,"sessionId":"s1"}"#)
             }
-            if path == "/agent-sessions/s1" { return .json(sessionInfoJSON("s1", documentId: "d1")) }
+            if path == "/agent-sessions/s1" { return .json(sessionInfoJSON("s1")) }
             return .status(404, "not scripted")
         }
     }

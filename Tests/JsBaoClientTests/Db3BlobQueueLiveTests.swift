@@ -71,7 +71,7 @@ final class Db3BlobQueueLiveTests: XCTestCase {
 
     func testAQueuedDb3UploadIsScopedToItsFamilyStoredWithItsDestinationAndSentToTheDb3RouteByTheNextClient() async throws {
         let owner = try await live.client("owner", models: [])
-        let db3Id = try await owner.db3.create(title: "Queued").id
+        let db3Id = try await createdOnServer(owner, title: "Queued").id
         let plain = try await ctx.createDocument(appId: live.app.appId, jwt: live.app.ownerJWT, title: "format-1")
         let path = try databasePath()
 
@@ -183,7 +183,7 @@ final class Db3BlobQueueLiveTests: XCTestCase {
 
     func testADb3UploadWithNobodySignedInIsQueuedUnboundAndNotStored() async throws {
         let owner = try await live.client("owner", models: [])
-        let db3Id = try await owner.db3.create(title: "Unbound").id
+        let db3Id = try await createdOnServer(owner, title: "Unbound").id
         let path = try databasePath()
         let anonymous = await client(token: nil, path: path, apiUrl: Self.unreachable)
         let blobs = anonymous.db3.blobs(db3Id)

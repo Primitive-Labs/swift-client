@@ -52,7 +52,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         return nil
     }
 
-    private func steps(_ view: AgentSessionView, turn turnId: String) -> [PrimitiveStep] {
+    private func steps(_ view: AgentSessionView, turn turnId: String) -> [AgentSessionStepRecord] {
         view.allSteps.filter { $0.turnId == turnId }.sorted { $0.seq < $1.seq }
     }
 
@@ -74,7 +74,6 @@ final class AgentSessionsLiveTests: XCTestCase {
         let byId = Dictionary(uniqueKeysWithValues: mine.items.map { ($0.sessionId, $0) })
         XCTAssertEqual(byId[s.sessionId]?.role, .participant)
         XCTAssertEqual(byId[other.sessionId]?.role, .participant)
-        XCTAssertEqual(byId[s.sessionId]?.storageDocumentId, s.documentId)
         XCTAssertEqual(byId[s.sessionId]?.scope, scope)
         let owned = try await ownerC.agents.sessions.list()
         XCTAssertEqual(owned.items.first { $0.sessionId == s.sessionId }?.role, .owner)
@@ -172,12 +171,13 @@ final class AgentSessionsLiveTests: XCTestCase {
         await cancelling.close()
         await observing.close()
 
-        // delete twice.
+        // delete, then again: once the cascade is done the session is not found (#4883).
         let deleted = try await ownerC.agents.sessions.delete(sessionId: s.sessionId)
         XCTAssertEqual(deleted, try JSONCoding.decodeData(AgentSessionDeleteResult.self, from: Data(
-            #"{"deleted":true,"sessionId":"\#(s.sessionId)","documentId":"\#(s.documentId)"}"#.utf8)))
-        let again = try await ownerC.agents.sessions.delete(sessionId: s.sessionId)
-        XCTAssertTrue(again.deleted, "a second delete succeeds")
+            #"{"deleted":true,"sessionId":"\#(s.sessionId)"}"#.utf8)))
+        _ = await expectServerCode("AGENT_SESSION_NOT_FOUND") {
+            _ = try await ownerC.agents.sessions.delete(sessionId: s.sessionId)
+        }
         _ = await expectServerCode("AGENT_SESSION_NOT_FOUND") {
             _ = try await partC.agents.sessions.get(sessionId: s.sessionId)
         }
@@ -192,7 +192,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         let sending = try await h.open(partC, s)
         let observing = try await h.open(ownerC, s)
 
-        let statuses = Recorder<PrimitiveSessionStatus>()
+        let statuses = Recorder<AgentSessionStatus>()
         let stepStates = Recorder<String>()
         let observerPending = Recorder<Int>()
         observing.onChange { [observing] in
@@ -219,7 +219,7 @@ final class AgentSessionsLiveTests: XCTestCase {
                 let calls = observing.toolCalls.filter { call in
                     observing.syncedMessages.first { $0.messageId == call.messageId }?.message.turnId == result.turnId
                 }
-                return calls.count == 2 && calls.allSatisfy { $0.state != "input-available" }
+                return calls.count == 2 && calls.allSatisfy { $0.state != .inputAvailable }
                     || observing.syncedMessages.contains { $0.message.turnId == result.turnId && $0.message.authorKind == .agent }
                     && calls.isEmpty
             }
@@ -250,12 +250,10 @@ final class AgentSessionsLiveTests: XCTestCase {
         let turnCalls = observing.toolCalls.filter { call in
             observing.syncedMessages.first { $0.messageId == call.messageId }?.message.turnId == result.turnId
         }
-        XCTAssertEqual(Set(turnCalls.compactMap(\.toolName)), ["lookup", "sweep"])
+        XCTAssertEqual(Set(turnCalls.map(\.toolName)), ["lookup", "sweep"])
         for call in turnCalls {
-            XCTAssertEqual(call.state, "output-available", "\(call)")
-            guard case let .toolCall(content) = call.content else { return XCTFail("not a tool call: \(call.content)") }
-            XCTAssertEqual(content.state, .outputAvailable)
-            XCTAssertEqual(content.output?["trigger"], "tool")
+            XCTAssertEqual(call.state, .outputAvailable, "\(call)")
+            XCTAssertEqual(call.output?["trigger"], "tool")
         }
         let toolSteps = steps(observing, turn: try XCTUnwrap(result.turnId)).filter { $0.kind == .toolCall }
         XCTAssertEqual(toolSteps.count, 2)
@@ -264,14 +262,14 @@ final class AgentSessionsLiveTests: XCTestCase {
             XCTAssertTrue(stepStates.all.contains("\(step.id):running"), "step \(step.id) seen running: \(stepStates.all)")
         }
         let final = observing.syncedMessages.filter { $0.message.turnId == result.turnId && $0.message.authorKind == .agent }.last
-        XCTAssertNotNil(final?.parts.first { $0.kind == .text }, "the final agent message arrived")
+        XCTAssertTrue(final?.parts.contains { $0.textPart != nil } == true, "the final agent message arrived")
 
-        // The file: an empty text with a PNG uploaded to the document.
+        // The file: an empty text with a PNG uploaded through the session.
         let blobId = try await h.uploadPng(partC, s)
         let withFile = try await sending.send(text: "", files: [AgentSessionFileRef(blobId: blobId)])
         try await h.poll(timeout: 30, "the observer sees the file part") {
             observing.syncedMessages.first { $0.messageId == withFile.messageId }?.parts.contains {
-                if case let .file(file) = $0.content { return file.blobId == blobId } else { return false }
+                $0.filePart?.blobId == blobId
             } == true
         }
         try await h.poll(timeout: 30, "the sender's entry gives way") { sending.pendingMessages.isEmpty }
@@ -299,7 +297,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         let callIds = try XCTUnwrap(turn.pause?.callIds)
         let pickId = try XCTUnwrap(callIds.first { answering.toolCall($0)?.toolName == "pick" })
         let signId = try XCTUnwrap(callIds.first { answering.toolCall($0)?.toolName == "sign" })
-        XCTAssertEqual(answering.toolCall(signId)?.state, "approval-requested")
+        XCTAssertEqual(answering.toolCall(signId)?.state, .approvalRequested)
 
         _ = await expectServerCode("AGENT_TURN_NOT_ALLOWED") {
             _ = try await viewerC.agents.sessions.answer(sessionId: s.sessionId, callId: pickId, .output(["count": 2]))
@@ -319,7 +317,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         }
         try await h.settled(s)
         try await h.poll(timeout: 30, "the answered parts sync") {
-            answering.toolCall(pickId)?.state == "output-available" && answering.toolCall(signId)?.state == "output-available"
+            answering.toolCall(pickId)?.state == .outputAvailable && answering.toolCall(signId)?.state == .outputAvailable
         }
         XCTAssertEqual(answering.toolCall(pickId)?.resolvedByUserId, h.part2.userId)
         XCTAssertEqual(answering.toolCall(signId)?.approvalApproved, true)
@@ -340,13 +338,13 @@ final class AgentSessionsLiveTests: XCTestCase {
         let userEvent = try XCTUnwrap(answering.syncedMessages.first { $0.messageId == recorded.messageId })
         XCTAssertEqual(userEvent.message.authorKind, .user)
         XCTAssertEqual(userEvent.parts.count, 1)
-        guard case let .event(content) = userEvent.parts.first?.content else { return XCTFail("not an event part") }
+        guard let content = userEvent.parts.first?.eventPart else { return XCTFail("not an event part") }
         XCTAssertEqual(content.eventKind, "viewed")
         XCTAssertEqual(content.refersTo, signId)
         XCTAssertEqual(content.eventId, eventId)
         let appEvent = try XCTUnwrap(answering.syncedMessages.first { $0.messageId == notedId })
         XCTAssertEqual(appEvent.message.authorKind, .app)
-        XCTAssertEqual(appEvent.parts.first?.kind, .event)
+        XCTAssertNotNil(appEvent.parts.first?.eventPart)
 
         // A denial in a later turn ends the part output-denied.
         let (_, later) = try await h.pausedTurn(s, sender: part2C, toolNames: ["sign", "pick"])
@@ -359,7 +357,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         let failedPick = try await answering.answer(callId: laterPick, .error(message: "No camera"))
         XCTAssertEqual(failedPick.state, .outputError)
         try await h.settled(s)
-        try await h.poll(timeout: 30, "the denial syncs") { answering.toolCall(laterSign)?.state == "output-denied" }
+        try await h.poll(timeout: 30, "the denial syncs") { answering.toolCall(laterSign)?.state == .outputDenied }
         XCTAssertEqual(answering.toolCall(laterSign)?.approvalReason, "Not now")
         XCTAssertEqual(answering.toolCall(laterSign)?.errorCode, "AGENT_CALL_DENIED")
     }
@@ -385,7 +383,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         let (paused, expiring) = try await h.pausedTurn(e, sender: partC, toolNames: ["pick"])
         let expiringId = try XCTUnwrap(expiring.pause?.callIds.first)
         try await h.poll(timeout: 30, "the call expires") {
-            view.toolCall(expiringId)?.state == "output-error" && view.toolCall(expiringId)?.errorCode == "AGENT_CALL_EXPIRED"
+            view.toolCall(expiringId)?.state == .outputError && view.toolCall(expiringId)?.errorCode == "AGENT_CALL_EXPIRED"
         }
         try await h.poll(timeout: 30, "the session reads expired") { view.status == .expired }
         try await h.settled(e)
@@ -478,12 +476,12 @@ final class AgentSessionsLiveTests: XCTestCase {
         XCTAssertNotEqual(qTurn, pTurn)
         let runningId = try XCTUnwrap(running.turnId)
         let runningStep = try XCTUnwrap(steps(view, turn: runningId).first { $0.kind == .modelCall })
-        XCTAssertTrue((runningStep.historyMessageIds ?? []).isDisjoint(with: ids), "mid-turn messages stay out of the running turn")
+        XCTAssertTrue(runningStep.historyMessageIds.isDisjoint(with: ids), "mid-turn messages stay out of the running turn")
         let qStep = try XCTUnwrap(steps(view, turn: qTurn).first { $0.kind == .modelCall })
         let pStep = try XCTUnwrap(steps(view, turn: pTurn).first { $0.kind == .modelCall })
-        XCTAssertTrue((qStep.historyMessageIds ?? []).isSuperset(of: [q1.messageId, q2.messageId]))
-        XCTAssertTrue((qStep.historyMessageIds ?? []).isDisjoint(with: [p1.messageId, p2.messageId]))
-        XCTAssertTrue((pStep.historyMessageIds ?? []).isSuperset(of: [p1.messageId, p2.messageId]))
+        XCTAssertTrue(qStep.historyMessageIds.isSuperset(of: [q1.messageId, q2.messageId]))
+        XCTAssertTrue(qStep.historyMessageIds.isDisjoint(with: [p1.messageId, p2.messageId]))
+        XCTAssertTrue(pStep.historyMessageIds.isSuperset(of: [p1.messageId, p2.messageId]))
         XCTAssertLessThan(qStep.seq, pStep.seq, "the author whose first message came first runs first")
 
         // During a pause on TOOLS, a participant's send sets the paused turn aside.
@@ -495,7 +493,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         XCTAssertEqual(superseding.superseded, paused.turnId)
         try await h.poll(timeout: 60, "the unanswered calls end superseded") {
             pausedIds.allSatisfy {
-                tView.toolCall($0)?.state == "output-error" && tView.toolCall($0)?.errorCode == "AGENT_CALL_SUPERSEDED"
+                tView.toolCall($0)?.state == .outputError && tView.toolCall($0)?.errorCode == "AGENT_CALL_SUPERSEDED"
             }
         }
         try await h.settled(t)
@@ -564,27 +562,35 @@ final class AgentSessionsLiveTests: XCTestCase {
 
     // MARK: - Behavior 25: paging live
 
+    /// #4884: no client writes a session's db3, so the rows are written
+    /// through the session object's binding (the local probe), as JS's
+    /// paging suite writes them.
     func testPagingWalksASeededSessionAndTwoSessionsStayApart() async throws {
         let big = try await h.createSession(h.plain, participants: [h.part])
         let small = try await h.createSession(h.plain, participants: [h.part])
-        let writer = try await h.client(h.owner)
-        writer.registerModels(AgentSessionModels.schemas)
         let created = "2026-10-02T12:00:00.000Z"
         func seed(_ s: AgentSessionScenarioHarness.Session, count: Int, firstSeq: Double, step: Double) async throws -> [String] {
-            _ = try await writer.documents.open(s.documentId, options: OpenDocumentOptions(waitForLoad: .network))
             var ids: [String] = []
+            var operations: [[String: Any]] = []
             for n in 0..<count {
-                let id = PrimitiveSchemaRegistry.generateULID()
+                let id = ULID.generate()
                 ids.append(id)
-                try writer.codegen.save(PrimitiveMessage.primitiveSchema, id: id, values: [
-                    "seq": .number(firstSeq + Double(n) * step), "authorKind": .string("user"),
-                    "authorUserId": .string(h.owner.userId), "createdAt": .date(created),
-                ], in: s.documentId)
-                try writer.codegen.save(PrimitivePart.primitiveSchema, id: PrimitiveSchemaRegistry.generateULID(), values: [
-                    "messageId": .string(id), "seq": .number(1), "kind": .string("text"), "state": .string("done"),
-                    "text": .string("seeded \(n)"), "createdAt": .date(created),
-                ], in: s.documentId)
+                operations.append([
+                    "model": "Message", "action": "create", "id": id,
+                    "data": [
+                        "seq": firstSeq + Double(n) * step, "authorKind": "user", "authorUserId": h.owner.userId,
+                        "createdAt": created,
+                    ] as [String: Any],
+                ])
+                operations.append([
+                    "model": "Part", "action": "create", "id": ULID.generate(),
+                    "data": [
+                        "messageId": id, "seq": 1, "kind": "text", "textState": "done", "text": "seeded \(n)",
+                        "createdAt": created,
+                    ] as [String: Any],
+                ])
             }
+            try await h.seed(s, operations: operations)
             return ids
         }
         let bigIds = try await seed(big, count: 120, firstSeq: 1, step: 1)
@@ -600,7 +606,7 @@ final class AgentSessionsLiveTests: XCTestCase {
         let bigView = try await h.open(reader, big, pageSize: 50)
         XCTAssertEqual(bigView.syncedMessages.map(\.seq), (71...120).map(Double.init))
         XCTAssertTrue(bigView.hasOlder)
-        XCTAssertEqual(bigView.syncedMessages.first?.parts.first?.text, "seeded 70")
+        XCTAssertEqual(bigView.syncedMessages.first?.parts.first?.textPart?.text, "seeded 70")
         let olderA = try await bigView.loadOlder()
         XCTAssertEqual(olderA, AgentSessionLoadOlderResult(loaded: 50, hasOlder: true))
         let olderB = try await bigView.loadOlder()

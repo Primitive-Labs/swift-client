@@ -3,7 +3,8 @@ import XCTest
 
 /// A watched session list and an open view's info against the dev server, from
 /// Swift (#4380, behavior 20): another member's activity and a rename reach
-/// both within seconds, with no `list` or `get` called by the app.
+/// both within seconds, with no `list` or `get` called by the app. Since
+/// #4884 the view is open over the session's db3 (behavior 16).
 final class AgentSessionLiveListLiveTests: XCTestCase {
     private static let harnessTask = LockedBox<Task<AgentSessionScenarioHarness, Error>?>(nil)
     private var h: AgentSessionScenarioHarness!
