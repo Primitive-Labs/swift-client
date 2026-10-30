@@ -1,0 +1,20 @@
+{
+  "model": "Session",
+  "row": {
+    "id": "01K6SESSION0000000000000000",
+    "agentKey": "support",
+    "status": "idle",
+    "createdAt": "2026-09-28T12:00:00.000Z",
+    "modifiedAt": "2026-09-28T12:05:00.000Z",
+    "deletingAt": "2026-09-28T12:05:00.000Z"
+  },
+  "expect": {
+    "id": "01K6SESSION0000000000000000",
+    "agentKey": "support",
+    "status": "idle",
+    "activeTurnId": {
+      "$absent": true
+    },
+    "deletingAt": "2026-09-28T12:05:00.000Z"
+  }
+}

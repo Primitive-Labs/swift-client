@@ -153,9 +153,13 @@ public struct Db3RowChange: Sendable, Equatable {
 
 /// Payload for `.db3Rows`: records of a db3 changed in the local copy.
 public struct Db3RowsEvent: Sendable, Equatable {
-    /// Who changed them: `local` for this client's write, `remote` for the
-    /// room's, `sibling` for another client on the same store (never on Apple
-    /// platforms, where one process holds a store).
+    /// Who changed them: `local` for this device's own optimistic write,
+    /// applied before the room has seen it; `sibling` for another client on
+    /// the same store (never on Apple platforms, where one process holds a
+    /// store); `remote` for the room changing the local copy — a change
+    /// relayed from elsewhere, but also the room correcting or reverting
+    /// this client's own write (a server-stamped field, or a refusal that
+    /// rolls the write back).
     public enum Origin: String, Sendable, Equatable, CaseIterable {
         case local
         case remote
@@ -231,9 +235,10 @@ public struct Db3EvictedEvent: Sendable, Equatable {
 /// revoked grant). `.syncOff` (`DB3_SYNC_OFF`): the db3's sync was turned
 /// off; new writes are refused until it is on again, and a subscribe then
 /// opens it as before. `.clientOutdated` (`DB3_CLIENT_OUTDATED`): it needs a
-/// newer client; update the client to sync the db3. Either way its rows stay
-/// readable on the device, and writes made before are kept until the room
-/// judges them.
+/// newer client; update the client to sync the db3. `.deleted`
+/// (`DB3_DELETED`): the db3 was deleted; evict it to remove the copy. Either
+/// way its rows stay readable on the device, and writes made before are kept
+/// until the room judges them.
 ///
 /// ```swift
 /// let watching = sub.observe { event in
@@ -246,12 +251,13 @@ public struct Db3GoneEvent: Sendable, Equatable {
         case permission
         case clientOutdated = "client-outdated"
         case syncOff = "sync-off"
+        case deleted
     }
 
     public let id: String
     public let reason: Reason
     /// `DB3_ACCESS_REFUSED` for `.permission`, `DB3_SYNC_OFF` for `.syncOff`,
-    /// `DB3_CLIENT_OUTDATED` for `.clientOutdated`.
+    /// `DB3_CLIENT_OUTDATED` for `.clientOutdated`, `DB3_DELETED` for `.deleted`.
     public let code: String
 
     public init(id: String) {
@@ -265,6 +271,7 @@ public struct Db3GoneEvent: Sendable, Equatable {
         case .permission: self.code = JsBaoErrorCode.db3AccessRefused.rawValue
         case .clientOutdated: self.code = JsBaoErrorCode.db3ClientOutdated.rawValue
         case .syncOff: self.code = JsBaoErrorCode.db3SyncOff.rawValue
+        case .deleted: self.code = JsBaoErrorCode.db3Deleted.rawValue
         }
     }
 }

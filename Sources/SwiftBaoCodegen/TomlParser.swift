@@ -24,6 +24,14 @@ enum CodegenError: Error, CustomStringConvertible {
     /// A declared field name the platform reserves (#3501, #4505); `message`
     /// is js-bao's `[models.<model>.fields.<field>]: <sentence>`.
     case reservedFieldName(message: String)
+    /// One model declared differently in two input files (#5025).
+    case conflictingDeclarations(model: String, first: String, second: String, differences: [String])
+    /// Two models whose resolved Swift name writes one file.
+    case swiftNameCollision(fileName: String, models: [String])
+    /// A model whose resolved Swift name is the registration barrel's.
+    case reservedBarrelName(fileName: String)
+    /// An error raised reading one of several input files, naming the file.
+    indirect case inFile(name: String, error: CodegenError)
 
     var description: String {
         switch self {
@@ -63,6 +71,16 @@ enum CodegenError: Error, CustomStringConvertible {
             return message
         case let .reservedFieldName(message):
             return message
+        case let .conflictingDeclarations(model, first, second, differences):
+            return "Model `\(model)` is declared differently in \(first) and \(second): "
+                + "\(differences.joined(separator: "; ")). Declare it in one file, or make both "
+                + "declarations the same."
+        case let .swiftNameCollision(fileName, models):
+            return "\(fileName) would be written by multiple models: \(models.joined(separator: ", ")). Disambiguate with [models.<name>] class_name = \"...\"."
+        case let .reservedBarrelName(fileName):
+            return "a model resolves to the reserved barrel filename \(fileName). Disambiguate with [models.<name>] class_name = \"...\"."
+        case let .inFile(name, error):
+            return "\(name): \(error.description)"
         }
     }
 }
@@ -113,12 +131,154 @@ enum TomlParser {
         strict: Bool = true,
         rejectReservedFieldNames: Bool = false
     ) throws -> [ParsedSchema] {
+        try parseAll(
+            documents: [(sourceName: "", source: tomlString)],
+            swiftNameSuffix: swiftNameSuffix,
+            strict: strict,
+            rejectReservedFieldNames: rejectReservedFieldNames
+        )
+    }
+
+    /// Parse several TOML documents into one model namespace (#5025): the
+    /// models of every document in input order, each document's in its own
+    /// order, with relationships resolved over the union. A model two
+    /// documents declare the same way is kept once, from the first; declared
+    /// differently, the parse throws naming both files and what differs.
+    /// Each schema's `sourceName` is its document's.
+    static func parseAll(
+        documents: [(sourceName: String, source: String)],
+        swiftNameSuffix: String,
+        strict: Bool = true,
+        rejectReservedFieldNames: Bool = false
+    ) throws -> [ParsedSchema] {
+        // One document reads, and refuses, exactly as it always has; among
+        // several, a refusal names the file it came from.
+        func naming<T>(_ sourceName: String, _ body: () throws -> T) throws -> T {
+            guard documents.count > 1 else { return try body() }
+            do {
+                return try body()
+            } catch let error as CodegenError {
+                throw CodegenError.inFile(name: sourceName, error: error)
+            }
+        }
+
+        var perDocument: [(sourceName: String, models: TOMLTable, schemas: [ParsedSchema])] = []
+        for document in documents {
+            let parsed = try naming(document.sourceName) {
+                try parseModels(
+                    tomlString: document.source,
+                    swiftNameSuffix: swiftNameSuffix,
+                    strict: strict,
+                    rejectReservedFieldNames: rejectReservedFieldNames
+                )
+            }
+            guard let parsed else { continue }
+            perDocument.append((
+                document.sourceName,
+                parsed.models,
+                parsed.schemas.map { schema in
+                    var named = schema
+                    named.sourceName = document.sourceName
+                    return named
+                }
+            ))
+        }
+
+        // Relationships need the full known-model set: every document's.
+        let knownModels = Set(perDocument.flatMap { $0.schemas.map(\.name) })
+        var merged: [ParsedSchema] = []
+        var mergedTables: [TOMLTable?] = []
+        var indexByName: [String: Int] = [:]
+        for document in perDocument {
+            for var schema in document.schemas {
+                if let relsTable = document.models[schema.name]?.table?["relationships"]?.table {
+                    schema.relationships = try naming(document.sourceName) {
+                        try buildRelationships(
+                            modelName: schema.name,
+                            relsTable: relsTable,
+                            knownModels: knownModels,
+                            strict: strict
+                        )
+                    }
+                }
+                let table = document.models[schema.name]?.table
+                guard let index = indexByName[schema.name] else {
+                    indexByName[schema.name] = merged.count
+                    merged.append(schema)
+                    mergedTables.append(table)
+                    continue
+                }
+                let first = merged[index]
+                let differences = declarationDifferences(first, schema)
+                    + defaultDifferences(first, mergedTables[index], schema, table)
+                if !differences.isEmpty {
+                    throw CodegenError.conflictingDeclarations(
+                        model: schema.name, first: first.sourceName,
+                        second: schema.sourceName, differences: differences
+                    )
+                }
+            }
+        }
+        return merged
+    }
+
+    /// What differs between two declarations of one model, as phrases naming
+    /// the field (or option) and the file each side came from. Empty when
+    /// they are the same declaration.
+    static func declarationDifferences(_ a: ParsedSchema, _ b: ParsedSchema) -> [String] {
+        var out: [String] = []
+        for name in a.fieldOrder + b.fieldOrder.filter({ a.fields[$0] == nil }) {
+            switch (a.fields[name], b.fields[name]) {
+            case (.some, .none): out.append("field `\(name)` is only in \(a.sourceName)")
+            case (.none, .some): out.append("field `\(name)` is only in \(b.sourceName)")
+            case let (.some(x), .some(y)) where x != y: out.append("field `\(name)` differs")
+            default: break
+            }
+        }
+        if a.swiftName != b.swiftName { out.append("class_name differs") }
+        if a.uniqueConstraints != b.uniqueConstraints { out.append("unique_constraints differ") }
+        let shape = { (s: ParsedSchema) in
+            s.relationships.map { "\($0.name):\($0.descriptor.rawType):\($0.descriptor.properties.map { "\($0.0)=\($0.1)" })" }.sorted()
+        }
+        if shape(a) != shape(b) { out.append("relationships differ") }
+        return out
+    }
+
+    /// The fields whose `default` differs as a TOML value, among fields that
+    /// otherwise read the same. The IR keeps only the defaults the emitter
+    /// writes (strings, booleans, numbers), so a date, time or array default
+    /// is compared here, from each model's own table.
+    static func defaultDifferences(
+        _ a: ParsedSchema, _ aTable: TOMLTable?,
+        _ b: ParsedSchema, _ bTable: TOMLTable?
+    ) -> [String] {
+        let declared = { (table: TOMLTable?, field: String) -> TOMLValue? in
+            table?["fields"]?.table?[field]?.table?["default"]?.tomlValue
+        }
+        return a.fieldOrder.compactMap { name in
+            guard let field = a.fields[name], b.fields[name] == field else { return nil }
+            return declared(aTable, name) == declared(bTable, name) ? nil : "field `\(name)` differs"
+        }
+    }
+
+    /// One document's models, without relationships, or `nil` when it has no
+    /// `[models]` table. In a db3 type file (a document with a `[type]`
+    /// table) a model that declares no `id` gets the field a declared
+    /// `type = "id", auto_assign = true` gives, first in field order, as
+    /// js-bao's loader reads the same file.
+    private static func parseModels(
+        tomlString: String,
+        swiftNameSuffix: String,
+        strict: Bool,
+        rejectReservedFieldNames: Bool
+    ) throws -> (models: TOMLTable, schemas: [ParsedSchema])? {
         let table: TOMLTable
         do {
             table = try TOMLTable(string: tomlString)
         } catch {
             throw CodegenError.parse(String(describing: error))
         }
+        let isTypeFile = table["type"]?.table != nil
 
         // A fresh-template schema.toml ships with no models yet (the
         // user adds the first `[models.<name>]` block as their next
@@ -129,7 +289,7 @@ enum TomlParser {
         // run-ios.sh) call codegen unconditionally without failing
         // before the schema has any models.
         guard let modelsTable = table["models"]?.table else {
-            return []
+            return nil
         }
 
         // First pass: collect field/constraint/codegen info per model.
@@ -144,10 +304,13 @@ enum TomlParser {
                 model, allowed: KnownKeys.model,
                 context: "Model `\(key)`", strict: strict
             )
+            // As js-bao's loader asks: does the model declare `id` at all.
+            let synthesizesId = isTypeFile && model["fields"]?.table?["id"] == nil
             var schema = try buildSchema(
                 name: key, table: model,
                 swiftNameSuffix: swiftNameSuffix, strict: strict,
-                rejectReservedFieldNames: rejectReservedFieldNames
+                rejectReservedFieldNames: rejectReservedFieldNames,
+                synthesizeId: synthesizesId
             )
             // TOMLKit hands keys back alphabetically, which is fine for
             // every internal use (lookups go through a dictionary) but
@@ -163,26 +326,17 @@ enum TomlParser {
                 model: key,
                 source: tomlString
             )
+            // The synthesized `id` is not in the source, so it is placed
+            // first again after the source order is recovered.
+            if synthesizesId {
+                schema.fieldOrder.removeAll { $0 == "id" }
+                schema.fieldOrder.insert("id", at: 0)
+            }
             schemasByName[key] = schema
             modelOrder.append(key)
         }
 
-        // Second pass: relationships (need full known-model set).
-        for key in modelOrder {
-            guard let model = modelsTable[key]?.table,
-                  var schema = schemasByName[key] else { continue }
-            if let relsTable = model["relationships"]?.table {
-                schema.relationships = try buildRelationships(
-                    modelName: key,
-                    relsTable: relsTable,
-                    knownModels: Set(schemasByName.keys),
-                    strict: strict
-                )
-                schemasByName[key] = schema
-            }
-        }
-
-        return modelOrder.compactMap { schemasByName[$0] }
+        return (modelsTable, modelOrder.compactMap { schemasByName[$0] })
     }
 
     // MARK: - Strict unknown-key validation
@@ -212,12 +366,24 @@ enum TomlParser {
         table: TOMLTable,
         swiftNameSuffix: String,
         strict: Bool,
-        rejectReservedFieldNames: Bool
+        rejectReservedFieldNames: Bool,
+        synthesizeId: Bool = false
     ) throws -> ParsedSchema {
-        let (fieldOrder, fields) = try buildFields(
+        var (fieldOrder, fields) = try buildFields(
             modelName: name, table: table, strict: strict,
             rejectReservedFieldNames: rejectReservedFieldNames
         )
+        // A db3 type file's model with no `id` is read as declaring
+        // `type = "id", auto_assign = true`, before anything that judges the
+        // model's fields (a unique constraint may name `id`), as js-bao does.
+        if synthesizeId && fields["id"] == nil {
+            fields["id"] = ParsedField(
+                type: .id, indexed: false, unique: false, required: false,
+                autoAssign: true, maxLength: nil, maxCount: nil,
+                defaultLiteral: nil, enumValues: nil, autoStamp: nil
+            )
+            fieldOrder.insert("id", at: 0)
+        }
         let constraints = try buildUniqueConstraints(
             modelName: name, table: table, fieldNames: Set(fields.keys),
             strict: strict

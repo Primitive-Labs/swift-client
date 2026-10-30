@@ -67,9 +67,17 @@ struct RecordLogMarks: Equatable, Sendable {
     var segment: RecordLogHeldSegment? = nil
     /// The full replacement in progress is staged (see ``RecordLogStoredState/staged``).
     var staged = false
+    /// What the room last said of the db3's type (#5020): `unknown` before any
+    /// `record.opened` answered on this device.
+    var typed: RecordLogTyped = .unknown
+    /// A typed db3's type: its name, and the revision hash whose declarations are held (`nil` when none are).
+    var db3Type: RecordLogDb3Type? = nil
+    /// A typed db3's declarations as the room sent them, per model each declared field's kind.
+    var declarations: [String: [String: String]]? = nil
 
     static func == (a: RecordLogMarks, b: RecordLogMarks) -> Bool {
-        a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
+        a.typed == b.typed && a.db3Type == b.db3Type && a.declarations == b.declarations
+            && a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
             && a.constraints == b.constraints && a.permission == b.permission && a.replacing == b.replacing
             && a.replacement == b.replacement && a.receipt == b.receipt && a.segment == b.segment && a.staged == b.staged
             && a.lastCatchUpAt == b.lastCatchUpAt && a.writer == b.writer && a.nextSeq == b.nextSeq
@@ -77,6 +85,27 @@ struct RecordLogMarks: Equatable, Sendable {
             && a.lowestPending == b.lowestPending && a.pending == b.pending
             && a.unacked.map(\.seq) == b.unacked.map(\.seq) && a.unacked.map(\.records) == b.unacked.map(\.records)
     }
+}
+
+/// Whether a db3 is typed, as its store last heard: `unknown` until a room answered (js-bao's `RecordLogTyped`).
+enum RecordLogTyped: String, Sendable, Equatable {
+    case unknown
+    case no
+    case yes
+}
+
+/// A typed db3's type as its store holds it: the name, and the revision hash
+/// whose declarations are held (`nil` when none are).
+struct RecordLogDb3Type: Equatable, Sendable {
+    var name: String
+    var hash: String?
+}
+
+/// What a store is told of a db3's type: untyped, or typed with a name, a
+/// hash and, when the room sent them, the declarations.
+enum RecordLogTypeUpdate: Sendable, Equatable {
+    case untyped
+    case typed(name: String, hash: String?, models: [String: [String: String]]?)
 }
 
 /// One write of a commit: an entry's mutations, `m` first.
@@ -337,6 +366,44 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
             "UPDATE record_log_state SET permission = ? WHERE doc_id = ?",
             [permission.map { .text($0) } ?? .null, doc]
         )
+    }
+
+    /// The `record_log_meta` key a document's type mark is kept under (#5020):
+    /// a JSON `{ typed, name?, hash?, models? }`, absent before any room answered.
+    private var typeKey: Format2SqlValue { .text("db3_type:\(docId)") }
+
+    /// The typed mark, the type and its held declarations.
+    func typeState() throws -> (typed: RecordLogTyped, db3Type: RecordLogDb3Type?, declarations: [String: [String: String]]?) {
+        let text = try sql.first("SELECT value FROM record_log_meta WHERE key = ?", [typeKey])?["value"].stringValue
+        guard let held = text.flatMap({ JSONValue(jsonText: $0) })?.objectValue else { return (.unknown, nil, nil) }
+        let typed = RecordLogTyped(rawValue: held["typed"]?.stringValue ?? "") ?? .unknown
+        guard typed == .yes, let name = held["name"]?.stringValue else { return (typed, nil, nil) }
+        let declarations = held["models"]?.objectValue?.mapValues { ($0.objectValue ?? [:]).compactMapValues(\.stringValue) }
+        return (typed, RecordLogDb3Type(name: name, hash: held["hash"]?.stringValue), declarations)
+    }
+
+    /// Record what the room said of the type: untyped clears it; typed keeps
+    /// the held declarations when the hash is theirs and none were sent.
+    func setType(_ update: RecordLogTypeUpdate) throws {
+        var object: [String: JSONValue]
+        switch update {
+        case .untyped:
+            object = ["typed": "no"]
+        case .typed(let name, let hash, let models):
+            let held = try typeState()
+            let kept = models ?? (hash != nil && held.db3Type?.hash == hash ? held.declarations : nil)
+            object = ["typed": "yes", "name": .string(name), "hash": kept != nil ? hash.map { .string($0) } ?? .null : .null]
+            object["models"] = kept.map { .object($0.mapValues { .object($0.mapValues { .string($0) }) }) } ?? .null
+        }
+        try sql.exec(
+            "INSERT INTO record_log_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [typeKey, .text(RecordLogJSON.text(.object(object)))]
+        )
+    }
+
+    /// Forget the type mark: the document's local data is removed.
+    func forgetType() throws {
+        try sql.exec("DELETE FROM record_log_meta WHERE key = ?", [typeKey])
     }
 
     func setLastCatchUpAt(_ at: Int64) throws {
@@ -1098,6 +1165,7 @@ final class RecordLogStore: @unchecked Sendable {
             for table in RecordLogSchema.clientTables {
                 try sql.exec("DELETE FROM \(table) WHERE doc_id = ?", [doc])
             }
+            try tables.forgetType()
             tables.forgetBuffered()
             return RecordLogPurgeReply(
                 purged: true, nothingStored: held == 0 && live.isEmpty, pendingOps: live.count, handedBack: live
@@ -1121,6 +1189,7 @@ final class RecordLogStore: @unchecked Sendable {
                 [doc, .text(writer)]
             )
         }
+        let type = try tables.typeState()
         return RecordLogMarks(
             cursor: try tables.cursor(), open: epochs.open, grant: epochs.grant, entries: epochs.entries,
             constraints: try tables.constraints(),
@@ -1136,7 +1205,10 @@ final class RecordLogStore: @unchecked Sendable {
             unacked: try writer.map { try unackedOf(sql, $0) } ?? [],
             receipt: try tables.receipts()?.latest,
             segment: try tables.heldSegment(),
-            staged: try tables.staged()
+            staged: try tables.staged(),
+            typed: type.typed,
+            db3Type: type.db3Type,
+            declarations: type.declarations
         )
     }
 
@@ -2098,16 +2170,17 @@ final class RecordLogStore: @unchecked Sendable {
         return changed
     }
 
-    /// Record what the room said about epochs and constraints, and the permission the client holds.
+    /// Record what the room said about epochs, constraints and the db3's type, and the permission the client holds.
     @discardableResult
     func setState(
         writer: String, notice: (current: Int, next: Int?, entries: Int?)? = nil,
-        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil
+        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil, type: RecordLogTypeUpdate? = nil
     ) throws -> RecordLogMarks {
         try command { sql in
             if let notice { try rules(writer).notice(current: notice.current, next: notice.next, entries: notice.entries) }
             if let constraints { try tables.setConstraints(constraints) }
             if let permission { try tables.setPermission(permission) }
+            if let type { try tables.setType(type) }
             return try marksOn(sql)
         }
     }
@@ -2215,6 +2288,7 @@ final class RecordLogStore: @unchecked Sendable {
                 "SELECT COUNT(*) AS n FROM record_log_pending WHERE void = 0 AND acked IS NULL"
             )?["n"].intValue ?? 0
             for table in RecordLogSchema.clientTables { try sql.exec("DELETE FROM \(table)") }
+            try sql.exec("DELETE FROM record_log_meta WHERE key LIKE 'db3_type:%'")
             return dropped
         }
     }

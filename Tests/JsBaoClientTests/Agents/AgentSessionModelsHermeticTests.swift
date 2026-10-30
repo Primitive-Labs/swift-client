@@ -62,7 +62,7 @@ final class AgentSessionModelsHermeticTests: XCTestCase {
     // MARK: - The generated file
 
     func testTheGeneratedFileNamesTheSevenModelsAndTheVersion() {
-        XCTAssertEqual(AgentSessionModels.schemaVersion, 2)
+        XCTAssertEqual(AgentSessionModels.schemaVersion, 3)
         XCTAssertEqual(AgentSessionModels.modelNames, ["Session", "Member", "Turn", "Message", "Part", "ToolCall", "Step"])
         XCTAssertEqual(AgentSessionStatus.known.count, 7)
         XCTAssertEqual(AgentSessionToolCallState.known.map(\.rawValue), [

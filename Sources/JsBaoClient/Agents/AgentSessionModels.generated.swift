@@ -11,7 +11,7 @@ import Foundation
 /// an app's own models never collide with these names.
 public enum AgentSessionModels {
     /// The generation of the `primitive:agentSession` type a session's db3 holds.
-    public static let schemaVersion: Double = 2
+    public static let schemaVersion: Double = 3
     /// The models of a session's db3.
     public static let modelNames: [String] = ["Session", "Member", "Turn", "Message", "Part", "ToolCall", "Step"]
 }
@@ -370,6 +370,7 @@ public struct AgentSessionRecord: Sendable, Equatable {
     public let lastErrorMessage: String?
     public let createdAt: String?
     public let modifiedAt: String?
+    public let deletingAt: String?
     public let row: [String: JSONValue]
 
     /// Decode a row. `nil` when a required column is missing or does not read;
@@ -391,6 +392,7 @@ public struct AgentSessionRecord: Sendable, Equatable {
         self.lastErrorMessage = row["lastErrorMessage"]?.stringValue
         self.createdAt = row["createdAt"]?.stringValue
         self.modifiedAt = row["modifiedAt"]?.stringValue
+        self.deletingAt = row["deletingAt"]?.stringValue
         self.row = row
     }
 }
@@ -426,6 +428,7 @@ public struct AgentSessionTurnRecord: Sendable, Equatable {
     public let seq: Double
     public let status: AgentSessionTurnStatus
     public let initiatorUserId: String?
+    public let configId: String?
     public let startedAt: String?
     public let endedAt: String?
     public let errorCode: String?
@@ -449,6 +452,7 @@ public struct AgentSessionTurnRecord: Sendable, Equatable {
         self.seq = seq
         self.status = status
         self.initiatorUserId = row["initiatorUserId"]?.stringValue
+        self.configId = row["configId"]?.stringValue
         self.startedAt = row["startedAt"]?.stringValue
         self.endedAt = row["endedAt"]?.stringValue
         self.errorCode = row["errorCode"]?.stringValue

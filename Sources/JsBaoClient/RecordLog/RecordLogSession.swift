@@ -42,6 +42,12 @@ struct RecordLogSessionHost: Sendable {
     var declared: @Sendable (String) -> Void = { _ in }
     /// The session's status changed: its phase, or a progress step.
     var status: @Sendable (String, RecordLogSessionStatus) -> Void = { _, _ in }
+    /// Whether an open of a store the room has not yet told whether its db3
+    /// is typed (its typed mark `unknown`) waits for `record.opened` before
+    /// it declares, as the client's does (#5020): a typed room refuses every
+    /// declaration. Without it the first open of a connection sends the
+    /// declaration ahead whatever the mark says, as before.
+    var waitsForTypeBeforeDeclaring = false
 }
 
 /// Where a db3's session is in its conversation with the room: `idle` (no
@@ -223,6 +229,8 @@ actor RecordLogSession {
     private struct SentAhead {
         /// The server answered them `DOCUMENT_NOT_OPEN`: the catch-up's end sends them again.
         var refused = false
+        /// A declaration went with them (none goes to a typed db3, #5020).
+        var declared = true
         /// The numbers its `record.entries` frame carried.
         var seqs: Set<Int> = []
     }
@@ -668,15 +676,21 @@ actor RecordLogSession {
         // judges the frames under it would answer them as that writer's. And
         // only when no resume can be owed: every number below `nextSeq` is
         // then one the room judged.
+        // A db3 the room may hold typed (#5020): nothing is declared ahead of
+        // its answer, and a typed one is never declared to.
         let sendAhead = !current.orphan && openedOnConnection == 0
             && history.opened.allSatisfy { $0 == current.writer } && nextSeq > marks.resumedAt
+            && (marks.typed != .unknown || !host.waitsForTypeBeforeDeclaring)
+        // The type revision whose declarations this device holds: the room
+        // sends them again only for another one.
+        if marks.typed == .yes, let hash = marks.db3Type?.hash { open["db3TypeHash"] = .string(hash) }
         openedOnConnection += 1
         history.opened.insert(current.writer)
         send(.object(open))
         guard sendAhead else { return }
-        ahead = SentAhead()
+        ahead = SentAhead(declared: marks.typed != .yes)
         declaredVersion = binding.declarationVersion
-        sender.enqueueControl(.declare(models: host.declarations()))
+        if marks.typed != .yes { sender.enqueueControl(.declare(models: host.declarations())) }
         for entry in unacked { sender.enqueue(entry.wire) }
         sendingAhead = true
         sender.flush()
@@ -925,6 +939,38 @@ actor RecordLogSession {
         }
     }
 
+    /// What a `record.opened` says of the db3's type (#5020): no `db3Type` key
+    /// is an untyped room; an object with a string `name` and `hash` (and,
+    /// when sent, `models` of field kinds) is the room's type. A malformed
+    /// value changes nothing.
+    private func typeOfOpened(_ frame: [String: JSONValue]) -> RecordLogTypeUpdate? {
+        guard let value = frame["db3Type"], value != .null else { return .untyped }
+        guard let object = value.objectValue, let name = object["name"]?.stringValue, !name.isEmpty,
+              let hash = object["hash"]?.stringValue, !hash.isEmpty
+        else {
+            logger?.warn("[record-log]", documentId, "— record.opened carried a db3Type this client cannot read; the type it holds is kept")
+            return nil
+        }
+        guard let models = object["models"] else { return .typed(name: name, hash: hash, models: nil) }
+        var declarations: [String: [String: String]] = [:]
+        for (model, fields) in models.objectValue ?? [:] {
+            guard let kinds = fields.objectValue else { return malformed() }
+            var declared: [String: String] = [:]
+            for (field, kind) in kinds {
+                guard let kind = kind.stringValue else { return malformed() }
+                declared[field] = kind
+            }
+            declarations[model] = declared
+        }
+        guard models.objectValue != nil else { return malformed() }
+        return .typed(name: name, hash: hash, models: declarations)
+
+        func malformed() -> RecordLogTypeUpdate? {
+            logger?.warn("[record-log]", documentId, "— record.opened carried a db3Type this client cannot read; the type it holds is kept")
+            return nil
+        }
+    }
+
     private func opened(_ frame: [String: JSONValue]) throws {
         if history.stale != nil {
             // The old id opened again: everything its stream carried before is in.
@@ -950,7 +996,9 @@ actor RecordLogSession {
             constraints: constraints.map { list in list.filter { binding.constraintInForce($0.name) } },
             // The room opened the document for this client's writer: an access
             // refusal it answered before is over.
-            permission: !current.orphan && binding.marks.permission == RecordLogPermission.refused ? .some(nil) : nil
+            permission: !current.orphan && binding.marks.permission == RecordLogPermission.refused ? .some(nil) : nil,
+            // The room says whether the db3 is typed, and by what (#5020).
+            type: typeOfOpened(frame)
         )
         lastSeq = frame["lastSeq"]?.wholeNumber ?? 0
         if !current.orphan && lastSeq >= marks.nextSeq {
@@ -1295,8 +1343,15 @@ actor RecordLogSession {
             // The declaration and the entries went with the open, with no
             // resume owed: what goes now is a model registered since, then what
             // was committed meanwhile (the sender keeps those in flight or
-            // queued once).
-            declareIfChanged()
+            // queued once). A typed db3 takes no declaration (#5020).
+            if binding.marks.typed == .yes {
+                if !ahead.declared { host.declared(documentId) }
+            } else if !ahead.declared {
+                declaredVersion = binding.declarationVersion
+                sender.enqueueControl(.declare(models: host.declarations()))
+            } else {
+                declareIfChanged()
+            }
             for entry in unsent { sender.enqueue(entry.wire) }
             return try synced()
         }
@@ -1316,7 +1371,12 @@ actor RecordLogSession {
         // room answers it with what it made of it.
         sender.requeueInFlight(unsent.map(\.wire))
         declaredVersion = binding.declarationVersion
-        sender.enqueueControl(.declare(models: host.declarations()))
+        // A typed db3 takes no declaration: its type's are in force (#5020).
+        if binding.marks.typed == .yes {
+            host.declared(documentId)
+        } else {
+            sender.enqueueControl(.declare(models: host.declarations()))
+        }
         for entry in unsent { sender.enqueue(entry.wire) }
         try synced()
     }
@@ -1625,7 +1685,7 @@ actor RecordLogSession {
     private static let accessRefusedMessage = "Access denied to document"
     /// The codes of a terminal access refusal. `DB3_SYNC_OFF`: the db3's sync
     /// is off, so no socket reaches it until it is on again (#4806, js-bao's #4799).
-    private static let accessRefusedCodes: Set<String> = ["ACCESS_DENIED", "DOC_ACCESS_DENIED", "DB3_SYNC_OFF"]
+    private static let accessRefusedCodes: Set<String> = ["ACCESS_DENIED", "DOC_ACCESS_DENIED", "DB3_SYNC_OFF", "DOCUMENT_DELETED"]
 
     /// Whether an `error` frame is the room's access refusal of a record frame:
     /// an access code, or the connection's code-less access-denied message,
@@ -1642,19 +1702,23 @@ actor RecordLogSession {
     /// is marked `permission: "refused"` (local writes are refused from now),
     /// its unjudged entries stay for the room to judge once access returns,
     /// nothing more is sent, and the open is reported failed with
-    /// `ACCESS_DENIED`, or `DB3_SYNC_OFF` when the db3's sync was turned off.
-    /// The own writer's next `record.opened` lifts the mark.
+    /// `ACCESS_DENIED`, `DB3_SYNC_OFF` when the db3's sync was turned off, or
+    /// `DOCUMENT_DELETED` when the db3 was deleted. The own writer's next
+    /// `record.opened` lifts the mark.
     private func accessRefused(_ frame: [String: JSONValue]) throws {
         guard phase != .closed else { return }
-        let syncOff = frame["code"]?.stringValue == JsBaoErrorCode.db3SyncOff.rawValue
+        let code = frame["code"]?.stringValue
+        let reason = code == JsBaoErrorCode.db3SyncOff.rawValue || code == "DOCUMENT_DELETED" ? code! : "ACCESS_DENIED"
+        let why = reason == JsBaoErrorCode.db3SyncOff.rawValue ? " because its sync is off;"
+            : reason == "DOCUMENT_DELETED" ? " because it was deleted;" : " for access;"
         logger?.warn(
             "[record-log] \(documentId): the room refused \(frame["messageType"]?.stringValue ?? "a record frame")"
-                + (syncOff ? " because its sync is off;" : " for access;")
+                + why
                 + " the document stays readable here, its unsent writes are kept, and nothing more is sent"
         )
         disconnected()
         try binding.setState(permission: .some(RecordLogPermission.refused))
-        host.syncFailed(documentId, syncOff ? JsBaoErrorCode.db3SyncOff.rawValue : "ACCESS_DENIED")
+        host.syncFailed(documentId, reason)
     }
 
     private func error(_ frame: [String: JSONValue]) throws {
@@ -1662,11 +1726,16 @@ actor RecordLogSession {
         let messageType = frame["messageType"]?.stringValue
         if code == "DB3_DECLARATION_REFUSED_TYPED" && messageType == "record.declare" {
             // A typed db3's type is its declaration: the room declared nothing
-            // and judges every write by the type. The declaration is answered.
-            logger?.warn(
+            // and judges every write by the type. The declaration is answered,
+            // and the store is marked typed so its next open declares nothing (#5020).
+            logger?.debug(
                 "[record-log]", documentId, "— the db3 is typed by", frame["db3Type"]?.stringValue ?? "its type",
                 "; the room keeps the type's declarations, and this client's models are judged against them"
             )
+            if let name = frame["db3Type"]?.stringValue, !name.isEmpty {
+                let held = binding.marks.db3Type
+                try binding.setState(type: .typed(name: name, hash: held?.name == name ? held?.hash : nil, models: nil))
+            }
             host.declared(documentId)
             return
         }
@@ -1979,6 +2048,8 @@ actor RecordLogSession {
         let version = binding.declarationVersion
         guard version != declaredVersion else { return }
         declaredVersion = version
+        // A typed db3 takes no declaration: its type's are in force (#5020).
+        guard binding.marks.typed != .yes else { return }
         sender.enqueueControl(.declare(models: host.declarations()))
     }
 

@@ -3,11 +3,40 @@ import Foundation
 // The answers of `client.db3`'s lifecycle calls: a db3 as the `db3/*` routes
 // answer it, and the sync, type, app-access and custody routes' own shapes.
 
+/// Which listing a `client.db3.listMine(_:)` row came from: the db3s you
+/// hold, those shared with you, those granted to every user of the app.
+public enum Db3Via: String, Sendable, CaseIterable, Codable {
+    case held
+    case shared
+    case app
+}
+
+/// The options of `client.db3.listMine(_:)`.
+///
+/// ```swift
+/// let shared = try await client.db3.listMine(Db3ListMineOptions(via: [.shared]))
+/// ```
+public struct Db3ListMineOptions: Sendable {
+    /// The listings to read, always in the order `held`, `shared`, `app`. All three by default.
+    public var via: [Db3Via]
+    /// Rows per page: 50 by default, at most 100.
+    public var limit: Int?
+    /// A previous page's `nextCursor`, with the same `via`.
+    public var cursor: String?
+
+    public init(via: [Db3Via] = Db3Via.allCases, limit: Int? = nil, cursor: String? = nil) {
+        self.via = via
+        self.limit = limit
+        self.cursor = cursor
+    }
+}
+
 /// A db3, as `client.db3.create`, `get`, `transfer` and `listMine` answer it.
 ///
 /// One type for every route that answers a db3: a field a route does not send
 /// decodes to its default (`tags` to `[]`; `metadata`, `permission`,
-/// `accessSource` and `grantedAt` to `nil`), and a null `title` to `""`.
+/// `accessSource`, `grantedAt` and `grantedBy` to `nil`), and a null `title`
+/// to `""`. `via` is set only on a `listMine(_:)` row.
 ///
 /// ```swift
 /// let info = try await client.db3.create(title: "Orders", type: "orders")
@@ -40,11 +69,15 @@ public struct Db3Info: Decodable, Sendable, Equatable {
     /// when absent or a value this client does not know.
     public let accessSource: DocumentAccessSource?
     public let grantedAt: String?
+    /// Who made the grant, on a `listMine` row of the `shared` listing; `nil` otherwise.
+    public let grantedBy: String?
+    /// The listing a `listMine(_:)` row came from; `nil` on any other answer.
+    public let via: Db3Via?
 
     public init(
         id: String, title: String, createdBy: String, createdAt: String, modifiedAt: String, custodian: String?,
         sync: Bool, type: String?, tags: [String], metadata: JSONValue?, permission: DocumentPermission?,
-        accessSource: DocumentAccessSource?, grantedAt: String?
+        accessSource: DocumentAccessSource?, grantedAt: String?, grantedBy: String? = nil, via: Db3Via? = nil
     ) {
         self.id = id
         self.title = title
@@ -59,10 +92,13 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         self.permission = permission
         self.accessSource = accessSource
         self.grantedAt = grantedAt
+        self.grantedBy = grantedBy
+        self.via = via
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, title, createdBy, createdAt, modifiedAt, custodian, sync, type, tags, metadata, permission, accessSource, grantedAt
+        case grantedBy
     }
 
     public init(from decoder: Decoder) throws {
@@ -80,6 +116,49 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         permission = try c.decodeIfPresent(DocumentPermission.self, forKey: .permission)
         accessSource = DocumentAccessSource.lenient(c, forKey: .accessSource)
         grantedAt = try c.decodeIfPresent(String.self, forKey: .grantedAt)
+        grantedBy = try c.decodeIfPresent(String.self, forKey: .grantedBy)
+        via = nil
+    }
+
+    /// This row as the `via` listing answered it.
+    func listed(via: Db3Via) -> Db3Info {
+        Db3Info(
+            id: id, title: title, createdBy: createdBy, createdAt: createdAt, modifiedAt: modifiedAt, custodian: custodian,
+            sync: sync, type: type, tags: tags, metadata: metadata, permission: permission, accessSource: accessSource,
+            grantedAt: grantedAt, grantedBy: grantedBy, via: via
+        )
+    }
+}
+
+/// A `client.db3.listMine(_:)` cursor: the listing it is in, and that
+/// listing's own cursor once past its first page. It travels as the JSON
+/// object `{"via": …, "cursor": …}`, the JS client's form.
+struct Db3ListMineCursor: Equatable {
+    let via: Db3Via
+    let cursor: String?
+
+    /// A cursor `listMine(_:)` issued, read back; `nil` for any other string
+    /// (a server listing's cursor carries no `via`).
+    static func decode(_ text: String) -> Db3ListMineCursor? {
+        guard let data = text.data(using: .utf8),
+              let object = try? JSONDecoder().decode([String: JSONValue].self, from: data),
+              let name = object["via"]?.stringValue, let via = Db3Via(rawValue: name),
+              object.keys.allSatisfy({ $0 == "via" || $0 == "cursor" })
+        else { return nil }
+        guard let raw = object["cursor"] else { return Db3ListMineCursor(via: via, cursor: nil) }
+        guard let cursor = raw.stringValue else { return nil }
+        return Db3ListMineCursor(via: via, cursor: cursor)
+    }
+
+    /// The cursor as `listMine(_:)` answers it.
+    var encoded: String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        func json(_ value: String) -> String {
+            (try? encoder.encode(value)).flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+        }
+        let viaPart = "\"via\":\(json(via.rawValue))"
+        return "{" + viaPart + (cursor.map { ",\"cursor\":\(json($0))" } ?? "") + "}"
     }
 }
 
@@ -99,14 +178,31 @@ public struct Db3GetOrCreateWithAliasOptions: Sendable {
     public var tags: [String]?
     public var metadata: JSONValue?
     public var type: String?
+    /// The alias user's level on a db3 this call creates; `nil` means
+    /// `.owner`. Ignored when the alias already names a db3.
+    public var permission: Db3AliasPermission?
 
-    public init(alias: AliasRef, title: String? = nil, tags: [String]? = nil, metadata: JSONValue? = nil, type: String? = nil) {
+    public init(
+        alias: AliasRef, title: String? = nil, tags: [String]? = nil, metadata: JSONValue? = nil, type: String? = nil,
+        permission: Db3AliasPermission? = nil
+    ) {
         self.alias = alias
         self.title = title
         self.tags = tags
         self.metadata = metadata
         self.type = type
+        self.permission = permission
     }
+}
+
+/// The alias user's level on a db3 `client.db3.getOrCreateWithAlias(_:)`
+/// creates. `.reader` and `.readWrite` give the alias user one grant at that
+/// level and no owner row, so a `.reader` never holds write access. Its own
+/// type, not `DocumentPermission`: `admin` is not a level a create takes.
+public enum Db3AliasPermission: String, Sendable, CaseIterable, Codable {
+    case owner
+    case readWrite = "read-write"
+    case reader
 }
 
 /// What `client.db3.getOrCreateWithAlias(_:)` answers: the db3's `id`, whether

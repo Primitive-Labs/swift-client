@@ -435,6 +435,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// the store is bound: a test holds a start-up binding while a logout
     /// races it. Internal; never set in production code.
     var db3BindHoldForTest: (@Sendable (String) async -> Void)?
+    /// Test seam at the top of the db3 lifecycle's close of a db3 on the
+    /// socket, awaited with its id: a test holds an identity release while a
+    /// subscribe or a sign-out races it. Internal; never set in production code.
+    var db3CloseHoldForTest: (@Sendable (String) async -> Void)?
+    /// The identity changes in progress, and the db3s each is releasing.
+    let db3IdentityRelease = Db3IdentityRelease()
     /// Test seam told each time the client reads a db3's index list, with its
     /// id. Internal; never set in production code.
     var db3IndexReadForTest: (@Sendable (String) -> Void)?
@@ -1592,6 +1598,8 @@ public final class JsBaoClient: @unchecked Sendable {
                 }
             }
         }
+        // The models read the db3's store from here: it answers queries.
+        recordLog?.attached = true
     }
 
     /// Drop a closing document's rows from every shared store so later
@@ -1599,6 +1607,7 @@ public final class JsBaoClient: @unchecked Sendable {
     private func disconnectFromSharedModels(documentId: String) {
         let models = lock.withLock { Array(sharedModels.values) }
         for model in models { model.disconnect(docId: documentId) }
+        recordLogState.binding(documentId)?.attached = false
     }
 
     // MARK: - Default client (backs the codegen'd `Model.query()` facade)
@@ -2194,6 +2203,10 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `AuthController.logout` through `onLogoutCleanup` (#2874). Mirrors the
     /// JS client's `handleLogoutCleanup`.
     private func runLogoutCleanup(options: LogoutOptions) async {
+        // The signed-out user's db3s are released from here: nothing is sent
+        // for them, and a db3 open or bind waits until the cleanup settled.
+        let db3Release = beginDb3IdentityRelease()
+        defer { db3IdentityRelease.end(db3Release) }
         // A `me.ownedDocuments` refresh still in flight answers with the
         // signed-out user's documents. Stop it before the cleanup below, or
         // its rows land in the local cache after the wipe and the next user's
@@ -2253,7 +2266,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // db3's store bound, so this is what takes the signed-out user's db3s
         // out of reads and writes. A start-up binding still running for them
         // is discarded when it finishes.
-        _db3Lifecycle.forgetStates()
+        forgetDb3Identity()
         await _db3Lifecycle.releaseAll(unbind: true)
 
         // On every logout, wipe or not: a signed-out user's failed create may
@@ -4280,6 +4293,12 @@ public final class JsBaoClient: @unchecked Sendable {
             )
             return
         }
+        // A db3 of the previous user, being released (or not yet released
+        // under the new user's token): nothing is sent for it but its close.
+        if isDb3Releasing(documentId) {
+            logger.debug("[db3] not syncing", documentId, "— it is being released for the previous user")
+            return
+        }
         if explicit {
             documentManager.setStartNetworkMode(documentId, .immediate)
             // An explicit call is the caller taking over the timing, so it
@@ -6028,6 +6047,17 @@ public final class JsBaoClient: @unchecked Sendable {
         // Only fires for documents whose sync this client drives — the
         // `deferNetworkSync` / `enableNetworkSync: false` opens are filtered
         // out by `DocumentManager.applyPostCommitPolicy`.
+        // A permission heard for a bound db3 reaches its store before the
+        // event: `reader` refuses saves here, a write-capable one takes them
+        // again, with no reopen (#5020).
+        documentManager.permissionApplied = { [weak self] documentId, permission in
+            guard let self, let binding = self.recordLogBinding(documentId), !binding.isClosed else { return }
+            do {
+                try binding.applyPermissionChange(permission)
+            } catch {
+                self.logger.warn("[record-log]", documentId, "— applying the permission", permission.rawValue, "failed:", error.localizedDescription)
+            }
+        }
         documentManager.onPendingCreateCommitted = { [weak self] documentId in
             Task { [weak self] in
                 guard let self, self.networkingAllowed() else { return }
@@ -6438,35 +6468,37 @@ public final class JsBaoClient: @unchecked Sendable {
     public func rebindUserScopedStorage() async {
         let newUserId = authController.getUserId() ?? ""
         // Another user: the previous user's db3s are unbound before anything
-        // of the new identity is applied (their subscriptions end).
-        if documentManager.userId != newUserId {
-            _db3Lifecycle.forgetStates()
+        // of the new identity is applied (their subscriptions end), and a db3
+        // open or bind waits until the new user's storage is in place.
+        guard documentManager.userId == newUserId else {
+            let db3Release = beginDb3IdentityRelease()
+            forgetDb3Identity()
             await _db3Lifecycle.releaseAll(unbind: true)
-        }
-        // The record-log store is reset when another user than its owner signs
-        // in; the same user keeps it, with its unsent writes.
-        await checkRecordLogOwnerAtSignIn()
-        if documentManager.userId == newUserId {
-            // Same user, but a logout in this process dropped in-memory
-            // user-scoped state the store still holds (#2874): reload it here,
-            // or their pending creates would stay uncommitted until the app
-            // relaunched. `loadLocalMetadata()` is additive and idempotent, so
-            // re-running it for an unchanged user is safe.
-            if documentManager.needsLocalMetadataReload {
+            // The record-log store is reset when another user than its owner signs in.
+            await checkRecordLogOwnerAtSignIn()
+            await documentManager.resetInMemoryUserState(userId: newUserId)
+            await kvCache.setUserId(authController.getUserId())
+            if !newUserId.isEmpty {
+                try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
                 await documentManager.loadLocalMetadata()
-                releaseHeldOutboundClassifications()
             }
-            // A logout unbound this user's db3s: bind them again.
+            releaseHeldOutboundClassifications()
+            db3IdentityRelease.end(db3Release)
             await bindStoredDb3s()
             return
         }
-        await documentManager.resetInMemoryUserState(userId: newUserId)
-        await kvCache.setUserId(authController.getUserId())
-        if !newUserId.isEmpty {
-            try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
+        // The same user keeps the record-log store, with its unsent writes.
+        await checkRecordLogOwnerAtSignIn()
+        // Same user, but a logout in this process dropped in-memory
+        // user-scoped state the store still holds (#2874): reload it here,
+        // or their pending creates would stay uncommitted until the app
+        // relaunched. `loadLocalMetadata()` is additive and idempotent, so
+        // re-running it for an unchanged user is safe.
+        if documentManager.needsLocalMetadataReload {
             await documentManager.loadLocalMetadata()
+            releaseHeldOutboundClassifications()
         }
-        releaseHeldOutboundClassifications()
+        // A logout unbound this user's db3s: bind them again.
         await bindStoredDb3s()
     }
 

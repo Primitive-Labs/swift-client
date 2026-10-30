@@ -159,13 +159,22 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     /// ``write(id:values:isUpdate:upsertOn:)`` carrying the write's guards:
     /// `condition` rides the mutation, `ifNotExists` makes it a create of the
     /// whole state whatever the view holds. The room judges both.
+    ///
+    /// `cleared` names the fields an update sets to nil: each is touched with
+    /// no value, which the plan writes as `null` (a string set as the removal
+    /// of every member the view holds).
     @discardableResult
     func write(
-        id: String, values: [String: PrimitiveValue], isUpdate: Bool, upsertOn: String?, guards: RecordLogWriteGuards
+        id: String, values: [String: PrimitiveValue], isUpdate: Bool, upsertOn: String?, guards: RecordLogWriteGuards,
+        cleared: Set<String> = []
     ) throws -> Int? {
         var dataToSave: [String: JSONValue] = ["id": .string(id)]
         var stringSetChanges: [String: (additions: [String], removals: [String])] = [:]
         let existing = isUpdate ? try row(id: id) : nil
+        let clearedFields = isUpdate ? cleared.filter { $0 != "id" && values[$0] == nil }.sorted() : []
+        for name in clearedFields where stringSetFields.contains(name) {
+            stringSetChanges[name] = (additions: [], removals: recordLogCanonicalStringSet(Set(try self.members(id: id, field: name))))
+        }
         for (name, value) in values where name != "id" {
             if case let .stringset(members) = value {
                 dataToSave[name] = .array(recordLogCanonicalStringSet(members).map { .string($0) })
@@ -182,7 +191,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         }
         let mutation = planRecordLogSave(RecordLogSaveInput(
             model: modelName, recordId: id, existing: isUpdate ? (existing ?? ["id": .string(id)]) : nil,
-            dataToSave: dataToSave, touchedFields: values.keys.filter { $0 != "id" },
+            dataToSave: dataToSave, touchedFields: values.keys.filter { $0 != "id" } + clearedFields,
             stringSetChanges: stringSetChanges, stringSetFieldNames: Set(stringSetFields), guards: guards
         ))
         return try commit([mutation], upsertOn: isUpdate ? nil : upsertOn, existing: existing)
@@ -222,6 +231,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
             let after = recordLogPlainRowAfter(existing, mutation) ?? existing
             let values = Dictionary(uniqueKeysWithValues: fields.keys.map { ($0, recordLogNumeric(after[$0])) })
             if binding.stage(mutation, upsertOn: nil, existing: existing) { return (values, nil) }
+            try assertRecordLogDeclaredTypes(documentId: binding.documentId, mutations: [mutation], type: binding.declaredType, report: report)
             let seq = try binding.commit([RecordLogWrite(mutations: [mutation])]).first?.seq
             return (values, seq)
         }
@@ -313,6 +323,11 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         if let existing { base = existing } else { base = try row(id: mutations[0].id) }
         if binding.stage(mutations[0], upsertOn: upsertOn, existing: base) { return nil }
         try assertRecordLogEntry(documentId: binding.documentId, mutations: mutations, upsertOn: upsertOn) { [binding] event in
+            binding.reportRefused(event)
+        }
+        // A typed db3's declarations, as the room judges the entry (#5020); a
+        // transaction's are judged whole when it commits.
+        try assertRecordLogDeclaredTypes(documentId: binding.documentId, mutations: mutations, type: binding.declaredType) { [binding] event in
             binding.reportRefused(event)
         }
         return try binding.commit([RecordLogWrite(mutations: mutations, upsertOn: upsertOn)]).first?.seq

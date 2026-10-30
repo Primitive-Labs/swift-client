@@ -43,7 +43,7 @@ struct AgentSessionViewHost: Sendable {
         self.db3 = AgentSessionDb3Door(
             subscribe: { [weak client] id in
                 guard let client else {
-                    throw JsBaoError(code: .db3Disposed, message: "The client was destroyed", details: ["db3Id": .string(id)])
+                    throw db3DisposedError(id, .destroyed, message: "The client was destroyed")
                 }
                 client.noteResourceHeldDb3(id)
                 return try client.db3.subscribe(id)

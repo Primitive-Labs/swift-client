@@ -17,6 +17,7 @@ final class RecordLogClientState: @unchecked Sendable {
     /// Each document's writer history, kept while the client keeps its connection id.
     private var _histories: [String: RecordLogWriterHistory] = [:]
     private var _resolvedFormats: [String: Int] = [:]
+    private var _formatRefusals: [String: Error] = [:]
     private var _resolving: Set<String> = []
     private var _unresolved: Set<String> = []
     private var _connection: RecordLogSocketConnection?
@@ -73,6 +74,10 @@ final class RecordLogClientState: @unchecked Sendable {
     func resolvedFormat(_ documentId: String) -> Int? { lock.withLock { _resolvedFormats[documentId] } }
     func noteResolvedFormat(_ documentId: String, _ format: Int) { lock.withLock { _resolvedFormats[documentId] = format } }
 
+    /// The server's final refusal of a db3's last format lookup, until the next lookup.
+    func formatRefusal(_ documentId: String) -> Error? { lock.withLock { _formatRefusals[documentId] } }
+    func noteFormatRefusal(_ documentId: String, _ refusal: Error?) { lock.withLock { _formatRefusals[documentId] = refusal } }
+
     /// Documents whose open could not ask the documents API their format: the
     /// handshake asks once, before it goes out.
     func noteUnresolved(_ documentId: String) { lock.withLock { _ = _unresolved.insert(documentId) } }
@@ -83,6 +88,45 @@ final class RecordLogClientState: @unchecked Sendable {
     /// second caller while it is out answers `false`.
     func beginResolving(_ documentId: String) -> Bool { lock.withLock { _resolving.insert(documentId).inserted } }
     func endResolving(_ documentId: String) { lock.withLock { _ = _resolving.remove(documentId) } }
+
+    /// Binds of a document in flight: a second caller joins the first, so one
+    /// document gets one binding (and one writer) however many ask at once.
+    private var _binds: [String: (token: UUID, task: Task<RecordLogDocumentBinding, Error>)] = [:]
+    /// Binds of a stored db3 in flight, its models' attachment included.
+    private var _storedBinds: [String: (token: UUID, task: Task<Void, Error>)] = [:]
+
+    /// The bind of `documentId` in flight, else the one `start` makes (handed
+    /// the token it ends with); `joined` says whether it was already running.
+    func bind(
+        _ documentId: String, start: (UUID) -> Task<RecordLogDocumentBinding, Error>
+    ) -> (task: Task<RecordLogDocumentBinding, Error>, joined: Bool) {
+        lock.withLock {
+            if let running = _binds[documentId] { return (running.task, true) }
+            let token = UUID()
+            let task = start(token)
+            _binds[documentId] = (token, task)
+            return (task, false)
+        }
+    }
+
+    func endBind(_ documentId: String, _ token: UUID) {
+        lock.withLock { if _binds[documentId]?.token == token { _binds[documentId] = nil } }
+    }
+
+    /// `bind(_:start:)` for a stored db3's bind.
+    func storedBind(_ documentId: String, start: (UUID) -> Task<Void, Error>) -> (task: Task<Void, Error>, joined: Bool) {
+        lock.withLock {
+            if let running = _storedBinds[documentId] { return (running.task, true) }
+            let token = UUID()
+            let task = start(token)
+            _storedBinds[documentId] = (token, task)
+            return (task, false)
+        }
+    }
+
+    func endStoredBind(_ documentId: String, _ token: UUID) {
+        lock.withLock { if _storedBinds[documentId]?.token == token { _storedBinds[documentId] = nil } }
+    }
 
     func connection(make: () -> RecordLogSocketConnection) -> RecordLogSocketConnection {
         lock.withLock {
@@ -333,9 +377,35 @@ extension JsBaoClient {
     /// `sessionEnded` fences the store's first writes (its state row and this
     /// client's writer): once it answers true, nothing is written and the
     /// bind throws `CancellationError`.
+    ///
+    /// One bind of a document at a time: a caller arriving while another's is
+    /// in flight joins it and answers its binding (its own fence checked once
+    /// the join returns).
     @discardableResult
     func bindRecordLogDocument(
-        _ documentId: String, sessionEnded: (() -> Bool)? = nil
+        _ documentId: String, sessionEnded: (@Sendable () -> Bool)? = nil
+    ) async throws -> RecordLogDocumentBinding {
+        if let existing = recordLogState.binding(documentId) { return existing }
+        let (task, joined) = recordLogState.bind(documentId) { token in
+            Task { [weak self] in
+                guard let self else { throw CancellationError() }
+                defer { self.recordLogState.endBind(documentId, token) }
+                return try await self.makeRecordLogBinding(documentId, sessionEnded: sessionEnded)
+            }
+        }
+        guard joined else { return try await task.value }
+        do {
+            let binding = try await task.value
+            if sessionEnded?() == true { throw CancellationError() }
+            return binding
+        } catch is CancellationError where sessionEnded?() != true {
+            // The bind joined was fenced by its own caller's session, not this one's.
+            return try await bindRecordLogDocument(documentId, sessionEnded: sessionEnded)
+        }
+    }
+
+    private func makeRecordLogBinding(
+        _ documentId: String, sessionEnded: (@Sendable () -> Bool)?
     ) async throws -> RecordLogDocumentBinding {
         if let existing = recordLogState.binding(documentId) { return existing }
         let host = try await recordLogHost(documentId)
@@ -347,6 +417,10 @@ extension JsBaoClient {
         )
         // A db3 created here is its own until its room's copy loads.
         binding.createdLocally = documentManager.isPendingCreate(documentId)
+        // A db3 created here with a type declares nothing to its room (#5020).
+        if let type = documentManager.getLocalMetadata(documentId)?.db3Type, !type.isEmpty {
+            try binding.seedType(type)
+        }
         binding.setRefusalReporter { [weak self] event in
             self?.eventEmitter.emit(event)
             self?._db3Lifecycle.writeRefused(event)
@@ -393,7 +467,10 @@ extension JsBaoClient {
                 },
                 status: { [weak self] documentId, status in
                     self?._db3Lifecycle.statusChanged(documentId, status)
-                }
+                },
+                // A db3 this device has not heard about may be typed: its
+                // first open declares only once the room says it is not (#5020).
+                waitsForTypeBeforeDeclaring: true
             ),
             logger: logger,
             history: recordLogState.history(documentId)
@@ -523,6 +600,7 @@ extension JsBaoClient {
                 logger.warn("[record-log] could not bind", name, "to", documentId, ":", error.localizedDescription)
             }
         }
+        binding.attached = true
     }
 
     /// The handshake is about to go out for a document whose open could not
@@ -635,6 +713,11 @@ extension JsBaoClient {
         if frame["type"]?.stringValue == "error", frame["code"]?.stringValue == JsBaoErrorCode.db3SyncOff.rawValue,
            let documentId = frame["documentId"]?.stringValue {
             _db3Lifecycle.syncOffHeard(documentId)
+        }
+        // A deleted db3 is gone for that reason, heard the same way (#5049).
+        if frame["type"]?.stringValue == "error", frame["code"]?.stringValue == "DOCUMENT_DELETED",
+           let documentId = frame["documentId"]?.stringValue {
+            _db3Lifecycle.deletedHeard(documentId)
         }
         guard let documentId = frame["documentId"]?.stringValue ?? frame["roomId"]?.stringValue,
               let session = recordLogState.session(documentId)

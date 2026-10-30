@@ -14,9 +14,12 @@ struct ParsedSchema {
     var fields: [String: ParsedField]
     var uniqueConstraints: [ParsedUniqueConstraint]
     var relationships: [(name: String, descriptor: ParsedRelationship)]
+    /// The basename of the input file that declared the model, which its
+    /// generated file's header names. Empty for a schema parsed on its own.
+    var sourceName: String = ""
 }
 
-struct ParsedField {
+struct ParsedField: Equatable {
     var type: ParsedFieldType
     var indexed: Bool
     var unique: Bool
@@ -52,14 +55,14 @@ enum ParsedAutoStamp: String {
     case both
 }
 
-enum ParsedDefault {
+enum ParsedDefault: Equatable {
     case string(String)
     case number(Double)
     case integer(Int64)
     case boolean(Bool)
 }
 
-struct ParsedUniqueConstraint {
+struct ParsedUniqueConstraint: Equatable {
     var name: String
     var fields: [String]
 }

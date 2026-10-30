@@ -94,6 +94,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     private var changeListeners: [UUID: @Sendable (RecordLogChangeNotice) -> Void] = [:]
     private var pendingListeners: [UUID: @Sendable () -> Void] = [:]
     private var _createdLocally = true
+    private var _attached = false
     private var errorListeners: [UUID: @Sendable (JsBaoError) -> Void] = [:]
     private var refusalReporter: (@Sendable (DocumentWriteRefusedEvent) -> Void)?
     /// Records this writer upserted under one id that the room applied to
@@ -137,6 +138,15 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     var createdLocally: Bool {
         get { state.withLock { _createdLocally } }
         set { state.withLock { _createdLocally = newValue } }
+    }
+
+    /// Whether the client's registered models read this binding: set once
+    /// `connectToSharedModels` attached them (with no model registered too),
+    /// cleared when they are disconnected. A binding published but not yet
+    /// attached answers no model query, so the db3 is not resident.
+    var attached: Bool {
+        get { state.withLock { _attached } }
+        set { state.withLock { _attached = newValue } }
     }
 
     /// Whether this document's store holds a readable copy (js-bao's
@@ -598,18 +608,56 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         try setState(constraints: kept)
     }
 
-    /// Record what the room said about epochs, constraints and this client's permission.
+    /// Record what the room said about epochs, constraints, the db3's type and this client's permission.
     @discardableResult
     func setState(
         notice: (current: Int, next: Int?, entries: Int?)? = nil,
-        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil
+        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil, type: RecordLogTypeUpdate? = nil
     ) throws -> RecordLogMarks {
         let writer = self.writer
         let marks = try withOperation {
-            try store.setState(writer: writer, notice: notice, constraints: constraints, permission: permission)
+            try store.setState(writer: writer, notice: notice, constraints: constraints, permission: permission, type: type)
         }
         state.withLock { _marks = marks }
         return marks
+    }
+
+    /// Take a permission the client heard for this db3 while it is bound
+    /// (#5020): the store's mark follows it, `read` on `.reader` (saves are
+    /// refused here from now) and lifted on a write-capable one, as the
+    /// room's `WRITE_ACCESS_DENIED` and a connect with write access set and
+    /// lift it. A `refused` mark is the room's to lift.
+    func applyPermissionChange(_ permission: DocumentPermission) throws {
+        // The mark is read and written under one hold of the operation lock,
+        // which every other write of the mark takes too: a `refused` the
+        // session records meanwhile is never overwritten.
+        try withOperation {
+            let mark = try refreshMarks().permission
+            if permission == .reader {
+                guard mark == nil else { return }
+                logger?.log("[record-log]", documentId, "— the client may only read now; saves are refused here")
+                _ = try setState(permission: .some(RecordLogPermission.read))
+            } else if mark == RecordLogPermission.read {
+                logger?.log("[record-log]", documentId, "— the client may write again; saves are allowed")
+                _ = try setState(permission: .some(nil))
+            }
+        }
+    }
+
+    /// Take the type this db3 was created with here (#5020): a store the room
+    /// has not yet told whether the db3 is typed is marked typed by `type`,
+    /// so its first open declares nothing. A mark the room set is kept.
+    func seedType(_ type: String) throws {
+        guard try refreshMarks().typed == .unknown else { return }
+        try setState(type: .typed(name: type, hash: nil, models: nil))
+    }
+
+    /// The type this db3's model writes are judged by on the device: the
+    /// declarations the room sent with its open, or `nil` while none are held.
+    var declaredType: RecordLogDeclaredType? {
+        let marks = self.marks
+        guard marks.typed == .yes, let name = marks.db3Type?.name, let models = marks.declarations else { return nil }
+        return RecordLogDeclaredType(name: name, models: models)
     }
 
     /// Mark the copy of a db3 the server just created caught up, so it is
@@ -674,6 +722,10 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             let upsertOn = finished.order.first.flatMap { finished.writes[$0]?.upsertOn }
             do {
                 try assertRecordLogEntry(documentId: documentId, mutations: mutations, upsertOn: upsertOn) { [weak self] event in
+                    self?.reportRefused(event)
+                }
+                // A typed db3's declarations, as the room judges the entry (#5020).
+                try assertRecordLogDeclaredTypes(documentId: documentId, mutations: mutations, type: declaredType) { [weak self] event in
                     self?.reportRefused(event)
                 }
                 let committed = try commit([RecordLogWrite(mutations: mutations, upsertOn: upsertOn)])

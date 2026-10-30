@@ -20,6 +20,164 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Added: `swift-bao-codegen` over every db3 type file
+
+`--input` repeats and takes a directory, so one run generates the models of
+every kind of db3 an app opens. A directory contributes each `*.toml` directly
+inside it, in name order:
+
+```bash
+swift-bao-codegen --input primitive/dev/db3-types --output Sources/App/Models
+```
+
+Every model gets one struct and `GeneratedModels.swift` registers them all.
+Each struct's header names the file that declared it; the barrel's names every
+input. A model two files declare must be declared the same way in both, or the
+run exits 1 naming both files and the fields that differ.
+
+`bao-codegen.json` takes the same list as `inputs`, files or directories
+resolved against the target directory, and the plugin generates them in one
+build command:
+
+```json
+{ "inputs": ["../../primitive/dev/db3-types"] }
+```
+
+A directory that holds no type file yet still gets an empty
+`GeneratedModels.swift`, so `GeneratedModels.all` compiles from the start.
+
+`{ "input": "<file>" }` works as before. A model in a db3 type file (a TOML
+document with a `[type]` table) needs no `id` field: it gets the `id` a
+declared `type = "id", auto_assign = true` gives, so the struct has `id`, the
+auto-id initializer mints one, and it compiles. A schema with no `[type]` table
+generates exactly as before.
+
+### `permission` on `client.db3.getOrCreateWithAlias`
+
+`Db3GetOrCreateWithAliasOptions` gains `permission: Db3AliasPermission?`
+(`.owner`, the default, `.readWrite` or `.reader`): the alias user's level on
+a db3 the call creates, with no owner row for a level other than `.owner`.
+An app owner or admin passes it to make a per-user db3 the user can only
+read; a member passing a level other than `.owner` gets `HttpError` 403.
+
+```swift
+let inbox = try await client.db3.getOrCreateWithAlias(
+    Db3GetOrCreateWithAliasOptions(
+        alias: AliasRef(scope: .user, aliasKey: "inbox", userId: memberId), title: "Inbox", permission: .reader
+    )
+)
+```
+
+A `.reader` db3 you create for yourself is read-only on this device at once:
+`Db3State.permission` is `.reader`, and a save throws `.accessDenied` before
+any subscribe, sending nothing. A db3 a create makes for another user, or one
+`create(title:custodian: "app")` makes, is no longer stored on the creating
+device (`stored()` does not list it); subscribe to it as any db3 you can read.
+
+The options' initializer gains a trailing defaulted `permission:` parameter.
+Every call compiles unchanged; a reference to the initializer as a function
+value (`Db3GetOrCreateWithAliasOptions.init(alias:title:tags:metadata:type:)`)
+must add `permission:` to its labels.
+
+### A db3 is `available` only once a query answers it
+
+Once `try await subscription.available()` returns, a model query scoped to
+the db3 answers its rows: after a relaunch, a sign-in and another account's
+session too, not only right after a create. `Db3State.resident` (and
+`Db3StoredEntry.resident`) is now `true` only for a store bound to this client
+with its models attached; a copy the device holds but has not bound yet reads
+`resident: false` until a subscribe or the start-up bind binds it. A held
+copy is a db3 even with no metadata row, so an offline subscribe over it
+binds it.
+
+A sign-out (`logout()`) or another user's sign-in (`updateToken(_:)`, then
+`rebindUserScopedStorage()`) now closes every open db3 of the previous user
+before anything opens for the next one: a subscribe made during the switch
+opens after it, under the new user, and its `ready()` settles. Nothing is
+sent for the previous user's db3s under the new user's token, and a db3 got
+by an existing alias reconnects with `record.open` from the start.
+
+A `DB3_DISPOSED` error now says why the subscription ended in
+`details["reason"]`, with the web client's strings: `disposed`, `destroyed`,
+`closed`, `evicted` or `identity-changed`.
+
+### `client.db3.listMine` lists held, shared and app db3s
+
+`listMine(_ options: Db3ListMineOptions = Db3ListMineOptions())` reads the
+db3s you hold, those shared with you and those granted to the app, in that
+order, one request per page, as the JS client does. Each `Db3Info` names its
+listing as `via` (`.held`, `.shared`, `.app`) and a shared row carries
+`grantedBy`. `Db3ListMineOptions(via:limit:cursor:)` reads only some listings;
+a cursor this call did not issue throws `.invalidArgument`. A db3 whose sync is
+off is not listed.
+
+```swift
+var page = try await client.db3.listMine()
+while page.hasMore {
+    page = try await client.db3.listMine(Db3ListMineOptions(cursor: page.nextCursor))
+}
+```
+
+- The bare `client.db3.listMine()` is now the full form. `listMine(options:)`
+  keeps its signature and its held-only answer for a server cursor, and
+  continues a cursor the full form issued, so an existing paging loop pages
+  through all three listings.
+- `Db3Info` gains `via` and `grantedBy` (`nil` from every other call), as
+  trailing defaulted parameters of its initializer.
+
+### `client.db3.subscribe` settles at once when the server refuses the db3
+
+A subscribe to a db3 this device has never held throws from `available()` and
+`ready()` within a few seconds when the server refuses it: `.db3AccessRefused`
+for no access (403), `.notFound` for no such db3 (404), and the `HttpError`
+for any other 4xx but 401 and 429. `Db3ErrorEvent` carries the code. Offline,
+a 5xx, 429 and 401 still retry as before.
+
+### Setting a generated model's field to `nil` clears it on a db3
+
+`model.closedAt = nil` followed by a save now stores null on a db3, as the web
+client's `undefined` does; a string set loses every member. A cleared
+required field is refused `requiredFieldMissing`, and a unique constraint
+over a cleared field no longer holds its old value. Saves into a format-1
+document are unchanged.
+
+### Added: a deleted db3 is gone for `.deleted`
+
+- `Db3GoneEvent.Reason` gains `.deleted` (code `DB3_DELETED`) and
+  `JsBaoErrorCode` gains `.db3Deleted`: a client subscribed to a db3 that is
+  deleted hears `Db3GoneEvent(reason: .deleted)` once, and `ready()` throws
+  `.db3Deleted`. A revoked grant still reports `.permission`. An exhaustive
+  `switch` over either enum needs the new case.
+
+### Agent session records gain `deletingAt` and `configId`
+
+An agent session's db3 is now at type generation 3, so a session can be
+rebuilt from it when the platform loses the session's own state. Two optional
+properties join the records the view reads, and nothing else changes:
+
+- `AgentSessionRecord.deletingAt` — set while a session's delete is under way.
+- `AgentSessionTurnRecord.configId` — the agent config the turn was pinned to.
+
+`AgentSessionModels.schemaVersion` is 3.
+
+### Changed: a db3 applies what the room allows on the device
+
+- A permission heard for a bound db3 (a `permission` frame, or a
+  `docMetadata` frame carrying one) applies before its `PermissionEvent`:
+  after `.reader`, `codegen.save` and `documents.records(id).put` throw
+  `.accessDenied` and commit nothing; after `.readWrite`, `.admin` or
+  `.owner`, saves land again with no resubscribe.
+- Once the device has opened a typed db3, a model save, increment or
+  `transact` that breaks the type's declarations throws before anything is
+  sent, with the room's code and message: `.documentEntryInvalid` for a value
+  its field's declared kind does not take (`""` for a `.date`),
+  `.db3ModelNotDeclared` for a model the type does not declare. Each is
+  reported as a `Db3WriteRefusedEvent` with `scope: "local"`.
+- The client sends no `record.declare` to a typed db3, so the room's
+  `DB3_DECLARATION_REFUSED_TYPED` and the error-level log line about it no
+  longer appear. A db3 created here with a `type` declares nothing on its
+  first open.
+
 ### Breaking: an agent session is its own db3, and the view reads it
 
 - A session's conversation is a db3 whose id is the session's. `open(sessionId:)`

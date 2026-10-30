@@ -5,7 +5,8 @@ import Foundation
 // — this binary is invoked by the SwiftPM build plugin on every consumer
 // build, so its dependency closure pays a recurring rebuild cost.
 struct CLIArgs {
-    var input: String = ""
+    /// Every `--input`, in order: each a TOML file or a directory of them.
+    var inputs: [String] = []
     var output: String = ""
     /// Strict/CI mode: regenerate in memory and compare against the
     /// on-disk generated files. Exit non-zero (listing the offending
@@ -35,7 +36,7 @@ struct CLIArgs {
             switch arg {
             case "--input":
                 i += 1; guard i < argv.count else { return nil }
-                a.input = argv[i]
+                a.inputs.append(argv[i])
             case "--output":
                 i += 1; guard i < argv.count else { return nil }
                 a.output = argv[i]
@@ -60,7 +61,7 @@ struct CLIArgs {
             }
             i += 1
         }
-        if a.input.isEmpty || a.output.isEmpty { return nil }
+        if a.inputs.isEmpty || a.inputs.contains(where: \.isEmpty) || a.output.isEmpty { return nil }
         let allowedAccess: Set<String> = ["internal", "public"]
         if !allowedAccess.contains(a.accessLevel) {
             FileHandle.standardError.write(Data(
@@ -74,13 +75,16 @@ struct CLIArgs {
 
 func usage() {
     let text = """
-    swift-bao-codegen — generate Swift PrimitiveModel structs from a TOML schema.
+    swift-bao-codegen — generate Swift PrimitiveModel structs from TOML schemas.
 
     USAGE:
-      swift-bao-codegen --input <path/to/schema.toml> --output <dir> [options]
+      swift-bao-codegen --input <path/to/schema.toml> [--input <path> ...] --output <dir> [options]
 
     OPTIONS:
-      --input <file>          Input TOML schema (required)
+      --input <path>          Input TOML schema, or a directory of them (every
+                              *.toml directly inside, in name order). Repeat to
+                              generate over several: one struct per model over
+                              all of them, one barrel (required)
       --output <dir>          Output directory; one .swift file per [models.X] (required)
       --access <level>        internal | public  (default: public)
       --module-import <name>  Module exporting PrimitiveModel/PrimitiveSchema/etc.
@@ -99,7 +103,8 @@ func usage() {
                               parsing (unknown keys silently dropped).
 
     Each run also emits a `GeneratedModels.swift` registration barrel that
-    aggregates every model (`GeneratedModels.all` + `register(on:)`).
+    aggregates every model (`GeneratedModels.all` + `register(on:)`). A model
+    declared in two inputs must be declared the same way in both.
 
     Generated files have a header banner; running again only writes a file if
     its content actually changed (Xcode rebuild signals stay quiet on no-op).
@@ -114,28 +119,29 @@ func run() -> Int32 {
         return 2
     }
 
-    // Read TOML.
-    let inputURL = URL(fileURLWithPath: args.input)
-    let tomlString: String
+    // Read every input (a directory names each `*.toml` inside it).
+    let inputs: [CodegenInput]
     do {
-        tomlString = try String(contentsOf: inputURL, encoding: .utf8)
+        inputs = try CodegenInputs.read(try CodegenInputs.expand(args.inputs))
     } catch {
         FileHandle.standardError.write(Data(
-            "swift-bao-codegen: cannot read \(inputURL.path): \(error)\n".utf8
+            "swift-bao-codegen: cannot read \(args.inputs.joined(separator: ", ")): \(error)\n".utf8
         ))
         return 1
     }
 
-    // Parse.
-    let schemas: [ParsedSchema]
+    // Parse and render every output (model files + registration barrel) in
+    // memory, in a stable order, before touching disk. `--check` compares
+    // this against on-disk; the normal path writes it.
+    let rendered: [(fileName: String, source: String)]
     do {
-        // An authoring door, like js-bao-codegen-v2: a field name that
-        // breaks a generated model on either client is refused here.
-        schemas = try TomlParser.parse(
-            tomlString: tomlString,
+        rendered = try CodegenRun.render(
+            documents: inputs.map { (sourceName: $0.sourceName, source: $0.source) },
+            emptyLabel: args.inputs.map { URL(fileURLWithPath: $0).lastPathComponent + "/" }.joined(separator: ", "),
+            accessLevel: args.accessLevel,
+            moduleImport: args.moduleImport,
             swiftNameSuffix: args.swiftNameSuffix,
-            strict: args.strict,
-            rejectReservedFieldNames: true
+            strict: args.strict
         )
     } catch let err as CodegenError {
         FileHandle.standardError.write(Data("swift-bao-codegen: \(err.description)\n".utf8))
@@ -144,55 +150,7 @@ func run() -> Int32 {
         FileHandle.standardError.write(Data("swift-bao-codegen: \(error)\n".utf8))
         return 1
     }
-
     let outputURL = URL(fileURLWithPath: args.output)
-
-    // Build the cross-model name map so relationship accessors can name
-    // their typed return types (`task` → `TaskRecord?`).
-    var swiftNamesByModel: [String: String] = [:]
-    for schema in schemas {
-        swiftNamesByModel[schema.name] = schema.swiftName
-    }
-
-    let emitter = SwiftEmitter(options: EmitOptions(
-        accessLevel: args.accessLevel,
-        moduleImport: args.moduleImport,
-        sourcePath: inputURL.lastPathComponent,
-        swiftNamesByModel: swiftNamesByModel
-    ))
-
-    // Detect Swift-name collisions (two TOML models with the same
-    // resolved swiftName would clobber each other) before rendering.
-    var collisions: [String: [String]] = [:]
-    for schema in schemas {
-        collisions["\(schema.swiftName).swift", default: []].append(schema.name)
-    }
-    for (fileName, models) in collisions where models.count > 1 {
-        FileHandle.standardError.write(Data(
-            "swift-bao-codegen: \(fileName) would be written by multiple models: \(models.joined(separator: ", ")). Disambiguate with [models.<name>] class_name = \"...\".\n".utf8
-        ))
-        return 1
-    }
-    // The registration barrel uses a fixed filename — reject a model
-    // whose resolved Swift name would collide with it.
-    if collisions[SwiftEmitter.barrelFileName] != nil {
-        FileHandle.standardError.write(Data(
-            "swift-bao-codegen: a model resolves to the reserved barrel filename \(SwiftEmitter.barrelFileName). Disambiguate with [models.<name>] class_name = \"...\".\n".utf8
-        ))
-        return 1
-    }
-
-    // Render every output (model files + registration barrel) in memory,
-    // in a stable order, before touching disk. `--check` compares this
-    // against on-disk; the normal path writes it.
-    var rendered: [(fileName: String, source: String)] = []
-    for schema in schemas {
-        rendered.append(("\(schema.swiftName).swift", emitter.emit(schema: schema)))
-    }
-    // The barrel is emitted even for an empty schema list — registering
-    // zero models is harmless, and a consumer can reference
-    // `GeneratedModels.all` unconditionally.
-    rendered.append((SwiftEmitter.barrelFileName, emitter.emitBarrel(schemas: schemas)))
     let emittedFiles = Set(rendered.map(\.fileName))
 
     // --check: regenerate in memory, compare to disk, never write.

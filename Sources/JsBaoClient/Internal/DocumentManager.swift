@@ -1720,8 +1720,13 @@ public final class DocumentManager: @unchecked Sendable {
 
     public func setPermission(_ documentId: String, permission: DocumentPermission) {
         lock.withLock { docPermissions[documentId] = permission }
+        permissionApplied?(documentId, permission)
         emitter?.emit(PermissionEvent(documentId: documentId, permission: permission))
     }
+
+    /// Hears a document's permission as it is recorded, before its
+    /// `PermissionEvent`: the client applies it to a bound db3's store (#5020).
+    var permissionApplied: ((String, DocumentPermission) -> Void)?
 
     /// Note a db3 a resource holds (an agent session's, #4884): its open takes
     /// `reader` and runs no `fetchDocumentInfo`.

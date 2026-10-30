@@ -44,6 +44,7 @@ enum AgentSessionProjection {
             "lastErrorMessage": value(s.lastErrorMessage),
             "createdAt": value(s.createdAt),
             "modifiedAt": value(s.modifiedAt),
+            "deletingAt": value(s.deletingAt),
         ]
     }
 
@@ -62,6 +63,7 @@ enum AgentSessionProjection {
             "seq": .number(t.seq),
             "status": open(t.status.rawValue, known: t.status.isKnown),
             "initiatorUserId": value(t.initiatorUserId),
+            "configId": value(t.configId),
             "startedAt": value(t.startedAt),
             "endedAt": value(t.endedAt),
             "errorCode": value(t.errorCode),

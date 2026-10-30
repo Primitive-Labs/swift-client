@@ -40,6 +40,26 @@ struct Db3PurgeOutcome: Sendable, Equatable {
     var purged: Bool
 }
 
+/// Why a subscription ended, as a `DB3_DISPOSED` error's `details["reason"]`
+/// names it: the web client's strings, verbatim.
+enum Db3DisposedReason: String, CaseIterable, Sendable {
+    /// A sign-out, or another user's sign-in.
+    case identityChanged = "identity-changed"
+    /// The subscription's own `dispose()`.
+    case disposed
+    /// The client was destroyed.
+    case destroyed
+    /// A document door (`closeDocument`, `documents.close`) closed the db3.
+    case closed
+    /// The db3's local copy was removed (`evict`, the retention policy).
+    case evicted
+}
+
+/// A `DB3_DISPOSED` error for `db3Id`, saying why in `details`.
+func db3DisposedError(_ db3Id: String, _ reason: Db3DisposedReason, message: String) -> JsBaoError {
+    JsBaoError(code: .db3Disposed, message: message, details: ["db3Id": .string(db3Id), "reason": .string(reason.rawValue)])
+}
+
 /// What the lifecycle needs of its client: js-bao's `Db3LifecycleDeps`. Every
 /// member has a default, so a test names only what its world answers.
 struct Db3LifecycleDeps: Sendable {
@@ -53,6 +73,10 @@ struct Db3LifecycleDeps: Sendable {
     var resolveFormat: @Sendable (String) async -> Int? = { _ in nil }
     /// Why this client's storage cannot hold a db3, or `nil` when it can.
     var storageRefusal: @Sendable (String) async -> JsBaoError? = { _ in nil }
+    /// The server's final refusal of the db3's last format lookup (a 403, a
+    /// 404, another 4xx but 401 and 429), or `nil`: read after `resolveFormat`
+    /// answered `nil`, and a subscription waiting for the format fails with it.
+    var formatRefusal: @Sendable (String) async -> Error? = { _ in nil }
     /// Open the db3 on the socket for its subscriptions: bind its store, register it, start its sync.
     var open: @Sendable (String) async throws -> Void = { _ in }
     /// Close the db3 on the socket (the room stops its updates); its store stays bound.
@@ -89,6 +113,11 @@ struct Db3LifecycleDeps: Sendable {
     var purge: @Sendable (String, Bool) async -> Db3PurgeOutcome = { _, _ in Db3PurgeOutcome(purged: true) }
     /// Unbind every db3.
     var unbindAll: @Sendable () async -> Void = {}
+    /// Every db3 bound here now.
+    var boundIds: @Sendable () -> [String] = { [] }
+    /// Whether another user's token was applied and the previous user's db3s
+    /// are not released yet: their opens are no answer to a subscription.
+    var identityPending: @Sendable () -> Bool = { false }
     var logger: Logger?
 }
 
@@ -118,14 +147,18 @@ final class Db3Lifecycle: @unchecked Sendable {
     private final class Handle: @unchecked Sendable {
         let subscription: Db3Subscription
         let timeout: TimeInterval
+        /// The lifecycle's `identity` when it was made: a release ends the
+        /// handles made before the user changed, not one made during it.
+        let identity: Int
         var timer: Task<Void, Never>?
         var timerGeneration = 0
         /// `ready()` was claimed by `settleReady`: it fires once.
         var readyClaimed = false
 
-        init(subscription: Db3Subscription, timeout: TimeInterval) {
+        init(subscription: Db3Subscription, timeout: TimeInterval, identity: Int) {
             self.subscription = subscription
             self.timeout = timeout
+            self.identity = identity
         }
     }
 
@@ -145,6 +178,9 @@ final class Db3Lifecycle: @unchecked Sendable {
     private var handles: [String: [Handle]] = [:]
     /// The db3s open on the socket for their subscriptions.
     private var active: Set<String> = []
+    /// The db3s whose open is in flight, by the identity its step started
+    /// under: one started before the user changed is the outgoing user's.
+    private var opening: [String: Int] = [:]
     /// Each db3's start and stop, one after another.
     private var chains: [String: Chain] = [:]
     /// The last state emitted for each db3.
@@ -169,11 +205,27 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// when such a db3 turns gone, it is for that reason. Cleared once it is
     /// live, or refused for access instead.
     private var syncOff: Set<String> = []
+    /// The db3s refused because they were deleted (#5049): when such a db3
+    /// turns gone, it is for that reason, whatever refusal follows. Cleared
+    /// once it is live, or its copy is removed.
+    private var deleted: Set<String> = []
+    /// The db3s heard deleted whose session has not yet taken the refusal
+    /// (#5049): a live state read meanwhile predates it, so it keeps the reason.
+    private var deletedUnapplied: Set<String> = []
     /// Removals of a db3's store in progress: a second door joins the first.
     private var removals: [String: Task<Void, Error>] = [:]
     /// Bumped when the user changes: a binding of the stored db3s started
     /// before it is undone when it finishes.
     private var identity = 0
+    /// The user changed (`forgetStates`) and no release has run since: a
+    /// reconcile does nothing, the release reconciles every db3 it covers.
+    private var identityChanged = false
+    /// Bumped by `releaseAll`: a reconcile queued before it does nothing (the
+    /// release queues its own after the close).
+    private var releases = 0
+    /// The db3s each release in progress is releasing, by its generation:
+    /// their bindings are the previous user's, and none is resident.
+    private var releasing: [Int: Set<String>] = [:]
     private var destroyedFlag = false
 
     init(deps: Db3LifecycleDeps) {
@@ -184,19 +236,19 @@ final class Db3Lifecycle: @unchecked Sendable {
 
     func subscribe(_ db3Id: String, options: Db3SubscribeOptions = Db3SubscribeOptions()) throws -> Db3Subscription {
         if lock.withLock({ destroyedFlag }) || deps.destroyed() {
-            throw JsBaoError(
-                code: .db3Disposed, message: "client.db3.subscribe('\(db3Id)'): the client was destroyed",
-                details: ["db3Id": .string(db3Id)]
-            )
+            throw db3DisposedError(db3Id, .destroyed, message: "client.db3.subscribe('\(db3Id)'): the client was destroyed")
         }
         guard !db3Id.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "client.db3.subscribe: a db3 id is a non-empty string")
         }
         let subscription = Db3Subscription(id: db3Id, owner: self)
-        let handle = Handle(subscription: subscription, timeout: options.readyTimeout)
-        lock.withLock { handles[db3Id, default: []].append(handle) }
+        let handle = lock.withLock { () -> Handle in
+            let handle = Handle(subscription: subscription, timeout: options.readyTimeout, identity: identity)
+            handles[db3Id, default: []].append(handle)
+            return handle
+        }
         let state = provisional(db3Id)
-        let live = state.phase == .live && isActive(db3Id)
+        let live = state.phase == .live && isActive(db3Id) && !deps.identityPending()
         if live {
             Task { [weak self] in self?.settleReady(handle) }
         } else {
@@ -276,9 +328,7 @@ final class Db3Lifecycle: @unchecked Sendable {
         lock.withLock { _ = doorHeld.remove(db3Id) }
         for handle in handlesOf(db3Id) {
             handle.subscription.deliver(.evicted(event))
-            handle.subscription.reject(JsBaoError(
-                code: .db3Disposed, message: "the db3 '\(db3Id)' was evicted", details: ["db3Id": .string(db3Id)]
-            ))
+            handle.subscription.reject(db3DisposedError(db3Id, .evicted, message: "the db3 '\(db3Id)' was evicted"))
             releaseHandle(handle, reconcile: false)
         }
         reconcile(db3Id)
@@ -310,6 +360,8 @@ final class Db3Lifecycle: @unchecked Sendable {
             errors[db3Id] = nil
             roomRefused.remove(db3Id)
             syncOff.remove(db3Id)
+            deleted.remove(db3Id)
+            deletedUnapplied.remove(db3Id)
         }
         deps.emit(event)
         await refreshState(db3Id)
@@ -375,9 +427,8 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// The subscription was disposed.
     func release(_ subscription: Db3Subscription) {
         guard let handle = handle(of: subscription) else { return }
-        subscription.reject(JsBaoError(
-            code: .db3Disposed, message: "the subscription to '\(subscription.id)' was disposed",
-            details: ["db3Id": .string(subscription.id)]
+        subscription.reject(db3DisposedError(
+            subscription.id, .disposed, message: "the subscription to '\(subscription.id)' was disposed"
         ))
         releaseHandle(handle, reconcile: true)
     }
@@ -467,25 +518,45 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// Bring the socket in line with the db3's subscriptions: open while any
     /// is held, closed once none is. One change of a db3 at a time.
     private func reconcile(_ db3Id: String) {
-        let token = UUID()
-        lock.withLock {
-            let previous = chains[db3Id]?.task
-            let task = Task { [weak self] in
-                await previous?.value
-                guard let self else { return }
-                await self.reconcileStep(db3Id)
-                self.lock.withLock {
-                    if self.chains[db3Id]?.token == token { self.chains[db3Id] = nil }
-                }
-            }
-            chains[db3Id] = Chain(token: token, task: task)
+        let release = lock.withLock { releases }
+        enqueue(db3Id) { [weak self] in
+            guard let self else { return }
+            // Queued before a user change, or run after it but before its
+            // release began: the release's own reconcile, queued behind its
+            // close, decides instead. Starting an open here, ahead of that
+            // close, would wait for the release that waits for it.
+            let identity = self.lock.withLock { self.releases == release && !self.identityChanged ? self.identity : nil }
+            guard let identity else { return }
+            await self.reconcileStep(db3Id, identity: identity)
         }
     }
 
-    private func reconcileStep(_ db3Id: String) async {
+    /// Run `step` on the db3's chain, after its earlier starts and stops.
+    @discardableResult
+    private func enqueue(_ db3Id: String, _ step: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        lock.withLock { enqueueLocked(db3Id, step) }
+    }
+
+    /// `enqueue`, with `lock` held.
+    private func enqueueLocked(_ db3Id: String, _ step: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        let token = UUID()
+        let previous = chains[db3Id]?.task
+        let task = Task { [weak self] in
+            await previous?.value
+            await step()
+            guard let self else { return }
+            self.lock.withLock {
+                if self.chains[db3Id]?.token == token { self.chains[db3Id] = nil }
+            }
+        }
+        chains[db3Id] = Chain(token: token, task: task)
+        return task
+    }
+
+    private func reconcileStep(_ db3Id: String, identity: Int) async {
         let (wanted, opened) = lock.withLock { (!(handles[db3Id] ?? []).isEmpty && !destroyedFlag, active.contains(db3Id)) }
         if wanted && !opened {
-            await start(db3Id)
+            await start(db3Id, identity: identity)
         } else if !wanted && opened {
             await stop(db3Id)
         }
@@ -498,7 +569,9 @@ final class Db3Lifecycle: @unchecked Sendable {
         }
     }
 
-    private func start(_ db3Id: String) async {
+    /// Open the db3 for its subscriptions; `identity` is the one the step
+    /// started under (`openIdentity` answers it while the open is in flight).
+    private func start(_ db3Id: String, identity: Int) async {
         var format: Int?
         if deps.isBound(db3Id) || deps.isPendingCreate(db3Id) {
             format = RecordLogTransport.documentFormat
@@ -508,7 +581,16 @@ final class Db3Lifecycle: @unchecked Sendable {
                 failOpen(db3Id, refusal)
                 return
             }
-            if format == nil { format = await waitForFormat(db3Id) }
+            if format == nil {
+                let waited = await waitForFormat(db3Id)
+                if let refusal = waited.refusal {
+                    // The server's final answer about the document: nothing is opened.
+                    failOpen(db3Id, refusal)
+                    await refreshState(db3Id)
+                    return
+                }
+                format = waited.format
+            }
         }
         guard format == RecordLogTransport.documentFormat else {
             let shown = format.map { "\($0)" } ?? "unknown"
@@ -523,9 +605,19 @@ final class Db3Lifecycle: @unchecked Sendable {
             return
         }
         guard !handlesOf(db3Id).isEmpty else { return }
-        lock.withLock { _ = active.insert(db3Id) }
+        lock.withLock {
+            active.insert(db3Id)
+            opening[db3Id] = identity
+        }
         do {
+            defer { lock.withLock { _ = opening.removeValue(forKey: db3Id) } }
             try await deps.open(db3Id)
+        } catch is CancellationError {
+            // Retired while it waited for an identity change: the user changed
+            // since it started, or a further change began, and that release
+            // settles the handles. No error is kept.
+            lock.withLock { _ = active.remove(db3Id) }
+            return
         } catch {
             lock.withLock { _ = active.remove(db3Id) }
             failOpen(db3Id, error)
@@ -533,11 +625,31 @@ final class Db3Lifecycle: @unchecked Sendable {
         await refreshState(db3Id)
     }
 
+    /// The identity the db3's open in flight started under; `nil` when no
+    /// open of it is in flight.
+    func openIdentity(_ db3Id: String) -> Int? {
+        lock.withLock { opening[db3Id] }
+    }
+
+    /// Close an outgoing user's open on the socket; one a document door holds
+    /// is left for the door, as `stop` leaves it, and one already closed (the
+    /// logout's sweep got there first) is left alone.
+    private func closeOutgoing(_ db3Id: String) async {
+        guard deps.isOpen(db3Id) else { return }
+        if lock.withLock({ doorHeld.contains(db3Id) }) { return }
+        do {
+            try await deps.close(db3Id)
+        } catch {
+            deps.logger?.warn("[db3] \(db3Id): closing it on the socket failed:", error.localizedDescription)
+        }
+    }
+
     /// An open of the db3 failed: it is told as `Db3ErrorEvent`, and every subscription fails with it.
     private func failOpen(_ db3Id: String, _ error: Error) {
         let typed = error as? JsBaoError
-        let code = typed?.code.rawValue ?? "DB3_OPEN_FAILED"
-        let message = typed?.message ?? error.localizedDescription
+        let http = error as? HttpError
+        let code = typed?.code.rawValue ?? http?.serverCode ?? "DB3_OPEN_FAILED"
+        let message = typed?.message ?? http?.serverMessage ?? http?.message ?? error.localizedDescription
         lock.withLock { errors[db3Id] = Db3StateError(code: code, message: message) }
         deps.emit(Db3ErrorEvent(id: db3Id, code: code, message: message))
         for handle in handlesOf(db3Id) {
@@ -565,13 +677,19 @@ final class Db3Lifecycle: @unchecked Sendable {
     }
 
     /// The document's format, waiting for the network when nothing local can
-    /// say, asked again less often each time.
-    private func waitForFormat(_ db3Id: String) async -> Int? {
+    /// say, asked again less often each time. A final refusal of the lookup
+    /// (403, 404, another 4xx) is answered as the error the subscriptions
+    /// fail with. The caller has already asked once and heard no format, so
+    /// that lookup's refusal is read before any second lookup can clear it.
+    private func waitForFormat(_ db3Id: String) async -> (format: Int?, refusal: Error?) {
         var delay: TimeInterval = 0.25
+        var asked = true
         while true {
-            if lock.withLock({ destroyedFlag }) { return nil }
-            if let format = await deps.resolveFormat(db3Id) { return format }
-            if handlesOf(db3Id).isEmpty { return nil }
+            if lock.withLock({ destroyedFlag }) { return (nil, nil) }
+            if !asked, let format = await deps.resolveFormat(db3Id) { return (format, nil) }
+            asked = false
+            if let refusal = await deps.formatRefusal(db3Id) { return (nil, refusal) }
+            if handlesOf(db3Id).isEmpty { return (nil, nil) }
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             delay = min(delay * 2, 5)
         }
@@ -622,10 +740,15 @@ final class Db3Lifecycle: @unchecked Sendable {
             kick(db3Id)
             return
         }
-        // A terminal refusal: a revoked grant, or the db3's sync turned off.
+        // A terminal refusal: a revoked grant, the db3's sync turned off, or
+        // the db3 deleted (which stays the reason whatever follows).
         let refused = reason == JsBaoErrorCode.accessDenied.rawValue || reason == JsBaoErrorCode.db3SyncOff.rawValue
+            || reason == Self.documentDeleted
         lock.withLock {
-            if reason == JsBaoErrorCode.db3SyncOff.rawValue {
+            if reason == Self.documentDeleted {
+                _ = deleted.insert(db3Id)
+                deletedUnapplied.remove(db3Id)
+            } else if reason == JsBaoErrorCode.db3SyncOff.rawValue {
                 _ = syncOff.insert(db3Id)
             } else if reason == JsBaoErrorCode.accessDenied.rawValue {
                 syncOff.remove(db3Id)
@@ -657,6 +780,26 @@ final class Db3Lifecycle: @unchecked Sendable {
     func syncOffHeard(_ db3Id: String) {
         lock.withLock { _ = syncOff.insert(db3Id) }
     }
+
+    /// The room or the connection refused the db3 because it was deleted
+    /// (#5049): heard by the client before the session marks the store
+    /// refused, so the gone a state read may report first is for that reason.
+    /// A live state read before the session takes the refusal does not clear it.
+    func deletedHeard(_ db3Id: String) {
+        lock.withLock {
+            _ = deleted.insert(db3Id)
+            _ = deletedUnapplied.insert(db3Id)
+        }
+    }
+
+    /// The reason the client heard for a refusal of the db3 (`deletedHeard`,
+    /// `syncOffHeard`, or the session's report), or `nil`.
+    func goneReasonHeard(_ db3Id: String) -> Db3GoneEvent.Reason? {
+        lock.withLock { deleted.contains(db3Id) ? .deleted : syncOff.contains(db3Id) ? .syncOff : nil }
+    }
+
+    /// The code the room and the connection refuse a deleted db3's frames with.
+    private static let documentDeleted = "DOCUMENT_DELETED"
 
     /// The db3's local rows changed.
     func rowsChanged(_ db3Id: String, changes: [Db3RowChange], origin: Db3RowsEvent.Origin, models: [String]) {
@@ -723,43 +866,84 @@ final class Db3Lifecycle: @unchecked Sendable {
         }
     }
 
-    /// Give up every subscription (`ready()` throws `DB3_DISPOSED`) and close
-    /// each db3 on the socket; with `unbind`, unbind every db3 too (a logout,
-    /// or the user is changing).
+    /// Give up every subscription made before the user changed (`ready()`
+    /// throws `DB3_DISPOSED`, `identity-changed`) and close each db3 on the
+    /// socket; with `unbind`, unbind every db3 too (a logout, or the user is
+    /// changing).
+    ///
+    /// Every open of the outgoing user is retired at once and closed on the
+    /// socket, whether or not a subscription was made since; such a
+    /// subscription opens after the close. While the release runs, no db3 it
+    /// releases reads resident. Returns once those closes ran, never waiting
+    /// for a later open, which may itself wait for this release.
     func releaseAll(unbind: Bool) async {
-        for (db3Id, list) in lock.withLock({ handles }) {
-            for handle in list {
-                handle.subscription.reject(JsBaoError(
-                    code: .db3Disposed, message: "the subscription to '\(db3Id)' ended", details: ["db3Id": .string(db3Id)]
+        let bound = deps.boundIds()
+        // Every outgoing open is retired and its close queued in the same hold
+        // that moves the generation on: a reconcile queued before it does
+        // nothing, and one queued after it runs behind the close, so no open
+        // of the new user starts ahead of a close this release waits for.
+        let (generation, ids, now, changed, closes) = lock.withLock { () -> (Int, [String], Int, Bool, [Task<Void, Never>]) in
+            releases += 1
+            let changed = identityChanged
+            identityChanged = false
+            let ids = Set(handles.keys).union(active)
+            releasing[releases] = ids.union(bound)
+            let closes = active.map { db3Id in
+                enqueueLocked(db3Id) { [weak self] in await self?.closeOutgoing(db3Id) }
+            }
+            active = []
+            return (releases, Array(ids), identity, changed, closes)
+        }
+        for db3Id in ids {
+            // A subscription made since the user changed is the new user's.
+            for handle in handlesOf(db3Id) where !changed || handle.identity < now {
+                handle.subscription.reject(db3DisposedError(
+                    db3Id, .identityChanged, message: "the subscription to '\(db3Id)' ended: the signed-in user changed"
                 ))
                 releaseHandle(handle, reconcile: false)
             }
             reconcile(db3Id)
         }
-        for db3Id in lock.withLock({ Array(chains.keys) }) { await settled(db3Id) }
-        guard unbind else { return }
-        await deps.unbindAll()
-        lock.withLock {
-            last = [:]
-            errors = [:]
-            doorHeld = []
-            roomRefused = []
-            outdated = []
-            syncOff = []
+        for close in closes { await close.value }
+        if unbind {
+            await deps.unbindAll()
+            lock.withLock {
+                last = [:]
+                errors = [:]
+                doorHeld = []
+                roomRefused = []
+                outdated = []
+                syncOff = []
+                deleted = []
+                deletedUnapplied = []
+            }
         }
+        let released = lock.withLock { releasing.removeValue(forKey: generation) ?? [] }
+        for db3Id in released { kick(db3Id) }
+    }
+
+    /// Whether a release in progress is releasing the db3.
+    private func isReleasing(_ db3Id: String) -> Bool {
+        lock.withLock { releasing.values.contains { $0.contains(db3Id) } }
     }
 
     /// Forget every db3's last state, error and status (the user changed); a
-    /// binding of the stored db3s under way is undone.
-    func forgetStates() {
+    /// binding of the stored db3s under way is undone. Answers the new
+    /// identity: an open in flight under an earlier one is the outgoing user's.
+    @discardableResult
+    func forgetStates() -> Int {
         lock.withLock {
             identity += 1
+            identityChanged = true
             last = [:]
             errors = [:]
             statuses = [:]
             roomRefused = []
             outdated = []
             syncOff = []
+            deleted = []
+            deletedUnapplied = []
+            return identity
         }
     }
 
@@ -769,9 +953,7 @@ final class Db3Lifecycle: @unchecked Sendable {
     func closedByDoor(_ db3Id: String) {
         lock.withLock { _ = doorHeld.remove(db3Id) }
         for handle in handlesOf(db3Id) {
-            handle.subscription.reject(JsBaoError(
-                code: .db3Disposed, message: "'\(db3Id)' was closed", details: ["db3Id": .string(db3Id)]
-            ))
+            handle.subscription.reject(db3DisposedError(db3Id, .closed, message: "'\(db3Id)' was closed"))
             releaseHandle(handle, reconcile: false)
         }
         lock.withLock { _ = active.remove(db3Id) }
@@ -791,6 +973,8 @@ final class Db3Lifecycle: @unchecked Sendable {
             errors[db3Id] = nil
             roomRefused.remove(db3Id)
             syncOff.remove(db3Id)
+            deleted.remove(db3Id)
+            deletedUnapplied.remove(db3Id)
         }
         deps.emit(Db3EvictedEvent(id: db3Id, reason: .explicit))
         kick(db3Id)
@@ -802,8 +986,8 @@ final class Db3Lifecycle: @unchecked Sendable {
         let held = lock.withLock { handles }
         for (db3Id, list) in held {
             for handle in list {
-                handle.subscription.reject(JsBaoError(
-                    code: .db3Disposed, message: "the client holding '\(db3Id)' was destroyed", details: ["db3Id": .string(db3Id)]
+                handle.subscription.reject(db3DisposedError(
+                    db3Id, .destroyed, message: "the client holding '\(db3Id)' was destroyed"
                 ))
                 releaseHandle(handle, reconcile: false)
             }
@@ -844,16 +1028,27 @@ final class Db3Lifecycle: @unchecked Sendable {
     }
 
     /// Why a gone db3 is gone, as the error a waiting `ready()` throws:
-    /// outdated first, then sync off, else a refused grant.
+    /// outdated first, then deleted, then sync off, else a refused grant.
     private func goneError(_ db3Id: String) -> JsBaoError {
-        if isOutdated(db3Id) { return Self.clientOutdated(db3Id) }
-        return lock.withLock { syncOff.contains(db3Id) } ? Self.syncOffRefused(db3Id) : Self.accessRefused(db3Id)
+        switch goneReason(db3Id) {
+        case .clientOutdated: return Self.clientOutdated(db3Id)
+        case .deleted: return Self.deletedRefused(db3Id)
+        case .syncOff: return Self.syncOffRefused(db3Id)
+        case .permission: return Self.accessRefused(db3Id)
+        }
     }
 
     /// `goneError`'s reason, as `Db3GoneEvent` names it.
     private func goneReason(_ db3Id: String) -> Db3GoneEvent.Reason {
         if isOutdated(db3Id) { return .clientOutdated }
-        return lock.withLock { syncOff.contains(db3Id) } ? .syncOff : .permission
+        return lock.withLock { deleted.contains(db3Id) ? .deleted : syncOff.contains(db3Id) ? .syncOff : .permission }
+    }
+
+    private static func deletedRefused(_ db3Id: String) -> JsBaoError {
+        JsBaoError(
+            code: .db3Deleted, message: "the db3 '\(db3Id)' was deleted; its rows stay readable until it is evicted",
+            details: ["db3Id": .string(db3Id)]
+        )
     }
 
     private static func clientOutdated(_ db3Id: String) -> JsBaoError {
@@ -880,7 +1075,7 @@ final class Db3Lifecycle: @unchecked Sendable {
 
     /// Whether the db3 is resident, read synchronously from its bound store.
     private func isResidentNow(_ db3Id: String) -> Bool {
-        guard deps.isBound(db3Id), var marks = deps.syncMarks(db3Id) else { return false }
+        guard !isReleasing(db3Id), deps.isBound(db3Id), var marks = deps.syncMarks(db3Id) else { return false }
         if deps.isPendingCreate(db3Id) { marks.createdLocally = true }
         return marks.resident
     }
@@ -918,12 +1113,10 @@ final class Db3Lifecycle: @unchecked Sendable {
         let pendingCreate = deps.isPendingCreate(db3Id)
         if pendingCreate { marks?.createdLocally = true }
         let lastSyncAt = stored?.lastCatchUpAt ?? marks?.lastCatchUpAt
-        let resident: Bool
-        if bound {
-            resident = marks?.resident ?? false
-        } else {
-            resident = pendingCreate || (lastSyncAt != nil && (!(stored?.replacing ?? false) || stored?.staged == true))
-        }
+        // Resident means a model query answers now: the store is bound to
+        // this client with its models attached (its marks read), and holds a
+        // readable copy. A stored copy nothing binds answers no query.
+        let resident = bound && (marks?.resident ?? false) && !isReleasing(db3Id)
         let phase = phaseOf(db3Id, subscribed: subscribed, marks: marks)
         let status = statusFor(db3Id)
         let progress = (phase == .loading || phase == .catchingUp) ? status.progress.map(Self.progress) : nil
@@ -990,6 +1183,7 @@ final class Db3Lifecycle: @unchecked Sendable {
             if state.phase == .live {
                 errors[db3Id] = nil
                 syncOff.remove(db3Id)
+                if !deletedUnapplied.contains(db3Id) { deleted.remove(db3Id) }
             }
             let previous = last[db3Id]
             let changed = previous != state
@@ -1017,7 +1211,9 @@ final class Db3Lifecycle: @unchecked Sendable {
             // Subscribed again since: the room's answer is the same.
             for handle in list { handle.subscription.reject(Self.clientOutdated(db3Id)) }
         }
-        if state.resident { for handle in list { handle.subscription.resolveAvailable() } }
-        if state.phase == .live && open { for handle in list { settleReady(handle) } }
+        // Read again now: a state read before the user changed, or before a
+        // release began, is no answer to a subscription made since.
+        if state.resident, isResidentNow(db3Id) { for handle in list { handle.subscription.resolveAvailable() } }
+        if state.phase == .live && open && !deps.identityPending() { for handle in list { settleReady(handle) } }
     }
 }

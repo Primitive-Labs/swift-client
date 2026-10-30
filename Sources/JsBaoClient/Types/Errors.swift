@@ -191,6 +191,10 @@ public enum JsBaoErrorCode: String, Sendable {
     /// reaches it. A subscription's `ready()` throws it, and the db3 is gone
     /// with `Db3GoneEvent.Reason.syncOff`, until its sync is on again.
     case db3SyncOff = "DB3_SYNC_OFF"
+    /// The db3 was deleted: a subscription's `ready()` throws it, and the db3
+    /// is gone with `Db3GoneEvent.Reason.deleted`. Its rows stay readable on
+    /// the device until it is evicted.
+    case db3Deleted = "DB3_DELETED"
     /// One of the db3's triggers refused the write: the room did not apply
     /// it. `details.reason` is the refusing trigger's own code.
     case db3TriggerRefused = "DB3_TRIGGER_REFUSED"

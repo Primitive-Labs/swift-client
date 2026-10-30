@@ -132,9 +132,13 @@ public final class Db3Subscription: @unchecked Sendable {
 
     /// Returns when the db3 is first `live` after this subscribe. Throws
     /// `DB3_READY_TIMEOUT` (no progress within `readyTimeout`),
-    /// `DB3_ACCESS_REFUSED` (the room refused access), `DB3_DISPOSED`
-    /// (disposed first) or `NOT_A_DB3` (the id is not a db3). Settles once:
-    /// every later call answers the same.
+    /// `DB3_ACCESS_REFUSED` (the room refused access), `DB3_DISPOSED` (the
+    /// subscription ended first) or `NOT_A_DB3` (the id is not a db3). A
+    /// `DB3_DISPOSED` error says why in `details["reason"]`: `disposed`
+    /// (`dispose()`), `destroyed` (the client was destroyed), `closed` (a
+    /// document door closed the db3), `evicted` (its local copy was removed)
+    /// or `identity-changed` (a sign-out, or another user's sign-in). Settles
+    /// once: every later call answers the same.
     public func ready() async throws {
         try await readySettlement.wait()
     }
@@ -457,11 +461,12 @@ public final class Db3API: @unchecked Sendable {
         client?.eventEmitter.emit(Db3CreateFailedEvent(code: code, message: message, title: title, type: type, id: id))
     }
 
-    /// Adopt a db3 the server created into this client, under the metadata
-    /// session its request was made in (a sync-off one only has its format noted).
-    private func adopt(_ info: Db3Info, session: UInt64?) async {
+    /// Adopt a db3 the server created into this client at the level it was
+    /// created with, under the metadata session its request was made in (a
+    /// sync-off one, or one another holder holds, only has its format noted).
+    private func adopt(_ info: Db3Info, session: UInt64?, permission: Db3AliasPermission = .owner) async {
         guard let client, let session else { return }
-        await client.adoptServerCreatedDb3(info.id, info: info, session: session)
+        await client.adoptServerCreatedDb3(info.id, info: info, session: session, permission: permission)
     }
 
     /// A db3, with the caller's `permission`, `accessSource` and `grantedAt`
@@ -495,8 +500,70 @@ public final class Db3API: @unchecked Sendable {
         try await transport.request(method: .delete, path: Self.path(db3Id))
     }
 
+    /// The listings `listMine(_:)` reads, in its order.
+    private static let listings: [(via: Db3Via, path: String)] = [
+        (.held, "/me/db3"), (.shared, "/me/shared-db3"), (.app, "/me/app-db3"),
+    ]
+
+    /// One page of the db3s you hold, those shared with you by a grant, and
+    /// those granted to every user of the app, in that order (one request per
+    /// call). Each row names its listing as `via`, with that listing's level
+    /// as `permission` (and `grantedAt`, `grantedBy` where the listing has
+    /// them). A db3 whose sync is off is not listed. Follow `nextCursor` to
+    /// the end; `via` reads only some listings. A `cursor` this call did not
+    /// issue throws `.invalidArgument` before any request.
+    ///
+    /// ```swift
+    /// var page = try await client.db3.listMine()
+    /// while true {
+    ///     for db3 in page.items { print(db3.via ?? .held, db3.id, db3.permission ?? .reader) }
+    ///     if !page.hasMore { break }
+    ///     page = try await client.db3.listMine(Db3ListMineOptions(cursor: page.nextCursor))
+    /// }
+    /// ```
+    ///
+    /// - Parameter options: The listings, the page size and a cursor.
+    public func listMine(_ options: Db3ListMineOptions = Db3ListMineOptions()) async throws -> PaginatedResult<Db3Info> {
+        let sources = Self.listings.filter { options.via.contains($0.via) }
+        let at: Db3ListMineCursor
+        if let cursor = options.cursor {
+            guard let read = Db3ListMineCursor.decode(cursor), sources.contains(where: { $0.via == read.via }) else {
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "client.db3.listMine: the cursor is not one listMine issued for these listings"
+                )
+            }
+            at = read
+        } else if let first = sources.first {
+            at = Db3ListMineCursor(via: first.via, cursor: nil)
+        } else {
+            return PaginatedResult(items: [], nextCursor: nil, hasMore: false)
+        }
+        guard let index = sources.firstIndex(where: { $0.via == at.via }) else {
+            return PaginatedResult(items: [], nextCursor: nil, hasMore: false)
+        }
+        let page: Db3Page = try await transport.request(
+            method: .get, path: Self.listingPath(sources[index].path, limit: options.limit, cursor: at.cursor)
+        )
+        let items = page.items.map { $0.listed(via: at.via) }
+        let next: Db3ListMineCursor?
+        if page.hasMore == true, let cursor = page.nextCursor {
+            next = Db3ListMineCursor(via: at.via, cursor: cursor)
+        } else if index + 1 < sources.count {
+            next = Db3ListMineCursor(via: sources[index + 1].via, cursor: nil)
+        } else {
+            next = nil
+        }
+        return PaginatedResult(items: items, nextCursor: next?.encoded, hasMore: next != nil)
+    }
+
     /// One page of the db3s the signed-in user holds, oldest first, each with
     /// the level of the user's own row (`nil` when an admin removed it).
+    /// `listMine(_:)` is the full form, which also lists the db3s shared with
+    /// you and those granted to the app.
+    ///
+    /// The loop below continues either form: given a cursor `listMine(_:)`
+    /// issued, this call continues that listing.
     ///
     /// ```swift
     /// var page = try await client.db3.listMine()
@@ -506,7 +573,10 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter options: The page size and the cursor of the page before.
-    public func listMine(options: PaginationOptions = PaginationOptions()) async throws -> PaginatedResult<Db3Info> {
+    public func listMine(options: PaginationOptions) async throws -> PaginatedResult<Db3Info> {
+        if let cursor = options.cursor, Db3ListMineCursor.decode(cursor) != nil {
+            return try await listMine(Db3ListMineOptions(limit: options.limit, cursor: cursor))
+        }
         var query: [String] = []
         if let limit = options.limit { query.append("limit=\(limit)") }
         if let cursor = options.cursor { query.append("cursor=\(URLEncoding.encodeComponent(cursor))") }
@@ -521,20 +591,41 @@ public final class Db3API: @unchecked Sendable {
         let nextCursor: String?
     }
 
+    /// A listing's path with its `limit` and `cursor`.
+    private static func listingPath(_ path: String, limit: Int?, cursor: String?) -> String {
+        var query: [String] = []
+        if let limit { query.append("limit=\(limit)") }
+        if let cursor { query.append("cursor=\(URLEncoding.encodeComponent(cursor))") }
+        return path + (query.isEmpty ? "" : "?" + query.joined(separator: "&"))
+    }
+
     /// The db3 an alias names, created for it when the alias names nothing.
-    /// A created db3 is answered whole (`db3`) and stored here as `create`
-    /// stores one; an existing one is a reference (`created == false`,
-    /// `db3 == nil`).
+    /// A created db3 is answered whole (`db3`) and, when you hold it, stored
+    /// here as `create` stores one; an existing one is a reference
+    /// (`created == false`, `db3 == nil`).
+    ///
+    /// `permission` sets the alias user's level on a db3 this call creates:
+    /// `.owner` (the default), `.readWrite` or `.reader`, which writes no owner
+    /// row and one grant at that level. A level other than `.owner` needs an
+    /// app owner or admin; a member is refused 403. A `.reader` db3 you create
+    /// for yourself is read-only here at once: a save throws `.accessDenied`
+    /// and nothing is sent. One created for another user is not stored here.
     ///
     /// ```swift
     /// let home = try await client.db3.getOrCreateWithAlias(
     ///     Db3GetOrCreateWithAliasOptions(alias: AliasRef(scope: .user, aliasKey: "home"), title: "Home", type: "notes")
     /// )
+    /// let inbox = try await client.db3.getOrCreateWithAlias(  // an app owner or admin
+    ///     Db3GetOrCreateWithAliasOptions(
+    ///         alias: AliasRef(scope: .user, aliasKey: "inbox", userId: memberId), title: "Inbox", permission: .reader
+    ///     )
+    /// )
     /// ```
     ///
     /// - Parameter options: The alias, and what a created db3 starts with.
     /// - Throws: `HttpError` 409 `DB3_TYPE_MISMATCH` when the alias names a
-    ///   db3 of another type, 404 `DB3_TYPE_NOT_FOUND`.
+    ///   db3 of another type, 404 `DB3_TYPE_NOT_FOUND`, 403 for a member
+    ///   passing a `permission` other than `.owner`.
     public func getOrCreateWithAlias(_ options: Db3GetOrCreateWithAliasOptions) async throws -> Db3GetOrCreateWithAliasResult {
         var alias: [String: JSONValue] = [
             "scope": .string(options.alias.scope.rawValue), "aliasKey": .string(options.alias.aliasKey),
@@ -545,6 +636,7 @@ public final class Db3API: @unchecked Sendable {
         if let tags = options.tags { body["tags"] = .array(tags.map(JSONValue.string)) }
         if let metadata = options.metadata { body["metadata"] = metadata }
         if let type = options.type { body["type"] = .string(type) }
+        if let permission = options.permission { body["permission"] = .string(permission.rawValue) }
         let session = client?.metadataSessionToken
         let result: Db3GetOrCreateWithAliasResult
         do {
@@ -554,8 +646,12 @@ public final class Db3API: @unchecked Sendable {
             throw error
         }
         if let created = result.db3 {
-            await adopt(created, session: session)
+            await adopt(created, session: session, permission: options.permission ?? .owner)
             client?.eventEmitter.emit(Db3CreatedEvent(id: created.id))
+        } else {
+            // An alias that already names a db3: known as one at once, so its
+            // subscribe asks the documents API nothing.
+            client?.noteDb3(result.id)
         }
         return result
     }

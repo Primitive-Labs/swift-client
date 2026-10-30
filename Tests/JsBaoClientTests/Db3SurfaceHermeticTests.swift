@@ -35,7 +35,7 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let union = try ClientSourceText.slice(errors, from: "export type JsBaoErrorCode", to: ";\n")
         let jsCodes = quoted(union).filter { $0.hasPrefix("DB3_") || $0 == "NOT_A_DB3" }
         XCTAssertEqual(
-            Set(jsCodes), ["DB3_READY_TIMEOUT", "DB3_ACCESS_REFUSED", "DB3_PENDING_WRITES", "DB3_HELD", "DB3_DISPOSED", "NOT_A_DB3", "DB3_SYNC_OFF", "DB3_CLIENT_OUTDATED", "DB3_DECLARATION_REFUSED_TYPED", "DB3_MODEL_NOT_DECLARED"],
+            Set(jsCodes), ["DB3_READY_TIMEOUT", "DB3_ACCESS_REFUSED", "DB3_PENDING_WRITES", "DB3_HELD", "DB3_DISPOSED", "NOT_A_DB3", "DB3_SYNC_OFF", "DB3_CLIENT_OUTDATED", "DB3_DECLARATION_REFUSED_TYPED", "DB3_MODEL_NOT_DECLARED", "DB3_DELETED"],
             "the JS union parse: \(jsCodes)"
         )
         let scope = try jsSource("packages/js-bao/src/models/db3QueryScope.ts")
@@ -44,6 +44,7 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let swift: [JsBaoErrorCode] = [
             .db3ReadyTimeout, .db3AccessRefused, .db3PendingWrites, .db3Held, .db3Disposed, .notADb3, .db3NotResident,
             .db3SyncOff, .db3ClientOutdated, .db3DeclarationRefusedTyped, .db3ModelNotDeclared,
+            .db3Deleted,
         ]
         XCTAssertEqual(Set(swift.map(\.rawValue)), Set(jsCodes + ["DB3_NOT_RESIDENT"]))
     }
@@ -91,11 +92,12 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let api = try jsSource("src/client/api/db3Api.ts")
         let event = try ClientSourceText.slice(api, from: "export interface Db3GoneEvent", to: "}")
         let reasons = try ClientSourceText.slice(event, from: "reason:", to: ";")
-        let swift: [Db3GoneEvent.Reason] = [.permission, .syncOff, .clientOutdated]
+        let swift: [Db3GoneEvent.Reason] = [.permission, .syncOff, .clientOutdated, .deleted]
         XCTAssertEqual(Set(swift.map(\.rawValue)), Set(quoted(reasons)), "the JS union parse: \(quoted(reasons))")
         XCTAssertEqual(Db3GoneEvent(id: "d", reason: .syncOff).code, "DB3_SYNC_OFF")
         XCTAssertEqual(Db3GoneEvent(id: "d", reason: .syncOff).code, JsBaoErrorCode.db3SyncOff.rawValue)
         XCTAssertEqual(Db3GoneEvent(id: "d", reason: .clientOutdated).code, "DB3_CLIENT_OUTDATED")
+        XCTAssertEqual(Db3GoneEvent(id: "d", reason: .deleted).code, "DB3_DELETED")
     }
 
     /// #4806 (R3g, add-only): `client.db3`'s lifecycle calls.
@@ -123,6 +125,15 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let _: (String, String) async throws -> DocumentIngestSession = api.ingests.abort(db3Id:sessionId:)
         let _: (String, String) async throws -> DocumentIngestSession = api.ingests.get(db3Id:sessionId:)
         let _: (String, Int?, String?) async throws -> DocumentIngestPage = api.ingests.list(db3Id:limit:cursor:)
+    }
+
+    /// #5021 (R3g, add-only): the full `listMine(_:)`, and its `via` names, the JS union's.
+    func testTheDb3NamespaceHasTheFullListMine() throws {
+        let api = Db3API(lifecycle: Db3Lifecycle(deps: Db3LifecycleDeps()), transport: RecordingTransport(status: 200))
+        let _: (Db3ListMineOptions) async throws -> PaginatedResult<Db3Info> = api.listMine(_:)
+        let via = try ClientSourceText.slice(try jsSource("src/client/api/db3Api.ts"), from: "export type Db3Via =", to: ";")
+        XCTAssertEqual(Db3Via.allCases.map(\.rawValue), quoted(via))
+        XCTAssertEqual(Db3Via.allCases.map(\.rawValue), ["held", "shared", "app"])
     }
 
     /// #4943 (R3g, add-only): a db3's sharing, as `client.db3.permissions(_:)`.
@@ -185,6 +196,21 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let _: (String) async -> Bool = documents.resumeUploadAsync(blobId:)
         let _: () async -> Void = documents.pauseAllAsync
         let _: () async -> Void = documents.resumeAllAsync
+    }
+
+    /// #5054 (R3g, add-only): the alias create's `permission` levels are the
+    /// JS union's, and the options take one.
+    func testTheAliasCreatePermissionsAreTheJsClients() throws {
+        let api = try jsSource("src/client/api/db3Api.ts")
+        let options = try ClientSourceText.slice(api, from: "export interface Db3AliasOptions {", to: "\n}")
+        let permission = try ClientSourceText.slice(options, from: "permission?:", to: ";")
+        XCTAssertEqual(Db3AliasPermission.allCases.map(\.rawValue), quoted(permission))
+        XCTAssertEqual(Db3AliasPermission.allCases.map(\.rawValue), ["owner", "read-write", "reader"])
+        let _: (AliasRef, String?, [String]?, JSONValue?, String?, Db3AliasPermission?) -> Db3GetOrCreateWithAliasOptions =
+            Db3GetOrCreateWithAliasOptions.init(alias:title:tags:metadata:type:permission:)
+        let options5054 = Db3GetOrCreateWithAliasOptions(alias: AliasRef(scope: .user, aliasKey: "inbox"), permission: .reader)
+        XCTAssertEqual(options5054.permission, .reader)
+        XCTAssertNil(Db3GetOrCreateWithAliasOptions(alias: AliasRef(scope: .user, aliasKey: "inbox")).permission)
     }
 
     func testTheClientHasADb3Namespace() async throws {

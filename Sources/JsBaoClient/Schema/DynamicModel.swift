@@ -2073,6 +2073,8 @@ public final class DynamicModel: @unchecked Sendable {
         let dataToSave: [String: PrimitiveValue]
         /// Just the fields this write actually writes.
         let changes: [String: PrimitiveValue]
+        /// The fields this update clears: held before, absent from `dataToSave`.
+        var cleared: Set<String> = []
     }
 
     /// Narrow, stamp, default, validate — everything a write decides about a
@@ -2087,6 +2089,11 @@ public final class DynamicModel: @unchecked Sendable {
     ///   when they equal what is persisted, and skip the dirty check: a
     ///   guarded db3 save is the room's to judge, so it travels unchanged
     ///   (js-bao sends the fields a guarded save touched the same way).
+    /// - Parameter cleared: on an update, the fields the caller set to nil
+    ///   (a generated model's `primitiveValues()` leaves them out): they leave
+    ///   the record's state before it is stamped, validated and dirty-checked,
+    ///   so a clear-only save is a change and a cleared required field is
+    ///   refused. Only a record-log document's save passes any.
     /// - Returns: `nil` when the dirty check finds nothing to do.
     private func preparedWrite(
         id: String,
@@ -2094,7 +2101,8 @@ public final class DynamicModel: @unchecked Sendable {
         isUpdate: Bool,
         changedFields: Set<String>?,
         oldData: [String: PrimitiveValue],
-        keepUnchanged: Bool = false
+        keepUnchanged: Bool = false,
+        cleared: Set<String> = []
     ) throws -> PreparedWrite? {
         var newValues = values
         // Stage 1 of js-bao's two-stage narrowing — `_localChanges` (#2459).
@@ -2145,6 +2153,9 @@ public final class DynamicModel: @unchecked Sendable {
         // persisted-from-a-previous-save value is NOT treated as explicit,
         // so `update` keeps firing on every save.
         let nowMillis = (Date().timeIntervalSince1970 * 1000).rounded()
+        // The fields this save stamps, kept before stage 2 drops a stamp equal
+        // to the stored value: a stamped field is written, never cleared.
+        var stamped: Set<String> = []
         for (fname, desc) in self.schema.fields {
             guard let stamp = desc.autoStamp else { continue }
             // Explicit-wins: caller set this field on this save.
@@ -2158,6 +2169,7 @@ public final class DynamicModel: @unchecked Sendable {
                 break  // always fire (caller didn't set it, per check above)
             }
             newValues[fname] = .number(nowMillis)
+            stamped.insert(fname)
         }
 
         // Stage 2 of the narrowing — js-bao's `_diffWithYjsData` (#2459):
@@ -2174,6 +2186,12 @@ public final class DynamicModel: @unchecked Sendable {
         // meaningful on create; a no-op on update since existing
         // fields will already cover the dict).
         var dataToSave = oldData
+        // A field the caller cleared leaves the state, unless this save writes
+        // it again (an `update` stamp, even one equal to the stored value).
+        let clearedFields: Set<String> = isUpdate
+            ? cleared.filter { newValues[$0] == nil && !stamped.contains($0) && oldData[$0] != nil }
+            : []
+        for field in clearedFields { dataToSave.removeValue(forKey: field) }
         for (k, v) in newValues { dataToSave[k] = v }
         if !isUpdate {
             for (fname, desc) in self.schema.fields where dataToSave[fname] == nil {
@@ -2292,7 +2310,7 @@ public final class DynamicModel: @unchecked Sendable {
         }
 
 
-        return PreparedWrite(dataToSave: dataToSave, changes: newValues)
+        return PreparedWrite(dataToSave: dataToSave, changes: newValues, cleared: clearedFields)
     }
 
 
@@ -2339,10 +2357,20 @@ public final class DynamicModel: @unchecked Sendable {
         let wrote = try delegate.withOperation { () throws -> (Bool, Int?) in
             let isUpdate = try requestedIsUpdate ?? delegate.exists(id: id)
             let oldData = try localCurrentValues(delegate, id: id)
+            // On a db3, a field the caller assigned and gave no value was set
+            // to nil: the save clears it, as js-bao writes a touched field with
+            // no value as null. Only a field the record holds is cleared.
+            var cleared: Set<String> = []
+            if isUpdate, delegate is RecordLogModelDelegate, let changedFields {
+                cleared = changedFields.filter {
+                    $0 != "id" && values[$0] == nil && schema.fields[$0] != nil && oldData[$0] != nil
+                }
+            }
             guard let prepared = try preparedWrite(
                 id: id, values: values, isUpdate: isUpdate,
                 changedFields: changedFields, oldData: oldData,
-                keepUnchanged: guards?.condition != nil
+                keepUnchanged: guards?.condition != nil,
+                cleared: cleared
             ) else { return (false, nil) }
 
             // Uniqueness against the VIEW, which is the whole document — not
@@ -2376,8 +2404,11 @@ public final class DynamicModel: @unchecked Sendable {
                 }
             }
             let seq: Int?
-            if let guards, let recordLog = delegate as? RecordLogModelDelegate {
-                seq = try recordLog.write(id: id, values: toWrite, isUpdate: isUpdate, upsertOn: upsertOn, guards: guards)
+            if let recordLog = delegate as? RecordLogModelDelegate, guards != nil || !prepared.cleared.isEmpty {
+                seq = try recordLog.write(
+                    id: id, values: toWrite, isUpdate: isUpdate, upsertOn: upsertOn,
+                    guards: guards ?? RecordLogWriteGuards(), cleared: prepared.cleared
+                )
             } else {
                 seq = try delegate.write(id: id, values: toWrite, isUpdate: isUpdate, upsertOn: upsertOn)
             }
