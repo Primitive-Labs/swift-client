@@ -67,8 +67,17 @@ public final class DocumentsAPI: @unchecked Sendable {
         self.blobManager = blobManager
         self.documentManager = documentManager
         self.client = client
-        self.aliases = DocumentAliasesAPI(transport: transport)
+        self.aliases = DocumentAliasesAPI(transport: transport) { [weak client] documentId in
+            try await client?.assertNotLocalOnlyDb3(documentId, call: "client.documents.aliases.set")
+        }
         self.ingests = DocumentIngestsAPI(transport: transport)
+    }
+
+    /// Refuse `call` on a db3 that lives only on this device (#5155), before
+    /// anything local changes or any request is made: it has no server
+    /// record to name.
+    private func refuseLocalOnlyDb3(_ documentId: String, _ call: String) async throws {
+        try await client?.assertNotLocalOnlyDb3(documentId, call: call)
     }
 
     // MARK: - CRUD
@@ -450,17 +459,20 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// written (`schema.models[name]["observed"]`: each field's kinds, and
     /// per-kind counts after a segment export).
     public func schema(_ documentId: String) async throws -> DocumentSchemaAnswer {
-        try await transport.request(method: .get, path: "/documents/\(documentId)/schema")
+        try await refuseLocalOnlyDb3(documentId, "client.documents.schema")
+        return try await transport.request(method: .get, path: "/documents/\(documentId)/schema")
     }
 
     /// Get a document by ID.
     public func get(documentId: String) async throws -> DocumentInfo {
-        try await transport.request(method: .get, path: "/documents/\(documentId)")
+        try await refuseLocalOnlyDb3(documentId, "client.documents.get")
+        return try await transport.request(method: .get, path: "/documents/\(documentId)")
     }
 
     /// Update a document's metadata.
     public func update(documentId: String, data: UpdateDocumentData) async throws -> DocumentInfo {
-        try await transport.request(method: .put, path: "/documents/\(documentId)", body: data)
+        try await refuseLocalOnlyDb3(documentId, "client.documents.update")
+        return try await transport.request(method: .put, path: "/documents/\(documentId)", body: data)
     }
 
     /// Delete a document.
@@ -473,6 +485,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         documentId: String,
         options: DeleteDocumentOptions = DeleteDocumentOptions()
     ) async throws {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.delete")
         // Root-document guard — mirrors js-bao (documentsApi.ts:1296-1297).
         if client?.isRootDocument(documentId) == true {
             throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be deleted")
@@ -533,7 +546,8 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Get the list of members (permission entries) for a document.
     public func getPermissions(documentId: String) async throws -> [DocumentPermissionEntry] {
-        try await transport.request(method: .get, path: "/documents/\(documentId)/permissions")
+        try await refuseLocalOnlyDb3(documentId, "client.documents.getPermissions")
+        return try await transport.request(method: .get, path: "/documents/\(documentId)/permissions")
     }
 
     /// Revoke a user's access, or cancel a pending email invitation. `target`
@@ -543,6 +557,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// resolves to a member, otherwise the matching unresolved
     /// `DeferredDocumentPermission` rows — issue #619).
     public func removePermission(documentId: String, _ target: DocumentPermissionTarget) async throws {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.removePermission")
         // Root-document guard — mirrors js-bao (documentsApi.ts:1834).
         if client?.isRootDocument(documentId) == true {
             throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be shared")
@@ -573,7 +588,8 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Transfer ownership of a document to another user.
     public func transferOwnership(documentId: String, newOwnerId: String) async throws {
-        try await transport.send(
+        try await refuseLocalOnlyDb3(documentId, "client.documents.transferOwnership")
+        return try await transport.send(
             method: .post,
             path: "/documents/\(documentId)/permissions/transfer",
             body: ["newOwnerId": newOwnerId]
@@ -596,6 +612,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// the default (`false`) branch, where it guards against a server
     /// predating #506 that returns system rows unconditionally.
     public func listGroupPermissions(documentId: String, includeSystem: Bool = false) async throws -> [DocumentGroupPermissionEntry] {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.listGroupPermissions")
         var query = URLQuery()
         if includeSystem { query.append("includeSystem", "true") }
         let all: [DocumentGroupPermissionEntry] = try await transport.request(
@@ -607,7 +624,8 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Grant a group permission on a document.
     public func grantGroupPermission(documentId: String, params: GrantGroupPermissionParams) async throws -> DocumentGroupPermissionEntry {
-        try await transport.request(
+        try await refuseLocalOnlyDb3(documentId, "client.documents.grantGroupPermission")
+        return try await transport.request(
             method: .post,
             path: "/documents/\(documentId)/group-permissions",
             body: params
@@ -648,6 +666,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         documentId: String,
         userId: String? = nil
     ) async throws -> DocumentAccessResult {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.validateAccess")
         if let client, client.isPendingCreate(documentId) {
             try await client.awaitPendingCreateCommit(
                 documentId: documentId,
@@ -675,6 +694,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Mirrors js-bao's `documents.listPendingInvitations` (issue #619).
     /// Sends `GET /documents/:documentId/pending-invitations`.
     public func listPendingInvitations(documentId: String) async throws -> [PendingInvitationEntry] {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.listPendingInvitations")
         let response: ItemsEnvelope<PendingInvitationEntry> = try await transport.request(
             method: .get,
             path: "/documents/\(documentId)/pending-invitations"
@@ -693,7 +713,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Build `params` with the `.user(...)`, `.email(...)`, or `.batch(...)`
     /// factories on `UpdatePermissionsData`.
     public func updatePermissions(documentId: String, params: UpdatePermissionsData) async throws -> PermissionUpdateResult {
-        try await transport.request(
+        try await refuseLocalOnlyDb3(documentId, "client.documents.updatePermissions")
+        return try await transport.request(
             method: .put,
             path: "/documents/\(documentId)/permissions",
             body: params
@@ -715,6 +736,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         documentId: String,
         level: DocumentLinkAccessLevel
     ) async throws -> LinkAccessResult {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.setLinkAccess")
         // Root-document guard — mirrors js-bao (documentsApi.ts:1863-1865).
         if client?.isRootDocument(documentId) == true {
             throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be shared")
@@ -737,7 +759,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// root-document guard: the server answers root documents with a 403,
     /// matching js-bao, which does not pre-check either.
     public func getLinkAccess(documentId: String) async throws -> LinkAccessResult {
-        try await transport.request(method: .get, path: "/documents/\(documentId)/link-access")
+        try await refuseLocalOnlyDb3(documentId, "client.documents.getLinkAccess")
+        return try await transport.request(method: .get, path: "/documents/\(documentId)/link-access")
     }
 
     /// Turn off "anyone with the link" access for a document. Existing explicit
@@ -747,6 +770,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// - Parameter documentId: The document to stop sharing via link.
     @discardableResult
     public func clearLinkAccess(documentId: String) async throws -> LinkAccessResult {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.clearLinkAccess")
         // Root-document guard — mirrors js-bao (documentsApi.ts:1880-1882).
         if client?.isRootDocument(documentId) == true {
             throw JsBaoError(code: .invalidArgument, message: "Root documents cannot be shared")
@@ -788,6 +812,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// js-bao's `[String]` return). Falls back to an empty list if
     /// the server response is shaped differently.
     public func addTag(documentId: String, tag: String) async throws -> [String] {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.addTag")
         let response: TagListResponse? = try await transport.requestOptional(
             method: .post,
             path: "/documents/\(documentId)/tags",
@@ -798,6 +823,7 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Remove a tag from a document. Returns the updated tag list.
     public func removeTag(documentId: String, tag: String) async throws -> [String] {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.removeTag")
         let encodedTag = URLEncoding.encodeComponent(tag)
         let response: TagListResponse? = try await transport.requestOptional(
             method: .delete,
@@ -831,7 +857,8 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Revoke a group's permission on a document, the group named by id.
     public func revokeGroupPermission(documentId: String, groupId: String) async throws -> SuccessResult {
-        try await transport.request(
+        try await refuseLocalOnlyDb3(documentId, "client.documents.revokeGroupPermission")
+        return try await transport.request(
             method: .delete,
             path: "/documents/\(documentId)/group-permissions/\(URLEncoding.encodeComponent(groupId))"
         )
@@ -845,6 +872,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         groupType: String,
         groupId: String
     ) async throws -> SuccessResult {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.revokeGroupPermission")
         let gType = URLEncoding.encodeComponent(groupType)
         let gId = URLEncoding.encodeComponent(groupId)
         return try await transport.request(
@@ -863,7 +891,8 @@ public final class DocumentsAPI: @unchecked Sendable {
         documentId: String,
         options: RequestAccessOptions
     ) async throws -> DocumentAccessRequestResponse {
-        try await transport.request(
+        try await refuseLocalOnlyDb3(documentId, "client.documents.requestAccess")
+        return try await transport.request(
             method: .post,
             path: "/documents/\(documentId)/access-requests",
             body: options
@@ -874,7 +903,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     public func listAccessRequests(
         documentId: String
     ) async throws -> [DocumentAccessRequest] {
-        try await transport.request(
+        try await refuseLocalOnlyDb3(documentId, "client.documents.listAccessRequests")
+        return try await transport.request(
             method: .get,
             path: "/documents/\(documentId)/access-requests"
         )
@@ -886,9 +916,10 @@ public final class DocumentsAPI: @unchecked Sendable {
         requestId: String,
         options: ApproveAccessRequestOptions? = nil
     ) async throws -> AccessRequestResult {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.approveAccessRequest")
         // A `nil` options object sends `{}`, as the untyped body did — every
         // field is optional, so the default value encodes to an empty object.
-        try await transport.request(
+        return try await transport.request(
             method: .post,
             path: "/documents/\(documentId)/access-requests/\(requestId)/approve",
             body: options ?? ApproveAccessRequestOptions()
@@ -901,8 +932,9 @@ public final class DocumentsAPI: @unchecked Sendable {
         requestId: String,
         options: DenyAccessRequestOptions? = nil
     ) async throws -> AccessRequestResult {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.denyAccessRequest")
         // A `nil` options object sends `{}`, as the untyped body did.
-        try await transport.request(
+        return try await transport.request(
             method: .post,
             path: "/documents/\(documentId)/access-requests/\(requestId)/deny",
             body: options ?? DenyAccessRequestOptions()
@@ -1047,7 +1079,12 @@ public final class DocumentsAPI: @unchecked Sendable {
         return DocumentBlobContext(
             documentId: documentId,
             transport: transport,
-            blobManager: blobManager
+            blobManager: blobManager,
+            refusal: { [weak client] in
+                // #5155 — a db3 that lives only on this device holds no blobs.
+                guard let client, await client.isLocalOnlyDb3(documentId) else { return nil }
+                return JsBaoClient.db3LocalOnlyError(documentId, call: "client.documents.blobs", instead: "it holds no blobs")
+            }
         )
     }
 
@@ -1362,11 +1399,17 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// `client.evictLocalDocument(_:)`. Mirrors js-bao's
     /// `documents.evict(documentId, { force })`: a doc with unsynced local
     /// changes (a pending offline create, or open writes that haven't
-    /// drained) throws unless `options.force` is set.
+    /// drained) throws unless `options.force` is set. A db3 that lives only
+    /// on this device throws `.db3LocalOnly`, `force` or not: this copy is
+    /// its only one, and `client.db3.delete` removes it.
     public func evict(
         documentId: String,
         options: EvictDocumentOptions = EvictDocumentOptions()
     ) async throws {
+        try await client?.assertNotLocalOnlyDb3(
+            documentId, call: "client.documents.evict",
+            instead: "this copy is its only one; remove it with client.db3.delete"
+        )
         // A db3's unjudged writes are unsynced local changes too.
         let db3Pending = await client?.db3PendingWrites(documentId) ?? 0
         if !options.force, documentManager?.hasUnsyncedLocalChanges(documentId) == true || db3Pending > 0 {
@@ -1390,7 +1433,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Evict every doc's local data. Walks the metadata index and evicts
     /// each entry. Mirrors js-bao's `documents.evictAll({ onlySynced })`:
     /// with `options.onlySynced`, docs holding unsynced local changes are
-    /// skipped rather than dropped. The top-level client doesn't expose a
+    /// skipped rather than dropped. A db3 that lives only on this device is
+    /// kept in either form. The top-level client doesn't expose a
     /// dedicated `evictAll` — we walk the index here.
     public func evictAll(
         options: EvictAllDocumentsOptions = EvictAllDocumentsOptions()
@@ -1410,14 +1454,25 @@ public final class DocumentsAPI: @unchecked Sendable {
 
 public final class DocumentAliasesAPI: @unchecked Sendable {
     private let transport: any Transport
+    /// Refuses a `documentId` no request may name (a db3 that lives only on
+    /// this device, #5155).
+    private var refuseDocument: @Sendable (String) async throws -> Void = { _ in }
 
     /// Designated initializer — the typed transport spine.
     public init(transport: any Transport) {
         self.transport = transport
     }
 
-    /// Create or update a document alias.
+    /// The aliases of a client whose `refuseDocument` refuses a document no request may name.
+    convenience init(transport: any Transport, refuseDocument: @escaping @Sendable (String) async throws -> Void) {
+        self.init(transport: transport)
+        self.refuseDocument = refuseDocument
+    }
+
+    /// Create or update a document alias. Naming a db3 that lives only on
+    /// this device throws `.db3LocalOnly` before any request.
     public func set(_ params: SetAliasParams) async throws -> DocumentAliasInfo {
+        try await refuseDocument(params.documentId)
         let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
         let body = SetAliasBody(
             documentId: params.documentId,
@@ -1501,6 +1556,9 @@ public final class DocumentBlobContext: @unchecked Sendable {
     private let documentId: String
     private let transport: any Transport
     private let blobManager: BlobManager
+    /// Why no request may name the document (a db3 that lives only on this
+    /// device, #5155), asked before each call that would send one.
+    private var refusal: @Sendable () async -> JsBaoError? = { nil }
 
     /// Designated initializer — the typed transport spine.
     public init(
@@ -1513,8 +1571,23 @@ public final class DocumentBlobContext: @unchecked Sendable {
         self.blobManager = blobManager
     }
 
+    /// A context whose calls first ask `refusal` (#5155).
+    convenience init(
+        documentId: String, transport: any Transport, blobManager: BlobManager,
+        refusal: @escaping @Sendable () async -> JsBaoError?
+    ) {
+        self.init(documentId: documentId, transport: transport, blobManager: blobManager)
+        self.refusal = refusal
+    }
+
+    /// Throw the document's refusal, when it has one.
+    private func refuseIfLocalOnly() async throws {
+        if let error = await refusal() { throw error }
+    }
+
     /// Upload a blob to the document.
     public func upload(data: Data, options: BlobUploadSourceOptions = BlobUploadSourceOptions()) async throws -> BlobUploadResult {
+        try await refuseIfLocalOnly()
         return try await blobManager.uploadFromSource(
             documentId: documentId,
             source: data,
@@ -1528,6 +1601,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// JS `BlobListResult<BlobInfo>`. A bare-array response (no envelope) is
     /// normalized into a result with `cursor == nil`.
     public func list(limit: Int? = nil, cursor: String? = nil) async throws -> DocumentBlobListResult {
+        try await refuseIfLocalOnly()
         var query = URLQuery()
         if let limit = limit {
             query.append("limit", limit)
@@ -1545,7 +1619,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
     /// Get metadata for a specific blob.
     public func get(blobId: String) async throws -> BlobInfo {
-        try await transport.request(method: .get, path: "/documents/\(documentId)/blobs/\(blobId)")
+        try await refuseIfLocalOnly()
+        return try await transport.request(method: .get, path: "/documents/\(documentId)/blobs/\(blobId)")
     }
 
     /// Build a download URL for a blob.
@@ -1574,6 +1649,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// cancels the in-flight transfer, a later `read` won't serve the deleted
     /// blob stale from cache, and `queue-drained` fires once the queue empties.
     public func delete(blobId: String) async throws -> BlobDeleteResult {
+        try await refuseIfLocalOnly()
         let result: BlobDeleteResult = try await transport.request(
             method: .delete,
             path: "/documents/\(documentId)/blobs/\(blobId)"
@@ -1592,11 +1668,13 @@ public final class DocumentBlobContext: @unchecked Sendable {
     ///     the cache key and download URL so an `inline` and an `attachment`
     ///     read don't collide in cache.
     public func read(blobId: String, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> Data {
+        try await refuseIfLocalOnly()
         return try await blobManager.read(documentId: documentId, blobId: blobId, force: force, disposition: disposition)
     }
 
     /// Read a blob and decode it as a UTF-8 `String`. Mirrors JS `read(blobId, { as: "text" })`.
     public func read(blobId: String, as type: String.Type, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> String {
+        try await refuseIfLocalOnly()
         let data = try await blobManager.read(documentId: documentId, blobId: blobId, force: force, disposition: disposition)
         guard let string = String(data: data, encoding: .utf8) else {
             throw JsBaoError(code: .invalidArgument, message: "Blob \(blobId) is not valid UTF-8 text")
@@ -1607,6 +1685,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// Read a blob and JSON-decode it into a `Decodable` type. Built on the
     /// raw `read(blobId:)`; mirrors a typed JSON read over the JS `read` bytes.
     public func read<T: Decodable>(blobId: String, as type: T.Type, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> T {
+        try await refuseIfLocalOnly()
         let data = try await blobManager.read(documentId: documentId, blobId: blobId, force: force, disposition: disposition)
         return try JSONCoding.decoder.decode(T.self, from: data)
     }
@@ -1619,6 +1698,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
     ///   - blobIds: the blobs to warm into the cache.
     ///   - concurrency: max concurrent downloads (defaults to 2, matching JS).
     public func prefetch(blobIds: [String], concurrency: Int = 2) async {
+        if await refusal() != nil { return }
         await blobManager.prefetch(
             documentId: documentId,
             blobIds: blobIds,
@@ -1634,6 +1714,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// bytesTransferred }` queue shape rather than the full result.
     @discardableResult
     public func uploadFile(data: Data, options: BlobUploadSourceOptions = BlobUploadSourceOptions()) async throws -> BlobUploadFileResult {
+        try await refuseIfLocalOnly()
         let result = try await blobManager.uploadFromSource(
             documentId: documentId,
             source: data,

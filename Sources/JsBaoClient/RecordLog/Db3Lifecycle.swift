@@ -25,11 +25,14 @@ struct Db3SyncMarks: Sendable, Equatable {
     var staged: Bool
     /// The db3 was created on this device and bound before its room's copy loaded.
     var createdLocally = false
+    /// The db3 lives only on this device (#5155).
+    var localOnly = false
 
-    /// js-bao's `isRecordLogResident`: created here, or a load completed and
-    /// no unstaged replacement is in progress.
+    /// js-bao's `isRecordLogResident`: it lives only on this device, or it
+    /// was created here, or a load completed and no unstaged replacement is
+    /// in progress.
     var resident: Bool {
-        if createdLocally { return true }
+        if createdLocally || localOnly { return true }
         guard lastCatchUpAt != nil else { return false }
         return !replacing || staged
     }
@@ -93,6 +96,10 @@ struct Db3LifecycleDeps: Sendable {
     var pendingCreates: @Sendable () -> [String] = { [] }
     /// Whether the db3 was created on this device and not yet committed.
     var isPendingCreate: @Sendable (String) -> Bool = { _ in false }
+    /// Whether the db3 lives only on this device (#5155), as the client knows
+    /// now (its metadata row, or its bound store's mark). A store not bound
+    /// yet that says so in its stored state counts too.
+    var isLocalOnly: @Sendable (String) -> Bool = { _ in false }
     /// Why the server refused committing a db3 created on this device (#4921), or `nil`.
     var createRefusal: @Sendable (String) -> Db3StateError? = { _ in nil }
     /// The last permission the client learned for the document, in `Db3State`'s names.
@@ -118,16 +125,49 @@ struct Db3LifecycleDeps: Sendable {
     /// Whether another user's token was applied and the previous user's db3s
     /// are not released yet: their opens are no answer to a subscription.
     var identityPending: @Sendable () -> Bool = { false }
+    /// Whether the db3's index list is applied to its store for this open
+    /// (#5101): `ready()` waits while it answers `false`. Without it,
+    /// `ready()` settles on `live`.
+    var indexesSettled: (@Sendable (String) -> Bool)?
+    /// When the db3 was last used here, in epoch ms (its metadata row's
+    /// `lastOpenedAt`: the later of its last open and the end of its last
+    /// subscription), or `nil` when no row says. The retention sweep ranks
+    /// the stored copies by it.
+    var lastUsedAt: @Sendable (String) -> Int64? = { _ in nil }
     var logger: Logger?
 }
 
+/// Why the retention sweep kept a copy it would have removed.
+enum Db3RetentionKeep: String, Sendable {
+    case subscribed
+    case open
+    case pendingCreate = "pending create"
+    case unjudgedWrites = "unjudged writes"
+    case held
+    /// It lives only on this device (#5155): nothing could fetch it again.
+    case localOnly = "local-only"
+}
+
+/// `DB3_LOCAL_ONLY` for an evict of a db3 that lives only on this device (#5155).
+func db3LocalOnlyEvictError(_ db3Id: String) -> JsBaoError {
+    JsBaoError(
+        code: .db3LocalOnly,
+        message: "client.db3.evict('\(db3Id)'): it lives only on this device, so this copy is its only one; "
+            + "remove it with client.db3.delete",
+        details: ["db3Id": .string(db3Id)]
+    )
+}
+
 extension Db3State {
-    /// This state with its subscription, phase and progress replaced.
-    func with(subscribed: Bool? = nil, phase: Db3Phase? = nil, progress: Db3Progress?? = nil) -> Db3State {
+    /// This state with its subscription, phase, progress and permission replaced.
+    func with(
+        subscribed: Bool? = nil, phase: Db3Phase? = nil, progress: Db3Progress?? = nil, permission: Db3Permission?? = nil
+    ) -> Db3State {
         Db3State(
             id: id, resident: resident, subscribed: subscribed ?? self.subscribed, phase: phase ?? self.phase,
             progress: progress ?? self.progress, cursor: cursor, rows: rows, lastSyncAt: lastSyncAt,
-            pendingWrites: pendingWrites, permission: permission, error: error, pendingCreate: pendingCreate
+            pendingWrites: pendingWrites, permission: permission ?? self.permission, error: error, pendingCreate: pendingCreate,
+            localOnly: localOnly
         )
     }
 }
@@ -154,6 +194,9 @@ final class Db3Lifecycle: @unchecked Sendable {
         var timerGeneration = 0
         /// `ready()` was claimed by `settleReady`: it fires once.
         var readyClaimed = false
+        /// The db3 was live for it, whatever its `ready()` answered (#5101):
+        /// a grant asks the room again for it after a refusal.
+        var wasLive = false
 
         init(subscription: Db3Subscription, timeout: TimeInterval, identity: Int) {
             self.subscription = subscription
@@ -201,6 +244,11 @@ final class Db3Lifecycle: @unchecked Sendable {
     private var roomRefused: Set<String> = []
     /// The db3s whose room refused this client's wire version: gone for the client's lifetime.
     private var outdated: Set<String> = []
+    /// The refused db3s a readable grant was heard for since the refusal,
+    /// until the room answers (#5101): the room's refusal no longer stands.
+    private var granted: Set<String> = []
+    /// The refused db3s asked of the room again on a grant, until the room answers.
+    private var reopening: Set<String> = []
     /// The db3s whose room refused them because their sync is off (#4806):
     /// when such a db3 turns gone, it is for that reason. Cleared once it is
     /// live, or refused for access instead.
@@ -212,6 +260,10 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// The db3s heard deleted whose session has not yet taken the refusal
     /// (#5049): a live state read meanwhile predates it, so it keeps the reason.
     private var deletedUnapplied: Set<String> = []
+    /// The reason the last gone event named for each db3 while it stays gone
+    /// (#5091): a db3 gone for another reason that is then deleted announces
+    /// `.deleted` once more, and only once.
+    private var announced: [String: Db3GoneEvent.Reason] = [:]
     /// Removals of a db3's store in progress: a second door joins the first.
     private var removals: [String: Task<Void, Error>] = [:]
     /// Bumped when the user changes: a binding of the stored db3s started
@@ -227,6 +279,8 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// their bindings are the previous user's, and none is resident.
     private var releasing: [Int: Set<String>] = [:]
     private var destroyedFlag = false
+    /// The db3s whose stored state said they live only on this device (#5155).
+    private var localOnlyIds: Set<String> = []
 
     init(deps: Db3LifecycleDeps) {
         self.deps = deps
@@ -248,7 +302,9 @@ final class Db3Lifecycle: @unchecked Sendable {
             return handle
         }
         let state = provisional(db3Id)
-        let live = state.phase == .live && isActive(db3Id) && !deps.identityPending()
+        // A bound db3 that lives only on this device has no room to wait for.
+        let local = isLocalOnly(db3Id) && deps.isBound(db3Id)
+        let live = (state.phase == .live && isActive(db3Id) || local) && !deps.identityPending()
         if live {
             Task { [weak self] in self?.settleReady(handle) }
         } else {
@@ -263,8 +319,12 @@ final class Db3Lifecycle: @unchecked Sendable {
             }
         }
         // A db3 already open here whose session stopped (the room refused it,
-        // or an open attempt ended) is asked of the room again by a new subscribe.
-        if isActive(db3Id), statusFor(db3Id).phase == .idle, deps.socketUp() { deps.resync(db3Id) }
+        // or an open attempt ended) is asked of the room again by a new
+        // subscribe, unless a grant is asking it already.
+        if isActive(db3Id), !isLocalOnly(db3Id), statusFor(db3Id).phase == .idle, deps.socketUp(),
+           !lock.withLock({ reopening.contains(db3Id) }) {
+            deps.resync(db3Id)
+        }
         reconcile(db3Id)
         kick(db3Id)
         return subscription
@@ -288,8 +348,14 @@ final class Db3Lifecycle: @unchecked Sendable {
     }
 
     func evict(_ db3Id: String, options: Db3EvictOptions = Db3EvictOptions()) async throws {
+        // A db3 that lives only on this device has no copy elsewhere to fetch
+        // again: it is removed by `client.db3.delete`, never evicted.
+        if isLocalOnly(db3Id) { throw db3LocalOnlyEvictError(db3Id) }
         let bound = deps.isBound(db3Id)
         let stored = try await deps.storedState(db3Id)
+        // Asked again of the store's own mark: one not bound, or whose row is
+        // gone, is still the device's only copy.
+        if stored?.localOnly == true || isLocalOnly(db3Id) { throw db3LocalOnlyEvictError(db3Id) }
         guard bound || stored != nil || deps.isPendingCreate(db3Id) else { return }
         let pending = stored?.writers.reduce(0) { $0 + $1.pending } ?? 0
         if pending > 0 && !options.force {
@@ -303,15 +369,27 @@ final class Db3Lifecycle: @unchecked Sendable {
         try await removeStore(db3Id, force: options.force, reason: .explicit)
     }
 
+    /// Delete a db3 that lives only on this device (`client.db3.delete`,
+    /// #5155): its copy is removed here and nothing is sent. Its subscriptions
+    /// end as evicted (`DB3_DISPOSED`, `reason: "evicted"`) and
+    /// `Db3EvictedEvent` fires once (`explicit`), only once the copy is gone;
+    /// when another holder keeps the store it throws `.db3Held` and changes
+    /// nothing.
+    func deleteLocalOnly(_ db3Id: String) async throws {
+        try await removeStore(db3Id, force: true, reason: .explicit, localDelete: true)
+    }
+
     /// Remove a db3's store: its subscriptions are disposed (each hears
     /// `evicted`), it is closed on the socket and unbound here, then purged.
-    /// One removal of a db3 at a time: a second joins the first.
-    func removeStore(_ db3Id: String, force: Bool, reason: Db3EvictedEvent.Reason) async throws {
+    /// One removal of a db3 at a time: a second joins the first. A
+    /// `localDelete` ends the subscriptions only once the copy is gone, and a
+    /// purge another holder refuses throws `.db3Held`.
+    func removeStore(_ db3Id: String, force: Bool, reason: Db3EvictedEvent.Reason, localDelete: Bool = false) async throws {
         let (task, started) = lock.withLock { () -> (Task<Void, Error>, Bool) in
             if let running = removals[db3Id] { return (running, false) }
             let task = Task { [weak self] in
                 guard let self else { return }
-                try await self.removeStoreOnce(db3Id, force: force, reason: reason)
+                try await self.removeStoreOnce(db3Id, force: force, reason: reason, localDelete: localDelete)
             }
             removals[db3Id] = task
             return (task, true)
@@ -322,16 +400,21 @@ final class Db3Lifecycle: @unchecked Sendable {
         try await task.value
     }
 
-    private func removeStoreOnce(_ db3Id: String, force: Bool, reason: Db3EvictedEvent.Reason) async throws {
+    private func removeStoreOnce(_ db3Id: String, force: Bool, reason: Db3EvictedEvent.Reason, localDelete: Bool) async throws {
         let event = Db3EvictedEvent(id: db3Id, reason: reason)
-        // The eviction ends a door's open of it too.
-        lock.withLock { _ = doorHeld.remove(db3Id) }
-        for handle in handlesOf(db3Id) {
-            handle.subscription.deliver(.evicted(event))
-            handle.subscription.reject(db3DisposedError(db3Id, .evicted, message: "the db3 '\(db3Id)' was evicted"))
-            releaseHandle(handle, reconcile: false)
+        let endSubscriptions = { [self] in
+            // The eviction ends a door's open of it too.
+            lock.withLock { _ = doorHeld.remove(db3Id) }
+            for handle in handlesOf(db3Id) {
+                handle.subscription.deliver(.evicted(event))
+                handle.subscription.reject(db3DisposedError(db3Id, .evicted, message: "the db3 '\(db3Id)' was evicted"))
+                releaseHandle(handle, reconcile: false)
+            }
+            reconcile(db3Id)
         }
-        reconcile(db3Id)
+        // A local-only db3's delete ends its subscriptions once its copy is
+        // gone (no socket open to close first): a refusal leaves them as they were.
+        if !localDelete { endSubscriptions() }
         await settled(db3Id)
         // Open through a document door only: closed on the socket here, so the
         // room stops counting this client and no member keeps the closed binding.
@@ -348,46 +431,247 @@ final class Db3Lifecycle: @unchecked Sendable {
         guard outcome.purged else {
             if wasBound { try? await deps.bind(db3Id) }
             await refreshState(db3Id)
+            if localDelete {
+                throw JsBaoError(
+                    code: .db3Held,
+                    message: "client.db3.delete('\(db3Id)'): another holder keeps its store; nothing was removed",
+                    details: ["db3Id": .string(db3Id)]
+                )
+            }
             throw JsBaoError(
                 code: .db3PendingWrites,
                 message: "client.db3.evict('\(db3Id)'): it holds writes the room has not judged",
                 details: ["db3Id": .string(db3Id)]
             )
         }
+        if localDelete {
+            endSubscriptions()
+            lock.withLock { _ = active.remove(db3Id) }
+        }
         await deps.forget(db3Id)
         lock.withLock {
+            localOnlyIds.remove(db3Id)
             last[db3Id] = nil
+            announced[db3Id] = nil
             errors[db3Id] = nil
             roomRefused.remove(db3Id)
             syncOff.remove(db3Id)
             deleted.remove(db3Id)
             deletedUnapplied.remove(db3Id)
+            granted.remove(db3Id)
+            reopening.remove(db3Id)
         }
         deps.emit(event)
         await refreshState(db3Id)
     }
 
-    /// The retention policy's door for a db3: removed unforced, so one holding
-    /// writes the room has not judged, or one subscribed here, is kept (and the
-    /// skip logged). Answers whether it was removed.
-    func retentionEvict(_ db3Id: String) async -> Bool {
+    /// The keep verdict the format-1 retention pass asks of a db3 row
+    /// (`DocumentManager.evictDb3ForRetention`): whether the retention sweep
+    /// would remove the copy now. Kept: one being removed, subscribed, held
+    /// open by a document door, a pending create, or holding writes the room
+    /// has not judged. Removes nothing: `enforceRetention` removes.
+    func retentionWouldRemove(_ db3Id: String) async -> Bool {
         if lock.withLock({ removals[db3Id] != nil }) { return false }
-        if isSubscribed(db3Id) {
-            deps.logger?.debug("[db3] \(db3Id): kept by the retention policy: it is subscribed")
-            return false
+        return await retentionKeep(db3Id, logged: false) == nil
+    }
+
+    /// Why the retention policy keeps the copy now (the skip logged when
+    /// `logged`), or `nil` when it may go. Judged with no wait after the store
+    /// is read, so a subscription made meanwhile is seen.
+    private func retentionKeep(_ db3Id: String, logged: Bool) async -> Db3RetentionKeep? {
+        let stored = (try? await deps.storedState(db3Id)) ?? nil
+        let pending = stored?.writers.reduce(0) { $0 + $1.pending } ?? 0
+        let keep: Db3RetentionKeep?
+        if stored?.localOnly == true || isLocalOnly(db3Id) {
+            keep = .localOnly
+        } else if isSubscribed(db3Id) || isActive(db3Id) {
+            keep = .subscribed
+        } else if deps.isOpen(db3Id) {
+            keep = .open
+        } else if deps.isPendingCreate(db3Id) {
+            keep = .pendingCreate
+        } else if pending > 0 {
+            keep = .unjudgedWrites
+        } else {
+            keep = nil
         }
-        let pending = ((try? await deps.storedState(db3Id)) ?? nil)?.writers.reduce(0) { $0 + $1.pending } ?? 0
-        if pending > 0 {
+        guard logged, let keep else { return keep }
+        switch keep {
+        case .subscribed: deps.logger?.debug("[db3] \(db3Id): kept by the retention policy: it is subscribed")
+        case .open: deps.logger?.debug("[db3] \(db3Id): kept by the retention policy: a document door holds it open")
+        case .pendingCreate: deps.logger?.debug("[db3] \(db3Id): kept by the retention policy: it is a create not yet committed")
+        case .unjudgedWrites:
             deps.logger?.warn("[db3] \(db3Id): kept by the retention policy: \(pending) write(s) the room has not judged")
-            return false
+        case .localOnly: deps.logger?.debug("[db3] \(db3Id): kept by the retention policy: it lives only on this device")
+        case .held: break
         }
+        return keep
+    }
+
+    private enum RetentionOutcome: Equatable {
+        case evicted
+        case gone
+        case kept(Db3RetentionKeep)
+    }
+
+    /// The retention policy's door for a stored copy: removed unforced
+    /// unless `retentionKeep` keeps it. A removal another door started is
+    /// waited for: `gone` when it took the copy.
+    private func retentionRemove(_ db3Id: String) async -> RetentionOutcome {
+        if let running = lock.withLock({ removals[db3Id] }) {
+            _ = try? await running.value
+            let listed = (try? await deps.storedIds()) ?? []
+            if !deps.isPendingCreate(db3Id) && !listed.contains(db3Id) { return .gone }
+        }
+        if let keep = await retentionKeep(db3Id, logged: true) { return .kept(keep) }
         do {
             try await removeStore(db3Id, force: false, reason: .retention)
-            return true
+            return .evicted
         } catch {
             deps.logger?.warn("[db3] \(db3Id): the retention policy could not remove it:", error.localizedDescription)
-            return false
+            return .kept(.held)
         }
+    }
+
+    /// The db3 rows the format-1 pass's `ttl` would hand this lifecycle
+    /// (`db3RowsPastTtl`), removed ahead of that pass as its door removed them
+    /// before the sweep took the db3 half (5085-C002): that pass's `maxDocs`
+    /// count is then taken without them, as it always was. One `retentionKeep`
+    /// keeps stays; a stored copy is evicted (one `Db3EvictedEvent`, reason
+    /// `retention`); a row with no copy is forgotten with no event.
+    func retentionExpire(_ db3Ids: [String]) async {
+        guard !db3Ids.isEmpty else { return }
+        let listed: [String]
+        do {
+            listed = try await deps.storedIds()
+        } catch {
+            deps.logger?.warn("[db3] retention: the stored db3s could not be listed:", error.localizedDescription)
+            return
+        }
+        for id in db3Ids {
+            if lock.withLock({ removals[id] != nil }) { continue }
+            if await retentionKeep(id, logged: true) != nil { continue }
+            guard listed.contains(id) else {
+                await deps.forget(id)
+                continue
+            }
+            do {
+                try await removeStore(id, force: false, reason: .retention)
+            } catch {
+                deps.logger?.warn("[db3] \(id): the retention policy could not remove it:", error.localizedDescription)
+            }
+        }
+    }
+
+    /// The retention sweep running, which the next one waits for.
+    private var sweep: Task<Void, Never>?
+
+    /// Apply the retention policy to the db3 copies stored on this device
+    /// (what `stored()` lists), ranked by last use: the metadata row's
+    /// `lastUsedAt`, else the store's last catch-up, else oldest. `ttlMs`
+    /// removes every copy not used for that long; `maxDocs` removes the least
+    /// recently used copies until at most that many remain (`nil` is no cap,
+    /// `0` keeps no copy it may remove). A subscribed copy, one a document
+    /// door holds open, a pending create and one holding writes the room has
+    /// not judged are kept and still count, so the count may stay above
+    /// `maxDocs`. Sweeps run one at a time, in the order they were asked for;
+    /// each writes one `[db3] retention: …` line.
+    func enforceRetention(ttlMs: Int64?, maxDocs: Int?) async {
+        let run = lock.withLock { () -> Task<Void, Never> in
+            let previous = sweep
+            let run = Task { [weak self] in
+                await previous?.value
+                await self?.sweepOnce(ttlMs: ttlMs, maxDocs: maxDocs)
+            }
+            sweep = run
+            return run
+        }
+        await run.value
+    }
+
+    private func sweepOnce(ttlMs: Int64?, maxDocs: Int?) async {
+        guard ttlMs != nil || maxDocs != nil else { return }
+        // Removals in progress settle first, so the listing is the store's.
+        for removal in lock.withLock({ Array(removals.values) }) { _ = try? await removal.value }
+        let ids: [String]
+        do {
+            var listed = try await deps.storedIds()
+            for id in deps.pendingCreates() where !listed.contains(id) { listed.append(id) }
+            ids = listed
+        } catch {
+            deps.logger?.warn("[db3] retention: the stored db3s could not be listed:", error.localizedDescription)
+            return
+        }
+        var copies: [(id: String, lastUsed: Int64)] = []
+        // A db3 that lives only here is never removed by a sweep and counts
+        // toward no cap: the cap is on the copies that can be fetched again (#5155).
+        var localOnly: [String] = []
+        for id in ids {
+            // A subscription change in progress (a dispose's close) settles first.
+            await settled(id)
+            let stored = (try? await deps.storedState(id)) ?? nil
+            if stored?.localOnly == true || isLocalOnly(id) {
+                localOnly.append(id)
+                continue
+            }
+            // A copy nothing dates is the oldest, for the cap and the TTL alike.
+            copies.append((id, deps.lastUsedAt(id) ?? stored?.lastCatchUpAt ?? 0))
+        }
+        let counted = ids.count - localOnly.count
+        // The least recently used first; a tie keeps the listing's order.
+        copies = copies.enumerated()
+            .sorted { ($0.element.lastUsed, $0.offset) < ($1.element.lastUsed, $1.offset) }
+            .map(\.element)
+
+        // Why each kept copy stays, by copy, in the order first kept: one
+        // judged by both passes counts once.
+        var keptOrder: [String] = []
+        var kept: [String: Db3RetentionKeep] = [:]
+        var left: Set<String> = []
+        var evicted = 0
+        var elsewhere = 0
+        func record(_ id: String, _ outcome: RetentionOutcome) {
+            switch outcome {
+            case .evicted, .gone:
+                left.insert(id)
+                kept[id] = nil
+                keptOrder.removeAll { $0 == id }
+                if outcome == .evicted { evicted += 1 } else { elsewhere += 1 }
+            case .kept(let reason):
+                if kept[id] == nil { keptOrder.append(id) }
+                kept[id] = reason
+            }
+        }
+
+        if let ttlMs {
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            for copy in copies where now - copy.lastUsed > ttlMs {
+                record(copy.id, await retentionRemove(copy.id))
+            }
+        }
+        if let maxDocs {
+            for copy in copies {
+                if counted - left.count <= maxDocs { break }
+                if left.contains(copy.id) { continue }
+                record(copy.id, await retentionRemove(copy.id))
+            }
+        }
+
+        for id in localOnly {
+            deps.logger?.debug("[db3] \(id): kept by the retention policy: it lives only on this device")
+            record(id, .kept(.localOnly))
+        }
+        var counts: [(Db3RetentionKeep, Int)] = []
+        for id in keptOrder {
+            guard let reason = kept[id] else { continue }
+            if let at = counts.firstIndex(where: { $0.0 == reason }) { counts[at].1 += 1 } else { counts.append((reason, 1)) }
+        }
+        let reasons = counts.map { "\($0.1) \($0.0.rawValue)" }.joined(separator: ", ")
+        let remaining = counted - left.count
+        var line = "[db3] retention: \(ids.count) stored, \(keptOrder.count) kept\(keptOrder.isEmpty ? "" : " (\(reasons))"), \(evicted) evicted"
+        if elsewhere > 0 { line += ", \(elsewhere) removed elsewhere" }
+        if let maxDocs, remaining > maxDocs { line += "; \(remaining) remain, above maxDocs \(maxDocs)" }
+        deps.logger?.debug(line)
     }
 
     func stored() async throws -> [Db3StoredEntry] {
@@ -398,7 +682,7 @@ final class Db3Lifecycle: @unchecked Sendable {
             let state = try await read(id)
             out.append(Db3StoredEntry(
                 id: id, rows: state.rows, cursor: state.cursor, pendingWrites: state.pendingWrites,
-                lastSyncAt: state.lastSyncAt, resident: state.resident
+                lastSyncAt: state.lastSyncAt, resident: state.resident, localOnly: state.localOnly
             ))
         }
         return out.sorted { $0.id < $1.id }
@@ -421,7 +705,10 @@ final class Db3Lifecycle: @unchecked Sendable {
             return (state, !(handles[db3Id] ?? []).isEmpty)
         }
         guard let (state, subscribed) = known else { return provisional(db3Id) }
-        return state.subscribed == subscribed ? state : state.with(subscribed: subscribed)
+        // A db3 that lives only here is live exactly while it is subscribed,
+        // whether or not its state was read since.
+        let phase = isLocalOnly(db3Id) ? (subscribed ? Db3Phase.live : .idle) : state.phase
+        return state.subscribed == subscribed && state.phase == phase ? state : state.with(subscribed: subscribed, phase: phase)
     }
 
     /// The subscription was disposed.
@@ -445,6 +732,14 @@ final class Db3Lifecycle: @unchecked Sendable {
 
     /// Whether this client holds a subscription to the db3.
     func isSubscribed(_ db3Id: String) -> Bool { lock.withLock { !(handles[db3Id] ?? []).isEmpty } }
+
+    /// Whether this client holds the db3 open (#5101): a subscription holds
+    /// it, or a document door does. A copy whose last subscription was
+    /// disposed is not held, whether or not its close has run yet.
+    func holdsOpen(_ db3Id: String) -> Bool {
+        let (subscribed, door) = lock.withLock { (!(handles[db3Id] ?? []).isEmpty, doorHeld.contains(db3Id)) }
+        return subscribed || (door && deps.isOpen(db3Id))
+    }
 
     private func handlesOf(_ db3Id: String) -> [Handle] { lock.withLock { handles[db3Id] ?? [] } }
 
@@ -498,7 +793,18 @@ final class Db3Lifecycle: @unchecked Sendable {
     }
 
     private func settleReady(_ handle: Handle) {
+        // Called only while the db3 is live for it: a grant reopens it after a refusal.
+        lock.withLock {
+            if handles[handle.subscription.id]?.contains(where: { $0 === handle }) == true { handle.wasLive = true }
+        }
         guard !handle.subscription.readySettled else { return }
+        // The db3's index list is not applied yet (#5101): `ready()` waits for
+        // it, bounded by its timeout on every path, the already-live attach included.
+        if !isLocalOnly(handle.subscription.id), deps.indexesSettled?(handle.subscription.id) == false {
+            guard isAttached(handle), lock.withLock({ handle.timer == nil }) else { return }
+            if handle.timeout <= 0 { timedOut(handle) } else { arm(handle) }
+            return
+        }
         let claimed = lock.withLock { () -> Bool in
             guard handles[handle.subscription.id]?.contains(where: { $0 === handle }) == true, !handle.readyClaimed else { return false }
             handle.readyClaimed = true
@@ -572,6 +878,7 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// Open the db3 for its subscriptions; `identity` is the one the step
     /// started under (`openIdentity` answers it while the open is in flight).
     private func start(_ db3Id: String, identity: Int) async {
+        if isLocalOnly(db3Id) { return await startLocal(db3Id) }
         var format: Int?
         if deps.isBound(db3Id) || deps.isPendingCreate(db3Id) {
             format = RecordLogTransport.documentFormat
@@ -625,6 +932,23 @@ final class Db3Lifecycle: @unchecked Sendable {
         await refreshState(db3Id)
     }
 
+    /// A db3 that lives only on this device takes its subscriptions with no
+    /// open (#5155): its store is bound when it is not, and it is live at once.
+    private func startLocal(_ db3Id: String) async {
+        guard !handlesOf(db3Id).isEmpty else { return }
+        if !deps.isBound(db3Id) {
+            do {
+                try await deps.bind(db3Id)
+            } catch {
+                failOpen(db3Id, error)
+                await refreshState(db3Id)
+                return
+            }
+        }
+        lock.withLock { _ = active.insert(db3Id) }
+        await refreshState(db3Id)
+    }
+
     /// The identity the db3's open in flight started under; `nil` when no
     /// open of it is in flight.
     func openIdentity(_ db3Id: String) -> Int? {
@@ -662,6 +986,11 @@ final class Db3Lifecycle: @unchecked Sendable {
         let held = lock.withLock { () -> Bool in
             active.remove(db3Id)
             return doorHeld.contains(db3Id)
+        }
+        // Nothing was opened on the socket for a db3 that lives only here.
+        if isLocalOnly(db3Id) {
+            await refreshState(db3Id)
+            return
         }
         // Open through a document door as well: it stays open for the door.
         if held && deps.isOpen(db3Id) {
@@ -705,9 +1034,14 @@ final class Db3Lifecycle: @unchecked Sendable {
         // read; the store's numbers follow.
         let known = current(db3Id)
         let subscribed = isSubscribed(db3Id)
-        let phase = phaseOf(db3Id, subscribed: subscribed, marks: deps.syncMarks(db3Id))
+        let marks = deps.syncMarks(db3Id)
+        let phase = phaseOf(db3Id, subscribed: subscribed, marks: marks)
         let progress = (phase == .loading || phase == .catchingUp) ? status.progress.map(Self.progress) : nil
-        apply(db3Id, known.with(subscribed: subscribed, phase: phase, progress: .some(progress)))
+        // The level is the marks' now too: a reopen's `live` after a grant is
+        // told with the grant's level, not the refusal last read (#5101).
+        apply(db3Id, known.with(
+            subscribed: subscribed, phase: phase, progress: .some(progress), permission: .some(permissionOf(db3Id, marks))
+        ))
         kick(db3Id)
     }
 
@@ -726,13 +1060,17 @@ final class Db3Lifecycle: @unchecked Sendable {
         let outdated = lock.withLock { self.outdated }
         for db3Id in ids {
             // A db3 whose room needs a newer client is not asked of it again.
-            if up, open.contains(db3Id), !outdated.contains(db3Id), statusFor(db3Id).phase == .idle { deps.resync(db3Id) }
+            if up, open.contains(db3Id), !outdated.contains(db3Id), !isLocalOnly(db3Id), statusFor(db3Id).phase == .idle {
+                deps.resync(db3Id)
+            }
             kick(db3Id)
         }
     }
 
     /// An open attempt of the db3 ended without a handshake.
     func syncFailed(_ db3Id: String, _ reason: String) {
+        // A reopen on a grant ended: the next grant may ask again.
+        lock.withLock { _ = reopening.remove(db3Id) }
         if reason == JsBaoErrorCode.db3ClientOutdated.rawValue {
             // The room needs a newer client: the db3 is gone for this client's
             // lifetime, its rows kept; nothing retries it.
@@ -764,8 +1102,10 @@ final class Db3Lifecycle: @unchecked Sendable {
         // Refused while already gone (again, or for the first time since a
         // mark the store kept): no transition fires, but this contact is the
         // room's answer to every subscription waiting now.
+        // A grant heard before the refusal no longer stands.
         if refused, lock.withLock({ () -> Bool in
             roomRefused.insert(db3Id)
+            granted.remove(db3Id)
             return last[db3Id]?.phase == .gone
         }) {
             let error = goneError(db3Id)
@@ -909,6 +1249,7 @@ final class Db3Lifecycle: @unchecked Sendable {
             await deps.unbindAll()
             lock.withLock {
                 last = [:]
+                announced = [:]
                 errors = [:]
                 doorHeld = []
                 roomRefused = []
@@ -916,6 +1257,8 @@ final class Db3Lifecycle: @unchecked Sendable {
                 syncOff = []
                 deleted = []
                 deletedUnapplied = []
+                granted = []
+                reopening = []
             }
         }
         let released = lock.withLock { releasing.removeValue(forKey: generation) ?? [] }
@@ -935,7 +1278,9 @@ final class Db3Lifecycle: @unchecked Sendable {
         lock.withLock {
             identity += 1
             identityChanged = true
+            localOnlyIds = []
             last = [:]
+            announced = [:]
             errors = [:]
             statuses = [:]
             roomRefused = []
@@ -943,6 +1288,8 @@ final class Db3Lifecycle: @unchecked Sendable {
             syncOff = []
             deleted = []
             deletedUnapplied = []
+            granted = []
+            reopening = []
             return identity
         }
     }
@@ -970,11 +1317,14 @@ final class Db3Lifecycle: @unchecked Sendable {
     func evictedElsewhere(_ db3Id: String) {
         lock.withLock {
             last[db3Id] = nil
+            announced[db3Id] = nil
             errors[db3Id] = nil
             roomRefused.remove(db3Id)
             syncOff.remove(db3Id)
             deleted.remove(db3Id)
             deletedUnapplied.remove(db3Id)
+            granted.remove(db3Id)
+            reopening.remove(db3Id)
         }
         deps.emit(Db3EvictedEvent(id: db3Id, reason: .explicit))
         kick(db3Id)
@@ -1030,7 +1380,11 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// Why a gone db3 is gone, as the error a waiting `ready()` throws:
     /// outdated first, then deleted, then sync off, else a refused grant.
     private func goneError(_ db3Id: String) -> JsBaoError {
-        switch goneReason(db3Id) {
+        Self.goneError(db3Id, goneReason(db3Id))
+    }
+
+    private static func goneError(_ db3Id: String, _ reason: Db3GoneEvent.Reason) -> JsBaoError {
+        switch reason {
         case .clientOutdated: return Self.clientOutdated(db3Id)
         case .deleted: return Self.deletedRefused(db3Id)
         case .syncOff: return Self.syncOffRefused(db3Id)
@@ -1040,8 +1394,13 @@ final class Db3Lifecycle: @unchecked Sendable {
 
     /// `goneError`'s reason, as `Db3GoneEvent` names it.
     private func goneReason(_ db3Id: String) -> Db3GoneEvent.Reason {
-        if isOutdated(db3Id) { return .clientOutdated }
-        return lock.withLock { deleted.contains(db3Id) ? .deleted : syncOff.contains(db3Id) ? .syncOff : .permission }
+        lock.withLock { goneReasonHeld(db3Id) }
+    }
+
+    /// `goneReason`, read with the lock held.
+    private func goneReasonHeld(_ db3Id: String) -> Db3GoneEvent.Reason {
+        if outdated.contains(db3Id) { return .clientOutdated }
+        return deleted.contains(db3Id) ? .deleted : syncOff.contains(db3Id) ? .syncOff : .permission
     }
 
     private static func deletedRefused(_ db3Id: String) -> JsBaoError {
@@ -1084,16 +1443,25 @@ final class Db3Lifecycle: @unchecked Sendable {
     private func provisional(_ db3Id: String) -> Db3State {
         let (known, subscribed) = lock.withLock { (last[db3Id], !(handles[db3Id] ?? []).isEmpty) }
         let marks = deps.syncMarks(db3Id)
+        let localOnly = isLocalOnly(db3Id)
         let base = known ?? Db3State(
             id: db3Id, resident: isResidentNow(db3Id), subscribed: subscribed, phase: .idle, progress: nil,
             cursor: marks?.cursor ?? 0, rows: 0, lastSyncAt: Self.date(marks?.lastCatchUpAt), pendingWrites: 0,
-            permission: deps.knownPermission(db3Id), error: nil, pendingCreate: deps.isPendingCreate(db3Id)
+            permission: localOnly ? .owner : deps.knownPermission(db3Id), error: nil,
+            pendingCreate: !localOnly && deps.isPendingCreate(db3Id), localOnly: localOnly
         )
         return base.with(subscribed: subscribed, phase: phaseOf(db3Id, subscribed: subscribed, marks: marks))
     }
 
     private func phaseOf(_ db3Id: String, subscribed: Bool, marks: Db3SyncMarks?) -> Db3Phase {
-        if marks?.permission == RecordLogPermission.refused || isOutdated(db3Id) { return .gone }
+        // A db3 that lives only here has no room to wait for.
+        if isLocalOnly(db3Id) { return subscribed ? .live : .idle }
+        if refusedNow(db3Id, marks) || isOutdated(db3Id) { return .gone }
+        // Granted since the room refused it, and not asked again yet (#5101).
+        if marks?.permission == RecordLogPermission.refused, statusFor(db3Id).phase == .idle,
+           lock.withLock({ granted.contains(db3Id) && !reopening.contains(db3Id) }) {
+            return .idle
+        }
         // Subscribed with the socket down, or networking not allowed: the room
         // cannot keep it up to date, whatever the session last said. (Swift's
         // offline mode can leave the socket open with the session still live,
@@ -1108,9 +1476,11 @@ final class Db3Lifecycle: @unchecked Sendable {
     private func read(_ db3Id: String) async throws -> Db3State {
         let bound = deps.isBound(db3Id)
         let stored = try await deps.storedState(db3Id)
+        if stored?.localOnly == true { lock.withLock { _ = localOnlyIds.insert(db3Id) } }
         var marks = bound ? deps.syncMarks(db3Id) : nil
         let subscribed = isSubscribed(db3Id)
-        let pendingCreate = deps.isPendingCreate(db3Id)
+        let localOnly = isLocalOnly(db3Id)
+        let pendingCreate = !localOnly && deps.isPendingCreate(db3Id)
         if pendingCreate { marks?.createdLocally = true }
         let lastSyncAt = stored?.lastCatchUpAt ?? marks?.lastCatchUpAt
         // Resident means a model query answers now: the store is bound to
@@ -1120,12 +1490,7 @@ final class Db3Lifecycle: @unchecked Sendable {
         let phase = phaseOf(db3Id, subscribed: subscribed, marks: marks)
         let status = statusFor(db3Id)
         let progress = (phase == .loading || phase == .catchingUp) ? status.progress.map(Self.progress) : nil
-        let permission: Db3Permission?
-        switch marks?.permission {
-        case RecordLogPermission.refused: permission = .refused
-        case RecordLogPermission.read: permission = .reader
-        default: permission = deps.knownPermission(db3Id)
-        }
+        let permission = localOnly ? .owner : permissionOf(db3Id, marks)
         let gone = goneError(db3Id)
         let openError = lock.withLock { errors[db3Id] }
         let error: Db3StateError? = phase == .gone
@@ -1135,8 +1500,79 @@ final class Db3Lifecycle: @unchecked Sendable {
             id: db3Id, resident: resident, subscribed: subscribed, phase: phase, progress: progress,
             cursor: stored?.cursor ?? marks?.cursor ?? 0, rows: stored?.rows ?? 0, lastSyncAt: Self.date(lastSyncAt),
             pendingWrites: stored?.writers.reduce(0) { $0 + $1.pending } ?? 0, permission: permission, error: error,
-            pendingCreate: pendingCreate
+            pendingCreate: pendingCreate, localOnly: localOnly
         )
+    }
+
+    /// Whether the db3 lives only on this device (#5155): no room serves it,
+    /// so it is never opened on the socket, its subscriptions are live at
+    /// once, and it has no state to wait for.
+    func isLocalOnly(_ db3Id: String) -> Bool {
+        lock.withLock { localOnlyIds.contains(db3Id) } || deps.isLocalOnly(db3Id) || deps.syncMarks(db3Id)?.localOnly == true
+    }
+
+    /// A permission was heard for the db3 and its store took it (#5070): its
+    /// state is read again, so a `Db3StateEvent` carries the new level.
+    ///
+    /// A readable level the server sent just now (`heard`, #5101) for a db3
+    /// the room refused for this user (not one gone because it was deleted,
+    /// its sync went off or the room needs a newer client) is a grant: the db3
+    /// is no longer `gone`, and its state answers the level until the room
+    /// answers. One this client holds open (a subscription that was live, one
+    /// whose `ready()` is still pending, or a document door) is asked of the
+    /// room again at once, once while that ask runs; any other is asked at
+    /// its next subscribe. The room's `record.opened` lifts the store's
+    /// refused mark; a refusal again turns it `gone` again.
+    ///
+    /// - Parameter heard: The level the server sent; `nil` for one the client
+    ///   learned at its own open or replayed from its cache, which only
+    ///   re-reads the state.
+    func permissionChanged(_ db3Id: String, heard: Db3Permission? = nil) {
+        if let heard, heard != .refused, deps.isBound(db3Id),
+           deps.syncMarks(db3Id)?.permission == RecordLogPermission.refused {
+            let grantable = lock.withLock { () -> Bool in
+                guard !outdated.contains(db3Id), !deleted.contains(db3Id), !syncOff.contains(db3Id) else { return false }
+                granted.insert(db3Id)
+                return true
+            }
+            if grantable, wantsReopen(db3Id), lock.withLock({ reopening.insert(db3Id).inserted }) {
+                deps.logger?.debug("[db3] \(db3Id): a grant was heard for a refused db3; asking the room again")
+                deps.resync(db3Id)
+            }
+        }
+        kick(db3Id)
+    }
+
+    /// Whether a grant asks the room again for the refused db3 at once: a
+    /// subscription that was live holds it, or one still waiting for the
+    /// room, or a document door. A subscription the refusal answered before
+    /// the db3 was ever live for it (its `ready()` rejected) does not: a new
+    /// subscribe asks again.
+    private func wantsReopen(_ db3Id: String) -> Bool {
+        let (list, door) = lock.withLock { (handles[db3Id] ?? [], doorHeld.contains(db3Id)) }
+        let wasLive = lock.withLock { list.contains { $0.wasLive } }
+        if wasLive || list.contains(where: { !$0.subscription.readySettled }) { return true }
+        return door && deps.isOpen(db3Id)
+    }
+
+    /// The level a db3's state reports: `refused` while the room's refusal
+    /// stands, `reader` on a store marked read-only, else the client's record.
+    private func permissionOf(_ db3Id: String, _ marks: Db3SyncMarks?) -> Db3Permission? {
+        if refusedNow(db3Id, marks) { return .refused }
+        if marks?.permission == RecordLogPermission.read { return .reader }
+        return deps.knownPermission(db3Id)
+    }
+
+    /// Whether the room's refusal of the db3 stands: its store is marked
+    /// refused and no grant was heard since.
+    private func refusedNow(_ db3Id: String, _ marks: Db3SyncMarks?) -> Bool {
+        marks?.permission == RecordLogPermission.refused && !lock.withLock { granted.contains(db3Id) }
+    }
+
+    /// The db3's index list was applied to its store, or its read settled
+    /// (#5101): a waiting `ready()` may settle.
+    func indexesChanged(_ db3Id: String) {
+        kick(db3Id)
     }
 
     /// Read the db3's state again, off the caller.
@@ -1178,34 +1614,57 @@ final class Db3Lifecycle: @unchecked Sendable {
     }
 
     private func apply(_ db3Id: String, _ state: Db3State) {
-        let (previous, changed, list, open, refusedByRoom) = lock.withLock {
-            () -> (Db3State?, Bool, [Handle], Bool, Bool) in
+        let (previous, changed, list, open, refusedByRoom, announce) = lock.withLock {
+            () -> (Db3State?, Bool, [Handle], Bool, Bool, Db3GoneEvent.Reason?) in
             if state.phase == .live {
                 errors[db3Id] = nil
+                granted.remove(db3Id)
+                reopening.remove(db3Id)
                 syncOff.remove(db3Id)
                 if !deletedUnapplied.contains(db3Id) { deleted.remove(db3Id) }
             }
             let previous = last[db3Id]
             let changed = previous != state
             if changed { last[db3Id] = state }
+            // What this read announces is decided with `last`, so a read
+            // applied meanwhile finds it told (#5091-C001): the transition's
+            // reason, or `.deleted` once more for a db3 gone for another reason.
+            var announce: Db3GoneEvent.Reason?
+            if state.phase != .gone {
+                announced[db3Id] = nil
+            } else {
+                let reason = goneReasonHeld(db3Id)
+                if previous?.phase != .gone || (reason == .deleted && announced[db3Id] != .deleted) {
+                    announce = reason
+                    announced[db3Id] = reason
+                }
+            }
             // The refusal was lifted: the next one is the room's anew.
             if previous?.phase == .gone && state.phase != .gone { roomRefused.remove(db3Id) }
-            return (previous, changed, handles[db3Id] ?? [], active.contains(db3Id), roomRefused.contains(db3Id))
+            return (previous, changed, handles[db3Id] ?? [], active.contains(db3Id), roomRefused.contains(db3Id), announce)
         }
         if changed {
             deps.emit(Db3StateEvent(state: state))
             for handle in list { handle.subscription.deliver(.state(state)) }
         }
         let outdated = isOutdated(db3Id)
-        if state.phase == .gone && previous?.phase != .gone {
-            let event = Db3GoneEvent(id: db3Id, reason: goneReason(db3Id))
-            let error = goneError(db3Id)
+        if let reason = announce, previous?.phase != .gone {
+            let event = Db3GoneEvent(id: db3Id, reason: reason)
+            let error = Self.goneError(db3Id, reason)
             deps.emit(event)
             for handle in list {
                 handle.subscription.deliver(.gone(event))
                 // A mark the store kept from before is no answer of the room's
                 // to these subscriptions: the open's own answer settles them.
                 if outdated || refusedByRoom { handle.subscription.reject(error) }
+            }
+        } else if announce != nil {
+            // Gone for another reason, then deleted: announced once more (#5091).
+            let event = Db3GoneEvent(id: db3Id, reason: .deleted)
+            deps.emit(event)
+            for handle in list {
+                handle.subscription.deliver(.gone(event))
+                if refusedByRoom { handle.subscription.reject(Self.deletedRefused(db3Id)) }
             }
         } else if state.phase == .gone && outdated {
             // Subscribed again since: the room's answer is the same.

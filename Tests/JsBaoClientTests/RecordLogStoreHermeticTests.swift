@@ -101,7 +101,8 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         XCTAssertEqual(try columns(provider, "record_log_state"), [
             "doc_id TEXT", "cursor INTEGER", "open_epoch INTEGER", "grant_epoch INTEGER", "epoch_entries INTEGER",
             "constraints TEXT", "last_catch_up_at INTEGER", "permission TEXT", "rows_gen INTEGER", "replacing INTEGER",
-            "receipt TEXT", "segment TEXT", "staged INTEGER",
+            // Since #5155 (storage version 4): a local-only db3's mark and registrations.
+            "receipt TEXT", "segment TEXT", "staged INTEGER", "local_only INTEGER", "local_indexes TEXT",
         ])
         XCTAssertEqual(try columns(provider, "record_log_writers"), [
             "doc_id TEXT", "client_id TEXT", "writer TEXT", "next_seq INTEGER", "resumed_at INTEGER",
@@ -209,7 +210,7 @@ final class RecordLogStoreHermeticTests: XCTestCase {
 
         // The view row is what a query reads (the query tables until #4700).
         let viewed = try provider.withConnection { connection in
-            try connection.query("SELECT _data FROM record_log_view WHERE doc_id = ? AND _id = ?", [.text("doc-1"), .text("n1")])
+            try connection.query("SELECT json(_data) AS _data FROM record_log_view WHERE doc_id = ? AND _id = ?", [.text("doc-1"), .text("n1")])
         }
         XCTAssertEqual(viewed.count, 1)
         let viewRow = RecordLogJSON.row(viewed.first?["_data"].stringValue)

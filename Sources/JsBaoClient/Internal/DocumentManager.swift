@@ -980,8 +980,10 @@ public final class DocumentManager: @unchecked Sendable {
         // device", so it evicts at close exactly like an explicit
         // `evictLocal` — js-bao `closeDocument`'s
         // `evictLocal || retainLocalByDoc.get(id) === false` (#2668).
-        let evictLocal = options.evictLocal
-            || lock.withLock { retainLocalByDoc[documentId] } == false
+        // A db3 whose row says it lives only on this device is its only copy:
+        // no close removes it (#5155; `client.db3.delete` does).
+        let evictLocal = (options.evictLocal || lock.withLock { retainLocalByDoc[documentId] } == false)
+            && !isLocalOnlyDb3Row(documentId)
 
         // Persist before tearing down: if the app is being backgrounded
         // or the doc is being closed between server syncs, this flushes
@@ -1728,6 +1730,11 @@ public final class DocumentManager: @unchecked Sendable {
     /// `PermissionEvent`: the client applies it to a bound db3's store (#5020).
     var permissionApplied: ((String, DocumentPermission) -> Void)?
 
+    /// Hears every permission a server `docMetadata` frame carries, whether
+    /// or not it changed the recorded level (#5101): a grant heard for a
+    /// refused db3 asks its room again.
+    var permissionHeard: ((String, DocumentPermission) -> Void)?
+
     /// Note a db3 a resource holds (an agent session's, #4884): its open takes
     /// `reader` and runs no `fetchDocumentInfo`.
     func noteResourceHeld(_ documentId: String) {
@@ -2235,6 +2242,11 @@ public final class DocumentManager: @unchecked Sendable {
            getPermission(documentId) != permission {
             setPermission(documentId, permission: permission)
         }
+        // Heard from the server, the cached level included (a re-grant after
+        // a revocation the cache never saw).
+        if source == "server", let permissionString, let permission = DocumentPermission(rawValue: permissionString) {
+            permissionHeard?(documentId, permission)
+        }
     }
 
     // MARK: - Pending Creates
@@ -2311,15 +2323,20 @@ public final class DocumentManager: @unchecked Sendable {
         db3Create: Bool = false,
         db3Type: String? = nil
     ) async throws -> LocalMetadataEntry {
-        // The one combination that can never work, refused before anything
-        // moves: no entry built, no lock taken, no classification registered,
-        // no row persisted, no event emitted. This is the only writer of a
-        // create's local state, so guarding it here covers
+        // The one combination the document doors cannot take, refused before
+        // anything moves: no entry built, no lock taken, no classification
+        // registered, no row persisted, no event emitted. This is the only
+        // writer of a create's local state, so guarding it here covers
         // `JsBaoClient.createDocument`, `documents.create` with a wired client
-        // and every direct caller at once.
-        try assertDocumentFormatAllowsLocalOnly(
-            documentFormat: documentFormat, localOnly: localOnly
-        )
+        // and every direct caller at once. The db3 door (`db3Create`) keeps a
+        // db3 that lives only on this device (#5155).
+        if db3Create && localOnly {
+            try assertRequestedDocumentFormat(documentFormat)
+        } else {
+            try assertDocumentFormatAllowsLocalOnly(
+                documentFormat: documentFormat, localOnly: localOnly
+            )
+        }
 
         var metadata = LocalMetadataEntry(documentId: documentId)
         metadata.title = title
@@ -2341,6 +2358,11 @@ public final class DocumentManager: @unchecked Sendable {
             metadata.db3Create = true
             metadata.db3Type = db3Type
             metadata.createdBy = userId
+            // #5155 — one that lives only on this device is its creator's for good.
+            if localOnly {
+                metadata.lastKnownPermission = DocumentPermission.owner.rawValue
+                metadata.permissionCachedAt = metadata.createdAt
+            }
         }
 
         // The sync protocol, the awareness entry and the update observer are
@@ -3175,6 +3197,28 @@ public final class DocumentManager: @unchecked Sendable {
         // an ordinary document and for a client with no record-log tables.
         await purgeLocalStoreData?(documentId)
         return true
+    }
+
+    /// Whether `documentId`'s metadata row is a db3 that lives only on this device (#5155).
+    func isLocalOnlyDb3Row(_ documentId: String) -> Bool {
+        lock.withLock {
+            metadataIndex[documentId].map { $0.localOnly == true && $0.documentFormat == RecordLogTransport.documentFormat } ?? false
+        }
+    }
+
+    /// Put back the metadata row of a db3 that lives only on this device
+    /// after a sweep took every row (#5155): its copy stays, and so does what
+    /// classifies it.
+    func restoreLocalOnlyRow(_ row: LocalMetadataEntry) async {
+        lock.withLock {
+            metadataIndex[row.documentId] = row
+            localOnlyDocs.insert(row.documentId)
+        }
+        do {
+            try await putMetadataTracked(row)
+        } catch {
+            logger.warn("[evict]", row.documentId, "— writing its kept row again failed:", error.localizedDescription)
+        }
     }
 
     public func evictAllLocalData() async {

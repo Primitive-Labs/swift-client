@@ -150,9 +150,10 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     /// Whether this document's store holds a readable copy (js-bao's
-    /// `isRecordLogResident`): created here, or a load completed and no
-    /// unstaged replacement is in progress. Answered from the mirrored marks;
-    /// they are read again only when they say no.
+    /// `isRecordLogResident`): it lives only on this device, or it was
+    /// created here, or a load completed and no unstaged replacement is in
+    /// progress. Answered from the mirrored marks; they are read again only
+    /// when they say no.
     var isResident: Bool {
         let createdLocally = self.createdLocally
         if RecordLogStore.isResident(marks, createdLocally: createdLocally) { return true }
@@ -172,13 +173,115 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     /// Bind a model to this document. Its reads answer from the document's
     /// view; no index is built here (the store builds its indexes from the
-    /// room's list, which a declaration reaches through the room).
+    /// room's list, which a declaration reaches through the room). A db3 that
+    /// lives only on this device takes the model's constraints and indexes
+    /// now (``applyLocalDeclarations()``).
     func registerModel(_ schema: PrimitiveSchema) throws {
-        state.withLock {
-            if schemas[schema.name] != schema { _declarationVersion += 1 }
+        let changed = state.withLock { () -> Bool in
+            guard schemas[schema.name] != schema else { return false }
+            _declarationVersion += 1
             schemas[schema.name] = schema
+            return true
+        }
+        if changed && isLocalOnly { try applyLocalDeclarations() }
+    }
+
+    // MARK: - A db3 that lives only on this device (#5155)
+
+    /// Whether the db3 lives only on this device: its store judges and
+    /// confirms its own writes, and its session sends nothing.
+    var isLocalOnly: Bool { marks.localOnly }
+
+    /// Mark the db3 as living only on this device. The mark is the store's,
+    /// so every later bind finds it; its constraints and indexes follow from
+    /// its models at once.
+    func markLocalOnly() throws {
+        if !isLocalOnly { try setState(localOnly: true) }
+        try applyLocalDeclarations()
+    }
+
+    /// Make a local-only db3's constraints and view indexes what its models
+    /// declare and what was registered on it here
+    /// (``RecordLogLocalOnly/constraints(_:_:)``,
+    /// ``RecordLogLocalOnly/indexList(_:_:)``): at every bind, when a model
+    /// registers later, and after a registration or a drop. Nothing happens
+    /// for a db3 that syncs.
+    func applyLocalDeclarations() throws {
+        guard isLocalOnly else { return }
+        _ = try changeLocalIndexes { current in (current, nil) }
+    }
+
+    /// Change a local-only db3's registrations to what `plan` makes of the
+    /// ones its store holds, with the constraints and view indexes that
+    /// follow, in one store transaction: written only while the store still
+    /// holds the registrations it was planned from and, for a unique key, no
+    /// two records share it; planned again when another change came first.
+    /// Answers the registrations written.
+    ///
+    /// - Throws: what `plan` throws, or `DB3_INDEX_NOT_UNIQUE` when records share the key.
+    private func changeLocalIndexes(
+        _ plan: ([RecordLogLocalIndex]) throws -> (registrations: [RecordLogLocalIndex], unique: (model: String, fields: [String])?)
+    ) throws -> [RecordLogLocalIndex] {
+        try withOperation {
+            var current = try refreshMarks().localIndexes
+            while true {
+                let schemas = registeredSchemas
+                let (registrations, unique) = try plan(current)
+                let change = try store.changeLocalIndexes(
+                    from: current, to: registrations, constraints: RecordLogLocalOnly.constraints(schemas, registrations),
+                    unique: unique.map { ($0.model, $0.fields, RecordLogLocalOnly.maxDuplicates) }
+                )
+                switch change {
+                case .changed(let marks):
+                    state.withLock { _marks = marks }
+                    try store.syncIndexes(RecordLogLocalOnly.entries(RecordLogLocalOnly.indexList(schemas, registrations)))
+                    return registrations
+                case .duplicates(let duplicates, let marks):
+                    state.withLock { _marks = marks }
+                    throw RecordLogLocalOnly.notUnique(model: unique?.model ?? "", fields: unique?.fields ?? [], duplicates: duplicates)
+                case .moved(let marks):
+                    current = marks.localIndexes
+                }
+            }
         }
     }
+
+    /// A local-only db3's index list, as the room lists its registry.
+    var localIndexes: [Db3Index] {
+        RecordLogLocalOnly.indexList(registeredSchemas, marks.localIndexes)
+    }
+
+    /// Register an index on a local-only db3 by the room's rules
+    /// (``RecordLogLocalOnly/register(_:_:_:)``): kept in its store, and its
+    /// constraints and view indexes made to match before this returns.
+    /// Answers the index as the list now shows it.
+    ///
+    /// - Throws: the room's refusal, as a `JsBaoError` with its code.
+    func registerLocalIndex(_ registration: Db3IndexRegistration) throws -> Db3Index {
+        // Checked before anything reads the store: a malformed body is the room's `DB3_INDEX_INVALID`.
+        let parsed = try RecordLogLocalOnly.parse(registration)
+        var index: Db3Index?
+        let written = try changeLocalIndexes { current in
+            let planned = try RecordLogLocalOnly.register(registeredSchemas, current, registration)
+            index = planned.index
+            return (planned.registrations, parsed.unique ? (parsed.model, parsed.fields) : nil)
+        }
+        return RecordLogLocalOnly.indexList(registeredSchemas, written).first { $0.name == index?.name } ?? index!
+    }
+
+    /// Drop an index of a local-only db3 by the room's rules
+    /// (``RecordLogLocalOnly/drop(_:_:name:)``); its constraints and view
+    /// indexes follow before this returns.
+    func dropLocalIndex(_ name: String) throws {
+        _ = try changeLocalIndexes { current in (try RecordLogLocalOnly.drop(registeredSchemas, current, name: name), nil) }
+    }
+
+    /// This writer's entries not yet acknowledged, in order: none on a db3
+    /// that lives only on this device once its save returned.
+    var unacknowledgedSeqs: [Int] { state.withLock { unacked.keys.sorted() } }
+
+    /// This writer's committed entries not yet settled, in order.
+    var unsettledSeqs: [Int] { state.withLock { unsettled.sorted() } }
 
     /// Hear that `model`'s rows changed through the room. Returns a token for ``removeModelListener(_:_:)``.
     @discardableResult
@@ -309,6 +412,13 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     /// rows they changed as `local`. A save refused before it commits (the
     /// epoch budget, or the room's access refusal: `WRITE_ACCESS_DENIED`) is
     /// reported with its writes and thrown.
+    ///
+    /// On a db3 that lives only on this device the store judges the writes
+    /// and confirms them in the commit (#5155): its group commits before this
+    /// returns, and only then are the entries acknowledged and settled here
+    /// (no sender is handed one); a refusal is reported and thrown as the
+    /// room's would be, and a group whose `COMMIT` fails throws its
+    /// `.unavailable` (`commit-failed`), its writes handed back.
     @discardableResult
     func commit(_ writes: [RecordLogWrite]) throws -> [RecordLogPendingEntry] {
         try assertOpen()
@@ -340,7 +450,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         do {
             reply = try withOperation {
                 try store.commitEntries(writer: writer, writes: writes) { [weak self] error in
-                    if let entries = delivery.outcome(error) { self?.groupCommitted(entries, writer: writer, error: error) }
+                    if let saved = delivery.outcome(error) { self?.groupCommitted(saved, writer: writer, error: error) }
                 }
             }
         } catch let error as JsBaoError where RecordLogHandBackCode.all.contains(error.code.rawValue) {
@@ -364,7 +474,13 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             _marks.nextSeq = max(_marks.nextSeq, (reply.entries.map(\.seq).max() ?? 0) + 1)
             _marks.cursor = reply.cursor
         }
-        if let (entries, error) = delivery.entries(reply.entries) { groupCommitted(entries, writer: writer, error: error) }
+        if let (saved, error) = delivery.entries(reply) { groupCommitted(saved, writer: writer, error: error) }
+        // Confirmed by the store itself: its group commits now, so the
+        // confirmation it carries is released before this returns.
+        if reply.acknowledged != nil {
+            try? store.flush()
+            if let failure = delivery.failure { throw failure }
+        }
         if !reply.changed.isEmpty {
             noticeChange(RecordLogChangeNotice(
                 origin: .local, records: reply.changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) },
@@ -388,29 +504,35 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     /// `lock`, a leaf lock held for the assignment alone.
     private final class Delivery: @unchecked Sendable {
         private let lock = NSLock()
-        private var saved: [RecordLogPendingEntry]?
+        private var saved: RecordLogCommitReply?
         private var heard: (error: Error?, at: Bool) = (nil, false)
 
         /// The save returned; answers what to deliver when the group already committed.
-        func entries(_ entries: [RecordLogPendingEntry]) -> ([RecordLogPendingEntry], Error?)? {
+        func entries(_ reply: RecordLogCommitReply) -> (RecordLogCommitReply, Error?)? {
             lock.withLock {
-                saved = entries
-                return heard.at ? (entries, heard.error) : nil
+                saved = reply
+                return heard.at ? (reply, heard.error) : nil
             }
         }
 
-        /// The group committed or failed; answers the entries when the save already returned.
-        func outcome(_ error: Error?) -> [RecordLogPendingEntry]? {
+        /// The group committed or failed; answers the save's reply when the save already returned.
+        func outcome(_ error: Error?) -> RecordLogCommitReply? {
             lock.withLock {
                 heard = (error, true)
                 return saved
             }
         }
+
+        /// The group's failure, once it was heard.
+        var failure: Error? { lock.withLock { heard.at ? heard.error : nil } }
     }
 
     /// A group of saves committed (or failed): runs on the provider's queue,
-    /// so it takes only the leaf lock.
-    private func groupCommitted(_ entries: [RecordLogPendingEntry], writer: String, error: Error?) {
+    /// so it takes only the leaf lock. A local-only store's entries were
+    /// confirmed in the commit: they are acknowledged and settled here, and
+    /// no sender hears them.
+    private func groupCommitted(_ reply: RecordLogCommitReply, writer: String, error: Error?) {
+        let entries = reply.entries
         guard !entries.isEmpty else { return }
         if let error {
             let failure = (error as? JsBaoError) ?? JsBaoError(
@@ -422,6 +544,15 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             let listeners = state.withLock { Array(errorListeners.values) }
             for listener in listeners { listener(failure) }
             notify(touched, origin: .local)
+            return
+        }
+        if let confirmed = reply.acknowledged {
+            for alias in reply.aliases { noteAlias(alias) }
+            acknowledged(confirmed.filter { $0.writer == writer }.map(\.seq))
+            var settled = RecordLogChangeReply()
+            settled.settled = reply.settled ?? []
+            settled.settlements = reply.settlements ?? [:]
+            noteSettled(settled)
             return
         }
         // Committed under a writer that has been re-minted since: the store
@@ -612,11 +743,14 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     @discardableResult
     func setState(
         notice: (current: Int, next: Int?, entries: Int?)? = nil,
-        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil, type: RecordLogTypeUpdate? = nil
+        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil, type: RecordLogTypeUpdate? = nil,
+        localOnly: Bool? = nil
     ) throws -> RecordLogMarks {
         let writer = self.writer
         let marks = try withOperation {
-            try store.setState(writer: writer, notice: notice, constraints: constraints, permission: permission, type: type)
+            try store.setState(
+                writer: writer, notice: notice, constraints: constraints, permission: permission, type: type, localOnly: localOnly
+            )
         }
         state.withLock { _marks = marks }
         return marks

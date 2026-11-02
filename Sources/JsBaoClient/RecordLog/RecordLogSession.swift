@@ -573,6 +573,12 @@ actor RecordLogSession {
             return
         }
         guard phase == .idle else { return }
+        // A db3 that lives only on this device (#5155) has no room: nothing
+        // names it on the socket.
+        if binding.isLocalOnly {
+            logger?.debug("[record-log]", documentId, "— lives only on this device; not opened on the socket")
+            return
+        }
         if outdated {
             // The room refused this client's wire version: opening again is refused again.
             logger?.debug("[record-log]", documentId, "— not opened: the room needs a newer client (DB3_CLIENT_OUTDATED)")

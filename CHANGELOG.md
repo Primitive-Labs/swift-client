@@ -20,6 +20,117 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Local-only databases
+
+`client.db3.create(title:localOnly: true)` keeps a db3 on this device only:
+nothing of it is ever sent to the server, in this session or a later one. It
+returns at once with `localOnly == true` and `sync == false`, and
+`Db3CreatedEvent` fires once.
+
+- Saves, queries, aggregates, upserts, increments, conditions,
+  `confirm: true`, live updates and `client.db3.indexes` work on it as on a
+  synced db3. Each write is judged on the device with the codes the server
+  uses (`.documentConstraintViolated` with the conflicting record,
+  `.db3ConditionNotMet` with `current`, `.db3RecordNotFound`) and accepted at
+  once, so `pendingWrites` stays 0. A subscription is `live` at once. It
+  survives restarts for the same user; another user signing in on the device
+  does not see it.
+- `Db3Info`, `Db3State` and `Db3StoredEntry` gain `localOnly`.
+- `client.db3.delete(_:)` removes it with nothing sent, and
+  `logout(wipeLocal: true)` removes it with everything else.
+  `client.db3.evict(_:)` and `client.documents.evict(documentId:)` throw
+  `.db3LocalOnly`; `client.evictLocalDocument(_:)`, `evictAllLocal()`,
+  `documents.evictAll()` and the retention policy keep it, and it counts
+  toward no `maxDocs` cap.
+- Every call that would ask the server about it — the `client.db3` server
+  calls, `blobs(_:)`, `ingests`, and the `client.documents` calls naming it —
+  throws the new `.db3LocalOnly` before any request. `create` refuses
+  `localOnly` with `type`, `sync: false` or `custodian`
+  (`.localOnlyUnsupportedOption`). The `.db3Index…` codes join
+  `JsBaoErrorCode` for its device-side index refusals.
+- The local store moves to storage version 4 at its next open: each db3's
+  state gains the local-only mark, and every db3 already stored reads synced.
+
+### A member index for a db3's string set field
+
+`client.db3.indexes.register(db3Id, Db3IndexRegistration(model:field:members: true))`
+registers a member index on a string set field, named
+`idx_members_<model>_<field>`. The db3 then answers `$contains`, any-of,
+membership groups and unfiltered facets on the field from the index, so a
+selective `$contains` on a large db3 answers in milliseconds, with the same
+results. It costs one stored row per member and a little time on each write
+that changes the set, and it is built from the existing records in the
+registration's one request (about 1,000,000 records). `Db3Index.members` is
+`true` on it and `false` on every other index. `members: true` on a field
+holding single values is refused `DB3_INDEX_NOT_SET_FIELD`. A device's copy
+builds nothing for a member index.
+
+### The db3 copies on this device take less space
+
+The local store keeps each db3 record as SQLite JSONB without its `id`, which
+the record's key already holds: the harness's 100,000 IMDb rows take 86% of
+the pages they took before. The first open after the update converts the
+copies already on the device, one db3 at a time, and an interrupted conversion
+continues at the next open. Reads answer every row with its `id`, as before.
+
+`$startsWith`, `$endsWith` and `$containsText` on `id` and `type` now match on
+the record's key and model; on `type` they matched nothing before.
+
+A build from before this change reads a converted copy wrongly until this
+build opens it again.
+
+### A re-grant reopens a refused db3
+
+When the server grants this user a readable level again on a db3 the room
+refused (`.gone`, `DB3_ACCESS_REFUSED`), the client asks the room again at once
+for a db3 it holds open: a subscription that was `.live`, one whose `ready()`
+is still waiting, or a document door. The same `Db3Subscription` goes `.live`
+with the new permission, with no new `Db3GoneEvent`, and writes made afterwards
+land. A re-grant at the level the client had before the revocation counts too.
+Re-granted `reader`, saves are refused on the device from the moment `.live` is
+reported. A refused copy nothing holds open reports the grant's level from
+`client.db3.state(id)`, and its next `subscribe` asks the room. A grant heard
+while offline takes effect when networking returns.
+
+### A registered index reaches this device
+
+`client.db3.indexes.register` and `drop` on a db3 this client has subscribed
+now change the local copy before they return, so a query on the field right
+after uses the index. After a subscribe, `ready()` returns only once the copy
+holds the database's index list (including an index the room created for this
+open's model declarations); `available()` does not wait for it. A failed list
+read is retried on a backoff while connected, and again when the socket opens
+or networking returns; `ready()` stays bounded by its `readyTimeout`.
+
+### Fixed: a db3 already gone that is then deleted emits a second gone event
+
+A db3 gone for `.permission` or `.syncOff` that is then deleted emits
+`Db3GoneEvent(reason: .deleted)` (`DB3_DELETED`) once more, at the latest on
+the client's next subscribe; a waiting `ready()` throws `.db3Deleted`. A db3
+already gone for `.deleted` or `.clientOutdated` emits nothing more.
+
+### Fixed: `maxDocs` counts the db3 copies stored on this device
+
+- `client.db3.setRetentionPolicy(RetentionPolicy(maxDocs:))` keeps at most
+  `maxDocs` of the copies `client.db3.stored()` lists, subscribed ones
+  included, and evicts the least recently used first. A copy's last use is the
+  later of its last open and the end of its last subscription (a `dispose()`,
+  a logout, another user's sign-in, `destroy()`).
+- A db3 the client only knows of, with no copy here, and a format-1 document
+  no longer take a slot, so the policy no longer keeps too few copies, and
+  `Db3EvictedEvent` no longer fires for a db3 that had no copy here.
+- A subscribed copy, one held open, a pending create and one with unsent
+  writes are never evicted and still count, so the device may keep more than
+  `maxDocs`. `maxDocs: nil` is no cap; `0` evicts every copy the policy may.
+- `ttl` applies to the stored copies by their last use; `maxBytes` never
+  removes a db3 copy. Format-1 documents are evicted exactly as before.
+
+### A grant change on an open db3 reaches its state
+
+A permission heard for a bound db3 (`reader` ↔ `read-write`, with no write of
+this client's) now emits a `Db3StateEvent` with the new `permission`, and
+`client.db3.state(id)` answers it. The phase stays `.live`.
+
 ### Added: `swift-bao-codegen` over every db3 type file
 
 `--input` repeats and takes a directory, so one run generates the models of

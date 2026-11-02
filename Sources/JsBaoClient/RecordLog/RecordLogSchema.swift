@@ -13,7 +13,10 @@ import Foundation
 /// - `record_log_state`: per document, the cursor, the epochs, the
 ///   constraints the room declared, the full replacement in progress, the
 ///   receipts of a load's or a segment's chunks begun and not completed, and
-///   the segment the confirmed rows were last replaced from.
+///   the segment the confirmed rows were last replaced from; and, for a db3
+///   that lives only on this device (`local_only` 1, #5155), the index
+///   registrations made on it here (`local_indexes`, the room's registry kept
+///   on the device).
 /// - `record_log_writers`: per document and client, its writer and next
 ///   sequence number.
 /// - `record_log_pending` and `record_log_pending_keys`: the unjudged entries,
@@ -63,17 +66,32 @@ enum RecordLogSchema {
         ("record_log_state", "receipt", "ALTER TABLE record_log_state ADD COLUMN receipt TEXT"),
         ("record_log_state", "segment", "ALTER TABLE record_log_state ADD COLUMN segment TEXT"),
         ("record_log_state", "staged", "ALTER TABLE record_log_state ADD COLUMN staged INTEGER"),
+    ] + localOnlyColumns
+
+    /// The columns storage version 4 adds (#5155): the mark of a db3 that
+    /// lives only on this device, and the index registrations made on it here.
+    static let localOnlyColumns: [(table: String, column: String, add: String)] = [
+        ("record_log_state", "local_only", "ALTER TABLE record_log_state ADD COLUMN local_only INTEGER NOT NULL DEFAULT 0"),
+        ("record_log_state", "local_indexes", "ALTER TABLE record_log_state ADD COLUMN local_indexes TEXT"),
     ]
 
     /// The table naming the user the record-log tables belong to.
     static let ownerTable = "record_log_owner"
 
-    /// The storage version a store is brought to at open (#4700): a db3's rows
-    /// live in its view only, its indexes come from the room's list. Version 1
-    /// kept the query projection (model tables with `_meta_doc_id`, their
-    /// marks and rule, and indexes built from declarations). A build that
-    /// changes the tables raises it: a store at the version runs no DDL at open.
-    static let storageVersion = 2
+    /// The storage version a store is brought to at open: 4 (#5155) adds the
+    /// local-only mark and registrations to `record_log_state`. Version 3
+    /// (#5136) keeps each record's `_data` as JSONB without `id`, which `_id`
+    /// holds. Version 2
+    /// (#4700) kept it as JSON text with `id`, a db3's rows in its view only
+    /// and its indexes from the room's list; version 1 also kept the query
+    /// projection (model tables with `_meta_doc_id`, their marks and rule, and
+    /// indexes built from declarations). A build that changes the tables
+    /// raises it: a store at or above the version runs no DDL at open.
+    static let storageVersion = 4
+
+    /// The version from which every row is JSONB without `id`: a store at it
+    /// or above has nothing to convert (#5136).
+    static let jsonbVersion = 3
 
     /// The statements that create the tables. Each is idempotent.
     static let ddl: [String] = [
@@ -110,7 +128,9 @@ enum RecordLogSchema {
           replacing INTEGER,
           receipt TEXT,
           segment TEXT,
-          staged INTEGER
+          staged INTEGER,
+          local_only INTEGER NOT NULL DEFAULT 0,
+          local_indexes TEXT
         )
         """,
         """

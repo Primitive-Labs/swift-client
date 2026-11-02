@@ -29,9 +29,10 @@ extension JsBaoClient {
             isOpen: { [weak self] id in self?.documentManager.isOpen(id) ?? false },
             pendingCreates: { [weak self] in self?.db3PendingCreates() ?? [] },
             isPendingCreate: { [weak self] id in self?.db3IsPendingCreate(id) ?? false },
+            isLocalOnly: { [weak self] id in self?.isLocalOnlyDb3Known(id) ?? false },
             createRefusal: { [weak self] id in self?.db3CreateRefusal(id) },
             knownPermission: { [weak self] id in self?.db3PermissionOf(id) },
-            forget: { [weak self] id in await self?.evictLocalDocument(id) },
+            forget: { [weak self] id in await self?.forgetLocalDocument(id) },
             setRetentionPolicy: { [weak self] policy in self?.retentionPolicy = policy },
             isBound: { [weak self] id in self?.recordLogBinding(id).map { !$0.isClosed } ?? false },
             syncMarks: { [weak self] id in self?.db3SyncMarks(id) },
@@ -41,8 +42,35 @@ extension JsBaoClient {
             unbindAll: { [weak self] in await self?.unbindAllDb3s() },
             boundIds: { [weak self] in self?.recordLogState.bindings.map(\.0) ?? [] },
             identityPending: { [weak self] in self?.db3IdentityOutgoing ?? false },
+            indexesSettled: { [weak self] id in self?.db3IndexRefresher?.settled(id) ?? true },
+            lastUsedAt: { [weak self] id in self?.db3LastUsedAt(id) },
             logger: logger
         )
+    }
+
+    /// When the db3 was last used here, in epoch ms: its metadata row's
+    /// `lastOpenedAt`, which its open and the close at the end of its last
+    /// subscription stamp; `nil` when no row says (#5085).
+    func db3LastUsedAt(_ documentId: String) -> Int64? {
+        guard let stamp = documentManager.getLocalMetadata(documentId)?.lastOpenedAt else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = ISO8601DateFormatter().date(from: stamp) ?? fractional.date(from: stamp) else { return nil }
+        return Int64(date.timeIntervalSince1970 * 1000)
+    }
+
+    /// The db3 rows `DocumentManager.enforceRetentionPolicy`'s `ttl` pass would
+    /// hand `evictDb3ForRetention` now: its own rule, a `lastOpenedAt` older
+    /// than `ttlMs` (5085-C002).
+    func db3RowsPastTtl(_ ttlMs: Int) -> [String] {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let formatter = ISO8601DateFormatter()
+        return documentManager.getMetadataIndex().compactMap { id, meta in
+            guard meta.documentFormat == 3,
+                  let lastOpenedAt = meta.lastOpenedAt,
+                  let date = formatter.date(from: lastOpenedAt) else { return nil }
+            return nowMs - (date.timeIntervalSince1970 * 1000) > Double(ttlMs) ? id : nil
+        }
     }
 
     /// A document's format for `client.db3.subscribe`: what the bound store,
@@ -172,6 +200,216 @@ extension JsBaoClient {
         )
     }
 
+    /// Keep a db3 `client.db3.create(title:localOnly: true)` makes under the
+    /// id it minted (#5155): its metadata row is local-only (never listed as
+    /// unaccounted, never committed, never opened with sync) and its store is
+    /// bound and marked local-only, so it judges and confirms its own writes.
+    /// Nothing is sent. `Db3CreatedEvent` fires once. A device that cannot
+    /// keep it creates nothing: the call throws the storage's refusal.
+    func createLocalOnlyDb3(_ db3Id: String, title: String, tags: [String]?, metadata: JSONValue?) async throws -> Db3Info {
+        guard let userId = authController.getUserId(), !userId.isEmpty else {
+            throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
+        }
+        if let refusal = await db3StorageRefusal(db3Id) { throw refusal }
+        let entry = try await documentManager.createLocalDocument(
+            documentId: db3Id, title: title, localOnly: true, tags: tags, docMetadata: metadata,
+            documentFormat: RecordLogTransport.documentFormat, db3Create: true
+        )
+        noteDb3(db3Id)
+        do {
+            try await bindStoredDb3(db3Id)
+            guard let binding = recordLogBinding(db3Id), binding.isLocalOnly else {
+                throw Format2Storage.unavailable(reason: .notPersistent, documentId: db3Id)
+            }
+        } catch {
+            logger.warn("[db3] \(db3Id): keeping the new local-only db3 on this device failed:", error.localizedDescription)
+            await unbindRecordLogDocument(db3Id)
+            await documentManager.evictLocalData(documentId: db3Id)
+            throw error
+        }
+        _db3Lifecycle.createChanged(db3Id)
+        eventEmitter.emit(Db3CreatedEvent(id: db3Id))
+        let createdAt = entry.createdAt ?? ISO8601DateFormatter().string(from: Date())
+        return Db3Info(
+            id: db3Id, title: title, createdBy: userId, createdAt: createdAt, modifiedAt: createdAt, custodian: "user:\(userId)",
+            sync: false, type: nil, tags: tags ?? [], metadata: metadata, permission: nil, accessSource: nil, grantedAt: nil,
+            localOnly: true
+        )
+    }
+
+    /// Whether `documentId`'s metadata row is a db3 that lives only on this
+    /// device and belongs to the signed-in user (#5155). This client's
+    /// metadata rows are app-wide, so another user's is not one.
+    func isLocalOnlyDb3Row(_ documentId: String) -> Bool {
+        guard let meta = documentManager.getLocalMetadata(documentId),
+              meta.localOnly == true, meta.documentFormat == RecordLogTransport.documentFormat
+        else { return false }
+        return meta.createdBy == nil || meta.createdBy == authController.getUserId()
+    }
+
+    /// Whether `documentId`'s metadata row is a db3 that lives only on this
+    /// device and belongs to another user (#5155): nothing of this user's
+    /// may remove its only copy.
+    func isOtherUsersLocalOnlyDb3Row(_ documentId: String) -> Bool {
+        guard let meta = documentManager.getLocalMetadata(documentId),
+              meta.localOnly == true, meta.documentFormat == RecordLogTransport.documentFormat
+        else { return false }
+        return !isLocalOnlyDb3Row(documentId)
+    }
+
+    /// Whether a db3 lives only on this device, as this client knows now
+    /// (#5155): its metadata row says so, or its bound store's mark does.
+    func isLocalOnlyDb3Known(_ documentId: String) -> Bool {
+        if isLocalOnlyDb3Row(documentId) { return true }
+        guard let binding = recordLogBinding(documentId), !binding.isClosed else { return false }
+        return binding.isLocalOnly
+    }
+
+    /// Whether a db3 lives only on this device (#5155), read without the
+    /// network: its metadata row or its bound store's mark says so, else,
+    /// with no row to say otherwise, the store's stored state (a row lost
+    /// while the store kept its mark).
+    func isLocalOnlyDb3(_ documentId: String) async -> Bool {
+        if isLocalOnlyDb3Known(documentId) { return true }
+        if documentManager.getLocalMetadata(documentId) != nil { return false }
+        return ((try? await db3StoredState(documentId)) ?? nil)?.localOnly == true
+    }
+
+    /// `DB3_LOCAL_ONLY`: `call` would reach the server about a db3 that lives
+    /// only on this device (#5155). `details.db3Id` names it.
+    static func db3LocalOnlyError(_ db3Id: String, call: String, instead: String? = nil) -> JsBaoError {
+        JsBaoError(
+            code: .db3LocalOnly,
+            message: "\(call): the db3 '\(db3Id)' lives only on this device and has no server record"
+                + (instead.map { "; \($0)" } ?? ""),
+            details: ["db3Id": .string(db3Id)]
+        )
+    }
+
+    /// Refuse `call` on a db3 that lives only on this device, before anything
+    /// local changes or any request is made (#5155). Read without the network.
+    func assertNotLocalOnlyDb3(_ documentId: String, call: String, instead: String? = nil) async throws {
+        guard await isLocalOnlyDb3(documentId) else { return }
+        throw Self.db3LocalOnlyError(
+            documentId, call: call,
+            instead: instead ?? "see it with client.db3.state or client.db3.stored, and remove it with client.db3.delete"
+        )
+    }
+
+    /// A db3 living only on this device that a request's path or JSON body
+    /// names, as this client knows now, or `nil` (#5155): the client's
+    /// transport refuses every such request, so no member naming a document
+    /// by its id can send one.
+    func localOnlyDb3Named(path: String, body: Data?) -> String? {
+        Self.db3IdsNamed(path: path, body: body).first { isLocalOnlyDb3Known($0) }
+    }
+
+    /// ``localOnlyDb3Named(path:body:)``, read durably (#5155): besides what
+    /// this client knows now, the local-only db3s the signed-in user's store
+    /// holds, so a request made before the stored db3s are bound or their
+    /// rows read (at start-up, or with a row lost) is checked against the
+    /// stores' own marks. The first such request waits for storage setup and
+    /// that one read.
+    func localOnlyDb3Requested(path: String, body: Data?) async -> String? {
+        if let known = localOnlyDb3Named(path: path, body: body) { return known }
+        let ids = Self.db3IdsNamed(path: path, body: body)
+        guard !ids.isEmpty else { return nil }
+        let stored = await storedLocalOnlyDb3Ids()
+        // Asked again of each one found: it may have been deleted since the read.
+        for id in ids where stored.contains(id) {
+            if await isLocalOnlyDb3(id) { return id }
+        }
+        return nil
+    }
+
+    /// The local-only db3s the signed-in user's store held when first asked
+    /// this session, read once per user once storage setup has restored the
+    /// session (#5155). A read that fails is not kept, so the next request reads again.
+    private func storedLocalOnlyDb3Ids() async -> Set<String> {
+        _ = await waitForStorageReady()
+        guard let userId = authController.getUserId(), !userId.isEmpty else { return [] }
+        let read = storedLocalOnlyLock.withLock { () -> Task<Set<String>?, Never> in
+            if let cached = storedLocalOnly, cached.userId == userId { return cached.ids }
+            let ids = Task { [weak self] () -> Set<String>? in
+                guard let self else { return nil }
+                guard let host = await self.db3Host() else { return [] }
+                return (try? RecordLogStore.localOnlyDocumentIds(host: host, userId: userId)).map(Set.init)
+            }
+            storedLocalOnly = (userId, ids)
+            return ids
+        }
+        if let ids = await read.value { return ids }
+        storedLocalOnlyLock.withLock {
+            if storedLocalOnly?.ids == read { storedLocalOnly = nil }
+        }
+        return []
+    }
+
+    /// Every id a request's path or JSON body names that could be a db3's.
+    private static func db3IdsNamed(path: String, body: Data?) -> [String] {
+        var text = path
+        if let body, let decoded = String(data: body, encoding: .utf8) { text += " " + decoded }
+        let range = NSRange(text.startIndex..., in: text)
+        return ulidText.matches(in: text, range: range).compactMap { match in
+            Range(match.range, in: text).map { String(text[$0]) }
+        }
+    }
+
+    /// A local-only db3 bound here, binding it first when it is stored and not yet bound (#5155).
+    private func boundLocalOnlyDb3(_ documentId: String) async throws -> RecordLogDocumentBinding {
+        if recordLogBinding(documentId) == nil { try await bindStoredDb3(documentId) }
+        guard let binding = recordLogBinding(documentId), !binding.isClosed, binding.isLocalOnly else {
+            throw db3NotResidentError([documentId])
+        }
+        return binding
+    }
+
+    /// A local-only db3's refusal of an index call, naming the db3 (#5155).
+    private func localIndexRefusal(_ documentId: String, _ error: Error) -> Error {
+        guard let refused = error as? JsBaoError else { return error }
+        var details = refused.details ?? [:]
+        details["db3Id"] = .string(documentId)
+        return JsBaoError(code: refused.code, message: refused.message, details: details)
+    }
+
+    /// A local-only db3's index list, kept on the device (#5155).
+    func localDb3Indexes(_ documentId: String) async throws -> [Db3Index] {
+        try await boundLocalOnlyDb3(documentId).localIndexes
+    }
+
+    /// Register an index on a local-only db3 on the device, by the room's rules (#5155).
+    func registerLocalDb3Index(_ documentId: String, _ registration: Db3IndexRegistration) async throws -> Db3Index {
+        let binding = try await boundLocalOnlyDb3(documentId)
+        do {
+            return try binding.registerLocalIndex(registration)
+        } catch {
+            throw localIndexRefusal(documentId, error)
+        }
+    }
+
+    /// Drop an index of a local-only db3 on the device, by the room's rules (#5155).
+    func dropLocalDb3Index(_ documentId: String, name: String) async throws {
+        let binding = try await boundLocalOnlyDb3(documentId)
+        do {
+            try binding.dropLocalIndex(name)
+        } catch {
+            throw localIndexRefusal(documentId, error)
+        }
+    }
+
+    /// Test seam: hear every request this client's API transport sends and
+    /// every frame its socket sends, from now on (a pass-through observer).
+    /// Internal; never set in production code.
+    func observeTrafficForTest(
+        requests: (@Sendable (HTTPMethod, String, Data?) -> Void)?, frames: (@Sendable (String) -> Void)?
+    ) {
+        gatedTransportForTest.observeSentForTest(requests)
+        wsManager.snapshot.sentForTest = frames
+    }
+
+    /// A ULID, as the ids a request's path or body may name are written.
+    private static let ulidText = try! NSRegularExpression(pattern: "[0-9A-HJKMNP-TV-Z]{26}")
+
     /// A pending db3 create committed (#4921): adopt the server's answer,
     /// read the db3's state again and fire `Db3CreatedEvent`.
     func db3CreateCommitted(_ db3Id: String, info: Db3Info) async {
@@ -203,7 +441,8 @@ extension JsBaoClient {
         let marks = (try? binding.refreshMarks()) ?? binding.marks
         return Db3SyncMarks(
             cursor: marks.cursor, permission: marks.permission, lastCatchUpAt: marks.lastCatchUpAt,
-            replacing: marks.replacing, staged: marks.staged, createdLocally: binding.createdLocally
+            replacing: marks.replacing, staged: marks.staged, createdLocally: binding.createdLocally,
+            localOnly: marks.localOnly
         )
     }
 
@@ -359,6 +598,7 @@ extension JsBaoClient {
 
     /// Unbind every db3 bound here (a logout, another user).
     func unbindAllDb3s() async {
+        db3IndexRefresher?.rebindAll()
         for (documentId, _) in recordLogState.bindings { await unbindRecordLogDocument(documentId) }
     }
 
@@ -385,8 +625,11 @@ extension JsBaoClient {
         // Signed out, the store is nobody's to read.
         guard let userId = authController.getUserId(), !userId.isEmpty else { return nil }
         guard let host = await db3Host(), try RecordLogStore.hasTables(host: host) else { return nil }
+        // #5155 — another user's db3 that lives only on this device holds nothing of this user's.
+        guard try RecordLogStore.isVisible(host: host, documentId: documentId, userId: userId) else { return nil }
         let state = try RecordLogStore(host: host, documentId: documentId, clientId: recordLogState.clientId, logger: logger).storedState()
         let empty = state.cursor == 0 && state.rows == 0 && state.writers.isEmpty && state.lastCatchUpAt == nil && !state.replacing
+            && !state.localOnly
         return empty ? nil : state
     }
 
@@ -410,7 +653,7 @@ extension JsBaoClient {
     /// Every db3 the store holds a state for; `[]` with no record-log tables.
     func db3StoredIds() async throws -> [String] {
         guard let userId = authController.getUserId(), !userId.isEmpty, let host = await db3Host() else { return [] }
-        return try RecordLogStore.storedDocumentIds(host: host)
+        return try RecordLogStore.storedDocumentIds(host: host, userId: userId)
     }
 }
 

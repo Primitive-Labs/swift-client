@@ -32,13 +32,14 @@ func assertRequestedDocumentFormat(_ documentFormat: Int?) throws {
     throw documentFormatUnsupported()
 }
 
-/// Refuse a record-log document that is also local-only.
+/// Refuse a record-log document that is also local-only at the document
+/// doors.
 ///
-/// A record-log document's writes are sequenced by the server's room; a
-/// local-only document is never sent to the server, in this session or any
-/// later one, so it can never reach it. The combination is not a document
-/// that syncs late — it is a document that can never work, so it is refused
-/// where every other impossible `localOnly` combination is, with the same code.
+/// The document doors on a record-log document are deprecated: a db3 that
+/// lives only on this device is created with
+/// `client.db3.create(title:localOnly: true)` (#5155). The combination is
+/// refused where every other impossible `localOnly` combination is, with the
+/// same code, and the message names that door.
 ///
 /// One function, called from every door a create reaches: the top of
 /// `DocumentManager.createLocalDocument`, which is the only writer of a
@@ -55,7 +56,7 @@ func assertDocumentFormatAllowsLocalOnly(
     throw JsBaoError(
         code: .localOnlyUnsupportedOption,
         message: "documentFormat: 3 (a record-log document) cannot be combined with "
-            + "localOnly: true — its writes are sequenced by the server's room, "
-            + "which a local-only document never reaches"
+            + "localOnly: true at the document doors — create a db3 that lives "
+            + "only on this device with client.db3.create(title:localOnly: true)"
     )
 }

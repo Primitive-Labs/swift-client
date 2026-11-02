@@ -28,11 +28,23 @@ public final class Db3BlobContext: Sendable {
     public let db3Id: String
     private let transport: any Transport
     private let blobManager: BlobManager
+    /// Why no request may name the db3 (one that lives only on this device,
+    /// #5155), asked before each call that would send one; `nil` lets it go.
+    private let refusal: @Sendable () async -> JsBaoError?
 
-    init(db3Id: String, transport: any Transport, blobManager: BlobManager) {
+    init(
+        db3Id: String, transport: any Transport, blobManager: BlobManager,
+        refusal: @escaping @Sendable () async -> JsBaoError? = { nil }
+    ) {
         self.db3Id = db3Id
         self.transport = transport
         self.blobManager = blobManager
+        self.refusal = refusal
+    }
+
+    /// Throw the db3's refusal, when it has one.
+    private func refuseIfLocalOnly() async throws {
+        if let error = await refusal() { throw error }
     }
 
     private func path(_ rest: String = "") -> String {
@@ -48,7 +60,8 @@ public final class Db3BlobContext: Sendable {
     /// - Throws: `HttpError` for a refusal: 403 for a caller who may not
     ///   write the db3, 409 `NOT_A_DB3` for a document that is not a db3.
     public func upload(data: Data, options: BlobUploadSourceOptions = BlobUploadSourceOptions()) async throws -> BlobUploadResult {
-        try await blobManager.uploadFromSource(documentId: db3Id, source: data, options: options, family: .db3)
+        try await refuseIfLocalOnly()
+        return try await blobManager.uploadFromSource(documentId: db3Id, source: data, options: options, family: .db3)
     }
 
     /// `upload`, answering the narrowed `{ blobId, numBytes, bytesTransferred }` shape.
@@ -66,6 +79,7 @@ public final class Db3BlobContext: Sendable {
     ///   - limit: The page size, 1 to 100.
     ///   - cursor: The `nextCursor` of the page before.
     public func list(limit: Int? = nil, cursor: String? = nil) async throws -> DocumentBlobListResult {
+        try await refuseIfLocalOnly()
         var query = URLQuery()
         if let limit { query.append("limit", limit) }
         if let cursor, !cursor.isEmpty { query.append("cursor", cursor) }
@@ -76,7 +90,8 @@ public final class Db3BlobContext: Sendable {
     /// A blob's metadata.
     /// - Parameter blobId: The blob.
     public func get(blobId: String) async throws -> BlobInfo {
-        try await transport.request(method: .get, path: path("/\(URLEncoding.encodeComponent(blobId))"))
+        try await refuseIfLocalOnly()
+        return try await transport.request(method: .get, path: path("/\(URLEncoding.encodeComponent(blobId))"))
     }
 
     /// An authenticated download URL for a blob, built without a request.
@@ -93,6 +108,7 @@ public final class Db3BlobContext: Sendable {
     /// Delete a blob. A queued upload of it is cancelled and its local copies go.
     /// - Parameter blobId: The blob.
     public func delete(blobId: String) async throws -> BlobDeleteResult {
+        try await refuseIfLocalOnly()
         let result: BlobDeleteResult = try await transport.request(
             method: .delete, path: path("/\(URLEncoding.encodeComponent(blobId))")
         )
@@ -107,7 +123,8 @@ public final class Db3BlobContext: Sendable {
     ///   - disposition: The variant to read and keep (`inline` by default).
     /// - Throws: `JsBaoError` `.offline` with no local copy while the client is offline.
     public func read(blobId: String, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> Data {
-        try await blobManager.read(family: .db3, documentId: db3Id, blobId: blobId, force: force, disposition: disposition)
+        try await refuseIfLocalOnly()
+        return try await blobManager.read(family: .db3, documentId: db3Id, blobId: blobId, force: force, disposition: disposition)
     }
 
     /// A blob's bytes as UTF-8 text.
@@ -141,6 +158,7 @@ public final class Db3BlobContext: Sendable {
     ///   - blobIds: The blobs.
     ///   - concurrency: How many downloads run at once.
     public func prefetch(blobIds: [String], concurrency: Int = 2) async {
+        if await refusal() != nil { return }
         await blobManager.prefetch(family: .db3, documentId: db3Id, blobIds: blobIds, concurrency: concurrency)
     }
 

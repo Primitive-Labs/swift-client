@@ -21,8 +21,6 @@ final class RecordLogClientState: @unchecked Sendable {
     private var _resolving: Set<String> = []
     private var _unresolved: Set<String> = []
     private var _connection: RecordLogSocketConnection?
-    /// The order each db3's index-list reads are applied in.
-    let indexReads = RecordLogIndexReadOrder()
 
     /// The identity this client's writers are minted under: a ULID minted
     /// lazily once per `JsBaoClient` instance, never persisted. A relaunch is a
@@ -412,11 +410,19 @@ extension JsBaoClient {
         if sessionEnded?() == true { throw CancellationError() }
         try await checkRecordLogOwner(host: host)
         if sessionEnded?() == true { throw CancellationError() }
+        // #5155 — another user's db3 that lives only on this device is not theirs to bind.
+        if let userId = authController.getUserId(), !userId.isEmpty,
+           try !RecordLogStore.isVisible(host: host, documentId: documentId, userId: userId) {
+            throw db3NotResidentError([documentId])
+        }
         let binding = try RecordLogDocumentBinding(
             host: host, documentId: documentId, clientId: recordLogState.clientId, logger: logger
         )
         // A db3 created here is its own until its room's copy loads.
         binding.createdLocally = documentManager.isPendingCreate(documentId)
+        // #5155 — one that lives only on this device: its row says so (a
+        // create), or its store's mark does (every later bind).
+        if isLocalOnlyDb3Row(documentId) || binding.isLocalOnly { try binding.markLocalOnly() }
         // A db3 created here with a type declares nothing to its room (#5020).
         if let type = documentManager.getLocalMetadata(documentId)?.db3Type, !type.isEmpty {
             try binding.seedType(type)
@@ -463,10 +469,19 @@ extension JsBaoClient {
                 // An index the room created for the declarations is in its
                 // list from now: the store reads the list again.
                 declared: { [weak self] documentId in
-                    self?.refreshDb3Indexes(documentId)
+                    self?.db3IndexRefresher?.declared(documentId)
                 },
                 status: { [weak self] documentId, status in
-                    self?._db3Lifecycle.statusChanged(documentId, status)
+                    guard let self else { return }
+                    // Each open's index list and declaration acknowledgment
+                    // are awaited from its live: the refresher hears the status
+                    // before the lifecycle can settle `ready()` on it (#5101).
+                    self.db3IndexRefresher?.statusChanged(documentId, status.phase)
+                    // Live under a `reader` permission (a reopen after a
+                    // refusal lifts the mark): saves are refused here before
+                    // the lifecycle tells anyone it is live (#5101).
+                    if status.phase == .live { self.markRecordLogReadOnlyIfReader(documentId) }
+                    self._db3Lifecycle.statusChanged(documentId, status)
                 },
                 // A db3 this device has not heard about may be typed: its
                 // first open declares only once the room says it is not (#5020).
@@ -483,42 +498,76 @@ extension JsBaoClient {
         return binding
     }
 
+    /// Mark a bound db3's store read-only when the document's permission is
+    /// `reader` and nothing marks it yet: the mirror of the session's
+    /// `adoptWriteAccess`, run synchronously when the session reports `live`.
+    func markRecordLogReadOnlyIfReader(_ documentId: String) {
+        guard documentManager.isReadOnly(documentId), let binding = recordLogState.binding(documentId),
+              !binding.isClosed, binding.marks.permission == nil else { return }
+        do {
+            try binding.applyPermissionChange(.reader)
+        } catch {
+            logger.warn("[record-log]", documentId, "— marking the store read-only at live failed:", error.localizedDescription)
+        }
+    }
+
     // MARK: - Indexes from the room's list
 
     /// How long a read of a db3's index list may take before it is abandoned
     /// (the cached list stands): js-bao's `DB3_INDEX_LIST_TIMEOUT_MS`.
-    static let db3IndexListTimeout: TimeInterval = 10
+    static let db3IndexListTimeout: TimeInterval = RecordLogIndexRefresher.listTimeout
 
-    /// Read `documentId`'s index list (`GET db3/:id/indexes`) and hand it to
-    /// its store, which builds its view's lookup indexes from it. Never awaited
-    /// by an open: the open answers from the store and the list is applied when
-    /// it arrives. Bounded by ``db3IndexListTimeout``; a failed or timed-out
-    /// read logs one warning naming the document, and the cached list stands.
-    /// Reads may answer out of order; one answered after a later read's list
-    /// was applied is dropped.
-    func refreshDb3Indexes(_ documentId: String) {
-        db3IndexReadForTest?(documentId)
-        let read = recordLogState.indexReads.issue(documentId)
-        Task { [weak self] in
-            guard let self else { return }
-            do {
+    /// The index refresher's deps over this client (#5101): the list is read
+    /// with `GET db3/:id/indexes`, bounded by ``db3IndexListTimeout``, and
+    /// handed to the db3's bound store, which builds its view's lookup
+    /// indexes from it. Every closure holds the client weakly.
+    func makeDb3IndexRefresherDeps() -> RecordLogIndexRefresherDeps {
+        RecordLogIndexRefresherDeps(
+            read: { [weak self] documentId in
+                guard let self else { throw CancellationError() }
+                self.db3IndexReadForTest?(documentId)
+                if let hold = self.db3IndexReadHoldForTest { await hold(documentId) }
                 let answer = try await self.requestJSON(
                     method: .get, path: "/db3/\(URLEncoding.encodeComponent(documentId))/indexes",
                     options: RequestOptions(timeout: Self.db3IndexListTimeout)
                 )
-                let entries = (answer?["indexes"]?.arrayValue ?? []).compactMap(RecordLogIndexEntry.init(json:))
-                guard let binding = self.recordLogState.binding(documentId) else { return }
-                try self.recordLogState.indexReads.apply(documentId, read) {
-                    _ = try binding.withOperation { try binding.store.syncIndexes(entries) }
-                }
-            } catch {
-                let status = (error as? HttpError).map { " (\($0.status))" } ?? ""
-                self.logger.warn(
-                    "[db3] \(documentId): the index list could not be read\(status): \(error.localizedDescription);"
-                        + " the store keeps its cached indexes."
-                )
-            }
-        }
+                return (answer?["indexes"]?.arrayValue ?? []).compactMap(RecordLogIndexEntry.init(json:))
+            },
+            // The binding is looked up before the guard: one bound after a
+            // rebind fails the guard, so a list of an earlier binding is never
+            // written to it.
+            apply: { [weak self] documentId, entries, whileLatest in
+                guard let binding = self?.recordLogState.binding(documentId), !binding.isClosed else { return }
+                _ = try whileLatest { _ = try binding.withOperation { try binding.store.syncIndexes(entries) } }
+            },
+            bound: { [weak self] documentId in self?.recordLogBinding(documentId).map { !$0.isClosed } ?? false },
+            socketUp: { [weak self] in
+                guard let self else { return false }
+                return self.wsManager.isSocketOpen && self.networkingAllowed()
+            },
+            // A typed db3 is acknowledged before it is live; a read-only one's
+            // declaration is refused, never acknowledged.
+            declares: { [weak self] documentId in
+                guard let self, let binding = self.recordLogBinding(documentId) else { return true }
+                let marks = binding.marks
+                return marks.typed != .yes && marks.permission != RecordLogPermission.read
+                    && marks.permission != RecordLogPermission.refused && self.db3PermissionOf(documentId) != .reader
+            },
+            settled: { [weak self] documentId, _ in self?._db3Lifecycle?.indexesChanged(documentId) },
+            logger: logger
+        )
+    }
+
+    /// Read the index list of a db3 this client holds open (subscribed, or
+    /// held by a document door) again and apply it to its local store
+    /// (`client.db3.indexes.register`/`drop`, #5101): returns once it is
+    /// applied. A db3 not held open here reads nothing: a copy kept bound
+    /// reads the list at its next open. A failed read throws, and the list is
+    /// owed: read again as the socket allows.
+    func refreshDb3IndexesIfHeldOpen(_ db3Id: String) async throws {
+        guard recordLogBinding(db3Id).map({ !$0.isClosed }) == true, _db3Lifecycle.holdsOpen(db3Id) else { return }
+        try await db3IndexRefresher.refresh(db3Id)
+        logger.debug("[db3] \(db3Id): the index list was read again and applied to the local copy")
     }
 
     /// Every registered model's declaration, as `record.declare` carries it:
@@ -774,6 +823,8 @@ extension JsBaoClient {
     /// Unbind a db3: its session and binding close and its models' members
     /// disconnect, so nothing of it answers here. The store keeps everything.
     func unbindRecordLogDocument(_ documentId: String) async {
+        // Its index-list reads in flight are the old binding's (#5101).
+        db3IndexRefresher?.rebind(documentId)
         await closeRecordLogDocument(documentId)
         if !documentManager.isOpen(documentId) { disconnectRecordLogMembers(documentId) }
     }
@@ -782,11 +833,20 @@ extension JsBaoClient {
     /// account wipe). Unacknowledged writes are dropped and handed back as one
     /// `DocumentWriteRefusedEvent` with `.documentStorePurged`.
     func purgeRecordLogDocument(_ documentId: String) async {
-        await unbindRecordLogDocument(documentId)
         guard let provider = await offlineStore.getStorageProvider(),
               let host = provider as? any Format2SqlHost,
               (try? RecordLogStore.hasTables(host: host)) == true
-        else { return }
+        else {
+            await unbindRecordLogDocument(documentId)
+            return
+        }
+        // #5155 — another user's db3 that lives only on this device: its only copy stays.
+        if let userId = authController.getUserId(), !userId.isEmpty,
+           (try? RecordLogStore.isVisible(host: host, documentId: documentId, userId: userId)) == false {
+            logger.warn("[record-log]", documentId, "— kept: it lives only on this device, and is another user's")
+            return
+        }
+        await unbindRecordLogDocument(documentId)
         let store = RecordLogStore(host: host, documentId: documentId, clientId: recordLogState.clientId, logger: logger)
         do {
             let reply = try store.purge(force: true)
@@ -808,7 +868,10 @@ extension JsBaoClient {
         let documents: [String] = (try? host.withConnection { connection in
             try connection.query("SELECT doc_id FROM record_log_state").compactMap { $0["doc_id"].stringValue }
         }) ?? []
+        // Another user's db3 that lives only on this device is theirs to remove (#5155).
+        let userId = (try? RecordLogStore.owner(host: host)) ?? authController.getUserId()
         for documentId in Set(documents + recordLogState.bindings.map(\.0)) {
+            if let userId, (try? RecordLogStore.isVisible(host: host, documentId: documentId, userId: userId)) == false { continue }
             await purgeRecordLogDocument(documentId)
         }
     }
@@ -892,6 +955,7 @@ extension JsBaoClient {
     /// Close every open format-3 document and forget the client id.
     @discardableResult
     private func closeAllRecordLogDocuments() async -> Int {
+        db3IndexRefresher?.rebindAll()
         let open = recordLogState.resetForAnotherUser()
         for (documentId, binding, session) in open {
             await session.close()
@@ -905,7 +969,8 @@ extension JsBaoClient {
         let closed = await closeAllRecordLogDocuments()
         let dropped: Int
         do {
-            dropped = try RecordLogStore.purgeAll(host: host)
+            // A db3 that lives only on this device stays, the previous user's (#5155).
+            dropped = try RecordLogStore.purgeAll(host: host, previousOwner: previous)
             try RecordLogStore.setOwner(host: host, userId: userId)
         } catch {
             logger.warn("[record-log] resetting the store for another user failed:", error.localizedDescription)
@@ -915,7 +980,6 @@ extension JsBaoClient {
             "[record-log] another user signed in: the record-log store of the previous user was reset (",
             dropped, "unsent write(s) of theirs dropped,", closed, "open document(s) closed)"
         )
-        _ = previous
     }
 
     /// Point every shared model's member of `documentId` back at its Y.Doc-less

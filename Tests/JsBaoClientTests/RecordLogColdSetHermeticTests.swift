@@ -58,7 +58,7 @@ final class RecordLogColdSetHermeticTests: XCTestCase {
         let row = try XCTUnwrap(try store.read(model: "Note", id: "n1"))
         XCTAssertEqual(row["tags"], ["b", "a"])
         let view = try provider.withConnection { connection in
-            try connection.query("SELECT _data FROM record_log_view WHERE _id = ?", [.text("n1")])
+            try connection.query("SELECT json(_data) AS _data FROM record_log_view WHERE _id = ?", [.text("n1")])
         }.first?["_data"].stringValue
         XCTAssertNotNil(view)
         XCTAssertTrue(view?.contains("\"tags\":[\"b\",\"a\"]") ?? false, "the view row holds the array: \(view ?? "nil")")

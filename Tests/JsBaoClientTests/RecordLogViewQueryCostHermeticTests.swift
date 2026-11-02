@@ -55,7 +55,7 @@ final class RecordLogViewQueryCostHermeticTests: XCTestCase {
         }.filter { ($0["sql"].stringValue ?? "").contains("'$.n'") }.compactMap { $0["name"].stringValue }
     }
 
-    /// 100,000 rows of one 10-field `Note`, `n` holding 0 to 999, written as a catch-up leaves them.
+    /// 100,000 rows of one 10-field `Note`, `n` holding 0 to 999, written as a catch-up leaves them (JSONB without `id`).
     private func seed() async throws {
         do {
             let (provider, _) = try await open()
@@ -69,10 +69,10 @@ final class RecordLogViewQueryCostHermeticTests: XCTestCase {
                         "b": .number(Double(i % 7)), "c": .number(Double(i) / 3), "done": .bool(i % 2 == 0),
                         "kind": .string("k\(i % 5)"), "owner": .string("owner-\(i % 50)"), "n": .number(Double(i % 1000)),
                     ]
-                    let data = RecordLogJSON.text(row)
+                    let data = RecordLogJSON.stored(row.objectValue ?? [:])
                     for table in ["record_log_rows", "record_log_view"] {
                         try connection.execute(
-                            "INSERT INTO \(table) (doc_id, _type, _id, _data) VALUES (?, ?, ?, ?)",
+                            "INSERT INTO \(table) (doc_id, _type, _id, _data) VALUES (?, ?, ?, jsonb(?))",
                             [.text("cost-4624"), .text("Note"), .text(id), .text(data)]
                         )
                     }

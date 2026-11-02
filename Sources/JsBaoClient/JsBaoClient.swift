@@ -122,6 +122,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// not allowed throws `.offline` instead of going out. Authentication and
     /// the blob manager keep the ungated `httpClient`, as in the JS client.
     private let gatedTransport: NetworkGatedTransport
+    /// The API transport, for a test's pass-through observer (``observeTrafficForTest(requests:frames:)``).
+    var gatedTransportForTest: NetworkGatedTransport { gatedTransport }
     /// `internal` for the same reason as `logger`: the open path raises the
     /// socket's receive limit before the handshake, and the record-log
     /// session sends its frames on it.
@@ -444,6 +446,11 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Test seam told each time the client reads a db3's index list, with its
     /// id. Internal; never set in production code.
     var db3IndexReadForTest: (@Sendable (String) -> Void)?
+    /// Test seam awaited before each index-list read leaves, with the db3's
+    /// id, so a test can hold a read in flight. Internal; never set in production code.
+    var db3IndexReadHoldForTest: (@Sendable (String) async -> Void)?
+    /// Each db3's index-list reads (#5101); `ready()` waits for the open's.
+    var db3IndexRefresher: RecordLogIndexRefresher!
     /// The document doors this client has logged a db3 deprecation line for.
     let db3DoorWarnings = Db3DoorWarnings()
 
@@ -496,6 +503,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Continuations parked in `awaitStorageReady()` before the signal fired,
     /// keyed so a cancelled waiter can remove only its own.
     private var storageReadyWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    /// Guards `storedLocalOnly`.
+    let storedLocalOnlyLock = NSLock()
+    /// The local-only db3s the signed-in user's store held when a request
+    /// first asked this session, read once per user (#5155).
+    var storedLocalOnly: (userId: String, ids: Task<Set<String>?, Never>)?
 
     // MARK: Analytics session lifecycle (#963)
 
@@ -1671,8 +1684,20 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Evict a single doc's local data from this device. Background;
-    /// the call returns once the eviction task is scheduled.
+    /// the call returns once the eviction task is scheduled. A db3 that lives
+    /// only on this device is kept (its only copy is here): remove it with
+    /// `client.db3.delete`.
     public func evictLocalDocument(_ documentId: String) async {
+        if await isLocalOnlyDb3(documentId) || isOtherUsersLocalOnlyDb3Row(documentId) {
+            logger.warn("[evict]", documentId, "— kept: it lives only on this device; remove it with client.db3.delete")
+            return
+        }
+        await forgetLocalDocument(documentId)
+    }
+
+    /// `evictLocalDocument` with no local-only guard: the lifecycle's own
+    /// removal of a db3 whose store it has already purged (#5155).
+    func forgetLocalDocument(_ documentId: String) async {
         // A record-log document's purge is not here but inside
         // `evictLocalData`, which is the one path every eviction passes
         // through: an evicting `closeDocument`, a retention sweep and a
@@ -1691,13 +1716,24 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `lastOpenedAt` and `localBytes` fields that enforcement reads.
     private var retentionPolicyStorage: RetentionPolicy = .init()
 
+    /// Every retention run the `retentionPolicy` setter started, the last
+    /// one waiting for the ones before it: settles once all have.
+    var retentionEnforcement: Task<Void, Never>? { lock.withLock { retentionEnforcementStorage } }
+    private var retentionEnforcementStorage: Task<Void, Never>?
+
     /// Apply a retention policy that bounds the local document store.
     ///
-    /// - `ttlMs`: docs whose `lastOpenedAt` is older than this are
-    ///   evicted on the next enforcement pass.
-    /// - `maxDocs`: only the most-recently-opened N docs are kept.
+    /// - `ttl`: docs whose `lastOpenedAt` is older than this are
+    ///   evicted on the next enforcement pass; a db3 copy stored here
+    ///   whose last use is older.
+    /// - `maxDocs`: only the most-recently-opened N docs are kept. For
+    ///   db3s, the most copies stored on this device (`db3.stored()`), the
+    ///   least recently used evicted first: a copy's last use is the later
+    ///   of its last open and the end of its last subscription. A
+    ///   subscribed copy, one with unsent writes and a pending create are
+    ///   never evicted and still count.
     /// - `maxBytes`: oldest docs are evicted until total `localBytes`
-    ///   fits the budget.
+    ///   fits the budget. Never removes a db3 copy.
     /// - `default`/`preserveOnSignOut`: stored for parity with js-bao's
     ///   shape; not yet enforced (matches JS — those fields are set
     ///   but not consumed by `enforceRetentionPolicy` either).
@@ -1707,15 +1743,29 @@ public final class JsBaoClient: @unchecked Sendable {
     public var retentionPolicy: RetentionPolicy {
         get { lock.withLock { retentionPolicyStorage } }
         set {
+            // Each call's format-1 pass applies its own policy, as before;
+            // its db3 sweep follows it, after every earlier call's (#5085).
             lock.withLock {
                 retentionPolicyStorage = newValue
-            }
-            Task { [newValue, weak self] in
-                await self?.documentManager.enforceRetentionPolicy(
-                    ttlMs: newValue.ttl.map(\.wholeMilliseconds),
-                    maxDocs: newValue.maxDocs,
-                    maxBytes: newValue.maxBytes
-                )
+                let previous = retentionEnforcementStorage
+                retentionEnforcementStorage = Task { [newValue, weak self] in
+                    guard let self else { return }
+                    // The db3 rows its `ttl` pass would hand the lifecycle go
+                    // first, so its `maxDocs` count is the one it took before.
+                    if let ttlMs = newValue.ttl.map(\.wholeMilliseconds) {
+                        await self._db3Lifecycle.retentionExpire(self.db3RowsPastTtl(ttlMs))
+                    }
+                    await self.documentManager.enforceRetentionPolicy(
+                        ttlMs: newValue.ttl.map(\.wholeMilliseconds),
+                        maxDocs: newValue.maxDocs,
+                        maxBytes: newValue.maxBytes
+                    )
+                    await previous?.value
+                    await self._db3Lifecycle.enforceRetention(
+                        ttlMs: newValue.ttl.map { Int64($0.wholeMilliseconds) },
+                        maxDocs: newValue.maxDocs
+                    )
+                }
             }
         }
     }
@@ -2795,7 +2845,12 @@ public final class JsBaoClient: @unchecked Sendable {
         authController.setNetworkMode(mode)
         // The socket may have stayed open while networking was not allowed:
         // record-log entries queued meanwhile leave once it is allowed again.
-        if mode != .offline { recordLogKick() }
+        if mode != .offline {
+            recordLogKick()
+            // No socket-open event follows on a socket that stayed open: an
+            // index list owed by a read that failed meanwhile is read again (#5101).
+            db3IndexRefresher?.socketOpened()
+        }
         _db3Lifecycle.connectionChanged()
         // Session uploads wait for networking: arm the queue for them again.
         let blobManager = self.blobManager
@@ -3260,13 +3315,24 @@ public final class JsBaoClient: @unchecked Sendable {
         // A record-log document is bound before its models connect, so each
         // member reads the document's store. Its Y.Doc stays empty, so whether
         // it holds data locally is the store's answer.
-        try await bindRecordLogDocumentIfResolved(documentId)
+        // The store's view indexes come from the room's list, read without
+        // holding the open, by an open that syncs the db3 (a subscription's or
+        // a door's); a db3 bound at its create or at start-up reads none. The
+        // list is on its way from the bind, and `ready()` waits for it (#5101).
+        let readsIndexes = options.enableNetworkSync && !options.deferNetworkSync
+            && (documentManager.documentFormat(documentId) ?? recordLogState.resolvedFormat(documentId)) == RecordLogTransport.documentFormat
+        if readsIndexes { db3IndexRefresher.opening(documentId) }
+        do {
+            try await bindRecordLogDocumentIfResolved(documentId)
+        } catch {
+            if readsIndexes { db3IndexRefresher.openFailed(documentId) }
+            throw error
+        }
         if isRecordLogDocument(documentId) {
             effectiveHasLocal = effectiveHasLocal || recordLogHasLocalData(documentId)
-            // The store's view indexes come from the room's list, read without
-            // holding the open, by an open that syncs the db3 (a subscription's
-            // or a door's); a db3 bound at its create or at start-up reads none.
-            if options.enableNetworkSync && !options.deferNetworkSync { refreshDb3Indexes(documentId) }
+            if readsIndexes { db3IndexRefresher.opened(documentId) }
+        } else if readsIndexes {
+            db3IndexRefresher.openFailed(documentId)
         }
 
         // Mirror the doc into every registered cross-document store so
@@ -3815,7 +3881,20 @@ public final class JsBaoClient: @unchecked Sendable {
         // document opened with `retainLocal: false`, which evicts at close too.
         var effectiveOptions = options
         let retainLocalEvicts = documentManager.retainLocalSetting(documentId) == false
-        if options.evictLocal || retainLocalEvicts {
+        // #5155 — a db3 that lives only on this device is its only copy: no
+        // close removes it (its delete does). An evicting close, or one its
+        // open's retention would make evicting, keeps the copy. Asked only of
+        // a close that would remove local data: any other close touches no store.
+        var localOnly = false
+        if options.evictLocal || retainLocalEvicts { localOnly = await isLocalOnlyDb3(documentId) }
+        if localOnly {
+            logger.warn(
+                "[closeDocument]", documentId,
+                "— local data kept: it lives only on this device; remove it with client.db3.delete"
+            )
+            effectiveOptions.evictLocal = false
+            documentManager.preserveLocalOnClose(documentId)
+        } else if options.evictLocal || retainLocalEvicts {
             let confirmed: Bool
             if db3, let binding = recordLogBinding(documentId) {
                 // A db3's writes are confirmed when none is left unjudged.
@@ -3848,7 +3927,8 @@ public final class JsBaoClient: @unchecked Sendable {
 
         // Tell the server we are done with this document before the local state
         // goes away. Best-effort: a closed socket simply has nothing to tell.
-        if isConnected {
+        // Nothing names a db3 that lives only on this device (#5155).
+        if isConnected, !localOnly, !isLocalOnlyDb3Known(documentId) {
             do {
                 let payload = try JSONCoding.encodeData(
                     UnsubscribeFrame(documentId: documentId)
@@ -4187,6 +4267,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// within `DocumentsAPI.pendingCreateWaitSeconds`. A transient failure does
     /// not end it: the backoff tries again.
     func awaitPendingDb3Create(_ db3Id: String) async throws {
+        // #5155 — a db3 that lives only on this device has no server record to ask about.
+        try await assertNotLocalOnlyDb3(
+            db3Id, call: "client.db3",
+            instead: "read and write it with the model APIs, see it with client.db3.state or client.db3.stored, "
+                + "and remove it with client.db3.delete"
+        )
         let documentManager = self.documentManager
         guard documentManager.isPendingCreate(db3Id) else { return }
         try await eventEmitter.waitForPendingDb3Create(
@@ -4291,6 +4377,11 @@ public final class JsBaoClient: @unchecked Sendable {
             logger.debug(
                 "[#3764] not handshaking a refused document on this connection:", documentId
             )
+            return
+        }
+        // #5155 — a db3 that lives only on this device has no room to open.
+        if isLocalOnlyDb3Known(documentId) {
+            logger.debug("[db3] not syncing", documentId, "— it lives only on this device")
             return
         }
         // A db3 of the previous user, being released (or not yet released
@@ -4992,9 +5083,19 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - Offline Data
 
-    /// Evict all local data
+    /// Evict all local data. A db3 that lives only on this device is kept,
+    /// its metadata row and its copy: only `client.db3.delete` and
+    /// `logout(wipeLocal: true)` remove it.
     public func evictAllLocal(force: Bool = false) async {
+        // #5155 — the sweep evicts what can be re-synced, never what exists only here.
+        let kept = documentManager.getMetadataIndex().values.filter {
+            $0.localOnly == true && $0.documentFormat == RecordLogTransport.documentFormat
+        }
         await documentManager.evictAllLocalData()
+        for row in kept {
+            logger.log("[evict]", row.documentId, "— kept by the sweep: it lives only on this device")
+            await documentManager.restoreLocalOnlyRow(row)
+        }
         await kvCache.clearAll()
         await blobManager.clearCache()
         // #3764 — the same rule one level up: a wipe takes the rows every
@@ -5921,6 +6022,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // Every db3 subscription ends (its `ready()` throws `DB3_DISPOSED`) and
         // each db3 is closed on the socket while the socket is still up.
         await _db3Lifecycle.destroy()
+        db3IndexRefresher?.destroy()
 
         // Idempotent; the monitor's own deinit also cancels as a safety net.
         connectivityMonitor?.cancel()
@@ -6034,9 +6136,11 @@ public final class JsBaoClient: @unchecked Sendable {
         documentManager.purgeLocalStoreData = { [weak self] documentId in
             await self?.purgeRecordLogDocument(documentId)
         }
-        // The retention sweep removes a db3 through its lifecycle, unforced.
+        // The format-1 retention pass asks a db3 row the lifecycle's keep
+        // verdict and removes nothing: the db3 sweep that follows removes
+        // stored copies only (#5085).
         documentManager.evictDb3ForRetention = { [weak self] documentId in
-            await self?._db3Lifecycle.retentionEvict(documentId) ?? false
+            await self?._db3Lifecycle.retentionWouldRemove(documentId) ?? false
         }
         // A `pendingCreate` doc doesn't exist server-side yet, so the
         // syncStep1 sent at open time never gets a `syncComplete` back and its
@@ -6049,7 +6153,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // out by `DocumentManager.applyPostCommitPolicy`.
         // A permission heard for a bound db3 reaches its store before the
         // event: `reader` refuses saves here, a write-capable one takes them
-        // again, with no reopen (#5020).
+        // again, with no reopen (#5020); then its state is read again (#5070).
         documentManager.permissionApplied = { [weak self] documentId, permission in
             guard let self, let binding = self.recordLogBinding(documentId), !binding.isClosed else { return }
             do {
@@ -6057,6 +6161,20 @@ public final class JsBaoClient: @unchecked Sendable {
             } catch {
                 self.logger.warn("[record-log]", documentId, "— applying the permission", permission.rawValue, "failed:", error.localizedDescription)
             }
+            // Its state is read again, so `db3:state` carries the level (#5070).
+            self._db3Lifecycle?.permissionChanged(documentId)
+        }
+        // A level the server sent just now is a grant the lifecycle hears: a
+        // refused db3 asks its room again (#5101). The store takes it first,
+        // as above; a level it already took changes nothing.
+        documentManager.permissionHeard = { [weak self] documentId, permission in
+            guard let self, let binding = self.recordLogBinding(documentId), !binding.isClosed else { return }
+            do {
+                try binding.applyPermissionChange(permission)
+            } catch {
+                self.logger.warn("[record-log]", documentId, "— applying the permission", permission.rawValue, "failed:", error.localizedDescription)
+            }
+            self._db3Lifecycle?.permissionChanged(documentId, heard: Db3Permission(rawValue: permission.rawValue))
         }
         documentManager.onPendingCreateCommitted = { [weak self] documentId in
             Task { [weak self] in
@@ -6072,6 +6190,14 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         documentManager.commitRetryBackoff = options.commitRetryBackoff
         documentManager.isOnlineProvider = { [weak self] in self?.networkingAllowed() ?? false }
+        // #5155 — a db3 that lives only on this device is never named to the server.
+        gatedTransport.setRequestCheck { [weak self] method, path, body in
+            guard let self, let db3Id = await self.localOnlyDb3Requested(path: path, body: body) else { return nil }
+            return Self.db3LocalOnlyError(
+                db3Id, call: "\(method.rawValue) \(path.split(separator: "?").first.map(String.init) ?? path)",
+                instead: "nothing naming it is sent"
+            )
+        }
         gatedTransport.setOfflineCheck { [weak self] method, path in
             self?.offlineRequestError(method: method, path: path)
         }
@@ -6094,6 +6220,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// storage read through non-optional public properties (#2367).
     private func setupSubApis() {
         self._codegen = CodegenAPI(client: self)
+        self.db3IndexRefresher = RecordLogIndexRefresher(deps: makeDb3IndexRefresherDeps())
         self._db3Lifecycle = Db3Lifecycle(deps: makeDb3LifecycleDeps())
         self._db3 = Db3API(lifecycle: _db3Lifecycle, transport: gatedTransport, client: self, blobManager: blobManager)
         self._agents = AgentsAPI(transport: gatedTransport, client: self)
@@ -8193,6 +8320,8 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // document sweep, as in JS, so a listener is back on its channels as
         // early as the socket allows; the sends are dispatched, not awaited.
         resubscribeChannelsOnConnect()
+        // An index list owed by a failed read is read again (#5101).
+        db3IndexRefresher?.socketOpened()
         // Re-subscribe to all open documents — except the ones JS's connect
         // sweep skips too (`JsBaoClient.ts` `[CONNECT] Evaluating sync`):
         //

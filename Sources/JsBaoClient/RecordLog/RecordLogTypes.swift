@@ -678,6 +678,33 @@ enum RecordLogJSON {
         text.flatMap(parse)?.objectValue ?? [:]
     }
 
+    /// A row as the store keeps it in `_data`, bound into `jsonb(?)`: its
+    /// JSON text without `id`, which the record's key (`_id`) holds. An `id`
+    /// holding U+0000 is kept: a key is bound as a C string, so `_id` holds
+    /// it cut short at that character and could not restore it whole.
+    static func stored(_ row: RecordLogRow) -> String {
+        var row = row
+        if row["id"]?.stringValue?.unicodeScalars.contains("\u{0}") != true { row.removeValue(forKey: "id") }
+        return text(.object(row))
+    }
+
+    /// A row read back from `_data` (`json(_data)`) with `id` restored from
+    /// the record's key; a row that holds `id` already (one an older build
+    /// wrote as text) keeps its own.
+    static func row(_ text: String?, id: String?) -> RecordLogRow {
+        var row = row(text)
+        if let id, row["id"] == nil { row["id"] = .string(id) }
+        return row
+    }
+
+    /// The bytes `id` adds to a row's JSON text stored as `stored`, so the
+    /// row counts as its text with `id`: `"id":<id>` and, unless the stored
+    /// row is empty, a comma; nothing when the stored row holds `id` already.
+    static func restoredIdBytes(stored: String, id: String, holdsId: Bool) -> Int {
+        guard !holdsId else { return 0 }
+        return bytes(.string(id)) + 5 + (stored == "{}" ? 0 : 1)
+    }
+
     /// Bytes of the value's JSON text.
     static func bytes(_ value: JSONValue) -> Int {
         text(value).utf8.count

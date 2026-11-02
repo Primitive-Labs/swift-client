@@ -489,7 +489,9 @@ func recordLogReservedFieldProblem(_ field: String) -> String? {
 /// Bytes of a value's JSON.
 func recordLogJSONBytes(_ value: JSONValue) -> Int { RecordLogJSON.bytes(value) }
 
-/// The refusal a client makes before sending, reported as the room's are.
+/// The refusal a client makes before sending, reported as the room's are:
+/// with the record holding the key and the record whose guard failed, when
+/// the refusal names them (a local-only db3's store does, #5155).
 func recordLogLocalRefusal(
     _ error: JsBaoError, documentId: String, mutations: [RecordLogMutation]
 ) -> DocumentWriteRefusedEvent {
@@ -498,7 +500,8 @@ func recordLogLocalRefusal(
     ).refusedWrites
     return DocumentWriteRefusedEvent(
         documentId: documentId, model: mutations[0].model, recordId: mutations[0].id, error: error,
-        writes: writes, conflictingRecord: nil
+        writes: writes, conflictingRecord: RecordLogRecordKey(json: error.details?["conflicting"]),
+        current: RecordLogCurrentRecord(json: error.details?["current"])
     )
 }
 

@@ -219,9 +219,11 @@ public struct QueryTranslator {
                 return nil
             }
             if let viewTable {
+                let like = "LIKE ? ESCAPE '\\' COLLATE NOCASE"
+                // `id` and `type` are the record's key and model columns, never in its JSON.
+                if viewSystemFields.contains(field) { return ("\(col) \(like)", [pattern]) }
                 // The record's own JSON: a stored array matches on a member,
                 // any other stored value on itself.
-                let like = "LIKE ? ESCAPE '\\' COLLATE NOCASE"
                 let path = try viewDataPath(field, table: viewTable)
                 return (
                     "((json_type(\(path)) <> 'array' AND \(col) \(like)) OR \(viewSetMember(path, "_set.value \(like)")))",

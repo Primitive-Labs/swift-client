@@ -1010,6 +1010,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         guard let currentTask = snapshot.sendableTask else {
             throw WebSocketError.notConnected
         }
+        snapshot.sentForTest?(text)
         try await currentTask.send(.string(text))
     }
 
@@ -1017,6 +1018,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         guard let currentTask = snapshot.sendableTask else {
             throw WebSocketError.notConnected
         }
+        snapshot.sentForTest?(String(decoding: data, as: UTF8.self))
         try await currentTask.send(.data(data))
     }
 

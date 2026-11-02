@@ -73,11 +73,14 @@ public struct Db3Info: Decodable, Sendable, Equatable {
     public let grantedBy: String?
     /// The listing a `listMine(_:)` row came from; `nil` on any other answer.
     public let via: Db3Via?
+    /// `true` for a db3 that lives only on this device (`create(title:localOnly: true)`).
+    public let localOnly: Bool
 
     public init(
         id: String, title: String, createdBy: String, createdAt: String, modifiedAt: String, custodian: String?,
         sync: Bool, type: String?, tags: [String], metadata: JSONValue?, permission: DocumentPermission?,
-        accessSource: DocumentAccessSource?, grantedAt: String?, grantedBy: String? = nil, via: Db3Via? = nil
+        accessSource: DocumentAccessSource?, grantedAt: String?, grantedBy: String? = nil, via: Db3Via? = nil,
+        localOnly: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -94,6 +97,7 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         self.grantedAt = grantedAt
         self.grantedBy = grantedBy
         self.via = via
+        self.localOnly = localOnly
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -118,6 +122,7 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         grantedAt = try c.decodeIfPresent(String.self, forKey: .grantedAt)
         grantedBy = try c.decodeIfPresent(String.self, forKey: .grantedBy)
         via = nil
+        localOnly = false
     }
 
     /// This row as the `via` listing answered it.

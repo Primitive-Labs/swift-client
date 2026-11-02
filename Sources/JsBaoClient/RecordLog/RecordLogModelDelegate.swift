@@ -305,7 +305,10 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     /// `YDocument` is never written.
     func publishDeclaration(doc: YDocument, schema: PrimitiveSchema) {}
 
-    func constraintInForce(_ name: String) -> Bool { binding.constraintInForce(name) }
+    /// Whether the local pre-check holds a save to a unique constraint. A db3
+    /// that lives only on this device is judged by its store, which refuses
+    /// with the room's code and details (#5155): no pre-check runs.
+    func constraintInForce(_ name: String) -> Bool { !binding.isLocalOnly && binding.constraintInForce(name) }
 
     var viewStore: RecordLogStore { binding.store }
 

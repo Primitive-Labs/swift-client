@@ -393,8 +393,8 @@ final class RecordLogSegmentKeepHermeticTests: XCTestCase {
     private func confirmedRows(_ h: H.Fixture) throws -> [String: [String: JSONValue]] {
         try h.provider.withConnection { connection in
             var out: [String: [String: JSONValue]] = [:]
-            for row in try connection.query("SELECT _id, _data FROM record_log_rows ORDER BY _id", []) {
-                if let id = row["_id"].stringValue { out[id] = RecordLogJSON.row(row["_data"].stringValue) }
+            for row in try connection.query("SELECT _id, json(_data) AS _data FROM record_log_rows ORDER BY _id", []) {
+                if let id = row["_id"].stringValue { out[id] = RecordLogJSON.row(row["_data"].stringValue, id: id) }
             }
             return out
         }

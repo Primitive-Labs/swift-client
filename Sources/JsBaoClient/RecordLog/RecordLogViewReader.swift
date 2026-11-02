@@ -146,7 +146,7 @@ struct RecordLogViewReader {
             "\(columns[field] ?? "NULL") \((backward ? -direction : direction) == 1 ? "ASC" : "DESC")"
         }
         // One row past the page says whether a further one exists.
-        let statement = "SELECT _data, _id, _type, doc_id FROM record_log_view WHERE "
+        let statement = "SELECT json(_data) AS _data, _id, _type, doc_id FROM record_log_view WHERE "
             + conditions.joined(separator: " AND ") + " ORDER BY " + order.joined(separator: ", ")
             + " LIMIT \(limit + 1)"
 
@@ -161,14 +161,19 @@ struct RecordLogViewReader {
                     hasMore = true
                     return false
                 }
-                let stored = raw["_data"].stringValue
-                let parsed = RecordLogJSON.row(stored)
+                let stored = raw["_data"].stringValue ?? "{}"
+                let id = raw["_id"].stringValue ?? ""
+                var parsed = RecordLogJSON.row(stored)
+                let holdsId = parsed["id"] != nil
+                if !holdsId { parsed["id"] = .string(id) }
                 let (record, reshaped) = Self.shaped(parsed, shape)
                 // With includes, a parent is read whole: a leg may need a field
                 // the projection leaves out. It applies once the legs resolved.
                 let answered = includes == nil ? keep(record) : record
+                // A row counts as it is answered: its stored text with its `id` restored.
                 let bytes = !reshaped && options.projection == nil
-                    ? stored?.utf8.count ?? 2 : RecordLogJSON.bytes(.object(answered))
+                    ? stored.utf8.count + RecordLogJSON.restoredIdBytes(stored: stored, id: id, holdsId: holdsId)
+                    : RecordLogJSON.bytes(.object(answered))
                 if !rows.isEmpty && used + bytes > Db3Limits.responseMaxBytes {
                     hasMore = true
                     return false
@@ -465,13 +470,14 @@ struct RecordLogViewReader {
         return out
     }
 
-    /// Run `statement` within `document`, a row at a time, each as a record.
+    /// Run `statement` within `document`, a row at a time, each as a record
+    /// (its `_data` read as `json(_data)`, its `id` restored from `_id`).
     fileprivate func readLeg(
         _ statement: String, _ bindings: [Format2SqlValue], _ row: (RecordLogRow) throws -> Void
     ) throws {
         try store.readView { sql in
             try sql.connection.eachRow(statement, bindings) { raw in
-                try row(RecordLogJSON.row(raw["_data"].stringValue))
+                try row(RecordLogJSON.row(raw["_data"].stringValue, id: raw["_id"].stringValue))
                 return true
             }
         }
@@ -763,7 +769,7 @@ private final class RecordLogIncludeResolution {
             var filter: DocumentFilter = [field: ["$in": .array(chunk)]]
             for (name, value) in extra ?? [:] { filter[name] = value }
             let (clause, params) = try QueryTranslator.translateView(filter)
-            var statement = "SELECT _data FROM record_log_view WHERE _type = ? AND doc_id = ? AND (\(clause)) ORDER BY \(order)"
+            var statement = "SELECT json(_data) AS _data, _id FROM record_log_view WHERE _type = ? AND doc_id = ? AND (\(clause)) ORDER BY \(order)"
             if let rowLimit { statement += " LIMIT \(rowLimit())" }
             try reader.readLeg(statement, [.text(model), .text(document)] + params.map(Format2SqlValue.init(bindable:)), onRow)
         }
@@ -790,7 +796,7 @@ private final class RecordLogIncludeResolution {
             let chunk = Array(values[start..<min(start + chunkSize, values.count)])
             start += chunkSize
             let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
-            let statement = "SELECT _data FROM (SELECT _data, ROW_NUMBER() OVER (PARTITION BY \(foreignKey) ORDER BY \(order)) AS _rn"
+            let statement = "SELECT json(_data) AS _data, _id FROM (SELECT _data, _id, ROW_NUMBER() OVER (PARTITION BY \(foreignKey) ORDER BY \(order)) AS _rn"
                 + " FROM record_log_view WHERE _type = ? AND doc_id = ? AND \(foreignKey) IN (\(placeholders))"
                 + " AND (\(filterClause))) WHERE _rn <= ? LIMIT ?"
             let bindings: [Format2SqlValue] = [.text(spec.target.modelName), .text(document)]

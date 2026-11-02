@@ -37,14 +37,19 @@ public struct Db3StoredEntry: Sendable, Equatable {
     public let lastSyncAt: Date?
     /// Whether the copy is readable (see ``Db3State/resident``).
     public let resident: Bool
+    /// Whether it lives only on this device (see ``Db3State/localOnly``).
+    public let localOnly: Bool
 
-    public init(id: String, rows: Int, cursor: Int, pendingWrites: Int, lastSyncAt: Date?, resident: Bool) {
+    public init(
+        id: String, rows: Int, cursor: Int, pendingWrites: Int, lastSyncAt: Date?, resident: Bool, localOnly: Bool = false
+    ) {
         self.id = id
         self.rows = rows
         self.cursor = cursor
         self.pendingWrites = pendingWrites
         self.lastSyncAt = lastSyncAt
         self.resident = resident
+        self.localOnly = localOnly
     }
 }
 
@@ -257,7 +262,19 @@ public final class Db3API: @unchecked Sendable {
         let awaitCreate: @Sendable (String) async throws -> Void = { [weak client] db3Id in
             try await client?.awaitPendingDb3Create(db3Id)
         }
-        self.indexes = Db3IndexesAPI(transport: transport, awaitCreate: awaitCreate)
+        self.indexes = Db3IndexesAPI(
+            transport: transport, awaitCreate: awaitCreate,
+            applyLocally: { [weak client] db3Id in try await client?.refreshDb3IndexesIfHeldOpen(db3Id) },
+            local: Db3LocalIndexDoor(
+                isLocalOnly: { [weak client] db3Id in await client?.isLocalOnlyDb3(db3Id) ?? false },
+                list: { [weak client] db3Id in try await client?.localDb3Indexes(db3Id) ?? [] },
+                register: { [weak client] db3Id, registration in
+                    guard let client else { throw JsBaoError(code: .db3NotResident, message: "the db3 '\(db3Id)' is not on this device") }
+                    return try await client.registerLocalDb3Index(db3Id, registration)
+                },
+                drop: { [weak client] db3Id, name in try await client?.dropLocalDb3Index(db3Id, name: name) }
+            )
+        )
         self.ingests = Db3IngestsAPI(transport: transport, awaitCreate: awaitCreate)
     }
 
@@ -368,10 +385,18 @@ public final class Db3API: @unchecked Sendable {
     /// `HttpError` and fires `Db3CreateFailedEvent`. A sync-off db3 is never
     /// stored here.
     ///
+    /// With `localOnly: true` (``create(title:type:sync:custodian:tags:metadata:localOnly:)``)
+    /// the db3 lives only on this device: it is created here under an id
+    /// minted here and answered at once with `localOnly` true and `sync`
+    /// false, and nothing of it is ever sent to the server, in this session or
+    /// a later one. Its writes are judged and confirmed on the device with the
+    /// codes the server would use. `Db3CreatedEvent` fires once.
+    ///
     /// ```swift
     /// let orders = try await client.db3.create(title: "Orders", type: "orders")
     /// let answer = try await client.documents.commitOfflineCreate(documentId: orders.id)
     /// let archive = try await client.db3.create(title: "Archive", sync: false) // an app owner or admin only
+    /// let scratch = try await client.db3.create(title: "Scratch", localOnly: true) // never leaves the device
     /// ```
     ///
     /// - Parameters:
@@ -444,6 +469,66 @@ public final class Db3API: @unchecked Sendable {
         }
     }
 
+    /// ``create(title:type:sync:custodian:tags:metadata:)`` with `localOnly`:
+    /// `true` keeps the db3 on this device only, `false` creates it as that
+    /// call does.
+    ///
+    /// ```swift
+    /// let scratch = try await client.db3.create(title: "Scratch", localOnly: true)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - title: The db3's title.
+    ///   - type: A db3 type of this app; refused with `localOnly`.
+    ///   - sync: `false` for a server-only db3; refused with `localOnly`.
+    ///   - custodian: Who holds it; refused with `localOnly`.
+    ///   - tags: Its tags.
+    ///   - metadata: An opaque metadata blob (at most 4 KB).
+    ///   - localOnly: Keep the db3 on this device only.
+    /// - Throws: `.localOnlyUnsupportedOption` for `localOnly` with `type`,
+    ///   `sync: false` or `custodian`, before anything is created;
+    ///   `.invalidArgument` with no signed-in user; `.format2StorageUnavailable`
+    ///   on a client whose storage cannot keep a db3 (an in-memory provider).
+    public func create(
+        title: String,
+        type: String? = nil,
+        sync: Bool? = nil,
+        custodian: String? = nil,
+        tags: [String]? = nil,
+        metadata: JSONValue? = nil,
+        localOnly: Bool
+    ) async throws -> Db3Info {
+        guard localOnly else {
+            return try await create(title: title, type: type, sync: sync, custodian: custodian, tags: tags, metadata: metadata)
+        }
+        return try await createLocalOnly(title: title, type: type, sync: sync, custodian: custodian, tags: tags, metadata: metadata)
+    }
+
+    /// A db3 kept on this device only (#5155): created under an id minted
+    /// here, answered at once, and never sent to the server. What only the
+    /// server can hold (a type, sync off, a custodian) is refused before
+    /// anything is created.
+    private func createLocalOnly(
+        title: String, type: String?, sync: Bool?, custodian: String?, tags: [String]?, metadata: JSONValue?
+    ) async throws -> Db3Info {
+        var unsupported: [String] = []
+        if type != nil { unsupported.append("type") }
+        if sync == false { unsupported.append("sync: false") }
+        if custodian != nil { unsupported.append("custodian") }
+        guard unsupported.isEmpty else {
+            throw JsBaoError(
+                code: .localOnlyUnsupportedOption,
+                message: "client.db3.create: localOnly: true cannot be combined with \(unsupported.joined(separator: ", ")) — "
+                    + "a db3 that lives only on this device has no server record to hold it",
+                details: ["options": .array(unsupported.map { .string($0) })]
+            )
+        }
+        guard let client, !(client.authController.getUserId() ?? "").isEmpty else {
+            throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
+        }
+        return try await client.createLocalOnlyDb3(ULID.generate(), title: title, tags: tags, metadata: metadata)
+    }
+
     /// A refused create's `Db3CreateFailedEvent`; `id` names a client-minted id.
     private func createFailed(_ error: Error, title: String?, type: String?, id: String?) {
         let code: String
@@ -491,13 +576,22 @@ public final class Db3API: @unchecked Sendable {
     /// Delete a db3 with its records, grants and blobs. Its owner deletes it,
     /// and so does an app owner or admin.
     ///
+    /// A db3 that lives only on this device is removed here with nothing
+    /// sent: its subscriptions end as evicted and `Db3EvictedEvent` fires
+    /// once (`explicit`) once its copy is gone; `.db3Held` while another
+    /// holder keeps its store, nothing removed.
+    ///
     /// ```swift
     /// _ = try await client.db3.delete(db3Id)
     /// ```
     ///
     /// - Parameter db3Id: The db3.
     public func delete(_ db3Id: String) async throws -> SuccessResult {
-        try await transport.request(method: .delete, path: Self.path(db3Id))
+        if let client, await client.isLocalOnlyDb3(db3Id) {
+            try await lifecycle.deleteLocalOnly(db3Id)
+            return SuccessResult(success: true)
+        }
+        return try await transport.request(method: .delete, path: Self.path(db3Id))
     }
 
     /// The listings `listMine(_:)` reads, in its order.
@@ -802,7 +896,8 @@ public final class Db3API: @unchecked Sendable {
     /// upload queue. An upload made offline, or to a db3 created here whose
     /// create the server does not have yet, is queued and answered at once
     /// (`bytesTransferred == 0`), and sent once the client is online and the
-    /// server has the db3.
+    /// server has the db3. On a db3 that lives only on this device every call
+    /// that would reach the server throws `.db3LocalOnly`.
     ///
     /// ```swift
     /// let blobs = client.db3.blobs(db3Id)
@@ -812,7 +907,11 @@ public final class Db3API: @unchecked Sendable {
     ///
     /// - Parameter db3Id: The db3.
     public func blobs(_ db3Id: String) -> Db3BlobContext {
-        Db3BlobContext(db3Id: db3Id, transport: transport, blobManager: blobManager)
+        Db3BlobContext(db3Id: db3Id, transport: transport, blobManager: blobManager) { [weak client] in
+            // #5155 — a db3 that lives only on this device holds no blobs.
+            guard let client, await client.isLocalOnlyDb3(db3Id) else { return nil }
+            return JsBaoClient.db3LocalOnlyError(db3Id, call: "client.db3.blobs", instead: "it holds no blobs")
+        }
     }
 
     /// Remove or restore the owner row of a db3 a user holds, while they stay
@@ -859,7 +958,8 @@ public struct Db3IndexOrigin: Sendable, Equatable, Decodable {
 public struct Db3Index: Sendable, Equatable, Decodable {
     /// `idx_records_<model>_<field>` for a field's shared index,
     /// `idx_uc_<model>_<constraint>` for a declared compound constraint,
-    /// `idx_named_<model>_<name>` for one registered with a name.
+    /// `idx_named_<model>_<name>` for one registered with a name,
+    /// `idx_members_<model>_<field>` for a string-set field's member index.
     public let name: String
     /// The model whose records the index covers.
     public let model: String
@@ -867,19 +967,40 @@ public struct Db3Index: Sendable, Equatable, Decodable {
     public let fields: [String]
     /// Whether uniqueness is enforced: true while any origin asks for it.
     public let unique: Bool
+    /// Whether this is a string-set field's member index, which serves
+    /// `$contains`, any-of, membership levels and unfiltered facets on the
+    /// field in the db3. `false` for every other index.
+    public let members: Bool
     /// Every origin keeping the index. It is dropped when the last one goes.
     public let origins: [Db3IndexOrigin]
+
+    private enum CodingKeys: String, CodingKey {
+        case name, model, fields, unique, members, origins
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        model = try container.decode(String.self, forKey: .model)
+        fields = try container.decode([String].self, forKey: .fields)
+        unique = try container.decode(Bool.self, forKey: .unique)
+        // Only a member index's row carries `members`.
+        members = try container.decodeIfPresent(Bool.self, forKey: .members) ?? false
+        origins = try container.decode([Db3IndexOrigin].self, forKey: .origins)
+    }
 }
 
 /// What `client.db3.indexes.register(_:_:)` registers: a model and one field,
 /// or a composite (a unique constraint, which also needs `unique: true` and a
 /// `name`). `unique: true` refuses the registration while two records share a key.
+/// `members: true` on a string-set field registers its member index instead.
 ///
 /// ```swift
 /// try await client.db3.indexes.register(db3Id, Db3IndexRegistration(model: "Note", field: "email"))
 /// try await client.db3.indexes.register(
 ///     db3Id, Db3IndexRegistration(model: "Note", fields: ["ownerId", "slug"], unique: true, name: "owner_slug")
 /// )
+/// try await client.db3.indexes.register(db3Id, Db3IndexRegistration(model: "Note", field: "tags", members: true))
 /// ```
 public struct Db3IndexRegistration: Sendable, Encodable {
     public let model: String
@@ -887,6 +1008,8 @@ public struct Db3IndexRegistration: Sendable, Encodable {
     public let fields: [String]?
     public let unique: Bool?
     public let name: String?
+    /// `true` for a string-set field's member index; `nil` for any other index.
+    public let members: Bool?
 
     /// An index on one field.
     public init(model: String, field: String, unique: Bool? = nil, name: String? = nil) {
@@ -895,6 +1018,7 @@ public struct Db3IndexRegistration: Sendable, Encodable {
         self.fields = nil
         self.unique = unique
         self.name = name
+        self.members = nil
     }
 
     /// A composite index over `fields`, in order.
@@ -904,7 +1028,30 @@ public struct Db3IndexRegistration: Sendable, Encodable {
         self.fields = fields
         self.unique = unique
         self.name = name
+        self.members = nil
     }
+
+    /// A member index on the string-set `field`: the db3 builds it from its
+    /// records in one request and keeps it on every write, so `$contains`,
+    /// any-of, membership levels and unfiltered facets on the field read it.
+    /// It takes no `unique` or `name`.
+    public init(model: String, field: String, members: Bool) {
+        self.model = model
+        self.field = field
+        self.fields = nil
+        self.unique = nil
+        self.name = nil
+        self.members = members
+    }
+}
+
+/// The indexes of a db3 that lives only on this device (#5155): its list,
+/// registrations and drops, kept on the device by the room's rules.
+struct Db3LocalIndexDoor: Sendable {
+    var isLocalOnly: @Sendable (String) async -> Bool
+    var list: @Sendable (String) async throws -> [Db3Index]
+    var register: @Sendable (String, Db3IndexRegistration) async throws -> Db3Index
+    var drop: @Sendable (String, String) async throws -> Void
 }
 
 /// A db3's indexes, as `client.db3.indexes`. A declared `indexed` or `unique`
@@ -912,6 +1059,13 @@ public struct Db3IndexRegistration: Sendable, Encodable {
 /// declaring it, or for a composite unique key. A refusal throws the route's
 /// `HttpError`, its `serverCode` naming why (`DB3_INDEX_NOT_UNIQUE`,
 /// `DB3_INDEX_IN_USE`, `NOT_A_DB3`, …).
+///
+/// On a db3 that lives only on this device the list, registrations and drops
+/// are the device's own, under the same names and origins and by the same
+/// rules, and nothing is sent: a refusal is a `JsBaoError` with the room's
+/// code and details (`details["db3Id"]` naming the db3), a unique
+/// registration is enforced on the device until it is dropped, and a member
+/// index (`members: true`) is refused `.db3LocalOnly`.
 ///
 /// ```swift
 /// let index = try await client.db3.indexes.register(db3Id, Db3IndexRegistration(model: "Note", field: "email"))
@@ -922,10 +1076,27 @@ public final class Db3IndexesAPI: Sendable {
     private let transport: any Transport
     /// The wait for a pending create of the db3 a call names (#5000).
     private let awaitCreate: @Sendable (String) async throws -> Void
+    /// Read the db3's list again into its local store when this client holds
+    /// it open (#5101), after a registration or a drop the route answered.
+    private let applyLocally: @Sendable (String) async throws -> Void
+    /// The indexes of a db3 that lives only on this device, kept there (#5155).
+    private let local: Db3LocalIndexDoor?
 
-    init(transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void = { _ in }) {
+    init(
+        transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void = { _ in },
+        applyLocally: @escaping @Sendable (String) async throws -> Void = { _ in },
+        local: Db3LocalIndexDoor? = nil
+    ) {
         self.transport = transport
         self.awaitCreate = awaitCreate
+        self.applyLocally = applyLocally
+        self.local = local
+    }
+
+    /// The local door, when `db3Id` lives only on this device.
+    private func localDoor(_ db3Id: String) async -> Db3LocalIndexDoor? {
+        guard let local, await local.isLocalOnly(db3Id) else { return nil }
+        return local
     }
 
     private struct Listed: Decodable, Sendable { let indexes: [Db3Index] }
@@ -941,6 +1112,7 @@ public final class Db3IndexesAPI: Sendable {
     ///
     /// - Parameter db3Id: The db3.
     public func list(_ db3Id: String) async throws -> [Db3Index] {
+        if let local = await localDoor(db3Id) { return try await local.list(db3Id) }
         try await awaitCreate(db3Id)
         let listed: Listed = try await transport.request(method: .get, path: Self.path(db3Id))
         return listed.indexes
@@ -948,7 +1120,10 @@ public final class Db3IndexesAPI: Sendable {
 
     /// Register an index and answer it as it now is. Registering an index a
     /// declaration already keeps adds your origin to it. Needs the db3's
-    /// owner, or an app owner or admin.
+    /// owner, or an app owner or admin. On a db3 this client has subscribed
+    /// (or opened), the local copy holds the index before this returns, so a
+    /// query on the field right after uses it; another copy takes it at its
+    /// next subscribe, before `ready()` returns.
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
@@ -956,14 +1131,24 @@ public final class Db3IndexesAPI: Sendable {
     ///   - db3Id: The db3.
     ///   - registration: The model and its field or fields.
     public func register(_ db3Id: String, _ registration: Db3IndexRegistration) async throws -> Db3Index {
+        if let local = await localDoor(db3Id) {
+            if registration.members == true {
+                throw JsBaoClient.db3LocalOnlyError(
+                    db3Id, call: "client.db3.indexes.register", instead: "a member index is built only by a db3's room"
+                )
+            }
+            return try await local.register(db3Id, registration)
+        }
         try await awaitCreate(db3Id)
         let registered: Registered = try await transport.request(method: .post, path: Self.path(db3Id), body: registration)
+        try await applyLocally(db3Id)
         return registered.index
     }
 
     /// Remove your registration of an index. The index is dropped when no
     /// origin keeps it; one a declaration still keeps is refused
-    /// `DB3_INDEX_IN_USE`.
+    /// `DB3_INDEX_IN_USE`. On a db3 this client has subscribed (or opened),
+    /// the local copy drops it before this returns.
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
@@ -971,7 +1156,9 @@ public final class Db3IndexesAPI: Sendable {
     ///   - db3Id: The db3.
     ///   - name: The index's name, as `list(_:)` answers it.
     public func drop(_ db3Id: String, name: String) async throws {
+        if let local = await localDoor(db3Id) { return try await local.drop(db3Id, name) }
         try await awaitCreate(db3Id)
-        return try await transport.send(method: .delete, path: "\(Self.path(db3Id))/\(URLEncoding.encodeComponent(name))")
+        try await transport.send(method: .delete, path: "\(Self.path(db3Id))/\(URLEncoding.encodeComponent(name))")
+        try await applyLocally(db3Id)
     }
 }

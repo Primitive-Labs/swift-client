@@ -98,10 +98,16 @@ public struct Db3State: Sendable, Equatable {
     /// yet: a `client.db3.create` of your own synced db3, until its commit
     /// lands (and while the server refuses it, `error` naming why).
     public let pendingCreate: Bool
+    /// Whether it lives only on this device (`client.db3.create(title:localOnly:
+    /// true)`): never sent to the server, so it is never `pendingCreate`, its
+    /// `pendingWrites` and `lastSyncAt` stay `0` and `nil`, and its phase is
+    /// `live` while subscribed and `idle` otherwise.
+    public let localOnly: Bool
 
     public init(
         id: String, resident: Bool, subscribed: Bool, phase: Db3Phase, progress: Db3Progress?, cursor: Int, rows: Int,
-        lastSyncAt: Date?, pendingWrites: Int, permission: Db3Permission?, error: Db3StateError?, pendingCreate: Bool = false
+        lastSyncAt: Date?, pendingWrites: Int, permission: Db3Permission?, error: Db3StateError?, pendingCreate: Bool = false,
+        localOnly: Bool = false
     ) {
         self.id = id
         self.resident = resident
@@ -115,6 +121,7 @@ public struct Db3State: Sendable, Equatable {
         self.permission = permission
         self.error = error
         self.pendingCreate = pendingCreate
+        self.localOnly = localOnly
     }
 }
 

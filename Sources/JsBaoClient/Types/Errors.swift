@@ -205,6 +205,28 @@ public enum JsBaoErrorCode: String, Sendable {
     /// A write to a model the db3's type does not declare: the room did not
     /// apply it, and the write is handed back with this code.
     case db3ModelNotDeclared = "DB3_MODEL_NOT_DECLARED"
+    /// The db3 lives only on this device (`client.db3.create(title:localOnly:
+    /// true)`) and has no server record: a call that would send a request
+    /// naming it, an eviction door (its only copy is here), and a
+    /// member-index registration are refused with it before anything is sent
+    /// or removed. `details` carry `db3Id`.
+    case db3LocalOnly = "DB3_LOCAL_ONLY"
+    // `client.db3.indexes` on a db3 that lives only on this device, refused by
+    // the room's rules on the device, with the room's codes.
+    /// An invalid registration (`model`, `field` or `fields`, `unique`, `name`).
+    case db3IndexInvalid = "DB3_INDEX_INVALID"
+    /// A field declared a string set takes no index. `details` carry `field`.
+    case db3IndexSetField = "DB3_INDEX_SET_FIELD"
+    /// Another index of the model holds the name over other fields. `details` carry `index`.
+    case db3IndexNameTaken = "DB3_INDEX_NAME_TAKEN"
+    /// The fields are indexed already under another name. `details` carry `index`.
+    case db3IndexExists = "DB3_INDEX_EXISTS"
+    /// A unique registration over records sharing a key. `details` carry `duplicates`.
+    case db3IndexNotUnique = "DB3_INDEX_NOT_UNIQUE"
+    /// No index has the name. `details` carry `index`.
+    case db3IndexNotFound = "DB3_INDEX_NOT_FOUND"
+    /// A declaration keeps the index. `details` carry `index` and `origins`.
+    case db3IndexInUse = "DB3_INDEX_IN_USE"
 }
 
 /// Main error type for the JsBao client library

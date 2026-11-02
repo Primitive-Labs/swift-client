@@ -95,10 +95,30 @@ public protocol Transport: Sendable {
 /// Until then every request is let through.
 final class NetworkGatedTransport: Transport, @unchecked Sendable {
     typealias OfflineCheck = @Sendable (_ method: HTTPMethod, _ path: String) -> JsBaoError?
+    /// The error to refuse a request with for what it names, or `nil`: the
+    /// path, and the body unless it is raw bytes. Asynchronous, so it may read
+    /// the device's store before the request goes out.
+    typealias RequestCheck = @Sendable (_ method: HTTPMethod, _ path: String, _ body: Data?) async -> JsBaoError?
 
     private let base: any Transport
     private let lock = NSLock()
     private var offlineCheck: OfflineCheck?
+    private var requestCheck: RequestCheck?
+    /// Test seam: hears every request that goes out to the base transport,
+    /// after the checks. Internal; never set in production code.
+    private var sentForTest: (@Sendable (HTTPMethod, String, Data?) -> Void)?
+
+    /// Hear every request this transport sends from now on (a test's pass-through observer).
+    func observeSentForTest(_ observer: (@Sendable (HTTPMethod, String, Data?) -> Void)?) {
+        lock.withLock { sentForTest = observer }
+    }
+
+    /// Install the check every request's path and JSON body are asked of
+    /// before anything else (#5155: a db3 that lives only on this device is
+    /// never named to the server).
+    func setRequestCheck(_ check: @escaping RequestCheck) {
+        lock.withLock { requestCheck = check }
+    }
 
     init(base: any Transport) {
         self.base = base
@@ -129,7 +149,12 @@ final class NetworkGatedTransport: Transport, @unchecked Sendable {
         body: Data?,
         options: RequestOptions?
     ) async throws -> TransportResponse {
+        if let check = lock.withLock({ requestCheck }),
+           let error = await check(method, path, options?.rawBody == true ? nil : body) {
+            throw error
+        }
         try requireNetworking(method: method, path: path)
+        lock.withLock({ sentForTest })?(method, path, body)
         return try await base.execute(method: method, path: path, body: body, options: options)
     }
 }

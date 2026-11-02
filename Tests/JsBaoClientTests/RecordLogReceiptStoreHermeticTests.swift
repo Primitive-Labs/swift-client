@@ -86,9 +86,9 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
     private func queryRow(_ provider: SQLiteStorageProvider, _ id: String) throws -> [String: JSONValue]? {
         try provider.withConnection { connection in
             try connection.query(
-                "SELECT _data FROM record_log_view WHERE doc_id = 'doc-1' AND _type = 'Note' AND _id = ?", [.text(id)]
+                "SELECT json(_data) AS _data FROM record_log_view WHERE doc_id = 'doc-1' AND _type = 'Note' AND _id = ?", [.text(id)]
             ).first.map { row in
-                let stored = RecordLogJSON.row(row["_data"].stringValue)
+                let stored = RecordLogJSON.row(row["_data"].stringValue, id: id)
                 var out: [String: JSONValue] = [:]
                 for column in ["id", "title", "slug", "n"] { out[column] = stored[column] ?? .null }
                 return out
@@ -449,13 +449,13 @@ final class RecordLogReceiptStoreHermeticTests: XCTestCase {
         // Another client of the store begins its own replacement: this one is stale.
         let second = try XCTUnwrap(try store.beginFencedCatchUp(writer: writer, full: true))
         XCTAssertGreaterThan(second, first)
-        let before = try provider.withConnection { try $0.query("SELECT _id, _data FROM record_log_rows ORDER BY _id", []) }
+        let before = try provider.withConnection { try $0.query("SELECT _id, hex(_data) AS _data FROM record_log_rows ORDER BY _id", []) }
             .map { "\($0["_id"].stringValue ?? "")=\($0["_data"].stringValue ?? "")" }
         XCTAssertTrue(try store.applySegmentChunk(writer: writer, generation: first, rows: [row("z", [:])]).stale)
         XCTAssertTrue(try store.applySegmentCorrections(writer: writer, generation: first, lines: []).stale)
         XCTAssertTrue(try store.applyCatchUpPage(writer: writer, rows: [row("z", [:])], generation: first).stale)
         XCTAssertTrue(try store.completeCatchUp(writer: writer, lsn: 30, full: true, generation: first).stale)
-        let after = try provider.withConnection { try $0.query("SELECT _id, _data FROM record_log_rows ORDER BY _id", []) }
+        let after = try provider.withConnection { try $0.query("SELECT _id, hex(_data) AS _data FROM record_log_rows ORDER BY _id", []) }
             .map { "\($0["_id"].stringValue ?? "")=\($0["_data"].stringValue ?? "")" }
         XCTAssertEqual(after, before)
         XCTAssertEqual(try store.marks().cursor, 0)

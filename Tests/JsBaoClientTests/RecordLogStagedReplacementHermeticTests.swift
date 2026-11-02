@@ -50,9 +50,9 @@ final class RecordLogStagedReplacementHermeticTests: XCTestCase {
     private func view(_ provider: SQLiteStorageProvider) throws -> [String: RecordLogRow] {
         var out: [String: RecordLogRow] = [:]
         for found in try provider.withConnection({
-            try $0.query("SELECT _id, _data FROM record_log_view WHERE doc_id = 'doc-1'")
+            try $0.query("SELECT _id, json(_data) AS _data FROM record_log_view WHERE doc_id = 'doc-1'")
         }) {
-            if let id = found["_id"].stringValue { out[id] = RecordLogJSON.row(found["_data"].stringValue) }
+            if let id = found["_id"].stringValue { out[id] = RecordLogJSON.row(found["_data"].stringValue, id: id) }
         }
         return out
     }
@@ -183,8 +183,8 @@ final class RecordLogStagedReplacementHermeticTests: XCTestCase {
         _ = try reopened.applyCatchUpPage(writer: writer, rows: [row("a", "a3")], lsn: 10, generation: second)
         XCTAssertEqual(try titles(provider)["a"], "a1", "the view still shows the completed generation")
         let staged = try provider.withConnection {
-            try $0.query("SELECT _data FROM record_log_staged_base WHERE doc_id = 'doc-1' AND _id = 'a'")
-        }.first.map { RecordLogJSON.row($0["_data"].stringValue) }
+            try $0.query("SELECT json(_data) AS _data FROM record_log_staged_base WHERE doc_id = 'doc-1' AND _id = 'a'")
+        }.first.map { RecordLogJSON.row($0["_data"].stringValue, id: "a") }
         XCTAssertEqual(staged?["title"], "a1", "the base holds the completed generation's row, not the interrupted attempt's")
         _ = try reopened.completeCatchUp(writer: writer, lsn: 10, full: true, generation: second)
         XCTAssertEqual(try titles(provider), ["a": "a3"])

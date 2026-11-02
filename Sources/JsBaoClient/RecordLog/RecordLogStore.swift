@@ -26,6 +26,9 @@ struct RecordLogStoredState: Equatable, Sendable {
     /// The replacement in progress is staged: the view keeps the previous
     /// completed generation until it commits.
     var staged = false
+    /// The db3 lives only on this device (#5155): its store judges and
+    /// confirms its own writes, and nothing of it is ever sent.
+    var localOnly = false
 
     struct Writer: Equatable, Sendable {
         var writer: String
@@ -74,9 +77,14 @@ struct RecordLogMarks: Equatable, Sendable {
     var db3Type: RecordLogDb3Type? = nil
     /// A typed db3's declarations as the room sent them, per model each declared field's kind.
     var declarations: [String: [String: String]]? = nil
+    /// The db3 lives only on this device (#5155): see ``RecordLogStoredState/localOnly``.
+    var localOnly = false
+    /// A local-only db3's index registrations made on this device, by name.
+    var localIndexes: [RecordLogLocalIndex] = []
 
     static func == (a: RecordLogMarks, b: RecordLogMarks) -> Bool {
         a.typed == b.typed && a.db3Type == b.db3Type && a.declarations == b.declarations
+            && a.localOnly == b.localOnly && a.localIndexes == b.localIndexes
             && a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
             && a.constraints == b.constraints && a.permission == b.permission && a.replacing == b.replacing
             && a.replacement == b.replacement && a.receipt == b.receipt && a.segment == b.segment && a.staged == b.staged
@@ -178,6 +186,70 @@ struct RecordLogCommitReply: Sendable {
     var entries: [RecordLogPendingEntry]
     var changed: [RecordLogRowChange]
     var cursor: Int
+    /// A local-only store's (#5155) entries it confirmed in the commit itself,
+    /// as a `receive` would have answered them: the acknowledged entries,
+    /// those that left the pending log, and their records' confirmed rows.
+    /// `nil` in a synced store's reply, whose entries wait for the room.
+    var acknowledged: [RecordLogEntryRef]? = nil
+    /// See ``acknowledged``.
+    var settled: [RecordLogEntryRef]? = nil
+    /// See ``acknowledged``.
+    var settlements: [RecordLogEntryRef: RecordLogSettlement]? = nil
+    /// The upserts a local-only store applied to another record, as the room's aliases name them.
+    var aliases: [RecordLogAlias] = []
+}
+
+/// An index registration made on a local-only db3 (#5155), as the store
+/// keeps it: the room's registry, kept on the device. Stored as js-bao's
+/// `RecordLogLocalIndex`, field for field.
+struct RecordLogLocalIndex: Equatable, Sendable {
+    /// The index's name, as the room would name it.
+    var name: String
+    var model: String
+    var fields: [String]
+    /// Whether the registration asks for uniqueness: its key is then a constraint the store enforces.
+    var unique: Bool
+    /// The `name` the registration gave, when it gave one.
+    var named: String?
+
+    var json: JSONValue {
+        var object: [String: JSONValue] = [
+            "name": .string(name), "model": .string(model), "fields": .array(fields.map { .string($0) }), "unique": .bool(unique),
+        ]
+        if let named { object["named"] = .string(named) }
+        return .object(object)
+    }
+
+    init(name: String, model: String, fields: [String], unique: Bool, named: String? = nil) {
+        self.name = name
+        self.model = model
+        self.fields = fields
+        self.unique = unique
+        self.named = named
+    }
+
+    init?(json: JSONValue?) {
+        guard let name = json?["name"]?.stringValue, let model = json?["model"]?.stringValue else { return nil }
+        self.init(
+            name: name, model: model, fields: json?["fields"]?.arrayValue?.compactMap(\.stringValue) ?? [],
+            unique: json?["unique"]?.boolValue == true, named: json?["named"]?.stringValue
+        )
+    }
+
+    /// Registrations as one text, in name order: what a change is judged against.
+    static func text(_ indexes: [RecordLogLocalIndex]) -> String {
+        RecordLogJSON.text(.array(indexes.sorted { $0.name < $1.name }.map(\.json)))
+    }
+}
+
+/// What a change of a local-only db3's registrations did (`changeLocalIndexes`), and the marks after it.
+enum RecordLogLocalIndexChange: Sendable {
+    /// Written.
+    case changed(RecordLogMarks)
+    /// Another change came first: nothing was written.
+    case moved(RecordLogMarks)
+    /// Records share the unique key: nothing was written.
+    case duplicates([(values: [JSONValue], count: Int)], RecordLogMarks)
 }
 
 /// What `purge` answers.
@@ -401,14 +473,35 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
         )
     }
 
-    /// Forget the type mark: the document's local data is removed.
+    /// Forget the type mark and the local-only owner: the document's local data is removed.
     func forgetType() throws {
-        try sql.exec("DELETE FROM record_log_meta WHERE key = ?", [typeKey])
+        try sql.exec("DELETE FROM record_log_meta WHERE key IN (?, ?)", [typeKey, .text(RecordLogStore.localOwnerKey(docId))])
     }
 
     func setLastCatchUpAt(_ at: Int64) throws {
         try ensureState()
         try sql.exec("UPDATE record_log_state SET last_catch_up_at = ? WHERE doc_id = ?", [.integer(at), doc])
+    }
+
+    /// Whether the db3 lives only on this device (#5155).
+    func localOnly() throws -> Bool { try state()?["local_only"].intValue == 1 }
+
+    func setLocalOnly(_ localOnly: Bool) throws {
+        try ensureState()
+        try sql.exec("UPDATE record_log_state SET local_only = ? WHERE doc_id = ?", [.integer(localOnly ? 1 : 0), doc])
+    }
+
+    /// A local-only db3's index registrations, by name.
+    func localIndexes() throws -> [RecordLogLocalIndex] {
+        guard let text = try state()?["local_indexes"].stringValue else { return [] }
+        return RecordLogJSON.parse(text)?.arrayValue?.compactMap { RecordLogLocalIndex(json: $0) } ?? []
+    }
+
+    func setLocalIndexes(_ indexes: [RecordLogLocalIndex]) throws {
+        try ensureState()
+        try sql.exec(
+            "UPDATE record_log_state SET local_indexes = ? WHERE doc_id = ?", [.text(RecordLogLocalIndex.text(indexes)), doc]
+        )
     }
 
     private func generation() throws -> Int {
@@ -542,10 +635,10 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
             }
             try sql.exec(
                 """
-                INSERT INTO record_log_rows (doc_id, _type, _id, _data, _gen) VALUES (?, ?, ?, ?, ?)
+                INSERT INTO record_log_rows (doc_id, _type, _id, _data, _gen) VALUES (?, ?, ?, jsonb(?), ?)
                   ON CONFLICT (doc_id, _type, _id) DO UPDATE SET _data = excluded._data, _gen = excluded._gen
                 """,
-                bindings + [.text(RecordLogJSON.text(.object(row))), .integer(Int64(generation))]
+                bindings + [.text(RecordLogJSON.stored(row)), .integer(Int64(generation))]
             )
         }
 
@@ -566,9 +659,9 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
 
     func confirmedRow(_ key: RecordLogRecordKey) throws -> RecordLogRow? {
         try sql.first(
-            "SELECT _data FROM record_log_rows WHERE doc_id = ? AND _type = ? AND _id = ?",
+            "SELECT json(_data) AS _data FROM record_log_rows WHERE doc_id = ? AND _type = ? AND _id = ?",
             [doc, .text(key.model), .text(key.id)]
-        ).map { RecordLogJSON.row($0["_data"].stringValue) }
+        ).map { RecordLogJSON.row($0["_data"].stringValue, id: key.id) }
     }
 
     func beginReplace() throws {
@@ -622,10 +715,10 @@ final class SqlRecordLogTables: RecordLogReceiptTables {
         guard try staged() else { return { [unowned self] key in try self.confirmedRow(key) } }
         return { [unowned self] key in
             guard let kept = try self.sql.first(
-                "SELECT _data FROM record_log_staged_base WHERE doc_id = ? AND _type = ? AND _id = ?",
+                "SELECT json(_data) AS _data FROM record_log_staged_base WHERE doc_id = ? AND _type = ? AND _id = ?",
                 [self.doc, .text(key.model), .text(key.id)]
             ) else { return try self.confirmedRow(key) }
-            return kept["_data"].isNull ? nil : RecordLogJSON.row(kept["_data"].stringValue)
+            return kept["_data"].isNull ? nil : RecordLogJSON.row(kept["_data"].stringValue, id: key.id)
         }
     }
 
@@ -952,54 +1045,154 @@ final class RecordLogStore: @unchecked Sendable {
     // MARK: - Tables and identity
 
     /// Create the record-log tables and bring the store to
-    /// ``RecordLogSchema/storageVersion``, in one transaction. Idempotent.
+    /// ``RecordLogSchema/storageVersion``, holding the provider's queue once
+    /// for the whole open. Idempotent.
     ///
-    /// A store at the version is answered by one read of its version and one
-    /// `sqlite_master` probe for the projection rule table an older build
-    /// creates on every open and the staged replacement's base table (#4701,
-    /// added with no version change): when neither says otherwise, nothing
-    /// else runs.
-    /// Otherwise the tables are created and the projection layout an older
-    /// build kept is retired (``retireProjection(_:)``), with every record
-    /// kept, and the version is written. An older build opening a store at
-    /// the version is not refused; its layout is retired again at the next open.
+    /// A store at or above the version is answered by one read of its version
+    /// and one `sqlite_master` probe for the projection rule table an older
+    /// build creates on every open and the staged replacement's base table
+    /// (#4701, added with no version change): when neither says otherwise,
+    /// nothing else runs; when one does, one transaction creates the tables
+    /// and retires the layout, and the version is left as it is (a newer
+    /// build's is never lowered).
+    ///
+    /// A store below the version takes one transaction to create the tables
+    /// and retire the projection layout an older build kept
+    /// (``retireProjection(_:)``), with every record kept; then each document
+    /// that still holds a row as JSON text is converted in a transaction of
+    /// its own, in `doc_id` order (``convertDocument(_:_:)``), and the version
+    /// is written last, in one more. A row's own SQLite type is its marker
+    /// (text is unconverted, a blob is done), so nothing else is written and
+    /// the store does not grow; a conversion interrupted between two documents
+    /// resumes at the next open with the documents still holding text. An
+    /// older build opening a store at the version is not refused: its layout
+    /// is retired again at the next open, and a row it wrote as text reads as
+    /// any other and is stored as JSONB when it is next written. A store at
+    /// version 3 has nothing to convert: the first transaction adds the
+    /// local-only columns (#5155) and the version is written after it, every
+    /// db3 it holds reading synced.
     func initialize() throws {
-        try command { sql in
-            let version = (try? sql.first(
-                "SELECT value FROM record_log_meta WHERE key = 'storage_version'"
-            ))??["value"].intValue
-            // One probe: an older build's projection rule, and the staged
-            // replacement's base table a store from before #4701 lacks (its
-            // `staged` column is added with it).
-            let probed = Set(try sql.rows(
-                """
-                SELECT name FROM sqlite_master WHERE type = 'table'
-                   AND name IN ('record_log_projection_rule', 'record_log_staged_base')
-                """
-            ).compactMap { $0["name"].stringValue })
-            let olderBuildWasHere = probed.contains("record_log_projection_rule")
-            if version == RecordLogSchema.storageVersion && !olderBuildWasHere && probed.contains("record_log_staged_base") { return }
-            for statement in RecordLogSchema.ddl { try sql.connection.executeScript(statement) }
-            for added in RecordLogSchema.addedColumns {
-                let has = try sql.first(
-                    "SELECT 1 AS present FROM pragma_table_info(?) WHERE name = ?", [.text(added.table), .text(added.column)]
-                ) != nil
-                if !has { try sql.connection.executeScript(added.add) }
+        try onConnection { sql in
+            guard let opened = try group.command(sql.connection, { try openTables(sql) }) else { return }
+            var parts: [String] = []
+            if let pending = opened.pending {
+                for documentId in pending {
+                    try group.command(sql.connection) { try convertDocument(sql, documentId) }
+                }
+                let rows = try group.command(sql.connection) { () -> Int in
+                    let changes = try sql.first("SELECT total_changes() AS n")?["n"].intValue ?? 0
+                    try sql.exec(
+                        """
+                        INSERT INTO record_log_meta (key, value) VALUES ('storage_version', ?)
+                          ON CONFLICT (key) DO UPDATE SET value = excluded.value
+                        """,
+                        [.text(String(RecordLogSchema.storageVersion))]
+                    )
+                    // Every change since the documents were listed: each one a row re-encoded.
+                    return changes - opened.changes
+                }
+                if !pending.isEmpty || opened.resumed > 0 {
+                    parts.append(
+                        "\(pending.count) document(s), \(rows) row(s) re-encoded as JSONB without id"
+                            + (opened.resumed > 0 ? " (resumed; \(opened.resumed) already converted)" : "")
+                    )
+                }
             }
-            let dropped = try retireProjection(sql)
+            if !opened.dropped.isEmpty {
+                parts.append("dropped \(opened.dropped.joined(separator: ", ")); a db3's rows live in its view")
+            }
+            if !parts.isEmpty {
+                let version = max(opened.version ?? 0, RecordLogSchema.storageVersion)
+                logger?.log("[record-log] the local store was migrated to storage version \(version):", parts.joined(separator: "; "))
+            }
+        }
+    }
+
+    /// What the first transaction of an open did to a store not answered by
+    /// the fast path.
+    private struct OpenedTables {
+        /// The version the store was at, or `nil` for one without it.
+        var version: Int?
+        /// What ``retireProjection(_:)`` dropped.
+        var dropped: [String]
+        /// The documents still to convert, in `doc_id` order; `nil` when the
+        /// store is at or above the version.
+        var pending: [String]?
+        /// The documents an interrupted conversion already converted.
+        var resumed: Int
+        /// The connection's `total_changes()` once the documents were listed.
+        var changes: Int
+    }
+
+    /// The first transaction of an open: `nil` on the fast path, else the
+    /// tables created, the projection layout retired, and the documents a
+    /// store below the version has still to convert.
+    private func openTables(_ sql: RecordLogSql) throws -> OpenedTables? {
+        let version = (try? sql.first(
+            "SELECT value FROM record_log_meta WHERE key = 'storage_version'"
+        ))??["value"].intValue
+        // One probe: an older build's projection rule, and the staged
+        // replacement's base table a store from before #4701 lacks (its
+        // `staged` column is added with it).
+        let probed = Set(try sql.rows(
+            """
+            SELECT name FROM sqlite_master WHERE type = 'table'
+               AND name IN ('record_log_projection_rule', 'record_log_staged_base')
+            """
+        ).compactMap { $0["name"].stringValue })
+        let olderBuildWasHere = probed.contains("record_log_projection_rule")
+        let current = (version ?? 0) >= RecordLogSchema.storageVersion
+        if current && !olderBuildWasHere && probed.contains("record_log_staged_base") { return nil }
+        for statement in RecordLogSchema.ddl { try sql.connection.executeScript(statement) }
+        for added in RecordLogSchema.addedColumns {
+            let has = try sql.first(
+                "SELECT 1 AS present FROM pragma_table_info(?) WHERE name = ?", [.text(added.table), .text(added.column)]
+            ) != nil
+            if !has { try sql.connection.executeScript(added.add) }
+        }
+        let dropped = try retireProjection(sql)
+        guard !current else { return OpenedTables(version: version, dropped: dropped, pending: nil, resumed: 0, changes: 0) }
+        // From version 3 every row is JSONB already: the step to 4 is the
+        // local-only columns the statements above added (#5155).
+        if (version ?? 0) >= RecordLogSchema.jsonbVersion {
+            return OpenedTables(version: version, dropped: dropped, pending: [], resumed: 0, changes: 0)
+        }
+        // A document holding a text row is still to convert; one holding
+        // only blobs was converted by an earlier open that was interrupted.
+        var pending: [String] = []
+        var resumed = 0
+        for row in try sql.rows(
+            """
+            SELECT doc_id, MAX(encoding = 'text') AS text FROM (
+              SELECT doc_id, typeof(_data) AS encoding FROM record_log_rows
+              UNION ALL SELECT doc_id, typeof(_data) FROM record_log_view
+              UNION ALL SELECT doc_id, typeof(_data) FROM record_log_staged_base
+            ) WHERE encoding IN ('text', 'blob') GROUP BY doc_id ORDER BY doc_id
+            """
+        ) {
+            guard let documentId = row["doc_id"].stringValue else { continue }
+            if row["text"].intValue == 1 { pending.append(documentId) } else { resumed += 1 }
+        }
+        let changes = try sql.first("SELECT total_changes() AS n")?["n"].intValue ?? 0
+        return OpenedTables(version: version, dropped: dropped, pending: pending, resumed: resumed, changes: changes)
+    }
+
+    /// Bring one document's rows to the storage version, in the caller's
+    /// transaction: every `_data` an older build wrote as JSON text with `id`
+    /// (confirmed, view and staged base rows) becomes JSONB without it. A row
+    /// whose `id` the key does not hold whole (``RecordLogJSON/stored(_:)``)
+    /// keeps it. A row already JSONB, and a staged base's NULL, are left as
+    /// they are.
+    private func convertDocument(_ sql: RecordLogSql, _ documentId: String) throws {
+        let doc = Format2SqlValue.text(documentId)
+        for table in ["record_log_rows", "record_log_view", "record_log_staged_base"] {
             try sql.exec(
                 """
-                INSERT INTO record_log_meta (key, value) VALUES ('storage_version', ?)
-                  ON CONFLICT (key) DO UPDATE SET value = excluded.value
+                UPDATE \(table) SET _data = jsonb(CASE WHEN json_extract(_data, '$.id') IS _id
+                  THEN json_remove(_data, '$.id') ELSE _data END) WHERE doc_id = ? AND typeof(_data) = 'text'
                 """,
-                [.text(String(RecordLogSchema.storageVersion))]
+                [doc]
             )
-            if !dropped.isEmpty {
-                logger?.log(
-                    "[record-log] the local store was migrated to storage version \(RecordLogSchema.storageVersion):",
-                    "dropped \(dropped.joined(separator: ", ")); a db3's rows live in its view"
-                )
-            }
         }
     }
 
@@ -1072,7 +1265,8 @@ final class RecordLogStore: @unchecked Sendable {
             }
             return RecordLogStoredState(
                 cursor: try tables.cursor(), rows: count, writers: writers, replacing: try tables.isReplacing(),
-                lastCatchUpAt: state?["last_catch_up_at"].intValue.map { Int64($0) }, staged: try tables.staged()
+                lastCatchUpAt: state?["last_catch_up_at"].intValue.map { Int64($0) }, staged: try tables.staged(),
+                localOnly: state?["local_only"].intValue == 1
             )
         }
     }
@@ -1208,7 +1402,9 @@ final class RecordLogStore: @unchecked Sendable {
             staged: try tables.staged(),
             typed: type.typed,
             db3Type: type.db3Type,
-            declarations: type.declarations
+            declarations: type.declarations,
+            localOnly: state?["local_only"].intValue == 1,
+            localIndexes: try tables.localIndexes()
         )
     }
 
@@ -1241,8 +1437,8 @@ final class RecordLogStore: @unchecked Sendable {
     /// The confirmed rows of the document, in the order they arrived.
     func confirmedRows() throws -> [RecordLogRow] {
         try reading { sql in
-            try sql.rows("SELECT _data FROM record_log_rows WHERE doc_id = ? ORDER BY rowid", [doc])
-                .map { RecordLogJSON.row($0["_data"].stringValue) }
+            try sql.rows("SELECT json(_data) AS _data, _id FROM record_log_rows WHERE doc_id = ? ORDER BY rowid", [doc])
+                .map { RecordLogJSON.row($0["_data"].stringValue, id: $0["_id"].stringValue) }
         }
     }
 
@@ -1255,9 +1451,9 @@ final class RecordLogStore: @unchecked Sendable {
 
     private func viewRow(_ sql: RecordLogSql, _ key: RecordLogRecordKey) throws -> RecordLogRow? {
         try sql.first(
-            "SELECT _data FROM record_log_view WHERE doc_id = ? AND _type = ? AND _id = ?",
+            "SELECT json(_data) AS _data FROM record_log_view WHERE doc_id = ? AND _type = ? AND _id = ?",
             [doc, .text(key.model), .text(key.id)]
-        ).map { RecordLogJSON.row($0["_data"].stringValue) }
+        ).map { RecordLogJSON.row($0["_data"].stringValue, id: key.id) }
     }
 
     /// Several records' view rows, in the order asked for; a missing one is `nil`.
@@ -1270,10 +1466,10 @@ final class RecordLogStore: @unchecked Sendable {
                 let slice = Array(unique[start..<min(start + 500, unique.count)])
                 let placeholders = slice.map { _ in "?" }.joined(separator: ", ")
                 for row in try sql.rows(
-                    "SELECT _id, _data FROM record_log_view WHERE doc_id = ? AND _type = ? AND _id IN (\(placeholders))",
+                    "SELECT _id, json(_data) AS _data FROM record_log_view WHERE doc_id = ? AND _type = ? AND _id IN (\(placeholders))",
                     [doc, .text(model)] + slice.map { .text($0) }
                 ) {
-                    if let id = row["_id"].stringValue { found[id] = RecordLogJSON.row(row["_data"].stringValue) }
+                    if let id = row["_id"].stringValue { found[id] = RecordLogJSON.row(row["_data"].stringValue, id: id) }
                 }
             }
             return ids.map { found[$0] }
@@ -1286,16 +1482,16 @@ final class RecordLogStore: @unchecked Sendable {
             let rows: [Format2SqlRow]
             if let after {
                 rows = try sql.rows(
-                    "SELECT _data FROM record_log_view WHERE doc_id = ? AND _type = ? AND _id > ? ORDER BY _id LIMIT ?",
+                    "SELECT json(_data) AS _data, _id FROM record_log_view WHERE doc_id = ? AND _type = ? AND _id > ? ORDER BY _id LIMIT ?",
                     [doc, .text(model), .text(after), .integer(Int64(limit))]
                 )
             } else {
                 rows = try sql.rows(
-                    "SELECT _data FROM record_log_view WHERE doc_id = ? AND _type = ? ORDER BY _id LIMIT ?",
+                    "SELECT json(_data) AS _data, _id FROM record_log_view WHERE doc_id = ? AND _type = ? ORDER BY _id LIMIT ?",
                     [doc, .text(model), .integer(Int64(limit))]
                 )
             }
-            return rows.map { RecordLogJSON.row($0["_data"].stringValue) }
+            return rows.map { RecordLogJSON.row($0["_data"].stringValue, id: $0["_id"].stringValue) }
         }
     }
 
@@ -1329,7 +1525,8 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// The live records of `model` in `table` (by id) whose `fields` hold
-    /// `values`, not one of `excluding`.
+    /// `values`, not one of `excluding`. A field named `id` is the record's
+    /// key (`_id`): `_data` does not hold it.
     static func findHolders(
         _ sql: RecordLogSql, table: String, docId: String, model: String, fields: [String],
         values: [JSONValue], excluding: [String], limitToFirst: Bool
@@ -1341,15 +1538,19 @@ final class RecordLogStore: @unchecked Sendable {
         if literal {
             predicates = ["_type = \(RecordLogSchema.quoteLiteral(model))"]
             for (field, value) in zip(fields, values) {
-                predicates.append("json_extract(_data, '$.\(field)') IS ?")
+                predicates.append(field == "id" ? "_id IS ?" : "json_extract(_data, '$.\(field)') IS ?")
                 bindings.append(.recordLogLookup(value))
             }
         } else {
             predicates = ["_type = ?"]
             bindings.append(.text(model))
             for (field, value) in zip(fields, values) {
-                predicates.append("json_extract(_data, '$.' || ?) IS ?")
-                bindings.append(.text(field))
+                if field == "id" {
+                    predicates.append("_id IS ?")
+                } else {
+                    predicates.append("json_extract(_data, '$.' || ?) IS ?")
+                    bindings.append(.text(field))
+                }
                 bindings.append(.recordLogLookup(value))
             }
         }
@@ -1686,10 +1887,10 @@ final class RecordLogStore: @unchecked Sendable {
             if let row {
                 try sql.exec(
                     """
-                    INSERT INTO record_log_view (doc_id, _type, _id, _data) VALUES (?, ?, ?, ?)
+                    INSERT INTO record_log_view (doc_id, _type, _id, _data) VALUES (?, ?, ?, jsonb(?))
                       ON CONFLICT (doc_id, _type, _id) DO UPDATE SET _data = excluded._data
                     """,
-                    [doc, .text(key.model), .text(key.id), .text(RecordLogJSON.text(.object(row)))]
+                    [doc, .text(key.model), .text(key.id), .text(RecordLogJSON.stored(row))]
                 )
             } else {
                 try sql.exec(
@@ -1728,7 +1929,9 @@ final class RecordLogStore: @unchecked Sendable {
     /// naming the document, with `details.reason` `"commit-failed"`.
     ///
     /// - Throws: `JsBaoError(.documentEpochBudget)` when both epochs this client
-    ///   may write into are full; nothing of the save lands.
+    ///   may write into are full; nothing of the save lands. A db3 that lives
+    ///   only on this device commits through ``commitLocally(_:writer:writes:ts:)``
+    ///   and throws what it throws.
     func commitEntries(
         writer: String, writes: [RecordLogWrite],
         ts: Int64? = nil, listener: RecordLogGroupCommit.Listener? = nil
@@ -1748,7 +1951,8 @@ final class RecordLogStore: @unchecked Sendable {
             }
         }
         return try save(listener: heard) { sql in
-            try tables.countingEpochs {
+            if try tables.localOnly() { return try commitLocally(sql, writer: writer, writes: writes, ts: ts) }
+            return try tables.countingEpochs {
                 let rules = rules(writer)
                 var entries: [RecordLogPendingEntry] = []
                 var refreshed: [RecordLogRecordKey] = []
@@ -1767,6 +1971,172 @@ final class RecordLogStore: @unchecked Sendable {
                 return RecordLogCommitReply(entries: entries, changed: changed, cursor: try tables.cursor())
             }
         }
+    }
+
+    /// Commit the writes of a db3 that lives only on this device (#5155), in
+    /// the save's transaction. No room will judge them, so the store does, as
+    /// the room would (``judgeLocally(_:_:)``). An accepted write is written
+    /// and confirmed at once by a result of the store's own making (the next
+    /// log number, the open epoch, its changes), so it leaves the pending log
+    /// as it lands and the cursor advances by one. The reply carries what such
+    /// a `receive` answers. No write budget applies: nothing else writes to
+    /// the db3.
+    ///
+    /// - Throws: `JsBaoError` `.documentConstraintViolated`,
+    ///   `.db3ConditionNotMet`, `.db3RecordNotFound` or `.documentEntryInvalid`
+    ///   (`details.scope` `local`, with the room's `constraint`, `conflicting`
+    ///   and `current`); nothing of the save lands.
+    private func commitLocally(
+        _ sql: RecordLogSql, writer: String, writes: [RecordLogWrite], ts: Int64?
+    ) throws -> RecordLogCommitReply {
+        let rules = rules(writer)
+        var reply = RecordLogCommitReply(entries: [], changed: [], cursor: 0, acknowledged: [], settled: [], settlements: [:])
+        var touched: [RecordLogRecordKey] = []
+        for write in writes {
+            guard let m = write.mutations.first else { continue }
+            let judged = try judgeLocally(sql, write)
+            let entry = try rules.write(
+                m, also: Array(write.mutations.dropFirst()), upsertOn: write.upsertOn,
+                ts: ts ?? Int64(Date().timeIntervalSince1970 * 1000)
+            )
+            let out = try rules.receive(.result(RecordLogResult(
+                l: try tables.cursor() + 1, e: try tables.epochs().open, changes: judged.changes, alias: judged.alias,
+                w: writer, seq: entry.seq
+            )))
+            touched.append(contentsOf: out.touched)
+            reply.acknowledged?.append(contentsOf: out.acknowledged)
+            reply.settled?.append(contentsOf: out.settled)
+            reply.settlements?.merge(out.settlements) { _, new in new }
+            if let alias = judged.alias { reply.aliases.append(alias) }
+            reply.entries.append(entry)
+        }
+        reply.changed = try settleView(sql, touched)
+        reply.cursor = try tables.cursor()
+        return reply
+    }
+
+    /// Judge one write of a local-only db3 against the confirmed rows, as the
+    /// room judges an entry (#5155): an upsert lands on the live record
+    /// holding its value; `ifNotExists` fails on a live record, a `condition`
+    /// on no live record or one it does not match, an increment on a record
+    /// neither live nor created by the entry; the rows the entry leaves are
+    /// checked against the store's unique constraints. Answers its changes,
+    /// whole rows, and the upsert's alias when it landed on another record.
+    ///
+    /// - Throws: the room's refusal, as ``commitLocally(_:writer:writes:ts:)`` says.
+    private func judgeLocally(
+        _ sql: RecordLogSql, _ write: RecordLogWrite
+    ) throws -> (changes: [RecordLogChange], alias: RecordLogAlias?) {
+        let documentId = documentId
+        func refused(_ code: JsBaoErrorCode, _ message: String, _ extra: [String: JSONValue] = [:]) -> JsBaoError {
+            var details: [String: JSONValue] = ["documentId": .string(documentId), "scope": "local"]
+            details.merge(extra) { _, new in new }
+            return JsBaoError(code: code, message: "Cannot save to the db3 '\(documentId)': \(message).", details: details)
+        }
+        let confirmed = try tables.confirmed()
+        let constraints = try tables.constraints()
+        let m = write.mutations[0]
+        if let field = write.upsertOn, !constraints.contains(where: { $0.model == m.model && $0.fields == [field] }) {
+            throw refused(.documentEntryInvalid, "upsertOn names \(field), which no single-field unique constraint of \(m.model) covers")
+        }
+        let resolved = try recordLogResolveEntry(confirmed, RecordLogPendingEntry(
+            seq: 0, e: 0, k: 0, m: m, also: write.mutations.count > 1 ? Array(write.mutations.dropFirst()) : nil,
+            upsertOn: write.upsertOn
+        ))
+        // The guards and an increment's record, on the records the entry
+        // resolves to, as they stand before it.
+        var created = Set<RecordLogRecordKey>()
+        for (at, sent) in write.mutations.enumerated() {
+            let target = resolved.mutations[at]
+            if target.kind == .create { created.insert(target.key) }
+            guard sent.kind == .increment || sent.carriesGuard else { continue }
+            let place = at == 0 ? "" : "write \(at + 1) of the transaction: "
+            let record = "\(target.model) id=\(target.id)"
+            let row = try confirmed.row(target.key)
+            let current: [String: JSONValue] = ["current": RecordLogCurrentRecord(model: target.model, id: target.id, row: row).json]
+            if sent.kind == .increment, !created.contains(target.key), row == nil {
+                throw refused(.db3RecordNotFound, "\(place)\(record) has no live record to increment", current)
+            }
+            if sent.ifNotExists, row != nil {
+                throw refused(.db3ConditionNotMet, "\(place)ifNotExists failed: \(record) already exists", current)
+            }
+            if let condition = sent.condition {
+                guard let row, try conditionHolds(sql, target.key, row, condition) else {
+                    let none = row == nil ? " (a record with no live row meets none)" : ""
+                    throw refused(.db3ConditionNotMet, "\(place)the condition on \(record) is not met\(none)", current)
+                }
+            }
+        }
+        // The rows the entry leaves, its guards dropped.
+        var order: [RecordLogRecordKey] = []
+        var before: [RecordLogRecordKey: RecordLogRow] = [:]
+        var after: [RecordLogRecordKey: RecordLogRow] = [:]
+        for (at, resolvedMutation) in resolved.mutations.enumerated() {
+            let mutation = resolvedMutation.withoutGuards
+            let key = mutation.key
+            if !order.contains(key) {
+                order.append(key)
+                before[key] = try confirmed.row(key)
+                after[key] = before[key]
+            }
+            let row = recordLogPlainRowAfter(after[key], mutation)
+            if mutation.kind == .increment, let row,
+               let field = (mutation.fields ?? [:]).keys.sorted().first(where: { !recordLogNumeric(row[$0]).isFinite }) {
+                let place = at == 0 ? "" : "write \(at + 1) of the transaction: "
+                throw refused(.documentEntryInvalid, "\(place)increment of `\(field)` overflows", [
+                    "current": RecordLogCurrentRecord(model: key.model, id: key.id, row: after[key]).json,
+                ])
+            }
+            after[key] = row
+        }
+        // Every touched live record against every constraint of its model whose
+        // key it holds in full: another touched record holding the key, or an
+        // untouched live one, refuses the entry (js-bao's `checkConstraints`).
+        for constraint in constraints {
+            let mine = order.filter { $0.model == constraint.model }
+            guard !mine.isEmpty else { continue }
+            var held: [String: RecordLogRecordKey] = [:]
+            for key in mine {
+                guard let row = after[key] else { continue }
+                let values = constraint.fields.map { row[$0] ?? .null }
+                guard !values.contains(.null) else { continue }
+                let text = RecordLogJSON.text(.array(values))
+                let holder: String?
+                if let other = held[text] {
+                    holder = other.id
+                } else {
+                    held[text] = key
+                    holder = try confirmed.holder(model: constraint.model, fields: constraint.fields, values: values, excluding: mine.map(\.id))
+                }
+                if let holder {
+                    throw refused(
+                        .documentConstraintViolated,
+                        "unique constraint \"\(constraint.name)\" of \(constraint.model): \(holder) already holds the key",
+                        ["constraint": .string(constraint.name), "conflicting": RecordLogRecordKey(model: constraint.model, id: holder).json]
+                    )
+                }
+            }
+        }
+        let changes = order.compactMap { key -> RecordLogChange? in
+            if let row = after[key] { return RecordLogChange(model: key.model, id: key.id, row: row) }
+            return before[key] == nil ? nil : RecordLogChange(model: key.model, id: key.id, gone: true)
+        }
+        return (changes, resolved.alias)
+    }
+
+    /// Whether `row`, as record `key`, matches `condition` (the query filter
+    /// grammar): the view's own translation, run over a one-row table holding
+    /// the row, so a condition means what the same filter means to a query.
+    private func conditionHolds(
+        _ sql: RecordLogSql, _ key: RecordLogRecordKey, _ row: RecordLogRow, _ condition: JSONValue
+    ) throws -> Bool {
+        guard let filter = condition.objectValue else { return false }
+        let (clause, params) = try QueryTranslator.translateView(filter, table: "condition_row")
+        return try sql.first(
+            "WITH condition_row(doc_id, _type, _id, _data) AS (SELECT ?, ?, ?, jsonb(?)) "
+                + "SELECT 1 AS hit FROM condition_row WHERE (\(clause))",
+            [doc, .text(key.model), .text(key.id), .text(RecordLogJSON.stored(row))] + params.map(Format2SqlValue.init(bindable:))
+        ) != nil
     }
 
     /// Apply what the room relayed, item by item.
@@ -2151,7 +2521,7 @@ final class RecordLogStore: @unchecked Sendable {
         var changed: [RecordLogRowChange] = []
         for found in try sql.rows(
             """
-            SELECT v._type AS _type, v._id AS _id, v._data AS _data FROM record_log_view v
+            SELECT v._type AS _type, v._id AS _id, json(v._data) AS _data FROM record_log_view v
               LEFT JOIN temp.record_log_view_before b ON b._type = v._type AND b._id = v._id
              WHERE v.doc_id = ? AND (b._id IS NULL OR b._data <> v._data)
             UNION ALL
@@ -2163,7 +2533,7 @@ final class RecordLogStore: @unchecked Sendable {
         ) {
             guard let model = found["_type"].stringValue, let id = found["_id"].stringValue else { continue }
             changed.append(RecordLogRowChange(
-                model: model, id: id, row: found["_data"].isNull ? nil : RecordLogJSON.row(found["_data"].stringValue)
+                model: model, id: id, row: found["_data"].isNull ? nil : RecordLogJSON.row(found["_data"].stringValue, id: id)
             ))
         }
         try sql.exec("DELETE FROM temp.record_log_view_before")
@@ -2171,17 +2541,67 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Record what the room said about epochs, constraints and the db3's type, and the permission the client holds.
+    /// `localOnly` marks the db3 as living only on this device (#5155): from
+    /// then on its writes are judged and confirmed here.
     @discardableResult
     func setState(
         writer: String, notice: (current: Int, next: Int?, entries: Int?)? = nil,
-        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil, type: RecordLogTypeUpdate? = nil
+        constraints: [RecordLogConstraint]? = nil, permission: String?? = nil, type: RecordLogTypeUpdate? = nil,
+        localOnly: Bool? = nil
     ) throws -> RecordLogMarks {
         try command { sql in
             if let notice { try rules(writer).notice(current: notice.current, next: notice.next, entries: notice.entries) }
             if let constraints { try tables.setConstraints(constraints) }
             if let permission { try tables.setPermission(permission) }
             if let type { try tables.setType(type) }
+            if let localOnly { try tables.setLocalOnly(localOnly) }
             return try marksOn(sql)
+        }
+    }
+
+    /// Replace a local-only db3's index registrations and the constraints it
+    /// enforces, in one transaction (#5155), only while its registrations are
+    /// still `from` and, when `unique` names a key, no two records of the view
+    /// share it: a registration is judged against the registrations and rows
+    /// it changes, and no write lands between the check and the constraint.
+    /// Answers `moved` (nothing written) when another change came first, and
+    /// `duplicates` (nothing written) naming up to `unique.limit` shared keys.
+    func changeLocalIndexes(
+        from: [RecordLogLocalIndex], to: [RecordLogLocalIndex], constraints: [RecordLogConstraint],
+        unique: (model: String, fields: [String], limit: Int)? = nil
+    ) throws -> RecordLogLocalIndexChange {
+        try command { sql in
+            if RecordLogLocalIndex.text(try tables.localIndexes()) != RecordLogLocalIndex.text(from) {
+                return .moved(try marksOn(sql))
+            }
+            if let unique {
+                let shared = try duplicateKeys(sql, model: unique.model, fields: unique.fields, limit: unique.limit)
+                if !shared.isEmpty { return .duplicates(shared, try marksOn(sql)) }
+            }
+            try tables.setLocalIndexes(to)
+            try tables.setConstraints(constraints)
+            return .changed(try marksOn(sql))
+        }
+    }
+
+    /// Up to `limit` keys over `fields` that records of `model` in the view
+    /// share, null-free keys only, in key order: what a unique registration on
+    /// a local-only db3 is refused for (#5155), as the room reads its records.
+    private func duplicateKeys(
+        _ sql: RecordLogSql, model: String, fields: [String], limit: Int
+    ) throws -> [(values: [JSONValue], count: Int)] {
+        let columns = fields.map { "json_extract(_data, '$.\($0)')" }
+        let selected = columns.enumerated().map { "json_quote(\($0.element)) AS k\($0.offset)" }.joined(separator: ", ")
+        return try sql.rows(
+            """
+            SELECT \(selected), COUNT(*) AS n FROM record_log_view
+             WHERE doc_id = ? AND _type = ? AND \(columns.map { "\($0) IS NOT NULL" }.joined(separator: " AND "))
+             GROUP BY \(columns.joined(separator: ", ")) HAVING COUNT(*) > 1
+             ORDER BY \(columns.joined(separator: ", ")) LIMIT \(max(1, limit))
+            """,
+            [doc, .text(model)]
+        ).map { row in
+            (fields.indices.map { RecordLogJSON.parse(row["k\($0)"].stringValue ?? "null") ?? .null }, row["n"].intValue ?? 0)
         }
     }
 
@@ -2215,16 +2635,24 @@ final class RecordLogStore: @unchecked Sendable {
     // MARK: - Residency
 
     /// Whether a db3's store holds a readable copy (js-bao's
-    /// `isRecordLogResident`): it was created here and not yet synced, or a
+    /// `isRecordLogResident`): it lives only on this device, or it was created
+    /// here and not yet synced, or a
     /// load or catch-up completed on this device and no replacement is
     /// interrupted, or the one in progress is staged.
     static func isResident(_ marks: RecordLogMarks, createdLocally: Bool = false) -> Bool {
-        isResident(lastCatchUpAt: marks.lastCatchUpAt, replacing: marks.replacing, staged: marks.staged, createdLocally: createdLocally)
+        // A db3 that lives only on this device (#5155) has no room to load from.
+        isResident(
+            lastCatchUpAt: marks.lastCatchUpAt, replacing: marks.replacing, staged: marks.staged,
+            createdLocally: createdLocally || marks.localOnly
+        )
     }
 
     /// ``isResident(_:createdLocally:)`` over what a store holds of a document before it is bound.
     static func isResident(_ state: RecordLogStoredState, createdLocally: Bool = false) -> Bool {
-        isResident(lastCatchUpAt: state.lastCatchUpAt, replacing: state.replacing, staged: state.staged, createdLocally: createdLocally)
+        isResident(
+            lastCatchUpAt: state.lastCatchUpAt, replacing: state.replacing, staged: state.staged,
+            createdLocally: createdLocally || state.localOnly
+        )
     }
 
     private static func isResident(lastCatchUpAt: Int64?, replacing: Bool, staged: Bool, createdLocally: Bool) -> Bool {
@@ -2234,12 +2662,80 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Every document the store holds a state row for, sorted by id; `[]`,
-    /// creating nothing, on a database with no record-log tables.
-    static func storedDocumentIds(host: any Format2SqlHost) throws -> [String] {
-        let store = RecordLogStore(host: host, documentId: "", clientId: "")
+    /// creating nothing, on a database with no record-log tables. With
+    /// `userId`, a db3 that lives only on this device is listed only for the
+    /// user it belongs to (``localOnlyOwner(sql:documentId:)``).
+    static func storedDocumentIds(host: any Format2SqlHost, userId: String? = nil) throws -> [String] {
+        let store = try migrated(host: host, documentId: "")
         return try store.reading { sql in
             guard try store.tablesExist(sql) else { return [] }
-            return try sql.rows("SELECT doc_id FROM record_log_state ORDER BY doc_id").compactMap { $0["doc_id"].stringValue }
+            guard let userId else {
+                return try sql.rows("SELECT doc_id FROM record_log_state ORDER BY doc_id").compactMap { $0["doc_id"].stringValue }
+            }
+            return try sql.rows(
+                """
+                SELECT s.doc_id AS doc_id FROM record_log_state s
+                 WHERE s.local_only = 0 OR COALESCE(
+                   (SELECT value FROM record_log_meta WHERE key = 'local_owner:' || s.doc_id),
+                   (SELECT user_id FROM record_log_owner LIMIT 1)
+                 ) IS ?
+                 ORDER BY s.doc_id
+                """,
+                [.text(userId)]
+            ).compactMap { $0["doc_id"].stringValue }
+        }
+    }
+
+    /// The db3s living only on this device that belong to `userId` (its owner
+    /// tag, else the store's owner, as ``isVisible(host:documentId:userId:)``
+    /// reads it), sorted by id; `[]`, creating nothing, on a database with no
+    /// record-log tables (#5155).
+    static func localOnlyDocumentIds(host: any Format2SqlHost, userId: String) throws -> [String] {
+        let store = try migrated(host: host, documentId: "")
+        return try store.reading { sql in
+            guard try store.tablesExist(sql) else { return [] }
+            return try sql.rows(
+                """
+                SELECT s.doc_id AS doc_id FROM record_log_state s
+                 WHERE s.local_only = 1 AND COALESCE(
+                   (SELECT value FROM record_log_meta WHERE key = 'local_owner:' || s.doc_id),
+                   (SELECT user_id FROM record_log_owner LIMIT 1)
+                 ) IS ?
+                 ORDER BY s.doc_id
+                """,
+                [.text(userId)]
+            ).compactMap { $0["doc_id"].stringValue }
+        }
+    }
+
+    /// A store for `documentId` whose tables, when an older build wrote them,
+    /// are brought to ``RecordLogSchema/storageVersion`` first, so a read of
+    /// the local-only columns (#5155) meets them; a database with no
+    /// record-log table is left without one. A store at the version costs one
+    /// version read and one probe.
+    private static func migrated(host: any Format2SqlHost, documentId: String) throws -> RecordLogStore {
+        let store = RecordLogStore(host: host, documentId: documentId, clientId: "")
+        if try store.reading({ try store.tablesExist($0) }) { try store.initialize() }
+        return store
+    }
+
+    /// The `record_log_meta` key a local-only db3's owner is kept under once
+    /// another user signed in on this device (#5155).
+    static func localOwnerKey(_ documentId: String) -> String { "local_owner:\(documentId)" }
+
+    /// Whether `userId` may read `documentId` here: any db3 that syncs; one
+    /// that lives only on this device only for the user it belongs to (its
+    /// owner tag, else the store's owner).
+    static func isVisible(host: any Format2SqlHost, documentId: String, userId: String) throws -> Bool {
+        let store = try migrated(host: host, documentId: documentId)
+        return try store.reading { sql in
+            guard try store.tablesExist(sql) else { return true }
+            guard try sql.first(
+                "SELECT 1 AS hit FROM record_log_state WHERE doc_id = ? AND local_only = 1", [.text(documentId)]
+            ) != nil else { return true }
+            let tagged = try sql.first("SELECT value FROM record_log_meta WHERE key = ?", [.text(localOwnerKey(documentId))])?["value"].stringValue
+            let owner = try sql.first("SELECT user_id FROM record_log_owner LIMIT 1")?["user_id"].stringValue
+            return (tagged ?? owner) == userId
         }
     }
 
@@ -2278,17 +2774,37 @@ final class RecordLogStore: @unchecked Sendable {
     /// dropped. A store an older build wrote is brought to the version first,
     /// since it lacks tables the reset clears; a database with no record-log
     /// table is left without one.
+    ///
+    /// A db3 that lives only on this device has no copy anywhere else, so the
+    /// reset keeps it (#5155): one with no owner tag is tagged `previousOwner`'s
+    /// (the user the store belonged to), and it is listed and bound for that
+    /// user alone (``storedDocumentIds(host:userId:)``,
+    /// ``isVisible(host:documentId:userId:)``).
     @discardableResult
-    static func purgeAll(host: any Format2SqlHost) throws -> Int {
-        let store = RecordLogStore(host: host, documentId: "", clientId: "")
-        if try store.reading({ try store.tablesExist($0) }) { try store.initialize() }
+    static func purgeAll(host: any Format2SqlHost, previousOwner: String? = nil) throws -> Int {
+        let store = try migrated(host: host, documentId: "")
         return try store.command { sql in
             guard try store.tablesExist(sql) else { return 0 }
+            let kept = "(SELECT doc_id FROM record_log_state WHERE local_only = 1)"
+            if let previousOwner {
+                try sql.exec(
+                    """
+                    INSERT OR IGNORE INTO record_log_meta (key, value)
+                      SELECT 'local_owner:' || doc_id, ? FROM record_log_state WHERE local_only = 1
+                    """,
+                    [.text(previousOwner)]
+                )
+            }
             let dropped = try sql.first(
-                "SELECT COUNT(*) AS n FROM record_log_pending WHERE void = 0 AND acked IS NULL"
+                "SELECT COUNT(*) AS n FROM record_log_pending WHERE void = 0 AND acked IS NULL AND doc_id NOT IN \(kept)"
             )?["n"].intValue ?? 0
-            for table in RecordLogSchema.clientTables { try sql.exec("DELETE FROM \(table)") }
-            try sql.exec("DELETE FROM record_log_meta WHERE key LIKE 'db3_type:%'")
+            for table in RecordLogSchema.clientTables where table != "record_log_state" {
+                try sql.exec("DELETE FROM \(table) WHERE doc_id NOT IN \(kept)")
+            }
+            try sql.exec(
+                "DELETE FROM record_log_meta WHERE key LIKE 'db3_type:%' AND substr(key, 10) NOT IN \(kept)"
+            )
+            try sql.exec("DELETE FROM record_log_state WHERE local_only = 0")
             return dropped
         }
     }

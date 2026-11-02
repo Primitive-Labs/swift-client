@@ -39,8 +39,16 @@ final class WebSocketTransportSnapshot: @unchecked Sendable {
     private var _connected = false
     private var _connecting = false
     private var _task: URLSessionWebSocketTask?
+    private var _sentForTest: (@Sendable (String) -> Void)?
 
     var connected: Bool { lock.withLock { _connected } }
+
+    /// Test seam: hears every frame `send(_:)` hands the socket (a binary one
+    /// decoded as UTF-8). Internal; never set in production code.
+    var sentForTest: (@Sendable (String) -> Void)? {
+        get { lock.withLock { _sentForTest } }
+        set { lock.withLock { _sentForTest = newValue } }
+    }
     var connecting: Bool { lock.withLock { _connecting } }
 
     var task: URLSessionWebSocketTask? {
