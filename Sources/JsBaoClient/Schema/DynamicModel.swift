@@ -703,6 +703,7 @@ public final class DynamicModel: @unchecked Sendable {
             return PrimitiveRecord(modelName: schema.name, id: id, model: self, recordLogSeq: seq)
         }
         // Format 1: a model saved here is deprecated (records belong in a db3).
+        try refuseVectorFieldsOffDb3()
         warnFormat1Save()
         try withThrowingTx { [self] txn in
             let root = txn.transactionGetOrInsertMap(name: self.schema.name)
@@ -1256,8 +1257,11 @@ public final class DynamicModel: @unchecked Sendable {
         )
     }
 
-    public func count(_ filter: DocumentFilter? = nil) throws -> Int {
-        if let local { return try local.count(filter: filter) }
+    /// How many of this document's records match `filter`. On a db3,
+    /// `options.maxDrift` refuses the count `DB3_DRIFT_EXCEEDED` as a page is
+    /// (#5221); the other options do not apply to a count.
+    public func count(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
+        if let local { return try local.count(filter: filter, options: options) }
         awaitObserverDrain()
         return try queryEngine.count(
             modelName: schema.name, filter: filter, scopedToDocId: docId,
@@ -1295,6 +1299,7 @@ public final class DynamicModel: @unchecked Sendable {
         case let .date(s):      return .string(s)
         case .stringset:        return nil
         case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
+        case let .vector(v):    return .array(v.map { .number(Double($0)) })
         }
     }
 
@@ -1884,6 +1889,7 @@ public final class DynamicModel: @unchecked Sendable {
             )
         }
         // Format 1: a model saved here is deprecated (records belong in a db3).
+        try refuseVectorFieldsOffDb3()
         warnFormat1Save()
         try withThrowingTx { [self] txn in
             try self.applyWriteInternal(
@@ -1916,6 +1922,22 @@ public final class DynamicModel: @unchecked Sendable {
         }
     }
 
+    /// Refuse a save of a model declaring a vector field to a document that
+    /// is not a db3 (#5225), before anything is written: a vector field
+    /// belongs to a db3, and a format-1 document holds no vectors. js-bao's
+    /// `VectorFieldFormatError`.
+    private func refuseVectorFieldsOffDb3() throws {
+        guard local == nil else { return }
+        let vectors = schema.fields.filter { $0.value.type == .vector }.keys.sorted()
+        guard !vectors.isEmpty else { return }
+        throw JsBaoError(
+            code: .invalidArgument,
+            message: "[\(schema.name)] Cannot save to document '\(docId)': the model declares the vector field "
+                + "\(vectors.joined(separator: ", ")), and a vector field belongs to a db3. Save it to a db3 instead.",
+            details: ["fields": .array(vectors.map { .string($0) })]
+        )
+    }
+
     private func applyWriteInternal(
         id: String,
         values: [String: PrimitiveValue],
@@ -1923,6 +1945,7 @@ public final class DynamicModel: @unchecked Sendable {
         changedFields: Set<String>? = nil,
         tx txn: YrsTransaction
     ) throws {
+        try refuseVectorFieldsOffDb3()
         // Every write funnels through here — `create`, `update`, `save`,
         // both upsert forms — so this is where the primary key's presence
         // is enforced, once, for all of them. Mirrors js-bao's `save()`
@@ -2891,7 +2914,7 @@ internal extension PrimitiveFieldType {
         switch self {
         case .number:                     return .number
         case .boolean:                    return .boolean
-        case .json, .stringset:           return .json
+        case .json, .stringset, .vector:  return .json
         case .string, .date, .id:         return .string
         }
     }

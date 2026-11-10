@@ -209,6 +209,7 @@ public struct PrimitiveDecodeError: Error, Sendable, Equatable {
         case .number:                    return value.numberValue != nil
         case .boolean:                   return value.rowBoolValue != nil
         case .stringset:                 return value.stringArrayValue != nil
+        case .vector:                    return value.floatArrayValue != nil
         }
     }
 }

@@ -9,8 +9,8 @@ import XCTest
 /// declared `indexed` and `unique` fields have theirs from the bind; a
 /// composite unique registration is refused `DB3_INDEX_NOT_UNIQUE` while
 /// records share its key, and otherwise is enforced until it is dropped;
-/// `drop` of an index a declaration keeps is refused `DB3_INDEX_IN_USE`; a
-/// member index is refused `DB3_LOCAL_ONLY` and lists nothing.
+/// `drop` of an index a declaration keeps is refused `DB3_INDEX_IN_USE` (a
+/// member index is #5156's).
 final class Db3LocalOnlyIndexesHermeticTests: XCTestCase {
 
     private let world = Db3LocalOnlyWorld()
@@ -84,13 +84,7 @@ final class Db3LocalOnlyIndexesHermeticTests: XCTestCase {
         let slug = await db3LocalOnlyThrown { _ = try notes.save(id: "n4", values: ["slug": .string("a")]) }
         XCTAssertEqual(slug?.code, .documentConstraintViolated)
 
-        // A member index is the room's to build: refused, and nothing is listed.
-        let members = await db3LocalOnlyThrown {
-            _ = try await db3.indexes.register(info.id, Db3IndexRegistration(model: "Note", field: "tags", members: true))
-        }
-        XCTAssertEqual(members?.code, .db3LocalOnly)
-        let after = try await db3.indexes.list(info.id)
-        XCTAssertFalse(after.contains { $0.members || $0.fields == ["tags"] })
+        // A member index is built on the device too (#5156: Db3LocalOnlyMemberIndexSurfaceHermeticTests).
 
         // An invalid registration is the room's DB3_INDEX_INVALID.
         let invalid = await db3LocalOnlyThrown {

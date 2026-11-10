@@ -69,6 +69,7 @@ final class Db3BlobQueueLiveTests: XCTestCase {
 
     // MARK: - Behaviors 12, 17 and 13
 
+    @available(*, deprecated)
     func testAQueuedDb3UploadIsScopedToItsFamilyStoredWithItsDestinationAndSentToTheDb3RouteByTheNextClient() async throws {
         let owner = try await live.client("owner", models: [])
         let db3Id = try await createdOnServer(owner, title: "Queued").id

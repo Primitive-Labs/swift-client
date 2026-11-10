@@ -1,8 +1,9 @@
 import Foundation
 
-/// A value a model-free write (`client.documents.records(_:)`) carries in a
+/// A value a model-free write (`client.db3.records(_:)`) carries in a
 /// field of a format-3 document: a string, a number, a boolean, `null`, a
-/// string set, or a change that edits a string set in place.
+/// string set, a change that edits a string set in place, or a vector's
+/// numbers (#5225).
 ///
 /// Literals build the first five, so a write reads as data:
 ///
@@ -28,6 +29,11 @@ public enum DocumentRecordValue: Sendable {
     /// then `remove` the ones named, then `add` adds. A create takes `add` only.
     /// A change of nothing still makes the field a string set.
     case setChange(add: [String] = [], remove: [String] = [], clear: Bool = false)
+    /// A vector field's numbers (#5225): written as the base64 of the field's
+    /// encoding, the db3's type's or a registered model's. Numbers for a field
+    /// this device does not know to be a vector are refused
+    /// `.documentEntryInvalid`; its stored base64 can be written as a string.
+    case vector([Float])
 
     /// A string set's members, each once, in byte order; `[]` for any other value.
     var members: [String] {
@@ -48,6 +54,7 @@ public enum DocumentRecordValue: Sendable {
             return .object([
                 "$add": .array(add.map { .string($0) }), "$remove": .array(remove.map { .string($0) }), "$clear": .bool(clear),
             ])
+        case .vector(let numbers): return .array(numbers.map { .number(Double($0)) })
         }
     }
 }
@@ -63,6 +70,7 @@ extension DocumentRecordValue: Equatable {
         case (.number(let x), .number(let y)): return x == y
         case (.bool(let x), .bool(let y)): return x == y
         case (.null, .null): return true
+        case (.vector(let x), .vector(let y)): return x == y
         case (.stringSet, .stringSet): return same(a.members, b.members)
         case (.setChange(let addA, let removeA, let clearA), .setChange(let addB, let removeB, let clearB)):
             return clearA == clearB && same(recordLogCanonicalStringSet(addA), recordLogCanonicalStringSet(addB))

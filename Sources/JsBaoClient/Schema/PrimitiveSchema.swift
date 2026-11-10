@@ -22,7 +22,7 @@ public enum DefaultValue: Equatable, Hashable, Sendable {
             return s
         case let .scalar(.date(s)):
             return s
-        case .scalar(.stringset), .scalar(.json):
+        case .scalar(.stringset), .scalar(.json), .scalar(.vector):
             // These field types don't serialize as primitive scalars on the
             // meta layer; js-bao has no precedent for them as defaults.
             return NSNull()
@@ -87,6 +87,10 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
     /// write path (`DynamicModel.save`) to stamp `Date.now()`-style epoch
     /// milliseconds on insert / update, mirroring js-bao's `BaseModel.save`.
     public var autoStamp: AutoStamp?
+    /// A vector field's number of numbers (#5225); `nil` on any other field.
+    public var dims: Int?
+    /// How each number of a vector field is stored (#5225); `nil` on any other field.
+    public var element: VectorElement?
 
     public init(
         type: PrimitiveFieldType,
@@ -97,7 +101,9 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         maxLength: Int? = nil,
         maxCount: Int? = nil,
         default: DefaultValue? = nil,
-        autoStamp: AutoStamp? = nil
+        autoStamp: AutoStamp? = nil,
+        dims: Int? = nil,
+        element: VectorElement? = nil
     ) {
         self.type = type
         self.indexed = indexed
@@ -108,6 +114,15 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         self.maxCount = maxCount
         self.default = `default`
         self.autoStamp = autoStamp
+        self.dims = dims
+        self.element = element
+    }
+
+    /// A vector field's encoding: its `dims` and `element`, or `nil` when the
+    /// field is not a well-formed vector field.
+    public var vectorEncoding: VectorEncoding? {
+        guard type == .vector, let dims, dims >= 1, let element else { return nil }
+        return VectorEncoding(dims: dims, element: element)
     }
 }
 

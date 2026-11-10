@@ -60,6 +60,8 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     private var _writer: String
     private var _marks: RecordLogMarks
     private var schemas: [String: PrimitiveSchema] = [:]
+    /// The vector fields whose stored value did not fit, warned about once (#5225).
+    private var vectorMisfits: Set<String> = []
     /// This writer's entries the room has not acknowledged, with the records each touches.
     private var unacked: [Int: [RecordLogRecordKey]] = [:]
     /// This writer's entries handed back, by `seq`. A later save that takes
@@ -105,10 +107,12 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     /// Open `documentId`'s store over `host`: create the tables, mint this
     /// client's writer (a ULID per document and client id), read the marks.
-    init(host: any Format2SqlHost, documentId: String, clientId: String, logger: Logger? = nil) throws {
+    init(
+        host: any Format2SqlHost, documentId: String, clientId: String, logger: Logger? = nil, deviceIndexes: Db3DeviceIndexes = .all
+    ) throws {
         self.documentId = documentId
         self.logger = logger
-        let store = RecordLogStore(host: host, documentId: documentId, clientId: clientId, logger: logger)
+        let store = RecordLogStore(host: host, documentId: documentId, clientId: clientId, logger: logger, deviceIndexes: deviceIndexes)
         try store.initialize()
         let writer = try store.mintWriter()
         let marks = try store.marks()
@@ -116,6 +120,31 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         self._writer = writer
         self._marks = marks
         for (seq, records) in marks.unacked { unacked[seq] = records }
+        vectorJobs = RecordLogVectorJobs(store: store) { [weak self] notice in self?.vectorNoticed(notice) }
+    }
+
+    // MARK: - Vector indexes (#5230)
+
+    /// The background work on the db3's device vector indexes: fills, and
+    /// what their `ann` entries want, told to ``onVectorNotice(_:)``.
+    private var vectorJobs: RecordLogVectorJobs!
+    private var vectorListener: (@Sendable (RecordLogVectorJobs.Notice) -> Void)?
+
+    /// Hear what the db3's vector indexes want and when their statuses change.
+    func onVectorNotice(_ listener: @escaping @Sendable (RecordLogVectorJobs.Notice) -> Void) {
+        state.withLock { vectorListener = listener }
+    }
+
+    private func vectorNoticed(_ notice: RecordLogVectorJobs.Notice) {
+        let listener = state.withLock { closed ? nil : vectorListener }
+        listener?(notice)
+    }
+
+    /// A store operation that may change the vector indexes' wants or start a fill ran.
+    func vectorsChanged(_ change: RecordLogVectorJobs.Change) {
+        guard !isClosed, let jobs = vectorJobs else { return }
+        // Off the caller's stack: a change heard inside a store operation runs once it returns.
+        Task.detached(priority: .utility) { jobs.after(change) }
     }
 
     /// This client's writer.
@@ -159,6 +188,82 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         if RecordLogStore.isResident(marks, createdLocally: createdLocally) { return true }
         guard let fresh = try? refreshMarks() else { return false }
         return RecordLogStore.isResident(fresh, createdLocally: createdLocally)
+    }
+
+    // MARK: - Vector fields (#5225)
+
+    /// Each vector field of `model` this device knows, with the encoding its
+    /// numbers are written and read with: the one the db3's type declares,
+    /// when the room sent it, else the registered model's own.
+    func vectorEncodings(model: String) -> [String: VectorEncoding] {
+        var out: [String: VectorEncoding] = [:]
+        for (field, descriptor) in state.withLock({ schemas[model] })?.fields ?? [:] {
+            if let encoding = descriptor.vectorEncoding { out[field] = encoding }
+        }
+        for (field, encoding) in declaredType?.vectors[model] ?? [:] { out[field] = encoding }
+        return out
+    }
+
+    /// `row` with each of `encodings`' fields read as its numbers: the
+    /// encoding's canonical base64 as an array of numbers, `null` as `null`,
+    /// and anything else (a writer that disagreed with the schema) as it is
+    /// stored, warned about once per model and field.
+    func decodedVectors(_ row: RecordLogRow, model: String, encodings: [String: VectorEncoding]) -> RecordLogRow {
+        guard !encodings.isEmpty else { return row }
+        var out = row
+        for (field, encoding) in encodings {
+            guard let value = row[field], value != .null else { continue }
+            if case .string(let text) = value, let numbers = try? VectorCodec.decode(text, encoding: encoding) {
+                out[field] = .array(numbers.map { .number(Double($0)) })
+                continue
+            }
+            let first = state.withLock { vectorMisfits.insert("\(model)\u{0}\(field)").inserted }
+            if first {
+                logger?.warn(
+                    "[record-log] \(model).\(field): a stored value does not fit the field's encoding (\(VectorCodec.describeField(encoding))); it reads as it is stored"
+                )
+            }
+        }
+        return out
+    }
+
+    /// `values`' vector numbers as the stored base64 of each field's encoding.
+    /// A value that does not fit is refused `.db3VectorInvalid`, and numbers
+    /// for a field this device does not know to be a vector
+    /// `.documentEntryInvalid`, before anything commits, each reported once as
+    /// a `DocumentWriteRefusedEvent`.
+    func encodedVectors(
+        _ values: [String: JSONValue], numbers: [String: [Float]], model: String, id: String, kind: RecordLogWriteKind
+    ) throws -> [String: JSONValue] {
+        guard !numbers.isEmpty else { return values }
+        let encodings = vectorEncodings(model: model)
+        var out = values
+        for (field, vector) in numbers.sorted(by: { $0.key < $1.key }) {
+            guard let encoding = encodings[field] else {
+                throw refusedVector(
+                    "Cannot save \(model) \(id): field `\(field)` holds numbers, and this device knows no vector field of that name: "
+                        + "declare it type \"vector\" with dims and element, or write its stored base64",
+                    code: .documentEntryInvalid, model: model, id: id, kind: kind
+                )
+            }
+            do {
+                out[field] = .string(try VectorCodec.encode(vector, encoding: encoding))
+            } catch let cause as JsBaoError {
+                throw refusedVector(
+                    "\(model) id=\(id): field \"\(field)\" is declared \(VectorCodec.describeField(encoding)); \(cause.message)",
+                    model: model, id: id, kind: kind
+                )
+            }
+        }
+        return out
+    }
+
+    private func refusedVector(
+        _ message: String, code: JsBaoErrorCode = .db3VectorInvalid, model: String, id: String, kind: RecordLogWriteKind
+    ) -> JsBaoError {
+        let error = JsBaoError(code: code, message: message, details: ["documentId": .string(documentId), "scope": "local"])
+        reportRefused(recordLogLocalRefusal(error, documentId: documentId, mutations: [RecordLogMutation(model: model, id: id, kind: kind)]))
+        return error
     }
 
     /// Every registered model's schema, by name.
@@ -235,6 +340,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
                 case .changed(let marks):
                     state.withLock { _marks = marks }
                     try store.syncIndexes(RecordLogLocalOnly.entries(RecordLogLocalOnly.indexList(schemas, registrations)))
+                    vectorsChanged(.list)
                     return registrations
                 case .duplicates(let duplicates, let marks):
                     state.withLock { _marks = marks }
@@ -304,6 +410,8 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         changes: [RecordLogRowChange] = []
     ) {
         let models = Set(records.map(\.model)).union(bulk)
+        // A row count is what a `train` want weighs (#5230).
+        if !records.isEmpty || !bulk.isEmpty { vectorsChanged(.rows) }
         let listeners = state.withLock { models.flatMap { modelListeners[$0]?.values.map { $0 } ?? [] } }
         for listener in listeners { listener() }
         guard let origin, !records.isEmpty || !bulk.isEmpty else { return }
@@ -320,6 +428,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     private func noticeChange(_ notice: RecordLogChangeNotice) {
+        if notice.origin == .local { vectorsChanged(.rows) }
         let listeners = state.withLock { Array(changeListeners.values) }
         for listener in listeners { listener(notice) }
     }
@@ -334,13 +443,18 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     /// Hear every change to this writer's unjudged entries: an acknowledgement
-    /// or a hand-back, whether or not a row changed.
+    /// or a hand-back, whether or not a row changed; and every results frame
+    /// that changed no row but may have moved the cursor or the head heard (#5221).
     @discardableResult
     func onPendingChanged(_ listener: @escaping @Sendable () -> Void) -> UUID {
         let token = UUID()
         state.withLock { pendingListeners[token] = listener }
         return token
     }
+
+    /// A results frame changed no row but may have moved the cursor or the
+    /// head heard (#5221): the pending listeners read the db3's state again.
+    func noticeHeard() { noticePending() }
 
     private func noticePending() {
         let listeners = state.withLock { Array(pendingListeners.values) }
@@ -739,22 +853,31 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         try setState(constraints: kept)
     }
 
-    /// Record what the room said about epochs, constraints, the db3's type and this client's permission.
+    /// Record what the room said about epochs, constraints, the db3's type,
+    /// its head (`heard`, a `record.opened`'s, #5221) and this client's permission.
     @discardableResult
     func setState(
         notice: (current: Int, next: Int?, entries: Int?)? = nil,
         constraints: [RecordLogConstraint]? = nil, permission: String?? = nil, type: RecordLogTypeUpdate? = nil,
-        localOnly: Bool? = nil
+        localOnly: Bool? = nil, heard: RecordLogHeard? = nil
     ) throws -> RecordLogMarks {
         let writer = self.writer
         let marks = try withOperation {
             try store.setState(
-                writer: writer, notice: notice, constraints: constraints, permission: permission, type: type, localOnly: localOnly
+                writer: writer, notice: notice, constraints: constraints, permission: permission, type: type, localOnly: localOnly,
+                heard: heard
             )
         }
         state.withLock { _marks = marks }
         return marks
     }
+
+    /// Whether this document's session is open now (#5221): a device read's
+    /// drift is `live` only then. The session marks it as its phase changes.
+    var isLive: Bool { store.isLive }
+
+    /// Mark the document's session open (`true`) or not.
+    func setLive(_ live: Bool) { store.setLive(live) }
 
     /// Take a permission the client heard for this db3 while it is bound
     /// (#5020): the store's mark follows it, `read` on `.reader` (saves are
@@ -791,7 +914,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     var declaredType: RecordLogDeclaredType? {
         let marks = self.marks
         guard marks.typed == .yes, let name = marks.db3Type?.name, let models = marks.declarations else { return nil }
-        return RecordLogDeclaredType(name: name, models: models)
+        return RecordLogDeclaredType(name: name, models: models, vectors: marks.vectors ?? [:])
     }
 
     /// Mark the copy of a db3 the server just created caught up, so it is
@@ -958,6 +1081,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             () -> ([CheckedContinuation<Void, Error>], [CheckedContinuation<RecordLogSettlement, Error>]) in
             guard !closed else { return ([], []) }
             closed = true
+            vectorListener = nil
             commitListeners = [:]
             modelListeners = [:]
             changeListeners = [:]
@@ -968,6 +1092,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             settleWaiters = [:]
             return (all, settling)
         }
+        vectorJobs?.stop()
         try? store.flush()
         let error = JsBaoError(
             code: .notFound,

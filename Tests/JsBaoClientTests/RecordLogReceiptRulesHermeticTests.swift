@@ -86,6 +86,21 @@ final class RecordLogReceiptRulesHermeticTests: XCTestCase {
         XCTAssertEqual(confirmed(tables)["n1"], ["id": "n1", "tags": ["c"]])
     }
 
+    /// #5274: the room stores a set in code-point order with each member once.
+    func testALoadLineKeepsAStringSetInCodePointOrderWithEachMemberOnce() throws {
+        let (tables, rules) = client([("n1", ["tags": ["a"]], "Note")])
+        let nested: JSONValue = .object(["list": ["z", "y"]])
+        _ = try rules.applyLoadLines(attempt: try load(rules), model: "Note", lines: [
+            line("n1", ["tags": ["Drama", "Comedy", "Drama"]]),
+            line("n2", ["tags": ["b", "a"], "meta": nested]),
+        ])
+        XCTAssertEqual(confirmed(tables), [
+            "n1": ["id": "n1", "tags": ["Comedy", "Drama"]],
+            // A nested value is opaque.
+            "n2": ["id": "n2", "tags": ["a", "b"], "meta": nested],
+        ])
+    }
+
     func testAPendingGuessStaysOnTopOfTheLoadedRow() throws {
         let (tables, rules) = client([("n1", ["title": "a", "n": 1], "Note")])
         _ = try rules.write(RecordLogMutation(json: .object([

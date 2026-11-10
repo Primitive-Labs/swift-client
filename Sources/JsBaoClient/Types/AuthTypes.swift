@@ -150,7 +150,7 @@ public struct OtpVerifyResult: Decodable, Sendable, Equatable {
 
 // MARK: Auth config
 
-/// One Google client, as `/oauth-config` publishes it (#2891).
+/// One Google client, as `GET settings/sign-in` publishes it (#2891).
 ///
 /// A projection of the stored entry, not the entry itself: no `clientSecret`
 /// is ever published, and `usable` is the server's SHAPE verdict — a client id,
@@ -210,7 +210,7 @@ let nativeGoogleClientType = "ios"
 
 /// The app's auth configuration, returned by `auth.getAuthConfig()`. Mirrors
 /// the object JS `AuthController.getAuthConfig()` resolves to (the
-/// `GET /oauth-config` envelope). The passkey fields pair with the native
+/// `GET settings/sign-in` envelope). The passkey fields pair with the native
 /// passkey flows (#929 — see `AuthAPI+NativePasskeys.swift`); the OAuth
 /// fields pair with native Google sign-in (#928); the Apple fields pair
 /// with `signInWithApple` (#409 port).
@@ -285,7 +285,7 @@ extension AuthConfigInfo {
 
 /// The app-launch config subset returned by `auth.getAppConfig()` /
 /// `client.getAppConfig()`. Mirrors the typed 7-field object JS
-/// `getAppConfig()` resolves to — the projection of the `/oauth-config`
+/// `getAppConfig()` resolves to — the projection of the sign-in settings
 /// envelope used to decide which login affordances to show before a session
 /// exists. (`getAuthConfig()` returns the typed superset `AuthConfigInfo`.)
 public struct AppConfigInfo: Decodable, Sendable, Equatable {
@@ -341,7 +341,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
     }
 
     public init(from decoder: Decoder) throws {
-        // The `/oauth-config` envelope carries no `googleAvailable` key — it is
+        // The sign-in settings carry no `googleAvailable` key — it is
         // a client-side predicate over the map — so decoding goes through the
         // full type and projects, rather than restating the rule here.
         self.init(from: try AuthConfigInfo(from: decoder))

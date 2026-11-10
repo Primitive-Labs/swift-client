@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-root-doc.test.ts
 /// Tests root document support.
+@available(*, deprecated)
 final class RootDocTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

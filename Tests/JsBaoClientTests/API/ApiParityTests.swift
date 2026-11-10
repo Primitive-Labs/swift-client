@@ -88,6 +88,7 @@ final class ApiParityTests: XCTestCase {
 
     // MARK: - DatabaseTypeConfigsAPI
 
+    @available(*, deprecated)
     func test_databaseTypeConfigs_routes() async throws {
         let r = CallRecorder()
         let api = DatabaseTypeConfigsAPI(transport: r)
@@ -167,6 +168,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(body?["inviteToken"] as? String, "tok-1")
     }
 
+    @available(*, deprecated)
     func test_invitations_listDeferredGrants_path() async throws {
         let r = CallRecorder()
         let api = InvitationsAPI(transport: r)
@@ -178,6 +180,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/deferred-grants")
     }
 
+    @available(*, deprecated)
     func test_invitations_revokeDeferredGrant_DELETE_withType() async throws {
         let r = CallRecorder()
         let api = InvitationsAPI(transport: r)
@@ -402,6 +405,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/documents/d1/group-permissions/team/g1")
     }
 
+    @available(*, deprecated)
     func test_documents_requestAccess_POSTsParams() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(
@@ -423,6 +427,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/documents/d1/access-requests")
     }
 
+    @available(*, deprecated)
     func test_documents_approveAccessRequest_path() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(

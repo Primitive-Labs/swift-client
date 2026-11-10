@@ -40,17 +40,51 @@ struct TestConfig {
     /// The admin this package's suites provision when no variable names one.
     static let harnessAdminEmail = "swift-client-tests@js-bao-wss.test"
 
-    /// Effective super-admin JWT used to provision test apps/users, resolved
-    /// once per test process (see `resolveSuperAdminJwt(environment:)`).
+    /// Effective super-admin JWT used to provision test apps/users. The admin
+    /// is resolved once per test process (see
+    /// `resolveSuperAdminCredential(environment:)`), but each call signs a
+    /// fresh token, so a run longer than the token's lifetime keeps
+    /// authenticating (#5474).
     static func superAdminJwt() async throws -> String {
-        try await superAdminJwtTask.value
+        try await superAdminCredentialTask.value.token()
     }
 
-    private static let superAdminJwtTask = Task<String, Error> {
-        try await resolveSuperAdminJwt(environment: ProcessInfo.processInfo.environment)
+    private static let superAdminCredentialTask = Task<SuperAdminCredential, Error> {
+        try await resolveSuperAdminCredential(environment: ProcessInfo.processInfo.environment)
     }
 
-    /// The suite's super-admin token, in order:
+    /// Who the suite authenticates as: a fixed token taken as given, or an
+    /// admin the suite signs its own tokens for.
+    enum SuperAdminCredential: Sendable {
+        case fixed(String)
+        case signed(adminId: String?, email: String)
+
+        /// A token for this admin, signed now when the suite signs its own.
+        func token() throws -> String {
+            switch self {
+            case .fixed(let jwt):
+                return jwt
+            case .signed(let adminId, let email):
+                guard let jwt = TestConfig.mintSuperAdminJwt(adminId: adminId, email: email) else {
+                    throw TestSetupError("Could not sign a token for \(adminId ?? email)")
+                }
+                return jwt
+            }
+        }
+    }
+
+    /// A token for the suite's super-admin (see
+    /// `resolveSuperAdminCredential(environment:testAdminToken:)`).
+    static func resolveSuperAdminJwt(
+        environment: [String: String],
+        testAdminToken: String? = nil
+    ) async throws -> String {
+        try await resolveSuperAdminCredential(
+            environment: environment, testAdminToken: testAdminToken
+        ).token()
+    }
+
+    /// The suite's super-admin, in order:
     ///
     ///   1. `TEST_SUPERADMIN_JWT`, when set and non-empty;
     ///   2. `TEST_SUPERADMIN_EMAIL`, when set: an email-only token, which the
@@ -62,18 +96,15 @@ struct TestConfig {
     /// The server refuses a token whose `adminId` has no row (#3885), so the
     /// suite can no longer self-mint an identity out of thin air. A failure of
     /// the third branch fails setup, naming the route and both variables.
-    static func resolveSuperAdminJwt(
+    static func resolveSuperAdminCredential(
         environment: [String: String],
         testAdminToken: String? = nil
-    ) async throws -> String {
+    ) async throws -> SuperAdminCredential {
         if let jwt = environment["TEST_SUPERADMIN_JWT"], !jwt.isEmpty {
-            return jwt
+            return .fixed(jwt)
         }
         if let email = environment["TEST_SUPERADMIN_EMAIL"], !email.isEmpty {
-            guard let jwt = mintSuperAdminJwt(adminId: nil, email: email) else {
-                throw TestSetupError("Could not sign an email-only token for TEST_SUPERADMIN_EMAIL=\(email)")
-            }
-            return jwt
+            return .signed(adminId: nil, email: email)
         }
         let admin: ProvisionedAdmin
         do {
@@ -90,10 +121,7 @@ struct TestConfig {
                 + "to an existing admin's email."
             )
         }
-        guard let jwt = mintSuperAdminJwt(adminId: admin.adminId, email: admin.email) else {
-            throw TestSetupError("Could not sign a token for provisioned admin \(admin.adminId)")
-        }
-        return jwt
+        return .signed(adminId: admin.adminId, email: admin.email)
     }
 
     struct ProvisionedAdmin: Sendable {

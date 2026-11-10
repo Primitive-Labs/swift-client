@@ -257,6 +257,7 @@ final class RoleSurfacesHermeticTests: XCTestCase {
 
     // MARK: - Behavior 8: document group grants by id
 
+    @available(*, deprecated)
     func testDocumentGroupGrantNamesTheGroupById() async throws {
         let transport = RecordingTransport(json: """
         {"documentId":"d1","groupType":"group","groupId":"g1","permission":"reader",
@@ -334,7 +335,9 @@ final class RoleSurfacesHermeticTests: XCTestCase {
     /// Every deprecation attribute in the group, collection and document
     /// client files names #4718, the issue that removes the compatibility
     /// surface. The floor keeps the scan from passing on files that declare
-    /// no deprecation at all.
+    /// no deprecation at all. A whole-family deprecation (#5356) names its
+    /// family and successor instead, ending with `(api-surface-stability)`;
+    /// `swift-api-status-5356.test.ts` holds those.
     func testEveryDeprecationNamesTheRemovalIssue() throws {
         var markers: [String] = []
         for file in [
@@ -342,7 +345,8 @@ final class RoleSurfacesHermeticTests: XCTestCase {
             "Types/GroupsTypes.swift", "Types/CollectionsTypes.swift", "Types/DocumentTypes.swift",
         ] {
             let lines = try ClientSourceText.code(file).components(separatedBy: "\n")
-            for line in lines where line.contains("@available(*, deprecated") {
+            for line in lines where line.contains("@available(*, deprecated")
+                && !line.contains("(api-surface-stability)\")") {
                 markers.append(line.trimmingCharacters(in: .whitespaces))
                 XCTAssertTrue(line.contains("#4718"), "\(file): \(line.trimmingCharacters(in: .whitespaces)) does not name #4718")
             }

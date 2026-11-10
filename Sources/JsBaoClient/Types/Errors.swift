@@ -207,16 +207,18 @@ public enum JsBaoErrorCode: String, Sendable {
     case db3ModelNotDeclared = "DB3_MODEL_NOT_DECLARED"
     /// The db3 lives only on this device (`client.db3.create(title:localOnly:
     /// true)`) and has no server record: a call that would send a request
-    /// naming it, an eviction door (its only copy is here), and a
-    /// member-index registration are refused with it before anything is sent
-    /// or removed. `details` carry `db3Id`.
+    /// naming it and an eviction door (its only copy is here) are refused
+    /// with it before anything is sent or removed. `details` carry `db3Id`.
     case db3LocalOnly = "DB3_LOCAL_ONLY"
     // `client.db3.indexes` on a db3 that lives only on this device, refused by
     // the room's rules on the device, with the room's codes.
     /// An invalid registration (`model`, `field` or `fields`, `unique`, `name`).
     case db3IndexInvalid = "DB3_INDEX_INVALID"
-    /// A field declared a string set takes no index. `details` carry `field`.
+    /// A field declared a string set takes no index of its own value: register
+    /// it with `members: true`. `details` carry `field`.
     case db3IndexSetField = "DB3_INDEX_SET_FIELD"
+    /// A member index on a field that holds one value, not a string set. `details` carry `field`.
+    case db3IndexNotSetField = "DB3_INDEX_NOT_SET_FIELD"
     /// Another index of the model holds the name over other fields. `details` carry `index`.
     case db3IndexNameTaken = "DB3_INDEX_NAME_TAKEN"
     /// The fields are indexed already under another name. `details` carry `index`.
@@ -227,6 +229,76 @@ public enum JsBaoErrorCode: String, Sendable {
     case db3IndexNotFound = "DB3_INDEX_NOT_FOUND"
     /// A declaration keeps the index. `details` carry `index` and `origins`.
     case db3IndexInUse = "DB3_INDEX_IN_USE"
+    /// An index kind and placement no side builds yet, refused before anything
+    /// is recorded: `details` carry `kind` and `on`. On a db3 that lives only
+    /// on this device, `.server` or `.both` is `DB3_LOCAL_ONLY` instead. Also
+    /// a query that needs a device index this device could not build: a
+    /// `$search` whose text index, or a `$near` whose vector index, is not
+    /// built here, with `details.engine` (`swift-sqlite`) and
+    /// `details.reason`; every other query answers.
+    case db3IndexPlacementUnsupported = "DB3_INDEX_PLACEMENT_UNSUPPORTED"
+    /// A vector field's value does not fit its encoding (#5225): the wrong
+    /// number of numbers, a number that is not finite, an `f16` value past
+    /// 65504, or stored text that is not the encoding's canonical base64. A
+    /// save is refused with it before anything commits (`details.scope:
+    /// "local"`), a typed db3's room hands a write back with it, and
+    /// `VectorCodec` throws it.
+    case db3VectorInvalid = "DB3_VECTOR_INVALID"
+    /// A device read with `QueryOptions.maxDrift` whose db3 copy is further
+    /// behind the server than the bound, or has not heard the server's
+    /// position yet (`details["drift"]` is then `null`). `details` carry
+    /// `db3Id`, `drift` and `maxDrift`. Subscribe to the db3 and await
+    /// `ready()`, or widen the bound. A db3 that lives only on this device
+    /// never is.
+    case db3DriftExceeded = "DB3_DRIFT_EXCEEDED"
+    /// A read needs an index this device does not hold, refused before
+    /// anything is read: a `$search` on a model with no text index on this
+    /// device (register one with `kind: .text, on: .device`; `details` carry
+    /// `model`), or a `$near` on a field with no vector index (register one
+    /// with `kind: .vector`; `details` carry `operator`, `model` and `field`).
+    case queryIndexNotOnDevice = "QUERY_INDEX_NOT_ON_DEVICE"
+    /// A read the server answers needs an index the server does not hold: a
+    /// `$search` on a model with no text index on the server (`details` carry
+    /// `model`, and `index` when the model's text index is built on devices
+    /// only), or `$near` in a records query, count or aggregate, which the
+    /// server never answers (`details` carry `operator`, `model` and `field`).
+    case queryIndexNotOnServer = "QUERY_INDEX_NOT_ON_SERVER"
+    /// A device read that cannot answer without an index this device declined
+    /// (`client.db3.indexes.decline`, or the client's `deviceIndexes` option
+    /// with nothing built): a `$search` on a declined text index, refused
+    /// before anything is read, and a `$near` on a declined vector index.
+    /// `details` carry `model`, `index` (the room's name) and `kind`;
+    /// `client.db3.indexes.accept` builds it again. A read a declined scalar
+    /// or member index only speeds answers by a scan.
+    case db3IndexDeclinedOnDevice = "DB3_INDEX_DECLINED_ON_DEVICE"
+    /// A read explained on this device (`client.db3.records(id).explain`)
+    /// forced onto an index that cannot serve it. `details` carry `index`,
+    /// `model` and `reason`: `kind` (a text or vector index), `placement`
+    /// (placed on the server only), `unbuilt` (not built here; with `status`
+    /// and `why`), `fields` (the read neither filters, sorts nor groups on its
+    /// fields), `shape` (no statement of the read took it), `search` (a
+    /// `$search` under `none`), `near` (a `$near` under any force) or `plan`
+    /// (SQLite found no plan through it). A name the db3's index list does not
+    /// have is `.db3IndexNotFound`.
+    case db3IndexCannotServe = "DB3_INDEX_CANNOT_SERVE"
+    // A vector index's shared model (`client.db3.indexes.fetchModel`,
+    // `uploadModel`, `deleteModel`): an `HttpError` whose `serverCode` is one
+    // of these. `JsBaoErrorCode(rawValue: error.serverCode)` reads it.
+    /// The index has a model, or another device holds the claim on its upload
+    /// (`details.pending` true, with `expiresAt`): fetch it instead.
+    case db3IndexModelExists = "DB3_INDEX_MODEL_EXISTS"
+    /// The upload names another generation of the index than the room's: the
+    /// index was dropped and registered again since the list was read.
+    case db3IndexGenerationStale = "DB3_INDEX_GENERATION_STALE"
+    /// The upload names a revision the room has moved past (its model was
+    /// deleted), or a claim that lapsed: read the index list again.
+    case db3IndexModelStale = "DB3_INDEX_MODEL_STALE"
+    /// The index has no model to fetch or delete.
+    case db3IndexModelNotFound = "DB3_INDEX_MODEL_NOT_FOUND"
+    /// The model is more than 64 MiB.
+    case db3IndexModelTooLarge = "DB3_INDEX_MODEL_TOO_LARGE"
+    /// The upload carries no body, or headers that do not describe one.
+    case db3IndexModelInvalid = "DB3_INDEX_MODEL_INVALID"
 }
 
 /// Main error type for the JsBao client library

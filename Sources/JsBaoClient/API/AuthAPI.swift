@@ -37,10 +37,10 @@ public final class AuthAPI: @unchecked Sendable {
     // `otpVerify` falls back to the email+code-only path.
     private let _otpVerifyWithInvite: ((_ email: String, _ code: String, _ inviteToken: String?) async throws -> OtpVerifyResult)?
 
-    // App auth config (`GET /oauth-config`)
+    // App auth config (`GET settings/sign-in`)
     private let _getAuthConfig: () async throws -> AuthConfigInfo
     // App-launch config subset. When unwired, derived from `_getAuthConfig`
-    // by projecting the shared `/oauth-config` envelope.
+    // by projecting the shared sign-in settings envelope.
     private let _getAppConfig: (() async throws -> AppConfigInfo)?
 
     // Logout. `_logout` is the legacy wipeLocal-only closure retained for the
@@ -163,6 +163,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Whether the client currently holds an authenticated session.
     /// Mirrors JS `client.isAuthenticated()`.
+    /// - Stability: production
     public func isAuthenticated() -> Bool { _isAuthenticated() }
 
     /// Block until a user id is available (e.g. while a persisted session
@@ -178,6 +179,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// Implemented here by polling the injected `getUserId` accessor — the
     /// Swift `AuthController` exposes no event-driven waiter, so this matches
     /// the JS contract (resolve-with-id / throw-on-timeout) without one.
+    /// - Stability: production
     @discardableResult
     public func waitForUserId(timeout: TimeInterval = 10) async throws -> String {
         if let uid = _getUserId() { return uid }
@@ -207,6 +209,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// A target that is sent must match the app's non-empty
     /// `emailRedirectUris`, or the request is rejected 400
     /// `Invalid redirect URI` (#2967); the client does not retry without it.
+    /// - Stability: production
     public func emailSignInRequest(
         _ params: EmailSignInRequestParams
     ) async throws -> EmailSignInRequestResult {
@@ -221,6 +224,7 @@ public final class AuthAPI: @unchecked Sendable {
     }
 
     /// Convenience overload taking the fields directly.
+    /// - Stability: production
     public func emailSignInRequest(
         email: String,
         redirectUri: String? = nil
@@ -233,6 +237,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// Request one sign-in email whose link lands on `target`, or none for
     /// `.codeOnly`. Mirrors JS `emailSignInRequest(email, { redirectUri })`,
     /// where `redirectUri: null` is `.codeOnly`.
+    /// - Stability: production
     public func emailSignInRequest(
         email: String,
         target: EmailSignInTarget
@@ -255,6 +260,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// 3. `links.appBaseURL`'s http(s) origin + `/oauth/callback`, read at
     ///    call time.
     /// 4. `nil`: a code-only email.
+    /// - Stability: production
     public func emailSignInLinkTarget(_ target: EmailSignInTarget = .automatic) -> String? {
         if let linkTarget = _emailSignInLinkTarget { return linkTarget(target) }
         return SignInRules.emailSignInLinkTarget(target, oauthRedirectUri: nil, appBaseURL: nil)
@@ -285,6 +291,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// A `state` beside `magic_token` is the app's own bag: its `continueUrl`
     /// is returned, and its `inviteToken` is used when `inviteToken` is nil. A
     /// failed verify or exchange throws that call's own error.
+    /// - Stability: production
     public func handleSignInCallback(
         _ url: URL,
         inviteToken: String? = nil
@@ -309,6 +316,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// signing-in user — even when the magic-link email differs from the
     /// invited email. Threaded through only when the invite-aware closure is
     /// wired; otherwise the token-only path is used.
+    /// - Stability: production
     public func magicLinkVerify(token: String, inviteToken: String? = nil) async throws -> MagicLinkVerifyResult {
         if let verifyWithInvite = _magicLinkVerifyWithInvite {
             return try await verifyWithInvite(token, inviteToken)
@@ -327,6 +335,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// signing-in user — even when the signup email differs from the invited
     /// email. Threaded through only when the invite-aware closure is wired;
     /// otherwise the email+code-only path is used.
+    /// - Stability: production
     public func otpVerify(_ params: OtpVerifyParams) async throws -> OtpVerifyResult {
         if let verifyWithInvite = _otpVerifyWithInvite {
             return try await verifyWithInvite(params.email, params.code, params.inviteToken)
@@ -335,14 +344,16 @@ public final class AuthAPI: @unchecked Sendable {
     }
 
     /// Convenience overload taking the fields directly.
+    /// - Stability: production
     public func otpVerify(email: String, code: String, inviteToken: String? = nil) async throws -> OtpVerifyResult {
         try await otpVerify(OtpVerifyParams(email: email, code: code, inviteToken: inviteToken))
     }
 
     // MARK: - Auth config
 
-    /// Fetch the app's auth configuration (`GET /oauth-config`). Mirrors JS
+    /// Fetch the app's auth configuration (`GET settings/sign-in`). Mirrors JS
     /// `auth.getAuthConfig()`, returning the typed `AuthConfigInfo`.
+    /// - Stability: production
     public func getAuthConfig() async throws -> AuthConfigInfo {
         try await _getAuthConfig()
     }
@@ -350,15 +361,16 @@ public final class AuthAPI: @unchecked Sendable {
     /// Fetch the app-launch config subset (`appId`, `name`, `mode`,
     /// `waitlistEnabled`, `googleAvailable`, `hasPasskey`, `emailSignInEnabled`).
     /// Mirrors JS `client.getAppConfig()` — the 7-field projection of the
-    /// `/oauth-config` envelope used to decide what login UI to show before a
-    /// session exists. Decodes the same `/oauth-config` payload as
+    /// sign-in settings envelope used to decide what login UI to show before a
+    /// session exists. Decodes the same `GET settings/sign-in` payload as
     /// `getAuthConfig()`; the extra fields are simply ignored.
+    /// - Stability: production
     public func getAppConfig() async throws -> AppConfigInfo {
         if let getAppConfig = _getAppConfig {
             return try await getAppConfig()
         }
         // Unwired: project the 7 launch-UI fields out of the full
-        // `/oauth-config` envelope (the same payload, extra fields ignored).
+        // sign-in settings envelope (the same payload, extra fields ignored).
         // Projected by `AppConfigInfo`'s own initializer, not restated here:
         // the launch UI and the flow must not be able to disagree about
         // whether Google sign-in is available (#2891).
@@ -372,6 +384,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// `revokeOffline`, `wipeLocal`, `clearOfflineIdentity`, and
     /// `waitForDisconnect`; otherwise it falls back to the legacy
     /// `wipeLocal`-only path.
+    /// - Stability: production
     public func logout(options: LogoutOptions = LogoutOptions()) async throws {
         if let logoutWithOptions = _logoutWithOptions {
             try await logoutWithOptions(options)
@@ -385,6 +398,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// Enable offline access by requesting a grant and storing it. Mirrors JS
     /// `auth.enableOfflineAccess(options)`, returning the typed
     /// `EnableOfflineAccessResult`.
+    /// - Stability: production
     public func enableOfflineAccess(
         options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()
     ) async throws -> EnableOfflineAccessResult {
@@ -394,6 +408,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// Unlock a stored offline grant (triggers Face ID / Touch ID when the
     /// grant is biometric-protected). Mirrors JS `auth.unlockOffline()`.
     /// Returns whether the unlock succeeded.
+    /// - Stability: production
     @discardableResult
     public func unlockOffline() async throws -> Bool {
         try await _unlockOffline()
@@ -407,6 +422,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Renew the offline grant while online. Mirrors JS
     /// `auth.renewOfflineGrantOnline(...)`. Returns whether renewal succeeded.
+    /// - Stability: production
     @discardableResult
     public func renewOfflineGrant(
         options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()
@@ -416,6 +432,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Revoke the stored offline grant. Mirrors JS
     /// `auth.revokeOfflineGrant(options)`.
+    /// - Stability: production
     public func revokeOfflineGrant(
         options: RevokeOfflineGrantOptions = RevokeOfflineGrantOptions()
     ) async throws {
@@ -425,6 +442,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// Whether an offline grant is currently stored on this device. Mirrors
     /// JS `auth.hasOfflineGrantStored()` — backed by the Swift controller's
     /// `isOfflineGrantAvailable()` (Keychain presence check).
+    /// - Stability: production
     public func hasOfflineGrantStored() -> Bool {
         _hasOfflineGrantStored()
     }
@@ -446,6 +464,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// host in the app's `webcredentials:` entitlement (#3024). Defaults to
     /// `AuthConfig.passkeyRpId`; with neither, the server picks from the
     /// request's `Origin`, which a native client never sends.
+    /// - Stability: production
     public func passkeyAuthStart(
         rpId: String? = nil
     ) async throws -> PasskeyAuthStartResult {
@@ -462,6 +481,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// `AuthenticationResponseJSON` (all binary fields base64url). Mirrors JS
     /// `passkeyAuthFinish(credential, challengeToken)`. On success the SDK
     /// has already applied the returned access token (cause `"passkeyAuth"`).
+    /// - Stability: production
     public func passkeyAuthFinish(
         credential: [String: Any],
         challengeToken: String
@@ -491,6 +511,7 @@ public final class AuthAPI: @unchecked Sendable {
     ///
     /// `rpId` names the relying party to register the passkey under, exactly
     /// as in `passkeyAuthStart(rpId:)` (#3024).
+    /// - Stability: production
     public func passkeyRegisterStart(
         rpId: String? = nil
     ) async throws -> PasskeyRegisterStartResult {
@@ -507,6 +528,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// `RegistrationResponseJSON`. Mirrors JS
     /// `passkeyRegisterFinish({ credential, challengeToken, deviceName,
     /// inviteToken })`.
+    /// - Stability: production
     public func passkeyRegisterFinish(
         credential: [String: Any],
         challengeToken: String,
@@ -537,6 +559,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// List the current user's registered passkeys. Mirrors JS
     /// `passkeyList()`.
+    /// - Stability: production
     public func passkeyList() async throws -> PasskeyListResult {
         guard let passkeyList = _passkeyList else {
             throw JsBaoError(code: .unavailable, message: "Passkey API not wired")
@@ -546,6 +569,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Delete a registered passkey by id. Mirrors JS
     /// `passkeyDelete(passkeyId)`.
+    /// - Stability: production
     @discardableResult
     public func passkeyDelete(passkeyId: String) async throws -> PasskeyDeleteResult {
         guard let passkeyDelete = _passkeyDelete else {
@@ -556,6 +580,7 @@ public final class AuthAPI: @unchecked Sendable {
 
     /// Rename a registered passkey. Mirrors JS
     /// `passkeyUpdate(passkeyId, { deviceName })`.
+    /// - Stability: production
     @discardableResult
     public func passkeyUpdate(passkeyId: String, deviceName: String) async throws -> PasskeyUpdateResult {
         guard let passkeyUpdate = _passkeyUpdate else {

@@ -14,6 +14,64 @@ struct RecordLogDeclaredType: Equatable, Sendable {
     var name: String
     /// Per declared model, each declared field's kind.
     var models: [String: [String: String]]
+    /// Per model declaring one, each vector field's encoding (#5225).
+    var vectors: RecordLogVectorDeclarations = [:]
+}
+
+/// What a written value is, for a vector refusal's message (#5225): js-bao's
+/// `vectorWrittenLabel`.
+private func recordLogVectorWrittenLabel(_ value: JSONValue) -> String {
+    switch value {
+    case .string(let text): return "a string of \(text.utf16.count) characters that is not that encoding's canonical base64"
+    case .array: return "an array"
+    case .object: return "a string-set change"
+    case .number: return "a number"
+    case .bool: return "a boolean"
+    case .null: return "an object"
+    }
+}
+
+/// Whether `value` is what a field of `encoding` holds: `null` or its canonical base64.
+func recordLogFitsVector(_ value: JSONValue, _ encoding: VectorEncoding) -> Bool {
+    switch value {
+    case .null: return true
+    case .string(let text): return VectorCodec.isCanonical(text, bytes: VectorCodec.byteLength(encoding))
+    default: return false
+    }
+}
+
+/// The message of a vector refusal: the record, the field, the declared encoding and what was written.
+func recordLogVectorWriteProblem(model: String, id: String, field: String, encoding: VectorEncoding, written: String) -> String {
+    "\(model) id=\(id): field \"\(field)\" is declared \(VectorCodec.describeField(encoding)); the write is \(written)"
+}
+
+/// Why an entry's mutations break a vector field, or `nil` (#5225): a value
+/// that is neither `null` nor the field's canonical base64, a string-set
+/// change of the field, or an increment of it. `m` is the first mutation,
+/// `also[i]` the others. js-bao's `vectorMutationsProblem`, the rule the room
+/// and the devices judge an entry with.
+func recordLogVectorMutationsProblem(
+    _ mutations: [RecordLogMutation], _ encodingOf: (String, String) -> VectorEncoding?
+) -> String? {
+    for (at, m) in mutations.enumerated() where m.kind != .delete {
+        let place = at == 0 ? "m" : "also[\(at - 1)]"
+        for (field, value) in (m.fields ?? [:]).sorted(by: { $0.key < $1.key }) {
+            guard let encoding = encodingOf(m.model, field) else { continue }
+            if m.kind == .increment {
+                return "\(place): " + recordLogVectorWriteProblem(model: m.model, id: m.id, field: field, encoding: encoding, written: "an increment")
+            }
+            if !recordLogFitsVector(value, encoding) {
+                return "\(place): " + recordLogVectorWriteProblem(
+                    model: m.model, id: m.id, field: field, encoding: encoding, written: recordLogVectorWrittenLabel(value)
+                )
+            }
+        }
+        for field in (m.stringSetDeltas ?? [:]).keys.sorted() {
+            guard let encoding = encodingOf(m.model, field) else { continue }
+            return "\(place): " + recordLogVectorWriteProblem(model: m.model, id: m.id, field: field, encoding: encoding, written: "a string-set change")
+        }
+    }
+    return nil
 }
 
 /// The scalar kinds a value is judged against.
@@ -82,10 +140,15 @@ private func recordLogReceivedKind(_ value: JSONValue) -> String {
 /// take, a scalar in a string set or a string-set change of a scalar
 /// (`.documentEntryInvalid`). An increment writes numbers; a delete, an `id`
 /// and a field the type does not declare are not judged. `m` is the first
-/// mutation, `also[i]` the others.
+/// mutation, `also[i]` the others. A vector field (#5225) is judged first, by
+/// the room's vector rule (``recordLogVectorMutationsProblem``),
+/// `.db3VectorInvalid`.
 func recordLogDeclaredTypeProblem(
     _ mutations: [RecordLogMutation], _ type: RecordLogDeclaredType
 ) -> (code: JsBaoErrorCode, message: String)? {
+    if !type.vectors.isEmpty, let vector = recordLogVectorMutationsProblem(mutations, { type.vectors[$0]?[$1] }) {
+        return (.db3VectorInvalid, vector)
+    }
     let declaredModels = type.models.keys.sorted { Array($0.utf16).lexicographicallyPrecedes(Array($1.utf16)) }
     for (at, m) in mutations.enumerated() {
         let place = at == 0 ? "m" : "also[\(at - 1)]"
@@ -116,7 +179,9 @@ func recordLogDeclaredTypeProblem(
             if !matches { return refuse(field, declared, kind == "string" && declared == "date" ? "a string that is not an ISO date" : kind) }
         }
         for field in (m.stringSetDeltas ?? [:]).keys.sorted() {
-            if let declared = kinds[field], declared != "stringset" { return refuse(field, declared, "a string-set change") }
+            if let declared = kinds[field], declared != "stringset", declared != "vector" {
+                return refuse(field, declared, "a string-set change")
+            }
         }
     }
     return nil

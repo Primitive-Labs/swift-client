@@ -118,9 +118,11 @@ final class WebSocketManagerSyncSurfaceTests: XCTestCase {
         XCTAssertTrue(armed, "the connect attempt never created its task")
         let pendingTask = try XCTUnwrap(manager.snapshot.task)
 
-        // Tell the manager the socket opened, so `disconnect()` takes the
-        // has-a-task path and parks on its continuation.
+        // Tell the manager the socket opened and the server said `ready`
+        // (#5578), so `disconnect()` takes the has-a-task path and parks on
+        // its continuation.
         manager.urlSession(.shared, webSocketTask: pendingTask, didOpenWithProtocol: nil)
+        manager.emit(.ready(task: ObjectIdentifier(pendingTask)))
         let connected = await eventuallyTrue { manager.isConnected }
         XCTAssertTrue(connected, "the injected open never landed")
         _ = try? await connecting.value

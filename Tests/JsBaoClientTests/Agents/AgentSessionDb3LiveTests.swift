@@ -63,6 +63,7 @@ final class AgentSessionDb3LiveTests: XCTestCase {
         throw TestSetupError("the model did not call the server tools")
     }
 
+    @available(*, deprecated)
     func testEveryMemberReadsTheTurnFromTheDb3WithNoDocumentsRequest() async throws {
         let s = try await h.createSession(h.server, participants: [h.part], viewers: [h.viewer], title: "Members")
         let ownerC = try await h.client(h.owner)

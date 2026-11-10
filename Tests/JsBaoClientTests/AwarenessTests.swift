@@ -4,6 +4,7 @@ import YSwift
 
 /// Tests awareness state sharing between clients.
 /// Port of awareness tests from tests/client/js-bao-client.test.ts
+@available(*, deprecated)
 final class AwarenessTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

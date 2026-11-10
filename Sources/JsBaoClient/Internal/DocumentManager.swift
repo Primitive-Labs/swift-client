@@ -3265,15 +3265,16 @@ public final class DocumentManager: @unchecked Sendable {
             persistDebounceTasks.removeAll()
         }
 
-        // Purge BOTH on-disk stores at the store level — the metadata store
-        // (`meta`) AND the Yjs CRDT store (`yjs_docs`). A per-document delete
+        // Purge the on-disk stores at the store level — this user's metadata
+        // store (with the pre-#4829 unscoped `meta` store) AND this user's rows
+        // in the app-wide Yjs CRDT store (`yjs_docs`). A per-document delete
         // driven by `metadataIndex` (the previous approach) evicted nothing
         // when nothing was loaded — the index is empty in the
         // `persistJwtInStorage == false` path — and never touched `yjs_docs`
         // at all, so a reused document ID reopened later could still hydrate a
         // prior account's CRDT content (issue #1780). The store-level clear
-        // truncates both tables regardless of what is in memory. Fast no-op on
-        // empty tables.
+        // truncates them regardless of what is in memory. Fast no-op on empty
+        // tables.
         try? await offlineStore?.clearAllDocumentData(appId: appId, userId: userId)
     }
 
@@ -3694,9 +3695,15 @@ public final class DocumentManager: @unchecked Sendable {
     /// `OfflineStore.putMetadata` silently does nothing while no provider is
     /// bound, and `setupStorage()` runs as an independent Task — so a write
     /// issued before it finishes used to be lost with no error and no retry.
-    /// Every metadata write the manager makes goes through here, and the same
-    /// enqueue-or-retry latch the skipped persist uses decides what happens to
-    /// the ones storage could not take (#3200).
+    /// It also takes nothing while no user is bound — the window between the
+    /// provider attaching and the signed-in user binding — because a row is
+    /// never persisted without an owner (#4829). Every metadata write the
+    /// manager makes goes through here, and the same enqueue-or-retry latch
+    /// the skipped persist uses decides what happens to the ones storage could
+    /// not take (#3200): the storage-ready drain runs after the bind and
+    /// writes them under the bound user. With storage ready and still no user
+    /// (no token, no session), the one retry is refused too and the row stays
+    /// in memory for the process, as in the JS client.
     ///
     /// `owner` pins the write to the user the row was written for; without it
     /// the row goes to whoever is signed in when the write reaches storage.
@@ -3935,7 +3942,7 @@ public final class YjsSQLitePersistence: @unchecked Sendable {
     /// The on-disk store (table partition) holding Yjs CRDT document
     /// content, keyed by `documentId` alone (app-wide). Exposed at module
     /// scope so a store-level purge (`OfflineStore.clearAllDocumentData`)
-    /// can truncate it alongside the `meta` store.
+    /// can truncate it alongside the metadata stores.
     static let store = "yjs_docs"
 
     public init(storageProvider: StorageProvider, documentId: String) {

@@ -216,7 +216,7 @@ public final class HttpClient: @unchecked Sendable {
         "/auth/otp/verify",
         "/passkey/auth/start",
         "/passkey/auth/finish",
-        "/oauth-config",
+        "/settings/sign-in",
         "/oauth/callback",
         "/auth/oauth/callback",
         "/auth/apple/callback",

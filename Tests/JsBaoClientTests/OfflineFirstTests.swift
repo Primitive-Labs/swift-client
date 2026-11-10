@@ -205,6 +205,7 @@ final class OfflineFirstTests: XCTestCase {
     /// pending-create entry — the same `{ documentId, title?, createdAt }`
     /// shape `listPendingCreates()` lists — or nil when the document has
     /// no uncommitted local create.
+    @available(*, deprecated)
     func testGetPendingCreateReturnsEntry() async throws {
         let client = createTestClient(
             appId: testApp.appId,

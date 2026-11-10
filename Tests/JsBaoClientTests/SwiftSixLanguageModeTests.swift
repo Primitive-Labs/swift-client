@@ -130,7 +130,7 @@ final class SwiftSixLanguageModeTests: XCTestCase {
         // one was not, which is what left the pin red on `main`.
         for target in [
             "JsBaoClient", "swift-bao-codegen", "JsBaoCodegenPlugin",
-            "JsBaoClientTests", "SwiftBaoCodegenTests", "E2EMiniApp",
+            "JsBaoClientTests", "SwiftBaoCodegenTests", "E2EMiniApp", "JsBaoSQLiteProbe",
         ] {
             XCTAssertTrue(
                 manifest.contains("name: \"\(target)\""),

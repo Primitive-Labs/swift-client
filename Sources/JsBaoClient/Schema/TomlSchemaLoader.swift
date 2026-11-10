@@ -10,7 +10,7 @@ import TOMLKit
 /// [models.<ModelName>]
 ///
 /// [models.<ModelName>.fields.<fieldName>]
-/// type = "string" | "number" | "boolean" | "date" | "id" | "stringset"
+/// type = "string" | "number" | "boolean" | "date" | "id" | "stringset" | "vector"
 /// indexed = true
 /// unique  = true
 /// required = true
@@ -18,6 +18,8 @@ import TOMLKit
 /// max_length = 128
 /// max_count = 10
 /// default = "guest"   # any scalar
+/// dims = 768           # a vector field: how many numbers
+/// element = "f32"      # a vector field: "f32" | "f16" | "i8"
 ///
 /// [models.<ModelName>.relationships.<relName>]
 /// type = "refersTo" | "hasMany" | "hasManyThrough"
@@ -53,6 +55,12 @@ import TOMLKit
 ///    `.unknownJoinModel`.
 ///  - Every field in a unique constraint must exist on its model →
 ///    `.uniqueConstraintUnknownField`.
+///  - A `vector` field (#5225) belongs to a db3 type file (one with a
+///    `[type]` table) → `.vectorFieldOutsideDb3Type`; it needs `dims` (an
+///    integer of at least 1) and `element`, and takes no index, uniqueness,
+///    default, stamp or length option, and any other field takes neither
+///    `dims` nor `element` → `.invalidVectorField`; no unique constraint
+///    names one → `.vectorInUniqueConstraint`.
 /// > **Codegen is the recommended path.** Prefer `swift-bao-codegen` at
 /// > build time — see [`docs/codegen.md`](../../../docs/codegen.md). The
 /// > runtime TOML loader is fully supported and kept as public API for
@@ -71,9 +79,13 @@ public enum TomlSchemaLoader {
     ///   unknown key under a model/field/relationship/unique-constraint
     ///   table. When `false`, accept everything silently — kept for
     ///   loading legacy/third-party TOML that hasn't been audited yet.
+    /// - Parameter vectors: whether a field may be `type = "vector"`; `nil`
+    ///   (the default) allows one when the text is a db3 type file (it has a
+    ///   `[type]` table), as js-bao's loader does.
     public static func load(
         tomlString: String,
-        strict: Bool = true
+        strict: Bool = true,
+        vectors: Bool? = nil
     ) throws -> [PrimitiveSchema] {
         let table: TOMLTable
         do {
@@ -94,7 +106,7 @@ public enum TomlSchemaLoader {
         for key in modelsTable.keys {
             guard let model = modelsTable[key]?.table else { continue }
             schemasByName[key] = try buildSchemaSkeleton(
-                name: key, table: model, strict: strict
+                name: key, table: model, strict: strict, vectors: vectors ?? (table["type"]?.table != nil)
             )
             modelOrder.append(key)
         }
@@ -121,7 +133,8 @@ public enum TomlSchemaLoader {
     /// Read a TOML schema file from disk.
     public static func load(
         from url: URL,
-        strict: Bool = true
+        strict: Bool = true,
+        vectors: Bool? = nil
     ) throws -> [PrimitiveSchema] {
         let data: Data
         do {
@@ -138,7 +151,7 @@ public enum TomlSchemaLoader {
                 )
             )
         }
-        return try load(tomlString: text, strict: strict)
+        return try load(tomlString: text, strict: strict, vectors: vectors)
     }
 
     // MARK: - Skeleton (fields + compound constraints only)
@@ -146,7 +159,8 @@ public enum TomlSchemaLoader {
     private static func buildSchemaSkeleton(
         name: String,
         table: TOMLTable,
-        strict: Bool
+        strict: Bool,
+        vectors: Bool
     ) throws -> PrimitiveSchema {
         if strict {
             try checkUnknownKeys(
@@ -155,12 +169,18 @@ public enum TomlSchemaLoader {
                 context: "Model `\(name)`"
             )
         }
-        let fields = try buildFields(modelName: name, table: table, strict: strict)
+        let fields = try buildFields(modelName: name, table: table, strict: strict, vectors: vectors)
         let constraints = try buildUniqueConstraints(
             modelName: name, table: table,
             fieldNames: Set(fields.keys),
             strict: strict
         )
+        // A vector cannot be part of a unique key (#5225).
+        for constraint in constraints.values.sorted(by: { $0.name < $1.name }) {
+            if let field = constraint.fields.first(where: { fields[$0]?.type == .vector }) {
+                throw TomlSchemaLoaderError.vectorInUniqueConstraint(model: name, constraint: constraint.name, field: field)
+            }
+        }
         let schema = PrimitiveSchema(
             name: name,
             fields: fields,
@@ -180,7 +200,8 @@ public enum TomlSchemaLoader {
     private static func buildFields(
         modelName: String,
         table: TOMLTable,
-        strict: Bool
+        strict: Bool,
+        vectors: Bool
     ) throws -> [String: FieldDescriptor] {
         guard let fieldsTable = table["fields"]?.table else { return [:] }
         var out: [String: FieldDescriptor] = [:]
@@ -188,7 +209,7 @@ public enum TomlSchemaLoader {
             guard let field = fieldsTable[fieldName]?.table else { continue }
             out[fieldName] = try buildField(
                 modelName: modelName, fieldName: fieldName,
-                table: field, strict: strict
+                table: field, strict: strict, vectors: vectors
             )
         }
         return out
@@ -198,7 +219,8 @@ public enum TomlSchemaLoader {
         modelName: String,
         fieldName: String,
         table: TOMLTable,
-        strict: Bool
+        strict: Bool,
+        vectors: Bool
     ) throws -> FieldDescriptor {
         guard let typeLiteral = table["type"]?.string else {
             throw TomlSchemaLoaderError.missingFieldType(
@@ -218,6 +240,14 @@ public enum TomlSchemaLoader {
                 allowed: knownFieldKeys,
                 context: "Model `\(modelName)` field `\(fieldName)`"
             )
+        }
+        if type == .vector && !vectors {
+            throw TomlSchemaLoaderError.vectorFieldOutsideDb3Type(model: modelName, field: fieldName)
+        }
+        // Judged before the other options, so one that does not apply to a
+        // vector is named even when its value would parse.
+        if let reason = vectorFieldProblem(table, type: typeLiteral) {
+            throw TomlSchemaLoaderError.invalidVectorField(model: modelName, field: fieldName, reason: reason)
         }
 
         // Parse `auto_stamp = "create" | "update" | "both"`. Fail-fast on
@@ -242,8 +272,58 @@ public enum TomlSchemaLoader {
             maxLength: table["max_length"]?.int,
             maxCount: table["max_count"]?.int,
             default: decodeDefault(table["default"]),
-            autoStamp: autoStamp
+            autoStamp: autoStamp,
+            dims: type == .vector ? table["dims"]?.int : nil,
+            element: type == .vector ? table["element"]?.string.flatMap(VectorElement.init(rawValue:)) : nil
         )
+    }
+
+    /// The options a vector field may not carry, as TOML spells them.
+    private static let notOnAVector = [
+        "indexed", "unique", "default", "enum", "auto_assign", "auto_stamp", "max_length", "max_count",
+    ]
+
+    /// The flags of ``notOnAVector``, which `false` leaves off. Any other
+    /// option is refused whatever its value: `default = false` would write
+    /// `false` into the vector.
+    private static let vectorFlagOptions: Set<String> = ["indexed", "unique", "auto_assign"]
+
+    /// What is wrong with a field table's vector options, or `nil`: js-bao's
+    /// `vectorFieldProblem` with TOML spelling. A vector field needs `dims`
+    /// (an integer of at least 1) and `element` (`f32`, `f16` or `i8`) and
+    /// carries none of ``notOnAVector`` (a flag set `false` is no option); any other
+    /// field carries neither `dims` nor `element`.
+    private static func vectorFieldProblem(_ table: TOMLTable, type: String) -> String? {
+        guard type == "vector" else {
+            for key in ["dims", "element"] where table[key] != nil {
+                return "`\(key)` applies to a vector field only, not a \"\(type)\" field"
+            }
+            return nil
+        }
+        guard let dims = table["dims"]?.int, dims >= 1 else {
+            return "a vector field needs `dims`, an integer of at least 1"
+                + (table["dims"].map { ", not \(tomlText($0))" } ?? "")
+        }
+        guard let element = table["element"]?.string, VectorElement(rawValue: element) != nil else {
+            return "a vector field needs `element`, one of "
+                + VectorElement.allCases.map(\.rawValue).joined(separator: ", ")
+                + (table["element"].map { ", not \(tomlText($0))" } ?? "")
+        }
+        for key in notOnAVector {
+            guard let value = table[key] else { continue }
+            if vectorFlagOptions.contains(key), value.bool == false { continue }
+            return "`\(key)` does not apply to a vector field"
+        }
+        return nil
+    }
+
+    /// A TOML value as a refusal quotes it: a string quoted, a number as written.
+    private static func tomlText(_ value: any TOMLValueConvertible) -> String {
+        if let text = value.string { return "\"\(text)\"" }
+        if let number = value.int { return String(number) }
+        if let number = value.double { return PrimitiveValue.jsNumberString(number) }
+        if let flag = value.bool { return flag ? "true" : "false" }
+        return "a \(value.type)"
     }
 
     /// `default` is heterogeneous — string, int, double, or bool. We
@@ -468,6 +548,7 @@ public enum TomlSchemaLoader {
         "type", "indexed", "unique", "required",
         "auto_assign", "auto_stamp",
         "max_length", "max_count", "default",
+        "dims", "element",
     ]
 
     private static let knownRelationshipKeys: Set<String> = [
@@ -484,11 +565,12 @@ public enum TomlSchemaLoader {
 
     // MARK: - Allowed values
 
-    /// The six wire-level field types js-bao's TOML loader accepts.
+    /// The wire-level field types js-bao's TOML loader accepts (`vector` in a
+    /// db3 type file only, #5225).
     /// `.json` is supported in-memory in Swift but isn't part of the
     /// TOML surface — js-bao never declares json columns in TOML.
     private static let allowedFieldTypes: Set<PrimitiveFieldType> = [
-        .string, .number, .boolean, .date, .id, .stringset,
+        .string, .number, .boolean, .date, .id, .stringset, .vector,
     ]
 
     private static let allowedRelationshipTypes: Set<String> = [
@@ -521,6 +603,14 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
     /// A unique constraint on a stringset field (#3719); `message` is the
     /// sentence js-bao's loader answers.
     case uniqueOnStringset(message: String)
+    /// A `vector` field outside a db3 type file (#5225): a schema with no
+    /// `[type]` table describes documents, which carry no vectors.
+    case vectorFieldOutsideDb3Type(model: String, field: String)
+    /// A vector field the loader cannot encode, or `dims`/`element` on
+    /// another field (#5225); `reason` is js-bao's sentence.
+    case invalidVectorField(model: String, field: String, reason: String)
+    /// A unique constraint naming a vector field (#5225).
+    case vectorInUniqueConstraint(model: String, constraint: String, field: String)
 
     public var description: String {
         switch self {
@@ -533,7 +623,7 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
         case let .missingFieldType(model, field):
             return "Model `\(model)` field `\(field)` is missing required `type`"
         case let .unknownFieldType(model, field, typeName):
-            return "Model `\(model)` field `\(field)` has unknown type `\(typeName)` — allowed: string, number, boolean, date, id, stringset"
+            return "Model `\(model)` field `\(field)` has unknown type `\(typeName)` — allowed: string, number, boolean, date, id, stringset, vector"
         case let .malformedUniqueConstraint(model, index, reason):
             return "Model `\(model)` unique_constraints[\(index)]: \(reason)"
         case let .uniqueConstraintUnknownField(model, constraint, field):
@@ -558,6 +648,12 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
             return "Model `\(model)` field `\(field)` has invalid auto_stamp value `\(value)` — must be one of: create, update, both"
         case let .uniqueOnStringset(message):
             return message
+        case let .vectorFieldOutsideDb3Type(model, field):
+            return "Model `\(model)` field `\(field)`: a vector field belongs to a db3 type (a schema with a [type] table); a document schema or a database type cannot declare one"
+        case let .invalidVectorField(model, field, reason):
+            return "Model `\(model)` field `\(field)`: \(reason)"
+        case let .vectorInUniqueConstraint(model, constraint, field):
+            return "[[models.\(model).unique_constraints]]: unique constraint \"\(constraint)\" names the vector field \"\(field)\", which cannot be unique"
         }
     }
 }

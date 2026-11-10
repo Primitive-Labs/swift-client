@@ -69,6 +69,7 @@ final class AgentSessionQueueIdentityHermeticTests: XCTestCase {
 
     // MARK: - Behavior 45: the attempt's own credentials
 
+    @available(*, deprecated)
     func testAHeldAttemptNeverLeavesWithTheNextUsersToken() async throws {
         let tokenA = makeTestJwt(userId: "u-a")
         let tokenB = makeTestJwt(userId: "u-b")

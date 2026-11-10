@@ -14,7 +14,7 @@ final class RecordLogConcurrencyHermeticTests: XCTestCase {
         // here would let a later frame, or a disconnect, interleave with it.
         let regions = [
             try ClientSourceText.slice(source, from: "func start() {", to: "func disconnected() {"),
-            try ClientSourceText.slice(source, from: "func receive(_ frame: [String: JSONValue]) {", to: "private func committed("),
+            try ClientSourceText.slice(source, from: "func receive(_ frame: [String: JSONValue], receivedAt stamp: Int64? = nil) {", to: "private func committed("),
         ]
         for region in regions {
             XCTAssertFalse(region.contains("await"), "a decision region must not suspend:\n\(region.prefix(400))")

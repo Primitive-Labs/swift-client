@@ -1116,7 +1116,7 @@ public final class AuthController: @unchecked Sendable {
 
     /// Start the OAuth flow. Mirrors JS `authController.startOAuthFlow`
     /// (src/client/internal/authController.ts): fetch the app's auth config
-    /// (`GET /oauth-config`), require a usable `ios` client entry, and build
+    /// (`GET settings/sign-in`), require a usable `ios` client entry, and build
     /// the Google authorize URL client-side with the base64-JSON state bag
     /// `{nonce, redirectUri, continueUrl?}`. Where the JS client redirects the
     /// browser, this returns the URL for the caller to open (e.g. via
@@ -1131,7 +1131,7 @@ public final class AuthController: @unchecked Sendable {
 
         let config: AuthConfigInfo = try await transport.request(
             method: .get,
-            path: "/oauth-config"
+            path: "/settings/sign-in"
         )
         // The same predicate the button gates on, re-checked here so a caller
         // that skipped `checkOAuthAvailable()` cannot start a flow that can

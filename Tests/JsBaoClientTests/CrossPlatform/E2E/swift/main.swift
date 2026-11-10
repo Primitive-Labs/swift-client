@@ -197,7 +197,7 @@ func recordToValuesForSchema(
             if let s = raw as? String { out[fname] = .date(s) }
         case .stringset:
             if let arr = raw as? [String] { out[fname] = .stringset(Set(arr)) }
-        case .json:
+        case .json, .vector:
             break  // unused in fixtures
         }
     }
@@ -265,7 +265,7 @@ func primitiveRecordToJson(
             if let v = rec[fname]?.asDateString { out[fname] = v }
         case .stringset:
             if let v = rec[fname]?.asStringSet { out[fname] = Array(v).sorted() }
-        case .json:
+        case .json, .vector:
             break  // unused in fixtures
         }
     }

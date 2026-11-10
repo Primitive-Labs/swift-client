@@ -79,6 +79,7 @@ final class Db3PermissionsLiveTests: XCTestCase {
 
     // MARK: - Behavior 2
 
+    @available(*, deprecated)
     func testUserGrantsInvitationsAndRemovalsAnswerAsTheDocumentsTwin() async throws {
         let owner = try await live.client("owner", models: [Self.note])
         let db3Id = try await ownedDb3(owner)
@@ -125,6 +126,7 @@ final class Db3PermissionsLiveTests: XCTestCase {
 
     // MARK: - Behavior 3
 
+    @available(*, deprecated)
     func testGroupGrantsAndTheAppRow() async throws {
         let owner = try await live.client("owner", models: [Self.note])
         let db3Id = try await ownedDb3(owner)
@@ -171,6 +173,7 @@ final class Db3PermissionsLiveTests: XCTestCase {
 
     // MARK: - Behavior 4 and E11
 
+    @available(*, deprecated)
     func testLinkAccessSetReadOverwrittenAndCleared() async throws {
         let owner = try await live.client("owner", models: [Self.note])
         let db3Id = try await ownedDb3(owner)

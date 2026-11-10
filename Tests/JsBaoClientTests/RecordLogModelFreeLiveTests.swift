@@ -2,8 +2,8 @@ import XCTest
 @testable import JsBaoClient
 
 /// A Swift client with no generated models on a format-3 document, live
-/// against the dev server, through `client.documents.records(documentId)`
-/// and `client.documents.schema(documentId)` (#4624 behaviours 10, 11, 13,
+/// against the dev server, through `client.db3.records(documentId)`
+/// and `client.db3.schema(documentId)` (#4624 behaviours 10, 11, 13,
 /// 14, 15, 16, 17, 18, 21). The Swift twin of
 /// `tests/client/js-bao-client-model-free-4623.test.ts`.
 final class RecordLogModelFreeLiveTests: XCTestCase {
@@ -64,7 +64,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testPutMintsAnIdGetAnswersItAndTheRoomHoldsIt() async throws {
         let (a, documentId) = try await modelFree("a")
-        let records = a.documents.records(documentId)
+        let records = a.db3.records(documentId)
         let row = try records.put("Note", ["title": "a"])
         let id = try XCTUnwrap(row["id"]?.stringValue)
         XCTAssertEqual(Self.ulid.numberOfMatches(in: id, range: NSRange(id.startIndex..., in: id)), 1, id)
@@ -80,7 +80,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testAPatchOfARecordTheCopyLacksIsSentAndADeleteRemovesTheRecord() async throws {
         let (a, documentId) = try await modelFree("a")
-        let records = a.documents.records(documentId)
+        let records = a.db3.records(documentId)
         XCTAssertNil(try records.patch("Note", id: "ghost", ["title": "x"]))
         XCTAssertEqual(try live.pending(a, documentId).map(\.m.kind), [.patch], "the patch is sent all the same")
         try await live.settled(a, documentId)
@@ -100,7 +100,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testConfirmWaitsForTheRoomAndARefusedWriteThrowsAndIsReported() async throws {
         let (a, documentId) = try await modelFree("a")
-        let records = a.documents.records(documentId)
+        let records = a.db3.records(documentId)
         let (heard, subscription) = refusals(a)
         defer { subscription.cancel() }
 
@@ -134,7 +134,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
     /// as one: a scalar written there next is refused.
     func testAnEmptySetChangeOnANewFieldLocksItAsASetInTheRoom() async throws {
         let (a, documentId) = try await modelFree("a")
-        let records = a.documents.records(documentId)
+        let records = a.db3.records(documentId)
         let put = try await records.put("Lock", ["id": "e1", "title": "x", "tags": .setChange()], confirm: true)
         XCTAssertEqual(put.raw, ["id": "e1", "title": "x", "tags": []])
         let room = try await roomRow(documentId, "Lock", "e1")
@@ -157,7 +157,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
     /// and the refusal hands back both mutations (C4624-001).
     func testAWriteNamingBothSpellingsIsRefusedWhole() async throws {
         let (a, documentId) = try await modelFree("a")
-        let records = a.documents.records(documentId)
+        let records = a.db3.records(documentId)
         let (heard, subscription) = refusals(a)
         defer { subscription.cancel() }
         let before: RecordLogRow = ["id": "u1", "locked": 1, "tags": ["old"]]
@@ -186,8 +186,8 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testASecondClientQueriesCountsAndHearsWhatTheFirstWrites() async throws {
         let (a, b, documentId) = try await pair()
-        let ra = a.documents.records(documentId)
-        let rb = b.documents.records(documentId)
+        let ra = a.db3.records(documentId)
+        let rb = b.db3.records(documentId)
         let heard = LockedBox(0)
         let stop = try rb.subscribe("Memo") { heard.withValue { $0 += 1 } }
         defer { stop() }
@@ -216,8 +216,8 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testWritesMadeOfflineShowAtOnceAndReachTheRoomAndTheOtherClient() async throws {
         let (a, b, documentId) = try await pair()
-        let ra = a.documents.records(documentId)
-        let rb = b.documents.records(documentId)
+        let ra = a.db3.records(documentId)
+        let rb = b.db3.records(documentId)
         let heard = LockedBox(0)
         let stop = try rb.subscribe("Memo") { heard.withValue { $0 += 1 } }
         defer { stop() }
@@ -249,8 +249,8 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testArraysAreStringSetsReplaceKeepsAConcurrentMemberAndChangesEdit() async throws {
         let (a, b, documentId) = try await pair()
-        let ra = a.documents.records(documentId)
-        let rb = b.documents.records(documentId)
+        let ra = a.db3.records(documentId)
+        let rb = b.db3.records(documentId)
         let row = try ra.put("Shelf", ["tags": ["a", "b"]])
         let id = try XCTUnwrap(row["id"]?.stringValue)
         try await live.settled(a, documentId)
@@ -262,6 +262,13 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
             method: "PATCH", appId: live.app.appId, path: "/documents/\(documentId)/records/Shelf/\(id)",
             body: ["data": ["tags": ["$add": ["h"]]]], jwt: live.app.ownerJWT
         )
+        // The room relays the member to both clients; the writer, offline on
+        // a socket that stays open, does not take it into its copy (#5447).
+        try await eventually(timeout: 30, description: "the other client to hold the concurrent member") {
+            try rb.get("Shelf", id: id)?["tags"]?.arrayValue?.contains("h") == true
+        }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(try ra.get("Shelf", id: id)?["tags"], ["a", "b"], "offline, the writer's copy does not take the relayed member")
         try ra.patch("Shelf", id: id, ["tags": ["a", "c"]])
         a.setNetworkMode(.online)
         try await live.settled(a, documentId)
@@ -301,14 +308,14 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testPagesByIdAndByAFieldDescendingAndFindsSetMembers() async throws {
         let (a, documentId) = try await modelFree("a")
-        let ra = a.documents.records(documentId)
+        let ra = a.db3.records(documentId)
         let pad = { (n: Int) in String(format: "%04d", n) }
         for i in 0..<250 {
             try ra.put("Page", ["id": .string("p\(pad(i))"), "rank": .number(Double(i % 10)), "tags": .stringSet(i % 3 == 0 ? ["three"] : [])])
         }
         try await live.settled(a, documentId, timeout: 120)
         let (b, _) = try await modelFree("b", documentId: documentId)
-        let rb = b.documents.records(documentId)
+        let rb = b.db3.records(documentId)
         try await eventually(timeout: 60, description: "the second client to hold 250 records") { try rb.count("Page") == 250 }
 
         var byId: [String] = []
@@ -365,7 +372,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
         )
         let legacy = try XCTUnwrap(created["documentId"] as? String)
         _ = try await a.openDocument(legacy, options: OpenDocumentOptions(waitForLoad: .network, enableNetworkSync: true))
-        for (name, call) in everyCall(a.documents.records(legacy)) {
+        for (name, call) in everyCall(a.db3.records(legacy)) {
             XCTAssertThrowsError(try call(), name) { error in
                 let error = error as? JsBaoError
                 XCTAssertEqual(error?.code, .documentFormatMismatch, name)
@@ -373,7 +380,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
                 XCTAssertEqual(error?.details?["documentFormat"], 1)
             }
         }
-        for (name, call) in everyCall(a.documents.records("01JD4624N0T0PENXXXXXXXXXXX")) {
+        for (name, call) in everyCall(a.db3.records("01JD4624N0T0PENXXXXXXXXXXX")) {
             XCTAssertThrowsError(try call(), name) { error in
                 let error = error as? JsBaoError
                 XCTAssertEqual(error?.code, .notFound, name)
@@ -386,7 +393,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
     /// close keeps answering, and still does after a reopen.
     func testAHandleKeptAcrossACloseKeepsAnsweringAndAfterAReopen() async throws {
         let (a, documentId) = try await modelFree("a")
-        let records = a.documents.records(documentId)
+        let records = a.db3.records(documentId)
         try records.put("Note", ["id": "n1", "title": "a"])
         try await live.settled(a, documentId)
         _ = await a.closeDocument(documentId)
@@ -403,11 +410,11 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     func testSchemaAnswersWhatTheRouteAnswers() async throws {
         let (a, documentId) = try await modelFree("a")
-        let records = a.documents.records(documentId)
+        let records = a.db3.records(documentId)
         try records.put("Memo", ["s": "x", "n": 1, "tags": ["a"]])
         try records.put("Note", ["title": "t"])
         try await live.settled(a, documentId)
-        let answer = try await a.documents.schema(documentId)
+        let answer = try await a.db3.schema(documentId)
         let raw = try await ctx.appRequest(
             method: "GET", appId: live.app.appId, path: "/documents/\(documentId)/schema", body: nil, jwt: live.app.ownerJWT
         )

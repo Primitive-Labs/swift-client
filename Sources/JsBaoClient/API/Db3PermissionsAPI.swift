@@ -38,6 +38,7 @@ public final class Db3PermissionsAPI: Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func list() async throws -> [DocumentPermissionEntry] {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: path("permissions"))
@@ -50,6 +51,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// - Parameter params: The grant or grants, with an optional notification email.
+    /// - Stability: beta
     public func set(_ params: UpdatePermissionsData) async throws -> PermissionUpdateResult {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .put, path: path("permissions"), body: params)
@@ -64,6 +66,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// - Parameter target: The user, or the invited email.
     /// - Throws: `JsBaoError` `.invalidArgument` for an empty user id or email,
     ///   before any request.
+    /// - Stability: beta
     public func remove(_ target: DocumentPermissionTarget) async throws {
         try await awaitCreate(db3Id)
         switch target {
@@ -86,10 +89,27 @@ public final class Db3PermissionsAPI: Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func listPendingInvitations() async throws -> [PendingInvitationEntry] {
         try await awaitCreate(db3Id)
         let answer: ItemsEnvelope<PendingInvitationEntry> = try await transport.request(method: .get, path: path("pending-invitations"))
         return answer.items
+    }
+
+    /// Revoke one pending invitation's grants on the db3: the `invitationId`
+    /// that `listPendingInvitations()` lists. The invitation and its grants
+    /// on other resources stay. Only the grant's grantor or an app owner or
+    /// admin may revoke it; a refusal is thrown as an `HttpError`.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
+    public func revokePendingInvitation(_ invitationId: String) async throws -> PendingInvitationRevokeResult {
+        try await awaitCreate(db3Id)
+        return try await transport.request(
+            method: .delete,
+            path: path("pending-invitations/\(URLEncoding.encodeComponent(invitationId))")
+        )
     }
 
     // MARK: - Groups
@@ -101,6 +121,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// - Parameter includeSystem: List the platform-managed groups too.
+    /// - Stability: beta
     public func listGroups(includeSystem: Bool = false) async throws -> [DocumentGroupPermissionEntry] {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: path("group-permissions" + (includeSystem ? "?includeSystem=true" : "")))
@@ -111,6 +132,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// - Parameter params: The group and the level.
+    /// - Stability: beta
     public func grantGroup(_ params: GrantGroupPermissionParams) async throws -> DocumentGroupPermissionEntry {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .post, path: path("group-permissions"), body: params)
@@ -121,6 +143,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// - Parameter groupId: The group.
+    /// - Stability: beta
     public func revokeGroup(_ groupId: String) async throws -> SuccessResult {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .delete, path: path("group-permissions/\(URLEncoding.encodeComponent(groupId))"))
@@ -132,6 +155,7 @@ public final class Db3PermissionsAPI: Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func getLinkAccess() async throws -> LinkAccessResult {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: path("link-access"))
@@ -144,6 +168,7 @@ public final class Db3PermissionsAPI: Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func setLinkAccess(_ level: DocumentLinkAccessLevel) async throws -> LinkAccessResult {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .put, path: path("link-access"), body: ["level": level.rawValue])
@@ -154,6 +179,7 @@ public final class Db3PermissionsAPI: Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func clearLinkAccess() async throws -> LinkAccessResult {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .delete, path: path("link-access"))
@@ -167,6 +193,7 @@ public final class Db3PermissionsAPI: Sendable {
     ///
     /// - Parameter options: The level asked for, a note, the URLs the
     ///   notification links to, and `sendEmail: false` to send none.
+    /// - Stability: beta
     public func requestAccess(_ options: RequestAccessOptions) async throws -> DocumentAccessRequestResponse {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .post, path: path("access-requests"), body: options)
@@ -176,6 +203,7 @@ public final class Db3PermissionsAPI: Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func listAccessRequests() async throws -> [DocumentAccessRequest] {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: path("access-requests"))
@@ -188,6 +216,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// - Parameters:
     ///   - requestId: The request.
     ///   - options: The level to grant, and the URL the notification links to.
+    /// - Stability: beta
     public func approveAccessRequest(_ requestId: String, options: ApproveAccessRequestOptions? = nil) async throws -> AccessRequestResult {
         try await awaitCreate(db3Id)
         return try await transport.request(
@@ -204,6 +233,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// - Parameters:
     ///   - requestId: The request.
     ///   - options: The URL the notification links to.
+    /// - Stability: beta
     public func denyAccessRequest(_ requestId: String, options: DenyAccessRequestOptions? = nil) async throws -> AccessRequestResult {
         try await awaitCreate(db3Id)
         return try await transport.request(

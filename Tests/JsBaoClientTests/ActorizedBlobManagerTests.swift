@@ -560,7 +560,10 @@ final class ActorizedBlobManagerTests: XCTestCase {
 
     /// `downloadUrl` stays synchronous **permanently** — it reads only the two
     /// immutable URL closures, and it is the member most likely to be called
-    /// from a SwiftUI `body`. It carries no deprecation and no twin.
+    /// from a SwiftUI `body`. It carries no deprecation and no twin. The one
+    /// attribute `DocumentBlobContext.downloadUrl` may carry is its whole
+    /// family's deprecation (#5356, ending `(api-surface-stability)`), which
+    /// points at db3 rather than at a twin.
     func testDownloadUrlStaysSynchronousAndUndeprecated() throws {
         let manager = try Self.clientSource("Internal/BlobManager.swift")
         XCTAssertTrue(manager.contains("public nonisolated func downloadUrl("),
@@ -572,8 +575,8 @@ final class ActorizedBlobManagerTests: XCTestCase {
         for declaration in ["public nonisolated func downloadUrl(", "public func downloadUrl("] where documents.contains(declaration) {
             XCTAssertFalse(
                 Self.attributes(before: declaration, in: documents)
-                    .contains { $0.hasPrefix("@available") },
-                "DocumentBlobContext.downloadUrl must carry no availability attribute"
+                    .contains { $0.hasPrefix("@available") && !$0.hasSuffix("(api-surface-stability)\")") },
+                "DocumentBlobContext.downloadUrl must carry no availability attribute but its family's"
             )
         }
         XCTAssertFalse(

@@ -352,6 +352,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// messages. Called once per change, never while the view holds its lock.
     ///
     /// - Returns: A function that removes the listener.
+    /// - Stability: beta
     @discardableResult
     public func onChange(_ listener: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         let id = UUID()
@@ -379,6 +380,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// throws it, and nothing is sent. Other messages go out at once. A newer
     /// send under the same `clientMessageId` replaces a waiting one, whose
     /// call throws `.invalidArgument`.
+    /// - Stability: beta
     @discardableResult
     public func send(
         text: String,
@@ -408,6 +410,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// land answers as a duplicate. It waits again for any upload it names
     /// that is still queued (`attachments.resume` retries a failed one).
     /// Throws `.invalidArgument` when no failed message has that id.
+    /// - Stability: beta
     @discardableResult
     public func retry(clientMessageId: String) async throws -> AgentSessionSendResult {
         let failed = lock.withLock {
@@ -425,6 +428,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Remove a failed message from the view.
     ///
     /// - Returns: Whether a failed message was removed.
+    /// - Stability: beta
     @discardableResult
     public func dismiss(clientMessageId: String) -> Bool {
         let removed: Bool = lock.withLock {
@@ -443,6 +447,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Load the page of messages before the window's oldest, with their parts,
     /// calls, steps and turns. Calls made while one is loading share its page;
     /// at the start of the session, or after `close()`, it answers `{ 0, false }`.
+    /// - Stability: beta
     public func loadOlder() async throws -> AgentSessionLoadOlderResult {
         let task: Task<AgentSessionLoadOlderResult, Error> = lock.withLock {
             if let olderInFlight { return olderInFlight }
@@ -459,6 +464,7 @@ public final class AgentSessionView: @unchecked Sendable {
     // MARK: - Turns
 
     /// Answer a call the active turn waits on.
+    /// - Stability: beta
     @discardableResult
     public func answer(callId: String, _ answer: AgentCallAnswer) async throws -> AgentCallAnswerResult {
         try await host.sessions.answer(sessionId: sessionId, callId: callId, answer)
@@ -473,6 +479,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Throws `.invalidArgument` on a closed view, the blob read's error for
     /// a download that fails, and a `DecodingError` for a blob that is not
     /// JSON.
+    /// - Stability: beta
     public func artifact(of call: AgentSessionToolCallRecord) async throws -> JSONValue? {
         if lock.withLock({ closed }) {
             throw JsBaoError(code: .invalidArgument, message: "The session view is closed")
@@ -508,6 +515,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// (`output-error`) and a message that is not the agent's yield none.
     /// `call(_:)` on each resolves numbers against the turn's calls in the
     /// window.
+    /// - Stability: beta
     public func presentations(of message: AgentSessionSyncedMessage, names: [String]) -> [AgentPresentation] {
         lock.withLock {
             let parts = partsByMessage[message.messageId] ?? message.parts
@@ -521,6 +529,7 @@ public final class AgentSessionView: @unchecked Sendable {
     }
 
     /// Record an event on the session.
+    /// - Stability: beta
     @discardableResult
     public func recordEvent(_ event: AgentSessionEvent) async throws -> AgentSessionEventResult {
         try await host.sessions.recordEvent(sessionId: sessionId, event: event)
@@ -529,6 +538,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Cancel the active turn: the one named, else the one the `Session` row
     /// names, else the one `get` answers. With no turn at all, throws
     /// `.agentSessionNoActiveTurn` and sends no cancel.
+    /// - Stability: beta
     @discardableResult
     public func cancel(turnId: String? = nil) async throws -> AgentSessionCancelResult {
         var target = turnId ?? activeTurnId
@@ -549,6 +559,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// `onChange` fires. Activity that arrived after the marker, while the
     /// call was answering, keeps the dot. Call it when the user opens or
     /// returns to the session.
+    /// - Stability: beta
     @discardableResult
     public func markRead() async throws -> AgentSessionReadResult {
         let result = try await host.sessions.markRead(sessionId: sessionId)
@@ -585,6 +596,7 @@ public final class AgentSessionView: @unchecked Sendable {
     ///
     /// - Returns: A function that removes these handlers; runs in flight
     ///   still answer.
+    /// - Stability: beta
     @discardableResult
     public func handleClientTools(
         _ handlers: [String: AgentClientToolHandler],
@@ -617,6 +629,7 @@ public final class AgentSessionView: @unchecked Sendable {
     }
 
     /// Read the session's info again (`get`), and notify when it is read.
+    /// - Stability: beta
     @discardableResult
     public func refreshInfo() async throws -> AgentSessionInfo {
         guard let next = try await readInfo(whileOpen: false) else { return info }
@@ -655,6 +668,7 @@ public final class AgentSessionView: @unchecked Sendable {
     /// Stop listening and give up the view's subscription to the session's
     /// db3; its local copy stays. Running client-tool handlers are cancelled
     /// and their answers never sent. Idempotent.
+    /// - Stability: beta
     public func close() async {
         let closing: (unsubscribes: [@Sendable () -> Void], observations: [EventSubscription], tasks: [Task<Void, Never>])? =
             lock.withLock {
@@ -1555,6 +1569,7 @@ extension AgentSessionsAPI {
     /// the session's copy on this device is evicted too. Call `close()` when
     /// done. A `pageSize` outside 1…500 throws `.invalidArgument` before any
     /// request.
+    /// - Stability: beta
     public func open(
         sessionId: String, options: OpenAgentSessionOptions = OpenAgentSessionOptions()
     ) async throws -> AgentSessionView {

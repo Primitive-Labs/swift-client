@@ -53,6 +53,7 @@ final class DocumentPermissionsNameOptionalHermeticTests: XCTestCase {
 
     /// The bug, end to end through the public call: the listing comes back
     /// whole, and each entry carries the right `name`.
+    @available(*, deprecated)
     func testGetPermissionsReturnsEveryEntryWhenOneHasNoName() async throws {
         let api = makeAPI(json: Self.listing)
 

@@ -70,6 +70,7 @@ final class BlobUploadRestartLiveTests: XCTestCase {
 
     // MARK: - Behavior 22: a document upload across a restart
 
+    @available(*, deprecated)
     func testADocumentUploadQueuedByAClientThatCouldNotReachTheServerIsCompletedByTheNextClient() async throws {
         let ctx = TestContext()
         try await ctx.initialize()

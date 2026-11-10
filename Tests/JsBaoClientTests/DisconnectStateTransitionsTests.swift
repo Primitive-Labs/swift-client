@@ -88,6 +88,7 @@ final class DisconnectStateTransitionsTests: XCTestCase {
 
     // MARK: - Behavior 3 — remote awareness cleared on close
 
+    @available(*, deprecated)
     func testRemoteAwarenessClearedOnClose() async throws {
         let docId = try await ctx.createDocument(
             appId: testApp.appId, jwt: testApp.ownerJWT, title: "Awareness Cleared On Close"
@@ -148,6 +149,7 @@ final class DisconnectStateTransitionsTests: XCTestCase {
     /// late close is dropped as stale, so the close handler never runs. That
     /// terminal point has to clear presence too, or peer cursors stay on
     /// screen for good.
+    @available(*, deprecated)
     func testRemoteAwarenessClearedWhenTheDisconnectResolvesOnTimeout() async throws {
         let docId = try await ctx.createDocument(
             appId: testApp.appId, jwt: testApp.ownerJWT, title: "Awareness Cleared On Timeout"

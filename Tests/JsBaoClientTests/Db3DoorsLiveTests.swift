@@ -20,6 +20,7 @@ import XCTest
 /// - Finding 4701-C01: `client.db3.evict` of a db3 only a door holds open
 ///   closes it on the socket before the purge: the room counts no subscriber
 ///   and no model member keeps the closed binding.
+@available(*, deprecated)
 final class Db3DoorsLiveTests: XCTestCase {
 
     private var ctx: TestContext!
@@ -79,7 +80,7 @@ final class Db3DoorsLiveTests: XCTestCase {
         try await eventually(description: "the handle disposed by the close") { !sub.state.subscribed }
         XCTAssertTrue(x.isRecordLogDocument(id))
         XCTAssertEqual(try titles(x, QueryOptions(db3: [id])), ["while open"])
-        XCTAssertEqual(try x.documents.records(id).query("Note").data.count, 1)
+        XCTAssertEqual(try x.db3.records(id).query("Note").data.count, 1)
 
         // The same doors again: no further line. The other doors: one more each.
         _ = try await x.documents.open(id, options: OpenDocumentOptions(waitForLoad: .network))

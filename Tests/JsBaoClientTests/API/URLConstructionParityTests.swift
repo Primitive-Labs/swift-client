@@ -163,6 +163,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - InvitationsAPI.listDeferredGrants — email filter
 
+    @available(*, deprecated)
     func test_invitationsListDeferredGrants_email_isEncoded() async throws {
         let recorder = PathRecorder()
         let invitations = InvitationsAPI(transport: recorder)

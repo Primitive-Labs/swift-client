@@ -144,6 +144,7 @@ public final class Db3Subscription: @unchecked Sendable {
     /// document door closed the db3), `evicted` (its local copy was removed)
     /// or `identity-changed` (a sign-out, or another user's sign-in). Settles
     /// once: every later call answers the same.
+    /// - Stability: beta
     public func ready() async throws {
         try await readySettlement.wait()
     }
@@ -151,6 +152,7 @@ public final class Db3Subscription: @unchecked Sendable {
     /// Returns as soon as a readable copy is on the device: at once for a
     /// resident db3 (an empty one that synced included), else when `ready()`
     /// does. Throws as `ready()` does until then.
+    /// - Stability: beta
     public func available() async throws {
         try await availableSettlement.wait()
     }
@@ -160,6 +162,7 @@ public final class Db3Subscription: @unchecked Sendable {
 
     /// This db3's events, from now on: each call answers a new stream,
     /// finished when its consumer stops iterating.
+    /// - Stability: beta
     public func stream() -> AsyncStream<Db3SubscriptionEvent> {
         AsyncStream { continuation in
             let observation = observe { event in continuation.yield(event) }
@@ -169,6 +172,7 @@ public final class Db3Subscription: @unchecked Sendable {
 
     /// Hear this db3's events; cancel the answered subscription to stop.
     /// - Parameter handler: Called with each event, on the thread that emitted it.
+    /// - Stability: beta
     public func observe(_ handler: @escaping @Sendable (Db3SubscriptionEvent) -> Void) -> EventSubscription {
         let token = UUID()
         lock.withLock { listeners[token] = handler }
@@ -178,6 +182,7 @@ public final class Db3Subscription: @unchecked Sendable {
     }
 
     /// Give this subscription up. Disposing twice is disposing once.
+    /// - Stability: beta
     public func dispose() {
         let first = lock.withLock { () -> Bool in
             guard !disposed else { return false }
@@ -241,9 +246,14 @@ public final class Db3Subscription: @unchecked Sendable {
 /// ```
 public final class Db3API: @unchecked Sendable {
     /// A db3's indexes: list, register and drop.
+    /// - Stability: beta
     public let indexes: Db3IndexesAPI
     /// A db3's bulk loads: build, create, upload, commit, follow, abort and list.
+    /// - Stability: beta
     public let ingests: Db3IngestsAPI
+    /// A user's aliases for db3s: set, resolve and delete.
+    /// - Stability: beta
+    public let aliases: Db3AliasesAPI
     private let lifecycle: Db3Lifecycle
     private let transport: any Transport
     /// The client a created db3 is adopted into (#4806); `nil` adopts nothing.
@@ -273,9 +283,24 @@ public final class Db3API: @unchecked Sendable {
                     return try await client.registerLocalDb3Index(db3Id, registration)
                 },
                 drop: { [weak client] db3Id, name in try await client?.dropLocalDb3Index(db3Id, name: name) }
+            ),
+            device: Db3DeviceIndexDoor(
+                list: { [weak client] db3Id in
+                    guard let client else { throw db3NotResidentError([db3Id]) }
+                    return try await client.deviceDb3Indexes(db3Id)
+                },
+                skipped: { [weak client] db3Id in
+                    guard let client else { throw db3NotResidentError([db3Id]) }
+                    return try await client.deviceDb3IndexSkips(db3Id)
+                },
+                change: { [weak client] db3Id, name, decline in
+                    guard let client else { throw db3NotResidentError([db3Id]) }
+                    return try await client.changeDeviceDb3Index(db3Id, name: name, decline: decline)
+                }
             )
         )
         self.ingests = Db3IngestsAPI(transport: transport, awaitCreate: awaitCreate)
+        self.aliases = Db3AliasesAPI(transport: transport, awaitCreate: awaitCreate)
     }
 
     /// #5000 — before a request naming `db3Id`, wait for a pending create of
@@ -296,12 +321,14 @@ public final class Db3API: @unchecked Sendable {
     ///   - options: How long `ready()` waits without progress.
     /// - Throws: `DB3_DISPOSED` once the client was destroyed;
     ///   `INVALID_ARGUMENT` for an empty id.
+    /// - Stability: beta
     public func subscribe(_ db3Id: String, options: Db3SubscribeOptions = Db3SubscribeOptions()) throws -> Db3Subscription {
         try lifecycle.subscribe(db3Id, options: options)
     }
 
     /// Dispose every subscription this client holds to a db3. The local copy stays readable.
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func unsubscribe(_ db3Id: String) {
         lifecycle.unsubscribe(db3Id)
     }
@@ -312,6 +339,7 @@ public final class Db3API: @unchecked Sendable {
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - options: How long it waits without progress.
+    /// - Stability: beta
     public func refresh(_ db3Id: String, options: Db3SubscribeOptions = Db3SubscribeOptions()) async throws -> Db3State {
         try await lifecycle.refresh(db3Id, options: options)
     }
@@ -324,11 +352,13 @@ public final class Db3API: @unchecked Sendable {
     ///   - options: `force` to drop writes the room has not judged; they are
     ///     handed back as `DOCUMENT_STORE_PURGED`.
     /// - Throws: `DB3_PENDING_WRITES` while it holds unjudged writes, unless `force`.
+    /// - Stability: beta
     public func evict(_ db3Id: String, options: Db3EvictOptions = Db3EvictOptions()) async throws {
         try await lifecycle.evict(db3Id, options: options)
     }
 
     /// Every db3 this device holds for the signed-in user, with its size and sync state, sorted by id.
+    /// - Stability: beta
     public func stored() async throws -> [Db3StoredEntry] {
         try await lifecycle.stored()
     }
@@ -336,6 +366,7 @@ public final class Db3API: @unchecked Sendable {
     /// A db3's state on this device, without subscribing. A db3 never seen
     /// here answers `idle`, not resident, with nothing stored.
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func state(_ db3Id: String) async throws -> Db3State {
         try await lifecycle.state(db3Id)
     }
@@ -344,7 +375,12 @@ public final class Db3API: @unchecked Sendable {
     /// holds): what the device keeps, and for how long. A db3 holding
     /// unjudged writes, or one subscribed here, is never removed by it.
     /// - Parameter policy: The policy.
-    public func setRetentionPolicy(_ policy: RetentionPolicy) {
+    /// - Throws: `JsBaoError` `.invalidArgument` when `maxDocs` is `0` or a
+    ///   negative (pass `nil` for no cap), or `ttl` is `0`, a negative or not
+    ///   finite (pass `nil` for no TTL); the policy stays as it was.
+    /// - Stability: beta
+    public func setRetentionPolicy(_ policy: RetentionPolicy) throws {
+        if let refusal = policy.refusal(call: "client.db3.setRetentionPolicy") { throw refusal }
         lifecycle.setRetentionPolicy(policy)
     }
 
@@ -408,11 +444,14 @@ public final class Db3API: @unchecked Sendable {
     ///     admin only); omitted means the caller.
     ///   - tags: Its tags.
     ///   - metadata: An opaque metadata blob (at most 4 KB).
-    /// - Throws: `JsBaoError(.invalidArgument)` with no signed-in user. A
-    ///   sync-off or custodian-naming create throws the route's `HttpError`,
-    ///   its `serverCode` naming why: 403 for a member's sync-off create, 404
-    ///   `DB3_TYPE_NOT_FOUND`, 409 `DB3_TYPE_REFUSED` or
-    ///   `DB3_TYPE_REVISION_CONFLICT`.
+    /// - Throws: `JsBaoError(.invalidArgument)` with no signed-in user, or
+    ///   with `details.reason` `identity-changed` when the caller is signed
+    ///   out, or another user signed in, while the create waits for an
+    ///   identity change in progress. A sync-off or custodian-naming create
+    ///   throws the route's `HttpError`, its `serverCode` naming why: 403 for
+    ///   a member's sync-off create, 404 `DB3_TYPE_NOT_FOUND`, 409
+    ///   `DB3_TYPE_REFUSED` or `DB3_TYPE_REVISION_CONFLICT`.
+    /// - Stability: beta
     public func create(
         title: String,
         type: String? = nil,
@@ -487,8 +526,10 @@ public final class Db3API: @unchecked Sendable {
     ///   - localOnly: Keep the db3 on this device only.
     /// - Throws: `.localOnlyUnsupportedOption` for `localOnly` with `type`,
     ///   `sync: false` or `custodian`, before anything is created;
-    ///   `.invalidArgument` with no signed-in user; `.format2StorageUnavailable`
+    ///   `.invalidArgument` with no signed-in user, or `identity-changed` as
+    ///   for the synced create; `.format2StorageUnavailable`
     ///   on a client whose storage cannot keep a db3 (an in-memory provider).
+    /// - Stability: beta
     public func create(
         title: String,
         type: String? = nil,
@@ -568,6 +609,7 @@ public final class Db3API: @unchecked Sendable {
     /// - Parameter db3Id: The db3.
     /// - Throws: `HttpError` 404 for no db3 of this app, 409 `NOT_A_DB3` for a
     ///   document that is not a db3, 403 `DOC_ACCESS_DENIED`.
+    /// - Stability: beta
     public func get(_ db3Id: String) async throws -> Db3Info {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: Self.path(db3Id))
@@ -579,19 +621,24 @@ public final class Db3API: @unchecked Sendable {
     /// A db3 that lives only on this device is removed here with nothing
     /// sent: its subscriptions end as evicted and `Db3EvictedEvent` fires
     /// once (`explicit`) once its copy is gone; `.db3Held` while another
-    /// holder keeps its store, nothing removed.
+    /// holder keeps its store, nothing removed. Either way this device's
+    /// index policy for the db3 (``Db3IndexesAPI/decline(_:name:)``) is cleared.
     ///
     /// ```swift
     /// _ = try await client.db3.delete(db3Id)
     /// ```
     ///
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func delete(_ db3Id: String) async throws -> SuccessResult {
         if let client, await client.isLocalOnlyDb3(db3Id) {
             try await lifecycle.deleteLocalOnly(db3Id)
             return SuccessResult(success: true)
         }
-        return try await transport.request(method: .delete, path: Self.path(db3Id))
+        let deleted: SuccessResult = try await transport.request(method: .delete, path: Self.path(db3Id))
+        // The device's index policy for it goes with it (#5322); an evict keeps it.
+        await client?.clearDb3IndexPolicy(db3Id)
+        return deleted
     }
 
     /// The listings `listMine(_:)` reads, in its order.
@@ -617,6 +664,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter options: The listings, the page size and a cursor.
+    /// - Stability: production
     public func listMine(_ options: Db3ListMineOptions = Db3ListMineOptions()) async throws -> PaginatedResult<Db3Info> {
         let sources = Self.listings.filter { options.via.contains($0.via) }
         let at: Db3ListMineCursor
@@ -667,6 +715,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter options: The page size and the cursor of the page before.
+    /// - Stability: production
     public func listMine(options: PaginationOptions) async throws -> PaginatedResult<Db3Info> {
         if let cursor = options.cursor, Db3ListMineCursor.decode(cursor) != nil {
             return try await listMine(Db3ListMineOptions(limit: options.limit, cursor: cursor))
@@ -720,6 +769,7 @@ public final class Db3API: @unchecked Sendable {
     /// - Throws: `HttpError` 409 `DB3_TYPE_MISMATCH` when the alias names a
     ///   db3 of another type, 404 `DB3_TYPE_NOT_FOUND`, 403 for a member
     ///   passing a `permission` other than `.owner`.
+    /// - Stability: beta
     public func getOrCreateWithAlias(_ options: Db3GetOrCreateWithAliasOptions) async throws -> Db3GetOrCreateWithAliasResult {
         var alias: [String: JSONValue] = [
             "scope": .string(options.alias.scope.rawValue), "aliasKey": .string(options.alias.aliasKey),
@@ -760,6 +810,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func getSync(_ db3Id: String) async throws -> Db3SyncState {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: Self.path(db3Id, "/sync"))
@@ -779,6 +830,7 @@ public final class Db3API: @unchecked Sendable {
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - sync: The state to set.
+    /// - Stability: beta
     public func setSync(_ db3Id: String, sync: Bool) async throws -> Db3SyncChange {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .put, path: Self.path(db3Id, "/sync"), body: JSONValue.object(["sync": .bool(sync)]))
@@ -795,6 +847,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func getType(_ db3Id: String) async throws -> Db3TypeState {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: Self.path(db3Id, "/type"))
@@ -815,6 +868,7 @@ public final class Db3API: @unchecked Sendable {
     ///   - type: A db3 type of this app.
     /// - Throws: `HttpError` 409 `DB3_TYPE_REFUSED` (`details.reasons`) when
     ///   the db3's records break the type, `DB3_TYPED` when it has another type.
+    /// - Stability: beta
     public func setType(_ db3Id: String, type: String) async throws -> Db3TypeChange {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .put, path: Self.path(db3Id, "/type"), body: JSONValue.object(["type": .string(type)]))
@@ -830,6 +884,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func getAppAccess(_ db3Id: String) async throws -> Db3AppAccess {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: Self.path(db3Id, "/app-access"))
@@ -850,6 +905,7 @@ public final class Db3API: @unchecked Sendable {
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - level: The level, or `nil` to remove the grant.
+    /// - Stability: beta
     public func setAppAccess(_ db3Id: String, level: Db3AppAccessLevel?) async throws -> Db3AppAccessChange {
         try await awaitCreate(db3Id)
         let value: JSONValue = level.map { .string($0.rawValue) } ?? .null
@@ -869,9 +925,83 @@ public final class Db3API: @unchecked Sendable {
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - custodian: `app` or `user:<userId>`.
+    /// - Stability: beta
     public func transfer(_ db3Id: String, to custodian: String) async throws -> Db3Info {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .post, path: Self.path(db3Id, "/transfer"), body: JSONValue.object(["to": .string(custodian)]))
+    }
+
+    // MARK: - Records
+
+    /// A db3's records by model name, with no model class: put, patch,
+    /// delete, get, query, count, subscribe and explain any model, declared
+    /// or not, answered from this device's copy online and offline. Every call
+    /// of the handle resolves the db3 when it runs, so the handle may be kept:
+    /// it throws `.notFound` while the db3 is not open here, and
+    /// `.db3NotResident` for a read before its rows have loaded.
+    ///
+    /// ```swift
+    /// let records = client.db3.records(db3Id)
+    /// try records.put("Note", ["title": "Groceries", "tags": ["home"]])
+    /// let open = try records.query("Note", ["done": false])
+    /// ```
+    ///
+    /// - Parameter db3Id: The db3.
+    /// - Stability: beta
+    public func records(_ db3Id: String) -> DocumentRecords {
+        JsBaoClient.modelFreeRecords(db3Id, client: client, logger: client?.logger.forScope(scope: "db3"))
+    }
+
+    /// What a db3 holds, model by model: each model's declaration and what
+    /// the room observed written (`schema.models[name]["observed"]`: each
+    /// field's kinds, and per-kind counts after a segment export).
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// let answer = try await client.db3.schema(db3Id)
+    /// print(answer.modelNames)
+    /// ```
+    ///
+    /// - Parameter db3Id: The db3.
+    /// - Throws: `HttpError` 404 for no db3 of this app, 409 `NOT_A_DB3` for a
+    ///   document that is not a db3, 403 `DOC_ACCESS_DENIED`.
+    /// - Stability: beta
+    public func schema(_ db3Id: String) async throws -> DocumentSchemaAnswer {
+        try await awaitCreate(db3Id)
+        return try await transport.request(method: .get, path: Self.path(db3Id, "/schema"))
+    }
+
+    // MARK: - Access
+
+    /// A db3's effective access: the caller's, or with `userId` that member's
+    /// (an app owner or admin may name anyone, a member only themselves). A
+    /// member reached by the db3's app access reads `accessSource` `"app"`.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// let mine = try await client.db3.validateAccess(db3Id)
+    /// let theirs = try await client.db3.validateAccess(db3Id, userId: memberId)
+    /// if theirs.permission == .readWrite { print("they may write") }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - userId: The member to ask about instead of the caller.
+    /// - Throws: `HttpError` 404 for no db3 of this app, 409 `NOT_A_DB3` for a
+    ///   document that is not a db3, 403 when a member names someone else.
+    /// - Stability: beta
+    public func validateAccess(_ db3Id: String, userId: String? = nil) async throws -> DocumentAccessResult {
+        try await awaitCreate(db3Id)
+        guard let userId else {
+            return try await transport.request(method: .post, path: Self.path(db3Id, "/validate-access"))
+        }
+        return try await transport.request(
+            method: .post, path: Self.path(db3Id, "/validate-access"), body: ValidateAccessSubjectParams(userId: userId)
+        )
     }
 
     // MARK: - Sharing
@@ -886,6 +1016,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func permissions(_ db3Id: String) -> Db3PermissionsAPI {
         Db3PermissionsAPI(db3Id: db3Id, transport: transport) { [weak self] id in try await self?.awaitCreate(id) }
     }
@@ -906,6 +1037,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func blobs(_ db3Id: String) -> Db3BlobContext {
         Db3BlobContext(db3Id: db3Id, transport: transport, blobManager: blobManager) { [weak client] in
             // #5155 — a db3 that lives only on this device holds no blobs.
@@ -927,9 +1059,87 @@ public final class Db3API: @unchecked Sendable {
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - present: Whether the owner row should exist.
+    /// - Stability: beta
     public func setOwnerRow(_ db3Id: String, present: Bool) async throws -> Db3OwnerRowChange {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .put, path: Self.path(db3Id, "/owner-row"), body: JSONValue.object(["present": .bool(present)]))
+    }
+
+    private struct BatchBody: Encodable, Sendable {
+        let operations: [Db3BatchOperation]
+        let atomic: Bool?
+        let requestId: String?
+    }
+
+    private struct BatchReadBody: Encodable, Sendable {
+        let operations: [Db3BatchReadOperation]
+        let atomic: Bool?
+    }
+
+    /// Apply creates, patches, deletes, upserts and increments across models,
+    /// with reads among them, in one request: in order, in one transaction,
+    /// all of them or none (at most 100 operations). A read sees the writes
+    /// before it and not those after it, and is answered in `reads` at its
+    /// index. With `atomic: false` each operation is applied on its own,
+    /// `results` reports each write and a refused read is `.refused`. Needs
+    /// write access; a caller who may only read uses ``batchRead(_:_:atomic:)``.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// let result = try await client.db3.batch(db3Id, [
+    ///     .create(model: "Task", data: ["title": "Plan"]),
+    ///     .count(model: "Task"),
+    /// ])
+    /// if case .count(let total)? = result.reads?.first?.answer { print(total) }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - operations: The operations, in order.
+    ///   - options: `atomic`, and a `requestId` naming the whole request.
+    /// - Throws: `HttpError` with the refusal's code (`BATCH_TOO_LARGE` past 100 operations,
+    ///   `DB3_CONDITION_NOT_MET`, `DB3_PAGE_TOO_LARGE`, …) and `details.index` naming the operation.
+    /// - Stability: beta
+    public func batch(_ db3Id: String, _ operations: [Db3BatchOperation], options: Db3BatchOptions = Db3BatchOptions()) async throws -> Db3BatchResult {
+        try await awaitCreate(db3Id)
+        return try await transport.request(
+            method: .post,
+            path: Self.path(db3Id, "/records/batch"),
+            body: BatchBody(operations: operations, atomic: options.atomic, requestId: options.requestId)
+        )
+    }
+
+    /// Run several reads (queries, counts, aggregates, across models) in one
+    /// request, all answered from one state of the db3, each at its index (at
+    /// most 100). By default the first refused read throws with its code and
+    /// `details.index`; with `atomic: false` it is answered `.refused` in its
+    /// place. Needs read access only.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// let answer = try await client.db3.batchRead(db3Id, [
+    ///     .query(model: "Project", limit: 20),
+    ///     .count(model: "Task", filter: ["done": false]),
+    /// ])
+    /// for result in answer.results { print(result.index, result.answer) }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - operations: The reads, in order.
+    ///   - atomic: `false` answers each read on its own; omitted, the first refusal throws.
+    /// - Stability: beta
+    public func batchRead(_ db3Id: String, _ operations: [Db3BatchReadOperation], atomic: Bool? = nil) async throws -> Db3BatchReadResponse {
+        try await awaitCreate(db3Id)
+        return try await transport.request(
+            method: .post,
+            path: Self.path(db3Id, "/records/batch-read"),
+            body: BatchReadBody(operations: operations, atomic: atomic)
+        )
     }
 }
 
@@ -954,6 +1164,127 @@ public struct Db3IndexOrigin: Sendable, Equatable, Decodable {
     }
 }
 
+/// What a db3 index is: `.scalar` for a field index (or a unique constraint
+/// over several fields), `.members` for a string-set field's member index,
+/// `.text` for a full-text index that answers `$search`. A kind no side of the
+/// db3 builds is refused with `DB3_INDEX_PLACEMENT_UNSUPPORTED`.
+public enum Db3IndexKind: String, Sendable, Equatable, Codable, CaseIterable {
+    case scalar
+    case members
+    case text
+    case vector
+}
+
+/// Where a db3 index lives: `server` (the db3's server-side reads use it),
+/// `device` (each device holding the db3 builds it for its local queries) or
+/// `both`. A db3 that lives only on this device keeps every index on the device.
+public enum Db3IndexPlacement: String, Sendable, Equatable, Codable, CaseIterable {
+    case server
+    case device
+    case both
+}
+
+/// How an index a synced db3's room places on this device stands here:
+/// `built` (this device holds it and device queries use it), `building` (it
+/// is being built in the background; queries answer meanwhile), `unbuilt`
+/// (this device holds none: its build failed, for one when the disk was full,
+/// or this device builds no index of its kind; ``Db3LocalIndex/reason`` says
+/// why, and every later sync tries again), `declined` (this device does not
+/// build it: ``Db3IndexesAPI/decline(_:name:)`` or the client's
+/// ``JsBaoClientOptions/deviceIndexes``).
+public enum Db3LocalIndexStatus: String, Sendable, Equatable, CaseIterable {
+    case built
+    case building
+    case unbuilt
+    case declined
+}
+
+/// An index placed on this device, with how it stands here, as
+/// `client.db3.indexes.local(_:)` lists it.
+public struct Db3LocalIndex: Sendable, Equatable {
+    /// The index's name, as `client.db3.indexes.list(_:)` names it.
+    public let name: String
+    public let model: String
+    /// The fields, in index order.
+    public let fields: [String]
+    public let kind: Db3IndexKind
+    /// `device` or `both`: an index placed on the server only is not listed.
+    public let on: Db3IndexPlacement
+    public let status: Db3LocalIndexStatus
+    /// Why it is not built: `declined on this device`, the `deviceIndexes` option, or its build's failure.
+    public let reason: String?
+    /// How a built vector index answers `$near` now: `.exact` from every
+    /// vector, or `.ann` from its approximate index once this device has
+    /// installed the shared model and finished filling it. `.exact` while
+    /// `.building`; `nil` for every other kind and for a vector index that is
+    /// not built.
+    public let mode: Db3LocalIndexMode?
+
+    public init(
+        name: String, model: String, fields: [String], kind: Db3IndexKind, on: Db3IndexPlacement, status: Db3LocalIndexStatus,
+        reason: String? = nil, mode: Db3LocalIndexMode? = nil
+    ) {
+        self.name = name
+        self.model = model
+        self.fields = fields
+        self.kind = kind
+        self.on = on
+        self.status = status
+        self.reason = reason
+        self.mode = mode
+    }
+}
+
+/// An entry of a db3's index list this device's copy built nothing for, as
+/// `client.db3.indexes.skipped(_:)` lists it: one placed on the server only,
+/// or one the device cannot build (a name that is not an identifier, an `id`
+/// field the primary key already serves, a member or vector index over more
+/// than one field, text options it cannot read).
+public struct Db3SkippedIndex: Sendable, Equatable {
+    /// The index's name, as `client.db3.indexes.list(_:)` names it.
+    public let name: String
+    public let model: String
+    /// The fields, in index order.
+    public let fields: [String]
+    public let kind: Db3IndexKind
+    /// Where the index list places it: `.server` only here, never in `local(_:)`.
+    public let on: Db3IndexPlacement
+    /// Why this device builds nothing for it, e.g. `placed on the server only; this device builds nothing for it`.
+    public let reason: String
+
+    public init(name: String, model: String, fields: [String], kind: Db3IndexKind, on: Db3IndexPlacement, reason: String) {
+        self.name = name
+        self.model = model
+        self.fields = fields
+        self.kind = kind
+        self.on = on
+        self.reason = reason
+    }
+}
+
+/// How a vector index built on this device answers `$near`: `.exact` (every
+/// vector compared) or `.ann` (its approximate index, reranked on the full
+/// vectors, so `_distance` stays exact).
+public enum Db3LocalIndexMode: String, Sendable, Equatable, CaseIterable {
+    case exact
+    case ann
+}
+
+/// Which of the indexes a db3's room places on this device the client builds
+/// when it has not built them yet: `.all` (the default), `.none`, or the kinds
+/// to build. An index already built stays built, and
+/// ``Db3IndexesAPI/decline(_:name:)`` and ``Db3IndexesAPI/accept(_:name:)``
+/// decide one index whatever this says.
+///
+/// ```swift
+/// let options = JsBaoClientOptions(apiUrl: api, wsUrl: ws, appId: appId, deviceIndexes: .kinds([.scalar]))
+/// ```
+public enum Db3DeviceIndexes: Sendable, Equatable {
+    case all
+    case none
+    case kinds([Db3IndexKind])
+}
+
 /// One index on a db3's records, as `client.db3.indexes.list(_:)` answers it.
 public struct Db3Index: Sendable, Equatable, Decodable {
     /// `idx_records_<model>_<field>` for a field's shared index,
@@ -973,9 +1304,28 @@ public struct Db3Index: Sendable, Equatable, Decodable {
     public let members: Bool
     /// Every origin keeping the index. It is dropped when the last one goes.
     public let origins: [Db3IndexOrigin]
+    /// What the index is: `.members` exactly when `members` is true.
+    public let kind: Db3IndexKind
+    /// Where the index lives. A declared field's index is on `.both`; every
+    /// index of a db3 that lives only on this device is on `.device`.
+    public let on: Db3IndexPlacement
+    /// A text index's options, every one filled in; `nil` for any other kind.
+    public let text: Db3TextIndex?
+    /// A vector index's options and its field's encoding; `nil` for any other
+    /// kind, and from a server that does not list them.
+    public let vector: Db3VectorIndex?
+    /// A vector index's generation: it changes when the index is dropped and
+    /// registered again, so no model of the old index is used. `nil` for any other kind.
+    public let generation: Int?
+    /// A vector index's model revision: it moves when the model is deleted,
+    /// so every device drops its copy. `nil` for any other kind.
+    public let revision: Int?
+    /// An `ann` vector index's shared model, once a device (or the app)
+    /// uploaded one; `nil` before, and for any other index.
+    public let annModel: Db3IndexAnnModel?
 
     private enum CodingKeys: String, CodingKey {
-        case name, model, fields, unique, members, origins
+        case name, model, fields, unique, members, origins, kind, on, text, vector, generation, revision, annModel
     }
 
     public init(from decoder: Decoder) throws {
@@ -987,13 +1337,185 @@ public struct Db3Index: Sendable, Equatable, Decodable {
         // Only a member index's row carries `members`.
         members = try container.decodeIfPresent(Bool.self, forKey: .members) ?? false
         origins = try container.decode([Db3IndexOrigin].self, forKey: .origins)
+        // A server from before kinds and placements lists neither: a member
+        // index lived on the server, every other index on both sides.
+        kind = try container.decodeIfPresent(Db3IndexKind.self, forKey: .kind) ?? (members ? .members : .scalar)
+        on = try container.decodeIfPresent(Db3IndexPlacement.self, forKey: .on) ?? (kind == .members ? .server : .both)
+        text = try container.decodeIfPresent(Db3TextIndex.self, forKey: .text)
+        vector = try container.decodeIfPresent(Db3VectorIndex.self, forKey: .vector)
+        generation = try container.decodeIfPresent(Int.self, forKey: .generation)
+        revision = try container.decodeIfPresent(Int.self, forKey: .revision)
+        annModel = try container.decodeIfPresent(Db3IndexAnnModel.self, forKey: .annModel)
+    }
+}
+
+/// A vector index's options as `client.db3.indexes.list(_:)` answers them:
+/// the registration's `distance` and `index`, filled in, and the field's
+/// encoding.
+public struct Db3VectorIndex: Sendable, Equatable, Decodable {
+    public let distance: Db3VectorIndexOptions.Distance
+    public let index: Db3VectorIndexOptions.Mode
+    /// How many numbers the field holds; `nil` when the room does not know the field's encoding.
+    public let dims: Int?
+    /// How each number is stored; `nil` when the room does not know the field's encoding.
+    public let element: VectorElement?
+
+    public init(distance: Db3VectorIndexOptions.Distance, index: Db3VectorIndexOptions.Mode, dims: Int?, element: VectorElement?) {
+        self.distance = distance
+        self.index = index
+        self.dims = dims
+        self.element = element
+    }
+}
+
+/// An `ann` vector index's shared model as `client.db3.indexes.list(_:)`
+/// lists it: its revision, when and over how many records it was trained,
+/// its size and its envelope's format (`pvm1`).
+public struct Db3IndexAnnModel: Sendable, Equatable, Decodable {
+    public let revision: Int
+    public let trainedAt: Date
+    public let rows: Int
+    public let bytes: Int
+    public let format: String
+
+    private enum CodingKeys: String, CodingKey { case revision, trainedAt, rows, bytes, format }
+
+    public init(revision: Int, trainedAt: Date, rows: Int, bytes: Int, format: String) {
+        self.revision = revision
+        self.trainedAt = trainedAt
+        self.rows = rows
+        self.bytes = bytes
+        self.format = format
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        revision = try container.decode(Int.self, forKey: .revision)
+        let text = try container.decode(String.self, forKey: .trainedAt)
+        guard let date = RecordLogVectorModelCheck.date(text) else {
+            throw DecodingError.dataCorruptedError(forKey: .trainedAt, in: container, debugDescription: "not an ISO 8601 date: \(text)")
+        }
+        trainedAt = date
+        rows = try container.decode(Int.self, forKey: .rows)
+        bytes = try container.decode(Int.self, forKey: .bytes)
+        format = try container.decode(String.self, forKey: .format)
+    }
+}
+
+/// An `ann` vector index's shared model as `client.db3.indexes.fetchModel`
+/// answers it: its bytes (the model in its `pvm1` envelope) and what it was
+/// uploaded with.
+public struct Db3IndexModel: Sendable, Equatable {
+    public let bytes: Data
+    /// The index's generation it was uploaded for.
+    public let generation: Int
+    /// The revision it was uploaded under.
+    public let revision: Int
+    /// How many records it was trained over.
+    public let rows: Int
+    public let trainedAt: Date
+    /// Its envelope's format, `pvm1`.
+    public let format: String
+
+    public init(bytes: Data, generation: Int, revision: Int, rows: Int, trainedAt: Date, format: String) {
+        self.bytes = bytes
+        self.generation = generation
+        self.revision = revision
+        self.rows = rows
+        self.trainedAt = trainedAt
+        self.format = format
+    }
+}
+
+/// What `client.db3.indexes.uploadModel` sends beside the bytes: the index's
+/// `generation` and `revision` as `list` answers them, and how the model was
+/// trained.
+public struct Db3IndexModelUpload: Sendable, Equatable {
+    public let generation: Int
+    public let revision: Int
+    /// How many records the model was trained over.
+    public let rows: Int
+    public let trainedAt: Date
+    /// Its envelope's format: `pvm1`.
+    public let format: String
+
+    public init(generation: Int, revision: Int, rows: Int, trainedAt: Date, format: String = "pvm1") {
+        self.generation = generation
+        self.revision = revision
+        self.rows = rows
+        self.trainedAt = trainedAt
+        self.format = format
+    }
+}
+
+/// What `client.db3.indexes.deleteModel` answers: the index's new revision.
+public struct Db3IndexModelDeletion: Sendable, Equatable {
+    public let ok: Bool
+    public let name: String
+    public let revision: Int
+
+    public init(ok: Bool, name: String, revision: Int) {
+        self.ok = ok
+        self.name = name
+        self.revision = revision
+    }
+}
+
+/// How a text index splits and folds words: `.unicode61` (the default: Unicode
+/// words, case and diacritics folded, so `cafe` finds `Café`) or `.porter`
+/// (the same, with English stemming, so `run` finds `running`).
+public enum Db3TextTokenizer: String, Sendable, Equatable, Codable, CaseIterable {
+    case unicode61
+    case porter
+}
+
+/// A text index's options on a registration, each optional: the tokenizer
+/// (`.unicode61` when `nil`), prefix-index lengths (each 1 to 32, at most 8;
+/// they speed up `prefix: true` searches of those lengths) and a positive
+/// weight per covered field (1 for each field left out; a match in a heavier
+/// field ranks higher).
+///
+/// ```swift
+/// Db3TextIndexOptions(tokenizer: .porter, weights: ["title": 3])
+/// ```
+public struct Db3TextIndexOptions: Sendable, Equatable, Encodable {
+    public let tokenizer: Db3TextTokenizer?
+    public let prefix: [Int]?
+    public let weights: [String: Double]?
+
+    public init(tokenizer: Db3TextTokenizer? = nil, prefix: [Int]? = nil, weights: [String: Double]? = nil) {
+        self.tokenizer = tokenizer
+        self.prefix = prefix
+        self.weights = weights
+    }
+}
+
+/// A text index's options as `client.db3.indexes.list(_:)` answers them, every
+/// one filled in: the tokenizer, the prefix-index lengths (none by default)
+/// and a weight per covered field.
+public struct Db3TextIndex: Sendable, Equatable, Decodable {
+    public let tokenizer: Db3TextTokenizer
+    public let prefix: [Int]
+    public let weights: [String: Double]
+
+    public init(tokenizer: Db3TextTokenizer, prefix: [Int], weights: [String: Double]) {
+        self.tokenizer = tokenizer
+        self.prefix = prefix
+        self.weights = weights
     }
 }
 
 /// What `client.db3.indexes.register(_:_:)` registers: a model and one field,
 /// or a composite (a unique constraint, which also needs `unique: true` and a
 /// `name`). `unique: true` refuses the registration while two records share a key.
-/// `members: true` on a string-set field registers its member index instead.
+/// `members: true` (or `kind: .members`) on a string-set field registers its
+/// member index instead, and `kind: .text` a full-text index over one or more
+/// string fields, with its options under `text`. `on` places the index:
+/// `.both` (the default for a field index), `.server` (the default for a
+/// member index) or `.device`; a `unique` index needs `.server` or `.both`, a
+/// text index `.device`, and on a db3 that lives only on this device every
+/// index is on the device. A placement changes by dropping the index and
+/// registering it again.
 ///
 /// ```swift
 /// try await client.db3.indexes.register(db3Id, Db3IndexRegistration(model: "Note", field: "email"))
@@ -1001,6 +1523,14 @@ public struct Db3Index: Sendable, Equatable, Decodable {
 ///     db3Id, Db3IndexRegistration(model: "Note", fields: ["ownerId", "slug"], unique: true, name: "owner_slug")
 /// )
 /// try await client.db3.indexes.register(db3Id, Db3IndexRegistration(model: "Note", field: "tags", members: true))
+/// try await client.db3.indexes.register(db3Id, Db3IndexRegistration(model: "Note", field: "status", on: .device))
+/// try await client.db3.indexes.register(db3Id, Db3IndexRegistration(
+///     model: "Note", field: "embedding", kind: .vector, vector: Db3VectorIndexOptions(distance: .cos, index: .ann(nbucket: 64))
+/// ))
+/// try await client.db3.indexes.register(
+///     db3Id, Db3IndexRegistration(model: "Note", fields: ["title", "body"], kind: .text, on: .device,
+///                                 text: Db3TextIndexOptions(weights: ["title": 3]))
+/// )
 /// ```
 public struct Db3IndexRegistration: Sendable, Encodable {
     public let model: String
@@ -1010,39 +1540,166 @@ public struct Db3IndexRegistration: Sendable, Encodable {
     public let name: String?
     /// `true` for a string-set field's member index; `nil` for any other index.
     public let members: Bool?
+    /// What the index is; `nil` sends none (`.scalar`, or `.members` with `members: true`).
+    public let kind: Db3IndexKind?
+    /// Where the index lives; `nil` sends none (`.both` for a field index, `.server` for a member index).
+    public let on: Db3IndexPlacement?
+    /// A text index's options (`kind: .text` only); `nil` sends none, the defaults.
+    public let text: Db3TextIndexOptions?
+    /// A `.vector` index's options (#5225); `nil` sends none, and on any other kind.
+    public let vector: Db3VectorIndexOptions?
 
     /// An index on one field.
-    public init(model: String, field: String, unique: Bool? = nil, name: String? = nil) {
+    public init(
+        model: String, field: String, unique: Bool? = nil, name: String? = nil, kind: Db3IndexKind? = nil, on: Db3IndexPlacement? = nil,
+        text: Db3TextIndexOptions? = nil
+    ) {
         self.model = model
         self.field = field
         self.fields = nil
         self.unique = unique
         self.name = name
         self.members = nil
+        self.kind = kind
+        self.on = on
+        self.text = text
+        self.vector = nil
     }
 
-    /// A composite index over `fields`, in order.
-    public init(model: String, fields: [String], unique: Bool? = nil, name: String? = nil) {
+    /// A composite index over `fields`, in order; with `kind: .text`, a text index over them.
+    public init(
+        model: String, fields: [String], unique: Bool? = nil, name: String? = nil, kind: Db3IndexKind? = nil,
+        on: Db3IndexPlacement? = nil, text: Db3TextIndexOptions? = nil
+    ) {
         self.model = model
         self.field = nil
         self.fields = fields
         self.unique = unique
         self.name = name
         self.members = nil
+        self.kind = kind
+        self.on = on
+        self.text = text
+        self.vector = nil
     }
 
     /// A member index on the string-set `field`: the db3 builds it from its
     /// records in one request and keeps it on every write, so `$contains`,
     /// any-of, membership levels and unfiltered facets on the field read it.
-    /// It takes no `unique` or `name`.
-    public init(model: String, field: String, members: Bool) {
+    /// A synced db3's copy on this device builds nothing for it; a db3 that
+    /// lives only on this device builds it here. It takes no `unique` or `name`.
+    public init(model: String, field: String, members: Bool, kind: Db3IndexKind? = nil, on: Db3IndexPlacement? = nil) {
         self.model = model
         self.field = field
         self.fields = nil
         self.unique = nil
         self.name = nil
         self.members = members
+        self.kind = kind
+        self.on = on
+        self.text = nil
+        self.vector = nil
     }
+
+    /// A vector index on the vector field `field` (#5225), searched as
+    /// `vector` says; a vector index lives on the device. It takes no
+    /// `unique` or `name`. The field's `dims` and `element` come from its
+    /// declaration.
+    public init(model: String, field: String, kind: Db3IndexKind, vector: Db3VectorIndexOptions?, on: Db3IndexPlacement? = nil) {
+        self.model = model
+        self.field = field
+        self.fields = nil
+        self.unique = nil
+        self.name = nil
+        self.members = nil
+        self.kind = kind
+        self.on = on
+        self.text = nil
+        self.vector = vector
+    }
+}
+
+/// A `vector` index's options (#5225): how a device searches a vector field.
+public struct Db3VectorIndexOptions: Sendable, Encodable, Equatable {
+    /// How nearness is measured.
+    public enum Distance: String, Sendable, Codable, Equatable, CaseIterable {
+        /// Cosine distance.
+        case cos
+        /// Euclidean distance.
+        case l2
+    }
+
+    /// How each vector of an approximate index is quantized.
+    public enum Quantizer: String, Sendable, Codable, Equatable, CaseIterable {
+        case pq
+        case opq
+        case bq
+    }
+
+    /// How the index searches: every vector, or an approximate index. A
+    /// listing decodes it from `"exact"` or `{ mode: "ann", … }`.
+    public enum Mode: Sendable, Codable, Equatable {
+        /// Compare every vector (the default).
+        case exact
+        /// Keep an approximate index: `nbucket` buckets the vectors are
+        /// partitioned into, `codesize` bytes per quantized vector, and how
+        /// each is quantized.
+        case ann(nbucket: Int? = nil, codesize: Int? = nil, quantizer: Quantizer? = nil)
+
+        private enum Keys: String, CodingKey { case mode, nbucket, codesize, quantizer }
+
+        public init(from decoder: Decoder) throws {
+            if let text = try? decoder.singleValueContainer().decode(String.self) {
+                guard text == "exact" else {
+                    throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "an index mode is exact or { mode: ann }"))
+                }
+                self = .exact
+                return
+            }
+            let container = try decoder.container(keyedBy: Keys.self)
+            guard try container.decode(String.self, forKey: .mode) == "ann" else {
+                self = .exact
+                return
+            }
+            self = .ann(
+                nbucket: try container.decodeIfPresent(Int.self, forKey: .nbucket), codesize: try container.decodeIfPresent(Int.self, forKey: .codesize),
+                // A quantizer this build has no case for (`none`) reads as none given.
+                quantizer: (try? container.decodeIfPresent(String.self, forKey: .quantizer)).flatMap { $0.flatMap(Quantizer.init(rawValue:)) }
+            )
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            switch self {
+            case .exact:
+                var container = encoder.singleValueContainer()
+                try container.encode("exact")
+            case .ann(let nbucket, let codesize, let quantizer):
+                var container = encoder.container(keyedBy: Keys.self)
+                try container.encode("ann", forKey: .mode)
+                try container.encodeIfPresent(nbucket, forKey: .nbucket)
+                try container.encodeIfPresent(codesize, forKey: .codesize)
+                try container.encodeIfPresent(quantizer, forKey: .quantizer)
+            }
+        }
+    }
+
+    /// `nil` sends none: the room's default.
+    public var distance: Distance?
+    /// `nil` sends none: `.exact`.
+    public var index: Mode?
+
+    public init(distance: Distance? = nil, index: Mode? = nil) {
+        self.distance = distance
+        self.index = index
+    }
+}
+
+/// The indexes a db3's room places on this device (#5322): their statuses
+/// here, and this device's decline or accept of one.
+struct Db3DeviceIndexDoor: Sendable {
+    var list: @Sendable (String) async throws -> [Db3LocalIndex]
+    var skipped: @Sendable (String) async throws -> [Db3SkippedIndex] = { db3Id in throw db3NotResidentError([db3Id]) }
+    var change: @Sendable (_ db3Id: String, _ name: String, _ decline: Bool) async throws -> Db3LocalIndex
 }
 
 /// The indexes of a db3 that lives only on this device (#5155): its list,
@@ -1065,7 +1722,7 @@ struct Db3LocalIndexDoor: Sendable {
 /// rules, and nothing is sent: a refusal is a `JsBaoError` with the room's
 /// code and details (`details["db3Id"]` naming the db3), a unique
 /// registration is enforced on the device until it is dropped, and a member
-/// index (`members: true`) is refused `.db3LocalOnly`.
+/// index (`members: true`) is built on the device and kept on every write.
 ///
 /// ```swift
 /// let index = try await client.db3.indexes.register(db3Id, Db3IndexRegistration(model: "Note", field: "email"))
@@ -1077,20 +1734,24 @@ public final class Db3IndexesAPI: Sendable {
     /// The wait for a pending create of the db3 a call names (#5000).
     private let awaitCreate: @Sendable (String) async throws -> Void
     /// Read the db3's list again into its local store when this client holds
-    /// it open (#5101), after a registration or a drop the route answered.
+    /// it open (#5101), after a registration, a drop or a model upload or
+    /// delete the route answered.
     private let applyLocally: @Sendable (String) async throws -> Void
     /// The indexes of a db3 that lives only on this device, kept there (#5155).
     private let local: Db3LocalIndexDoor?
+    /// The indexes placed on this device, and this device's policy over them (#5322).
+    private let device: Db3DeviceIndexDoor?
 
     init(
         transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void = { _ in },
         applyLocally: @escaping @Sendable (String) async throws -> Void = { _ in },
-        local: Db3LocalIndexDoor? = nil
+        local: Db3LocalIndexDoor? = nil, device: Db3DeviceIndexDoor? = nil
     ) {
         self.transport = transport
         self.awaitCreate = awaitCreate
         self.applyLocally = applyLocally
         self.local = local
+        self.device = device
     }
 
     /// The local door, when `db3Id` lives only on this device.
@@ -1111,6 +1772,7 @@ public final class Db3IndexesAPI: Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     ///
     /// - Parameter db3Id: The db3.
+    /// - Stability: beta
     public func list(_ db3Id: String) async throws -> [Db3Index] {
         if let local = await localDoor(db3Id) { return try await local.list(db3Id) }
         try await awaitCreate(db3Id)
@@ -1130,15 +1792,9 @@ public final class Db3IndexesAPI: Sendable {
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - registration: The model and its field or fields.
+    /// - Stability: beta
     public func register(_ db3Id: String, _ registration: Db3IndexRegistration) async throws -> Db3Index {
-        if let local = await localDoor(db3Id) {
-            if registration.members == true {
-                throw JsBaoClient.db3LocalOnlyError(
-                    db3Id, call: "client.db3.indexes.register", instead: "a member index is built only by a db3's room"
-                )
-            }
-            return try await local.register(db3Id, registration)
-        }
+        if let local = await localDoor(db3Id) { return try await local.register(db3Id, registration) }
         try await awaitCreate(db3Id)
         let registered: Registered = try await transport.request(method: .post, path: Self.path(db3Id), body: registration)
         try await applyLocally(db3Id)
@@ -1155,10 +1811,316 @@ public final class Db3IndexesAPI: Sendable {
     /// - Parameters:
     ///   - db3Id: The db3.
     ///   - name: The index's name, as `list(_:)` answers it.
+    /// - Stability: beta
     public func drop(_ db3Id: String, name: String) async throws {
         if let local = await localDoor(db3Id) { return try await local.drop(db3Id, name) }
         try await awaitCreate(db3Id)
         try await transport.send(method: .delete, path: "\(Self.path(db3Id))/\(URLEncoding.encodeComponent(name))")
         try await applyLocally(db3Id)
+    }
+
+    /// The indexes the db3's room places on this device, sorted by name, each
+    /// with how it stands here: `.built`, `.unbuilt` (with why) or `.declined`.
+    /// An index placed on the server only is left out. Read from this device's
+    /// copy, so nothing is sent; the copy must be bound here (subscribe to it
+    /// first). On a db3 that lives only on this device every index is listed,
+    /// never `.declined`.
+    ///
+    /// ```swift
+    /// for index in try await client.db3.indexes.local(db3Id) where index.status != .built {
+    ///     print(index.name, index.status, index.reason ?? "")
+    /// }
+    /// ```
+    ///
+    /// - Parameter db3Id: The db3.
+    /// - Throws: `.db3NotResident` for a db3 whose copy is not bound here.
+    /// - Stability: beta
+    public func local(_ db3Id: String) async throws -> [Db3LocalIndex] {
+        guard let device else { throw db3NotResidentError([db3Id]) }
+        return try await device.list(db3Id)
+    }
+
+    /// The entries of the db3's index list this device built nothing for,
+    /// sorted by name, each with why: an index placed on the server only, and
+    /// one the device cannot build (a name that is not an identifier, an index
+    /// on `id`, which the primary key serves, a member or vector index over
+    /// more than one field, text options it cannot read). ``local(_:)`` lists
+    /// none of them. Read from this device's copy, so nothing is sent and it
+    /// answers offline; the copy must be bound here (subscribe to it first).
+    ///
+    /// ```swift
+    /// for index in try await client.db3.indexes.skipped(db3Id) {
+    ///     print(index.name, index.model, index.reason)
+    /// }
+    /// ```
+    ///
+    /// - Parameter db3Id: The db3.
+    /// - Throws: `.db3NotResident` for a db3 whose copy is not bound here.
+    /// - Stability: beta
+    public func skipped(_ db3Id: String) async throws -> [Db3SkippedIndex] {
+        guard let device else { throw db3NotResidentError([db3Id]) }
+        return try await device.skipped(db3Id)
+    }
+
+    /// Stop building an index on this device: its local table or index is
+    /// dropped before this returns, and it stays unbuilt across restarts,
+    /// index-list refreshes, a drop and re-registration of the same index and
+    /// an evict, until ``accept(_:name:)`` (or `client.db3.delete`). The room's
+    /// index list is not changed, and other devices and the server keep the
+    /// index. On this device a `$search` that needs a declined text index is
+    /// refused `.db3IndexDeclinedOnDevice`; a query a declined scalar or
+    /// member index only speeds answers by a scan. Nothing is sent.
+    ///
+    /// ```swift
+    /// try await client.db3.indexes.decline(db3Id, name: "idx_text_note")
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - name: The index's name, as ``local(_:)`` lists it.
+    /// - Returns: Its status here: `.declined`.
+    /// - Throws: `.db3IndexNotFound` for a name placed on no device;
+    ///   `.db3LocalOnly` on a db3 that lives only on this device (drop its index instead).
+    /// - Stability: beta
+    @discardableResult
+    public func decline(_ db3Id: String, name: String) async throws -> Db3LocalIndex {
+        if await localDoor(db3Id) != nil {
+            throw JsBaoError(
+                code: .db3LocalOnly,
+                message: "client.db3.indexes.decline: the db3 '\(db3Id)' lives only on this device, whose indexes are its own: "
+                    + "remove one with client.db3.indexes.drop(db3Id, name:)",
+                details: ["db3Id": .string(db3Id)]
+            )
+        }
+        guard let device else { throw db3NotResidentError([db3Id]) }
+        return try await device.change(db3Id, name, true)
+    }
+
+    /// Build an index on this device again: one declined, one the client's
+    /// `deviceIndexes` option leaves out, or one whose build failed. It is
+    /// built before this returns, from the copy's rows; when the build fails
+    /// again the answer is `.unbuilt` with why, and every later sync retries.
+    /// An index already built answers `.built` and is not rebuilt. Nothing is
+    /// sent. Throws as ``decline(_:name:)`` does.
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - name: The index's name, as ``local(_:)`` lists it.
+    /// - Returns: Its status here.
+    /// - Stability: beta
+    @discardableResult
+    public func accept(_ db3Id: String, name: String) async throws -> Db3LocalIndex {
+        if await localDoor(db3Id) != nil {
+            throw JsBaoError(
+                code: .db3LocalOnly,
+                message: "client.db3.indexes.accept: the db3 '\(db3Id)' lives only on this device, whose indexes are its own: "
+                    + "register or drop them with client.db3.indexes.register and client.db3.indexes.drop(db3Id, name:)",
+                details: ["db3Id": .string(db3Id)]
+            )
+        }
+        guard let device else { throw db3NotResidentError([db3Id]) }
+        return try await device.change(db3Id, name, false)
+    }
+    /// The model refusal of a db3 that lives only on this device: its vector
+    /// indexes train and keep their models on the device.
+    private func refuseLocalOnlyModel(_ db3Id: String, _ call: String) async throws {
+        guard await localDoor(db3Id) != nil else { return }
+        throw JsBaoError(
+            code: .db3LocalOnly,
+            message: "\(call): the db3 '\(db3Id)' lives only on this device, whose vector indexes train and keep their models on this device",
+            details: ["db3Id": .string(db3Id)]
+        )
+    }
+
+    private var models: Db3IndexModelHttp { Db3IndexModelHttp(transport: transport) }
+
+    /// Read an `ann` vector index's shared model: its bytes (the model in its
+    /// `pvm1` envelope) and what it was uploaded with. Devices fetch and
+    /// install the model on their own, so most apps never call this. Needs
+    /// read access. Refused `DB3_INDEX_MODEL_NOT_FOUND` while the index has
+    /// none.
+    ///
+    /// ```swift
+    /// let model = try await client.db3.indexes.fetchModel(db3Id, name: "idx_vec_note_embedding")
+    /// print(model.revision, model.rows, model.bytes.count)
+    /// ```
+    ///
+    /// - Stability: beta
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - name: The vector index's name, as ``list(_:)`` answers it.
+    public func fetchModel(_ db3Id: String, name: String) async throws -> Db3IndexModel {
+        try await refuseLocalOnlyModel(db3Id, "client.db3.indexes.fetchModel")
+        try await awaitCreate(db3Id)
+        let fetched = try await models.fetch(db3Id, name)
+        guard let trainedAt = RecordLogVectorModelCheck.date(fetched.trainedAt) else {
+            throw Db3IndexModelHttp.Malformed(message: "the model's trained-at header is not a date: \(fetched.trainedAt)")
+        }
+        return Db3IndexModel(
+            bytes: fetched.bytes, generation: fetched.generation, revision: fetched.revision, rows: fetched.rows, trainedAt: trainedAt,
+            format: fetched.format
+        )
+    }
+
+    /// Upload an `ann` vector index's model trained elsewhere: every device
+    /// holding the db3 checks it against its registration and installs it.
+    /// The bytes are a model in its `pvm1` envelope, at most 64 MiB; the
+    /// server stores them as they are. Devices train and upload a model on
+    /// their own when none is listed, so most apps never call this. Needs
+    /// read-write access. Refused `DB3_INDEX_MODEL_EXISTS` once a model is
+    /// uploaded (or while a device's upload is under way),
+    /// `DB3_INDEX_GENERATION_STALE` and `DB3_INDEX_MODEL_STALE` when the
+    /// index moved on since `upload`'s values were listed,
+    /// `DB3_INDEX_MODEL_TOO_LARGE` past 64 MiB, `DB3_INDEX_MODEL_INVALID` for
+    /// an empty body. On a db3 this client has subscribed (or opened), the
+    /// local copy reads the index list again before this returns.
+    ///
+    /// - Stability: beta
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - name: The vector index's name, as ``list(_:)`` answers it.
+    ///   - bytes: The model in its `pvm1` envelope.
+    ///   - upload: The index's generation and revision as ``list(_:)`` answers them, and how the model was trained.
+    /// - Returns: The index as it now is, listing its `annModel`.
+    public func uploadModel(_ db3Id: String, name: String, bytes: Data, upload: Db3IndexModelUpload) async throws -> Db3Index {
+        try await refuseLocalOnlyModel(db3Id, "client.db3.indexes.uploadModel")
+        try await awaitCreate(db3Id)
+        let index = try await models.upload(db3Id, name, bytes: bytes, Db3IndexModelHttp.Metadata(
+            generation: upload.generation, revision: upload.revision, rows: upload.rows,
+            trainedAt: Self.isoDate(upload.trainedAt), format: upload.format
+        ))
+        try await applyLocally(db3Id)
+        return try JSONDecoder().decode(Db3Index.self, from: Data(RecordLogJSON.text(index).utf8))
+    }
+
+    /// Delete an `ann` vector index's shared model, or a device's upload
+    /// under way, so a device trains it again: every device drops its copy
+    /// and answers `$near` exactly until a new model is installed, and an
+    /// upload naming the old revision is refused. Needs the db3's owner (or
+    /// an app owner or admin). Refused `DB3_INDEX_MODEL_NOT_FOUND` when there
+    /// is neither. On a db3 this client has subscribed (or opened), the local
+    /// copy reads the index list again before this returns.
+    ///
+    /// ```swift
+    /// let deleted = try await client.db3.indexes.deleteModel(db3Id, name: "idx_vec_note_embedding")
+    /// print(deleted.revision)
+    /// ```
+    ///
+    /// - Stability: beta
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - name: The vector index's name, as ``list(_:)`` answers it.
+    /// - Returns: The index's new revision.
+    @discardableResult
+    public func deleteModel(_ db3Id: String, name: String) async throws -> Db3IndexModelDeletion {
+        try await refuseLocalOnlyModel(db3Id, "client.db3.indexes.deleteModel")
+        try await awaitCreate(db3Id)
+        let deleted = try await models.delete(db3Id, name)
+        try await applyLocally(db3Id)
+        return Db3IndexModelDeletion(ok: deleted.ok, name: deleted.name, revision: deleted.revision)
+    }
+
+    /// `date` as the model routes carry it: ISO 8601 with milliseconds, in UTC, as JavaScript's `toISOString()` writes it.
+    static func isoDate(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+}
+
+// MARK: - Db3AliasesAPI
+
+/// A user's aliases for db3s, as `client.db3.aliases`: stable keys that name
+/// a db3, bound with `set(_:)`, read with `resolve(_:)` and removed with
+/// `delete(_:)`, mirroring `client.documents.aliases` over the db3 alias
+/// routes. Only `.user` scope exists; `userId` defaults to the caller, and
+/// only an app owner or admin may name another member. A document that is
+/// not a db3 is refused `HttpError` status 409, `serverCode` `"NOT_A_DB3"`;
+/// an id that is no db3 of the app, 404 `"DB3_NOT_FOUND"`.
+///
+/// ```swift
+/// let created = try await client.db3.create(title: "Inbox")
+/// _ = try await client.db3.aliases.set(SetAliasParams(scope: .user, aliasKey: "inbox", documentId: created.id))
+/// let inbox = try await client.db3.aliases.resolve(AliasRef(scope: .user, aliasKey: "inbox"))
+/// try await client.db3.aliases.delete(AliasRef(scope: .user, aliasKey: "inbox"))
+/// ```
+public final class Db3AliasesAPI: @unchecked Sendable {
+    private let transport: any Transport
+    /// The wait for a pending create of the db3 `set` names (#5000), which
+    /// also refuses a db3 that lives only on this device (#5155).
+    private let awaitCreate: @Sendable (String) async throws -> Void
+
+    /// `client.db3.aliases`: `set` waits first for a pending create of its db3.
+    init(transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void) {
+        self.transport = transport
+        self.awaitCreate = awaitCreate
+    }
+
+    /// Bind a user alias to a db3, or re-point it. With `mustNotExist`, an
+    /// existing alias is refused 409 `alias_exists` instead.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// - Parameter params: The alias, the db3 as `documentId`, and `mustNotExist`.
+    /// - Throws: `.db3LocalOnly` before any request for a db3 that lives only
+    ///   on this device; `HttpError` 409 `NOT_A_DB3`, 404 `DB3_NOT_FOUND`.
+    /// - Stability: beta
+    public func set(_ params: SetAliasParams) async throws -> DocumentAliasInfo {
+        try await awaitCreate(params.documentId)
+        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
+        var body: [String: JSONValue] = ["documentId": .string(params.documentId)]
+        if let userId = params.userId { body["userId"] = .string(userId) }
+        if params.mustNotExist == true { body["mustNotExist"] = .bool(true) }
+        return try await transport.request(
+            method: .put,
+            path: "/db3-aliases/\(params.scope.rawValue)/\(encodedKey)",
+            body: JSONValue.object(body)
+        )
+    }
+
+    /// The db3 a user alias names, with the alias, or `nil` when the alias
+    /// names nothing.
+    ///
+    /// - Parameter params: The alias; `userId` names another member's.
+    /// - Throws: `HttpError` 409 `NOT_A_DB3` for an alias naming a document
+    ///   that is not a db3, 403 `DOC_ACCESS_DENIED` when the caller cannot read it.
+    /// - Stability: beta
+    public func resolve(_ params: AliasRef) async throws -> Db3AliasResolution? {
+        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
+        var path = "/db3-aliases/\(params.scope.rawValue)/\(encodedKey)"
+        if params.scope == .user, let userId = params.userId {
+            var query = URLQuery()
+            query.append("userId", userId)
+            path += query.queryString
+        }
+        do {
+            let resolved: Db3AliasResolution = try await transport.request(method: .get, path: path)
+            return resolved
+        } catch let error as HttpError where error.status == 404 {
+            return nil
+        }
+    }
+
+    /// Delete a user alias; an alias that names nothing returns quietly.
+    ///
+    /// - Parameter params: The alias; `userId` names another member's.
+    /// - Throws: `HttpError` 409 `NOT_A_DB3` for an alias naming a document
+    ///   that is not a db3, which is kept.
+    /// - Stability: beta
+    public func delete(_ params: AliasRef) async throws {
+        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
+        var path = "/db3-aliases/\(params.scope.rawValue)/\(encodedKey)"
+        if params.scope == .user, let userId = params.userId {
+            var query = URLQuery()
+            query.append("userId", userId)
+            path += query.queryString
+        }
+        do {
+            let _: SuccessResult = try await transport.request(method: .delete, path: path)
+        } catch let error as HttpError where error.status == 404 {
+            return
+        }
     }
 }

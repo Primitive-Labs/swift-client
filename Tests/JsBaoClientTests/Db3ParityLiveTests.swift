@@ -9,7 +9,7 @@ import XCTest
 /// - 34: every case of `tests/fixtures/db3-null-contract-4694/cases.json`
 ///   answers its ids on the room's `db3/:id/records/:model` and `count`, on
 ///   `DynamicModel` and `MultiDocModel` of a subscribed typed client, and on
-///   the model-free `documents.records(id)`; a limited case is walked forward
+///   the model-free `db3.records(id)`; a limited case is walked forward
 ///   by cursor and backward from the last page's `prevCursor` on every door.
 /// - 35: the aggregate and count cases of `tests/fixtures/db3-parity-4701/aggregate.json`
 ///   answer alike on the room and `MultiDocModel.aggregate` / `count`, and the
@@ -162,7 +162,7 @@ final class Db3ParityLiveTests: XCTestCase {
         let id = try await live.createDocument(writer)
         let handle = try writer.db3.subscribe(id)
         try await handle.ready()
-        let records = writer.documents.records(id)
+        let records = writer.db3.records(id)
         for (model, list) in rows {
             for row in list {
                 var data: [String: DocumentRecordValue] = [:]
@@ -215,7 +215,7 @@ final class Db3ParityLiveTests: XCTestCase {
         let client = try await typed(id, [schema])
         let member = try XCTUnwrap(client.sharedModel(for: schema).member(docId: id))
         let shared = client.sharedModel(for: schema)
-        let records = writer.documents.records(id)
+        let records = writer.db3.records(id)
         let base = "/db3/\(id)/records/\(model)"
 
         // The precheck: the model-free client holds the room's rows.

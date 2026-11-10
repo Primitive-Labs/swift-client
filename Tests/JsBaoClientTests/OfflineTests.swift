@@ -382,6 +382,7 @@ final class OfflineTests: XCTestCase {
 
     // MARK: - Data available immediately after network sync (evict + reopen)
 
+    @available(*, deprecated)
     func testDataAvailableAfterEvictAndReopen() async throws {
         let dbPath = tempDir + "evict-reopen-\(UUID().uuidString.prefix(6)).sqlite"
         let client = createTestClient(

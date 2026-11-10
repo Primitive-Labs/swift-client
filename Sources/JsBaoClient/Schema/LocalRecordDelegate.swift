@@ -18,7 +18,7 @@ protocol LocalRecordDelegate: AnyObject, Sendable {
     func query(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> [[String: JSONValue]]
     func queryPaged(filter: DocumentFilter?, options: QueryOptions?) throws -> PagedQueryResult<PrimitiveRow>
     func queryPaged(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> PagedQueryResult<PrimitiveRow>
-    func count(filter: DocumentFilter?) throws -> Int
+    func count(filter: DocumentFilter?, options: QueryOptions?) throws -> Int
     func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]]
     func exists(id: String) throws -> Bool
     func allIds() throws -> [String]

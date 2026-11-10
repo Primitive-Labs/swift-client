@@ -293,6 +293,7 @@ final class Db3OfflineCreateHermeticTests: XCTestCase {
 
     /// #5000 (5000-SO-001): `documents.commitOfflineCreate` carries the
     /// refusal in the public result; the initializer as it was still compiles.
+    @available(*, deprecated)
     func testTheDocumentsCommitResultCarriesTheRefusal() async throws {
         let (client, _, heard, subs) = try await offlineClient(answers: [Self.taken])
         defer { subs.forEach { $0.cancel() } }

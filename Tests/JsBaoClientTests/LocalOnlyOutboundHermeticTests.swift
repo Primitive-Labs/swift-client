@@ -42,11 +42,12 @@ final class LocalOnlyOutboundHermeticTests: XCTestCase {
 
     /// A client that never talks to a server, with zero outbound debounce so a
     /// queued update reaches the (intercepted) socket promptly.
-    private func makeClient(appId: String) -> JsBaoClient {
+    private func makeClient(appId: String, token: String? = nil) -> JsBaoClient {
         JsBaoClient(options: JsBaoClientOptions(
             apiUrl: "http://127.0.0.1:1",
             wsUrl: "ws://127.0.0.1:1",
             appId: appId,
+            token: token,
             offline: true,
             logLevel: .none,
             storageConfig: .memory,
@@ -353,7 +354,9 @@ final class LocalOnlyOutboundHermeticTests: XCTestCase {
         // could equally make — is forwarded while `isLocalOnly` still answers
         // false out of ignorance. The classification hold has to cover the open
         // itself, or #2691's guarantee has a hole the size of it.
-        let client = makeClient(appId: "local-only-outbound-open-window")
+        // Signed in: a stored metadata row belongs to a user, and with none
+        // bound nothing is written or read (#4829).
+        let client = makeClient(appId: "local-only-outbound-open-window", token: makeTestJwt(userId: "user-a"))
         defer { Task { await client.destroy() } }
         let sink = FrameSink()
         client.documentManager.sendWebSocketMessage = { sink.append($0) }

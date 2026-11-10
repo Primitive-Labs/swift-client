@@ -20,6 +20,446 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Added: revoke one pending invitation on its resource
+
+`documents.revokePendingInvitation(documentId:invitationId:)` (deprecated with
+the documents family), `db3.permissions(_:).revokePendingInvitation(_:)`
+(beta), `groups.revokePendingInvitation(groupId:invitationId:)` and
+`collections.revokePendingInvitation(collectionId:invitationId:)` cancel a
+share made by email before the invitee signed up, keyed by the `invitationId`
+each resource's `listPendingInvitations` returns, and answer a
+`PendingInvitationRevokeResult`. The invitation and its grants on other
+resources stay. `invitations.listDeferredGrants` and `revokeDeferredGrant` are
+deprecated: the deferred-grants routes they call are.
+
+### Changed: sign-in settings are read from `GET settings/sign-in`
+
+`auth.getAuthConfig()`, `auth.getAppConfig()`, `checkOAuthAvailable()` and
+`signInWithGoogle` / `startOAuthFlow` now read the app's sign-in settings
+from the public `GET /app/{appId}/api/settings/sign-in`, which answers the
+same body as the deprecated `GET oauth-config`. Signatures and results are
+unchanged, and the read still skips the token refresh. This client needs a
+server that serves the route: against one that does not, `getAuthConfig()`
+throws `HttpError` 404 and `checkOAuthAvailable()` answers `false`.
+
+### Added: `client.db3.aliases`; `documents.aliases` deprecated
+
+`client.db3.aliases.set(_:)`, `resolve(_:)` and `delete(_:)` (beta) bind a
+user's key to a db3, read the db3's row back as a `Db3AliasResolution` (`nil`
+when the key names nothing) and remove the key. `set` on a db3 that lives only
+on this device throws `.db3LocalOnly` before any request; a document that is
+not a db3 is refused `HttpError` 409 `NOT_A_DB3`.
+`DocumentAliasesAPI.set(_:)`, `resolve(_:)` and `delete(_:)` are deprecated in
+their favour, and keep working.
+
+### Every public method states its stability; the documents family is deprecated
+
+Each public method and sub-API accessor now ends its doc comment with
+`- Stability: production`, `beta` or `experimental`, so Quick Help shows how
+settled it is. `beta` members (`client.db3`, `client.agents`, channel
+subscriptions) may still change shape. `experimental` members
+(`client.notifications`' inbox, `client.resourceMetadata`,
+`client.ruleSets.debug`) are the ones a later release leaves out of production
+builds.
+
+These members are now deprecated, with db3 (`client.db3`) as the successor:
+
+- every method of `client.documents`, its blob, ingest and context types
+  (`DocumentBlobContext`, `DocumentIngestsAPI`, `DocumentContext`) and
+  `client.documents.aliases.listForDocument(documentId:)`;
+- every method of `client.databaseTypeConfigs`;
+- `client.collections.listCollectionsForDocument(documentId:options:)`, and
+  `client.collections.listAll(limit:cursor:)`, which has no successor;
+- the document-protocol members of `JsBaoClient`: `checkStateVector`,
+  `waitForInSync`, `waitForWriteConfirmation`, `setAwareness` and
+  `removeAwareness`.
+
+Calling one produces a compiler warning naming the successor. Nothing is
+removed and nothing behaves differently: every deprecated method keeps working
+until a later removal release.
+
+Three db3 members (beta) answer what their documents counterparts answer, so
+replacing the call is the whole migration:
+
+- `client.db3.records(_:)` returns the same `DocumentRecords` handle as
+  `client.documents.records(_:)`;
+- `client.db3.schema(_:)` returns the same `DocumentSchemaAnswer` as
+  `client.documents.schema(_:)`;
+- `client.db3.validateAccess(_:userId:)` returns the same
+  `DocumentAccessResult` as `client.documents.validateAccess(documentId:userId:)`.
+
+```swift
+let records = client.db3.records(db3Id)
+try records.put("Note", ["title": "Groceries"])
+let schema = try await client.db3.schema(db3Id)
+let access = try await client.db3.validateAccess(db3Id, userId: memberId)
+```
+### Added: shared enums in db3 type fields
+
+`swift-bao-codegen` reads the `schemas/` directory beside the `db3-types/` it
+is given, and expands a field's `ref = "<Name>"` (or `"<file>.<Name>"`,
+`"schemas.<file>.<Name>"`) to the `enum` of the string enum def it names, so
+the generated struct matches the type `config push` stores. A ref that names no
+plain string enum fails codegen naming the file, model, field and ref.
+
+### Changed: `.connected` means user events reach the client
+
+The client now reports `.connected` (`StatusChangedEvent`, `isConnected`,
+`connect()` returning) when the server's new `ready` frame arrives, not when
+the socket opens: from then on the server delivers the user's events
+(notifications, document metadata, agent sessions, access requests) to this
+client, so an app that lists on `.connected` and applies the events misses
+none. The work the client does on connect (re-subscribing channels and open
+documents) starts then. A socket that opens and hears no `ready` within
+`SyncConfig.handshakeTimeout` is closed and retried, and a token for another
+user applied while the socket waits for `ready` rebuilds the connection as
+that user. The client needs a server that sends `ready`.
+
+### User properties on `me` and `users`
+
+`UserProfile`, `BasicUserInfo`, `BatchUserProfile` and `UserLookupSummary`
+gain `properties: [String: JSONValue]`: the user's properties the app's
+`user-properties.toml` lets a client read, with the schema's defaults
+applied. On another user that is the fields whose `client` is `members` or
+`self-write-members`; on the caller's own row also `self` and `self-write`.
+An app with no schema answers `[:]`, and an answer cached before this release
+decodes to `[:]`.
+
+`UpdateMeParams(properties: ["theme": .string("dark"), "nickname": .null])`
+sets the caller's own `self-write` and `self-write-members` fields through
+`me.update(params:)` as a merge patch: `.null` clears a field so its default
+shows again, and a stringset is replaced whole. Naming any other field throws
+`HttpError` with status 403 and `serverCode`
+`USER_PROPERTY_NOT_CLIENT_WRITABLE`, and nothing in the update is written.
+`BasicUserInfo(...)`, `BatchUserProfile(...)` and `UpdateMeParams(...)` keep
+their existing initializers; `properties` is a trailing parameter with a
+default.
+### Added: access-request events
+
+The client now emits the server's access-request frames as typed events:
+`Db3AccessRequestCreatedEvent` and `Db3AccessRequestResolvedEvent` for a db3,
+and `DocumentAccessRequestCreatedEvent` and
+`DocumentAccessRequestResolvedEvent` for any document (a db3 sends both
+pairs), under four new `JsBaoEvent` cases named like the JS events
+(`.db3AccessRequestCreated` is `"db3:access-request-created"`, and so on).
+Owners hear `created`; the requester and every owner hear `resolved`, whoever
+resolved it. A frame missing a required field is dropped with a warning.
+Nothing is replayed after a reconnect, so list the requests on each
+`StatusChangedEvent` with `.connected` and apply the events from there.
+`AccessRequestDocumentSummary` is now `Equatable`.
+
+### What a device skipped, and a read explained on the device
+
+`client.db3.indexes.skipped(_:)` lists the entries of a db3's index list this
+device's copy built nothing for, as a new `[Db3SkippedIndex]` (`name`,
+`model`, `fields`, `kind`, `on`, `reason`): an index placed on the server
+only, and one the device can't build (an index on `id`, which the primary key
+serves, a name that isn't an identifier, a member or vector index over more
+than one field, text options it can't read). It reads the device's copy, so
+it answers offline and sends nothing. `local(_:)`, `Db3LocalIndex` and
+`Db3LocalIndexStatus` are unchanged: a `switch` over its four cases still
+compiles.
+
+`client.documents.records(id).explain(_:_:)` explains a read of the device's
+copy in the shape the server's explain answers (`Db3Explain`, with
+`Db3ExplainedStatement`s and `Db3ExplainCost`): the indexes it used by their
+names in the db3's index list, the models it scanned, each statement's plan,
+and `answered`; `cost` is `nil` on a device. `Db3ExplainRequest(op:filter:
+options:include:aggregate:index:setFields:)` describes the read; `index`
+forces it through a field or member index, or `"none"`. A force that can't
+serve the read throws the new `JsBaoErrorCode.db3IndexCannotServe` with
+`details["reason"]`; an unknown name `.db3IndexNotFound`.
+
+The store moves to storage version 10 (a table of skipped entries); a store
+of an earlier build gains it when it is next opened, and nothing is
+downloaded again.
+### Changed: `ttl: 0` is refused
+
+`client.db3.setRetentionPolicy(_:)` throws `JsBaoError` `.invalidArgument`
+when the policy's `ttl` is `0`, a negative or not finite, and the policy stays
+as it was. Assigning such a policy to `client.retentionPolicy` is refused the
+same way: the policy is unchanged, no enforcement runs, and one error line is
+logged. `0` used to evict every db3 copy and local document with a recorded
+last use, while the web client read it as no TTL. Pass `nil` for no TTL; any
+positive `ttl`, a fraction of a second included, is accepted as before.
+
+### Breaking: `maxDocs: 0` is refused, and `client.db3.setRetentionPolicy` throws
+
+`client.db3.setRetentionPolicy(_:)` is now `throws`; add `try` at each call. It throws `JsBaoError` `.invalidArgument` when `maxDocs` is `0`
+or a negative, and the policy stays as it was. Assigning such a policy to
+`client.retentionPolicy` is refused the same way: the policy is unchanged,
+no enforcement runs, and one error line is logged. `0` used to evict every
+copy and every local document the policy may remove, while the web client
+read it as no cap. Pass `nil` for no cap.
+### Vector search on the device — `$near`, with one shared approximate model per database
+
+A db3 `vector` index now builds on the device, and `$near` answers the `k`
+records nearest a query vector there, nearest first, each raw row carrying
+its exact `_distance` (`client.codegen.query`/`queryPaged`, `PrimitiveRow.raw`,
+the model-free records); `count` and `aggregate` keep a `$near`'s rows. It
+answers exactly from the first record. An index registered with
+`Db3VectorIndexOptions(index: .ann())` answers from an approximate index once
+the device has the database's model and has filled the index, reranked on
+the full vectors, and exactly until then; no query waits. One device that
+holds at least 1,000 records trains the model in the background and uploads
+it, and every other device — Swift or JavaScript — fetches and uses it. A db3
+that lives only on this device registers `kind: .vector` on a field its model
+declares a vector, and trains and keeps its own model.
+
+New and changed:
+
+- `Db3IndexesAPI.fetchModel(_:name:)` (answers `Db3IndexModel`),
+  `uploadModel(_:name:bytes:upload:)` (takes `Db3IndexModelUpload`, answers
+  the `Db3Index`) and `deleteModel(_:name:)` (answers
+  `Db3IndexModelDeletion`, the index's new revision); a db3 that lives only
+  on this device refuses all three `.db3LocalOnly`. After an upload or a
+  delete, a db3 this client holds open reads its index list again before
+  the call returns, as `register` and `drop` do.
+- `Db3Index` gains `vector` (`Db3VectorIndex`: `distance`, `index`, `dims`,
+  `element`), `generation`, `revision` and `annModel` (`Db3IndexAnnModel`:
+  `revision`, `trainedAt`, `rows`, `bytes`, `format`); each is `nil` for
+  other kinds.
+- `Db3LocalIndex` gains `mode` (`Db3LocalIndexMode`: `.exact` or `.ann`) for
+  a vector index; its initializer's new `mode:` parameter is defaulted.
+- `Db3VectorIndexOptions.Distance`, `.Quantizer` and `.Mode` are `Codable`.
+- `JsBaoErrorCode` gains `.db3IndexModelExists`, `.db3IndexGenerationStale`,
+  `.db3IndexModelStale`, `.db3IndexModelNotFound`, `.db3IndexModelTooLarge`
+  and `.db3IndexModelInvalid`, the codes of the model routes' refusals.
+- `Format2SqlValue` gains `.blob(Data)`: a `switch` over it that has no
+  `default` needs a case for it.
+- The bundled SQLite (`JsBaoSQLite`) includes the read-only `dbstat` virtual
+  table, for measuring what a store file holds.
+- The device store moves to storage version 9, adding the column that names
+  a vector index's table; a store from version 8 converts at its first open.
+### Batches of records: `client.db3.batch` and `client.db3.batchRead`
+
+`client.db3.batch(db3Id, operations, options:)` applies creates, patches,
+deletes, upserts and increments across models in one request, with reads
+among them (`.query`, `.count`, `.aggregate`): in order, in one transaction,
+at most 100 operations, each read answered in the result's `reads` against
+the writes before it. `client.db3.batchRead(db3Id, reads, atomic:)` answers
+several reads from one state of the db3 and needs read access only. Each
+read result decodes its answer as `.query` (with its next and previous
+cursors), `.count`, `.aggregate`, or, with `atomic: false`,
+`.refused(code:status:error:)`. A batch's increments answer each field's
+value after it, in `incremented` and in each applied increment's `values`;
+what the db3's hook rules wrote rides in `appliedFields` on each created,
+changed and upserted record and on each applied write's result. Both wait for a pending create of the db3, as the other `client.db3` calls
+do.
+### Fixed: offline, a db3's copy no longer takes other writers' changes (#5447)
+
+Once `setNetworkMode(.offline)` returns, changes other writers make to an open
+db3 no longer reach the device's copy until the client is online again, as in
+the JavaScript client. They apply in order when networking returns. A write
+made offline starts from the copy as it was when the client went offline: an
+offline replace of a string set keeps a member another writer added
+meanwhile.
+
+### A database download writes each chunk in a few statements
+
+A db3 download writes each chunk into the device's copy in a few SQL
+statements instead of three per row: a 40,000-row chunk takes under half
+the time it did. The copy that results is the same row for row; nothing is
+downloaded again and the device storage is unchanged.
+
+### A device's indexes — live index lists, failed builds and `deviceIndexes`
+
+An index registered or dropped on a db3 reaches every device holding it open
+within moments, without a resubscribe. A device that cannot build an index
+(its storage is full, say) keeps syncing: the index stays unbuilt, queries it
+would speed up scan, and each later sync retries. New
+`client.db3.indexes.local(_:)` lists the indexes placed on devices as
+`Db3LocalIndex` values with their `Db3LocalIndexStatus` here (`.built`,
+`.building`, `.unbuilt`, `.declined`, with a `reason`), and `Db3State.indexes`
+carries the same list. `client.db3.indexes.decline(_:name:)` drops one from
+this device's copy and keeps it declined across restarts, evicts and
+re-registration until `accept(_:name:)` or `client.db3.delete`; nothing is
+sent. A device `$search` needing a declined text index throws
+`JsBaoErrorCode.db3IndexDeclinedOnDevice` with `details` `model`, `index` and
+`kind`. The new `JsBaoClientOptions.deviceIndexes` (`.all`, the default,
+`.none`, or `.kinds([...])`) says which indexes a device builds when it has
+not already. Opening a store from an earlier build adds the device's index
+list in place; nothing is downloaded again.
+### An interrupted database download continues where it stopped
+
+A db3's download that is cut short — the app quitting, a dropped connection —
+continues at the next subscribe from the chunks already on the device. The
+database offers that same download again while it still keeps it, even when
+other imports landed meanwhile or many rows changed since; once it no longer
+does, the device syncs as before. `state.progress` starts at the chunks already downloaded. Two
+clients over one store never download it at once: the later one continues the
+download and the earlier one waits for it.
+
+### Show a db3 blob as an image: `BlobImage` and `downloadRequest`
+
+A new product, `JsBaoClientUI`, holds the client's SwiftUI views. Its
+`BlobImage` shows a db3 blob as `AsyncImage` shows a URL:
+`BlobImage(client.db3.blobs(db3Id), blobId:)`, the
+`content:placeholder:` form, or `content:` over `BlobImagePhase`. It loads
+through `blobs.read(blobId:)`, so it carries the user's auth, shows the
+local copy without a request, and fails `JsBaoError` `.offline` while the
+client is offline with no local copy. Add
+`.product(name: "JsBaoClientUI", package: "JsBaoClient")` to the target and
+`import JsBaoClientUI`.
+
+`Db3BlobContext.downloadRequest(blobId:disposition:attachmentFilename:)`
+answers a `URLRequest` for the blob's download URL carrying
+`Authorization: Bearer` with the token in force, for an image library
+(Kingfisher, Nuke) to send. `downloadUrl` itself carries no credentials: an
+`AsyncImage` of it is refused `401`.
+
+### Fixed: a `wipeLocal` logout no longer deletes other users' document content (#5366)
+
+`logout(wipeLocal: true)` deleted the local content of every document on the
+device, whoever stored it. After user B's wipe, user A's pending create was
+still listed but empty, so content A never synced was lost, and documents A
+had synced were downloaded again. The wipe now removes the signed-out user's
+content only:
+
+- A document another user on the device has stored keeps its content, so that
+  user reopens their pending creates and synced documents as they left them.
+- Everything else goes: the content of every document only the signed-out
+  user stored, and content no user's local metadata lists.
+- If the client cannot read which documents the other users stored, the wipe
+  removes no document content rather than guess.
+
+### Fixed: one user's local document metadata no longer loads for another user on the same device (#4829)
+
+The client keeps one SQLite file per app, and every user who signed in on a
+device shared its document metadata rows. After user A signed out with a
+pending create, user B's `documents.listPendingCreates()` listed it,
+`getPendingCreate` answered for it, and the client retried its commit under
+B's token. Local metadata is now kept per app and per user:
+
+- A signed-in user's `listPendingCreates()`, `getPendingCreate(documentId:)`,
+  `isPendingCreate` and `getLocalMetadata` answer from that user's rows only,
+  and another user's pending creates are never retried or committed under
+  them. A user who signs back in, in the same process or after a relaunch,
+  finds their own rows again.
+- Rows written by an earlier build carry no owner, so no user loads them:
+  pending creates still uncommitted when the app updates are no longer
+  listed. They stay on disk until a `logout(wipeLocal: true)` clears them.
+- `logout(wipeLocal: true)` clears the signed-out user's metadata, the rows
+  from an earlier build and the signed-out user's local document content.
+  Other users' metadata stays.
+- A `documents.create` made while the client is still starting up, before the
+  signed-in user is bound, is stored under that user once the bind finishes.
+### Vector fields
+
+A db3 model field can be `.vector` with `dims` and `element` (`VectorElement`:
+`.f32`, `.f16`, `.i8`): `FieldDescriptor(type: .vector, dims: 768, element:
+.f16)`, or `type = "vector"` with `dims` and `element` in a db3 type file,
+which `TomlSchemaLoader` and `swift-bao-codegen` read (generated models type
+it `[Float]`). A save writes `PrimitiveValue.vector([Float])` as the standard
+base64 of the field's encoding — the db3 type's when the room sent it — and
+reads answer it decoded: an array of numbers in a row
+(`JSONValue.floatArrayValue`), `.vector` from a record. `VectorCodec`
+(`encode(_:encoding:)`, `decode(_:encoding:)`, `bytes(_:)`) converts, byte
+for byte as the JS client and the functions SDK do. The model-free records
+take `DocumentRecordValue.vector([Float])` for a field the type or a
+registered model declares a vector. A value that does not fit is refused
+before anything commits with `JsBaoErrorCode.db3VectorInvalid`
+(`DB3_VECTOR_INVALID`); a model declaring a vector field saves only to a db3
+(`.invalidArgument` on a format-1 document). `Db3IndexRegistration(model:
+field: kind: .vector, vector: Db3VectorIndexOptions(...))` registers a vector
+index. `$near` in a device read is refused `.queryIndexNotOnDevice`, and the
+server's records routes answer it `QUERY_INDEX_NOT_ON_SERVER`
+(`.queryIndexNotOnServer`).
+
+**Source-breaking:** `PrimitiveFieldType` gains `.vector` and `PrimitiveValue`
+gains `.vector([Float])`; an exhaustive `switch` over either needs the new
+case.
+### How far behind a device's copy is, and `maxDrift`
+
+A device page's `PagedQueryResult` carries `drift`: by db3 id, a `Db3Drift`
+of `entriesBehind` (changes the server had that the copy hadn't applied, as
+of `asOf`, when the device last heard the server's position), `live` and
+`pendingWrites`. `Db3State.drift` reports the same, kept on the device so it
+survives going offline and a relaunch. `QueryOptions.maxDrift`
+(`Db3MaxDrift(entries:age:)`, `age` in seconds) on model queries and counts
+(generated models' and `DynamicModel`'s `count` take a trailing `options:`),
+and `documents.records(id).query` and `count(_:_:maxDrift:)`, refuses a copy
+further behind with `JsBaoErrorCode.db3DriftExceeded` (`details` carry
+`db3Id`, `drift` and `maxDrift`); it never waits. A synced db3 that has not
+heard the server's position yet has no `drift` and refuses every `maxDrift`;
+a local-only db3 has none and passes every one. Generated models' paged
+queries and `hasManyThrough` pages forward `drift`, and their `count`
+forwards its options; regenerate them. Each new
+member is added with a default, so existing code compiles unchanged.
+### The bundled SQLite is 3.54.1, with vec1
+
+The client's own SQLite moves from 3.53.4 to 3.54.1, the release the JS
+client's sqlite-wasm carries, and now includes SQLite's vec1 extension (0.8),
+set up on every connection the library opens. The compiled SQLite library
+grows by about 0.57 MB. Store files written by the earlier build open as they
+are, and nothing in the client's API changes.
+
+### Text search and member indexes on the device
+
+A db3's copy on this device builds the text indexes the room places on the
+device (`kind: .text`, `on: .device`), and the member indexes placed `.device`
+or `.both`, and keeps them on every write. `$search` in a query filter finds
+records by their words: a string, or `["query": …, "mode": "all" | "any",
+"prefix": true, "fields": […]]`, with double-quoted phrases. Results come best
+first; each raw row (`client.codegen.query`, `PrimitiveRow.raw`) carries its
+`_score`, and `sort` may name `_score`. Register one with
+`Db3IndexRegistration(model:fields:kind: .text, on: .device, text:
+Db3TextIndexOptions(tokenizer:prefix:weights:))`; `Db3Index.text` lists its
+options (`Db3TextIndex`). A local-only db3 takes a text index too. A `$search`
+on a model with no text index on the device is refused
+`JsBaoErrorCode.queryIndexNotOnDevice`; `.queryIndexNotOnServer` names the
+server's refusal. The bundled SQLite now includes FTS5, which adds about
+0.8 MB to the compiled SQLite library. Opening a store from an earlier build converts its
+index cache in place at the first open; nothing is downloaded again. The device
+keeps a text index in the same form as the JS client and the server, so a
+`$search` ranks the same wherever it answers, with the same `_score`, after
+any creates, patches and deletes; a store from an earlier unreleased build
+rebuilds its text tables once, from the rows it holds, at its next index sync.
+
+### An index's kind and where it lives
+
+`Db3IndexRegistration` takes optional trailing `kind:` and `on:`
+parameters: `.both` (the default) builds the index on the server and on
+every device holding a synced copy, `.server` on the server only, and
+`.device` on the devices only. `Db3Index` lists its `kind` (`Db3IndexKind`:
+`.scalar`, or `.members` for a member index) and its `on`
+(`Db3IndexPlacement`). A member index lives on the server, and a local-only
+db3 keeps every index on the device. To move an index, drop it and register
+it again: the same fields registered with another `on` are refused
+`DB3_INDEX_EXISTS`, with `details.on`. A `unique` index on the device alone
+is refused `DB3_INDEX_INVALID`, a kind and placement no side builds
+`DB3_INDEX_PLACEMENT_UNSUPPORTED` (`JsBaoErrorCode.db3IndexPlacementUnsupported`),
+and `.server` or `.both` on a local-only db3 `DB3_LOCAL_ONLY`. A
+registration without `on` works as before.
+### An untyped db3 is declared only the models it uses
+
+A db3 without a type takes its indexes and unique constraints from the
+model declarations of the clients that write it. The client now declares to
+such a db3 only the models it uses there, instead of every registered model:
+
+- the models whose records the device's copy holds, or whose writes are
+  still unconfirmed;
+- a model written there for the first time, declared just before that write,
+  so its unique constraint holds from the first record;
+- the models bound to it with the new `client.setModelDefaultDb3(model, id)`,
+  and, when it is the client's default db3 (`client.setDefaultDb3(id)`),
+  every model bound to no db3.
+
+A model used only in other db3s, `client.registerModels` additions included,
+no longer reaches this db3's declaration or its schema. An empty db3 with
+nothing bound declares no model at open. To have a model's indexes and unique
+constraints in force before its first record, bind it with
+`setModelDefaultDb3` before you subscribe.
+
+- `client.setModelDefaultDb3(_:_:)` records the binding without checking the
+  db3: it need not be open, bound or held on this device.
+  `getDocumentModelMapping(modelName:)` reads it back and
+  `clearDocumentModelMapping(modelName:)` removes it. No save reads it; every
+  save still names its db3.
+- A model bound while its db3 is open is declared at the db3's next open (or
+  at its first write); a bound model registered while the db3 is open is
+  declared at once.
+
 ### Local-only databases
 
 `client.db3.create(title:localOnly: true)` keeps a db3 on this device only:
@@ -48,7 +488,7 @@ returns at once with `localOnly == true` and `sync == false`, and
   `localOnly` with `type`, `sync: false` or `custodian`
   (`.localOnlyUnsupportedOption`). The `.db3Index…` codes join
   `JsBaoErrorCode` for its device-side index refusals.
-- The local store moves to storage version 4 at its next open: each db3's
+- The local store moves to storage version 5 at its next open: each db3's
   state gains the local-only mark, and every db3 already stored reads synced.
 
 ### A member index for a db3's string set field
@@ -62,8 +502,10 @@ results. It costs one stored row per member and a little time on each write
 that changes the set, and it is built from the existing records in the
 registration's one request (about 1,000,000 records). `Db3Index.members` is
 `true` on it and `false` on every other index. `members: true` on a field
-holding single values is refused `DB3_INDEX_NOT_SET_FIELD`. A device's copy
-builds nothing for a member index.
+holding single values is refused `.db3IndexNotSetField`. A synced db3's copy
+on a device builds nothing for a member index. A local-only db3 builds it on
+the device, by the same rules and names, keeps it on every write and across
+restarts, and answers the same reads from it.
 
 ### The db3 copies on this device take less space
 

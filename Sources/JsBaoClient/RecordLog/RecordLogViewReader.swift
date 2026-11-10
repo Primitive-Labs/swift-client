@@ -71,13 +71,50 @@ enum Db3Limits {
 /// - Includes resolve within each parent's own db3, by this reader's own
 ///   statements: the public page never cuts a leg.
 ///
+/// - A read of one db3 holding a member table on this device reads as its
+///   room would (a local-only db3's, #5156, or a synced db3's placed on the
+///   device, #5223): a field holding a member index has `$contains`, any-of,
+///   membership levels and unfiltered facets read from the device table, and
+///   a sorted facet orders the members its sort leaves tied by the member (on
+///   a local-only db3 always). A read over several db3s reads `_data`.
+/// - A `$search` reads the db3's text index on this device (#5223): a page
+///   joins its matches ranked by `-bm25` as `_score`, which every row
+///   carries; count and an aggregate keep the rows it matches.
+/// - A `$near` reads the db3's vector index on this device (#5230): a page
+///   joins its `k` nearest rows with their exact `_distance`, which every
+///   row carries, nearest first with no sort given; count and an aggregate
+///   keep its rows.
+///
 /// Its statements run on `store`'s connection as the store reads, so they see
 /// what an open group of saves has written. `documents` is the scope: every
-/// statement names it.
+/// statement names it, but a facet read from a member table, which holds
+/// exactly the one db3's rows.
 struct RecordLogViewReader {
 
     let store: RecordLogStore
     let documents: [String]
+    /// An explain's force and recorder (#5241): `nil` for every ordinary read.
+    var force: RecordLogReadForce? = nil
+
+    /// `record_log_view` at a FROM position, with the index an explain forces
+    /// `model`'s statements through (#5241).
+    private func viewFrom(_ model: String) -> String {
+        guard let index = force?.indexedBy(model) else { return "record_log_view" }
+        return "record_log_view INDEXED BY \(Self.quoted(index))"
+    }
+
+    /// The condition that a row is `model`'s: bound, or under a forced index
+    /// the model as a literal, so the partial index proves at prepare time (#5241).
+    private func typeCondition(_ model: String, table: String? = nil) -> (sql: String, bindings: [Format2SqlValue]) {
+        let column = table.map { "\($0).\"_type\"" } ?? "_type"
+        if force?.indexedBy(model) != nil { return ("\(column) = \(RecordLogSchema.quoteLiteral(model))", []) }
+        return ("\(column) = ?", [.text(model)])
+    }
+
+    /// Tell an explain's recorder a statement of `model`'s is about to run (#5241).
+    private func noteRun(_ model: String, _ statement: String, _ bindings: [Format2SqlValue]) {
+        force?.record(model, statement, bindings)
+    }
 
     /// The key the document tie-break takes in a cursor and its sort fields.
     static let documentTieBreak = "_tiebreak:doc_id"
@@ -88,8 +125,101 @@ struct RecordLogViewReader {
         case stored
         /// As the model API reads it: each declared set field an array of its
         /// members in canonical order (`[]` when the record holds none), and
-        /// the record's document under `_meta_doc_id`.
-        case model(setFields: Set<String>)
+        /// the record's document under `_meta_doc_id`. `decode`, given a
+        /// record's model, the row and its document, reads each vector field
+        /// as its numbers (#5225), once the page is cut: the page's rows as
+        /// the queried model's, each included row as its include's model's.
+        case model(setFields: Set<String>, decode: RowDecode? = nil)
+        /// As the model-free records read it (#5225): as stored, each vector
+        /// field this device knows read as its numbers by `decode`.
+        case decoded(RowDecode)
+
+        /// Reads a row of a model (the first argument) in a document (the last) as the caller answers it.
+        typealias RowDecode = (String, RecordLogRow, String) -> RecordLogRow
+
+        var decode: RowDecode? {
+            switch self {
+            case .stored: return nil
+            case .model(_, let decode): return decode
+            case .decoded(let decode): return decode
+            }
+        }
+    }
+
+    /// The models a read with `include` answers rows of: `model` and each
+    /// include's target, nested includes too.
+    static func models(_ model: String, _ include: [Include]?) -> Set<String> {
+        var out: Set<String> = [model]
+        for spec in include ?? [] { out.formUnion(models(spec.target.modelName, spec.include)) }
+        return out
+    }
+
+    /// `row` with each record its includes attached under `_related` read by
+    /// `decode` as its include's model's, nested includes too (#5225). A key
+    /// two specs share holds the later spec's records, as the resolution
+    /// attaches them.
+    static func decodedIncludes(
+        _ row: RecordLogRow, _ includes: [Include], document: String, _ decode: @escaping RowShape.RowDecode
+    ) -> RecordLogRow {
+        guard var related = row["_related"]?.objectValue else { return row }
+        var specs: [String: Include] = [:]
+        for spec in includes { specs[spec.resultKey ?? spec.target.modelName] = spec }
+        for (key, spec) in specs {
+            guard let attached = related[key] else { continue }
+            let read = { (value: JSONValue) -> JSONValue in
+                guard let included = value.objectValue else { return value }
+                var out = decode(spec.target.modelName, included, document)
+                if let nested = spec.include, !nested.isEmpty {
+                    out = decodedIncludes(out, nested, document: document, decode)
+                }
+                return .object(out)
+            }
+            if let rows = attached.arrayValue {
+                related[key] = .array(rows.map(read))
+            } else {
+                related[key] = read(attached)
+            }
+        }
+        var out = row
+        out["_related"] = .object(related)
+        return out
+    }
+
+    /// Refuse a device read whose filter, or any include spec's filter, uses
+    /// `$near` at any depth (#5225): an include leg reads no vector index, so
+    /// the read is refused `.queryIndexNotOnDevice` before any statement,
+    /// naming the operator, the model whose filter used it and the field
+    /// (`null` when it names none). A read's own filter is judged by
+    /// ``nearIndex(_:_:)`` instead (#5230).
+    static func refuseNear(_ model: String, _ filter: DocumentFilter?, include: [Include]? = nil) throws {
+        if let filter, case .some(let field) = nearField(.object(filter)) {
+            throw JsBaoError(
+                code: .queryIndexNotOnDevice,
+                message: "$near on \(model)\(field.map { ".\($0)" } ?? "") needs a vector index on this device, and this device holds none over the field",
+                details: ["operator": "$near", "model": .string(model), "field": field.map { .string($0) } ?? .null]
+            )
+        }
+        for spec in include ?? [] {
+            try refuseNear(spec.target.modelName, spec.filter, include: spec.include)
+        }
+    }
+
+    /// The field the first `$near` in `value` names, at any depth: `.some(nil)`
+    /// for one naming none, `nil` when `value` uses no `$near`.
+    private static func nearField(_ value: JSONValue) -> String?? {
+        switch value {
+        case .array(let members):
+            for member in members { if case .some(let field) = nearField(member) { return .some(field) } }
+            return nil
+        case .object(let object):
+            for (key, member) in object.sorted(by: { $0.key < $1.key }) {
+                if key == "$near" { return .some(member.objectValue?["field"]?.stringValue) }
+                if case .some(let field) = nearField(member) { return .some(field) }
+            }
+            return nil
+        default:
+            return nil
+        }
     }
 
     struct Page {
@@ -99,6 +229,141 @@ struct RecordLogViewReader {
         var nextCursor: String?
         var prevCursor: String?
         var hasMore: Bool
+        /// How far behind each synced db3 of the scope whose head is known
+        /// is (#5221), read in the rows' transaction; `nil` for a read of no document.
+        var drift: [String: Db3Drift]? = nil
+    }
+
+    /// How a read of `model` reads as its room would (#5156, #5223): each
+    /// field's member table, and whether a sorted facet orders tied members by
+    /// the member. Both empty for a read over several db3s, or of a synced one
+    /// holding no member table for the model.
+    private struct DeviceIndexRead {
+        var tables: [String: String] = [:]
+        var tiesByMember = false
+
+        func table(_ field: String) -> String? { tables[field] }
+    }
+
+    /// The text index a `$search` of `model` reads (#5223), refused before
+    /// any statement: over other than one db3 `.invalidArgument`; with no text
+    /// entry cached for the model `.queryIndexNotOnDevice`; with one this
+    /// device declined `.db3IndexDeclinedOnDevice` (#5322); with one this
+    /// device holds no table for `.db3IndexPlacementUnsupported`, naming the
+    /// engine and why. `nil` for a filter without `$search`.
+    private func searchIndex(_ model: String, _ filter: DocumentFilter?) throws -> QueryTranslator.ViewTextIndex? {
+        guard RecordLogTextSearch.has(filter) else { return nil }
+        guard documents.count == 1, let documentId = documents.first else {
+            throw JsBaoError(
+                code: .invalidArgument, message: "$search reads one db3's text index: give exactly one db3, not \(documents.count)"
+            )
+        }
+        guard let index = try store.readView({
+            try RecordLogIndexes.textIndex($0, documentId: documentId, model: model, deviceIndexes: store.deviceIndexes)
+        }) else {
+            throw RecordLogTextSearch.notOnDevice(model: model)
+        }
+        // Declined here (#5322): refused ahead of why a build failed.
+        if let declined = index.declined { throw RecordLogTextSearch.declined(model: model, index: index.roomName, reason: declined) }
+        guard let table = index.table else {
+            throw RecordLogTextSearch.notBuilt(
+                model: model, on: index.options.on, reason: index.options.unbuilt ?? "the text index is not built on this device"
+            )
+        }
+        let weights = index.fields.map { field -> Double in
+            let weight = index.options.weights[field] ?? 1
+            return weight.isFinite && weight > 0 ? weight : 1
+        }
+        return QueryTranslator.ViewTextIndex(table: table, fields: index.fields, weights: weights)
+    }
+
+    /// The key a search's rank is selected, sorted and paged by (#5223).
+    static let scoreKey = "_score"
+
+    /// The key a `$near`'s distance is selected, sorted and paged by (#5230).
+    static let distanceKey = RecordLogNearSearch.distanceKey
+
+    /// The vector index a `$near` of `model` reads (#5230, js-bao's
+    /// `nearIndexOf`), its query checked, refused before any statement reads
+    /// a record, in this order: a `$near` the grammar does not admit
+    /// (`.invalidArgument`); more than one db3 (`.invalidArgument`); a field
+    /// the db3's type does not declare a vector, or a query vector of another
+    /// length than the field's or holding a member that is not a finite
+    /// number (`.db3VectorInvalid`); no vector entry cached for the field
+    /// (`.queryIndexNotOnDevice`); one this device declined
+    /// (`.db3IndexDeclinedOnDevice`); one this device holds no table for
+    /// (`.db3IndexPlacementUnsupported`, naming the engine and why). `nil` for
+    /// a filter without `$near`.
+    func nearIndex(_ model: String, _ filter: DocumentFilter?) throws -> RecordLogNearSearch.Read? {
+        guard let near = try RecordLogNearSearch.parse(filter) else { return nil }
+        try QueryTranslator.requireViewIdentifier(model, context: "query model")
+        guard documents.count == 1, let documentId = documents.first else {
+            throw JsBaoError(code: .invalidArgument, message: "$near reads one db3's vector index: give exactly one db3, not \(documents.count)")
+        }
+        return try store.readView { sql in
+            let declared = try RecordLogNearSearch.declaredField(sql, documentId: documentId, model: model, field: near.field)
+            if let declared, declared.kind != "vector" {
+                throw RecordLogNearSearch.vectorInvalid(
+                    model: model, field: near.field,
+                    "\(model).\(near.field) is \(declared.kind.map { "a \($0) field" } ?? "not declared"), not a vector field: $near reads a vector field's index"
+                )
+            }
+            let index = try RecordLogIndexes.vectorIndex(sql, documentId: documentId, model: model, field: near.field, deviceIndexes: store.deviceIndexes)
+            let vector = try RecordLogNearSearch.vectorBytes(near, model: model, dims: declared?.dims ?? index?.vector?.dims)
+            guard let index else { throw RecordLogNearSearch.notOnDevice(model: model, field: near.field) }
+            if let declined = index.declined { throw RecordLogNearSearch.declined(model: model, index: index.roomName, reason: declined) }
+            guard let table = index.table, let options = index.vector else {
+                throw RecordLogNearSearch.notBuilt(model: model, reason: index.unbuilt ?? "the vector index is not built on this device")
+            }
+            return RecordLogNearSearch.Read(
+                table: table, annTable: index.annTable, distance: options.distance, vector: vector, k: near.k, filter: near.filter
+            )
+        }
+    }
+
+    /// The statement a `$near` reads its rows from, its filter translated
+    /// with the db3's member tables, as `translateView` writes conditions.
+    static func nearRows(_ read: RecordLogNearSearch.Read, memberIndexTable: ((String) -> String?)?, model: String) throws -> (sql: String, params: [Format2SqlValue]) {
+        let (clause, params) = read.filter.isEmpty
+            ? ("", [])
+            : try QueryTranslator.translateView(read.filter, memberIndexTable: memberIndexTable, model: model)
+        return RecordLogNearSearch.subquery(
+            read, viewTable: "record_log_view", filterSQL: clause.isEmpty ? "" : "(\(clause))", filterParams: params.map(Format2SqlValue.init(bindable:))
+        )
+    }
+
+    /// A weight as the statement writes it: as JavaScript writes the number,
+    /// an integral weight past Int64 written as a double rather than trapping.
+    private static func number(_ value: Double) -> String {
+        if abs(value) < 1e21, let integral = Int64(exactly: value) { return String(integral) }
+        return String(value)
+    }
+
+    /// How a read of `model` over one db3 reads its device indexes: the member
+    /// tables the db3 holds for the model, and ties by member where it holds
+    /// one (always for a db3 that lives only on this device, as its room would).
+    /// Asked once the read's names were judged, so a refused name runs no statement.
+    private func deviceIndexRead(_ model: String) throws -> DeviceIndexRead {
+        guard documents.count == 1, let documentId = documents.first else { return DeviceIndexRead() }
+        return try store.readView { sql in
+            let localOnly = try sql.first(
+                "SELECT local_only FROM record_log_state WHERE doc_id = ?", [.text(documentId)]
+            )?["local_only"].intValue == 1
+            var read = DeviceIndexRead()
+            for row in try sql.rows(
+                "SELECT fields, members FROM record_log_indexes WHERE doc_id = ? AND model = ? AND members IS NOT NULL",
+                [.text(documentId), .text(model)]
+            ) {
+                guard let field = (row["fields"].stringValue.flatMap(RecordLogJSON.parse)?.arrayValue ?? []).first?.stringValue,
+                      let table = row["members"].stringValue
+                else { continue }
+                read.tables[field] = table
+            }
+            read.tiesByMember = localOnly || !read.tables.isEmpty
+            // An explain's force reads its own member tables (#5241).
+            if let forced = force?.memberTables(model) { read.tables = forced }
+            return read
+        }
     }
 
     // MARK: - Query
@@ -115,115 +380,218 @@ struct RecordLogViewReader {
     func page(
         _ model: String, _ filter: DocumentFilter, options: QueryOptions?, shape: RowShape, include: [Include]? = nil
     ) throws -> Page {
+        try Self.refuseNear(model, nil, include: include)
+        // A `$near` is judged first: its own refusals name what it got wrong (#5230).
+        let near = try nearIndex(model, filter)
+        if near != nil { try store.vectorEntryReadForTest?() }
         let options = options ?? QueryOptions()
         try QueryTranslator.requireViewIdentifier(model, context: "query model")
         let limit = try options.limit.map { try Db3Limits.checkedLimit($0) } ?? Db3Limits.pageDefault
         let includes = try RecordLogIncludeTree.validated(include)
-        let (clause, params) = try QueryTranslator.translateView(filter)
-        let sort = options.pagingSort
+        // A text search joins its index's matches, ranked (#5223); the rest of
+        // the filter is translated as any filter is.
+        let search = try searchIndex(model, filter)
+        var rest = filter
+        var join = ""
+        var joinBindings: [Format2SqlValue] = []
+        if let search, let value = rest.removeValue(forKey: RecordLogTextSearch.key) {
+            let match = try RecordLogTextSearch.match(try RecordLogTextSearch.parse(value), indexFields: search.fields)
+            let fts = Self.quoted(search.table)
+            let weights = search.weights.map { ", \(Self.number($0))" }.joined()
+            join = " JOIN (SELECT rowid, -bm25(\(fts)\(weights)) AS \(Self.scoreKey) FROM \(fts) WHERE \(fts) MATCH ?) AS _search"
+                + " ON _search.rowid = record_log_view.rowid"
+            joinBindings = [.text(match)]
+        }
+        // A `$near` is its filter's only key: its k nearest rows are joined, nearest first (#5230).
+        if near != nil { rest = [:] }
+        var (clause, params) = try QueryTranslator.translateView(rest, model: model)
+        // A search with no sort answers the best match first, then by id; a `$near` the nearest first.
+        var ordered = options
+        let unsorted = (options.sortOrder ?? []).isEmpty && (options.sort ?? [:]).isEmpty
+        if search != nil, unsorted { ordered.sortOrder = [(Self.scoreKey, -1)] }
+        if near != nil, unsorted { ordered.sortOrder = [(Self.distanceKey, 1)] }
+        let sort = ordered.pagingSort
         let fields = sort.fields + [Self.documentTieBreak]
         let directions = sort.directions + [1]
         var columns = [Self.documentTieBreak: "doc_id"]
-        for field in sort.fields { columns[field] = try QueryTranslator.viewField(field) }
-        let keep = try Self.projection(options.projection)
-        guard !documents.isEmpty else { return Page(rows: [], documents: [], nextCursor: nil, prevCursor: nil, hasMore: false) }
-
-        var conditions = ["_type = ?", "(\(clause))"]
-        var bindings: [Format2SqlValue] = [.text(model)] + params.map(Format2SqlValue.init(bindable:))
-        if let cursor = options.cursor {
-            let (paging, cursorParams) = try CursorManager.buildJSONPaginationConditions(
-                cursor: cursor, currentSortFields: fields, sortDirections: directions, direction: options.direction,
-                fieldFormatter: { columns[$0] ?? "NULL" }, nonNullFields: [Self.documentTieBreak]
-            )
-            conditions.append(paging)
-            bindings += cursorParams.map(Format2SqlValue.init(bindable:))
-        }
-        conditions.append(Self.scopeClause(documents.count))
-        bindings += documents.map { .text($0) }
-        // A backward page is read nearest the cursor first.
-        let backward = options.direction == .backward
-        let order = zip(fields, directions).map { field, direction in
-            "\(columns[field] ?? "NULL") \((backward ? -direction : direction) == 1 ? "ASC" : "DESC")"
-        }
-        // One row past the page says whether a further one exists.
-        let statement = "SELECT json(_data) AS _data, _id, _type, doc_id FROM record_log_view WHERE "
-            + conditions.joined(separator: " AND ") + " ORDER BY " + order.joined(separator: ", ")
-            + " LIMIT \(limit + 1)"
-
-        var rows: [RecordLogRow] = []
-        var rowDocuments: [String] = []
-        var minting: [RecordLogRow] = []
-        var used = 0
-        var hasMore = false
-        try store.readView { sql in
-            try sql.connection.eachRow(statement, bindings) { raw in
-                if rows.count >= limit {
-                    hasMore = true
-                    return false
-                }
-                let stored = raw["_data"].stringValue ?? "{}"
-                let id = raw["_id"].stringValue ?? ""
-                var parsed = RecordLogJSON.row(stored)
-                let holdsId = parsed["id"] != nil
-                if !holdsId { parsed["id"] = .string(id) }
-                let (record, reshaped) = Self.shaped(parsed, shape)
-                // With includes, a parent is read whole: a leg may need a field
-                // the projection leaves out. It applies once the legs resolved.
-                let answered = includes == nil ? keep(record) : record
-                // A row counts as it is answered: its stored text with its `id` restored.
-                let bytes = !reshaped && options.projection == nil
-                    ? stored.utf8.count + RecordLogJSON.restoredIdBytes(stored: stored, id: id, holdsId: holdsId)
-                    : RecordLogJSON.bytes(.object(answered))
-                if !rows.isEmpty && used + bytes > Db3Limits.responseMaxBytes {
-                    hasMore = true
-                    return false
-                }
-                used += bytes
-                let document = raw["doc_id"].stringValue ?? ""
-                // A cursor carries the stored values the statement sorts (a set
-                // the model answers `[]` or reorders is NULL or its stored
-                // array there), `id` and `type` as the columns a page sorts
-                // them by hold them, and the document under its tie-break key.
-                var mint = parsed
-                if let id = raw["_id"].stringValue { mint["id"] = .string(id) }
-                if let type = raw["_type"].stringValue { mint["type"] = .string(type) }
-                mint[Self.documentTieBreak] = .string(document)
-                rows.append(answered)
-                rowDocuments.append(document)
-                minting.append(mint)
-                return true
+        for field in sort.fields {
+            if search != nil && field == Self.scoreKey {
+                columns[field] = "_search.\(Self.scoreKey)"
+            } else if near != nil && field == Self.distanceKey {
+                columns[field] = "_near.\(Self.distanceKey)"
+            } else {
+                columns[field] = try QueryTranslator.viewField(field)
             }
         }
+        let keep = try Self.projection(options.projection)
+        let maxDrift = try Db3DriftJudge.checked(options.maxDrift)
+        guard !documents.isEmpty else { return Page(rows: [], documents: [], nextCursor: nil, prevCursor: nil, hasMore: false) }
+        // One read transaction (#5221): the rows, their include legs and each
+        // document's sync state, read last, are one snapshot of the store.
+        return try store.readView { _ in
+            // Every name judged, the db3's member tables are read (#5156, #5223).
+            let local = try deviceIndexRead(model)
+            if !local.tables.isEmpty { (clause, params) = try QueryTranslator.translateView(rest, memberIndexTable: local.table, model: model) }
+            // The vector index read again in the rows' transaction: an index list applied since may have dropped the ANN table judged above.
+            if near != nil, let near = try nearIndex(model, filter) {
+                let members: ((String) -> String?)? = local.tables.isEmpty ? nil : { local.table($0) }
+                let rows = try Self.nearRows(near, memberIndexTable: members, model: model)
+                join = " JOIN (\(rows.sql)) AS _near ON _near.rowid = record_log_view.rowid"
+                joinBindings = rows.params
+            }
 
-        if let includes {
-            try RecordLogIncludeResolution(reader: self).resolve(&rows, documents: rowDocuments, includes: includes, used: used)
-            rows = rows.map(keep)
+            let type = typeCondition(model)
+            var conditions = [type.sql, "(\(clause))"]
+            var bindings: [Format2SqlValue] = joinBindings + type.bindings + params.map(Format2SqlValue.init(bindable:))
+            if let cursor = options.cursor {
+                let (paging, cursorParams) = try CursorManager.buildJSONPaginationConditions(
+                    cursor: cursor, currentSortFields: fields, sortDirections: directions, direction: options.direction,
+                    fieldFormatter: { columns[$0] ?? "NULL" }, nonNullFields: [Self.documentTieBreak]
+                )
+                conditions.append(paging)
+                bindings += cursorParams.map(Format2SqlValue.init(bindable:))
+            }
+            conditions.append(Self.scopeClause(documents.count))
+            bindings += documents.map { .text($0) }
+            // A backward page is read nearest the cursor first.
+            let backward = options.direction == .backward
+            let order = zip(fields, directions).map { field, direction in
+                "\(columns[field] ?? "NULL") \((backward ? -direction : direction) == 1 ? "ASC" : "DESC")"
+            }
+            // One row past the page says whether a further one exists.
+            let statement = "SELECT json(_data) AS _data, _id, _type, doc_id"
+                + (search != nil ? ", _search.\(Self.scoreKey) AS \(Self.scoreKey)" : "")
+                + (near != nil ? ", _near.\(Self.distanceKey) AS \(Self.distanceKey)" : "") + " FROM \(viewFrom(model))\(join) WHERE "
+                + conditions.joined(separator: " AND ") + " ORDER BY " + order.joined(separator: ", ")
+                + " LIMIT \(limit + 1)"
+
+            var rows: [RecordLogRow] = []
+            var rowDocuments: [String] = []
+            var minting: [RecordLogRow] = []
+            var used = 0
+            var hasMore = false
+            noteRun(model, statement, bindings)
+            try store.readView { sql in
+                try sql.connection.eachRow(statement, bindings) { raw in
+                    if rows.count >= limit {
+                        hasMore = true
+                        return false
+                    }
+                    let stored = raw["_data"].stringValue ?? "{}"
+                    let id = raw["_id"].stringValue ?? ""
+                    var parsed = RecordLogJSON.row(stored)
+                    let holdsId = parsed["id"] != nil
+                    if !holdsId { parsed["id"] = .string(id) }
+                    let (record, reshaped) = Self.shaped(parsed, shape)
+                    // With includes, a parent is read whole: a leg may need a field
+                    // the projection leaves out. It applies once the legs resolved.
+                    var answered = includes == nil ? keep(record) : record
+                    // A search's rank rides every row it answers, whatever the projection (#5223).
+                    let score = search == nil ? nil : Self.scoreValue(raw[Self.scoreKey])
+                    if let score { answered[Self.scoreKey] = score }
+                    // As does a `$near`'s exact distance (#5230).
+                    let distance = near == nil ? nil : Self.scoreValue(raw[Self.distanceKey])
+                    if let distance { answered[Self.distanceKey] = distance }
+                    // A row counts as it is answered: its stored text with its `id` restored.
+                    let bytes = !reshaped && options.projection == nil && score == nil && distance == nil
+                        ? stored.utf8.count + RecordLogJSON.restoredIdBytes(stored: stored, id: id, holdsId: holdsId)
+                        : RecordLogJSON.bytes(.object(answered))
+                    if !rows.isEmpty && used + bytes > Db3Limits.responseMaxBytes {
+                        hasMore = true
+                        return false
+                    }
+                    used += bytes
+                    let document = raw["doc_id"].stringValue ?? ""
+                    // A cursor carries the stored values the statement sorts (a set
+                    // the model answers `[]` or reorders is NULL or its stored
+                    // array there), `id` and `type` as the columns a page sorts
+                    // them by hold them, and the document under its tie-break key.
+                    var mint = parsed
+                    if let id = raw["_id"].stringValue { mint["id"] = .string(id) }
+                    if let type = raw["_type"].stringValue { mint["type"] = .string(type) }
+                    mint[Self.documentTieBreak] = .string(document)
+                    if let score { mint[Self.scoreKey] = score }
+                    if let distance { mint[Self.distanceKey] = distance }
+                    rows.append(answered)
+                    rowDocuments.append(document)
+                    minting.append(mint)
+                    return true
+                }
+            }
+
+            if let includes {
+                try RecordLogIncludeResolution(reader: self).resolve(&rows, documents: rowDocuments, includes: includes, used: used)
+                rows = rows.map(keep)
+            }
+            let (next, prev) = try CursorManager.generateJSONResultCursors(
+                rows: minting, sortFields: fields, direction: options.direction, hasMore: hasMore,
+                isFirstPage: options.cursor == nil, sortDirections: directions
+            )
+            if let decode = shape.decode {
+                for index in rows.indices {
+                    rows[index] = decode(model, rows[index], rowDocuments[index])
+                    if let includes {
+                        rows[index] = Self.decodedIncludes(rows[index], includes, document: rowDocuments[index], decode)
+                    }
+                }
+            }
+            if case .model = shape {
+                for index in rows.indices { rows[index]["_meta_doc_id"] = .string(rowDocuments[index]) }
+            }
+            if backward {
+                rows.reverse()
+                rowDocuments.reverse()
+            }
+            var page = Page(rows: rows, documents: rowDocuments, nextCursor: next, prevCursor: prev, hasMore: hasMore)
+            page.drift = try judgedDrift(maxDrift, options)
+            return page
         }
-        let (next, prev) = try CursorManager.generateJSONResultCursors(
-            rows: minting, sortFields: fields, direction: options.direction, hasMore: hasMore,
-            isFirstPage: options.cursor == nil, sortDirections: directions
-        )
-        if case .model = shape {
-            for index in rows.indices { rows[index]["_meta_doc_id"] = .string(rowDocuments[index]) }
-        }
-        if backward {
-            rows.reverse()
-            rowDocuments.reverse()
-        }
-        return Page(rows: rows, documents: rowDocuments, nextCursor: next, prevCursor: prev, hasMore: hasMore)
+    }
+
+    /// The scope's drift (#5221) from each document's sync state, read now in
+    /// the caller's read, judged against `maxDrift` in scope order: the order
+    /// `options` names its db3s in, then the reader's.
+    private func judgedDrift(_ maxDrift: Db3MaxDrift?, _ options: QueryOptions?) throws -> [String: Db3Drift] {
+        let sync = try store.readView { sql in try RecordLogStore.documentSync(sql, documents) }
+        let host = store.host
+        let drift = Db3DriftJudge.drift(documents, sync) { RecordLogLiveness.isLive(host, $0) }
+        let named = (try? options?.documentScope()) ?? nil
+        let order = (named ?? []).filter(documents.contains) + documents.filter { !(named ?? []).contains($0) }
+        try Db3DriftJudge.judge(maxDrift, order: order, sync: sync, drift: drift)
+        return drift
     }
 
     /// How many of `model`'s records in the scope match `filter`, matched as
     /// ``page(_:_:options:shape:include:)`` matches them. Consumes every row.
-    func count(_ model: String, _ filter: DocumentFilter) throws -> Int {
+    /// With `maxDrift`, the count and the scope's sync state are read in one
+    /// read transaction and refused `DB3_DRIFT_EXCEEDED` as a page is (#5221).
+    func count(_ model: String, _ filter: DocumentFilter, maxDrift: Db3MaxDrift? = nil, options: QueryOptions? = nil) throws -> Int {
+        // A `$near` keeps its rows (#5230), judged first.
+        let near = try nearIndex(model, filter)
+        if near != nil { try store.vectorEntryReadForTest?() }
         try QueryTranslator.requireViewIdentifier(model, context: "query model")
-        let (clause, params) = try QueryTranslator.translateView(filter)
+        // A text search keeps the rows its index matches (#5223).
+        let search = try searchIndex(model, filter)
+        var (clause, params) = try QueryTranslator.translateView(filter, textIndex: search, vectorIndex: near, model: model)
+        let maxDrift = try Db3DriftJudge.checked(maxDrift)
         guard !documents.isEmpty else { return 0 }
         return try store.readView { sql in
-            try sql.first(
-                "SELECT COUNT(*) AS n FROM record_log_view WHERE _type = ? AND (\(clause)) AND \(Self.scopeClause(documents.count))",
-                [.text(model)] + params.map(Format2SqlValue.init(bindable:)) + documents.map { .text($0) }
-            )?["n"].intValue ?? 0
+            let local = try deviceIndexRead(model)
+            // The vector index read again in the count's transaction, as a page reads it.
+            let near = near == nil ? nil : try nearIndex(model, filter)
+            if !local.tables.isEmpty || near != nil {
+                let members: ((String) -> String?)? = local.tables.isEmpty ? nil : { local.table($0) }
+                (clause, params) = try QueryTranslator.translateView(
+                    filter, memberIndexTable: members, textIndex: search, vectorIndex: near, model: model
+                )
+            }
+            let type = typeCondition(model)
+            let statement = "SELECT COUNT(*) AS n FROM \(viewFrom(model)) WHERE \(type.sql) AND (\(clause)) AND \(Self.scopeClause(documents.count))"
+            let bindings = type.bindings + params.map(Format2SqlValue.init(bindable:)) + documents.map { .text($0) }
+            noteRun(model, statement, bindings)
+            let count = try sql.first(statement, bindings)?["n"].intValue ?? 0
+            if maxDrift != nil { _ = try judgedDrift(maxDrift, options) }
+            return count
         }
     }
 
@@ -238,6 +606,9 @@ struct RecordLogViewReader {
     /// `limit` (1 to 10,000) and `sort` as the room applies them. Rows whose
     /// JSON passes 8 MiB are refused `DB3_PAGE_TOO_LARGE`, never cut.
     func aggregate(_ model: String, _ options: AggregateOptions, setFields: Set<String>) throws -> [[String: JSONValue]] {
+        // A `$near` in the filter keeps its rows (#5230), judged first.
+        let near = try nearIndex(model, options.filter)
+        if near != nil { try store.vectorEntryReadForTest?() }
         try QueryTranslator.requireViewIdentifier(model, context: "query model")
         if let limit = options.limit { try Db3Limits.checkedLimit(limit) }
         if let key = QueryTranslator.ambiguousGroupKey(options.groupBy) {
@@ -254,9 +625,18 @@ struct RecordLogViewReader {
             }
             try QueryTranslator.requireViewIdentifier(field)
         }
-        let statement = try aggregateStatement(model, options, setFields: setFields)
+        // A text search in the filter keeps the rows its index matches (#5223).
+        let search = try searchIndex(model, options.filter)
+        // Judged with today's statement first, so a refused name runs no statement (#5156).
+        _ = try aggregateStatement(model, options, setFields: setFields, local: DeviceIndexRead(), textIndex: search, vectorIndex: near)
         let rows = try store.readView { sql in
-            try sql.rows(statement.sql, statement.bindings).map(Self.aggregateRow)
+            // The vector index read again in the statement's transaction, as a page reads it.
+            let near = near == nil ? nil : try nearIndex(model, options.filter)
+            let statement = try aggregateStatement(
+                model, options, setFields: setFields, local: try deviceIndexRead(model), textIndex: search, vectorIndex: near
+            )
+            noteRun(model, statement.sql, statement.bindings)
+            return try sql.rows(statement.sql, statement.bindings).map(Self.aggregateRow)
         }
         let shaped = QueryTranslator.aggregationRows(rows, options: options)
         // The array's brackets, then each row and the comma before every row but the first.
@@ -275,7 +655,8 @@ struct RecordLogViewReader {
     /// operation under its own (`_o<i>`), so ``QueryTranslator/aggregationRows(_:options:)``
     /// shapes the rows as it shapes the typed tables'.
     private func aggregateStatement(
-        _ model: String, _ options: AggregateOptions, setFields: Set<String>
+        _ model: String, _ options: AggregateOptions, setFields: Set<String>, local: DeviceIndexRead,
+        textIndex: QueryTranslator.ViewTextIndex?, vectorIndex: RecordLogNearSearch.Read? = nil
     ) throws -> (sql: String, bindings: [Format2SqlValue]) {
         var plain: [(index: Int, field: String)] = []
         var facets: [(index: Int, field: String)] = []
@@ -292,7 +673,9 @@ struct RecordLogViewReader {
             }
         }
         let table = "record_log_view"
-        let (clause, filterParams) = try QueryTranslator.translateView(options.filter ?? [:])
+        let (clause, filterParams) = try QueryTranslator.translateView(
+            options.filter ?? [:], memberIndexTable: local.table, textIndex: textIndex, vectorIndex: vectorIndex, model: model
+        )
         let scope = Self.scopeClause(documents.count, table: table)
         let scopeParams = documents.map { Format2SqlValue.text($0) }
         let filterBindings = filterParams.map(Format2SqlValue.init(bindable:))
@@ -314,10 +697,11 @@ struct RecordLogViewReader {
         func operationAlias(_ field: String) -> String? {
             options.operations.firstIndex { $0.resultKey == field }.map { Self.quoted(QueryTranslator.positionalOperationAlias($0)) }
         }
-        func orderAndLimit(_ sortExpression: (String) throws -> String) throws -> String {
+        func orderAndLimit(tieBreak: String? = nil, _ sortExpression: (String) throws -> String) throws -> String {
             var sql = ""
             if let sort = options.sort {
                 sql += " ORDER BY \(try sortExpression(sort.field)) \(sort.direction == -1 ? "DESC" : "ASC")"
+                if let tieBreak { sql += ", \(tieBreak) ASC" }
             }
             if let limit = options.limit { sql += " LIMIT \(limit)" }
             return sql
@@ -333,17 +717,32 @@ struct RecordLogViewReader {
             let path = "\(table)._data, '$.\(facet.field)'"
             let member = "_facet.value"
             let select = ["\(member) AS \(Self.quoted(QueryTranslator.positionalGroupAlias(facet.index)))"] + (try operations(true))
-            var sql = "SELECT \(select.joined(separator: ", ")) FROM \(table), json_each(\(path)) AS _facet"
-                + " WHERE \(table).\"_type\" = ? AND json_type(\(path)) = 'array' AND (\(clause)) AND \(scope)"
-                + " GROUP BY \(member)"
-            sql += try orderAndLimit { field in
+            // A db3 holding a member table orders the members a sort leaves tied by the member, as its room does.
+            let tieBreak = local.tiesByMember && options.sort?.field != facet.field ? member : nil
+            let order = { (field: String) -> String in
                 if field == "count" { return "COUNT(*)" }
                 if let alias = operationAlias(field) { return alias }
                 // The facet's own field sorts by the member: the record has no column of that name.
                 if field == facet.field { return member }
                 return Self.quoted(field)
             }
-            return (sql, [.text(model)] + filterBindings + scopeParams)
+            if let index = local.table(facet.field), (options.filter ?? [:]).isEmpty {
+                // An unfiltered facet reads the member table (#5156): it holds exactly this
+                // db3's live rows of the model, so it takes no condition, and a facet that
+                // counts reads no record at all.
+                let readsRecords = options.operations.contains { $0.type != .count }
+                var sql = "SELECT \(select.joined(separator: ", ")) FROM \(Self.quoted(index)) AS _facet"
+                    + (readsRecords ? " JOIN \(table) ON \(table).rowid = _facet.rid" : "")
+                    + " GROUP BY \(member)"
+                sql += try orderAndLimit(tieBreak: tieBreak, order)
+                return (sql, [])
+            }
+            let type = typeCondition(model, table: table)
+            var sql = "SELECT \(select.joined(separator: ", ")) FROM \(viewFrom(model)), json_each(\(path)) AS _facet"
+                + " WHERE \(type.sql) AND json_type(\(path)) = 'array' AND (\(clause)) AND \(scope)"
+                + " GROUP BY \(member)"
+            sql += try orderAndLimit(tieBreak: tieBreak, order)
+            return (sql, type.bindings + filterBindings + scopeParams)
         }
 
         var select: [String] = []
@@ -367,10 +766,15 @@ struct RecordLogViewReader {
             try QueryTranslator.requireViewIdentifier(field, context: "aggregation groupBy field")
             let path = "\(table)._data, '$.\(field)'"
             let alias = Self.quoted(QueryTranslator.positionalGroupAlias(index))
-            select.append(
-                "CASE WHEN (json_type(\(path)) = 'array' AND EXISTS (SELECT 1 FROM json_each(\(path)) AS _set "
-                    + "WHERE _set.value = ?)) THEN 'true' ELSE 'false' END AS \(alias)"
-            )
+            if let member = local.table(field) {
+                // An opted-in field's level is a probe of its member table (#5156).
+                select.append("CASE WHEN \(QueryTranslator.viewMemberProbe(member, table: table)) THEN 'true' ELSE 'false' END AS \(alias)")
+            } else {
+                select.append(
+                    "CASE WHEN (json_type(\(path)) = 'array' AND EXISTS (SELECT 1 FROM json_each(\(path)) AS _set "
+                        + "WHERE _set.value = ?)) THEN 'true' ELSE 'false' END AS \(alias)"
+                )
+            }
             selectBindings.append(.text(contains))
             // The presence binds its member, so the level groups by its alias.
             group.append(alias)
@@ -379,7 +783,8 @@ struct RecordLogViewReader {
         }
         select += try operations(false)
         if select.isEmpty { select.append("COUNT(*) AS \"count\"") }
-        var sql = "SELECT \(select.joined(separator: ", ")) FROM \(table) WHERE \(table).\"_type\" = ? AND (\(clause)) AND \(scope)"
+        let type = typeCondition(model, table: table)
+        var sql = "SELECT \(select.joined(separator: ", ")) FROM \(viewFrom(model)) WHERE \(type.sql) AND (\(clause)) AND \(scope)"
         if !group.isEmpty { sql += " GROUP BY \(group.joined(separator: ", "))" }
         sql += try orderAndLimit { field in
             if field == "count" { return "COUNT(*)" }
@@ -390,7 +795,7 @@ struct RecordLogViewReader {
             // A plain field, by its own expression.
             return try QueryTranslator.viewField(field)
         }
-        return (sql, selectBindings + [.text(model)] + filterBindings + scopeParams)
+        return (sql, selectBindings + type.bindings + filterBindings + scopeParams)
     }
 
     // MARK: - Helpers
@@ -399,7 +804,7 @@ struct RecordLogViewReader {
     static func paged(_ page: Page) -> PagedQueryResult<PrimitiveRow> {
         PagedQueryResult(
             data: page.rows.map(PrimitiveRow.init(raw:)), nextCursor: page.nextCursor, prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            hasMore: page.hasMore, drift: page.drift
         )
     }
 
@@ -416,7 +821,7 @@ struct RecordLogViewReader {
 
     /// `record` as `shape` answers it, and whether that changed it.
     static func shaped(_ record: RecordLogRow, _ shape: RowShape) -> (RecordLogRow, Bool) {
-        guard case .model(let setFields) = shape, !setFields.isEmpty else { return (record, false) }
+        guard case .model(let setFields, _) = shape, !setFields.isEmpty else { return (record, false) }
         var row = record
         var changed = false
         for field in setFields {
@@ -439,9 +844,19 @@ struct RecordLogViewReader {
         return (row, changed)
     }
 
-    /// A projection over an answered record: inclusion keeps `id`, `_related`
-    /// and the listed fields; exclusion drops the listed fields but never
-    /// `id`. Mixed modes are refused before any statement.
+    /// A search's `_score` column as a row carries it: a number.
+    private static func scoreValue(_ value: Format2SqlValue) -> JSONValue? {
+        switch value {
+        case .real(let number): return .number(number)
+        case .integer(let number): return .number(Double(number))
+        default: return nil
+        }
+    }
+
+    /// A projection over an answered record: inclusion keeps `id`, `_related`,
+    /// a search's `_score` (#5223), a `$near`'s `_distance` (#5230) and the listed fields; exclusion drops the
+    /// listed fields but never those. Mixed modes are refused before any
+    /// statement.
     static func projection(_ projection: [String: Int]?) throws -> (RecordLogRow) -> RecordLogRow {
         guard let projection, !projection.isEmpty else { return { $0 } }
         let included = Set(projection.filter { $0.value != 0 }.keys)
@@ -449,7 +864,7 @@ struct RecordLogViewReader {
         if !included.isEmpty && !excluded.isEmpty {
             throw JsBaoError(code: .invalidArgument, message: "Cannot mix inclusion and exclusion in projection")
         }
-        let kept: Set<String> = ["id", "_related"]
+        let kept: Set<String> = ["id", "_related", scoreKey, distanceKey]
         if !included.isEmpty {
             return { row in row.filter { kept.contains($0.key) || included.contains($0.key) } }
         }
@@ -465,16 +880,25 @@ struct RecordLogViewReader {
             case .text(let text): out[name] = .string(text)
             case .integer(let number): out[name] = .number(Double(number))
             case .real(let number): out[name] = .number(number)
+            // No aggregate selects bytes: a record's fields are JSON.
+            case .blob: out[name] = .null
             }
         }
         return out
     }
 
+    /// ``viewFrom(_:)`` for an include leg's statement (#5241).
+    fileprivate func legFrom(_ model: String) -> String { viewFrom(model) }
+
+    /// ``typeCondition(_:table:)`` for an include leg's statement (#5241).
+    fileprivate func legType(_ model: String) -> (sql: String, bindings: [Format2SqlValue]) { typeCondition(model) }
+
     /// Run `statement` within `document`, a row at a time, each as a record
     /// (its `_data` read as `json(_data)`, its `id` restored from `_id`).
     fileprivate func readLeg(
-        _ statement: String, _ bindings: [Format2SqlValue], _ row: (RecordLogRow) throws -> Void
+        _ model: String, _ statement: String, _ bindings: [Format2SqlValue], _ row: (RecordLogRow) throws -> Void
     ) throws {
+        noteRun(model, statement, bindings)
         try store.readView { sql in
             try sql.connection.eachRow(statement, bindings) { raw in
                 try row(RecordLogJSON.row(raw["_data"].stringValue, id: raw["_id"].stringValue))
@@ -759,7 +1183,7 @@ private final class RecordLogIncludeResolution {
         _ model: String, field: String, _ values: [JSONValue], filter extra: DocumentFilter?, sort: [String: Int]?,
         rowLimit: (() -> Int)? = nil, document: String, _ onRow: (RecordLogRow) throws -> Void
     ) throws {
-        let extraParams = try extra.map { try QueryTranslator.translateView($0).1.count } ?? 0
+        let extraParams = try extra.map { try QueryTranslator.translateView($0, model: model).1.count } ?? 0
         let chunkSize = max(1, Self.boundParams - 2 - extraParams)
         let order = try Self.order(sort)
         var start = 0
@@ -768,10 +1192,11 @@ private final class RecordLogIncludeResolution {
             start += chunkSize
             var filter: DocumentFilter = [field: ["$in": .array(chunk)]]
             for (name, value) in extra ?? [:] { filter[name] = value }
-            let (clause, params) = try QueryTranslator.translateView(filter)
-            var statement = "SELECT json(_data) AS _data, _id FROM record_log_view WHERE _type = ? AND doc_id = ? AND (\(clause)) ORDER BY \(order)"
+            let (clause, params) = try QueryTranslator.translateView(filter, model: model)
+            let type = reader.legType(model)
+            var statement = "SELECT json(_data) AS _data, _id FROM \(reader.legFrom(model)) WHERE \(type.sql) AND doc_id = ? AND (\(clause)) ORDER BY \(order)"
             if let rowLimit { statement += " LIMIT \(rowLimit())" }
-            try reader.readLeg(statement, [.text(model), .text(document)] + params.map(Format2SqlValue.init(bindable:)), onRow)
+            try reader.readLeg(model, statement, type.bindings + [.text(document)] + params.map(Format2SqlValue.init(bindable:)), onRow)
         }
     }
 
@@ -782,7 +1207,7 @@ private final class RecordLogIncludeResolution {
         _ onRow: (RecordLogRow) throws -> Void
     ) throws {
         let foreignKey = try QueryTranslator.viewField(spec.foreignKey ?? "")
-        let (filterClause, filterParams) = try QueryTranslator.translateView(spec.filter ?? [:])
+        let (filterClause, filterParams) = try QueryTranslator.translateView(spec.filter ?? [:], model: spec.target.modelName)
         let chunkSize = max(1, Self.boundParams - 4 - filterParams.count)
         let order: String
         if let sort = spec.sort, !sort.isEmpty {
@@ -797,12 +1222,12 @@ private final class RecordLogIncludeResolution {
             start += chunkSize
             let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
             let statement = "SELECT json(_data) AS _data, _id FROM (SELECT _data, _id, ROW_NUMBER() OVER (PARTITION BY \(foreignKey) ORDER BY \(order)) AS _rn"
-                + " FROM record_log_view WHERE _type = ? AND doc_id = ? AND \(foreignKey) IN (\(placeholders))"
+                + " FROM \(reader.legFrom(spec.target.modelName)) WHERE \(reader.legType(spec.target.modelName).sql) AND doc_id = ? AND \(foreignKey) IN (\(placeholders))"
                 + " AND (\(filterClause))) WHERE _rn <= ? LIMIT ?"
-            let bindings: [Format2SqlValue] = [.text(spec.target.modelName), .text(document)]
+            let bindings: [Format2SqlValue] = reader.legType(spec.target.modelName).bindings + [.text(document)]
                 + chunk.map { Format2SqlValue(json: $0) } + filterParams.map(Format2SqlValue.init(bindable:))
                 + [.integer(Int64(perParent)), .integer(Int64(rowLimit()))]
-            try reader.readLeg(statement, bindings, onRow)
+            try reader.readLeg(spec.target.modelName, statement, bindings, onRow)
         }
     }
 

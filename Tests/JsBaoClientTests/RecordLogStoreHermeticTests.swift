@@ -92,8 +92,12 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         // in, `record_log_projection` out, and the store-wide `record_log_meta`
         // beside the owner table in place of the projection rule. Since #4701:
         // `record_log_staged_base` (a staged full replacement's previous rows).
-        XCTAssertEqual(names, Set(RecordLogSchema.clientTables + ["record_log_owner", "record_log_meta"]))
-        XCTAssertEqual(RecordLogSchema.clientTables.count, 12)
+        // Since #5322: `record_log_index_policy` (the device's decline and
+        // accept verdicts), store-wide beside the owner table. Since #5241:
+        // `record_log_index_skips` (the entries a copy skipped), a copy's table.
+        XCTAssertEqual(names, Set(RecordLogSchema.clientTables + ["record_log_owner", "record_log_meta", "record_log_index_policy"]))
+        XCTAssertEqual(RecordLogSchema.clientTables.count, 13)
+        XCTAssertTrue(RecordLogSchema.clientTables.contains("record_log_index_skips"))
         XCTAssertTrue(RecordLogSchema.clientTables.contains("record_log_indexes"))
         XCTAssertTrue(RecordLogSchema.clientTables.contains("record_log_staged_base"))
         XCTAssertEqual(try columns(provider, "record_log_rows"), ["doc_id TEXT", "_type TEXT", "_id TEXT", "_data TEXT", "_gen INTEGER"])
@@ -103,6 +107,8 @@ final class RecordLogStoreHermeticTests: XCTestCase {
             "constraints TEXT", "last_catch_up_at INTEGER", "permission TEXT", "rows_gen INTEGER", "replacing INTEGER",
             // Since #5155 (storage version 4): a local-only db3's mark and registrations.
             "receipt TEXT", "segment TEXT", "staged INTEGER", "local_only INTEGER", "local_indexes TEXT",
+            // Since #5221 (storage version 7): the room's head as last heard, and when.
+            "known_head INTEGER", "known_head_at INTEGER",
         ])
         XCTAssertEqual(try columns(provider, "record_log_writers"), [
             "doc_id TEXT", "client_id TEXT", "writer TEXT", "next_seq INTEGER", "resumed_at INTEGER",
@@ -122,7 +128,14 @@ final class RecordLogStoreHermeticTests: XCTestCase {
         ])
         XCTAssertEqual(try columns(provider, "record_log_epoch_counts"), ["doc_id TEXT", "epoch INTEGER", "count INTEGER"])
         XCTAssertEqual(try columns(provider, "record_log_indexes"), [
-            "doc_id TEXT", "model TEXT", "fields TEXT", "is_unique INTEGER", "room_name TEXT",
+            // Since #5223 (storage version 6): keyed by kind, beside `scalar` the `members` and `text` entries.
+            "doc_id TEXT", "model TEXT", "fields TEXT", "kind TEXT", "is_unique INTEGER", "room_name TEXT",
+            // Since #5156 (storage version 5): the table a member index is kept in.
+            "members TEXT",
+            // Since #5223: a text index's FTS5 table and its options.
+            "text TEXT", "options TEXT",
+            // Since #5230 (storage version 9): a vector index's vec1 flat table.
+            "vector TEXT",
         ])
         XCTAssertEqual(try columns(provider, "record_log_meta"), ["key TEXT", "value TEXT"])
         XCTAssertEqual(try columns(provider, "record_log_load_keys"), ["doc_id TEXT", "attempt TEXT", "_type TEXT", "_id TEXT"])

@@ -224,7 +224,7 @@ extension JsBaoClient {
             )
         }
 
-        // 2. Build the authorize URL (GET /oauth-config + client-side URL
+        // 2. Build the authorize URL (GET settings/sign-in + client-side URL
         //    construction, same as the JS client).
         let authUrl = try await startOAuthFlow(
             redirectUri: resolvedRedirectUri,

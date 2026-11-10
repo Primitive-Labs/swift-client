@@ -15,6 +15,7 @@ import XCTest
 /// and the confirmed close runs against an in-process loopback WebSocket
 /// server whose `stateVectorCheck` answer is fed back through the client's own
 /// message router.
+@available(*, deprecated)
 final class DocumentContextCloseResultHermeticTests: XCTestCase {
 
     private var directories: [String] = []

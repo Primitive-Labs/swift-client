@@ -11,7 +11,8 @@ import XCTest
 ///   acknowledged, `whenSettled` answers the rows captured when the entry's
 ///   result applied, and `DB3_CONDITION_NOT_MET` / `DB3_RECORD_NOT_FOUND` hand
 ///   back under their own codes with `current`.
-/// - 31: every `record.open` declares `wireVersion: 2`; `DB3_CLIENT_OUTDATED`
+/// - 31: every `record.open` declares the client's wire version (3 since
+///   #5221); `DB3_CLIENT_OUTDATED`
 ///   ends the open, nothing opens again, and the lifecycle reports the db3
 ///   gone with `reason: .clientOutdated`.
 /// - 33: a save into a format-1 document logs the deprecation warning once per
@@ -290,19 +291,19 @@ final class RecordLogIncrementHermeticTests: XCTestCase {
 
     // MARK: - Behavior 31: the wire version
 
-    func testEveryOpenDeclaresWireVersionTwoTheBarrierIncluded() async throws {
+    func testEveryOpenDeclaresWireVersionThreeTheBarrierIncluded() async throws {
         let h = try await harness()
         try h.save("r1", ["t": 1])
         try h.save("r2", ["t": 2])
         await h.session.start()
-        XCTAssertEqual(h.of("record.open").first?["wireVersion"], 2)
+        XCTAssertEqual(h.of("record.open").first?["wireVersion"], 3)
         // The room judged numbers this store never minted: re-minted, and the old
         // id opened again once its owed answers do not come.
         var reopened = H.opened(lsn: 0)
         reopened["lastSeq"] = 7
         await h.feed(reopened)
         await until("the barrier re-open", timeout: 5) { h.of("record.open").count >= 2 }
-        for frame in h.of("record.open") { XCTAssertEqual(frame["wireVersion"], 2, "\(frame)") }
+        for frame in h.of("record.open") { XCTAssertEqual(frame["wireVersion"], 3, "\(frame)") }
         XCTAssertEqual(JsBaoErrorCode.db3ConditionNotMet.rawValue, "DB3_CONDITION_NOT_MET")
         XCTAssertEqual(JsBaoErrorCode.db3RecordNotFound.rawValue, "DB3_RECORD_NOT_FOUND")
         XCTAssertEqual(JsBaoErrorCode.db3ClientOutdated.rawValue, "DB3_CLIENT_OUTDATED")
@@ -313,7 +314,7 @@ final class RecordLogIncrementHermeticTests: XCTestCase {
         try h.save("r1", ["t": 1])
         await h.session.start()
         XCTAssertEqual(h.of("record.open").count, 1)
-        await h.feed(["type": "error", "messageType": "record.open", "code": "DB3_CLIENT_OUTDATED", "wireVersion": 2, "declared": 1])
+        await h.feed(["type": "error", "messageType": "record.open", "code": "DB3_CLIENT_OUTDATED", "wireVersion": 3, "minimum": 2, "declared": 1])
         await h.feed(["type": "error", "messageType": "record.declare", "code": "DOCUMENT_NOT_OPEN"])
         await h.feed(["type": "error", "messageType": "record.entries", "code": "DOCUMENT_NOT_OPEN"])
         XCTAssertEqual(h.failed.value, ["DB3_CLIENT_OUTDATED"])
@@ -323,8 +324,8 @@ final class RecordLogIncrementHermeticTests: XCTestCase {
         XCTAssertEqual(h.of("record.entries").count, 1)
     }
 
-    func testARecordOpenedAtWireVersionTwoOrThreeOpens() async throws {
-        for version in [2, 3] {
+    func testARecordOpenedAtWireVersionThreeOrHigherOpens() async throws {
+        for version in [3, 4] {
             let h = try await harness()
             await h.session.start()
             var frame = H.opened(lsn: 0)

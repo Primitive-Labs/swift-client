@@ -56,6 +56,17 @@ left off. Evicting it, or `logout(wipeLocal: true)`, removes it; writes the room
 had not received are handed back as one `DocumentWriteRefusedEvent` with
 `.documentStorePurged`.
 
+The indexes the room's list places on the device are kept in the same file: a
+view index per field index, a member table per member index placed `.device`
+or `.both`, and a full-text table per text index (the bundled SQLite carries
+FTS5). Triggers on the view keep each table equal to the rows the copy holds
+through every write, catch-up, load and segment, and the store gathers
+SQLite's statistics as a member table grows. A `$search` reads its model's
+text table and answers each row with `_score`; one on a model with no text
+index here is refused `.queryIndexNotOnDevice`, and one whose table could not
+be built `.db3IndexPlacementUnsupported` with `details.engine`
+(`swift-sqlite`) and `details.reason`, every other query answering.
+
 ### What a crash can lose
 
 Saves issued together share one commit, made at `synchronous=NORMAL` within a

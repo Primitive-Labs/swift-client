@@ -267,4 +267,39 @@ private func _functionInvokerBindingsCompile(_ client: JsBaoClient) async throws
     let settleResult: FunctionResult<SettleOutput> =
         try await settle(client).invoke(input: SettleInput(id: "o-1"))
     if case let .settled(branch) = settleResult.output { _ = branch.note }
+
+    // Doc comments on members and roots change no type: the annotated
+    // fixture's members, nested enum and tagged-union output bind as usual.
+    let annotatedResult: FunctionResult<AnnotatedOutput> = try await annotated(client).invoke(
+        input: AnnotatedInput(name: "Ada", locale: .en, tags: ["a"], address: .null)
+    )
+    if case let .saved(branch) = annotatedResult.output { _ = branch.version }
+
+    // The shapes one schema IR fixed: a repeated enum value is one case, an
+    // enum or a type list beside a defective oneOf binds as its enum or
+    // scalar, and an object-typed enum stays `JSONValue`.
+    let conformanceResult: FunctionResult<ConformanceOutput> = try await conformance(client).invoke(
+        input: ConformanceInput(level: .low, mode: .safe, note: nil, legacy: .null)
+    )
+    _ = conformanceResult.output?.ok
+    _ = ConformanceInput.LevelValue.allCases.count == 2
+
+    // The shared types: a def, a db3 row projection, a prompt output and a
+    // presentation input each name one declaration of Primitive.generated.swift.
+    // A nullable root object is an Optional alias, so the input takes `nil`.
+    let price = Money(amount: 9.5, currency: "EUR")
+    let pricing = priced(client)
+    let pricedResult: FunctionResult<PricedOutput> = try await pricing.invoke(
+        input: PricedInputValue(price: price, discount: nil, mode: .quote)
+    )
+    let row: TasksRow? = pricedResult.output?.row
+    _ = row?.title
+    _ = pricedResult.output?.status
+    _ = try await pricing.invoke(input: nil) as FunctionResult<PricedOutput>
+    let quote = QuotePromptOutput(total: price)
+    _ = quote.total.amount
+    let show = DisplayPresentationShow(status: .closed)
+    if case let .show(card)? = DisplayAgentPresentation?.some(.show(show)) { _ = card.status }
+    _ = Status.allCases.count == 2
+    _ = PricedInputValue.ModeValue.allCases
 }

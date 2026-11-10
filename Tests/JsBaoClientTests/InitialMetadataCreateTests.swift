@@ -88,6 +88,7 @@ final class InitialMetadataCreateTests: XCTestCase {
 
     /// Behavior 8: an unknown category fails the whole create — the Swift call
     /// throws and no collection is left behind.
+    @available(*, deprecated)
     func testCollectionCreateWithUnknownCategoryFailsAtomically() async throws {
         let name = "orphan-\(Int(Date().timeIntervalSince1970))"
         await XCTAssertThrowsErrorAsync(

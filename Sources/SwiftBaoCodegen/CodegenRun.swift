@@ -1,4 +1,5 @@
 import Foundation
+import TOMLKit
 
 /// One schema input: its path, the name generated headers give it (its
 /// basename) and its contents.
@@ -42,6 +43,34 @@ enum CodegenInputs {
         return files
     }
 
+    /// The `schemas/` each input's shared-enum refs resolve against (#5545):
+    /// `<input's directory>/../schemas`, its `*.toml` in name order, each
+    /// directory read once; the inputs' type names are the db3 keys.
+    static func sharedEnumFiles(for inputs: [CodegenInput]) -> [SharedEnums] {
+        let db3 = typeNames(inputs)
+        var byDirectory: [String: SharedEnums] = [:]
+        return inputs.map { input in
+            let url = URL(fileURLWithPath: input.path).deletingLastPathComponent().appending(path: "../schemas").standardizedFileURL
+            let dir = url.path(percentEncoded: false)
+            if let read = byDirectory[dir] { return read }
+            var isDirectory: ObjCBool = false
+            let files = FileManager.default.fileExists(atPath: dir, isDirectory: &isDirectory) && isDirectory.boolValue
+                ? ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".toml") }.sorted()
+                    .map { (String($0.dropLast(5)), (try? String(contentsOf: url.appending(path: $0), encoding: .utf8)) ?? "") }
+                : nil
+            byDirectory[dir] = SharedEnums(files: files, dir: "\(dir)/", db3: db3)
+            return byDirectory[dir]!
+        }
+    }
+
+    /// Each type file's db3 type name: its `[type] name`, else its stem.
+    static func typeNames(_ inputs: [CodegenInput]) -> [String] {
+        inputs.compactMap { input in
+            guard let type = (try? TOMLTable(string: input.source))?["type"]?.table else { return nil }
+            return type["name"]?.string.flatMap { $0.isEmpty ? nil : $0 } ?? URL(fileURLWithPath: input.sourceName).deletingPathExtension().lastPathComponent
+        }
+    }
+
     /// Read each file, named by its basename.
     static func read(_ paths: [String]) throws -> [CodegenInput] {
         try paths.map { path in
@@ -63,9 +92,11 @@ enum CodegenRun {
     /// Render `documents` (each a file's basename and contents). A model's
     /// file names the input that declared it; the barrel names every input,
     /// or `emptyLabel` when there is none. For one input the output is what
-    /// a single `--input` has always written.
+    /// a single `--input` has always written. `sharedEnums`, one per
+    /// document, expands its fields' shared-enum refs (#5545).
     static func render(
         documents: [(sourceName: String, source: String)],
+        sharedEnums: [SharedEnums?]? = nil,
         emptyLabel: String,
         accessLevel: String,
         moduleImport: String,
@@ -76,6 +107,7 @@ enum CodegenRun {
         // breaks a generated model on either client is refused here.
         let schemas = try TomlParser.parseAll(
             documents: documents,
+            sharedEnums: sharedEnums,
             swiftNameSuffix: swiftNameSuffix,
             strict: strict,
             rejectReservedFieldNames: true

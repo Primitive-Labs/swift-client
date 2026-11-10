@@ -142,6 +142,7 @@ public final class AgentSessionList: @unchecked Sendable {
     /// short window, and never made while the list holds its lock.
     ///
     /// - Returns: A function that removes the listener.
+    /// - Stability: beta
     @discardableResult
     public func onChange(_ listener: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
         let id = UUID()
@@ -156,6 +157,7 @@ public final class AgentSessionList: @unchecked Sendable {
     }
 
     /// Load the next page; returns at once, with no request, when there is none.
+    /// - Stability: beta
     public func loadMore() async throws {
         guard lock.withLock({ !closed && more }) else { return }
         try await serial { [weak self] in
@@ -180,6 +182,7 @@ public final class AgentSessionList: @unchecked Sendable {
     /// as listed. A session no longer in those pages leaves the list. The
     /// list also refreshes itself after every reconnect. A call while a
     /// refresh runs makes one more after it.
+    /// - Stability: beta
     public func refresh() async throws {
         let task: Task<Void, Error>? = lock.withLock {
             guard !closed else { return nil }
@@ -222,6 +225,7 @@ public final class AgentSessionList: @unchecked Sendable {
     }
 
     /// Stop listening: nothing changes after this and no listener is called.
+    /// - Stability: beta
     public func close() {
         let tasks: [Task<Void, Never>] = lock.withLock {
             guard !closed else { return [] }
@@ -522,6 +526,7 @@ extension AgentSessionsAPI {
     /// change, and the list reads its pages again after a reconnect. Call
     /// `close()` when done. Throws as `list` does; a `userId` throws
     /// `.invalidArgument` before any request.
+    /// - Stability: beta
     public func watch(options: WatchAgentSessionsOptions = WatchAgentSessionsOptions()) async throws -> AgentSessionList {
         if options.userId != nil {
             throw JsBaoError(

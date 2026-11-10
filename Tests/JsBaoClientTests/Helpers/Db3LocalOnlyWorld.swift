@@ -13,13 +13,14 @@ final class Db3LocalOnlyWorld: @unchecked Sendable {
     private var remote = 0
 
     /// The model every client registers: a unique `slug`, an indexed
-    /// `status`, a compound unique `(owner, day)`.
+    /// `status`, a compound unique `(owner, day)`, and a string set `tags`.
     static let note = PrimitiveSchema(
         name: "Note",
         fields: [
             "id": FieldDescriptor(type: .id), "title": FieldDescriptor(type: .string),
             "slug": FieldDescriptor(type: .string, unique: true), "status": FieldDescriptor(type: .string, indexed: true),
             "views": FieldDescriptor(type: .number), "owner": FieldDescriptor(type: .string), "day": FieldDescriptor(type: .number),
+            "tags": FieldDescriptor(type: .stringset),
         ],
         constraints: ["owner_day": ConstraintDescriptor(name: "owner_day", fields: ["owner", "day"])]
     )

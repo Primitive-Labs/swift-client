@@ -84,6 +84,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// written yet. Throws `HttpError` with status 404 when the category is not
     /// defined for the resource type, and 403 when the category's `readRule`
     /// denies the caller.
+    /// - Stability: experimental
     public func get(
         resourceType: String,
         resourceId: String,
@@ -100,6 +101,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// This is a replace, not a merge: keys absent from `data` are removed. The
     /// data is validated against the category's schema, and the category's
     /// `writeRule` gates the write (403 on denial).
+    /// - Stability: experimental
     public func set(
         resourceType: String,
         resourceId: String,
@@ -122,6 +124,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// exceeding either limit fails the whole call with 400 `BATCH_TOO_LARGE`.
     /// Otherwise this is a partial-success call: per-item 403/404 problems come
     /// back as structured `ok: false` entries and do **not** throw.
+    /// - Stability: experimental
     public func getBatch(
         requests: [ResourceMetadataBatchRequestItem]
     ) async throws -> ResourceMetadataBatchResult {
@@ -162,6 +165,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     ///     print(owner.resourceId)  // the user that owns the value
     /// }
     /// ```
+    /// - Stability: experimental
     public func resolve(
         resourceType: String,
         category: String,
@@ -188,6 +192,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// `readRule`, with the app-level owner/admin bypass); a resource with no
     /// metadata comes back with an empty `categories` array rather than an
     /// error.
+    /// - Stability: experimental
     public func list(
         resourceType: String,
         resourceId: String
@@ -203,6 +208,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// The category's `writeRule` gates the delete (403 on denial). Idempotent:
     /// deleting an item that does not exist succeeds with `deleted == false`
     /// rather than failing with 404.
+    /// - Stability: experimental
     public func delete(
         resourceType: String,
         resourceId: String,

@@ -12,7 +12,8 @@ func createTestClient(
     storageConfig: StorageConfig = .memory,
     autoNetwork: Bool = false,
     logLevel: LogLevel = .warn,
-    analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig()
+    analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
+    deviceIndexes: Db3DeviceIndexes = .all
 ) -> JsBaoClient {
     JsBaoClient(options: JsBaoClientOptions(
         apiUrl: TestConfig.httpUrl,
@@ -25,7 +26,8 @@ func createTestClient(
         logLevel: logLevel,
         storageConfig: storageConfig,
         autoNetwork: autoNetwork,
-        analyticsAutoEvents: analyticsAutoEvents
+        analyticsAutoEvents: analyticsAutoEvents,
+        deviceIndexes: deviceIndexes
     ))
 }
 

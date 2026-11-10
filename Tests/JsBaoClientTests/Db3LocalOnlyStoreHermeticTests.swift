@@ -96,7 +96,7 @@ final class Db3LocalOnlyStoreHermeticTests: XCTestCase {
         let version = try provider.withConnection {
             try $0.query("SELECT value FROM record_log_meta WHERE key = 'storage_version'", []).first?["value"].stringValue
         }
-        XCTAssertEqual(version, "4")
+        XCTAssertEqual(version, String(RecordLogSchema.storageVersion), "the current storage version, 4 or later")
         let columns = try provider.withConnection {
             try $0.query("SELECT name FROM pragma_table_info('record_log_state')", []).compactMap { $0["name"].stringValue }
         }

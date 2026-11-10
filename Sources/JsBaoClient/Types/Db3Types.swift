@@ -233,6 +233,43 @@ public struct Db3GetOrCreateWithAliasResult: Decodable, Sendable, Equatable {
     }
 }
 
+/// What `client.db3.aliases.resolve(_:)` answers: the db3's row, as
+/// `client.db3.get(_:)` reads it, and the alias that names it.
+public struct Db3AliasResolution: Decodable, Sendable, Equatable {
+    public let id: String
+    /// The title, `""` when it has none.
+    public let title: String
+    /// Who created it: a user id, or `sys:<appId>` for one the app created.
+    public let createdBy: String
+    public let createdAt: String
+    public let modifiedAt: String
+    /// Who holds it: `user:<userId>`, `app`, or the platform resource that holds it.
+    public let custodian: String?
+    /// Whether clients sync it over a socket.
+    public let sync: Bool
+    /// Its type, or `nil` for an untyped db3.
+    public let type: String?
+    /// The alias that names it.
+    public let alias: DocumentAliasInfo
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, createdBy, createdAt, modifiedAt, custodian, sync, type, alias
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy) ?? ""
+        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        modifiedAt = try c.decodeIfPresent(String.self, forKey: .modifiedAt) ?? ""
+        custodian = try c.decodeIfPresent(String.self, forKey: .custodian)
+        sync = try c.decodeIfPresent(Bool.self, forKey: .sync) ?? true
+        type = try c.decodeIfPresent(String.self, forKey: .type)
+        alias = try c.decode(DocumentAliasInfo.self, forKey: .alias)
+    }
+}
+
 /// A db3's sync state, as `client.db3.getSync(_:)` answers it.
 public struct Db3SyncState: Decodable, Sendable, Equatable {
     public let id: String

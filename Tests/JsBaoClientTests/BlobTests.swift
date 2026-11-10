@@ -2,6 +2,7 @@ import XCTest
 @testable import JsBaoClient
 
 /// Port of tests/client/js-bao-client-blobs.test.ts
+@available(*, deprecated)
 final class BlobTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

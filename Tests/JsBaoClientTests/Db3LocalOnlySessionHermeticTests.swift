@@ -15,6 +15,7 @@ import XCTest
 /// - A request naming it is refused `.db3LocalOnly` before anything is sent,
 ///   also when made before storage setup has loaded its row or bound its
 ///   store, and when its row is lost and its store unbound.
+@available(*, deprecated)
 final class Db3LocalOnlySessionHermeticTests: XCTestCase {
 
     private let world = Db3LocalOnlyWorld()
@@ -109,7 +110,7 @@ final class Db3LocalOnlySessionHermeticTests: XCTestCase {
         let version = try upgraded.withConnection {
             try $0.query("SELECT value FROM record_log_meta WHERE key = 'storage_version'", []).first?["value"].stringValue
         }
-        XCTAssertEqual(version, "4")
+        XCTAssertEqual(version, String(RecordLogSchema.storageVersion))
     }
 
     // MARK: - No close removes it

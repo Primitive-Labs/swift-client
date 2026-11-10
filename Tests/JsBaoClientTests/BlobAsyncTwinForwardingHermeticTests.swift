@@ -25,6 +25,7 @@ import XCTest
 ///
 /// Server-free (`*HermeticTests`): the manager talks to a stub transport, and
 /// the one `JsBaoClient` case points at a closed local port.
+@available(*, deprecated)
 final class BlobAsyncTwinForwardingHermeticTests: XCTestCase {
 
     /// Clients built by a case here, torn down before the next one starts —

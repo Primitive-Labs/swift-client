@@ -171,6 +171,7 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
         """
     }
 
+    @available(*, deprecated)
     func test_databaseTypeConfig_getDecodesManifest() async throws {
         let transport = RecordingTransport(
             json: Self.databaseConfigJSON(manifest: Self.manifestJSON)
@@ -186,6 +187,7 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
     }
 
     /// `metadataManifest: null` is the "none set" case, not a decode failure.
+    @available(*, deprecated)
     func test_databaseTypeConfig_getDecodesNullManifestAsNil() async throws {
         let transport = RecordingTransport(json: Self.databaseConfigJSON(manifest: nil))
         let config = try await DatabaseTypeConfigsAPI(transport: transport)
@@ -193,6 +195,7 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
         XCTAssertNil(config.metadataManifest)
     }
 
+    @available(*, deprecated)
     func test_databaseTypeConfig_createSendsManifest() async throws {
         let transport = RecordingTransport(
             json: Self.databaseConfigJSON(manifest: Self.manifestJSON)
@@ -226,6 +229,7 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
 
     /// Create omits the key entirely when no manifest is passed — parity with
     /// JS's optional `metadataManifest?`.
+    @available(*, deprecated)
     func test_databaseTypeConfig_createOmitsUnsetManifest() async throws {
         let transport = RecordingTransport(json: Self.databaseConfigJSON(manifest: nil))
         _ = try await DatabaseTypeConfigsAPI(transport: transport).create(
@@ -234,6 +238,7 @@ final class TypeConfigMetadataManifestHermeticTests: XCTestCase {
         XCTAssertNil(try bodyObject(transport)["metadataManifest"])
     }
 
+    @available(*, deprecated)
     func test_databaseTypeConfig_updateSetsClearsAndOmitsManifest() async throws {
         let api = { DatabaseTypeConfigsAPI(transport: $0) }
 

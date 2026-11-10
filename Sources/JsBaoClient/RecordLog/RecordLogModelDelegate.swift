@@ -8,7 +8,9 @@ import YSwift
 ///
 /// Values are spelled as format 1 spells them (`PrimitiveValue.encodedForYrs`
 /// and `PrimitiveValue.decode`), so one schema and one decoder describe every
-/// format. A model's declaration reaches the room in `record.declare`, never
+/// format. A vector field (#5225) is the exception: a save writes its numbers
+/// as the base64 of the field's encoding, and every read answers them decoded,
+/// an array of numbers. A model's declaration reaches the room in `record.declare`, never
 /// through the `YDocument`: a format-3 document carries no Yjs traffic.
 ///
 /// A view of the binding; it holds no state of its own.
@@ -36,11 +38,20 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     // MARK: - Reads
 
     /// The record as this document's view holds it — or, inside a
-    /// `transact` on this thread, as the transaction's saves leave it.
+    /// `transact` on this thread, as the transaction's saves leave it — each
+    /// vector field read as its numbers.
     func row(id: String) throws -> [String: JSONValue]? {
+        try storedRow(id: id).map { binding.decodedVectors($0, model: modelName, encodings: vectorEncodings) }
+    }
+
+    /// ``row(id:)`` as stored, a vector field its base64: what a write plans against.
+    private func storedRow(id: String) throws -> [String: JSONValue]? {
         if let staged = binding.stagedRow(RecordLogRecordKey(model: modelName, id: id)) { return staged }
         return try store.read(model: modelName, id: id)
     }
+
+    /// The vector fields of this model this device knows, with their encodings.
+    private var vectorEncodings: [String: VectorEncoding] { binding.vectorEncodings(model: modelName) }
 
     /// The row a handle reads: the record's own, or — when the room applied
     /// an upsert of this client's under this id to another record — that one.
@@ -61,8 +72,21 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         RecordLogViewReader(store: store, documents: scope(narrowedTo: requested))
     }
 
-    /// How the model API answers a record: declared sets as arrays, the document tagged.
-    private var shape: RecordLogViewReader.RowShape { .model(setFields: Set(stringSetFields)) }
+    /// How the model API answers a record: declared sets as arrays, vectors as
+    /// their numbers (an included record's as its own model's), the document
+    /// tagged.
+    private func shape(_ include: [Include]? = nil) -> RecordLogViewReader.RowShape {
+        var encodings: [String: [String: VectorEncoding]] = [:]
+        for model in RecordLogViewReader.models(modelName, include) {
+            let fields = binding.vectorEncodings(model: model)
+            if !fields.isEmpty { encodings[model] = fields }
+        }
+        guard !encodings.isEmpty else { return .model(setFields: Set(stringSetFields)) }
+        return .model(setFields: Set(stringSetFields), decode: { [binding] model, row, _ in
+            guard let fields = encodings[model] else { return row }
+            return binding.decodedVectors(row, model: model, encodings: fields)
+        })
+    }
 
     // The filtered reads answer from the document's view with the room's
     // statement and the db3 limits (``RecordLogViewReader``).
@@ -72,7 +96,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     }
 
     func query(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> [[String: JSONValue]] {
-        try reader(options?.documentScope()).page(modelName, filter ?? [:], options: options, shape: shape, include: include).rows
+        try reader(options?.documentScope()).page(modelName, filter ?? [:], options: options, shape: shape(include), include: include).rows
     }
 
     func queryPaged(filter: DocumentFilter?, options: QueryOptions?) throws -> PagedQueryResult<PrimitiveRow> {
@@ -81,12 +105,12 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
 
     func queryPaged(filter: DocumentFilter?, options: QueryOptions?, include: [Include]?) throws -> PagedQueryResult<PrimitiveRow> {
         RecordLogViewReader.paged(
-            try reader(options?.documentScope()).page(modelName, filter ?? [:], options: options, shape: shape, include: include)
+            try reader(options?.documentScope()).page(modelName, filter ?? [:], options: options, shape: shape(include), include: include)
         )
     }
 
-    func count(filter: DocumentFilter?) throws -> Int {
-        try reader(nil).count(modelName, filter ?? [:])
+    func count(filter: DocumentFilter?, options: QueryOptions?) throws -> Int {
+        try reader(options?.documentScope()).count(modelName, filter ?? [:], maxDrift: options?.maxDrift, options: options)
     }
 
     func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
@@ -170,7 +194,8 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     ) throws -> Int? {
         var dataToSave: [String: JSONValue] = ["id": .string(id)]
         var stringSetChanges: [String: (additions: [String], removals: [String])] = [:]
-        let existing = isUpdate ? try row(id: id) : nil
+        var vectors: [String: [Float]] = [:]
+        let existing = isUpdate ? try storedRow(id: id) : nil
         let clearedFields = isUpdate ? cleared.filter { $0 != "id" && values[$0] == nil }.sorted() : []
         for name in clearedFields where stringSetFields.contains(name) {
             stringSetChanges[name] = (additions: [], removals: recordLogCanonicalStringSet(Set(try self.members(id: id, field: name))))
@@ -185,10 +210,14 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
                         removals: recordLogCanonicalStringSet(held.subtracting(members))
                     )
                 }
+            } else if case let .vector(numbers) = value {
+                vectors[name] = numbers
             } else {
                 dataToSave[name] = try Self.wireValue(value, field: name, model: modelName, documentId: binding.documentId)
             }
         }
+        // A vector's numbers travel as the base64 of the field's encoding (#5225).
+        dataToSave = try binding.encodedVectors(dataToSave, numbers: vectors, model: modelName, id: id, kind: isUpdate ? .patch : .create)
         let mutation = planRecordLogSave(RecordLogSaveInput(
             model: modelName, recordId: id, existing: isUpdate ? (existing ?? ["id": .string(id)]) : nil,
             dataToSave: dataToSave, touchedFields: values.keys.filter { $0 != "id" } + clearedFields,
@@ -218,7 +247,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         }
         return try binding.withOperation {
             try assertRecordLogEntry(documentId: binding.documentId, mutations: [mutation], report: report)
-            guard let existing = try row(id: id) else {
+            guard let existing = try storedRow(id: id) else {
                 throw refuse(
                     .db3RecordNotFound,
                     "Cannot increment \(modelName) \(id) in `\(binding.documentId)`: no such record here (never created, or deleted). Nothing was sent."
@@ -323,7 +352,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         _ mutations: [RecordLogMutation], upsertOn: String? = nil, existing: RecordLogRow?? = nil
     ) throws -> Int? {
         let base: RecordLogRow?
-        if let existing { base = existing } else { base = try row(id: mutations[0].id) }
+        if let existing { base = existing } else { base = try storedRow(id: mutations[0].id) }
         if binding.stage(mutations[0], upsertOn: upsertOn, existing: base) { return nil }
         try assertRecordLogEntry(documentId: binding.documentId, mutations: mutations, upsertOn: upsertOn) { [binding] event in
             binding.reportRefused(event)

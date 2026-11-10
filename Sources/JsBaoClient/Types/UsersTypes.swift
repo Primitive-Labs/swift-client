@@ -20,6 +20,12 @@ public struct BasicUserInfo: Decodable, Sendable, Equatable {
     public let appRole: String
     public let appId: String
     public let addedAt: String?
+    /// The user's properties a client may read: on another user, the fields
+    /// whose `client` is `members` or `self-write-members`; on the caller's
+    /// own row, also `self` and `self-write`. Defaults applied; `[:]` when
+    /// the app declares none, and for an answer cached before the field
+    /// existed.
+    public let properties: [String: JSONValue]
 
     public init(
         userId: String,
@@ -28,7 +34,8 @@ public struct BasicUserInfo: Decodable, Sendable, Equatable {
         avatarUrl: String? = nil,
         appRole: String,
         appId: String,
-        addedAt: String? = nil
+        addedAt: String? = nil,
+        properties: [String: JSONValue] = [:]
     ) {
         self.userId = userId
         self.email = email
@@ -37,6 +44,23 @@ public struct BasicUserInfo: Decodable, Sendable, Equatable {
         self.appRole = appRole
         self.appId = appId
         self.addedAt = addedAt
+        self.properties = properties
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case userId, email, name, avatarUrl, appRole, appId, addedAt, properties
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try c.decode(String.self, forKey: .userId)
+        email = try c.decode(String.self, forKey: .email)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        avatarUrl = try c.decodeIfPresent(String.self, forKey: .avatarUrl)
+        appRole = try c.decode(String.self, forKey: .appRole)
+        appId = try c.decode(String.self, forKey: .appId)
+        addedAt = try c.decodeIfPresent(String.self, forKey: .addedAt)
+        properties = try c.decodeIfPresent([String: JSONValue].self, forKey: .properties) ?? [:]
     }
 }
 
@@ -48,17 +72,35 @@ public struct BatchUserProfile: Decodable, Sendable, Equatable {
     public let email: String
     public let name: String?
     public let avatarUrl: String?
+    /// The user's properties a client may read, as on
+    /// `BasicUserInfo.properties`.
+    public let properties: [String: JSONValue]
 
     public init(
         userId: String,
         email: String,
         name: String? = nil,
-        avatarUrl: String? = nil
+        avatarUrl: String? = nil,
+        properties: [String: JSONValue] = [:]
     ) {
         self.userId = userId
         self.email = email
         self.name = name
         self.avatarUrl = avatarUrl
+        self.properties = properties
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case userId, email, name, avatarUrl, properties
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try c.decode(String.self, forKey: .userId)
+        email = try c.decode(String.self, forKey: .email)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        avatarUrl = try c.decodeIfPresent(String.self, forKey: .avatarUrl)
+        properties = try c.decodeIfPresent([String: JSONValue].self, forKey: .properties) ?? [:]
     }
 }
 
@@ -71,10 +113,25 @@ public struct UserLookupSummary: Decodable, Sendable, Equatable {
     /// Optional: `users-controller.ts` (`lookup`) omits `name` when unset.
     public let name: String?
     public let email: String
+    /// The user's properties a client may read, as on
+    /// `BasicUserInfo.properties`.
+    public let properties: [String: JSONValue]
+
+    private enum CodingKeys: String, CodingKey {
+        case userId, name, email, properties
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try c.decode(String.self, forKey: .userId)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        email = try c.decode(String.self, forKey: .email)
+        properties = try c.decodeIfPresent([String: JSONValue].self, forKey: .properties) ?? [:]
+    }
 }
 
-/// Result of `users.lookup(email:)`. Mirrors JS
-/// `{ exists: boolean; user?: { userId; name; email } }`.
+/// Result of `users.lookup(email:)`. Mirrors JS `UserLookupResult`
+/// (`{ exists: boolean; user?: { userId; name; email; properties } }`).
 public struct UserLookupResult: Decodable, Sendable, Equatable {
     public let exists: Bool
     public let user: UserLookupSummary?

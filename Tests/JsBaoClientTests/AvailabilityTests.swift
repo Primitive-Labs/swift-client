@@ -50,6 +50,7 @@ final class AvailabilityTests: XCTestCase {
     /// no wrapper swallows them (#2667, behavior 7). Uses the live server so
     /// the sub-API is exercised the way callers reach it, against a document
     /// that really exists.
+    @available(*, deprecated)
     func testDocumentsOpenTwinSurfaceThrowsTypedErrors() async throws {
         let client = createTestClient(
             appId: testApp.appId,

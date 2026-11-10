@@ -142,7 +142,7 @@ public enum SchemaSync {
         case .number:    return "number"
         case .boolean:   return "boolean"
         case .stringset: return "stringset"
-        case .date, .id, .json: return nil
+        case .date, .id, .json, .vector: return nil
         }
     }
 

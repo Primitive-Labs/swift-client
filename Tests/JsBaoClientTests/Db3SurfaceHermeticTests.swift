@@ -125,6 +125,11 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let _: (String, String) async throws -> DocumentIngestSession = api.ingests.abort(db3Id:sessionId:)
         let _: (String, String) async throws -> DocumentIngestSession = api.ingests.get(db3Id:sessionId:)
         let _: (String, Int?, String?) async throws -> DocumentIngestPage = api.ingests.list(db3Id:limit:cursor:)
+        // #5361 (R9, add-only): a user's aliases for db3s.
+        let _: Db3AliasesAPI = api.aliases
+        let _: (SetAliasParams) async throws -> DocumentAliasInfo = api.aliases.set(_:)
+        let _: (AliasRef) async throws -> Db3AliasResolution? = api.aliases.resolve(_:)
+        let _: (AliasRef) async throws -> Void = api.aliases.delete(_:)
     }
 
     /// #5021 (R3g, add-only): the full `listMine(_:)`, and its `via` names, the JS union's.
@@ -145,6 +150,7 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let _: (UpdatePermissionsData) async throws -> PermissionUpdateResult = sharing.set(_:)
         let _: (DocumentPermissionTarget) async throws -> Void = sharing.remove(_:)
         let _: () async throws -> [PendingInvitationEntry] = sharing.listPendingInvitations
+        let _: (String) async throws -> PendingInvitationRevokeResult = sharing.revokePendingInvitation(_:)
         let _: (Bool) async throws -> [DocumentGroupPermissionEntry] = sharing.listGroups(includeSystem:)
         let _: (GrantGroupPermissionParams) async throws -> DocumentGroupPermissionEntry = sharing.grantGroup(_:)
         let _: (String) async throws -> SuccessResult = sharing.revokeGroup(_:)
@@ -159,6 +165,7 @@ final class Db3SurfaceHermeticTests: XCTestCase {
 
     /// #4943 (R3g, add-only): a db3's blobs, as `client.db3.blobs(_:)`, with
     /// the method set of `DocumentBlobContext`, which keeps its own.
+    @available(*, deprecated)
     func testTheDb3NamespaceHasBlobs() {
         let api = Db3API(lifecycle: Db3Lifecycle(deps: Db3LifecycleDeps()), transport: RecordingTransport(status: 200))
         let _: (String) -> Db3BlobContext = api.blobs(_:)

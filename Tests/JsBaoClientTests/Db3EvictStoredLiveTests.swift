@@ -69,7 +69,7 @@ final class Db3EvictStoredLiveTests: XCTestCase {
         XCTAssertEqual(stored.first?.rows, 3)
         XCTAssertEqual(stored.first?.resident, true)
         XCTAssertEqual(try titles(x2), ["row 1", "row 2", "row 3"])
-        XCTAssertEqual(try x2.documents.records(id).count("Note"), 3)
+        XCTAssertEqual(try x2.db3.records(id).count("Note"), 3)
         await x2.destroy()
 
         // A model registered after the binding reads its rows too.
@@ -202,7 +202,7 @@ final class Db3EvictStoredLiveTests: XCTestCase {
         let evicted = ThreadSafeBox<[Db3EvictedEvent]>([])
         let heard = x.eventEmitter.subscribe(Db3EvictedEvent.self) { event in evicted.mutate { $0.append(event) } }
         try await delay(0.05)
-        x.db3.setRetentionPolicy(RetentionPolicy(ttl: 0.01))
+        try x.db3.setRetentionPolicy(RetentionPolicy(ttl: 0.01))
         try await eventually(timeout: 15, description: "the retention eviction") { evicted.value.contains { $0.id == clean } }
         try await delay(0.5)
         XCTAssertEqual(
@@ -286,7 +286,7 @@ final class Db3EvictStoredLiveTests: XCTestCase {
         }
         XCTAssertEqual(try titles(x), [])
         XCTAssertEqual(code { _ = try x.sharedModel(for: Self.note).query(nil, options: QueryOptions(db3: [id])) }, "DB3_NOT_RESIDENT")
-        XCTAssertEqual(code { _ = try x.documents.records(id).query("Note") }, "NOT_FOUND")
+        XCTAssertEqual(code { _ = try x.db3.records(id).query("Note") }, "NOT_FOUND")
         XCTAssertEqual(code { try self.save(x, id, "after the logout") }, "NOT_FOUND")
         XCTAssertFalse(x.isRecordLogDocument(id))
         XCTAssertFalse(x.isRecordLogDocument(never))

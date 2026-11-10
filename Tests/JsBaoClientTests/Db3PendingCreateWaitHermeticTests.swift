@@ -32,6 +32,11 @@ final class Db3PendingCreateWaitHermeticTests: XCTestCase {
             "permissions": "answers a Db3PermissionsAPI, whose methods are checked",
         ],
         "Db3IngestsAPI": ["buildChunks": "builds chunks on this device"],
+        // #5361 — `set` names its db3 and waits; these two name only an alias.
+        "Db3AliasesAPI": [
+            "resolve": "names an alias, not a db3",
+            "delete": "names an alias, not a db3",
+        ],
     ]
 
     /// One public method: its class, name and body.

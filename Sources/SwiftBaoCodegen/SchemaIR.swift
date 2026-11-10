@@ -36,6 +36,10 @@ struct ParsedField: Equatable {
     /// Auto-timestamp policy (`auto_stamp = "create" | "update" | "both"`).
     /// Mirrors js-bao's `FieldOptions.autoStamp`. `nil` when omitted.
     var autoStamp: ParsedAutoStamp?
+    /// A vector field's number of numbers (#5225); `nil` on any other field.
+    var dims: Int? = nil
+    /// A vector field's element type, `f32`, `f16` or `i8` (#5225); `nil` on any other field.
+    var element: String? = nil
 }
 
 enum ParsedFieldType: String {
@@ -45,6 +49,8 @@ enum ParsedFieldType: String {
     case date
     case id
     case stringset
+    /// A db3 vector field (#5225), in a type file only: `[Float]` in Swift.
+    case vector
 }
 
 /// When an `auto_stamp` field is auto-populated with a timestamp. Raw

@@ -472,6 +472,7 @@ final class PersistenceTests: XCTestCase {
     /// Rewritten for #2668: this used to assert only through `hasLocalCopy`,
     /// which reports on in-memory bookkeeping and was blind to the CRDT
     /// snapshot eviction left in `yjs_docs`. It now reads that row directly.
+    @available(*, deprecated)
     func testEvictionRemovesPersistedData() async throws {
         let dbPath = tempDir + "evict-test-\(UUID().uuidString.prefix(6)).sqlite"
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Eviction Test")

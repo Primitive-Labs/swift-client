@@ -192,6 +192,7 @@ final class Db3LocalFirstCreateLiveTests: XCTestCase {
 
     // MARK: - Behavior 15
 
+    @available(*, deprecated)
     func testCommitOfflineCreateAnswersTheServersVerdictJoiningTheAttemptInFlight() async throws {
         let owner = try await live.client("owner", models: [Self.note])
         let heard = Heard(owner)
@@ -246,6 +247,7 @@ final class Db3LocalFirstCreateLiveTests: XCTestCase {
 
     // MARK: - Behavior 16
 
+    @available(*, deprecated)
     func testDocumentsCommitOfflineCreateWaitsForAHeldCommitAndTheDocumentPathIsUnchanged() async throws {
         let owner = try await live.client("owner", models: [Self.note])
         let heard = Heard(owner)
@@ -281,7 +283,7 @@ final class Db3LocalFirstCreateLiveTests: XCTestCase {
         let opened = LockedBox<Date?>(nil)
         let info = try await within(5, "create") { try await alice.db3.create(title: "Shared at once") }
         let access = Task { () -> (DocumentAccessResult, Date) in
-            (try await alice.documents.validateAccess(documentId: info.id), Date())
+            (try await alice.db3.validateAccess(info.id), Date())
         }
         let grant = Task { () -> Date in
             _ = try await alice.db3.permissions(info.id).set(.user(bobUser.userId, permission: "reader"))

@@ -278,6 +278,7 @@ final class CloseEvictLifecycleTests: XCTestCase {
         )
     }
 
+    @available(*, deprecated)
     func test_documentsCloseReportsEvictedFalseWhenTheServerHasNotConfirmed() async throws {
         // `documents.close` forwards to `client.closeDocument`, which owns the
         // guard since #2668; this pins the reported verdict through that path.

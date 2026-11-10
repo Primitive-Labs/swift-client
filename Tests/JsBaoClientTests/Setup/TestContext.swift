@@ -58,7 +58,7 @@ final class TestContext: @unchecked Sendable {
     func initialize() async throws {
         // The suite's super-admin token: TEST_SUPERADMIN_JWT, else an
         // email-only token for TEST_SUPERADMIN_EMAIL, else an admin the local
-        // server provisions (TestConfig.resolveSuperAdminJwt, #3885).
+        // server provisions (TestConfig.resolveSuperAdminCredential, #3885).
         let jwt = try await TestConfig.superAdminJwt()
         self.superuserJWT = jwt
 
@@ -536,6 +536,20 @@ final class TestContext: @unchecked Sendable {
         if let settings { body["settings"] = settings }
         let data = try await adminData(method: "POST", path: "/admin/api/apps/\(app.appId)/groups", body: body)
         return try JSONDecoder().decode(GroupInfo.self, from: data)
+    }
+
+    /// Publish `toml` as the app's `user-properties.toml` through the admin
+    /// API (`PUT /admin/api/apps/{appId}/users/properties`), as the
+    /// super-admin (#5387).
+    func pushUserProperties(appId: String, toml: String) async throws {
+        try await adminRequest(method: "PUT", path: "/admin/api/apps/\(appId)/users/properties", body: ["schema": toml])
+    }
+
+    /// Write a member's properties through the admin API
+    /// (`PATCH /admin/api/apps/{appId}/users/{userId}/properties`), which
+    /// reaches every declared field, as the super-admin (#5387).
+    func writeUserProperties(appId: String, userId: String, patch: [String: Any]) async throws {
+        try await adminRequest(method: "PATCH", path: "/admin/api/apps/\(appId)/users/\(userId)/properties", body: ["patch": patch])
     }
 
     @discardableResult

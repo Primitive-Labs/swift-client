@@ -51,6 +51,8 @@ public final class DocumentIngestsAPI: @unchecked Sendable {
     ///   carriage return, or starts with U+FEFF, a non-finite number, a `(model, id)` named
     ///   twice, a row too large for any chunk, or an artifact past a load's
     ///   limits.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func buildChunks(
         rows: [DocumentIngestRow],
         options: DocumentIngestBuildOptions = DocumentIngestBuildOptions()
@@ -66,6 +68,8 @@ public final class DocumentIngestsAPI: @unchecked Sendable {
     /// not take with `HttpError` status 400, `serverCode`
     /// `"INGEST_OPTION_INVALID"`, and a second session while one is running
     /// with `"DOCUMENT_INGEST_ACTIVE"`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func create(
         documentId: String,
         options: DocumentIngestCreateOptions? = nil
@@ -81,6 +85,8 @@ public final class DocumentIngestsAPI: @unchecked Sendable {
     /// descriptor before anything is stored.
     ///
     /// Answers for the chunk, not for the session.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func uploadChunk(
         documentId: String,
         sessionId: String,
@@ -99,6 +105,8 @@ public final class DocumentIngestsAPI: @unchecked Sendable {
     ///
     /// Returns as soon as the session is committed; poll `get` until it reads
     /// `complete` or `failed`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func commit(documentId: String, sessionId: String) async throws -> DocumentIngestSession {
         try await transport.request(method: .post, path: path(documentId, sessionId, "commit"))
     }
@@ -106,16 +114,22 @@ public final class DocumentIngestsAPI: @unchecked Sendable {
     /// Give up on a session and sweep what it uploaded. Rows a committed load
     /// already applied stay. A session that has finished is refused with
     /// `"INGEST_SESSION_NOT_ABORTABLE"`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func abort(documentId: String, sessionId: String) async throws -> DocumentIngestSession {
         try await transport.request(method: .post, path: path(documentId, sessionId, "abort"))
     }
 
     /// One session's state and progress.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func get(documentId: String, sessionId: String) async throws -> DocumentIngestSession {
         try await transport.request(method: .get, path: path(documentId, sessionId))
     }
 
     /// A document's bulk-load sessions, newest first.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func list(documentId: String, limit: Int? = nil, cursor: String? = nil) async throws -> DocumentIngestPage {
         var query = URLQuery()
         if let limit { query.append("limit", limit) }

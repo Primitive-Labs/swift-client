@@ -52,8 +52,10 @@ public final class DocumentsAPI: @unchecked Sendable {
         self.logger = logger.forScope(scope: "documents")
     }
 
+    /// - Stability: production
     public let aliases: DocumentAliasesAPI
     /// Bulk loads of a large document.
+    /// - Stability: production
     public let ingests: DocumentIngestsAPI
 
     /// Designated initializer — the typed transport spine.
@@ -98,6 +100,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// inside it (`metadata.documentId`). When no owning client is wired
     /// (isolated/test construction) it falls back to the legacy blocking
     /// `POST /documents`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func create(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> CreateDocumentResult {
         guard let client else {
             // No client to route through (tests / isolated construction):
@@ -441,35 +445,41 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// try records.put("Note", ["title": "Groceries", "tags": ["home"]])
     /// let open = try records.query("Note", ["done": false])
     /// ```
+    /// - Stability: production
+    @available(*, deprecated, message: "documents.records is deprecated with the documents family. Use client.db3.records, which answers the same records. It keeps answering until a later removal project. (api-surface-stability)")
     public func records(_ documentId: String) -> DocumentRecords {
-        DocumentRecords(
-            documentId: documentId, logger: logger,
-            readable: { [weak client] in
-                guard let client else { throw JsBaoClient.documentNotOpenForRecords(documentId) }
-                return try client.readableModelFreeBinding(documentId)
-            }
-        ) { [weak client] in
-            guard let client else { throw JsBaoClient.documentNotOpenForRecords(documentId) }
-            return try client.modelFreeBinding(documentId)
-        }
+        JsBaoClient.modelFreeRecords(documentId, client: client, logger: logger)
     }
 
     /// What `documentId` holds by model: `GET /documents/{id}/schema`. Each
     /// model's declaration and, on a format-3 document, what the room observed
     /// written (`schema.models[name]["observed"]`: each field's kinds, and
     /// per-kind counts after a segment export).
+    /// - Stability: production
+    @available(*, deprecated, message: "documents.schema is deprecated with the documents family. Use client.db3.schema, which answers the same schema. It keeps answering until a later removal project. (api-surface-stability)")
     public func schema(_ documentId: String) async throws -> DocumentSchemaAnswer {
         try await refuseLocalOnlyDb3(documentId, "client.documents.schema")
         return try await transport.request(method: .get, path: "/documents/\(documentId)/schema")
     }
 
     /// Get a document by ID.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func get(documentId: String) async throws -> DocumentInfo {
+        try await fetchDocumentInfo(documentId: documentId)
+    }
+
+    /// `get(documentId:)`'s request, guard included, for the client's own
+    /// callers (the open-time permission refresh and the format lookup): the
+    /// public member is deprecated, and they are not.
+    func fetchDocumentInfo(documentId: String) async throws -> DocumentInfo {
         try await refuseLocalOnlyDb3(documentId, "client.documents.get")
         return try await transport.request(method: .get, path: "/documents/\(documentId)")
     }
 
     /// Update a document's metadata.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func update(documentId: String, data: UpdateDocumentData) async throws -> DocumentInfo {
         try await refuseLocalOnlyDb3(documentId, "client.documents.update")
         return try await transport.request(method: .put, path: "/documents/\(documentId)", body: data)
@@ -481,6 +491,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///   `DocumentManager` close the doc before the server DELETE lands.
     ///   Mirrors js-bao's `documents.delete(id, { forceCloseIfOpen: true })`.
     ///   Without it, deleting a still-open doc surfaces stale state.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func delete(
         documentId: String,
         options: DeleteDocumentOptions = DeleteDocumentOptions()
@@ -545,6 +557,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     // MARK: - Permissions
 
     /// Get the list of members (permission entries) for a document.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getPermissions(documentId: String) async throws -> [DocumentPermissionEntry] {
         try await refuseLocalOnlyDb3(documentId, "client.documents.getPermissions")
         return try await transport.request(method: .get, path: "/documents/\(documentId)/permissions")
@@ -556,6 +570,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// email-targeted permission (live `DocumentPermission` if the email
     /// resolves to a member, otherwise the matching unresolved
     /// `DeferredDocumentPermission` rows — issue #619).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func removePermission(documentId: String, _ target: DocumentPermissionTarget) async throws {
         try await refuseLocalOnlyDb3(documentId, "client.documents.removePermission")
         // Root-document guard — mirrors js-bao (documentsApi.ts:1834).
@@ -587,6 +603,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// Transfer ownership of a document to another user.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func transferOwnership(documentId: String, newOwnerId: String) async throws {
         try await refuseLocalOnlyDb3(documentId, "client.documents.transferOwnership")
         return try await transport.send(
@@ -611,6 +629,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// the param since #506). The client-side `_`-prefix filter runs only on
     /// the default (`false`) branch, where it guards against a server
     /// predating #506 that returns system rows unconditionally.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listGroupPermissions(documentId: String, includeSystem: Bool = false) async throws -> [DocumentGroupPermissionEntry] {
         try await refuseLocalOnlyDb3(documentId, "client.documents.listGroupPermissions")
         var query = URLQuery()
@@ -623,6 +643,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// Grant a group permission on a document.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func grantGroupPermission(documentId: String, params: GrantGroupPermissionParams) async throws -> DocumentGroupPermissionEntry {
         try await refuseLocalOnlyDb3(documentId, "client.documents.grantGroupPermission")
         return try await transport.request(
@@ -662,6 +684,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// within 30 seconds. A failed commit attempt does not end the wait: the
     /// client retries it. A document the server does not hold, deleted or
     /// never created, throws the server's 404 (`NOT_FOUND`).
+    /// - Stability: production
+    @available(*, deprecated, message: "documents.validateAccess is deprecated with the documents family. Use client.db3.validateAccess, which answers the same access. It keeps answering until a later removal project. (api-surface-stability)")
     public func validateAccess(
         documentId: String,
         userId: String? = nil
@@ -693,6 +717,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// per-document invitation model removed in #2951.
     /// Mirrors js-bao's `documents.listPendingInvitations` (issue #619).
     /// Sends `GET /documents/:documentId/pending-invitations`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listPendingInvitations(documentId: String) async throws -> [PendingInvitationEntry] {
         try await refuseLocalOnlyDb3(documentId, "client.documents.listPendingInvitations")
         let response: ItemsEnvelope<PendingInvitationEntry> = try await transport.request(
@@ -700,6 +726,24 @@ public final class DocumentsAPI: @unchecked Sendable {
             path: "/documents/\(documentId)/pending-invitations"
         )
         return response.items
+    }
+
+    /// Revoke one pending invitation's grants on this document: the
+    /// `invitationId` that `listPendingInvitations(documentId:)` lists. The
+    /// invitation, its token and its grants on other resources stay, so the
+    /// invitee's signup still resolves those. Only the grant's grantor or an
+    /// app owner or admin may revoke it; a refusal is thrown as an
+    /// `HttpError` (403, 404 when the document has no unaccepted grant of the
+    /// invitation, 409 `ALREADY_RESOLVED`).
+    /// Sends `DELETE /documents/:documentId/pending-invitations/:invitationId`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public func revokePendingInvitation(documentId: String, invitationId: String) async throws -> PendingInvitationRevokeResult {
+        try await refuseLocalOnlyDb3(documentId, "client.documents.revokePendingInvitation")
+        return try await transport.request(
+            method: .delete,
+            path: "/documents/\(URLEncoding.encodeComponent(documentId))/pending-invitations/\(URLEncoding.encodeComponent(invitationId))"
+        )
     }
 
     /// Update document permissions for a user.
@@ -712,6 +756,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///
     /// Build `params` with the `.user(...)`, `.email(...)`, or `.batch(...)`
     /// factories on `UpdatePermissionsData`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func updatePermissions(documentId: String, params: UpdatePermissionsData) async throws -> PermissionUpdateResult {
         try await refuseLocalOnlyDb3(documentId, "client.documents.updatePermissions")
         return try await transport.request(
@@ -731,6 +777,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// - Parameters:
     ///   - documentId: The document to share via link.
     ///   - level: The shared level — `.reader` or `.readWrite`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func setLinkAccess(
         documentId: String,
@@ -758,6 +806,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Mirrors js-bao's `documents.getLinkAccess(id)`. No client-side
     /// root-document guard: the server answers root documents with a 403,
     /// matching js-bao, which does not pre-check either.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getLinkAccess(documentId: String) async throws -> LinkAccessResult {
         try await refuseLocalOnlyDb3(documentId, "client.documents.getLinkAccess")
         return try await transport.request(method: .get, path: "/documents/\(documentId)/link-access")
@@ -768,6 +818,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// `documents.clearLinkAccess(id)`.
     ///
     /// - Parameter documentId: The document to stop sharing via link.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func clearLinkAccess(documentId: String) async throws -> LinkAccessResult {
         try await refuseLocalOnlyDb3(documentId, "client.documents.clearLinkAccess")
@@ -790,6 +842,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// (`documentsApi.ts` `getRoot`). The server has no `/documents/root`
     /// alias — that path resolves as `GET /documents/:documentId` with the
     /// literal id `"root"` and fails (#2358).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getRoot() async throws -> DocumentInfo {
         guard let client else {
             throw JsBaoError(
@@ -811,6 +865,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Add a tag to a document. Returns the updated tag list (matches
     /// js-bao's `[String]` return). Falls back to an empty list if
     /// the server response is shaped differently.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func addTag(documentId: String, tag: String) async throws -> [String] {
         try await refuseLocalOnlyDb3(documentId, "client.documents.addTag")
         let response: TagListResponse? = try await transport.requestOptional(
@@ -822,6 +878,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// Remove a tag from a document. Returns the updated tag list.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func removeTag(documentId: String, tag: String) async throws -> [String] {
         try await refuseLocalOnlyDb3(documentId, "client.documents.removeTag")
         let encodedTag = URLEncoding.encodeComponent(tag)
@@ -835,6 +893,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     // MARK: - Create With Alias
 
     /// Create a document with an alias atomically.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func createWithAlias(options: CreateWithAliasOptions) async throws -> CreateWithAliasResult {
         // Match JS guards (documentsApi.ts:523-533): non-empty title + aliasKey.
         // (`scope` is a closed enum here, so the JS scope check is unrepresentable.)
@@ -856,6 +916,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     // MARK: - Group permissions
 
     /// Revoke a group's permission on a document, the group named by id.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func revokeGroupPermission(documentId: String, groupId: String) async throws -> SuccessResult {
         try await refuseLocalOnlyDb3(documentId, "client.documents.revokeGroupPermission")
         return try await transport.request(
@@ -866,6 +928,7 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// Revoke a group's permission on a document, the group named by type
     /// and id.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use revokeGroupPermission(documentId:groupId:). Removed by #4718.")
     public func revokeGroupPermission(
         documentId: String,
@@ -887,6 +950,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// permission grant on. Owners (and app admins) can approve/deny
     /// via `listAccessRequests` / `approveAccessRequest` /
     /// `denyAccessRequest`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func requestAccess(
         documentId: String,
         options: RequestAccessOptions
@@ -900,6 +965,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// List pending access requests for a document. Owner/admin only.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listAccessRequests(
         documentId: String
     ) async throws -> [DocumentAccessRequest] {
@@ -911,6 +978,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// Approve a pending access request. Owner/admin only.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func approveAccessRequest(
         documentId: String,
         requestId: String,
@@ -927,6 +996,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// Deny a pending access request. Owner/admin only.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func denyAccessRequest(
         documentId: String,
         requestId: String,
@@ -946,17 +1017,23 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Check whether a document is currently open locally. Does NOT
     /// hit the server. Requires the `documentManager` to be wired by
     /// `JsBaoClient.setupSubApis`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func isOpen(documentId: String) -> Bool {
         return documentManager?.isOpen(documentId) ?? false
     }
 
     /// Check whether a document has a pending local create that has
     /// not been committed to the server.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func isPendingCreate(documentId: String) -> Bool {
         return documentManager?.isPendingCreate(documentId) ?? false
     }
 
     /// Check whether a document has a local copy stored on this device.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func hasLocalCopy(documentId: String) -> Bool {
         return documentManager?.hasLocalCopy(documentId) ?? false
     }
@@ -964,12 +1041,16 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Check whether a document is read-only for the current user (i.e. the
     /// cached permission is `reader`). Local-only check. Mirrors js-bao's
     /// `documents.isReadOnly(documentId)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func isReadOnly(documentId: String) -> Bool {
         return documentManager?.getPermission(documentId) == .reader
     }
 
     /// List the IDs of all currently open documents. Local-only. Mirrors
     /// js-bao's `documents.listOpen()`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listOpen() -> [String] {
         return documentManager?.listOpenDocuments() ?? []
     }
@@ -977,6 +1058,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Check whether a document's local state is synced with the server.
     /// Synchronous local read — an alias of `inSync`. Mirrors js-bao's
     /// `documents.isSynced(documentId)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func isSynced(documentId: String) -> Bool {
         return documentManager?.isSynced(documentId) ?? false
     }
@@ -984,6 +1067,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// List all documents created locally but not yet committed to the
     /// server, as `{ documentId, title?, createdAt }` entries sourced from
     /// local metadata. Mirrors js-bao's async `documents.listPendingCreates()`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listPendingCreates() async -> [PendingCreateInfo] {
         guard let mgr = documentManager else { return [] }
         return mgr.listPendingCreates().map { id in
@@ -1000,6 +1085,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// the document has no uncommitted local create. Same entry shape as
     /// `listPendingCreates()` (`{ documentId, title?, createdAt }`),
     /// sourced from local metadata — no network (#1111).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getPendingCreate(documentId: String) async -> PendingCreateInfo? {
         guard let mgr = documentManager, mgr.isPendingCreate(documentId) else { return nil }
         let meta = mgr.getLocalMetadata(documentId)
@@ -1013,6 +1100,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Cancel a pending local document create. With `options.evictLocal`,
     /// the document's local data is also evicted after cancellation.
     /// Mirrors js-bao's `documents.cancelPendingCreate(documentId, { evictLocal })`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func cancelPendingCreate(
         documentId: String,
         options: CancelPendingCreateOptions = CancelPendingCreateOptions()
@@ -1035,6 +1124,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// the `reason` when the server refused it, and `reason: "not_pending"`
     /// when its create had already landed. A failure the client keeps
     /// retrying throws.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func commitOfflineCreate(
         documentId: String,
         options: CommitOfflineCreateOptions = CommitOfflineCreateOptions()
@@ -1060,6 +1151,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Get the current user's permission level for a document, as
     /// last observed by the local document manager. Returns `nil`
     /// when the document isn't open locally.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getDocumentPermission(documentId: String) -> DocumentPermission? {
         return documentManager?.getPermission(documentId)
     }
@@ -1068,6 +1161,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// metadata is stored. Declared `async` to match js-bao's async
     /// accessor (whose IndexedDB read is inherently asynchronous); the
     /// Swift read itself is a synchronous SQLite / in-memory lookup.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getLocalMetadata(documentId: String) async -> LocalMetadataEntry? {
         return documentManager?.getLocalMetadata(documentId)
     }
@@ -1075,6 +1170,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     // MARK: - Blob Context
 
     /// Get a blob context scoped to a specific document.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func blobs(documentId: String) -> DocumentBlobContext {
         return DocumentBlobContext(
             documentId: documentId,
@@ -1119,7 +1216,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// List tracked blob uploads, newest first. With `documentId == nil`
     /// (the default) returns uploads across **all** documents; pass a
     /// `documentId` to scope to one. Mirrors JS `documents.uploads(documentId?)`.
+    /// - Stability: production
     @available(*, unavailable, renamed: "uploadsAsync(documentId:)")
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func uploads(documentId: String? = nil) -> [BlobUploadStatus] {
         fatalError("unavailable — use uploadsAsync(documentId:)")
     }
@@ -1127,6 +1226,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// List tracked blob uploads, newest first. With `documentId == nil`
     /// (the default) returns uploads across **all** documents; pass a
     /// `documentId` to scope to one. Mirrors JS `documents.uploads(documentId?)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func uploadsAsync(documentId: String? = nil) async -> [BlobUploadStatus] {
         return await blobManager.listUploads(documentId: documentId)
     }
@@ -1136,7 +1237,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// the match. Returns `false` if no matching, pausable upload is
     /// tracked. Mirrors JS `documents.pauseUpload(documentId, blobId)`
     /// (Swift makes `documentId` optional for the cross-document form).
+    /// - Stability: production
     @available(*, unavailable, renamed: "pauseUploadAsync(blobId:documentId:)")
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func pauseUpload(blobId: String, documentId: String? = nil) -> Bool {
         fatalError("unavailable — use pauseUploadAsync(blobId:documentId:)")
@@ -1146,6 +1249,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// blob is matched across all documents; pass a `documentId` to scope
     /// the match. Returns `false` if no matching, pausable upload is
     /// tracked. Mirrors JS `documents.pauseUpload(documentId, blobId)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func pauseUploadAsync(blobId: String, documentId: String? = nil) async -> Bool {
         return await blobManager.pauseUpload(blobId, documentId: documentId)
@@ -1155,7 +1260,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// blob is matched across all documents; pass a `documentId` to scope
     /// the match. Returns `false` if no matching, paused upload is
     /// tracked. Mirrors JS `documents.resumeUpload(documentId, blobId)`.
+    /// - Stability: production
     @available(*, unavailable, renamed: "resumeUploadAsync(blobId:documentId:)")
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func resumeUpload(blobId: String, documentId: String? = nil) -> Bool {
         fatalError("unavailable — use resumeUploadAsync(blobId:documentId:)")
@@ -1165,6 +1272,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// blob is matched across all documents; pass a `documentId` to scope
     /// the match. Returns `false` if no matching, paused upload is
     /// tracked. Mirrors JS `documents.resumeUpload(documentId, blobId)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func resumeUploadAsync(blobId: String, documentId: String? = nil) async -> Bool {
         return await blobManager.resumeUpload(blobId, documentId: documentId)
@@ -1173,6 +1282,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Pause all in-progress uploads, returning once every matching upload is
     /// paused. With `documentId == nil` (the default) pauses uploads across
     /// **all** documents; pass a `documentId` to scope.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func pauseAllUploadsAsync(documentId: String? = nil) async {
         await blobManager.pauseAll(documentId: documentId)
     }
@@ -1180,12 +1291,16 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Resume all paused uploads, returning once every matching upload is back
     /// in the retry rotation. With `documentId == nil` (the default) resumes
     /// uploads across **all** documents; pass a `documentId` to scope.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func resumeAllUploadsAsync(documentId: String? = nil) async {
         await blobManager.resumeAll(documentId: documentId)
     }
 
     /// Set the maximum number of concurrent blob uploads (app-wide),
     /// returning once the setting is in effect.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func setUploadConcurrencyAsync(_ concurrency: Int) async {
         await blobManager.setUploadConcurrency(concurrency)
     }
@@ -1208,6 +1323,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///
     /// For `scope: .user`, `alias.userId` defaults to the current user
     /// when omitted.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getOrCreateWithAlias(
         options: GetOrCreateWithAliasOptions
     ) async throws -> GetOrCreateWithAliasResult {
@@ -1255,6 +1372,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Returns `{ doc, metadata }`, mirroring js-bao's `documents.open`
     /// (`documentsApi.ts`): the live `YDocument` plus the document's locally
     /// cached metadata at open time (`getLocalMetadata`, `nil` when none).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func open(
         _ documentId: String,
         options: OpenDocumentOptions = OpenDocumentOptions()
@@ -1274,6 +1393,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// `getRootDocId()`). Throws `notFound` if the app has no root.
     ///
     /// Returns `{ doc, metadata }` like `open`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func openRoot(
         options: OpenDocumentOptions = OpenDocumentOptions()
     ) async throws -> OpenDocumentResult {
@@ -1298,6 +1419,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// evicted if the server already has all of this client's writes —
     /// matching js-bao, which skips eviction (and reports `evicted: false`)
     /// when local writes are still outstanding (#961).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func close(
         _ documentId: String,
@@ -1315,6 +1438,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Resolve an alias and open the document it points at, in one call.
     /// Mirrors js-bao's `documents.openAlias(params, options?)`; returns
     /// `{ doc, metadata }` (as `open` does).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func openAlias(
         _ params: AliasRef,
         options: OpenDocumentOptions = OpenDocumentOptions()
@@ -1334,6 +1459,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Async WebSocket state-vector round-trip (`stateVectorCheck`),
     /// mirroring js-bao's `documents.includesWrites(documentId, timeoutMs?)`.
     /// Resolves `false` when offline or the check times out.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func includesWrites(documentId: String, timeout: TimeInterval = 5) async -> Bool {
         guard let client else { return false }
         return await client.checkStateVector(documentId: documentId, timeout: timeout).includesWrites
@@ -1345,6 +1472,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// `false` when offline or the check times out. (For a cheap
     /// synchronous read of the last-known local sync state, use
     /// `isSynced(documentId)`.)
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func inSync(documentId: String, timeout: TimeInterval = 5) async -> Bool {
         guard let client else { return false }
         return await client.checkStateVector(documentId: documentId, timeout: timeout).inSync
@@ -1360,6 +1489,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// `stateVectorCheck` round-trip's `includesWrites`, mirroring js-bao's
     /// `documents.waitForWriteConfirmation(documentId, timeoutMs?, pollMs?)` (ms on JS)
     /// — which resolves to a `boolean` rather than throwing on timeout.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func waitForWriteConfirmation(
         documentId: String,
         timeout: TimeInterval = 10,
@@ -1380,6 +1511,8 @@ public final class DocumentsAPI: @unchecked Sendable {
         return false
     }
 
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func waitForInSync(
         documentId: String,
         timeout: TimeInterval = 10,
@@ -1402,6 +1535,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// drained) throws unless `options.force` is set. A db3 that lives only
     /// on this device throws `.db3LocalOnly`, `force` or not: this copy is
     /// its only one, and `client.db3.delete` removes it.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func evict(
         documentId: String,
         options: EvictDocumentOptions = EvictDocumentOptions()
@@ -1436,6 +1571,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// skipped rather than dropped. A db3 that lives only on this device is
     /// kept in either form. The top-level client doesn't expose a
     /// dedicated `evictAll` — we walk the index here.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func evictAll(
         options: EvictAllDocumentsOptions = EvictAllDocumentsOptions()
     ) async {
@@ -1471,6 +1608,8 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
 
     /// Create or update a document alias. Naming a db3 that lives only on
     /// this device throws `.db3LocalOnly` before any request.
+    /// - Stability: production
+    @available(*, deprecated, message: "Bind a db3 with client.db3.aliases.set(_:). This keeps answering until a later removal project. (api-surface-stability)")
     public func set(_ params: SetAliasParams) async throws -> DocumentAliasInfo {
         try await refuseDocument(params.documentId)
         let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
@@ -1487,6 +1626,8 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
     }
 
     /// Resolve a document alias, returning nil if not found.
+    /// - Stability: production
+    @available(*, deprecated, message: "Resolve a db3 with client.db3.aliases.resolve(_:). This keeps answering until a later removal project. (api-surface-stability)")
     public func resolve(_ params: AliasRef) async throws -> DocumentAliasInfo? {
         let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
         var path = "/document-aliases/\(params.scope.rawValue)/\(encodedKey)"
@@ -1505,6 +1646,8 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
     }
 
     /// Delete a document alias.
+    /// - Stability: production
+    @available(*, deprecated, message: "Delete a db3's alias with client.db3.aliases.delete(_:). This keeps answering until a later removal project. (api-surface-stability)")
     public func delete(_ params: AliasRef) async throws {
         let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
         var path = "/document-aliases/\(params.scope.rawValue)/\(encodedKey)"
@@ -1527,6 +1670,8 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
     /// a server deployed before #1168's server-side filter can still
     /// return retained legacy `scope: "app"` rows, and one such row must
     /// not fail the whole response (the remaining user aliases are valid).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listForDocument(documentId: String) async throws -> [DocumentAliasInfo] {
         let entries: [FailableEntry<DocumentAliasInfo>] = try await transport.request(
             method: .get,
@@ -1586,6 +1731,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
     }
 
     /// Upload a blob to the document.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func upload(data: Data, options: BlobUploadSourceOptions = BlobUploadSourceOptions()) async throws -> BlobUploadResult {
         try await refuseIfLocalOnly()
         return try await blobManager.uploadFromSource(
@@ -1600,6 +1747,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// Returns a typed page (`items` + optional pagination `cursor`), mirroring
     /// JS `BlobListResult<BlobInfo>`. A bare-array response (no envelope) is
     /// normalized into a result with `cursor == nil`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func list(limit: Int? = nil, cursor: String? = nil) async throws -> DocumentBlobListResult {
         try await refuseIfLocalOnly()
         var query = URLQuery()
@@ -1618,6 +1767,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
     }
 
     /// Get metadata for a specific blob.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func get(blobId: String) async throws -> BlobInfo {
         try await refuseIfLocalOnly()
         return try await transport.request(method: .get, path: "/documents/\(documentId)/blobs/\(blobId)")
@@ -1629,6 +1780,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
     ///   - disposition: serve `inline` (display) or `attachment` (download).
     ///   - attachmentFilename: override the download filename (RFC 5987-encoded),
     ///     mirroring JS `BlobDownloadUrlParams.attachmentFilename`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func downloadUrl(
         blobId: String,
         disposition: BlobDisposition? = nil,
@@ -1648,6 +1801,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// `BlobManager` cache, matching JS `delete`: a delete issued mid-upload
     /// cancels the in-flight transfer, a later `read` won't serve the deleted
     /// blob stale from cache, and `queue-drained` fires once the queue empties.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func delete(blobId: String) async throws -> BlobDeleteResult {
         try await refuseIfLocalOnly()
         let result: BlobDeleteResult = try await transport.request(
@@ -1667,12 +1822,16 @@ public final class DocumentBlobContext: @unchecked Sendable {
     ///     `attachment`. Mirrors JS `BlobReadOptions.disposition`; threaded into
     ///     the cache key and download URL so an `inline` and an `attachment`
     ///     read don't collide in cache.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func read(blobId: String, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> Data {
         try await refuseIfLocalOnly()
         return try await blobManager.read(documentId: documentId, blobId: blobId, force: force, disposition: disposition)
     }
 
     /// Read a blob and decode it as a UTF-8 `String`. Mirrors JS `read(blobId, { as: "text" })`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func read(blobId: String, as type: String.Type, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> String {
         try await refuseIfLocalOnly()
         let data = try await blobManager.read(documentId: documentId, blobId: blobId, force: force, disposition: disposition)
@@ -1684,6 +1843,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
     /// Read a blob and JSON-decode it into a `Decodable` type. Built on the
     /// raw `read(blobId:)`; mirrors a typed JSON read over the JS `read` bytes.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func read<T: Decodable>(blobId: String, as type: T.Type, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> T {
         try await refuseIfLocalOnly()
         let data = try await blobManager.read(documentId: documentId, blobId: blobId, force: force, disposition: disposition)
@@ -1697,6 +1858,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// - Parameters:
     ///   - blobIds: the blobs to warm into the cache.
     ///   - concurrency: max concurrent downloads (defaults to 2, matching JS).
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func prefetch(blobIds: [String], concurrency: Int = 2) async {
         if await refusal() != nil { return }
         await blobManager.prefetch(
@@ -1712,6 +1875,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// upload can't complete. Mirrors JS `uploadFile`: it shares the upload
     /// path with `upload(data:)` but returns the narrowed `{ blobId, numBytes,
     /// bytesTransferred }` queue shape rather than the full result.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func uploadFile(data: Data, options: BlobUploadSourceOptions = BlobUploadSourceOptions()) async throws -> BlobUploadFileResult {
         try await refuseIfLocalOnly()
@@ -1736,7 +1901,9 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
     /// The current status of all tracked uploads for this document, newest
     /// first. Mirrors JS `uploads()` (scoped to this document's id).
+    /// - Stability: production
     @available(*, unavailable, renamed: "uploadsAsync()")
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func uploads() -> [BlobUploadStatus] {
         fatalError("unavailable — use uploadsAsync()")
     }
@@ -1745,13 +1912,17 @@ public final class DocumentBlobContext: @unchecked Sendable {
     /// first. Mirrors JS `uploads()` (scoped to this document's id). The
     /// queue verbs of this context reach its documents uploads only: a db3
     /// upload of the same id is `client.db3.blobs(_:)`'s.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func uploadsAsync() async -> [BlobUploadStatus] {
         return await blobManager.listUploads(documentId: documentId, family: .documents)
     }
 
     /// Pause an in-progress upload for this document by blob ID. Returns `false`
     /// if no matching, pausable upload is tracked. Mirrors JS `pauseUpload`.
+    /// - Stability: production
     @available(*, unavailable, renamed: "pauseUploadAsync(blobId:)")
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func pauseUpload(blobId: String) -> Bool {
         fatalError("unavailable — use pauseUploadAsync(blobId:)")
@@ -1759,6 +1930,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
     /// Pause an in-progress upload for this document by blob ID. Returns `false`
     /// if no matching, pausable upload is tracked. Mirrors JS `pauseUpload`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func pauseUploadAsync(blobId: String) async -> Bool {
         return await blobManager.pauseUpload(blobId, documentId: documentId, family: .documents)
@@ -1766,7 +1939,9 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
     /// Resume a paused upload for this document by blob ID. Returns `false` if
     /// no matching, paused upload is tracked. Mirrors JS `resumeUpload`.
+    /// - Stability: production
     @available(*, unavailable, renamed: "resumeUploadAsync(blobId:)")
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func resumeUpload(blobId: String) -> Bool {
         fatalError("unavailable — use resumeUploadAsync(blobId:)")
@@ -1774,6 +1949,8 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
     /// Resume a paused upload for this document by blob ID. Returns `false` if
     /// no matching, paused upload is tracked. Mirrors JS `resumeUpload`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func resumeUploadAsync(blobId: String) async -> Bool {
         return await blobManager.resumeUpload(blobId, documentId: documentId, family: .documents)
@@ -1781,12 +1958,16 @@ public final class DocumentBlobContext: @unchecked Sendable {
 
     /// Pause all in-progress uploads for this document, returning once they
     /// are paused. Mirrors JS `pauseAll`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func pauseAllAsync() async {
         await blobManager.pauseAll(documentId: documentId, family: .documents)
     }
 
     /// Resume all paused uploads for this document, returning once they are
     /// back in the retry rotation. Mirrors JS `resumeAll`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func resumeAllAsync() async {
         await blobManager.resumeAll(documentId: documentId, family: .documents)
     }

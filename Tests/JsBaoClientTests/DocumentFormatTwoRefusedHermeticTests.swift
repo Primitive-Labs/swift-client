@@ -126,6 +126,7 @@ final class DocumentFormatTwoRefusedHermeticTests: XCTestCase {
 
     // MARK: - Creates (behavior 28)
 
+    @available(*, deprecated)
     func testEveryCreateThatAsksForFormatTwoIsRefusedBeforeAnyRequest() async throws {
         let path = newDatabasePath()
         let remoteCreates = Counter()

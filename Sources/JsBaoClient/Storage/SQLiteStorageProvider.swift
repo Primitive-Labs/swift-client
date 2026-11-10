@@ -104,6 +104,11 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                     }
                     self.db = dbPointer
 
+                    // A device vector index's triggers convert its values with this function (#5230).
+                    guard RecordLogVectorFunction.register(on: dbPointer) == SQLITE_OK else {
+                        throw SQLiteStorageError.openFailed(message: "\(RecordLogVectorFunction.name) could not be registered: \(self.lastError())")
+                    }
+
                     // Enable WAL mode for better concurrent read performance.
                     try self.exec("PRAGMA journal_mode=WAL")
 
@@ -312,10 +317,45 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
             sqlite3_bind_text(stmt, 1, store, -1, Self.SQLITE_TRANSIENT)
 
             var result: [String] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
                 if let ptr = sqlite3_column_text(stmt, 0) {
                     result.append(String(cString: ptr))
                 }
+                rc = sqlite3_step(stmt)
+            }
+            // A scan that stops short of `SQLITE_DONE` read part of the
+            // rows; a `wipeLocal` decides what to delete from these lists,
+            // so a partial one has to fail rather than pass for complete.
+            guard rc == SQLITE_DONE else {
+                throw SQLiteStorageError.executionFailed(message: self.lastError())
+            }
+            return result
+        }
+    }
+
+    func storeNames(withPrefix prefix: String) async throws -> [String] {
+        try await onQueue {
+            try self.ensureReady()
+
+            let sql = "SELECT DISTINCT store FROM kv_store WHERE substr(store, 1, ?) = ?"
+            var stmt: OpaquePointer?
+            try self.prepare(sql, statement: &stmt)
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_int(stmt, 1, Int32(prefix.unicodeScalars.count))
+            sqlite3_bind_text(stmt, 2, prefix, -1, Self.SQLITE_TRANSIENT)
+
+            var result: [String] = []
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                if let ptr = sqlite3_column_text(stmt, 0) {
+                    result.append(String(cString: ptr))
+                }
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else {
+                throw SQLiteStorageError.executionFailed(message: self.lastError())
             }
             return result
         }
@@ -627,3 +667,5 @@ extension SQLiteStorageProvider: RecordLogGroupCommitHost {
         queue.asyncAfter(deadline: .now() + .milliseconds(milliseconds), execute: work)
     }
 }
+
+extension SQLiteStorageProvider: StoreNameListing {}

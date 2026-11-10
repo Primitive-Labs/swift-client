@@ -46,7 +46,7 @@ final class AgentSessionDecodeParityLiveTests: XCTestCase {
         try await h.poll(timeout: 60, "the corpus syncs with its coverage") {
             rows = try sessions.flatMap { sessionId in
                 try AgentSessionModels.modelNames.flatMap { model in
-                    try client.documents.records(sessionId).query(model, nil, options: QueryOptions(limit: 10_000)).data
+                    try client.db3.records(sessionId).query(model, nil, options: QueryOptions(limit: 10_000)).data
                         .map { (model: model, row: $0.raw) }
                 }
             }

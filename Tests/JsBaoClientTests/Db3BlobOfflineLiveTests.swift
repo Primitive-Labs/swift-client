@@ -115,6 +115,7 @@ final class Db3BlobOfflineLiveTests: XCTestCase {
 
     /// The documents family keeps its own offline behavior: its upload is
     /// not gated on the network mode, and it lands now as it did before.
+    @available(*, deprecated)
     func testTheDocumentsFamilyOfflineUploadIsUnchanged() async throws {
         let owner = try await live.client("owner", models: [])
         let plain = try await ctx.createDocument(appId: live.app.appId, jwt: live.app.ownerJWT, title: "format-1")
@@ -129,6 +130,7 @@ final class Db3BlobOfflineLiveTests: XCTestCase {
 
     // MARK: - Behavior 14, E7 and E8
 
+    @available(*, deprecated)
     func testTheDb3FamilysLocalCopiesAreItsOwn() async throws {
         let owner = try await live.client("owner", models: [])
         let other = try await live.client("owner-other", models: [])

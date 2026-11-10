@@ -16,6 +16,7 @@ import XCTest
 /// - Behavior 15: abort ends an uploading session and a second abort is
 ///   refused; `get` decodes a completed session's record-log fields.
 /// - E8: a session id carrying `/` and `?` addresses that id and nothing else.
+@available(*, deprecated)
 final class DocumentIngestsLiveTests: XCTestCase {
 
     private var ctx: TestContext!

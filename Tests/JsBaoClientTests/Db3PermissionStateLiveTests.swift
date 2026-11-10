@@ -79,6 +79,7 @@ final class Db3PermissionStateLiveTests: XCTestCase {
         handle.dispose()
     }
 
+    @available(*, deprecated)
     func testAFormat1DocumentsPermissionEmitsNoDb3State() async throws {
         let plain = try await ctx.createDocument(appId: live.app.appId, jwt: live.app.ownerJWT, title: "format-1")
         let bob = try await ctx.createTestUser(appId: live.app.appId)

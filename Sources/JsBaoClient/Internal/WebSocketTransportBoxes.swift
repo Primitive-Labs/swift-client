@@ -34,10 +34,13 @@ import Foundation
 /// - It stores the `URLSessionWebSocketTask` **reference**, not a cached
 ///   `Bool`, so `socketIsOpen` keeps reading the socket's live `state`.
 ///   `URLSessionWebSocketTask.state` is documented as readable from any thread.
+/// - `opened` belongs to the task it was set for: replacing the task clears it
+///   in the same hold, so it can never describe a socket that is gone.
 final class WebSocketTransportSnapshot: @unchecked Sendable {
     private let lock = NSLock()
     private var _connected = false
     private var _connecting = false
+    private var _opened = false
     private var _task: URLSessionWebSocketTask?
     private var _sentForTest: (@Sendable (String) -> Void)?
 
@@ -53,7 +56,21 @@ final class WebSocketTransportSnapshot: @unchecked Sendable {
 
     var task: URLSessionWebSocketTask? {
         get { lock.withLock { _task } }
-        set { lock.withLock { _task = newValue } }
+        set {
+            lock.withLock {
+                if _task !== newValue { _opened = false }
+                _task = newValue
+            }
+        }
+    }
+
+    /// The current task's socket has opened (`didOpenWithProtocol`). Before
+    /// the server's `ready` (#5578) it is open without being connected.
+    var opened: Bool { lock.withLock { _opened } }
+
+    /// Record the current task's open.
+    func markOpened() {
+        lock.withLock { _opened = _task != nil }
     }
 
     /// The transport state as one value, read under a single lock hold so
@@ -79,6 +96,19 @@ final class WebSocketTransportSnapshot: @unchecked Sendable {
     /// the actor's executor, so concurrent sends stay concurrent.
     var sendableTask: URLSessionWebSocketTask? {
         lock.withLock { _connected ? _task : nil }
+    }
+
+    /// Whether the socket is open, connected or still waiting for the server's
+    /// `ready` (#5578): the live `state`, like `socketIsOpen`, but not gated on
+    /// `connected`. What decides that an applied token goes to the socket
+    /// rather than to the next handshake.
+    var transportIsOpen: Bool {
+        lock.withLock { _task != nil && _task?.state == .running && _opened }
+    }
+
+    /// The task to send on once its socket has opened, before `ready` too.
+    var openTask: URLSessionWebSocketTask? {
+        lock.withLock { _opened ? _task : nil }
     }
 
     /// Writes both flags in one hold — see the safety argument above.

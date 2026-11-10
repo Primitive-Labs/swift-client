@@ -590,7 +590,26 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     }
 
     /// How the model API answers a db3's record.
-    private var viewShape: RecordLogViewReader.RowShape { .model(setFields: stringsetFieldNames) }
+    /// Each record-log member's vector fields read as their numbers (#5225),
+    /// an included record's as its own model's in the same db3.
+    private func viewShape(_ include: [Include]? = nil) -> RecordLogViewReader.RowShape {
+        let models = RecordLogViewReader.models(schema.name, include)
+        var decoders: [String: (RecordLogDocumentBinding, [String: [String: VectorEncoding]])] = [:]
+        for (docId, model) in localMembers() {
+            guard let delegate = model.local as? RecordLogModelDelegate else { continue }
+            var encodings: [String: [String: VectorEncoding]] = [:]
+            for name in models {
+                let fields = delegate.binding.vectorEncodings(model: name)
+                if !fields.isEmpty { encodings[name] = fields }
+            }
+            if !encodings.isEmpty { decoders[docId] = (delegate.binding, encodings) }
+        }
+        guard !decoders.isEmpty else { return .model(setFields: stringsetFieldNames) }
+        return .model(setFields: stringsetFieldNames, decode: { model, row, document in
+            guard let (binding, encodings) = decoders[document], let fields = encodings[model] else { return row }
+            return binding.decodedVectors(row, model: model, encodings: fields)
+        })
+    }
 
     /// The refusal a filtered read gives when this model's members are in
     /// documents whose local stores differ: their rows are read by different engines.
@@ -638,7 +657,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         options: QueryOptions? = nil
     ) throws -> [[String: JSONValue]] {
         if let reader = try localRoute(options) {
-            return try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape).rows
+            return try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape()).rows
         }
         drainAllObservers()
         return try engine.query(
@@ -652,15 +671,16 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     }
 
     /// Count variant that accepts `QueryOptions` — used when callers
-    /// want the `documents` scoping shortcut (or future options) on a
-    /// count call. `sort`/`limit`/`cursor` on the options are ignored
-    /// since they don't apply to a count.
+    /// want the `documents` scoping shortcut (or `maxDrift`, refused
+    /// `DB3_DRIFT_EXCEEDED` as a page is) on a count call.
+    /// `sort`/`limit`/`cursor` on the options are ignored since they don't
+    /// apply to a count.
     public func count(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions?
     ) throws -> Int {
         if let reader = try localRoute(options) {
-            return try reader.count(schema.name, filter ?? [:])
+            return try reader.count(schema.name, filter ?? [:], maxDrift: options?.maxDrift, options: options)
         }
         drainAllObservers()
         return try engine.count(
@@ -819,7 +839,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         // reader resolves the includes too, each parent's legs within its own
         // db3 by its own statements; format 1 keeps the resolver it had.
         if let reader = try localRoute(options) {
-            return try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape, include: include).rows
+            return try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape(include), include: include).rows
         }
         drainAllObservers()
         var rows = try engine.query(
@@ -844,7 +864,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         // page of the ordinary documents only, and its cursor would walk them
         // alone.
         if let reader = try localRoute(options) {
-            return RecordLogViewReader.paged(try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape))
+            return RecordLogViewReader.paged(try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape()))
         }
         drainAllObservers()
         return try engine.queryPaged(
@@ -862,7 +882,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     ) throws -> PagedQueryResult<PrimitiveRow> {
         if let reader = try localRoute(options) {
             return RecordLogViewReader.paged(
-                try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape, include: include)
+                try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape(include), include: include)
             )
         }
         drainAllObservers()
@@ -914,6 +934,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         case let .date(s):      return .string(s)
         case let .stringset(s): return .array(Array(s).map { .string($0) })
         case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
+        case let .vector(v):    return .array(v.map { .number(Double($0)) })
         }
     }
 }

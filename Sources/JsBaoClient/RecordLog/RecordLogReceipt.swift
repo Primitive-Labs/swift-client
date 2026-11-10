@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // The vocabulary of a receipt of chunks: a bulk load's or a checkpoint
@@ -25,6 +26,11 @@ struct RecordLogReceipt: Equatable, Sendable {
     var kind: RecordLogReceiptKind
     /// The load's session id, or the segment's id.
     var id: String
+    /// As the marks show a receipt that can be continued (it recorded its
+    /// chunk list's fingerprint): how many chunks it has done, and whether it
+    /// completed them. `nil` otherwise.
+    var done: Int? = nil
+    var completed: Bool? = nil
 }
 
 /// One receipt of chunks begun in a store and not completed, with the store's
@@ -36,6 +42,58 @@ struct RecordLogReceiptAttempt: Equatable, Sendable {
     var attempt: String
     /// The store's change count when the attempt last changed a row.
     var last: Int
+    /// The fingerprint of the chunk list it receives; `nil` on an attempt an
+    /// earlier build wrote, which is never resumed.
+    var fingerprint: String? = nil
+    /// How many chunks of the list, in list order, it applied or kept.
+    var done: Int? = nil
+    /// A load's completion (the refresh's removal) ran, or a segment's corrections applied.
+    var completed: Bool = false
+    /// The generation its rows are written under; its progress counts only while that generation holds them.
+    var generation: Int? = nil
+    /// The earlier ids this attempt took over: a command naming one is refused.
+    var replaced: [String]? = nil
+
+    /// The attempt as the JS store keeps it in `record_log_state.receipt`.
+    var json: JSONValue {
+        var object: [String: JSONValue] = [
+            "kind": .string(kind.rawValue), "id": .string(id), "attempt": .string(attempt), "last": .number(Double(last)),
+        ]
+        if let fingerprint { object["fingerprint"] = .string(fingerprint) }
+        if let done { object["done"] = .number(Double(done)) }
+        if completed { object["completed"] = .bool(true) }
+        if let generation { object["generation"] = .number(Double(generation)) }
+        if let replaced { object["replaced"] = .array(replaced.map(JSONValue.string)) }
+        return .object(object)
+    }
+}
+
+/// A receipt attempt taken over (``RecordLogRules/resumeReceipt(_:fingerprint:chunks:)``):
+/// its new id and how far it got.
+struct RecordLogReceiptResume: Equatable, Sendable {
+    /// The new id; the old one is refused from now.
+    var attempt: String
+    /// The chunks of the list it applied or kept, in list order.
+    var done: Int
+    /// The chunks and the load's completion or the segment's corrections are done.
+    var completed: Bool
+    /// The generation its rows are written under.
+    var generation: Int
+}
+
+/// What a store answers when a receipt begins: the attempt's id, and how far
+/// it already got when it was resumed (the JS store's `RecordLogReceiptStart`).
+struct RecordLogReceiptStart: Equatable, Sendable {
+    var cursor: Int
+    var attempt: String
+    /// The chunks of the list already applied or kept, in list order: 0 for a fresh attempt.
+    var done: Int = 0
+    /// Only the remainder pages are left.
+    var completed: Bool = false
+    /// For a resumed segment, the replacement generation it continues under.
+    var generation: Int? = nil
+    /// For a resumed segment, the segment the rows were last replaced from, read in the same transaction.
+    var held: RecordLogHeldSegment? = nil
 }
 
 /// The receipts of chunks a store has begun and not completed, persisted with
@@ -55,12 +113,7 @@ struct RecordLogReceiptState: Equatable, Sendable {
         .object([
             "n": .number(Double(n)),
             "since": since.map { .number(Double($0)) } ?? .null,
-            "attempts": .array(attempts.map { attempt in
-                .object([
-                    "kind": .string(attempt.kind.rawValue), "id": .string(attempt.id),
-                    "attempt": .string(attempt.attempt), "last": .number(Double(attempt.last)),
-                ])
-            }),
+            "attempts": .array(attempts.map(\.json)),
         ])
     }
 
@@ -83,7 +136,10 @@ struct RecordLogReceiptState: Equatable, Sendable {
                           let id = item["id"]?.stringValue
                     else { return nil }
                     return RecordLogReceiptAttempt(
-                        kind: kind, id: id, attempt: item["attempt"]?.stringValue ?? "", last: item["last"]?.wholeNumber ?? 0
+                        kind: kind, id: id, attempt: item["attempt"]?.stringValue ?? "", last: item["last"]?.wholeNumber ?? 0,
+                        fingerprint: item["fingerprint"]?.stringValue, done: item["done"]?.wholeNumber,
+                        completed: item["completed"]?.boolValue == true, generation: item["generation"]?.wholeNumber,
+                        replaced: item["replaced"]?.arrayValue?.compactMap(\.stringValue)
                     )
                 }
             )
@@ -95,9 +151,19 @@ struct RecordLogReceiptState: Equatable, Sendable {
         self.init(attempts: [RecordLogReceiptAttempt(kind: kind, id: id, attempt: "", last: 0)])
     }
 
-    /// The latest attempt begun and not completed, as the marks show it.
+    /// The latest attempt begun and not completed.
     var latest: RecordLogReceipt? {
         attempts.last.map { RecordLogReceipt(kind: $0.kind, id: $0.id) }
+    }
+
+    /// The latest attempt begun and not completed, as the marks show it: with
+    /// its progress when it can be continued.
+    var latestMark: RecordLogReceipt? {
+        attempts.last.map { a in
+            a.fingerprint == nil
+                ? RecordLogReceipt(kind: a.kind, id: a.id)
+                : RecordLogReceipt(kind: a.kind, id: a.id, done: a.done ?? 0, completed: a.completed)
+        }
     }
 }
 
@@ -355,4 +421,45 @@ func recordLogLoadManifest(_ data: Data, pointer: RecordLogLoadPointer) throws -
         }
         return chunk
     }
+}
+
+// MARK: - Fingerprint
+
+/// The chunk list a receipt receives: a load's manifest chunks, or a
+/// segment's chunks and corrections.
+enum RecordLogFingerprintInput: Sendable {
+    case load([RecordLogChunkDescriptor])
+    case segment(segmentId: String, chunks: [RecordLogChunkDescriptor], corrections: RecordLogCorrectionsDescriptor)
+}
+
+/// The canonical text a fingerprint digests, as js-bao's
+/// `recordLogReceiptFingerprintText` writes it: `load` or `segment`, then one
+/// line per chunk in list order with every field its reader checks or the
+/// held segment keeps, joined by tabs (a segment's lines lead with the chunk's
+/// object), then for a segment a line of its corrections.
+func recordLogReceiptFingerprintText(_ input: RecordLogFingerprintInput) -> String {
+    switch input {
+    case let .load(chunks):
+        let lines = chunks.map { c in
+            [c.model, c.path, String(c.rows), String(c.bytes), String(c.rawBytes), c.sha256, c.firstId, c.lastId].joined(separator: "\t")
+        }
+        return "load\n" + lines.joined(separator: "\n")
+    case let .segment(segmentId, chunks, k):
+        let lines = chunks.map { c in
+            [
+                recordLogSegmentChunkObject(segmentId: segmentId, model: c.model, index: c.index, source: c.source), c.model,
+                String(c.index), c.path, String(c.rows), String(c.bytes), String(c.rawBytes), c.sha256, c.firstId, c.lastId,
+            ].joined(separator: "\t")
+        }
+        let corrections = [k.path, String(k.rows), String(k.bytes), String(k.rawBytes), k.sha256].joined(separator: "\t")
+        return "segment\n" + lines.joined(separator: "\n") + "\n" + corrections
+    }
+}
+
+/// The lowercase hex SHA-256 of ``recordLogReceiptFingerprintText(_:)``: two
+/// lists that differ in any field of any chunk, in their order, or in the
+/// corrections have different fingerprints. The JS client answers the same
+/// hex for the same list.
+func recordLogReceiptFingerprint(_ input: RecordLogFingerprintInput) -> String {
+    SHA256.hash(data: Data(recordLogReceiptFingerprintText(input).utf8)).map { String(format: "%02x", $0) }.joined()
 }

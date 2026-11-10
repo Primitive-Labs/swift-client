@@ -183,6 +183,7 @@ final class AnalyticsAutoEventsTests: XCTestCase {
     /// blobUploads.success auto-event: a real blob upload through the live
     /// server emits `blob_upload_succeeded` (feature `blobs`) exactly once —
     /// and is suppressed when `blobUploadsSuccess` is gated off.
+    @available(*, deprecated)
     func testBlobUploadSuccessAutoEventAndGate() async throws {
         let docId = try await ctx.createDocument(
             appId: testApp.appId, jwt: testApp.ownerJWT, title: "Analytics Blob Doc"

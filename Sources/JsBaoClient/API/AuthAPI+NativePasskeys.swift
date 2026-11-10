@@ -61,6 +61,7 @@ extension AuthAPI {
     ///   (or no local passkey exists under
     ///   `preferImmediatelyAvailableCredentials`); `HttpError` for
     ///   server-side verification failures.
+    /// - Stability: production
     public func signInWithPasskey(
         presentationAnchor: ASPresentationAnchor? = nil,
         preferImmediatelyAvailableCredentials: Bool = false,
@@ -119,6 +120,7 @@ extension AuthAPI {
     ///     `AuthConfig.passkeyRpId` (#3024).
     /// - Throws: `PasskeyError.canceled` when the user dismisses the sheet;
     ///   `HttpError` for server-side verification failures.
+    /// - Stability: production
     @discardableResult
     public func registerPasskey(
         deviceName: String? = nil,

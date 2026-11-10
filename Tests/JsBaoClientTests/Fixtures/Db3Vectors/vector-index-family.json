@@ -1,0 +1,172 @@
+{
+  "source": "js-bao record-log-client/vectorIndex.ts and query/nearSearch.ts (#5229), written by tests/unit/workflows/db3-vector-family-fixture-5230.test.ts",
+  "targets": [
+    {
+      "docId": "01JD5230VECT0RFAM1LY000000AA",
+      "model": "Note",
+      "field": "embedding",
+      "element": "f32",
+      "dims": 8,
+      "table": "idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding",
+      "annTable": "idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann",
+      "ddl": "CREATE VIRTUAL TABLE \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" USING vec1",
+      "annDdl": "CREATE VIRTUAL TABLE \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann\" USING vec1",
+      "flatRebuild": {
+        "cos": "{index:\"flat\",distance:\"cos\"}",
+        "l2": "{index:\"flat\",distance:\"l2\"}"
+      },
+      "triggers": [
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding__i\" AFTER INSERT ON record_log_view WHEN NEW.doc_id = '01JD5230VECT0RFAM1LY000000AA' AND NEW._type = 'Note'\nBEGIN\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.embedding'), 'f32', 8) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding__u\" AFTER UPDATE OF _data ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000AA' AND OLD._type = 'Note' AND json_extract(OLD._data, '$.embedding') IS NOT json_extract(NEW._data, '$.embedding')\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.embedding'), 'f32', 8) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding__d\" AFTER DELETE ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000AA' AND OLD._type = 'Note'\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" WHERE rowid = OLD.rowid;\nEND"
+      ],
+      "triggersWithAnn": [
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding__i\" AFTER INSERT ON record_log_view WHEN NEW.doc_id = '01JD5230VECT0RFAM1LY000000AA' AND NEW._type = 'Note'\nBEGIN\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.embedding'), 'f32', 8) AS v LIMIT -1) WHERE v IS NOT NULL;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.embedding'), 'f32', 8) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding__u\" AFTER UPDATE OF _data ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000AA' AND OLD._type = 'Note' AND json_extract(OLD._data, '$.embedding') IS NOT json_extract(NEW._data, '$.embedding')\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.embedding'), 'f32', 8) AS v LIMIT -1) WHERE v IS NOT NULL;\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.embedding'), 'f32', 8) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding__d\" AFTER DELETE ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000AA' AND OLD._type = 'Note'\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\" WHERE rowid = OLD.rowid;\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann\" WHERE rowid = OLD.rowid;\nEND"
+      ],
+      "fill": "SELECT rowid, v FROM (SELECT rowid, record_log_vec_f32(json_extract(_data, '$.embedding'), 'f32', 8) AS v FROM record_log_view WHERE doc_id = ? AND _type = ? LIMIT -1) WHERE v IS NOT NULL"
+    },
+    {
+      "docId": "01JD5230VECT0RFAM1LY000000BB",
+      "model": "Photo",
+      "field": "Clip",
+      "element": "i8",
+      "dims": 3,
+      "table": "idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip",
+      "annTable": "idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip_ann",
+      "ddl": "CREATE VIRTUAL TABLE \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" USING vec1",
+      "annDdl": "CREATE VIRTUAL TABLE \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip_ann\" USING vec1",
+      "flatRebuild": {
+        "cos": "{index:\"flat\",distance:\"cos\"}",
+        "l2": "{index:\"flat\",distance:\"l2\"}"
+      },
+      "triggers": [
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip__i\" AFTER INSERT ON record_log_view WHEN NEW.doc_id = '01JD5230VECT0RFAM1LY000000BB' AND NEW._type = 'Photo'\nBEGIN\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.Clip'), 'i8', 3) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip__u\" AFTER UPDATE OF _data ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000BB' AND OLD._type = 'Photo' AND json_extract(OLD._data, '$.Clip') IS NOT json_extract(NEW._data, '$.Clip')\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.Clip'), 'i8', 3) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip__d\" AFTER DELETE ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000BB' AND OLD._type = 'Photo'\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" WHERE rowid = OLD.rowid;\nEND"
+      ],
+      "triggersWithAnn": [
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip__i\" AFTER INSERT ON record_log_view WHEN NEW.doc_id = '01JD5230VECT0RFAM1LY000000BB' AND NEW._type = 'Photo'\nBEGIN\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.Clip'), 'i8', 3) AS v LIMIT -1) WHERE v IS NOT NULL;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip_ann\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.Clip'), 'i8', 3) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip__u\" AFTER UPDATE OF _data ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000BB' AND OLD._type = 'Photo' AND json_extract(OLD._data, '$.Clip') IS NOT json_extract(NEW._data, '$.Clip')\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.Clip'), 'i8', 3) AS v LIMIT -1) WHERE v IS NOT NULL;\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip_ann\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip_ann\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.Clip'), 'i8', 3) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip__d\" AFTER DELETE ON record_log_view WHEN OLD.doc_id = '01JD5230VECT0RFAM1LY000000BB' AND OLD._type = 'Photo'\nBEGIN\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip\" WHERE rowid = OLD.rowid;\n  DELETE FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000bb_5_photo_4_clip_ann\" WHERE rowid = OLD.rowid;\nEND"
+      ],
+      "fill": "SELECT rowid, v FROM (SELECT rowid, record_log_vec_f32(json_extract(_data, '$.Clip'), 'i8', 3) AS v FROM record_log_view WHERE doc_id = ? AND _type = ? LIMIT -1) WHERE v IS NOT NULL"
+    },
+    {
+      "docId": "doc'quoted",
+      "model": "Track",
+      "field": "sound_print",
+      "element": "f16",
+      "dims": 768,
+      "table": "idx_record_log_vec_10_doc'quoted_5_track_11_sound_print",
+      "annTable": "idx_record_log_vec_10_doc'quoted_5_track_11_sound_print_ann",
+      "ddl": "CREATE VIRTUAL TABLE \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" USING vec1",
+      "annDdl": "CREATE VIRTUAL TABLE \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print_ann\" USING vec1",
+      "flatRebuild": {
+        "cos": "{index:\"flat\",distance:\"cos\"}",
+        "l2": "{index:\"flat\",distance:\"l2\"}"
+      },
+      "triggers": [
+        "CREATE TRIGGER \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print__i\" AFTER INSERT ON record_log_view WHEN NEW.doc_id = 'doc''quoted' AND NEW._type = 'Track'\nBEGIN\n  INSERT INTO \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.sound_print'), 'f16', 768) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print__u\" AFTER UPDATE OF _data ON record_log_view WHEN OLD.doc_id = 'doc''quoted' AND OLD._type = 'Track' AND json_extract(OLD._data, '$.sound_print') IS NOT json_extract(NEW._data, '$.sound_print')\nBEGIN\n  DELETE FROM \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.sound_print'), 'f16', 768) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print__d\" AFTER DELETE ON record_log_view WHEN OLD.doc_id = 'doc''quoted' AND OLD._type = 'Track'\nBEGIN\n  DELETE FROM \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" WHERE rowid = OLD.rowid;\nEND"
+      ],
+      "triggersWithAnn": [
+        "CREATE TRIGGER \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print__i\" AFTER INSERT ON record_log_view WHEN NEW.doc_id = 'doc''quoted' AND NEW._type = 'Track'\nBEGIN\n  INSERT INTO \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.sound_print'), 'f16', 768) AS v LIMIT -1) WHERE v IS NOT NULL;\n  INSERT INTO \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print_ann\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.sound_print'), 'f16', 768) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print__u\" AFTER UPDATE OF _data ON record_log_view WHEN OLD.doc_id = 'doc''quoted' AND OLD._type = 'Track' AND json_extract(OLD._data, '$.sound_print') IS NOT json_extract(NEW._data, '$.sound_print')\nBEGIN\n  DELETE FROM \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.sound_print'), 'f16', 768) AS v LIMIT -1) WHERE v IS NOT NULL;\n  DELETE FROM \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print_ann\" WHERE rowid = OLD.rowid;\n  INSERT INTO \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print_ann\" (rowid, vector) SELECT NEW.rowid, v FROM (SELECT record_log_vec_f32(json_extract(NEW._data, '$.sound_print'), 'f16', 768) AS v LIMIT -1) WHERE v IS NOT NULL;\nEND",
+        "CREATE TRIGGER \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print__d\" AFTER DELETE ON record_log_view WHEN OLD.doc_id = 'doc''quoted' AND OLD._type = 'Track'\nBEGIN\n  DELETE FROM \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print\" WHERE rowid = OLD.rowid;\n  DELETE FROM \"idx_record_log_vec_10_doc'quoted_5_track_11_sound_print_ann\" WHERE rowid = OLD.rowid;\nEND"
+      ],
+      "fill": "SELECT rowid, v FROM (SELECT rowid, record_log_vec_f32(json_extract(_data, '$.sound_print'), 'f16', 768) AS v FROM record_log_view WHERE doc_id = ? AND _type = ? LIMIT -1) WHERE v IS NOT NULL"
+    }
+  ],
+  "tieWindow": [
+    {
+      "k": 1,
+      "window": 65
+    },
+    {
+      "k": 3,
+      "window": 67
+    },
+    {
+      "k": 10,
+      "window": 74
+    },
+    {
+      "k": 64,
+      "window": 128
+    },
+    {
+      "k": 100,
+      "window": 200
+    },
+    {
+      "k": 10000,
+      "window": 20000
+    }
+  ],
+  "near": [
+    {
+      "annTable": null,
+      "distance": "cos",
+      "k": 10,
+      "filterSql": "",
+      "filterParams": [],
+      "sql": "WITH _near_window AS MATERIALIZED (SELECT n.rowid AS rowid, n.distance AS _distance, record_log_view._id AS _near_id FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\"(?, ?) AS n CROSS JOIN record_log_view ON record_log_view.rowid = n.rowid LIMIT 74) SELECT rowid, _distance FROM (SELECT * FROM _near_window WHERE NOT ((SELECT COUNT(*) FROM _near_window) = 74 AND (SELECT MAX(_distance) FROM _near_window) <= (SELECT _distance FROM _near_window ORDER BY _distance LIMIT 1 OFFSET 9)) UNION ALL SELECT t.rowid AS rowid, t.distance AS _distance, record_log_view._id AS _near_id FROM (SELECT 1 WHERE ((SELECT COUNT(*) FROM _near_window) = 74 AND (SELECT MAX(_distance) FROM _near_window) <= (SELECT _distance FROM _near_window ORDER BY _distance LIMIT 1 OFFSET 9))) AS _near_tied CROSS JOIN \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\"(?, ?) AS t CROSS JOIN record_log_view ON record_log_view.rowid = t.rowid WHERE t.distance <= (SELECT _distance FROM _near_window ORDER BY _distance LIMIT 1 OFFSET 9)) ORDER BY _distance, _near_id LIMIT 10",
+      "params": [
+        "vector",
+        "{K:74}",
+        "vector",
+        "{K:74, streaming:1}"
+      ]
+    },
+    {
+      "annTable": null,
+      "distance": "l2",
+      "k": 3,
+      "filterSql": "(json_extract(record_log_view._data, '$.n') > ?)",
+      "filterParams": [
+        5
+      ],
+      "sql": "WITH _near_window AS MATERIALIZED (SELECT n.rowid AS rowid, n.distance AS _distance, record_log_view._id AS _near_id FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\"(?, ?) AS n CROSS JOIN record_log_view ON record_log_view.rowid = n.rowid WHERE (json_extract(record_log_view._data, '$.n') > ?) LIMIT 67) SELECT rowid, _distance FROM (SELECT * FROM _near_window WHERE NOT ((SELECT COUNT(*) FROM _near_window) = 67 AND (SELECT MAX(_distance) FROM _near_window) <= (SELECT _distance FROM _near_window ORDER BY _distance LIMIT 1 OFFSET 2)) UNION ALL SELECT t.rowid AS rowid, t.distance AS _distance, record_log_view._id AS _near_id FROM (SELECT 1 WHERE ((SELECT COUNT(*) FROM _near_window) = 67 AND (SELECT MAX(_distance) FROM _near_window) <= (SELECT _distance FROM _near_window ORDER BY _distance LIMIT 1 OFFSET 2))) AS _near_tied CROSS JOIN \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding\"(?, ?) AS t CROSS JOIN record_log_view ON record_log_view.rowid = t.rowid WHERE (json_extract(record_log_view._data, '$.n') > ?) AND t.distance <= (SELECT _distance FROM _near_window ORDER BY _distance LIMIT 1 OFFSET 2)) ORDER BY _distance, _near_id LIMIT 3",
+      "params": [
+        "vector",
+        "{K:67, streaming:1}",
+        5,
+        "vector",
+        "{K:67, streaming:1}",
+        5
+      ]
+    },
+    {
+      "annTable": "idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann",
+      "distance": "cos",
+      "k": 10,
+      "filterSql": "",
+      "filterParams": [],
+      "sql": "SELECT rowid, _distance FROM (SELECT a.rowid AS rowid, vec1_cos_distance(a.vector, ?) AS _distance, record_log_view._id AS _near_id FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann\"(?, ?) AS a CROSS JOIN record_log_view ON record_log_view.rowid = a.rowid LIMIT 200) ORDER BY _distance, _near_id LIMIT 10",
+      "params": [
+        "vector",
+        "vector",
+        "{K:200, nprobe:0.1}"
+      ]
+    },
+    {
+      "annTable": "idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann",
+      "distance": "l2",
+      "k": 25,
+      "filterSql": "(json_extract(record_log_view._data, '$.n') > ?)",
+      "filterParams": [
+        5
+      ],
+      "sql": "SELECT rowid, _distance FROM (SELECT a.rowid AS rowid, vec1_l2_distance(a.vector, ?) AS _distance, record_log_view._id AS _near_id FROM \"idx_record_log_vec_28_01jd5230vect0rfam1ly000000aa_4_note_9_embedding_ann\"(?, ?) AS a CROSS JOIN record_log_view ON record_log_view.rowid = a.rowid WHERE (json_extract(record_log_view._data, '$.n') > ?) LIMIT 500) ORDER BY _distance, _near_id LIMIT 25",
+      "params": [
+        "vector",
+        "vector",
+        "{K:500, nprobe:0.1, streaming:1}",
+        5
+      ]
+    }
+  ]
+}

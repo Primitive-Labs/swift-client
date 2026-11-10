@@ -193,6 +193,7 @@ final class AvailabilityHermeticTests: XCTestCase {
     /// Behavior 7 — the sub-API twin callers reach through
     /// `client.documents.open(...)` forwards the same typed errors; no
     /// wrapper turns a failed open back into a document.
+    @available(*, deprecated)
     func testDocumentsOpenTwinPropagatesTheTypedError() async throws {
         let client = makeClient()
         let docId = newDocId("twin-surface")

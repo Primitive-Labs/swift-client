@@ -22,6 +22,13 @@ let package = Package(
             name: "JsBaoClient",
             targets: ["JsBaoClient"]
         ),
+        // SwiftUI views over the client: `BlobImage` shows a db3 blob as
+        // `AsyncImage` shows a URL. A product of its own so the client
+        // library itself never imports SwiftUI.
+        .library(
+            name: "JsBaoClientUI",
+            targets: ["JsBaoClientUI"]
+        ),
         // The SQLite every connection in this package opens (#4700): the
         // release sqlite-wasm carries for the JS client, built from source, so
         // the store answers the same SQL on every OS it runs on. A product so
@@ -78,25 +85,49 @@ let package = Package(
         .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
     ],
     targets: [
-        // The SQLite amalgamation, vendored unmodified beside `Sources/` as
-        // `yswift-fork` is (`Vendor/JsBaoSQLite/VERSION` names the release and
-        // its SHA3-256). `BundledSQLiteHermeticTests` holds its version to
-        // `@sqlite.org/sqlite-wasm`'s in packages/js-bao/package.json.
+        // The SQLite amalgamation and SQLite's vec1 extension, vendored
+        // unmodified beside `Sources/` as `yswift-fork` is
+        // (`Vendor/JsBaoSQLite/VERSION` names both releases and their hashes).
+        // `BundledSQLiteHermeticTests` holds the release and vec1's version to
+        // js-bao's own sqlite-wasm build, packages/js-bao/vendor/sqlite-wasm/VERSION,
+        // and `vec1.c` to packages/primitive-vec1-node/src/vec1.c byte for byte.
         //
         // SQLite's options are `.define`s. JSON functions are built in since
         // 3.38; the double-quoted-string default is left as SQLite ships it,
-        // as the room's engine has it.
+        // as the room's engine has it. FTS5 keeps a db3's device text index (a
+        // contentless table kept by FTS5's 'delete' command).
+        //
+        // vec1 is compiled in (`VEC1_STATIC`) and SQLite sets it up itself:
+        // `SQLITE_EXTRA_AUTOEXT` puts the hook in `jsbao_init.c` on SQLite's
+        // list of compiled-in extensions (FTS5's list), which every connection
+        // runs as it opens, so every connection the library opens has vec1,
+        // with no loadable-extension path and nothing registered globally.
+        // Not an initialization hook: `SQLITE_EXTRA_INIT_MUTEXED`, the wasm
+        // build's, deadlocks under `THREADSAFE=1` (registering an
+        // auto-extension allocates while it holds the static main mutex, and
+        // the allocation re-enters initialization, which takes that mutex
+        // again), and `SQLITE_EXTRA_INIT` runs after SQLite counts itself
+        // initialized, so a concurrent first connection, or one opened while
+        // SQLite re-initializes after `sqlite3_shutdown`, could miss vec1.
         .target(
             name: "JsBaoSQLite",
             path: "Vendor/JsBaoSQLite",
             exclude: ["VERSION"],
-            sources: ["sqlite3.c"],
+            sources: ["sqlite3.c", "vec1.c", "jsbao_init.c"],
             publicHeadersPath: "include",
             cSettings: [
                 .define("SQLITE_THREADSAFE", to: "1"),
                 .define("SQLITE_OMIT_LOAD_EXTENSION"),
                 .define("SQLITE_ENABLE_MATH_FUNCTIONS"),
                 .define("SQLITE_OMIT_DEPRECATED"),
+                .define("SQLITE_ENABLE_FTS5"),
+                // `dbstat` reads each table's and index's pages, so a measurement
+                // splits a store's bytes by what holds them (a device vector
+                // index's flat and ANN tables beside the records), as js-bao's
+                // sqlite-wasm build can.
+                .define("SQLITE_ENABLE_DBSTAT_VTAB"),
+                .define("VEC1_STATIC"),
+                .define("SQLITE_EXTRA_AUTOEXT", to: "jsbao_sqlite3_vec1_autoext"),
                 // A debug build compiles C at -O0, which makes SQLite's JSON
                 // functions about 2.7 times slower than the OS's optimized
                 // build (an unindexed `json_extract` scan of 100,000 rows: 92
@@ -130,6 +161,11 @@ let package = Package(
             // suite. Its first check is that the committed mode is still `.v6`
             // — a silent revert would otherwise read as "zero sites".
         ),
+        .target(
+            name: "JsBaoClientUI",
+            dependencies: ["JsBaoClient"],
+            path: "Sources/JsBaoClientUI"
+        ),
         .executableTarget(
             name: "swift-bao-codegen",
             dependencies: [
@@ -154,7 +190,7 @@ let package = Package(
         ),
         .testTarget(
             name: "JsBaoClientTests",
-            dependencies: ["JsBaoClient", "JsBaoSQLite"],
+            dependencies: ["JsBaoClient", "JsBaoClientUI", "JsBaoSQLite"],
             path: "Tests/JsBaoClientTests",
             // The cross-language E2E mini-app lives under this test
             // target's path tree but compiles as its own executable
@@ -162,13 +198,21 @@ let package = Package(
             // doesn't pull the same Swift sources into both target
             // compilations. The session-row fixtures (#3802), the bulk-load
             // chunk fixtures (#4475) and the role-compatibility response
-            // fixtures (#4727) are JSON the JS and Swift suites both read by
-            // path, not bundle resources.
+            // fixtures (#4727) and the vector codec and rule fixtures (#5225)
+            // are JSON the JS and Swift suites both read by path, not bundle
+            // resources; the vector codegen golden's TOML is read by path the
+            // same way. `JsBaoSQLiteProbe` is its own executable target too,
+            // and the store the earlier bundled SQLite wrote (#5227) is read
+            // by path.
             exclude: [
+                "BundledSQLite/Probe",
                 "CrossPlatform/E2E",
                 "Fixtures/AgentSessionRows",
+                "Fixtures/BundledSQLite",
+                "Fixtures/Db3Vectors",
                 "Fixtures/DocumentIngestChunks",
                 "Fixtures/RoleCompatResponses",
+                "Schema/CodegenVector/vector-note.toml",
             ]
         ),
         .testTarget(
@@ -189,6 +233,16 @@ let package = Package(
             dependencies: ["JsBaoClient"],
             path: "Tests/JsBaoClientTests/CrossPlatform/E2E/swift",
             plugins: [.plugin(name: "JsBaoCodegenPlugin")]
+        ),
+        // The bundled SQLite's first use in a fresh process: `sqlite3_config`
+        // before first use, then two threads open the process's first
+        // connections at once and each asks for vec1, again after a
+        // `sqlite3_shutdown`. Spawned by `BundledSQLiteFreshProcessHermeticTests`,
+        // since the test process itself initialized SQLite long before.
+        .executableTarget(
+            name: "JsBaoSQLiteProbe",
+            dependencies: ["JsBaoSQLite"],
+            path: "Tests/JsBaoClientTests/BundledSQLite/Probe"
         ),
     ],
     // Package-wide: every target compiles in the Swift 6 language mode, so

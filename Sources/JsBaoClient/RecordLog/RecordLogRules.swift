@@ -75,9 +75,19 @@ protocol RecordLogTables: AnyObject {
     func countEpoch(_ e: Int) throws
     /// How many unjudged, unwithdrawn entries of epoch `e` the store holds, every writer's.
     func pendingInEpoch(_ e: Int) throws -> Int
+    /// The room's head as last heard, and when (#5221); `nil` before one is heard.
+    func knownHead() throws -> RecordLogKnownHead?
+    /// Record the room's head as heard at `at` (epoch ms).
+    func setKnownHead(_ head: Int, at: Int64) throws
 }
 
 extension RecordLogTables {
+    /// Tables that keep no head: none is ever heard.
+    func knownHead() throws -> RecordLogKnownHead? { nil }
+
+    /// Tables that keep no head record none.
+    func setKnownHead(_ head: Int, at: Int64) throws {}
+
     /// Answered from ``pending(_:)``, reading every entry of the writer.
     func pendingEntry(_ writer: String, _ seq: Int) throws -> RecordLogPendingEntry? {
         try pending(writer).first(where: { $0.seq == seq })
@@ -95,6 +105,10 @@ extension RecordLogTables {
 protocol RecordLogReceiptTables: RecordLogTables {
     /// The generation of the full replacement in progress, or `nil`.
     func replacing() throws -> Int?
+    /// The generation confirmed rows are written under: the full replacement's
+    /// in progress, else the confirmed rows'. A receipt's progress counts only
+    /// while the generation it began under is still this one.
+    func generation() throws -> Int
     /// The receipts of chunks begun and not completed, or `nil` when none is
     /// and no replacement counts against them.
     func receipts() throws -> RecordLogReceiptState?
@@ -106,6 +120,8 @@ protocol RecordLogReceiptTables: RecordLogTables {
     func removeUnnamed(_ attempt: String, models: [String]) throws -> [RecordLogRecordKey]
     /// Forget the records receipt `attempt` named.
     func forgetLoad(_ attempt: String) throws
+    /// The records receipt `from` named are receipt `to`'s now (an adoption).
+    func renameLoad(_ from: String, to: String) throws
     /// Forget the records every receipt but `attempts` named.
     func keepLoads(_ attempts: [String]) throws
     /// The segment the confirmed rows were last replaced from, or `nil`.
@@ -117,6 +133,114 @@ protocol RecordLogReceiptTables: RecordLogTables {
     /// when there are exactly `rows` of them, as though it had put them.
     /// Answers whether it did; when not, nothing changed.
     func keepConfirmedRange(model: String, firstId: String, lastId: String, rows: Int) throws -> Bool
+}
+
+/// A record's key compared byte for byte, as SQLite compares `_type` and
+/// `_id`: `String`'s `==` holds canonically equivalent spellings equal
+/// (U+00E9 and U+0065 U+0301), which are two records.
+struct RecordLogExactKey: Hashable {
+    let key: RecordLogRecordKey
+
+    init(_ key: RecordLogRecordKey) { self.key = key }
+
+    static func == (a: Self, b: Self) -> Bool {
+        RecordLogExactText(a.key.id) == RecordLogExactText(b.key.id) && RecordLogExactText(a.key.model) == RecordLogExactText(b.key.model)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        RecordLogExactText(key.model).hash(into: &hasher)
+        RecordLogExactText(key.id).hash(into: &hasher)
+    }
+}
+
+/// Text compared and hashed by its UTF-8 bytes (``RecordLogExactKey``).
+struct RecordLogExactText: Hashable {
+    var text: String
+
+    init(_ text: String) { self.text = text }
+
+    static func == (a: Self, b: Self) -> Bool {
+        var a = a.text, b = b.text
+        return a.withUTF8 { x in b.withUTF8 { y in x.count == y.count && (x.isEmpty || memcmp(x.baseAddress!, y.baseAddress!, x.count) == 0) } }
+    }
+
+    func hash(into hasher: inout Hasher) {
+        var text = text
+        text.withUTF8 { bytes in
+            hasher.combine(bytes.count)
+            hasher.combine(bytes: UnsafeRawBufferPointer(bytes))
+        }
+    }
+}
+
+/// Tables that read and write a load chunk's or a segment's confirmed rows
+/// at once; the rules go row by row through ``RecordLogTables/confirmed()``
+/// over tables that are not these, and for a chunk holding an id
+/// ``recordLogJsonUnsafeId(_:)`` names: neither member is given one.
+protocol RecordLogBatchRowTables: AnyObject {
+    /// The confirmed rows of `keys` that exist.
+    func readConfirmed(_ keys: [RecordLogRecordKey]) throws -> [RecordLogExactKey: RecordLogRow]
+    /// Apply `changes` at once, with the outcome (rows, generation and row
+    /// order) of `confirmed().delete(key)` for each `nil` row and
+    /// `confirmed().set(key, row)` for each other, in order. Callers name each
+    /// key at most once with a row, after any `nil` of it.
+    func writeConfirmed(_ changes: [(key: RecordLogRecordKey, row: RecordLogRow?)]) throws
+}
+
+/// A chunk's confirmed rows over ``RecordLogBatchRowTables``: the rows its
+/// records had, read at once, with the chunk's changes over them, so that a
+/// later line sees an earlier one's row; ``flush()`` writes the changes at
+/// once. The puts keep the row order `confirmed().set` leaves line by line:
+/// a put over a record that exists keeps its place, one over a record that
+/// does not (or that an earlier line removed) takes its place at its line,
+/// and under a full replacement, where each `set` deletes and re-inserts, a
+/// put takes its place at its last line. Removals are written before puts.
+private final class RecordLogBatchedRows {
+    private let tables: RecordLogBatchRowTables
+    private let before: [RecordLogExactKey: RecordLogRow]
+    private let replacing: Bool
+    /// The puts in the order they are written; a slot a later line moved or removed is `nil`.
+    private var order: [RecordLogExactKey?] = []
+    private var slot: [RecordLogExactKey: Int] = [:]
+    private var puts: [RecordLogExactKey: RecordLogRow] = [:]
+    private var removals: [RecordLogExactKey] = []
+    private var removed = Set<RecordLogExactKey>()
+
+    init(tables: RecordLogBatchRowTables, before: [RecordLogExactKey: RecordLogRow], replacing: Bool) {
+        self.tables = tables
+        self.before = before
+        self.replacing = replacing
+    }
+
+    func row(_ key: RecordLogRecordKey) -> RecordLogRow? {
+        let key = RecordLogExactKey(key)
+        if let put = puts[key] { return put }
+        if removed.contains(key) { return nil }
+        return before[key]
+    }
+
+    func set(_ key: RecordLogRecordKey, _ row: RecordLogRow) {
+        let key = RecordLogExactKey(key)
+        if let at = slot[key], replacing { order[at] = nil }
+        if slot[key] == nil || replacing {
+            slot[key] = order.count
+            order.append(key)
+        }
+        puts[key] = row
+    }
+
+    func delete(_ key: RecordLogRecordKey) {
+        let key = RecordLogExactKey(key)
+        if let at = slot.removeValue(forKey: key) { order[at] = nil }
+        puts[key] = nil
+        if removed.insert(key).inserted { removals.append(key) }
+    }
+
+    func flush() throws {
+        let changes = removals.map { (key: $0.key, row: RecordLogRow?.none) }
+            + order.compactMap { $0 }.map { (key: $0.key, row: puts[$0]) }
+        if !changes.isEmpty { try tables.writeConfirmed(changes) }
+    }
 }
 
 /// What a refusal did.
@@ -228,6 +352,30 @@ final class RecordLogRules {
         try tables.setEpochs(epochs)
     }
 
+    /// Record what a frame said of the room's head (#5221), once the frame
+    /// has applied: the bound becomes the highest of the stored one, the
+    /// frame's `head` and the cursor, and is never lowered (a lower `head` is
+    /// stale information). It takes the frame's receipt time when the frame
+    /// raised it, or when its `head` equals it (a fresh confirmation; the
+    /// later time is kept). Before any head is heard, a frame without one
+    /// records nothing. js-bao's `RecordLogClient.noteHead`.
+    func noteHead(_ heard: RecordLogHeard) throws {
+        let head = heard.head.flatMap { $0 >= 0 ? $0 : nil }
+        let stored = try tables.knownHead()
+        if head == nil && stored == nil { return }
+        let at = heard.receivedAt ?? Int64(Date().timeIntervalSince1970 * 1000)
+        let bound = max(stored?.head ?? 0, head ?? 0, try tables.cursor())
+        if let stored {
+            if bound > stored.head {
+                try tables.setKnownHead(bound, at: at)
+            } else if head == stored.head && at > stored.at {
+                try tables.setKnownHead(bound, at: at)
+            }
+        } else {
+            try tables.setKnownHead(bound, at: at)
+        }
+    }
+
     /// The room says which epoch is current; the one after it is open too.
     func notice(current: Int, next: Int? = nil, entries: Int? = nil) throws {
         let epochs = try tables.epochs()
@@ -299,7 +447,10 @@ final class RecordLogRules {
             let confirmed = try tables.confirmed()
             if result.l > (try tables.cursor()) {
                 tables.buffer(result)
+                var applied = false
                 while let next = tables.buffered(try tables.cursor() + 1) {
+                    if !applied { try changedUnderReplacement() }
+                    applied = true
                     if let changes = next.changes {
                         for change in changes {
                             try recordLogApplyChange(confirmed, change)
@@ -492,20 +643,30 @@ final class RecordLogRules {
     /// Begin a catch-up as ``beginCatchUp(full:)`` does, answering a full one's
     /// replacement generation (`nil` for one that is not full, or for tables
     /// that keep none). Receipts whose last change precedes it are made right
-    /// when it completes.
-    func beginFencedCatchUp(full: Bool) throws -> Int? {
+    /// when it completes. A full one begun for a segment's receipt `attempt`
+    /// records the generation on it: the attempt's rows are written under it.
+    func beginFencedCatchUp(full: Bool, attempt: String? = nil) throws -> Int? {
         guard full else { return nil }
         try tables.beginReplace()
         guard let receiving = tables as? RecordLogReceiptTables else { return nil }
+        let generation = try receiving.replacing()
         var state = try receiving.receipts() ?? RecordLogReceiptState()
         state.since = state.n
+        if let attempt, let generation, let at = state.attempts.firstIndex(where: { $0.attempt == attempt }) {
+            state.attempts[at].generation = generation
+        }
         try receiving.setReceipts(state)
-        return try receiving.replacing()
+        return generation
     }
 
-    /// Apply one part of a catch-up: its rows, and the records gone since the cursor.
-    func applyCatchUpPage(_ page: RecordLogCatchUpInput, generation: Int? = nil) throws -> [RecordLogRecordKey] {
+    /// Apply one part of a catch-up: its rows, and the records gone since the
+    /// cursor. A page of receipt `receipt`'s remainder is refused with
+    /// ``RecordLogStaleReceiptError`` before anything changes once another
+    /// attempt took that receipt over; it does not count as the attempt's change.
+    func applyCatchUpPage(_ page: RecordLogCatchUpInput, generation: Int? = nil, receipt: String? = nil) throws -> [RecordLogRecordKey] {
+        try assertNotDisplaced(receipt)
         try assertGeneration(generation)
+        if !page.rows.isEmpty || !page.gone.isEmpty { try changedUnderReplacement(receipt: receipt, generation: generation) }
         let confirmed = try tables.confirmed()
         var touched: [RecordLogRecordKey] = []
         for row in page.rows {
@@ -527,11 +688,14 @@ final class RecordLogRules {
     ///
     /// - Parameters:
     ///   - generation: The replacement's generation, checked before anything is removed.
-    ///   - receipt: The receipt attempt it completes: that attempt's changes are the room's now.
+    ///   - receipt: The receipt attempt it completes: that attempt's changes are
+    ///     the room's now. One another attempt took over is refused as
+    ///     ``applyCatchUpPage(_:generation:receipt:)`` refuses its pages.
     ///   - segment: For a segment's replacement, the segment and its chunks: the store holds them from now.
     func completeCatchUp(
         lsn: Int, high: Int?, full: Bool, generation: Int? = nil, receipt: String? = nil, segment: RecordLogHeldSegment? = nil
     ) throws -> RecordLogReceiveOutcome {
+        try assertNotDisplaced(receipt)
         try assertGeneration(generation)
         var out = RecordLogReceiveOutcome()
         if full {
@@ -602,16 +766,64 @@ final class RecordLogRules {
         return try receiving.receipts()?.attempts.contains { $0.attempt == attempt } == true
     }
 
-    /// Count a change of receipt `attempt`. One no longer in progress is
-    /// refused: whatever made its earlier changes right came before this one.
-    private func touchReceipt(_ attempt: String) throws {
+    /// Whether another attempt in progress took receipt `attempt` over
+    /// (``resumeReceipt(_:fingerprint:chunks:)``).
+    func displacedReceipt(_ attempt: String) throws -> Bool {
+        guard let receiving = tables as? RecordLogReceiptTables else { return false }
+        return try receiving.receipts()?.attempts.contains { $0.replaced?.contains(attempt) == true } == true
+    }
+
+    /// A remainder page or completion of a receipt another attempt took over is refused.
+    private func assertNotDisplaced(_ attempt: String?) throws {
+        if let attempt, try displacedReceipt(attempt) { throw RecordLogStaleReceiptError(attempt: attempt) }
+    }
+
+    /// Count a change of receipt `attempt`, with the progress it made: one more
+    /// chunk of its list, or its load's completion or segment's corrections.
+    /// One no longer in progress is refused: whatever made its earlier changes
+    /// right came before this one.
+    private func touchReceipt(_ attempt: String, chunk: Bool = false, completed: Bool = false) throws {
         let receiving = try receiptTables()
         guard var state = try receiving.receipts(),
               let at = state.attempts.firstIndex(where: { $0.attempt == attempt })
         else { throw RecordLogStaleReceiptError(attempt: attempt) }
+        state.attempts = try unresumable(state.attempts, receipt: attempt)
         state.n += 1
         state.attempts[at].last = state.n
+        if chunk { state.attempts[at].done = (state.attempts[at].done ?? 0) + 1 }
+        if completed { state.attempts[at].completed = true }
         try receiving.setReceipts(state)
+    }
+
+    /// Confirmed rows change under the replacement in progress other than by
+    /// its own segment receipt: a page of that replacement (it carries the
+    /// generation) or a command of that attempt (`receipt`) is its own. Its
+    /// completion would keep those rows uncorrected, so the segment attempt
+    /// owning the replacement is never continued
+    /// (``resumeReceipt(_:fingerprint:chunks:)``), though whatever wrote them
+    /// completes before the reopen.
+    private func changedUnderReplacement(receipt: String? = nil, generation: Int? = nil) throws {
+        guard let receiving = tables as? RecordLogReceiptTables, try receiving.replacing() != nil,
+              var state = try receiving.receipts()
+        else { return }
+        let attempts = try unresumable(state.attempts, receipt: receipt, generation: generation)
+        guard attempts != state.attempts else { return }
+        state.attempts = attempts
+        try receiving.setReceipts(state)
+    }
+
+    /// `attempts`, the segment attempt owning the replacement in progress
+    /// without its generation unless `receipt` or `generation` is its own.
+    private func unresumable(
+        _ attempts: [RecordLogReceiptAttempt], receipt: String? = nil, generation: Int? = nil
+    ) throws -> [RecordLogReceiptAttempt] {
+        guard let replacing = try (tables as? RecordLogReceiptTables)?.replacing(), generation != replacing else { return attempts }
+        return attempts.map { a in
+            guard a.kind == .segment, a.generation == replacing, a.attempt != receipt else { return a }
+            var rest = a
+            rest.generation = nil
+            return rest
+        }
     }
 
     /// A command under `generation` while the store replaces under another is stale.
@@ -624,15 +836,66 @@ final class RecordLogRules {
     /// A receipt of chunks begins: from its first committed chunk the confirmed
     /// rows may hold what the room does not, until its own completion or a full
     /// replacement begun after its last change makes them right. Answers the
-    /// attempt's id, which each of its commands carries.
-    func beginReceipt(_ receipt: RecordLogReceipt) throws -> String {
+    /// attempt's id, which each of its commands carries. The attempt records
+    /// the `fingerprint` of the chunk list it receives, the chunks done (none
+    /// yet) and, for a load, the generation its rows are written under, so
+    /// that the same list offered again can continue it
+    /// (``resumeReceipt(_:fingerprint:chunks:)``). A segment's generation is
+    /// recorded when its own replacement begins
+    /// (``beginFencedCatchUp(full:attempt:)``): until then it has none and is
+    /// never continued.
+    func beginReceipt(_ receipt: RecordLogReceipt, fingerprint: String? = nil) throws -> String {
         let receiving = try receiptTables()
         var state = try receiving.receipts() ?? RecordLogReceiptState()
         state.n += 1
         let attempt = "\(state.n).\(Self.attemptSuffix())"
-        state.attempts.append(RecordLogReceiptAttempt(kind: receipt.kind, id: receipt.id, attempt: attempt, last: state.n))
+        state.attempts.append(RecordLogReceiptAttempt(
+            kind: receipt.kind, id: receipt.id, attempt: attempt, last: state.n, fingerprint: fingerprint, done: 0,
+            generation: receipt.kind == .load ? try receiving.generation() : nil
+        ))
         try receiving.setReceipts(state)
         return attempt
+    }
+
+    /// Take over the latest attempt of a load or segment whose chunk list had
+    /// `fingerprint`, when the rows it counts are still the store's: a load's
+    /// while the generation rows are written under is the one it began under
+    /// (no full replacement began since), a segment's while its own
+    /// replacement is still the one in progress and no other attempt changed
+    /// a row since that replacement began (its rows would be kept with the
+    /// segment's, uncorrected); a change under it by anything else, however
+    /// it ended, took the segment's generation away. The attempt keeps its place
+    /// and progress under a new id, with the load keys it named; the old id
+    /// leaves the state, so a session still holding it is refused at its next
+    /// command. Answers `nil`, changing nothing, when there is no such attempt
+    /// (an attempt an earlier build wrote has no fingerprint), when its rows
+    /// may be gone, or when it counts more than the list's `chunks`.
+    func resumeReceipt(_ receipt: RecordLogReceipt, fingerprint: String, chunks: Int? = nil) throws -> RecordLogReceiptResume? {
+        let receiving = try receiptTables()
+        guard var state = try receiving.receipts(),
+              let at = state.attempts.lastIndex(where: { $0.kind == receipt.kind && $0.id == receipt.id && $0.fingerprint == fingerprint })
+        else { return nil }
+        let old = state.attempts[at]
+        let done = old.done ?? 0
+        guard let generation = old.generation else { return nil }
+        if let chunks, done > chunks { return nil }
+        let current = old.kind == .segment ? try receiving.replacing() : try receiving.generation()
+        guard current == generation else { return nil }
+        if old.kind == .segment {
+            guard let since = state.since,
+                  !state.attempts.indices.contains(where: { $0 != at && state.attempts[$0].last > since })
+            else { return nil }
+        }
+        state.n += 1
+        let attempt = "\(state.n).\(Self.attemptSuffix())"
+        state.attempts[at].attempt = attempt
+        state.attempts[at].last = state.n
+        state.attempts[at].replaced = (old.replaced ?? []) + [old.attempt]
+        // Before the old id leaves the state, in the same transaction: a
+        // refresh never sees the keys half under one id.
+        try receiving.renameLoad(old.attempt, to: attempt)
+        try receiving.setReceipts(state)
+        return RecordLogReceiptResume(attempt: attempt, done: done, completed: old.completed, generation: generation)
     }
 
     /// Eight base-36 characters, as the JS attempt ids carry.
@@ -650,33 +913,57 @@ final class RecordLogRules {
     /// receipt `attempt`: `_deleted: true` removes the record (an absent one is
     /// left alone); otherwise the line's fields are set over the row it has,
     /// `null` kept as a present null, the line's own `id` field ignored, a
-    /// nested value or a string set's array taken whole. Each key is remembered
-    /// for a refresh. An attempt no longer in progress is refused with
+    /// nested value taken whole and a string set's array in code point order
+    /// with each member once, as the room stores it (#5274). Each key is
+    /// remembered for a refresh. An attempt no longer in progress is refused with
     /// ``RecordLogStaleReceiptError`` before anything changes.
     ///
     /// - Returns: The records whose confirmed row changed.
     func applyLoadLines(attempt: String, model: String, lines: [RecordLogLoadLine]) throws -> [RecordLogRecordKey] {
         let receiving = try receiptTables()
-        try touchReceipt(attempt)
-        let confirmed = try tables.confirmed()
+        try touchReceipt(attempt, chunk: true)
+        let batch = try batchRows(lines.map { RecordLogRecordKey(model: model, id: $0.id) }, read: true)
+        let confirmed = batch == nil ? try tables.confirmed() : nil
         var touched: [RecordLogRecordKey] = []
         for line in lines {
             let key = RecordLogRecordKey(model: model, id: line.id)
-            let existing = try confirmed.row(key)
+            let existing: RecordLogRow?
+            if let batch { existing = batch.row(key) } else { existing = try confirmed?.row(key) }
             if line.patch["_deleted"] == .bool(true) {
                 guard existing != nil else { continue }
-                try confirmed.delete(key)
+                if let batch { batch.delete(key) } else { try confirmed?.delete(key) }
                 touched.append(key)
                 continue
             }
             var row = existing ?? [:]
-            for (field, value) in line.patch where field != "id" { row[field] = value }
+            for (field, value) in line.patch where field != "id" {
+                if let array = value.arrayValue, case let members = array.compactMap(\.stringValue), members.count == array.count {
+                    row[field] = .array(recordLogCanonicalStringSet(members).map { .string($0) })
+                } else {
+                    row[field] = value
+                }
+            }
             row["id"] = .string(line.id)
-            try confirmed.set(key, row)
+            if let batch { batch.set(key, row) } else { try confirmed?.set(key, row) }
             touched.append(key)
         }
+        try batch?.flush()
         try receiving.noteLoadKeys(attempt, lines.map { RecordLogRecordKey(model: model, id: $0.id) })
         return touched
+    }
+
+    /// The confirmed rows of a chunk's `keys` read at once, its changes
+    /// written at once (``RecordLogBatchedRows``), when the tables can and
+    /// every id is one they take; `nil` when not and the rules go row by row.
+    /// `read` is false where no row is read.
+    private func batchRows(_ keys: [RecordLogRecordKey], read: Bool) throws -> RecordLogBatchedRows? {
+        guard let batch = tables as? RecordLogBatchRowTables else { return nil }
+        guard !keys.contains(where: { recordLogJsonUnsafeId($0.id) }) else { return nil }
+        var seen = Set<RecordLogExactKey>()
+        let distinct = read ? keys.filter { seen.insert(RecordLogExactKey($0)).inserted } : []
+        let before = distinct.isEmpty ? [:] : try batch.readConfirmed(distinct)
+        let replacing = try (tables as? RecordLogReceiptTables)?.replacing() != nil
+        return RecordLogBatchedRows(tables: batch, before: before, replacing: replacing)
     }
 
     /// Receipt `attempt` applied every chunk of its load. A refresh removes
@@ -686,7 +973,7 @@ final class RecordLogRules {
     /// longer in progress is refused as ``applyLoadLines(attempt:model:lines:)`` refuses it.
     func completeLoad(attempt: String, mode: RecordLogLoadMode, models: [String]) throws -> [RecordLogRecordKey] {
         let receiving = try receiptTables()
-        try touchReceipt(attempt)
+        try touchReceipt(attempt, completed: true)
         let touched = mode == .refresh ? try receiving.removeUnnamed(attempt, models: models) : []
         try receiving.forgetLoad(attempt)
         return touched
@@ -695,16 +982,19 @@ final class RecordLogRules {
     /// Put a segment's rows under the replacement `generation`, as receipt `attempt` when it names one.
     func applySegmentRows(generation: Int, attempt: String?, rows: [RecordLogCatchUpRow]) throws -> [RecordLogRecordKey] {
         try assertGeneration(generation)
-        if let attempt { try touchReceipt(attempt) }
-        let confirmed = try tables.confirmed()
+        if let attempt { try touchReceipt(attempt, chunk: true) }
+        // A segment's rows replace the records' whole: none is read.
+        let batch = try batchRows(rows.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, read: false)
+        let confirmed = batch == nil ? try tables.confirmed() : nil
         var touched: [RecordLogRecordKey] = []
         for item in rows {
             let key = RecordLogRecordKey(model: item.model, id: item.id)
             var row = item.row
             row["id"] = .string(item.id)
-            try confirmed.set(key, row)
+            if let batch { batch.set(key, row) } else { try confirmed?.set(key, row) }
             touched.append(key)
         }
+        try batch?.flush()
         return touched
     }
 
@@ -737,7 +1027,7 @@ final class RecordLogRules {
         guard same, alone, try receiving.keepConfirmedRange(model: model, firstId: firstId, lastId: lastId, rows: rows) else {
             return .mismatch
         }
-        try touchReceipt(attempt)
+        try touchReceipt(attempt, chunk: true)
         return .kept(rows: rows, ranges: [RecordLogIdRange(model: model, firstId: firstId, lastId: lastId)])
     }
 
@@ -746,7 +1036,7 @@ final class RecordLogRules {
     /// changes nothing).
     func applySegmentCorrections(generation: Int, attempt: String?, lines: [RecordLogCorrection]) throws -> [RecordLogRecordKey] {
         try assertGeneration(generation)
-        if let attempt { try touchReceipt(attempt) }
+        if let attempt { try touchReceipt(attempt, completed: true) }
         let confirmed = try tables.confirmed()
         var touched: [RecordLogRecordKey] = []
         for line in lines {
@@ -780,7 +1070,7 @@ final class RecordLogRules {
 }
 
 /// A client's state in memory: what a replay of the golden traces drives.
-final class RecordLogMemoryTables: RecordLogReceiptTables {
+class RecordLogMemoryTables: RecordLogReceiptTables {
     private var cursorValue: Int
     private var epochValue: RecordLogEpochs
     private var constraintList: [RecordLogConstraint] = []
@@ -800,6 +1090,7 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
     private var writerOrder: [String] = []
     private var writers: [String: Writer] = [:]
     private var counts: [Int: Int] = [:]
+    private var headValue: RecordLogKnownHead?
 
     private struct Writer {
         var nextSeq = 1
@@ -834,6 +1125,8 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
 
     func cursor() -> Int { cursorValue }
     func setCursor(_ cursor: Int) { cursorValue = cursor }
+    func knownHead() -> RecordLogKnownHead? { headValue }
+    func setKnownHead(_ head: Int, at: Int64) { headValue = RecordLogKnownHead(head: head, at: at) }
     func epochs() -> RecordLogEpochs { epochValue }
     func setEpochs(_ epochs: RecordLogEpochs) { epochValue = epochs }
     func constraints() -> [RecordLogConstraint] { constraintList }
@@ -869,6 +1162,7 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
     }
 
     func replacing() -> Int? { replaced == nil ? nil : generationValue }
+    func generation() -> Int { generationValue }
 
     func receipts() -> RecordLogReceiptState? { receiptValue }
     func setReceipts(_ state: RecordLogReceiptState?) { receiptValue = state }
@@ -886,6 +1180,10 @@ final class RecordLogMemoryTables: RecordLogReceiptTables {
     }
 
     func forgetLoad(_ attempt: String) { loadKeys[attempt] = nil }
+    func renameLoad(_ from: String, to: String) {
+        guard let named = loadKeys.removeValue(forKey: from) else { return }
+        loadKeys[to] = named
+    }
 
     func heldSegment() -> RecordLogHeldSegment? { heldValue }
     func setHeldSegment(_ segment: RecordLogHeldSegment?) { heldValue = segment }

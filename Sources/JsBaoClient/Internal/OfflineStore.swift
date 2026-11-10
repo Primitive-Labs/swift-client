@@ -20,7 +20,13 @@ public actor OfflineStore {
     private var isInitialized = false
 
     // Store names matching JS constants
-    static let storeMetaDocs = "meta"
+    /// The store every user's document metadata shared before #4829, keyed
+    /// by document id alone. Quarantined: nothing reads it, and only a
+    /// `wipeLocal` logout (`clearAllDocumentData`) clears it. A row in it
+    /// carries no owner, and the first user to sign in after an upgrade is
+    /// not necessarily the one who wrote it, so loading or adopting it would
+    /// hand one user's pending creates to another.
+    static let legacyStoreMetaDocs = "meta"
     static let storeGrants = "grants"
     static let storeAnalytics = "analytics"
     static let storeAnalyticsMeta = "analyticsMeta"
@@ -48,7 +54,10 @@ public actor OfflineStore {
 
     // MARK: - Initialization
 
-    /// Bind the app+user database, at most once per namespace.
+    /// Bind the storage provider for an app and user, at most once per
+    /// namespace. A `SQLiteStorageProvider` given a path opens that one file
+    /// for every namespace, so binding does not separate users; the
+    /// metadata store name does (`metadataStore(appId:userId:)`).
     ///
     /// The three steps are the same three the `NSLock` version had — read the
     /// decision from isolated state, `await` the provider's `initialize` with
@@ -73,12 +82,34 @@ public actor OfflineStore {
 
     // MARK: - Metadata Operations
 
+    /// The document metadata of one app and user, keyed by document id. The
+    /// app's SQLite file is shared by every user who signs in on the device,
+    /// so the store name is what keeps one user's rows (pending creates
+    /// among them) from loading for another. Same naming as the upload
+    /// queue's stores; the JS client gets the same split from its per-user
+    /// database.
+    ///
+    /// No row is persisted without an owner: with an empty `userId` every
+    /// metadata operation below writes nothing and reads nothing, as the JS
+    /// client's `if (!ctx.userId) return` guard does. A write refused that
+    /// way reports `false`, and `DocumentManager` replays it under the user
+    /// the client binds. The provider is still bound first, as before: the
+    /// document content store and the other stores in the file rely on a
+    /// metadata call having opened it.
+    static func metadataStore(appId: String, userId: String) -> String {
+        "\(metadataStorePrefix)\(appId):\(userId)"
+    }
+
+    /// The prefix every user's metadata store name starts with.
+    static let metadataStorePrefix = "meta:"
+
     public func loadAllMetadata(appId: String, userId: String) async throws -> [LocalMetadataEntry] {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return [] }
         guard let provider = storageProvider else { return [] }
 
         var results: [LocalMetadataEntry] = []
-        try await provider.iterate(store: Self.storeMetaDocs) { (record: StorageRecord<LocalMetadataEntry>) in
+        try await provider.iterate(store: Self.metadataStore(appId: appId, userId: userId)) { (record: StorageRecord<LocalMetadataEntry>) in
             results.append(record.value)
         }
         return results
@@ -93,28 +124,34 @@ public actor OfflineStore {
     /// With no provider bound this silently wrote nothing, which on a cold
     /// start is how a `documents.create` — metadata-only since #3200 — could
     /// return successfully and leave no durable trace at all. The caller uses
-    /// the answer to remember the row and replay it when storage binds.
+    /// the answer to remember the row and replay it when storage binds. A
+    /// write with no user is not taken either: the row would have no owner.
     @discardableResult
     public func putMetadataReporting(
         appId: String, userId: String, record: LocalMetadataEntry
     ) async throws -> Bool {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return false }
         guard let provider = storageProvider else { return false }
-        try await provider.put(store: Self.storeMetaDocs, key: record.documentId, value: record, metadata: nil)
+        try await provider.put(
+            store: Self.metadataStore(appId: appId, userId: userId), key: record.documentId, value: record, metadata: nil
+        )
         return true
     }
 
     public func putMetadataBatch(appId: String, userId: String, records: [LocalMetadataEntry]) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return }
         guard let provider = storageProvider else { return }
         let items = records.map { (key: $0.documentId, value: $0, metadata: nil as [String: String]?) }
-        try await provider.putBatch(store: Self.storeMetaDocs, records: items)
+        try await provider.putBatch(store: Self.metadataStore(appId: appId, userId: userId), records: items)
     }
 
     public func deleteMetadata(appId: String, userId: String, documentId: String) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return }
         guard let provider = storageProvider else { return }
-        try await provider.delete(store: Self.storeMetaDocs, key: documentId)
+        try await provider.delete(store: Self.metadataStore(appId: appId, userId: userId), key: documentId)
     }
 
     public func getMetadata(appId: String, userId: String, documentId: String) async throws -> LocalMetadataEntry? {
@@ -127,33 +164,70 @@ public actor OfflineStore {
     /// document" and "no provider bound yet, so nothing could be read". The
     /// local-only classification (#2691) has to tell them apart — the second is
     /// *unknown*, not "ordinary", and a document whose classification is
-    /// unknown may not have its content put on the wire.
+    /// unknown may not have its content put on the wire. With no user bound
+    /// yet there is no store to read, which is unknown in the same way.
     public func readMetadata(
         appId: String,
         userId: String,
         documentId: String
     ) async throws -> (entry: LocalMetadataEntry?, readable: Bool) {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return (nil, false) }
         guard let provider = storageProvider else { return (nil, false) }
-        let record: StorageRecord<LocalMetadataEntry>? = try await provider.get(store: Self.storeMetaDocs, key: documentId)
+        let record: StorageRecord<LocalMetadataEntry>? = try await provider.get(
+            store: Self.metadataStore(appId: appId, userId: userId), key: documentId
+        )
         return (record?.value, true)
     }
 
-    /// Store-level purge of ALL locally persisted document data for this
-    /// app's SQLite database: both the metadata store (`meta`) and the Yjs
-    /// CRDT store (`yjs_docs`). Both are truncated directly on disk
-    /// (`clear` → `DELETE FROM …`), independent of any in-memory document
-    /// index — so rows for documents that were never loaded into memory are
-    /// removed too. The single app-wide database keys these stores by
-    /// `documentId` alone (not by `userId`), so a per-document delete driven
-    /// by the current user's in-memory index cannot enforce a fresh-client
-    /// boundary. This does, by clearing the on-disk tables outright. Fast
-    /// no-op on empty tables (`DELETE FROM` an empty table is instant).
+    /// Store-level purge of the locally persisted document data a
+    /// `wipeLocal` logout removes: this user's metadata store, the unscoped
+    /// pre-#4829 `meta` store, and this user's rows in the Yjs CRDT store
+    /// (`yjs_docs`). Each is purged directly on disk, independent of any
+    /// in-memory document index — so rows for documents that were never
+    /// loaded into memory are removed too. Other users' metadata stores are
+    /// left in place, as the JS client's wipe leaves other users' databases.
+    ///
+    /// `yjs_docs` is keyed by `documentId` alone and shared by every user of
+    /// the file, so its rows are told apart by the metadata stores: a row
+    /// another user's store lists is theirs too and stays, and every other
+    /// row goes — the ones only this user listed, and the ones no user lists
+    /// (written before #4829, or left without a row), so a prior account's
+    /// content cannot hydrate a reused document id. Clearing the table
+    /// outright took another user's unsynced pending creates with it (#5366).
+    /// A failed read of the stores throws before any row is deleted, since a
+    /// partial list would pass another user's rows off as unowned.
     public func clearAllDocumentData(appId: String, userId: String) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
         guard let provider = storageProvider else { return }
-        try await provider.clear(store: Self.storeMetaDocs)
-        try await provider.clear(store: YjsSQLitePersistence.store)
+        let ownStore = Self.metadataStore(appId: appId, userId: userId)
+        // The content goes first: until the metadata stores are cleared they
+        // still say which rows this wipe owns, so an interrupted wipe can run
+        // again.
+        for documentId in try await contentRemovedByWipe(of: ownStore, provider: provider) {
+            try await provider.delete(store: YjsSQLitePersistence.store, key: documentId)
+        }
+        try await provider.clear(store: ownStore)
+        try await provider.clear(store: Self.legacyStoreMetaDocs)
+    }
+
+    /// The `yjs_docs` rows a wipe of the metadata store `ownStore` removes:
+    /// every row no other user's metadata store lists. A provider that cannot
+    /// name its stores cannot say what the other users stored, so with one
+    /// only the rows `ownStore` and the legacy store list go.
+    private func contentRemovedByWipe(of ownStore: String, provider: StorageProvider) async throws -> [String] {
+        let content = try await provider.keys(store: YjsSQLitePersistence.store)
+        guard !content.isEmpty else { return [] }
+        guard let lister = provider as? StoreNameListing else {
+            var listed = Set(try await provider.keys(store: ownStore))
+            listed.formUnion(try await provider.keys(store: Self.legacyStoreMetaDocs))
+            return content.filter(listed.contains)
+        }
+        var kept = Set<String>()
+        for store in try await lister.storeNames(withPrefix: Self.metadataStorePrefix) where store != ownStore {
+            kept.formUnion(try await provider.keys(store: store))
+        }
+        return content.filter { !kept.contains($0) }
     }
 
     // MARK: - Grant Operations

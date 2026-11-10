@@ -18,6 +18,7 @@ public final class InvitationsAPI: @unchecked Sendable {
 
     /// Check the caller's invitation quota. Admins/owners always get
     /// `unlimited: true`.
+    /// - Stability: production
     public func quota() async throws -> InvitationQuota {
         try await transport.request(method: .get, path: "/invitations/quota")
     }
@@ -25,12 +26,14 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// Create an app-level invitation. Members can create invitations
     /// when `memberInvitationsEnabled` is true; admins/owners always can.
     /// Only `params.email` is required.
+    /// - Stability: production
     public func create(params: CreateInvitationParams) async throws -> AppInvitationInfo {
         try await transport.request(method: .post, path: "/invitations", body: params)
     }
 
     /// List app-level invitations (admin/owner only). Returns a typed
     /// `{ items, hasMore, nextCursor? }` page.
+    /// - Stability: production
     public func list(
         limit: Int? = nil,
         cursor: String? = nil
@@ -44,12 +47,14 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// Fetch a single app invitation by id. Includes `inviteToken` so
     /// callers can build their own accept-page CTA.
     /// Permissions: app admin/owner, OR the original inviter.
+    /// - Stability: production
     public func get(invitationId: String) async throws -> AppInvitationInfo {
         try await transport.request(method: .get, path: "/invitations/\(invitationId)")
     }
 
     /// Delete an app-level invitation (admin/owner only). Cascade-deletes
     /// any linked deferred grants.
+    /// - Stability: production
     public func delete(invitationId: String) async throws -> InvitationDeleteResult {
         try await transport.request(method: .delete, path: "/invitations/\(invitationId)")
     }
@@ -63,6 +68,7 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// Throws on any failure with a uniform `INVITE_TOKEN_INVALID` code
     /// (the server collapses invalid / expired / already-accepted to one
     /// shape so existence isn't leaked to probing).
+    /// - Stability: production
     public func accept(inviteToken: String) async throws -> AcceptInviteResult {
         try await transport.request(
             method: .post,
@@ -86,6 +92,8 @@ public final class InvitationsAPI: @unchecked Sendable {
     ///   - cursor: Continuation token from a previous page's `nextCursor`
     ///     (#1316). Without it the server's real position cursor is
     ///     unreachable and a caller can never advance past page one.
+    /// - Stability: production
+    @available(*, deprecated, message: "The deferred-grants API is deprecated: revoke a pending invitation from its resource (documents, db3.permissions, groups, collections). It keeps answering until a later removal project. (api-surface-stability)")
     public func listDeferredGrants(
         type: DeferredGrantType? = nil,
         email: String? = nil,
@@ -108,6 +116,8 @@ public final class InvitationsAPI: @unchecked Sendable {
     ///
     /// - Parameter type: `.document` or `.group` — required because
     ///   document and group deferred grants live in separate tables.
+    /// - Stability: production
+    @available(*, deprecated, message: "The deferred-grants API is deprecated: revoke a pending invitation from its resource (documents, db3.permissions, groups, collections). It keeps answering until a later removal project. (api-surface-stability)")
     public func revokeDeferredGrant(
         deferredId: String,
         type: DeferredGrantType

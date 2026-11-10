@@ -798,7 +798,7 @@ public struct DocumentAccessRequest: Decodable, Sendable {
 }
 
 /// A short document summary attached to an access-request response.
-public struct AccessRequestDocumentSummary: Decodable, Sendable {
+public struct AccessRequestDocumentSummary: Decodable, Sendable, Equatable {
     public let documentId: String?
     public let title: String?
     public let tags: [String]?
@@ -876,6 +876,29 @@ public struct PendingInvitationEntry: Decodable, Sendable {
     public let createdAt: String
     public let expiresAt: String
     public let grantedBy: String?
+}
+
+/// The answer of a resource's `revokePendingInvitation`: the invitation's
+/// unaccepted grants on that resource were deleted. The invitation and its
+/// grants on other resources stay.
+public struct PendingInvitationRevokeResult: Decodable, Sendable, Equatable {
+    public let success: Bool
+    /// Always `"pending_cancelled"`.
+    public let status: String
+    /// The invitation whose grants on the resource were revoked.
+    public let invitationId: String
+    /// The invited address.
+    public let email: String
+    /// How many unaccepted grant rows were deleted.
+    public let deferredCount: Int
+
+    public init(success: Bool, status: String, invitationId: String, email: String, deferredCount: Int) {
+        self.success = success
+        self.status = status
+        self.invitationId = invitationId
+        self.email = email
+        self.deferredCount = deferredCount
+    }
 }
 
 // MARK: Small result wrappers

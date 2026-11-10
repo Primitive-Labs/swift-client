@@ -25,6 +25,7 @@ import XCTest
 /// (`MEMBER_INVITATIONS_DISABLED` fires for a plain "member" caller), so every
 /// test that drives one uses the app owner's client and an owner-created
 /// document.
+@available(*, deprecated)
 final class InvitationTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

@@ -23,10 +23,11 @@ import XCTest
 ///   only the rewritten one and the corrections; a mismatch falls back to the
 ///   fetch (036); a chunk rewritten with identical bytes is fetched (035);
 ///   another session's load that changes a kept range between the held read
-///   and the keep leaves the store equal to the room; a later replacement
-///   makes the earlier's keeps stale, the marker naming the segment that
-///   completed (037); an interrupted receipt leaves an attempt in progress, so
-///   the next keeps nothing (038).
+///   and the keep leaves the store equal to the room; a later session takes
+///   the earlier's receipt of the same segment over (#5267), so the earlier's
+///   keeps are stale, the marker naming the segment that completed (037); an
+///   interrupted receipt leaves its attempt in progress, and the next offer
+///   continues it from the chunk it stopped at (#5267, 038).
 final class RecordLogSegmentKeepHermeticTests: XCTestCase {
     typealias H = RecordLogReceiptHarness
 
@@ -541,13 +542,15 @@ final class RecordLogSegmentKeepHermeticTests: XCTestCase {
         await a.session.start()
         await a.feed(segmentOpen(s2a, cursor: 12, upTo: 22))
         await until("a's rewritten chunk's fetch") { a.connection.fetched.contains("\(grantA)/Note/0") }
-        // b's replacement begins after a's (whose attempt is in progress, so b keeps nothing) and completes.
+        // b is offered the same segment while a's attempt is in progress: it
+        // takes that attempt over (#5267), continues from the chunk a kept,
+        // and completes it.
         await b.session.start()
         await b.feed(segmentOpen(s2b, cursor: 12, upTo: 22))
         await until("b's remainder request") { b.of("record.catchUp").count == 1 }
         await b.feed(H.page(lsn: 22))
         await until("b to complete") { b.synced.value == 1 }
-        XCTAssertEqual(b.connection.fetched, ["\(grantB)/\(Self.s1)/Note/0", "\(grantB)/Note/0", "\(grantB)/corrections"])
+        XCTAssertEqual(b.connection.fetched, ["\(grantB)/Note/0", "\(grantB)/corrections"])
 
         gate.open()
         await until("a to open again") { a.of("record.open").count == 2 }
@@ -577,13 +580,15 @@ final class RecordLogSegmentKeepHermeticTests: XCTestCase {
         await h.feed(segmentOpen(s2, cursor: 12, upTo: 22))
         await until("the session to open again") { h.of("record.open").count == 2 }
         XCTAssertEqual(h.connection.fetched, ["\(grant)/Note/0"])
-        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .segment, id: Self.s2))
+        // The kept chunk is the attempt's progress (#5267).
+        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .segment, id: Self.s2, done: 1, completed: false))
 
+        // Offered again, the attempt continues at the rewritten chunk.
         await h.feed(segmentOpen(s2, cursor: 12, upTo: 22))
         await until("the remainder request") { h.of("record.catchUp").count == 1 }
         await h.feed(H.page(lsn: 22))
         await until("S2 to complete") { h.synced.value == 1 }
-        XCTAssertEqual(h.connection.fetched, ["\(grant)/Note/0", "\(grant)/\(Self.s1)/Note/0", "\(grant)/Note/0", "\(grant)/corrections"])
+        XCTAssertEqual(h.connection.fetched, ["\(grant)/Note/0", "\(grant)/Note/0", "\(grant)/corrections"])
         XCTAssertEqual(try confirmedRows(h), ["a": n("a"), "b": n("b"), "c": n("c", "c at B2"), "e": n("e")])
         XCTAssertNil(h.marks.receipt)
         XCTAssertFalse(h.marks.replacing)

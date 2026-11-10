@@ -1,10 +1,15 @@
-SQLite 3.53.4 amalgamation (sqlite-amalgamation-3530400.zip)
-Source: https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
-SHA3-256 of sqlite3.c: 67f423e9ebbbdc473cbc4772c872ee6b89f31fde4ed0279a5c25d5f65c043a16 (published in https://www.sqlite.org/releaselog/3_53_4.html)
-SHA3-256 of the zip: 628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e
-Pinned to: @sqlite.org/sqlite-wasm 3.53.4-build2 (packages/js-bao/package.json)
+SQLite 3.54.1 amalgamation (sqlite-amalgamation-3540100.zip)
+Source: https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip
+SHA3-256 of sqlite3.c: e2b869d3003b33c942b7dd7063604fbc53553e1b66609570df39b9b7b558ee81 (published in https://www.sqlite.org/releaselog/3_54_1.html)
+SHA3-256 of the zip: 92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30
+vec1: 0.8
+vec1.c: sqlite-src-3540100.zip ext/vec1/vec1.c, SHA-256 a38c62274093bec34631831371ad433703d6dde7fa9ecd6088da4ed33d4a61f9 (the same file as packages/primitive-vec1-node/src/vec1.c)
+vec1 registration: VEC1_STATIC, SQLITE_EXTRA_AUTOEXT=jsbao_sqlite3_vec1_autoext (jsbao_init.c; run by every connection as it opens)
+Pinned to: packages/js-bao/vendor/sqlite-wasm/VERSION
 
-sqlite3.c and include/sqlite3.h are the release files, unmodified. To move
-to a new release, replace both from the amalgamation sqlite-wasm's version
-names and update this file; BundledSQLiteHermeticTests fails until the two
-versions agree.
+sqlite3.c, include/sqlite3.h and vec1.c are the release files, unmodified;
+jsbao_init.c is ours. To
+move to a new release, replace sqlite3.c and include/sqlite3.h from the
+amalgamation, and vec1.c from the source release's ext/vec1/ (with the Node
+package's copy), to the versions the wasm build's VERSION names, and update
+this file; BundledSQLiteHermeticTests fails until they all agree.

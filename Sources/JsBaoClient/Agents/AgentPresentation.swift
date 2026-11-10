@@ -23,12 +23,14 @@ public struct AgentPresentation: Sendable, Equatable {
 
     /// The call numbered `number` in this presentation's turn; `nil` for a
     /// number no call of the turn in the view's window carries.
+    /// - Stability: beta
     public func call(_ number: Int) -> AgentSessionToolCallRecord? {
         turnCalls[number]
     }
 
     /// The input decoded as `type`, the way the generated
     /// `<Key>AgentPresentation(_:)` decodes it.
+    /// - Stability: beta
     public func decode<T: Decodable>(_ type: T.Type) throws -> T {
         try JSONDecoder().decode(T.self, from: JSONEncoder().encode(input))
     }

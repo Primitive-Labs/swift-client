@@ -222,6 +222,21 @@ public enum JsBaoEvent: String, Sendable {
     case db3Created = "db3:created"
     /// The server refused a `client.db3.create`. Payload: `Db3CreateFailedEvent`.
     case db3CreateFailed = "db3:create-failed"
+    // The access-request events, appended for the same reason; each is the JS
+    // client's key verbatim. The `document:` pair follows the deprecated
+    // documents family; a db3 request also sends the `db3:` pair.
+    /// Someone asked for access to a document this user owns. Payload:
+    /// `DocumentAccessRequestCreatedEvent`.
+    case documentAccessRequestCreated = "document:access-request-created"
+    /// An access request on a document was approved or denied. Payload:
+    /// `DocumentAccessRequestResolvedEvent`.
+    case documentAccessRequestResolved = "document:access-request-resolved"
+    /// Someone asked for access to a db3 this user owns. Payload:
+    /// `Db3AccessRequestCreatedEvent`.
+    case db3AccessRequestCreated = "db3:access-request-created"
+    /// An access request on a db3 was approved or denied. Payload:
+    /// `Db3AccessRequestResolvedEvent`.
+    case db3AccessRequestResolved = "db3:access-request-resolved"
 }
 
 // MARK: - Event Payloads
@@ -594,6 +609,107 @@ public struct NotificationEvent: Sendable, Equatable {
         self.deepLink = deepLink
         self.sourceRef = sourceRef
         self.createdAt = createdAt
+    }
+}
+
+/// Payload for `.documentAccessRequestCreated`
+/// (`for await e in client.stream(for: DocumentAccessRequestCreatedEvent.self)`).
+///
+/// Someone asked for access to a document this user owns. Sent to every
+/// connected owner when a request is made or a pending one is re-submitted;
+/// a db3 request is also delivered as `Db3AccessRequestCreatedEvent`. Nothing
+/// is replayed after a reconnect: list the requests then and apply the events
+/// from there. Mirrors the JS client's `AccessRequestCreatedEvent`.
+public struct DocumentAccessRequestCreatedEvent: Decodable, Sendable, Equatable {
+    public let requestId: String
+    public let documentId: String
+    public let requesterId: String
+    /// `"read-write"` or `"reader"`.
+    public let requestedPermission: String
+    /// Always `"pending"`.
+    public let status: String
+    public let requesterEmail: String?
+    public let requesterName: String?
+    /// The requester's note, when they wrote one.
+    public let message: String?
+    /// When the request was made, ISO 8601.
+    public let createdAt: String?
+    public let title: String?
+    public let document: AccessRequestDocumentSummary?
+
+    public init(
+        requestId: String,
+        documentId: String,
+        requesterId: String,
+        requestedPermission: String,
+        status: String,
+        requesterEmail: String? = nil,
+        requesterName: String? = nil,
+        message: String? = nil,
+        createdAt: String? = nil,
+        title: String? = nil,
+        document: AccessRequestDocumentSummary? = nil
+    ) {
+        self.requestId = requestId
+        self.documentId = documentId
+        self.requesterId = requesterId
+        self.requestedPermission = requestedPermission
+        self.status = status
+        self.requesterEmail = requesterEmail
+        self.requesterName = requesterName
+        self.message = message
+        self.createdAt = createdAt
+        self.title = title
+        self.document = document
+    }
+}
+
+/// Payload for `.documentAccessRequestResolved`
+/// (`for await e in client.stream(for: DocumentAccessRequestResolvedEvent.self)`).
+///
+/// An access request was approved or denied. Sent to the requester and to
+/// every connected owner, whoever resolved it; a db3 request is also delivered
+/// as `Db3AccessRequestResolvedEvent`. `grantedPermission` is set only when
+/// `status` is `"approved"`. Mirrors the JS client's `AccessRequestResolvedEvent`.
+public struct DocumentAccessRequestResolvedEvent: Decodable, Sendable, Equatable {
+    public let requestId: String
+    public let documentId: String
+    public let requesterId: String
+    /// `"read-write"` or `"reader"`.
+    public let requestedPermission: String
+    /// `"approved"` or `"denied"`.
+    public let status: String
+    /// `"read-write"` or `"reader"`, when approved.
+    public let grantedPermission: String?
+    /// The user who approved or denied it.
+    public let resolvedBy: String?
+    /// When it was resolved, ISO 8601.
+    public let resolvedAt: String?
+    public let title: String?
+    public let document: AccessRequestDocumentSummary?
+
+    public init(
+        requestId: String,
+        documentId: String,
+        requesterId: String,
+        requestedPermission: String,
+        status: String,
+        grantedPermission: String? = nil,
+        resolvedBy: String? = nil,
+        resolvedAt: String? = nil,
+        title: String? = nil,
+        document: AccessRequestDocumentSummary? = nil
+    ) {
+        self.requestId = requestId
+        self.documentId = documentId
+        self.requesterId = requesterId
+        self.requestedPermission = requestedPermission
+        self.status = status
+        self.grantedPermission = grantedPermission
+        self.resolvedBy = resolvedBy
+        self.resolvedAt = resolvedAt
+        self.title = title
+        self.document = document
     }
 }
 

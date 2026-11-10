@@ -27,6 +27,10 @@ struct Db3SyncMarks: Sendable, Equatable {
     var createdLocally = false
     /// The db3 lives only on this device (#5155).
     var localOnly = false
+    /// The room's head as the store last heard it (#5221), or `nil`.
+    var knownHead: Int? = nil
+    /// When ``knownHead`` was heard (epoch ms), or `nil`.
+    var knownHeadAt: Int64? = nil
 
     /// js-bao's `isRecordLogResident`: it lives only on this device, or it
     /// was created here, or a load completed and no unstaged replacement is
@@ -118,6 +122,10 @@ struct Db3LifecycleDeps: Sendable {
     var storedIds: @Sendable () async throws -> [String] = { [] }
     /// Purge the db3's store; `force` drops writes the room has not judged.
     var purge: @Sendable (String, Bool) async -> Db3PurgeOutcome = { _, _ in Db3PurgeOutcome(purged: true) }
+    /// Clear the device's index policy for a db3 deleted here (#5322); an evict keeps it.
+    var clearIndexPolicy: @Sendable (String) async -> Void = { _ in }
+    /// Each index a bound db3's room places on this device, with how it stands here (#5322); `nil` when not bound.
+    var indexStatuses: @Sendable (String) async throws -> [Db3LocalIndex]? = { _ in nil }
     /// Unbind every db3.
     var unbindAll: @Sendable () async -> Void = {}
     /// Every db3 bound here now.
@@ -159,15 +167,19 @@ func db3LocalOnlyEvictError(_ db3Id: String) -> JsBaoError {
 }
 
 extension Db3State {
-    /// This state with its subscription, phase, progress and permission replaced.
+    /// This state with its subscription, phase, progress and permission
+    /// replaced; its drift, when it has one, `live` exactly when the phase is (#5221).
     func with(
         subscribed: Bool? = nil, phase: Db3Phase? = nil, progress: Db3Progress?? = nil, permission: Db3Permission?? = nil
     ) -> Db3State {
-        Db3State(
-            id: id, resident: resident, subscribed: subscribed ?? self.subscribed, phase: phase ?? self.phase,
+        let phase = phase ?? self.phase
+        return Db3State(
+            id: id, resident: resident, subscribed: subscribed ?? self.subscribed, phase: phase,
             progress: progress ?? self.progress, cursor: cursor, rows: rows, lastSyncAt: lastSyncAt,
             pendingWrites: pendingWrites, permission: permission ?? self.permission, error: error, pendingCreate: pendingCreate,
-            localOnly: localOnly
+            localOnly: localOnly,
+            drift: drift.map { Db3Drift(entriesBehind: $0.entriesBehind, asOf: $0.asOf, live: phase == .live, pendingWrites: $0.pendingWrites) },
+            indexes: phase == .gone ? nil : indexes
         )
     }
 }
@@ -447,6 +459,8 @@ final class Db3Lifecycle: @unchecked Sendable {
         if localDelete {
             endSubscriptions()
             lock.withLock { _ = active.remove(db3Id) }
+            // Only the db3's deletion clears the device's index policy for it (#5322).
+            await deps.clearIndexPolicy(db3Id)
         }
         await deps.forget(db3Id)
         lock.withLock {
@@ -1496,11 +1510,24 @@ final class Db3Lifecycle: @unchecked Sendable {
         let error: Db3StateError? = phase == .gone
             ? Db3StateError(code: gone.code.rawValue, message: gone.message)
             : openError ?? (pendingCreate ? deps.createRefusal(db3Id) : nil)
+        let cursor = stored?.cursor ?? marks?.cursor ?? 0
+        let pendingWrites = stored?.writers.reduce(0) { $0 + $1.pending } ?? 0
+        // How far behind the copy is (#5221), once the server's position was heard.
+        let knownHead = stored?.knownHead ?? marks?.knownHead
+        let knownHeadAt = stored?.knownHead != nil ? stored?.knownHeadAt : marks?.knownHeadAt
+        let drift = localOnly ? nil : knownHead.map { head in
+            Db3Drift(
+                entriesBehind: max(0, head - cursor), asOf: Date(timeIntervalSince1970: Double(knownHeadAt ?? 0) / 1000),
+                live: phase == .live, pendingWrites: pendingWrites
+            )
+        }
+        // The indexes placed on this device and how each stands (#5322), while the copy is bound here.
+        let indexes = bound && phase != .gone ? try await deps.indexStatuses(db3Id) : nil
         return Db3State(
             id: db3Id, resident: resident, subscribed: subscribed, phase: phase, progress: progress,
-            cursor: stored?.cursor ?? marks?.cursor ?? 0, rows: stored?.rows ?? 0, lastSyncAt: Self.date(lastSyncAt),
-            pendingWrites: stored?.writers.reduce(0) { $0 + $1.pending } ?? 0, permission: permission, error: error,
-            pendingCreate: pendingCreate, localOnly: localOnly
+            cursor: cursor, rows: stored?.rows ?? 0, lastSyncAt: Self.date(lastSyncAt),
+            pendingWrites: pendingWrites, permission: permission, error: error,
+            pendingCreate: pendingCreate, localOnly: localOnly, drift: drift, indexes: indexes
         )
     }
 

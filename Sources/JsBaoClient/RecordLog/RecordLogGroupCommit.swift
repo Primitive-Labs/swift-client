@@ -1,4 +1,5 @@
 import Foundation
+import JsBaoSQLite
 
 /// A storage provider that lets the record-log store group its saves into one
 /// commit.
@@ -167,6 +168,29 @@ final class RecordLogGroupCommit: @unchecked Sendable {
         depth += 1
         defer { depth -= 1 }
         return try body()
+    }
+
+    /// Run `body` as a read in one read transaction (#5221): a deferred
+    /// `BEGIN` … `COMMIT` of its own when nothing is open on the connection,
+    /// so every statement of it reads one snapshot; inside an open group, a
+    /// command or another read (or a transaction the connection holds) it
+    /// joins that one and commits nothing of its own.
+    func readTransaction<T>(_ connection: any Format2SqlConnection, _ body: () throws -> T) throws -> T {
+        let open = depth > 0 || groupOpen || connection.inTransaction
+            || connection.rawHandle.map { sqlite3_get_autocommit($0) == 0 } == true
+        if open { return try read(body) }
+        try connection.executeScript("BEGIN")
+        depth = 1
+        do {
+            let value = try body()
+            depth = 0
+            try connection.executeScript("COMMIT")
+            return value
+        } catch {
+            depth = 0
+            try? connection.executeScript("ROLLBACK")
+            throw error
+        }
     }
 
     private func nested<T>(_ listener: Listener?, _ body: () throws -> T) throws -> T {

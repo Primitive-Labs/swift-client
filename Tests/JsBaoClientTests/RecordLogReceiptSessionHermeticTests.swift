@@ -352,7 +352,8 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         // The pages from C complete the replacement: until they do, the marker stays.
         let during = h.marks
         XCTAssertEqual(during.cursor, 0)
-        XCTAssertEqual(during.receipt, RecordLogReceipt(kind: .segment, id: "G1"))
+        // Its chunk and corrections are the attempt's progress (#5267).
+        XCTAssertEqual(during.receipt, RecordLogReceipt(kind: .segment, id: "G1", done: 1, completed: true))
         XCTAssertTrue(during.replacing)
         XCTAssertEqual(try h.read("mine"), ["id": "mine", "title": "pending"], "the own guess holds through the receipt")
         await h.feed(H.page(rows: [H.row("c", ["title": "after C"])], lsn: 16))
@@ -402,7 +403,8 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         await until("the first reopen") { h.of("record.open").count == 2 }
         XCTAssertEqual(h.of("record.open")[1]["cursor"], 0)
         XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment", "building"])
-        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .load, id: Self.session1))
+        // The first chunk committed: the attempt records it (#5267).
+        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .load, id: Self.session1, done: 1, completed: false))
         XCTAssertTrue(lines.contains("[record-log] load receipt failed \(H.documentId): \(Self.session1) fetching ", level: .warn))
         XCTAssertFalse(lines.messages().contains { $0.contains("grant1/Note") && $0.contains("receipt failed") && $0.contains("/doc-artifact/grant1") },
                        "a log line shows the grant path as /doc-artifact/…")
@@ -552,7 +554,8 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
                 ])
             }
             await until("the reopen after \(answer)") { h.of("record.open").count == 2 }
-            XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .load, id: Self.session1), answer)
+            // Its chunk and completion ran before the remainder failed (#5267).
+            XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .load, id: Self.session1, done: 1, completed: true), answer)
             XCTAssertTrue(lines.contains("[record-log] load receipt failed \(H.documentId): \(Self.session1) ", level: .warn), answer)
         }
     }
@@ -574,7 +577,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         }
         XCTAssertEqual(h.of("record.open").dropFirst().first?["accepts"], ["load", "segment", "building"])
         XCTAssertEqual(h.of("record.open")[2]["accepts"], [])
-        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .segment, id: "G1"))
+        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .segment, id: "G1", done: 1, completed: true))
     }
 
     func testAReopenedStoreHoldingTheMarkerWalksTheTableWhenTheRoomAnswersPagedRows() async throws {
@@ -740,7 +743,7 @@ final class RecordLogReceiptSessionHermeticTests: XCTestCase {
         // The socket drops while the second chunk is on its way (edge 008: the next open starts from idle, marker set).
         await h.session.disconnected()
         h.connection.intercept(nil)
-        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .load, id: Self.session1))
+        XCTAssertEqual(h.marks.receipt, RecordLogReceipt(kind: .load, id: Self.session1, done: 1, completed: false))
         await h.session.start()
         XCTAssertEqual(h.of("record.open").count, 2)
         // The marker is set: the rows answer is walked as a full replacement, and the room has no "refused".

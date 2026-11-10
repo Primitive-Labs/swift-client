@@ -35,6 +35,7 @@ final class Db3IngestsHermeticTests: XCTestCase {
         return text.replacingOccurrences(of: boundary, with: "<boundary>")
     }
 
+    @available(*, deprecated)
     func testEachCallIsTheDocumentsCallOnTheDb3Mount() async throws {
         let ours = transport()
         let theirs = transport()

@@ -10,6 +10,7 @@ import XCTest
 /// actually attempted fails in transit as `JsBaoNetworkError`. So `.offline`
 /// coming back means the gate answered before the request went out, and
 /// `JsBaoNetworkError` means it was attempted.
+@available(*, deprecated)
 final class OfflineRequestGateHermeticTests: XCTestCase {
 
     private func makeClient(monitor: FakeConnectivityMonitor? = nil) -> JsBaoClient {

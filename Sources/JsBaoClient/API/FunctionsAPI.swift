@@ -106,6 +106,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// change what the function runs. A `nil` input omits `rootInput` (the server supplies `{}`); an
     /// input that fails to encode throws `.invalidArgument` before any request
     /// is made.
+    /// - Stability: production
     public func invoke<Input: Encodable, Output: Decodable & Sendable>(
         _ functionKey: String,
         input: Input?,
@@ -148,6 +149,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// As with `invoke`, the untyped `[String: Any]` twin #3278 shipped is
     /// gone (#3344): call a generated `<Key>Function`, or name the witness
     /// (`start(key, input: nil as JSONValue?)`) for a dynamic one.
+    /// - Stability: production
     @discardableResult
     public func start<Input: Encodable>(
         _ functionKey: String,
@@ -182,6 +184,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// A task run that has a slice record also carries `slice` (#3388): its
     /// refresh count, the current slice's 12-hour ceiling and how the slice
     /// settled. `nil` for a request invocation and for a DSL run.
+    /// - Stability: production
     public func getStatus(runId: String) async throws -> FunctionRunStatus {
         guard !runId.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "runId is required for functions.getStatus")
@@ -220,6 +223,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     }
 
     /// Typed `getStatus`: `output` decoded into `Output`.
+    /// - Stability: production
     public func getStatus<Output: Decodable & Sendable>(
         runId: String
     ) async throws -> FunctionRunResult<Output> {
@@ -263,6 +267,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// finalization window) is re-checked on a short timer and settles from the
     /// record after the bounded re-check. Cancelling the surrounding `Task`
     /// throws `CancellationError` promptly and stops polling.
+    /// - Stability: production
     public func waitFor(
         runId: String,
         options: FunctionWaitOptions? = nil
@@ -358,6 +363,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     }
 
     /// Typed `waitFor`: `output` decoded into `Output`, nil when absent.
+    /// - Stability: production
     public func waitFor<Output: Decodable & Sendable>(
         runId: String,
         as outputType: Output.Type,
@@ -381,6 +387,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// GETs `functions/runs` with the JS client's query, in its order —
     /// `functionKey`, `contextDocId`, `status`, `limit`, `cursor`, `forward`
     /// (sent only when `true`).
+    /// - Stability: production
     public func listRuns(
         options: FunctionRunListOptions = FunctionRunListOptions()
     ) async throws -> FunctionRunPage {
@@ -407,6 +414,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// `.invalidArgument` for an empty `runId`, and `.notFound` with
     /// `Function run <id> not found` for a run id that does not exist or names
     /// a run another user started.
+    /// - Stability: production
     public func listRunSteps(runId: String) async throws -> FunctionRunSteps {
         guard !runId.isEmpty else {
             throw JsBaoError(
@@ -444,6 +452,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// engine's diagnostic verbatim, because a live run the engine could not
     /// stop is not a run that does not exist, and discarding what the engine
     /// said would leave a caller with nothing to act on.
+    /// - Stability: production
     @discardableResult
     public func terminate(_ ref: FunctionRunRef) async throws -> FunctionRunStatus {
         guard !ref.functionKey.isEmpty else {
@@ -487,6 +496,7 @@ public final class FunctionsAPI: @unchecked Sendable {
 
     /// Typed `terminate`: a terminated run can carry partial output, decoded
     /// into `Output`.
+    /// - Stability: production
     public func terminate<Output: Decodable & Sendable>(
         _ ref: FunctionRunRef
     ) async throws -> FunctionRunResult<Output> {

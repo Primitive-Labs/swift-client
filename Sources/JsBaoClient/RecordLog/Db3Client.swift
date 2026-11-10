@@ -39,6 +39,11 @@ extension JsBaoClient {
             storedState: { [weak self] id in try await self?.db3StoredState(id) },
             storedIds: { [weak self] in try await self?.db3StoredIds() ?? [] },
             purge: { [weak self] id, force in await self?.db3Purge(id, force: force) ?? Db3PurgeOutcome(purged: false) },
+            clearIndexPolicy: { [weak self] id in await self?.clearDb3IndexPolicy(id) },
+            indexStatuses: { [weak self] id in
+                guard let binding = self?.recordLogBinding(id), !binding.isClosed else { return nil }
+                return try binding.store.localIndexes()
+            },
             unbindAll: { [weak self] in await self?.unbindAllDb3s() },
             boundIds: { [weak self] in self?.recordLogState.bindings.map(\.0) ?? [] },
             identityPending: { [weak self] in self?.db3IdentityOutgoing ?? false },
@@ -144,6 +149,36 @@ extension JsBaoClient {
         _ = try await openDocument(documentId, options: OpenDocumentOptions(waitForLoad: .local, enableNetworkSync: true), door: nil)
     }
 
+    /// The user a create is made for, once no identity change is in progress
+    /// (a sign-out, another user's sign-in), so what it keeps here is kept in
+    /// that user's storage, never in the previous user's that the change is
+    /// about to reset (#5204). The user is read when the create is called: a
+    /// further change beginning meanwhile is waited for too while the same
+    /// user stays signed in, and one that signs another user in, or signs out,
+    /// throws `.invalidArgument`, so nothing of the create reaches that user.
+    func db3CreateUserSettled() async throws -> String {
+        guard let userId = authController.getUserId(), !userId.isEmpty else {
+            throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
+        }
+        while true {
+            let settled: Bool
+            do {
+                try await db3IdentityRelease.wait()
+                settled = true
+            } catch {
+                settled = false
+            }
+            guard authController.getUserId() == userId else {
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "client.db3.create: the signed-in user changed before the db3 was kept",
+                    details: ["reason": .string("identity-changed")]
+                )
+            }
+            if settled { return userId }
+        }
+    }
+
     /// Close a db3 on the socket for its last subscription: its session stops,
     /// the room is told it unsubscribed, and its store stays bound.
     func closeDb3ForSubscriptions(_ documentId: String) async {
@@ -176,12 +211,12 @@ extension JsBaoClient {
     /// and queries work at once. `commitNow` starts the commit (an online
     /// create whose request failed in a way worth retrying); otherwise the
     /// next online transition commits it. Answers the db3 as the route will.
+    /// Made during an identity change, it is kept once the change settled,
+    /// unless the change signed the caller out.
     func createPendingDb3(
         _ db3Id: String, title: String, type: String?, tags: [String]?, metadata: JSONValue?, commitNow: Bool
     ) async throws -> Db3Info {
-        guard let userId = authController.getUserId(), !userId.isEmpty else {
-            throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
-        }
+        let userId = try await db3CreateUserSettled()
         let entry = try await documentManager.createLocalDocument(
             documentId: db3Id, title: title, localOnly: false, tags: tags, docMetadata: metadata,
             documentFormat: RecordLogTransport.documentFormat, db3Create: true, db3Type: type
@@ -205,11 +240,11 @@ extension JsBaoClient {
     /// unaccounted, never committed, never opened with sync) and its store is
     /// bound and marked local-only, so it judges and confirms its own writes.
     /// Nothing is sent. `Db3CreatedEvent` fires once. A device that cannot
-    /// keep it creates nothing: the call throws the storage's refusal.
+    /// keep it creates nothing: the call throws the storage's refusal. Made
+    /// during an identity change, it is kept once the change settled, unless
+    /// the change signed the caller out.
     func createLocalOnlyDb3(_ db3Id: String, title: String, tags: [String]?, metadata: JSONValue?) async throws -> Db3Info {
-        guard let userId = authController.getUserId(), !userId.isEmpty else {
-            throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
-        }
+        let userId = try await db3CreateUserSettled()
         if let refusal = await db3StorageRefusal(db3Id) { throw refusal }
         let entry = try await documentManager.createLocalDocument(
             documentId: db3Id, title: title, localOnly: true, tags: tags, docMetadata: metadata,
@@ -372,6 +407,39 @@ extension JsBaoClient {
         return JsBaoError(code: refused.code, message: refused.message, details: details)
     }
 
+    /// The indexes the db3's room places on this device, with how each stands
+    /// here (#5322, `client.db3.indexes.local`): read from the bound store, so
+    /// nothing is sent. `.db3NotResident` for a db3 not bound here.
+    func deviceDb3Indexes(_ documentId: String) async throws -> [Db3LocalIndex] {
+        guard let binding = recordLogBinding(documentId), !binding.isClosed else { throw db3NotResidentError([documentId]) }
+        return try binding.withOperation { try binding.store.localIndexes() }
+    }
+
+    /// The entries of the db3's room's list its copy here skipped, with why
+    /// (#5241, `client.db3.indexes.skipped`): read from the bound store, so
+    /// nothing is sent. `.db3NotResident` for a db3 not bound here, as `local` is.
+    func deviceDb3IndexSkips(_ documentId: String) async throws -> [Db3SkippedIndex] {
+        guard let binding = recordLogBinding(documentId), !binding.isClosed else { throw db3NotResidentError([documentId]) }
+        return try binding.withOperation { try binding.store.localIndexSkips() }
+    }
+
+    /// Decline or accept an index on this device (#5322,
+    /// `client.db3.indexes.decline`/`accept`): the store drops or builds it in
+    /// the one call, its state is read again, and nothing is sent.
+    func changeDeviceDb3Index(_ documentId: String, name: String, decline: Bool) async throws -> Db3LocalIndex {
+        guard let binding = recordLogBinding(documentId), !binding.isClosed else { throw db3NotResidentError([documentId]) }
+        let status: Db3LocalIndex
+        do {
+            status = try binding.withOperation { decline ? try binding.store.declineIndex(name) : try binding.store.acceptIndex(name) }
+        } catch {
+            throw localIndexRefusal(documentId, error)
+        }
+        // A vector entry built or dropped: what its model wants is evaluated again (#5230).
+        binding.vectorsChanged(.list)
+        _db3Lifecycle.indexesChanged(documentId)
+        return status
+    }
+
     /// A local-only db3's index list, kept on the device (#5155).
     func localDb3Indexes(_ documentId: String) async throws -> [Db3Index] {
         try await boundLocalOnlyDb3(documentId).localIndexes
@@ -442,7 +510,7 @@ extension JsBaoClient {
         return Db3SyncMarks(
             cursor: marks.cursor, permission: marks.permission, lastCatchUpAt: marks.lastCatchUpAt,
             replacing: marks.replacing, staged: marks.staged, createdLocally: binding.createdLocally,
-            localOnly: marks.localOnly
+            localOnly: marks.localOnly, knownHead: marks.knownHead, knownHeadAt: marks.knownHeadAt
         )
     }
 
@@ -599,6 +667,7 @@ extension JsBaoClient {
     /// Unbind every db3 bound here (a logout, another user).
     func unbindAllDb3s() async {
         db3IndexRefresher?.rebindAll()
+        db3VectorModels?.forgetAll()
         for (documentId, _) in recordLogState.bindings { await unbindRecordLogDocument(documentId) }
     }
 
@@ -631,6 +700,21 @@ extension JsBaoClient {
         let empty = state.cursor == 0 && state.rows == 0 && state.writers.isEmpty && state.lastCatchUpAt == nil && !state.replacing
             && !state.localOnly
         return empty ? nil : state
+    }
+
+    /// Clear the device's index policy for a db3 deleted by this client
+    /// (#5322): only `client.db3.delete` does; an evict keeps it.
+    func clearDb3IndexPolicy(_ documentId: String) async {
+        guard let host = await db3Host() else { return }
+        do {
+            try host.withConnection { connection in
+                guard try !connection.query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'record_log_index_policy'", []).isEmpty
+                else { return }
+                try connection.execute("DELETE FROM record_log_index_policy WHERE doc_id = ?", [.text(documentId)])
+            }
+        } catch {
+            logger.warn("[db3] \(documentId): its index policy was not cleared:", error.localizedDescription)
+        }
     }
 
     /// Purge a db3's store; unforced, refused while it holds unjudged writes.

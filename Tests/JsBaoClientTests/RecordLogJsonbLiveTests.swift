@@ -160,7 +160,7 @@ final class RecordLogJsonbLiveTests: XCTestCase {
                 try connection.query("SELECT rows_gen FROM record_log_state WHERE doc_id = ?", [.text(documentId)]).first
             )
         }
-        XCTAssertEqual(after.0, "4")
+        XCTAssertEqual(after.0, String(RecordLogSchema.storageVersion))
         XCTAssertEqual(try count(store, "record_log_rows", documentId), 40)
         XCTAssertEqual(try notJsonb(store, "record_log_rows", documentId), 0, "the confirmed rows are JSONB without id")
         XCTAssertEqual(try notJsonb(store, "record_log_view", documentId), 0, "the view rows are JSONB without id")

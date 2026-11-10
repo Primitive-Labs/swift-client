@@ -382,7 +382,7 @@ final class AuthEndpointCaptureURLProtocol: URLProtocol {
             "/auth/otp/verify",
             "/passkey/auth/start",
             "/passkey/auth/finish",
-            "/oauth-config",
+            "/settings/sign-in",
         ].contains { path.hasSuffix($0) }
     }
 

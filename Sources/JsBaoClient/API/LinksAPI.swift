@@ -134,6 +134,7 @@ public final class LinksAPI: @unchecked Sendable {
     /// (`myapp://document/abc` or `myapp:///document/abc`) are
     /// understood; for custom schemes the URL "host" is treated as the
     /// first path segment.
+    /// - Stability: production
     public func parse(url: URL) -> LinkTarget {
         // Origin guard: only treat a web link's query/path as a trusted
         // Primitive link when it comes from a host we recognize. Without
@@ -190,6 +191,7 @@ public final class LinksAPI: @unchecked Sendable {
     /// links were removed (#1168) every target parses purely — this is
     /// now equivalent to `parse(url:)`. The `async throws` signature is
     /// kept so existing `try await` call sites stay source-compatible.
+    /// - Stability: production
     public func resolve(url: URL) async throws -> LinkTarget {
         return parse(url: url)
     }
@@ -200,6 +202,7 @@ public final class LinksAPI: @unchecked Sendable {
     /// `application(_:continue:restorationHandler:)`). Extracts the
     /// activity's `webpageURL` and resolves it. Throws
     /// `JsBaoError(.invalidArgument)` when the activity carries no URL.
+    /// - Stability: production
     public func resolve(userActivity: NSUserActivity) async throws -> LinkTarget {
         guard let url = userActivity.webpageURL else {
             throw JsBaoError(
@@ -222,6 +225,7 @@ public final class LinksAPI: @unchecked Sendable {
     /// so an alias-based link cannot work as a share URL.
     ///
     /// Returns `nil` until `appBaseURL` is configured.
+    /// - Stability: production
     public func shareURL(forDocument documentId: String) -> URL? {
         guard let base = appBaseURL, !documentId.isEmpty else { return nil }
         let encoded = encodePathSegment(documentId)
@@ -235,6 +239,7 @@ public final class LinksAPI: @unchecked Sendable {
     /// default `app-invite` email template.
     ///
     /// Returns `nil` until `appBaseURL` is configured.
+    /// - Stability: production
     public func inviteAcceptURL(inviteToken: String) -> URL? {
         guard let base = appBaseURL, !inviteToken.isEmpty else { return nil }
         var components = URLComponents(

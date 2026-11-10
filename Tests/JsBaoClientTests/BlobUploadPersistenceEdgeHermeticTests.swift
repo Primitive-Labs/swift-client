@@ -91,6 +91,7 @@ final class BlobUploadPersistenceEdgeHermeticTests: XCTestCase {
 
     // MARK: - Behavior 19: storage that binds after the upload is queued
 
+    @available(*, deprecated)
     func testAnUploadQueuedBeforeStorageBindsIsWrittenWhenItBindsAndRestoredLater() async throws {
         let path = try databasePath()
         let store = OfflineStore()
@@ -178,6 +179,7 @@ final class BlobUploadPersistenceEdgeHermeticTests: XCTestCase {
 
     // MARK: - Edge: the same user out and in after a restore
 
+    @available(*, deprecated)
     func testTheSameUserSigningOutAndInKeepsTheRestoredTaskInMemoryOnce() async throws {
         let path = try databasePath()
         try await UploadRows.seed(path, Self.record("B-R", nextAttemptAt: 0), bytes: Self.bytes)
@@ -221,6 +223,7 @@ final class BlobUploadPersistenceEdgeHermeticTests: XCTestCase {
 
     // MARK: - Edge: nobody signed in
 
+    @available(*, deprecated)
     func testAnUploadQueuedWithNobodySignedInIsNotPersisted() async throws {
         let path = try databasePath()
         let first = try server(Self.busy)
@@ -261,6 +264,7 @@ final class BlobUploadPersistenceEdgeHermeticTests: XCTestCase {
 
     // MARK: - Edge: pause then resume, back to back
 
+    @available(*, deprecated)
     func testPauseThenResumeBackToBackStoresPending() async throws {
         let path = try databasePath()
         let first = try server(Self.busy)
@@ -279,6 +283,7 @@ final class BlobUploadPersistenceEdgeHermeticTests: XCTestCase {
 
     // MARK: - Edge: logout with a wipe
 
+    @available(*, deprecated)
     func testLogoutWithAWipeLeavesThePersistedUploadsAndTheSameUserReadoptsThem() async throws {
         let path = try databasePath()
         let first = try server(Self.busy)

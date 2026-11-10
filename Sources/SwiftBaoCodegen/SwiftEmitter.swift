@@ -99,7 +99,8 @@ struct SwiftEmitter {
         out += "            data: PrimitiveRowDecoder.decodeAll(page.data, as: \(typeName).self),\n"
         out += "            nextCursor: page.nextCursor,\n"
         out += "            prevCursor: page.prevCursor,\n"
-        out += "            hasMore: page.hasMore\n"
+        out += "            hasMore: page.hasMore,\n"
+        out += "            drift: page.drift\n"
         out += "        )\n"
         out += "    }\n\n"
         out += "    /// Paginated query with query-time relationship includes.\n"
@@ -110,12 +111,14 @@ struct SwiftEmitter {
         out += "            data: PrimitiveRowDecoder.decodeAll(page.data, as: \(typeName).self),\n"
         out += "            nextCursor: page.nextCursor,\n"
         out += "            prevCursor: page.prevCursor,\n"
-        out += "            hasMore: page.hasMore\n"
+        out += "            hasMore: page.hasMore,\n"
+        out += "            drift: page.drift\n"
         out += "        )\n"
         out += "    }\n\n"
-        out += "    /// Count across all open documents.\n"
-        out += "    static func count(_ filter: DocumentFilter? = nil) throws -> Int {\n"
-        out += "        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)\n"
+        out += "    /// Count across all open documents. `options.maxDrift` refuses a\n"
+        out += "    /// db3's count `DB3_DRIFT_EXCEEDED` as a page is.\n"
+        out += "    static func count(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {\n"
+        out += "        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter, options: options)\n"
         out += "    }\n\n"
         out += "    /// Every record across all open documents. Synchronous like the\n"
         out += "    /// rest of the facade reads (#1156) — the shared store never\n"
@@ -793,7 +796,8 @@ struct SwiftEmitter {
                 out += "            data: PrimitiveRowDecoder.decodeAll(page.data, as: \(targetType).self),\n"
                 out += "            nextCursor: page.nextCursor,\n"
                 out += "            prevCursor: page.prevCursor,\n"
-                out += "            hasMore: page.hasMore\n"
+                out += "            hasMore: page.hasMore,\n"
+                out += "            drift: page.drift\n"
                 out += "        )\n"
                 out += "    }\n\n"
                 out += "    /// Typed query-time include payload for `\(rname)`, when present in `related`.\n"
@@ -989,6 +993,9 @@ struct SwiftEmitter {
         if let s = f.autoStamp {
             args.append("autoStamp: .\(s.rawValue)")
         }
+        // A vector field's encoding (#5225), last as the initializer takes it.
+        if let dims = f.dims { args.append("dims: \(dims)") }
+        if let element = f.element { args.append("element: .\(element)") }
         return "FieldDescriptor(\(args.joined(separator: ", ")))"
     }
 
@@ -1000,6 +1007,7 @@ struct SwiftEmitter {
         case .date:      return ".date"
         case .id:        return ".id"
         case .stringset: return ".stringset"
+        case .vector:    return ".vector"
         }
     }
 
@@ -1124,6 +1132,7 @@ struct SwiftEmitter {
         case .number:              base = "Double"
         case .boolean:             base = "Bool"
         case .stringset:           base = "Set<String>"
+        case .vector:              base = "[Float]"
         }
         let nonOptional = (f.type == .id) || f.required || (fieldName == "id")
         return nonOptional ? base : "\(base)?"
@@ -1221,6 +1230,7 @@ struct SwiftEmitter {
         case .id:        return "asId"
         case .date:      return "asDateString"
         case .stringset: return "asStringSet"
+        case .vector:    return "asVector"
         }
     }
 
@@ -1294,6 +1304,7 @@ struct SwiftEmitter {
         case .number:              return "numberValue"
         case .boolean:             return "rowBoolValue"
         case .stringset:           return "stringArrayValue"  // unused; see rowReadExpression
+        case .vector:              return "floatArrayValue"
         }
     }
 
@@ -1348,6 +1359,7 @@ struct SwiftEmitter {
         case .id:        return ".id(\(propRef))"
         case .date:      return ".date(\(propRef))"
         case .stringset: return ".stringset(\(propRef))"
+        case .vector:    return ".vector(\(propRef))"
         }
     }
 

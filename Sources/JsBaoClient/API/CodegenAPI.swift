@@ -60,6 +60,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// position), so when the owning client has been released it returns a
     /// detached target whose `query` throws `.unavailable` — the include fails
     /// where it is resolved, with a message, rather than trapping here.
+    /// - Stability: production
     public func includeTarget(for schema: PrimitiveSchema) -> any IncludeTarget {
         guard let client else { return DetachedIncludeTarget(modelName: schema.name) }
         return client.sharedModel(for: schema)
@@ -68,6 +69,7 @@ public final class CodegenAPI: @unchecked Sendable {
     // MARK: - Reads
 
     /// Cross-document query → raw rows. The facade maps rows to the model type.
+    /// - Stability: production
     public func query(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -79,6 +81,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Cross-document query with query-time relationship includes. Returns raw
     /// rows with related records attached under `_related`, matching JS
     /// `BaseModel.query(filter, { include })`.
+    /// - Stability: production
     public func query(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -95,6 +98,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// actually obtain the next page. Mirrors js-bao's `BaseModel.query()`
     /// return shape (#946); ``query(_:filter:options:)`` stays the flat-array
     /// convenience.
+    /// - Stability: production
     public func queryPaged(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -104,6 +108,7 @@ public final class CodegenAPI: @unchecked Sendable {
     }
 
     /// Cross-document paginated query with query-time relationship includes.
+    /// - Stability: production
     public func queryPaged(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -114,20 +119,25 @@ public final class CodegenAPI: @unchecked Sendable {
             .queryPaged(filter, options: options, include: include)
     }
 
-    /// Cross-document count.
-    public func count(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil) throws -> Int {
-        try requireClient("count").sharedModel(for: schema).count(filter)
+    /// Cross-document count. `options` scopes it (`documents`, `db3`) and
+    /// bounds a db3's drift (`maxDrift`, refused `DB3_DRIFT_EXCEEDED` as a
+    /// page is, #5221); sort and paging do not apply to a count.
+    /// - Stability: production
+    public func count(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
+        try requireClient("count").sharedModel(for: schema).count(filter, options: options)
     }
 
     /// First record with `id` across every open doc (raw row), or `nil`.
     /// Answers `nil` once the owning client has been released — the same
     /// answer it gives for a record that isn't there.
+    /// - Stability: production
     public func find(_ schema: PrimitiveSchema, id: String) -> [String: JSONValue]? {
         client?.sharedModel(for: schema).find(id: id)?.row
     }
 
     /// First record matching a unique `constraint` and `value` across every
     /// open doc (raw row), or `nil`. Mirrors js-bao's `BaseModel.findByUnique`.
+    /// - Stability: production
     public func findByUnique(
         _ schema: PrimitiveSchema, constraint: String, value: PrimitiveValue
     ) throws -> [String: JSONValue]? {
@@ -137,6 +147,7 @@ public final class CodegenAPI: @unchecked Sendable {
 
     /// First record matching `filter` across every open doc (raw row), or
     /// `nil` — `query(...).first`. Mirrors js-bao's `BaseModel.queryOne`.
+    /// - Stability: production
     public func queryOne(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -155,6 +166,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// overloads stay consistent with each other; the include resolver runs over
     /// the full match set and the first row (with its `_related`) is returned. A
     /// filter that matches nothing returns `nil` with no related decode.
+    /// - Stability: production
     public func queryOne(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -166,6 +178,7 @@ public final class CodegenAPI: @unchecked Sendable {
     }
 
     /// Aggregate (group / count / sum / avg / …) across every open document.
+    /// - Stability: production
     public func aggregate(
         _ schema: PrimitiveSchema, options: AggregateOptions
     ) throws -> [[String: JSONValue]] {
@@ -180,6 +193,7 @@ public final class CodegenAPI: @unchecked Sendable {
     ///
     /// Once the owning client has been released there is nothing left to
     /// observe, so this registers nothing and returns a no-op unsubscribe.
+    /// - Stability: production
     public func subscribe(
         _ schema: PrimitiveSchema, _ callback: @escaping @Sendable () -> Void
     ) -> @Sendable () -> Void {
@@ -207,6 +221,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// write keep whatever another device put there, and on an insert the
     /// schema defaults and `auto_stamp` values are filled in. The generated
     /// `save(in:)` rebuilds its return value from this (#2459).
+    /// - Stability: production
     @discardableResult
     public func save(
         _ schema: PrimitiveSchema, id: String,
@@ -221,6 +236,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// (format-3) document, with `confirm: true`, return once the room has
     /// acknowledged the save — throwing the hand-back's error when it refuses
     /// it. See `DynamicModel.save(id:values:changedFields:confirm:)`.
+    /// - Stability: production
     @discardableResult
     public func save(
         _ schema: PrimitiveSchema, id: String,
@@ -238,6 +254,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// `options.confirm` it returns once the room acknowledged the save,
     /// throwing its refusal. On any other document the options are ignored.
     /// See `DynamicModel.save(id:values:changedFields:options:)`.
+    /// - Stability: production
     @discardableResult
     public func save(
         _ schema: PrimitiveSchema, id: String,
@@ -266,6 +283,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// - Parameter changedFields: the fields the caller actually assigned
     ///   (see ``save(_:id:values:in:changedFields:)``). Applies to the merge
     ///   path only; the insert path writes every supplied value.
+    /// - Stability: production
     @discardableResult
     public func upsert(
         _ schema: PrimitiveSchema, id: String,
@@ -304,6 +322,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// - Parameter changedFields: the fields the caller actually assigned
     ///   (see ``save(_:id:values:in:changedFields:)``). Applies to the merge
     ///   path only; the insert path writes every supplied value.
+    /// - Stability: production
     @discardableResult
     public func upsertByUnique(
         _ schema: PrimitiveSchema, id: String,
@@ -326,6 +345,7 @@ public final class CodegenAPI: @unchecked Sendable {
     }
 
     /// Delete a record from document `docId`. Throws if the doc isn't open.
+    /// - Stability: production
     public func delete(_ schema: PrimitiveSchema, id: String, in docId: String) throws {
         try requireClient("delete").requireMember(schema, in: docId).delete(id: id)
     }
@@ -333,6 +353,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Delete a record from document `docId` with a db3 write's
     /// `options.condition` and `options.confirm`; with neither, it deletes as
     /// ``delete(_:id:in:)`` does. See `DynamicModel.delete(id:options:)`.
+    /// - Stability: production
     public func delete(
         _ schema: PrimitiveSchema, id: String, in docId: String,
         options: Db3WriteOptions
@@ -347,6 +368,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// the document's view does not hold throws `.db3RecordNotFound`; a
     /// document that is not a db3 throws `.invalidArgument`. See
     /// `DynamicModel.increment(id:fields:options:)`.
+    /// - Stability: production
     @discardableResult
     public func increment(
         _ schema: PrimitiveSchema, id: String, fields: [String: Double], in docId: String,
@@ -376,6 +398,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Returns the target's raw row, or `nil` when the FK is unset or
     /// points at a missing record. Mirrors JS `generateRefersToMethod`
     /// (`targetModelClass.find(relatedId)`).
+    /// - Stability: production
     public func refersTo(
         target: PrimitiveSchema,
         foreignKey sourceForeignKey: String?
@@ -389,6 +412,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// optional `orderByField` / `orderDirection` sort. Returns raw rows.
     /// Mirrors JS `generateHasManyMethod`
     /// (`targetModelClass.query({ [relatedIdField]: this.id }, { sort })`).
+    /// - Stability: production
     public func hasMany(
         target: PrimitiveSchema,
         relatedIdField: String,
@@ -410,6 +434,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// in **target `id ASC`** — the declared join order governs which rows are
     /// selected, not the final order. Mirrors JS `generateHasManyThroughMethod`
     /// (sort join leg → `query({ id: { $in } })` → `id ASC` tiebreaker).
+    /// - Stability: production
     public func hasManyThrough(
         target: PrimitiveSchema,
         joinModel: PrimitiveSchema,
@@ -461,6 +486,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// "a prevCursor is present".
     ///
     /// A non-positive `limit` returns an empty page without querying.
+    /// - Stability: production
     public func hasManyThrough(
         target: PrimitiveSchema,
         joinModel: PrimitiveSchema,
@@ -502,17 +528,19 @@ public final class CodegenAPI: @unchecked Sendable {
         guard !relatedIds.isEmpty else {
             return PagedQueryResult(
                 data: [], nextCursor: joinPage.nextCursor,
-                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore, drift: joinPage.drift
             )
         }
-        let rows = try query(
+        // A page of the target, so its drift comes with its rows (#5221).
+        let targets = try queryPaged(
             target,
             filter: ["id": ["$in": .array(relatedIds.map { .string($0) })]],
             options: nil
         )
         return PagedQueryResult(
-            data: rows.map(PrimitiveRow.init(raw:)), nextCursor: joinPage.nextCursor,
-            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+            data: targets.data, nextCursor: joinPage.nextCursor,
+            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore,
+            drift: mergedDrift(joinPage.drift, targets.drift)
         )
     }
 }

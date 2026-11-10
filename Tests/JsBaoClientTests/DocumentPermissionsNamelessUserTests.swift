@@ -16,6 +16,7 @@ import XCTest
 /// premise that suite's fixture asserts — that the server omits the key — and
 /// mirrors the JS pin in
 /// `tests/client/js-bao-client-document-permissions-nameless-user.test.ts`.
+@available(*, deprecated)
 final class DocumentPermissionsNamelessUserTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

@@ -468,8 +468,9 @@ final class ActorizedWebSocketManagerTests: XCTestCase {
                 body.contains(region.mustContain),
                 "\(region.name): the slice must be the region under test"
             )
-            XCTAssertFalse(
-                body.contains("await"),
+            // A whole-word match: `awaitingReady` (#5578) is a state field, not a suspension.
+            XCTAssertNil(
+                body.range(of: #"\bawait\b"#, options: .regularExpression),
                 "\(region.name) must not suspend between its state read and its commit:\n\(body)"
             )
         }

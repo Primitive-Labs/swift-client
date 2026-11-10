@@ -6,7 +6,7 @@ import XCTest
 /// `tests/client/db3-residency-4698.test.ts`:
 ///
 /// - 17: a resident, unsubscribed db3 answers the model API and
-///   `documents.records` from its store and queues writes; the room delivers
+///   `db3.records` from its store and queues writes; the room delivers
 ///   nothing to it while unsubscribed; the next subscribe opens from the stored
 ///   cursor, and the queued writes land as an offline write's through the open
 ///   door do.
@@ -118,7 +118,7 @@ final class Db3ResidencyLiveTests: XCTestCase {
         XCTAssertEqual(try titles(x, QueryOptions(db3: [id])), ["kept", "queued offline"])
         XCTAssertEqual(try x.sharedModel(for: Self.note).count(nil, options: QueryOptions(db3: [id])), 2)
         XCTAssertEqual(x.sharedModel(for: Self.note).find(id: keep)?.row["title"]?.stringValue, "kept")
-        let page = try x.documents.records(id).query("Note")
+        let page = try x.db3.records(id).query("Note")
         XCTAssertEqual(page.data.compactMap { $0.raw["title"]?.stringValue }.sorted(), ["kept", "queued offline"])
 
         // The next subscribe opens from the stored cursor; nothing is replaced whole.
@@ -185,7 +185,7 @@ final class Db3ResidencyLiveTests: XCTestCase {
             XCTAssertEqual(error.details?["documents"], .array([.string(big)]))
         }
         XCTAssertEqual(code { try self.save(x, big, "into it") }, "DB3_NOT_RESIDENT")
-        let records = x.documents.records(big)
+        let records = x.db3.records(big)
         XCTAssertEqual(code { _ = try records.get("Note", id: "p000001") }, "DB3_NOT_RESIDENT")
         XCTAssertEqual(code { _ = try records.query("Note") }, "DB3_NOT_RESIDENT")
         XCTAssertEqual(code { _ = try records.count("Note") }, "DB3_NOT_RESIDENT")
@@ -205,7 +205,7 @@ final class Db3ResidencyLiveTests: XCTestCase {
         let reopened = try await x2.db3.state(big)
         XCTAssertFalse(reopened.resident)
         XCTAssertTrue(reopened.subscribed == false)
-        let again = x2.documents.records(big)
+        let again = x2.db3.records(big)
         XCTAssertEqual(code { _ = try again.get("Note", id: "p000001") }, "DB3_NOT_RESIDENT")
         XCTAssertEqual(code { _ = try again.query("Note") }, "DB3_NOT_RESIDENT")
         XCTAssertEqual(code { _ = try again.count("Note") }, "DB3_NOT_RESIDENT")
@@ -236,7 +236,7 @@ final class Db3ResidencyLiveTests: XCTestCase {
         XCTAssertNil(waiting.availableResult)
         let unloaded = try await x.db3.state(neverLoaded)
         XCTAssertFalse(unloaded.resident)
-        let records = x.documents.records(neverLoaded)
+        let records = x.db3.records(neverLoaded)
         XCTAssertEqual(code { _ = try records.query("Note") }, "DB3_NOT_RESIDENT")
         XCTAssertEqual(code { _ = try records.count("Note") }, "DB3_NOT_RESIDENT")
         stopNever()
@@ -258,7 +258,7 @@ final class Db3ResidencyLiveTests: XCTestCase {
                 let got = await db3Outcome { try await handle.available() }
                 XCTAssertEqual(got, "resolved")
             }
-            let answered = try x.documents.records(id).query("Note").data.compactMap { $0.raw["title"]?.stringValue }
+            let answered = try x.db3.records(id).query("Note").data.compactMap { $0.raw["title"]?.stringValue }
             XCTAssertEqual(answered, id == empty ? [] : ["one"])
             stop()
             handle.dispose()
@@ -280,7 +280,7 @@ final class Db3ResidencyLiveTests: XCTestCase {
             let got = await db3Outcome { try await handle.available() }
             XCTAssertEqual(got, "resolved")
         }
-        XCTAssertEqual(try x.documents.records(local).get("Note", id: first)?.raw["title"]?.stringValue, "first")
+        XCTAssertEqual(try x.db3.records(local).get("Note", id: first)?.raw["title"]?.stringValue, "first")
         handle.dispose()
     }
 

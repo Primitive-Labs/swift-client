@@ -13,6 +13,9 @@ public enum PrimitiveFieldType: String, Codable, Sendable, Equatable, Hashable, 
     case id
     case stringset
     case json
+    /// A db3 vector field (#5225): `dims` numbers of an `element` type,
+    /// stored as base64 text (`VectorCodec`) and read as `[Float]`.
+    case vector
 }
 
 /// A single field value as understood by the runtime schema layer.
@@ -29,6 +32,9 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     case id(String)
     case stringset(Set<String>)
     case json(Data)
+    /// A vector field's numbers (#5225). A save to a db3 encodes them with the
+    /// field's encoding; a read answers them decoded.
+    case vector([Float])
 
     public var fieldType: PrimitiveFieldType {
         switch self {
@@ -39,6 +45,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         case .id:        return .id
         case .stringset: return .stringset
         case .json:      return .json
+        case .vector:    return .vector
         }
     }
 
@@ -89,6 +96,11 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         return nil
     }
 
+    public var asVector: [Float]? {
+        if case let .vector(v) = self { return v }
+        return nil
+    }
+
     // MARK: - Yrs FFI encoding
 
     /// Encode into the JSON string expected by the Yniffi `YrsMap.insert`
@@ -117,6 +129,11 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
             // — this mirrors js-bao's "JSON-encoded string field" convention.
             let text = String(data: d, encoding: .utf8) ?? ""
             return PrimitiveValue.jsonEncodeString(text)
+        case let .vector(numbers):
+            // A vector reaches a record-log document as its encoded text; the
+            // nested-map path carries no vectors (a format-1 save is refused).
+            guard numbers.allSatisfy(\.isFinite) else { return nil }
+            return "[" + numbers.map { PrimitiveValue.jsNumberString(Double($0)) }.joined(separator: ",") + "]"
         case .stringset:
             return nil
         }
@@ -160,6 +177,11 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         case .json:
             guard let s = decodeJsonString(yrsString) else { return nil }
             return .json(Data(s.utf8))
+        case .vector:
+            // A record-log read answers a vector field decoded, as a JSON
+            // array of its numbers; anything else is no vector.
+            guard let items = JSONValue(jsonText: yrsString)?.floatArrayValue else { return nil }
+            return .vector(items)
         case .stringset:
             return nil
         }

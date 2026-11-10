@@ -31,6 +31,13 @@ public struct JsBaoClientOptions: Sendable {
     /// without explicit app calls (#963). Mirrors js-bao's
     /// `analyticsAutoEvents` option.
     public let analyticsAutoEvents: AnalyticsAutoEventsConfig
+    /// Which of the indexes a synced db3's room places on this device the
+    /// client builds when it has not built them yet: `.all` (the default),
+    /// `.none`, or the kinds to build. An index already built stays built, one
+    /// left out reads `declined` in `client.db3.indexes.local(_:)`, and
+    /// `accept`/`decline` decide one index whatever this says. A db3 that
+    /// lives only on this device builds all of its indexes.
+    public let deviceIndexes: Db3DeviceIndexes
 
     public init(
         apiUrl: String,
@@ -48,7 +55,8 @@ public struct JsBaoClientOptions: Sendable {
         sync: SyncConfig = SyncConfig(),
         commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff(),
         autoNetwork: Bool = true,
-        analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig()
+        analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
+        deviceIndexes: Db3DeviceIndexes = .all
     ) {
         self.apiUrl = apiUrl
         self.wsUrl = wsUrl
@@ -66,6 +74,7 @@ public struct JsBaoClientOptions: Sendable {
         self.commitRetryBackoff = commitRetryBackoff
         self.autoNetwork = autoNetwork
         self.analyticsAutoEvents = analyticsAutoEvents
+        self.deviceIndexes = deviceIndexes
     }
 }
 
@@ -506,9 +515,14 @@ public struct RetentionPolicy: Sendable {
     /// shape parity with js-bao; not yet consumed by enforcement
     /// (matches JS — same field is set but unused in enforcement).
     public var `default`: DefaultMode
-    /// Evict docs whose `lastOpenedAt` age exceeds this.
+    /// Evict docs whose `lastOpenedAt` age exceeds this, in seconds. A
+    /// positive number, a fraction included; `nil` is no TTL. `0`, a
+    /// negative or a non-finite number is refused `.invalidArgument`, and the
+    /// policy stays as it was.
     public var ttl: TimeInterval?
-    /// Cap on local-doc count; oldest-first eviction when exceeded.
+    /// Cap on local-doc count; oldest-first eviction when exceeded. A
+    /// positive integer; `nil` is no cap. `0` or a negative is refused
+    /// `.invalidArgument`, and the policy stays as it was.
     public var maxDocs: Int?
     /// Cap on total `localBytes`; oldest-first eviction when exceeded.
     public var maxBytes: Int?
@@ -527,6 +541,41 @@ public struct RetentionPolicy: Sendable {
         self.maxDocs = maxDocs
         self.maxBytes = maxBytes
         self.preserveOnSignOut = preserveOnSignOut
+    }
+}
+
+extension RetentionPolicy {
+    /// The one `maxDocs` rule (#5112): `nil` is no cap, `1` or more is a cap,
+    /// and `0` or a negative is refused. Answers the `.invalidArgument` error
+    /// `call` refuses with, or `nil` when the value is accepted.
+    func maxDocsRefusal(call: String) -> JsBaoError? {
+        guard let maxDocs, maxDocs < 1 else { return nil }
+        return JsBaoError(
+            code: .invalidArgument,
+            message: "\(call): maxDocs must be a positive integer (got \(maxDocs)); pass nil for no cap",
+            details: ["maxDocs": .number(Double(maxDocs))]
+        )
+    }
+
+    /// The one `ttl` rule (#5421), beside the `maxDocs` one: `nil` is no TTL,
+    /// a finite number of seconds above `0` (a fraction included) is a TTL,
+    /// and `0`, a negative, `nan` or an infinity is refused. Answers the
+    /// `.invalidArgument` error `call` refuses with, or `nil` when the value
+    /// is accepted.
+    func ttlRefusal(call: String) -> JsBaoError? {
+        guard let ttl, !(ttl.isFinite && ttl > 0) else { return nil }
+        return JsBaoError(
+            code: .invalidArgument,
+            message: "\(call): ttl must be a positive number of seconds (got \(ttl)); pass nil for no TTL",
+            details: ["ttl": .number(ttl)]
+        )
+    }
+
+    /// The policy's validator, which both doors (`client.retentionPolicy` and
+    /// `client.db3.setRetentionPolicy(_:)`) call before applying anything:
+    /// the `maxDocs` refusal, else the `ttl` one, else `nil`.
+    func refusal(call: String) -> JsBaoError? {
+        maxDocsRefusal(call: call) ?? ttlRefusal(call: call)
     }
 }
 

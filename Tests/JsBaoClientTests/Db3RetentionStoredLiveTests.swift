@@ -72,7 +72,7 @@ final class Db3RetentionStoredLiveTests: XCTestCase {
 
     /// Apply `policy` and wait for every retention run it started.
     private func apply(_ client: JsBaoClient, _ policy: RetentionPolicy) async {
-        client.db3.setRetentionPolicy(policy)
+        try! client.db3.setRetentionPolicy(policy)
         await client.retentionEnforcement?.value
     }
 

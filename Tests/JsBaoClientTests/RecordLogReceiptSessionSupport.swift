@@ -66,6 +66,7 @@ enum RecordLogReceiptHarness {
         private let lock = NSLock()
         private var _frames: [[String: JSONValue]] = []
         private var _open = true
+        private var _networking = true
         private var _artifacts: [String: Data] = [:]
         private var _fetched: [String] = []
         private var _intercept: (@Sendable (String) -> Answer)?
@@ -79,9 +80,21 @@ enum RecordLogReceiptHarness {
             get { lock.withLock { _open } }
             set { lock.withLock { _open = newValue } }
         }
+        /// Whether the client may use the network, whatever the socket: `false`
+        /// is a client set offline on a socket that stays open.
+        var networkingAllowed: Bool {
+            get { lock.withLock { _networking } }
+            set { lock.withLock { _networking = newValue } }
+        }
         func intercept(_ answer: (@Sendable (String) -> Answer)?) { lock.withLock { _intercept = answer } }
         func put(_ path: String, _ data: Data) { lock.withLock { _artifacts[path] = data } }
         func artifact(_ path: String) -> Data? { lock.withLock { _artifacts[path] } }
+        /// Serve every artifact `other` serves: another session of the same
+        /// store offered the same download (#5267).
+        func serve(from other: Connection) {
+            let copied = other.lock.withLock { other._artifacts }
+            lock.withLock { _artifacts.merge(copied) { _, theirs in theirs } }
+        }
 
         func send(_ frame: [String: JSONValue]) { lock.withLock { _frames.append(frame) } }
         func connected() -> Bool { isOpen }
@@ -131,6 +144,12 @@ enum RecordLogReceiptHarness {
         let failed = LockedBox<[String]>([])
         /// Every status the session reported, in order.
         let statuses = LockedBox<[RecordLogSessionStatus]>([])
+        /// The clock a frame's receipt is stamped with (epoch ms); `nil` reads the wall clock.
+        let clock = LockedBox<Int64?>(nil)
+        /// How many times the session read ``clock``.
+        let clockReads = LockedBox(0)
+        /// Set, the session's synced callback waits on it, holding the session busy.
+        let holdSynced = LockedBox<DispatchSemaphore?>(nil)
         private var grants = 0
 
         init(provider: SQLiteStorageProvider, clientId: String, fetches: Bool, timings: RecordLogSessionTimings) async throws {
@@ -146,15 +165,25 @@ enum RecordLogReceiptHarness {
             let progress = self.progress
             let failed = self.failed
             let statuses = self.statuses
+            let clock = self.clock
+            let clockReads = self.clockReads
+            let holdSynced = self.holdSynced
             session = RecordLogSession(
                 documentId: RecordLogReceiptHarness.documentId, binding: binding,
                 host: RecordLogSessionHost(
                     connection: { connection },
                     declarations: { [:] },
-                    synced: { _ in synced.withValue { $0 += 1 } },
+                    synced: { _ in
+                        synced.withValue { $0 += 1 }
+                        holdSynced.value?.wait()
+                    },
                     syncFailed: { _, reason in failed.withValue { $0.append(reason) } },
                     progress: { _ in progress.withValue { $0 += 1 } },
-                    status: { _, status in statuses.withValue { $0.append(status) } }
+                    status: { _, status in statuses.withValue { $0.append(status) } },
+                    now: {
+                        clockReads.withValue { $0 += 1 }
+                        return clock.value ?? Int64(Date().timeIntervalSince1970 * 1000)
+                    }
                 ),
                 timings: timings, logger: Logger(level: .verbose)
             )

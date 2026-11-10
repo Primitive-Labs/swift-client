@@ -45,6 +45,7 @@ public final class AnalyticsAPI: Sendable {
 
     /// Log a typed analytics event, returning once it is buffered. The queue
     /// fills in `user_ulid`, `timestamp`, and any plan / app-version overrides.
+    /// - Stability: production
     public func logEventAsync(_ event: AnalyticsEventInput) async {
         await queue.logEvent(event)
     }
@@ -53,6 +54,7 @@ public final class AnalyticsAPI: Sendable {
 
     /// Log a point-in-time state snapshot for the current user, returning once
     /// it is buffered. No-ops when there is no authenticated user.
+    /// - Stability: production
     public func logSnapshotAsync(context: JSONValue? = nil) async {
         guard let event = snapshotEvent(context: context) else { return }
         await queue.logEvent(event)
@@ -73,6 +75,7 @@ public final class AnalyticsAPI: Sendable {
     /// Flush pending analytics events, returning once the batch has reached
     /// the socket (or, on a send failure, once it has been re-buffered and
     /// persisted).
+    /// - Stability: production
     public func flushAsync() async {
         await queue.flushAndWait()
     }
@@ -81,12 +84,14 @@ public final class AnalyticsAPI: Sendable {
 
     /// Override the plan field on all subsequent analytics events, returning
     /// once the override is in effect.
+    /// - Stability: production
     public func setPlanOverrideAsync(_ plan: String?) async {
         await queue.setPlanOverride(plan)
     }
 
     /// Override the app-version field on all subsequent analytics events,
     /// returning once the override is in effect.
+    /// - Stability: production
     public func setAppVersionOverrideAsync(_ version: String?) async {
         await queue.setAppVersionOverride(version)
     }

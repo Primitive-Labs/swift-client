@@ -161,15 +161,18 @@ final class RecordLogSocketConnection: RecordLogConnection, @unchecked Sendable 
     private let lane: AsyncStream<String>.Continuation
     private let consumer: Task<Void, Never>
     private let isOpen: @Sendable () -> Bool
+    private let mayUseNetwork: @Sendable () -> Bool
     private let fetch: (@Sendable (String) async throws -> Data)?
 
     init(
         send: @escaping @Sendable (String) async -> Void, isOpen: @escaping @Sendable () -> Bool,
+        networkingAllowed: @escaping @Sendable () -> Bool = { true },
         fetch: (@Sendable (String) async throws -> Data)? = nil
     ) {
         let (stream, lane) = AsyncStream.makeStream(of: String.self)
         self.lane = lane
         self.isOpen = isOpen
+        self.mayUseNetwork = networkingAllowed
         self.fetch = fetch
         self.consumer = Task {
             for await text in stream { await send(text) }
@@ -193,6 +196,8 @@ final class RecordLogSocketConnection: RecordLogConnection, @unchecked Sendable 
     }
 
     func connected() -> Bool { isOpen() }
+
+    var networkingAllowed: Bool { mayUseNetwork() }
 }
 
 /// An artifact read answered something other than 200 (or could not be
@@ -219,7 +224,7 @@ extension JsBaoClient {
         recordLogState.binding(documentId)
     }
 
-    /// The binding `documents.records(documentId)` reads and writes through:
+    /// The binding `db3.records(_:)` and `documents.records(_:)` read and write through:
     /// the document must be open, and format 3.
     func modelFreeBinding(_ documentId: String) throws -> RecordLogDocumentBinding {
         if let binding = recordLogBinding(documentId), !binding.isClosed { return binding }
@@ -234,7 +239,7 @@ extension JsBaoClient {
         )
     }
 
-    /// The binding `documents.records(documentId)` reads through: as
+    /// The binding `db3.records(_:)` and `documents.records(_:)` read through: as
     /// ``modelFreeBinding(_:)``, and a db3 whose rows have not loaded here is
     /// refused `DB3_NOT_RESIDENT` (js-bao's `readableStore`). Writes keep the
     /// open binding and queue.
@@ -242,6 +247,22 @@ extension JsBaoClient {
         let binding = try modelFreeBinding(documentId)
         guard binding.isResident else { throw db3NotResidentError([documentId], source: "documents.records") }
         return binding
+    }
+
+    /// The model-free records of `documentId`, as `client.db3.records(_:)`
+    /// and the deprecated `client.documents.records(_:)` both answer them:
+    /// each call resolves the document through `client` when it runs.
+    static func modelFreeRecords(_ documentId: String, client: JsBaoClient?, logger: Logger?) -> DocumentRecords {
+        DocumentRecords(
+            documentId: documentId, logger: logger,
+            readable: { [weak client] in
+                guard let client else { throw JsBaoClient.documentNotOpenForRecords(documentId) }
+                return try client.readableModelFreeBinding(documentId)
+            }
+        ) { [weak client] in
+            guard let client else { throw JsBaoClient.documentNotOpenForRecords(documentId) }
+            return try client.modelFreeBinding(documentId)
+        }
     }
 
     /// A model-free call on a document that is not open.
@@ -275,6 +296,7 @@ extension JsBaoClient {
                     guard let self else { return false }
                     return self.wsManager.isSocketOpen && self.networkingAllowed()
                 },
+                networkingAllowed: { [weak self] in self?.networkingAllowed() ?? false },
                 fetch: { [weak self] path in
                     guard let self else { throw CancellationError() }
                     return try await self.fetchRecordLogArtifact(path)
@@ -416,8 +438,14 @@ extension JsBaoClient {
             throw db3NotResidentError([documentId])
         }
         let binding = try RecordLogDocumentBinding(
-            host: host, documentId: documentId, clientId: recordLogState.clientId, logger: logger
+            host: host, documentId: documentId, clientId: recordLogState.clientId, logger: logger, deviceIndexes: deviceIndexDefault
         )
+        // A device read is live only while the room can reach this client, as
+        // its db3's state is (#5221): offline mode can leave the session open.
+        RecordLogLiveness.connect(host) { [weak self] in
+            guard let self else { return false }
+            return self.wsManager.isSocketOpen && self.networkingAllowed()
+        }
         // A db3 created here is its own until its room's copy loads.
         binding.createdLocally = documentManager.isPendingCreate(documentId)
         // #5155 — one that lives only on this device: its row says so (a
@@ -440,6 +468,16 @@ extension JsBaoClient {
         }
         binding.onPendingChanged { [weak self] in
             self?._db3Lifecycle.pendingChanged(documentId)
+        }
+        // The db3's vector indexes (#5230): what their models want runs the
+        // model loop, and a model installed, filled or dropped tells the
+        // db3's state.
+        binding.onVectorNotice { [weak self] notice in
+            guard let self else { return }
+            switch notice {
+            case .wants: Task { await self.db3VectorModels?.run(documentId) }
+            case .statuses: self._db3Lifecycle?.indexesChanged(documentId)
+            }
         }
         binding.onError { [weak self] error in
             guard let self else { return }
@@ -471,6 +509,10 @@ extension JsBaoClient {
                 declared: { [weak self] documentId in
                     self?.db3IndexRefresher?.declared(documentId)
                 },
+                // An index registered or dropped in the room, by anyone: the list is read again (#5322).
+                indexesChanged: { [weak self] documentId in
+                    self?.db3IndexRefresher?.noticed(documentId)
+                },
                 status: { [weak self] documentId, status in
                     guard let self else { return }
                     // Each open's index list and declaration acknowledgment
@@ -482,16 +524,25 @@ extension JsBaoClient {
                     // the lifecycle tells anyone it is live (#5101).
                     if status.phase == .live { self.markRecordLogReadOnlyIfReader(documentId) }
                     self._db3Lifecycle.statusChanged(documentId, status)
+                    // Live: the db3's vector models are fetched, trained or uploaded as they want (#5230).
+                    if status.phase == .live { Task { await self.db3VectorModels?.run(documentId) } }
                 },
                 // A db3 this device has not heard about may be typed: its
                 // first open declares only once the room says it is not (#5020).
-                waitsForTypeBeforeDeclaring: true
+                waitsForTypeBeforeDeclaring: true,
+                // An untyped db3 is declared only the models it uses: those its
+                // copy holds or its entries write, and those bound to it (#5160).
+                scopedDeclarations: { [weak self] documentId, held in
+                    self?.recordLogDeclarations(for: documentId, held: held) ?? [:]
+                }
             ),
             logger: logger,
             history: recordLogState.history(documentId)
         )
         await session.attach()
         recordLogState.set(binding, session, for: documentId)
+        // A fill under way when the store was last closed goes on; a training mark's lapse is armed (#5230).
+        binding.vectorsChanged(.open)
         // The store's view indexes come from the room's list, read by an open
         // that syncs the db3 (and on `record.declared`), not here: a db3 bound
         // for residency at start-up, or at its create, reads nothing.
@@ -539,6 +590,8 @@ extension JsBaoClient {
             apply: { [weak self] documentId, entries, whileLatest in
                 guard let binding = self?.recordLogState.binding(documentId), !binding.isClosed else { return }
                 _ = try whileLatest { _ = try binding.withOperation { try binding.store.syncIndexes(entries) } }
+                // A vector entry built, dropped or given a model to fetch (#5230).
+                binding.vectorsChanged(.list)
             },
             bound: { [weak self] documentId in self?.recordLogBinding(documentId).map { !$0.isClosed } ?? false },
             socketUp: { [weak self] in
@@ -553,9 +606,59 @@ extension JsBaoClient {
                 return marks.typed != .yes && marks.permission != RecordLogPermission.read
                     && marks.permission != RecordLogPermission.refused && self.db3PermissionOf(documentId) != .reader
             },
-            settled: { [weak self] documentId, _ in self?._db3Lifecycle?.indexesChanged(documentId) },
+            settled: { [weak self] documentId, outcome in
+                self?._db3Lifecycle?.indexesChanged(documentId)
+                // The list's models are fetched or trained (#5230).
+                if outcome == .applied { Task { await self?.db3VectorModels?.run(documentId) } }
+            },
             logger: logger
         )
+    }
+
+    /// The model loop's deps over this client (#5230): a bound db3's store
+    /// answers its wants, sample and installs, the model routes go through
+    /// the gated transport, and every closure holds the client weakly.
+    func makeDb3VectorModelsDeps() -> Db3VectorModelsDeps {
+        let bound: @Sendable (String) -> RecordLogDocumentBinding? = { [weak self] documentId in
+            guard let binding = self?.recordLogState.binding(documentId), !binding.isClosed else { return nil }
+            return binding
+        }
+        return Db3VectorModelsDeps(
+            wants: { documentId in try bound(documentId)?.store.vectorModelWants() },
+            sample: { documentId, name in
+                guard let binding = bound(documentId) else { return nil }
+                let sample = try binding.store.vectorTrainingSample(name)
+                binding.vectorsChanged(.training)
+                return sample
+            },
+            releaseTraining: { documentId, name in
+                guard let binding = bound(documentId) else { return }
+                try binding.store.releaseVectorTraining(name)
+                binding.vectorsChanged(.training)
+            },
+            install: { documentId, name, generation, revision, bytes, source in
+                guard let binding = bound(documentId) else { return nil }
+                let installed = try binding.store.installVectorModel(name, generation: generation, revision: revision, bytes: bytes, source: source)
+                binding.vectorsChanged(.install)
+                return installed
+            },
+            trainer: vec1Trainer,
+            http: { [weak self, gatedTransport] in Db3IndexModelHttp(transport: gatedTransport, timeout: self?.db3ModelRequestTimeoutForTest) },
+            localOnly: { documentId in bound(documentId)?.isLocalOnly ?? false },
+            live: { documentId in bound(documentId)?.store.isLive ?? false },
+            online: { [weak self] in
+                guard let self else { return false }
+                return self.wsManager.isSocketOpen && self.networkingAllowed()
+            },
+            refreshList: { [weak self] documentId in self?.db3IndexRefresher?.noticed(documentId) },
+            logger: logger
+        )
+    }
+
+    /// Run the model loop for every db3 bound here (#5230): the socket opened, or networking was allowed again.
+    func runDb3VectorModels() {
+        guard let models = db3VectorModels else { return }
+        for (documentId, _) in recordLogState.bindings { Task { await models.run(documentId) } }
     }
 
     /// Read the index list of a db3 this client holds open (subscribed, or
@@ -581,6 +684,24 @@ extension JsBaoClient {
         return out
     }
 
+    /// The declarations an untyped open of `documentId` carries (#5160): the
+    /// models in `held` this client has a schema for, the models bound to the
+    /// db3 (``setModelDefaultDb3(_:_:)``), and, when it is the default db3,
+    /// every model bound to none. A model used only in another db3 is left out.
+    func recordLogDeclarations(for documentId: String, held: [String]) -> [String: JSONValue] {
+        let held = Set(held)
+        let defaults = modelDefaultDb3s()
+        var out: [String: JSONValue] = [:]
+        for name in registeredModelNames() {
+            let bound = defaults.perModel[name]
+            guard held.contains(name) || bound == documentId || (bound == nil && defaults.global == documentId),
+                  let schema = sharedModel(name)?.schema
+            else { continue }
+            out[name] = Self.recordLogDeclaration(schema)
+        }
+        return out
+    }
+
     static func recordLogDeclaration(_ schema: PrimitiveSchema) -> JSONValue {
         var fields: [String: JSONValue] = [:]
         for (name, descriptor) in schema.fields {
@@ -592,6 +713,8 @@ extension JsBaoClient {
             if let autoStamp = descriptor.autoStamp { options["autoStamp"] = .string(autoStamp.rawValue) }
             if let maxLength = descriptor.maxLength { options["maxLength"] = .number(Double(maxLength)) }
             if let maxCount = descriptor.maxCount { options["maxCount"] = .number(Double(maxCount)) }
+            if let dims = descriptor.dims { options["dims"] = .number(Double(dims)) }
+            if let element = descriptor.element { options["element"] = .string(element.rawValue) }
             if let value = descriptor.default, let json = try? JSONValue(jsonAny: value.encodedForMeta()), json != .null {
                 options["default"] = json
             }
@@ -774,7 +897,7 @@ extension JsBaoClient {
             logger.debug("[record-log] dropped", frame["type"]?.stringValue ?? "a frame", "for a document with no session")
             return
         }
-        await session.receive(frame)
+        await session.deliver(frame)
     }
 
     // MARK: - The connection
@@ -825,6 +948,8 @@ extension JsBaoClient {
     func unbindRecordLogDocument(_ documentId: String) async {
         // Its index-list reads in flight are the old binding's (#5101).
         db3IndexRefresher?.rebind(documentId)
+        // Its model waits, retries and kept bytes are the old binding's (#5230).
+        db3VectorModels?.forget(documentId)
         await closeRecordLogDocument(documentId)
         if !documentManager.isOpen(documentId) { disconnectRecordLogMembers(documentId) }
     }
@@ -956,6 +1081,7 @@ extension JsBaoClient {
     @discardableResult
     private func closeAllRecordLogDocuments() async -> Int {
         db3IndexRefresher?.rebindAll()
+        db3VectorModels?.forgetAll()
         let open = recordLogState.resetForAnotherUser()
         for (documentId, binding, session) in open {
             await session.close()

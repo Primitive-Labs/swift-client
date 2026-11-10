@@ -60,6 +60,55 @@ public struct Db3StateError: Sendable, Equatable {
     }
 }
 
+/// How far a device's copy of one db3 is behind the server, as a device page
+/// (`PagedQueryResult.drift`) or ``Db3State/drift`` reports it.
+///
+/// ```swift
+/// if let drift = try await client.db3.state(db3Id).drift, drift.entriesBehind > 0 {
+///     print("\(drift.entriesBehind) behind as of \(drift.asOf)")
+/// }
+/// ```
+public struct Db3Drift: Sendable, Equatable {
+    /// Entries the server had accepted that this copy has not applied, when
+    /// it last heard the server's position: a lower bound, since the server
+    /// may have accepted more since ``asOf``.
+    public let entriesBehind: Int
+    /// When this device last heard the server's position.
+    public let asOf: Date
+    /// Whether this client's session of the db3 is open now, so the bound is kept current.
+    public let live: Bool
+    /// Writes made on this device the server has not judged yet.
+    public let pendingWrites: Int
+
+    public init(entriesBehind: Int, asOf: Date, live: Bool, pendingWrites: Int) {
+        self.entriesBehind = entriesBehind
+        self.asOf = asOf
+        self.live = live
+        self.pendingWrites = pendingWrites
+    }
+}
+
+/// The most drift a device read accepts (`QueryOptions.maxDrift`): a copy more
+/// than `entries` behind, or whose position was last heard more than `age`
+/// seconds ago, is refused `DB3_DRIFT_EXCEEDED`. `Db3MaxDrift()` refuses only a
+/// db3 whose position was never heard. A db3 that lives only on this device
+/// always passes; the read never waits.
+///
+/// ```swift
+/// let page = try Note.queryPaged(nil, options: QueryOptions(db3: [db3Id], maxDrift: Db3MaxDrift(entries: 100, age: 60)))
+/// ```
+public struct Db3MaxDrift: Sendable, Equatable {
+    /// The most entries behind the copy may be.
+    public var entries: Int?
+    /// The most seconds since the server's position was last heard.
+    public var age: TimeInterval?
+
+    public init(entries: Int? = nil, age: TimeInterval? = nil) {
+        self.entries = entries
+        self.age = age
+    }
+}
+
 /// A db3's state on this device, as `client.db3.state(_:)`, a subscription's
 /// `state` and `Db3StateEvent` answer it.
 ///
@@ -103,11 +152,24 @@ public struct Db3State: Sendable, Equatable {
     /// `pendingWrites` and `lastSyncAt` stay `0` and `nil`, and its phase is
     /// `live` while subscribed and `idle` otherwise.
     public let localOnly: Bool
+    /// How far this copy is behind the server: ``Db3Drift/entriesBehind`` (a
+    /// lower bound, as of ``Db3Drift/asOf``), ``Db3Drift/live`` (whether the
+    /// phase is `live`) and ``Db3Drift/pendingWrites``. Kept on the device,
+    /// so it is reported offline and after a restart. `nil` until the
+    /// server's position is first heard, and on a db3 that lives only on this
+    /// device. A device page reports the same (`PagedQueryResult.drift`).
+    public let drift: Db3Drift?
+    /// Each index the db3's room places on this device, with how it stands
+    /// here, as `client.db3.indexes.local(_:)` lists them. Present while the
+    /// copy is bound to this client (empty when no index is placed on
+    /// devices); `nil` on a copy not bound here and on a `gone` db3.
+    /// `Db3StateEvent` fires when a status changes.
+    public let indexes: [Db3LocalIndex]?
 
     public init(
         id: String, resident: Bool, subscribed: Bool, phase: Db3Phase, progress: Db3Progress?, cursor: Int, rows: Int,
         lastSyncAt: Date?, pendingWrites: Int, permission: Db3Permission?, error: Db3StateError?, pendingCreate: Bool = false,
-        localOnly: Bool = false
+        localOnly: Bool = false, drift: Db3Drift? = nil, indexes: [Db3LocalIndex]? = nil
     ) {
         self.id = id
         self.resident = resident
@@ -122,6 +184,8 @@ public struct Db3State: Sendable, Equatable {
         self.error = error
         self.pendingCreate = pendingCreate
         self.localOnly = localOnly
+        self.drift = drift
+        self.indexes = indexes
     }
 }
 
@@ -216,6 +280,79 @@ public struct Db3WriteRefusedEvent: Sendable {
         writes = event.writes
         conflictingRecord = event.conflictingRecord
         current = event.current
+    }
+}
+
+/// Payload for `.db3AccessRequestCreated`: someone asked for access to a db3
+/// this user owns. The same fields as the `DocumentAccessRequestCreatedEvent`
+/// delivered just before it; `documentId` is the db3's id.
+public struct Db3AccessRequestCreatedEvent: Sendable, Equatable {
+    public let requestId: String
+    public let documentId: String
+    public let requesterId: String
+    /// `"read-write"` or `"reader"`.
+    public let requestedPermission: String
+    /// Always `"pending"`.
+    public let status: String
+    public let requesterEmail: String?
+    public let requesterName: String?
+    /// The requester's note, when they wrote one.
+    public let message: String?
+    /// When the request was made, ISO 8601.
+    public let createdAt: String?
+    public let title: String?
+    public let document: AccessRequestDocumentSummary?
+
+    /// The db3 form of a `DocumentAccessRequestCreatedEvent`.
+    /// - Parameter event: The request as `document:access-request-created` carries it.
+    public init(_ event: DocumentAccessRequestCreatedEvent) {
+        requestId = event.requestId
+        documentId = event.documentId
+        requesterId = event.requesterId
+        requestedPermission = event.requestedPermission
+        status = event.status
+        requesterEmail = event.requesterEmail
+        requesterName = event.requesterName
+        message = event.message
+        createdAt = event.createdAt
+        title = event.title
+        document = event.document
+    }
+}
+
+/// Payload for `.db3AccessRequestResolved`: an access request on a db3 was
+/// approved or denied. The same fields as the
+/// `DocumentAccessRequestResolvedEvent` delivered just before it.
+public struct Db3AccessRequestResolvedEvent: Sendable, Equatable {
+    public let requestId: String
+    public let documentId: String
+    public let requesterId: String
+    /// `"read-write"` or `"reader"`.
+    public let requestedPermission: String
+    /// `"approved"` or `"denied"`.
+    public let status: String
+    /// `"read-write"` or `"reader"`, when approved.
+    public let grantedPermission: String?
+    /// The user who approved or denied it.
+    public let resolvedBy: String?
+    /// When it was resolved, ISO 8601.
+    public let resolvedAt: String?
+    public let title: String?
+    public let document: AccessRequestDocumentSummary?
+
+    /// The db3 form of a `DocumentAccessRequestResolvedEvent`.
+    /// - Parameter event: The outcome as `document:access-request-resolved` carries it.
+    public init(_ event: DocumentAccessRequestResolvedEvent) {
+        requestId = event.requestId
+        documentId = event.documentId
+        requesterId = event.requesterId
+        requestedPermission = event.requestedPermission
+        status = event.status
+        grantedPermission = event.grantedPermission
+        resolvedBy = event.resolvedBy
+        resolvedAt = event.resolvedAt
+        title = event.title
+        document = event.document
     }
 }
 
@@ -356,6 +493,14 @@ extension Db3RowsEvent: JsBaoEventPayload {
 
 extension Db3WriteRefusedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .db3WriteRefused }
+}
+
+extension Db3AccessRequestCreatedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .db3AccessRequestCreated }
+}
+
+extension Db3AccessRequestResolvedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .db3AccessRequestResolved }
 }
 
 extension Db3EvictedEvent: JsBaoEventPayload {

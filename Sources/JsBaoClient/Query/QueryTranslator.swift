@@ -65,8 +65,51 @@ public struct QueryTranslator {
     /// `$in`. A field name that is not an identifier, or an operator the
     /// grammar lacks, throws `JsBaoError(.invalidArgument)` before any SQL is
     /// built. js-bao's `JsonQueryTranslator` with `stringSets: "json_each"`.
-    static func translateView(_ filter: DocumentFilter, table: String = "record_log_view") throws -> (String, [Any]) {
-        try translate(filter, stringsetFields: [], stringFields: nil, fieldTypes: nil, tableName: nil, viewTable: table)
+    ///
+    /// `memberIndexTable` names the device table a field's members are kept in
+    /// (a member index placed on the device, #5156, #5223), or `nil` for a
+    /// field with none: `$contains` on such a field is a rowid probe of the
+    /// table, binding the member alone as the `_data` statement does.
+    ///
+    /// `textIndex` is the text index a top-level `$search` reads (#5223): it
+    /// keeps the rows whose rowid the index matches, binding the MATCH text
+    /// (``RecordLogTextSearch``). A `$search` inside `$and` or `$or` throws
+    /// `JsBaoError(.invalidArgument)`; one with no `textIndex` throws
+    /// `JsBaoError(.queryIndexNotOnDevice)` naming `model`.
+    ///
+    /// `vectorIndex` is the vector index a top-level `$near` reads (#5230): it
+    /// keeps the `$near`'s rows (`rowid IN` its nearest rows), binding the
+    /// query vector. A `$near` with no `vectorIndex`, or inside `$and` or
+    /// `$or`, throws as ``RecordLogViewReader/nearIndex(_:_:)`` refuses it.
+    static func translateView(
+        _ filter: DocumentFilter, table: String = "record_log_view", memberIndexTable: ((String) -> String?)? = nil,
+        textIndex: ViewTextIndex? = nil, vectorIndex: RecordLogNearSearch.Read? = nil, model: String? = nil
+    ) throws -> (String, [Any]) {
+        try translate(
+            filter, stringsetFields: [], stringFields: nil, fieldTypes: nil, tableName: nil, viewTable: table,
+            memberIndexTable: memberIndexTable,
+            search: ViewSearch(index: textIndex, vector: vectorIndex, model: model ?? "the model", nested: false)
+        )
+    }
+
+    /// The text index a view read's `$search` reads (#5223): its FTS5 table,
+    /// its fields in index order (column `f<i>` keeps field `i`) and a
+    /// positive weight per field, in the same order.
+    struct ViewTextIndex: Equatable, Sendable {
+        var table: String
+        var fields: [String]
+        var weights: [Double]
+    }
+
+    /// How a view translation answers a `$search` key: the index it reads,
+    /// the model a refusal names, and whether the filter is a branch of
+    /// `$and` or `$or`.
+    private struct ViewSearch {
+        var index: ViewTextIndex?
+        /// The vector index a `$near` reads (#5230).
+        var vector: RecordLogNearSearch.Read? = nil
+        var model: String
+        var nested: Bool
     }
 
     /// `translate`, reading fields from `viewTable`'s `_data` when it is set.
@@ -76,21 +119,47 @@ public struct QueryTranslator {
         stringFields: Set<String>?,
         fieldTypes: [String: String]?,
         tableName: String?,
-        viewTable: String?
+        viewTable: String?,
+        memberIndexTable: ((String) -> String?)? = nil,
+        search: ViewSearch? = nil
     ) throws -> (String, [Any]) {
         var conditions: [String] = []
         var params: [Any] = []
+        var branch = search
+        branch?.nested = true
 
         for (key, value) in filter {
-            if key == "$and", let arr = subFilters(value) {
-                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable) }
+            if key == RecordLogTextSearch.key, let viewTable, let search {
+                // A text search keeps the rows its index matches (#5223).
+                if search.nested {
+                    throw JsBaoError(
+                        code: .invalidArgument,
+                        message: "$search is allowed only at the top level of a filter: it combines with the rest of the filter by AND"
+                    )
+                }
+                guard let index = search.index else { throw RecordLogTextSearch.notOnDevice(model: search.model) }
+                let match = try RecordLogTextSearch.match(try RecordLogTextSearch.parse(value), indexFields: index.fields)
+                let fts = quoted(index.table)
+                conditions.append("\(viewTable).rowid IN (SELECT rowid FROM \(fts) WHERE \(fts) MATCH ?)")
+                params.append(match)
+            } else if key == RecordLogNearSearch.key, viewTable != nil, let search {
+                // A count, a filter and an aggregate keep the `$near`'s rows (#5230).
+                if search.nested { throw RecordLogNearSearch.nested() }
+                guard let read = search.vector else {
+                    throw RecordLogNearSearch.notOnDevice(model: search.model, field: value["field"]?.stringValue ?? "")
+                }
+                let rows = try RecordLogViewReader.nearRows(read, memberIndexTable: memberIndexTable, model: search.model)
+                conditions.append("record_log_view.rowid IN (SELECT rowid FROM (\(rows.sql)))")
+                params.append(contentsOf: rows.params.map { $0 as Any })
+            } else if key == "$and", let arr = subFilters(value) {
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable, memberIndexTable: memberIndexTable, search: branch) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " AND ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
             } else if key == "$or", let arr = subFilters(value) {
-                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable) }
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable, memberIndexTable: memberIndexTable, search: branch) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " OR ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
@@ -124,7 +193,8 @@ public struct QueryTranslator {
                         stringFields: stringFields,
                         fieldTypes: fieldTypes,
                         tableName: tableName,
-                        viewTable: viewTable
+                        viewTable: viewTable,
+                        memberIndexTable: memberIndexTable
                     ) {
                         conditions.append(cond)
                         params.append(contentsOf: p)
@@ -176,10 +246,13 @@ public struct QueryTranslator {
         stringFields: Set<String>? = nil,
         fieldTypes: [String: String]? = nil,
         tableName: String? = nil,
-        viewTable: String? = nil
+        viewTable: String? = nil,
+        memberIndexTable: ((String) -> String?)? = nil
     ) throws -> (String, [Any])? {
         let col = try viewTable == nil ? quoted(field) : viewField(field)
-        if let viewTable, let condition = try viewOperator(field: field, op: op, value: value, column: col, table: viewTable) {
+        if let viewTable, let condition = try viewOperator(
+            field: field, op: op, value: value, column: col, table: viewTable, memberIndexTable: memberIndexTable
+        ) {
             return condition
         }
 
@@ -794,7 +867,7 @@ public struct QueryTranslator {
     /// that exist in the view mode only; `nil` for the shared ones. An
     /// operator the grammar lacks throws rather than matching nothing.
     private static func viewOperator(
-        field: String, op: String, value: JSONValue, column: String, table: String
+        field: String, op: String, value: JSONValue, column: String, table: String, memberIndexTable: ((String) -> String?)? = nil
     ) throws -> (String, [Any])? {
         switch op {
         case "$eq" where value.isNull:
@@ -818,6 +891,10 @@ public struct QueryTranslator {
         case "$contains":
             guard let member = value.stringValue else {
                 throw viewOperatorError("$contains operator requires a string value for field \(field)", field: field, op: op)
+            }
+            // An opted-in field's members are read from its member index (#5156).
+            if !viewSystemFields.contains(field), let index = memberIndexTable?(field) {
+                return (viewMemberProbe(index, table: table), [member])
             }
             return (viewSetMember(try viewDataPath(field, table: table), "_set.value = ?"), [member])
         case "$all":
@@ -871,6 +948,12 @@ public struct QueryTranslator {
     private static func viewDataPath(_ field: String, table: String) throws -> String {
         try requireViewIdentifier(field)
         return "\(table)._data, '$.\(field)'"
+    }
+
+    /// A record holds `?` in the set `index` keeps: a rowid probe of the member
+    /// index (#5156), driven by the member, never a correlated `EXISTS`.
+    static func viewMemberProbe(_ index: String, table: String = "record_log_view") -> String {
+        "\(table).rowid IN (SELECT rid FROM \(quoted(index)) WHERE value = ?)"
     }
 
     /// True only where the stored value is an array, and then when `members`

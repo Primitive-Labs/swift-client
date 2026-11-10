@@ -376,7 +376,8 @@ func planRecordLogRecordWrites(_ input: RecordLogRecordWriteInput) -> [RecordLog
     for (key, value) in input.data where key != "id" {
         var change = RecordLogMemberChanges()
         switch value {
-        case .string, .number, .bool:
+        case .string, .number, .bool, .vector:
+            // A vector arrives here as its base64 (`DocumentRecords` encodes it).
             fields[key] = value.json
             continue
         case .null:

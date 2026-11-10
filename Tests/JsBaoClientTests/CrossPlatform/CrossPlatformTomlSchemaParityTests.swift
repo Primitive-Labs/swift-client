@@ -162,7 +162,7 @@ final class CrossPlatformTomlSchemaParityTests: XCTestCase {
         case let .scalar(.boolean(b)):   return "b:\(b)"
         case let .scalar(.id(s)):        return "i:\(s)"
         case let .scalar(.date(s)):      return "d:\(s)"
-        case .scalar(.stringset), .scalar(.json):
+        case .scalar(.stringset), .scalar(.json), .scalar(.vector):
             return nil
         case let .function(name):        return "fn:\(name)"
         }

@@ -544,6 +544,7 @@ final class OutboundUnsyncedFlagRaceTests: XCTestCase {
     /// Behavior 7 — the user-visible symptom. `documents.evict` without `force`
     /// must refuse a document whose batch is drained but unsent, and accept it
     /// once the drain confirms.
+    @available(*, deprecated)
     func testEvictRefusesWhileABatchIsDrainedButUnsent() async throws {
         let client = makeZeroDebounceClient()
         let documentManager = client.documentManager

@@ -19,6 +19,7 @@ public final class UsersAPI: @unchecked Sendable {
 
     /// Retrieves basic profile information for a user by their ID.
     /// Results are cached with a default staleness threshold of 5 minutes.
+    /// - Stability: production
     public func getBasic(userId: String, options: GetUserOptions? = nil) async throws -> BasicUserInfo {
         guard !userId.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "userId is required")
@@ -90,6 +91,7 @@ public final class UsersAPI: @unchecked Sendable {
     /// - Returns: The contents of the response's `profiles` array.
     ///   Users that don't exist or don't belong to the current app are
     ///   silently omitted (no per-id error).
+    /// - Stability: production
     public func getProfiles(userIds: [String]) async throws -> [BatchUserProfile] {
         guard !userIds.isEmpty else {
             throw JsBaoError(
@@ -111,6 +113,7 @@ public final class UsersAPI: @unchecked Sendable {
     /// Look up a user by email in the current app. Returns a
     /// `UserLookupResult` with an `exists` flag and an optional `user`
     /// summary (`userId`, `name`, `email`).
+    /// - Stability: production
     public func lookup(email: String) async throws -> UserLookupResult {
         var query = URLQuery()
         query.append("email", email)

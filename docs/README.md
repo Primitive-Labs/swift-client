@@ -92,6 +92,22 @@ syncSubscription = client.observeOnMainActor(SyncEvent.self) { event in
 // For one occurrence: `try await client.nextEvent(SyncEvent.self, timeout: 30)`.
 ```
 
+## SwiftUI views (`JsBaoClientUI`)
+
+The package's second library product, `JsBaoClientUI`, holds SwiftUI views over the client, so `JsBaoClient` itself never imports SwiftUI. `BlobImage` shows a db3 blob as `AsyncImage` shows a URL, loading through `client.db3.blobs(db3Id).read(blobId:)` with the client's auth, local copy and offline behavior. The Swift template links the product; another app adds `.product(name: "JsBaoClientUI", package: "JsBaoClient")` to its target.
+
+```swift
+import JsBaoClientUI
+
+BlobImage(client.db3.blobs(db3Id), blobId: blobId) { image in
+    image.resizable().scaledToFit()
+} placeholder: {
+    ProgressView()
+}
+```
+
+An app on an image library sends `client.db3.blobs(db3Id).downloadRequest(blobId:)`, which carries the user's `Authorization` header.
+
 ## Status
 
 This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method sets; remaining behavioral divergences are tracked as GitHub issues (label `swift-client-parity`).

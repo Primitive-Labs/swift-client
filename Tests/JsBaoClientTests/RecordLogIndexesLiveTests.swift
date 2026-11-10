@@ -80,6 +80,7 @@ final class RecordLogIndexesLiveTests: XCTestCase {
         try await register(documentId, ["model": model, "field": "title"])
         try await register(documentId, ["model": model, "fields": ["a", "b"], "unique": true, "name": "by_ab"])
 
+        swift.setModelDefaultDb3(Self.note.name, documentId)
         try await live.open(swift, documentId)
         try await eventually(timeout: 20, description: "the room to hold the declaration's index") {
             try await self.roomTuples(documentId).count == 3
@@ -95,6 +96,7 @@ final class RecordLogIndexesLiveTests: XCTestCase {
         try await register(documentId, ["model": model, "field": "temp"])
         let withTemp = try await roomTuples(documentId)
         XCTAssertEqual(withTemp.count, 4)
+        swift.setModelDefaultDb3(Self.later.name, documentId)
         swift.registerModels([Self.later])
         try await eventually(timeout: 20, description: "the store to hold the registration after a declaration") {
             try self.storeTuples(swift, documentId) == withTemp
@@ -118,6 +120,7 @@ final class RecordLogIndexesLiveTests: XCTestCase {
         let swift = try await live.client("swift", models: [Self.note])
         let documentId = try await live.createDocument(swift)
         try await register(documentId, ["model": Self.note.name, "field": "title"])
+        swift.setModelDefaultDb3(Self.note.name, documentId)
         try await live.open(swift, documentId)
         try await eventually(timeout: 20, description: "the store to cache the room's list") {
             try self.storeTuples(swift, documentId).count == 2

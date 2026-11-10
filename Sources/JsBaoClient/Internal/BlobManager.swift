@@ -20,9 +20,13 @@ import CryptoKit
 ///   emit helper is `nonisolated` and no isolated method calls one, which is
 ///   what stops a slow `blobs:upload-progress` handler from occupying the
 ///   upload queue (the rule Phase D2 shipped for `KvCache`).
-/// * **`downloadUrl` stays synchronous, permanently.** It reads only the
-///   immutable `getApiUrl` / `getAppId` closures, so it is `nonisolated` and
-///   keeps its exact shape — it feeds URLs straight from SwiftUI bodies.
+/// * **`downloadUrl` and `downloadRequest` stay synchronous, permanently.**
+///   They read only the immutable `getApiUrl` / `getAppId` / `getToken` /
+///   `getGlobalAdminAppId` closures, so they are `nonisolated` and keep their
+///   exact shape — they are called straight from SwiftUI bodies. The URL
+///   carries no credentials, so a bare `AsyncImage` of it is refused; the
+///   request carries them, and `BlobImage` (`JsBaoClientUI`) reads through
+///   `read`, which sends it.
 /// * **Everything else on the queue surface is `async`.** The public forms are
 ///   the `…Async` members on `JsBaoClient`, `DocumentsAPI` and
 ///   `DocumentBlobContext`. The synchronous forms that bridged the conversion
@@ -82,6 +86,10 @@ public actor BlobManager {
     /// the upload's user (`OfflineStore.blobUploadsStore`). `nil` keeps the
     /// queue in memory only, as a manager built for a unit test does.
     nonisolated let offlineStore: OfflineStore?
+    /// The session `read` downloads on: `NetworkSession.uncached` in
+    /// production, a session over a capturing `URLProtocol` in a hermetic
+    /// test (the `AuthController.init` precedent).
+    private nonisolated let networkSession: URLSession
 
     // Upload queue — isolated state, exactly what the NSLock guarded.
     private var uploadQueue: [String: UploadTask] = [:]
@@ -163,7 +171,8 @@ public actor BlobManager {
         currentIdentity: (@Sendable () -> UploadIdentity)? = nil,
         networkingAllowed: (@Sendable () -> Bool)? = nil,
         pendingDb3Create: (@Sendable (String) -> Bool)? = nil,
-        offlineStore: OfflineStore? = nil
+        offlineStore: OfflineStore? = nil,
+        networkSession: URLSession = NetworkSession.uncached
     ) {
         self.logger = logger.forScope(scope: "blob")
         self.uploadConcurrency = uploadConcurrency
@@ -179,6 +188,7 @@ public actor BlobManager {
         self.networkingAllowed = networkingAllowed
         self.pendingDb3Create = pendingDb3Create
         self.offlineStore = offlineStore
+        self.networkSession = networkSession
     }
 
     static let defaultBackoffBaseMs = 2000
@@ -496,11 +506,15 @@ public actor BlobManager {
     /// download filename. The filename is emitted as an RFC 5987 ext-value
     /// (`UTF-8''<pct-encoded>`), matching the JS client's `encodeRFC5987Value`.
     ///
+    /// The URL carries no credentials: the route answers 401 to a load that
+    /// does not add `Authorization` (an `AsyncImage`, an `<img>`). Send
+    /// `downloadRequest(family:…)` instead, or show the blob with `BlobImage`
+    /// (`JsBaoClientUI`).
+    ///
     /// `nonisolated`, and therefore **synchronous permanently** — it reads only
     /// the immutable `getApiUrl` / `getAppId` closures. This is deliberate: it
-    /// is the blob member most likely to be called from a SwiftUI `body` (it
-    /// feeds an `AsyncImage` URL), so it carries no deprecation and no `Async`
-    /// twin.
+    /// is a blob member likely to be called from a SwiftUI `body`, so it
+    /// carries no deprecation and no `Async` twin.
     public nonisolated func downloadUrl(
         documentId: String,
         blobId: String,
@@ -536,6 +550,36 @@ public actor BlobManager {
             url += "?" + query.joined(separator: "&")
         }
         return url
+    }
+
+    /// The authenticated GET of `downloadUrl(family:…)`: `Authorization:
+    /// Bearer` with the token in force when it is called (none without one),
+    /// and `X-Global-Admin-App-Id` when the client has one. `nil` when the URL
+    /// cannot be built (no API URL or app id). `read` sends exactly this.
+    ///
+    /// `nonisolated` and synchronous, as `downloadUrl` is: it reads only the
+    /// immutable closures.
+    nonisolated func downloadRequest(
+        family: BlobRouteFamily,
+        documentId: String,
+        blobId: String,
+        disposition: BlobDisposition? = nil,
+        attachmentFilename: String? = nil
+    ) -> URLRequest? {
+        let url = downloadUrl(
+            family: family, documentId: documentId, blobId: blobId,
+            disposition: disposition, attachmentFilename: attachmentFilename
+        )
+        guard !url.isEmpty, let requestUrl = URL(string: url) else { return nil }
+        var request = URLRequest(url: requestUrl)
+        request.httpMethod = "GET"
+        if let token = getToken?() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let adminAppId = getGlobalAdminAppId?() {
+            request.setValue(adminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
+        }
+        return request
     }
 
     /// Percent-encode a string as an RFC 5987 ext-value payload. Everything
@@ -588,20 +632,13 @@ public actor BlobManager {
         }
 
         // Download from server
-        let url = downloadUrl(family: family, documentId: documentId, blobId: blobId, disposition: effectiveDisposition)
-        guard let requestUrl = URL(string: url) else {
+        guard let request = downloadRequest(
+            family: family, documentId: documentId, blobId: blobId, disposition: effectiveDisposition
+        ) else {
             throw JsBaoError(code: .invalidArgument, message: "Invalid blob URL")
         }
 
-        var request = URLRequest(url: requestUrl)
-        if let token = getToken?() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-        if let adminAppId = getGlobalAdminAppId?() {
-            request.setValue(adminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
-        }
-
-        let (data, response) = try await NetworkSession.data(for: request)
+        let (data, response) = try await NetworkSession.data(for: request, using: networkSession)
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0

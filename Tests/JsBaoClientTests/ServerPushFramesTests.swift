@@ -226,6 +226,7 @@ final class ServerPushFramesTests: XCTestCase {
 
     // MARK: - C3: refreshAwareness
 
+    @available(*, deprecated)
     func testRefreshAwarenessFrameRebroadcastsLocalState() async throws {
         let server = try LoopbackWebSocketServer()
         let url = try server.start()

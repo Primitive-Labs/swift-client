@@ -9,7 +9,7 @@ import XCTest
 /// exactly the committed `observed-schema-4624.toml`; a client registering the
 /// models generated from it reads every existing record through them, a value
 /// that does not fit its type as missing; what the export omitted stays
-/// readable through `documents.records`.
+/// readable through `db3.records`.
 final class ObservedSchemaCodegenLiveTests: XCTestCase {
 
     private var ctx: TestContext!
@@ -152,7 +152,7 @@ final class ObservedSchemaCodegenLiveTests: XCTestCase {
         XCTAssertEqual(try PrimitiveRowModel.findAll().map(\.id), ["primitive_row1"])
 
         // What the export left out is read through the model-free records.
-        let records = reader.documents.records(documentId)
+        let records = reader.db3.records(documentId)
         XCTAssertEqual(try records.get("shelf", id: "lowerA")?["label"], "lower case")
         XCTAssertEqual(try records.get("Mix", id: "mixA")?["title"], "lower")
     }

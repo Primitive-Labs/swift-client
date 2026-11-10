@@ -45,7 +45,7 @@ final class RecordLogModelFreeParityLiveTests: XCTestCase {
         let documentId = try await live.createDocument(swift)
         try await live.open(swift, documentId)
         let js = try await child(documentId)
-        let records = swift.documents.records(documentId)
+        let records = swift.db3.records(documentId)
 
         let pre = "\u{E9}", decomposed = "e\u{301}"
         let fromJS = try await js.send([

@@ -96,10 +96,13 @@ final class RecordLogLiveApp {
     /// A file of this app's directory, for clients that share one store (one at a time).
     func file(_ name: String) -> String { directory + "/\(name).sqlite" }
 
-    func client(_ name: String, models: [PrimitiveSchema], token: String? = nil, file: String? = nil) async throws -> JsBaoClient {
+    func client(
+        _ name: String, models: [PrimitiveSchema], token: String? = nil, file: String? = nil, deviceIndexes: Db3DeviceIndexes = .all
+    ) async throws -> JsBaoClient {
         let client = createTestClient(
             appId: app.appId, token: token ?? app.ownerJWT,
-            storageConfig: .sqlite(directory: file ?? directory + "/\(name)-\(UUID().uuidString.prefix(4)).sqlite"), autoNetwork: true
+            storageConfig: .sqlite(directory: file ?? directory + "/\(name)-\(UUID().uuidString.prefix(4)).sqlite"), autoNetwork: true,
+            deviceIndexes: deviceIndexes
         )
         client.registerModels(models)
         clients.append(client)

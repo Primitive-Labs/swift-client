@@ -11,6 +11,7 @@ import XCTest
 /// sweeps (`evictAllLocal()`, `documents.evictAll`, in either form) keep it.
 /// `client.db3.delete` removes it with nothing sent: its subscriptions end as
 /// evicted, `Db3EvictedEvent` fires once, and its row and copy are gone.
+@available(*, deprecated)
 final class Db3LocalOnlyDoorsHermeticTests: XCTestCase {
 
     private let world = Db3LocalOnlyWorld()

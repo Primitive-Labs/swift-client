@@ -209,7 +209,7 @@ final class RecordLogJsonbConversionHermeticTests: XCTestCase {
         XCTAssertTrue(blocks.last?.contains { $0.contains("INSERT INTO record_log_meta") } ?? false, "\(blocks.last ?? [])")
         XCTAssertFalse(blocks.last?.contains { $0.contains("jsonb(") } ?? true)
 
-        XCTAssertEqual(try version(provider), "4")
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
         XCTAssertEqual(try unconverted(provider), 0, "every stored row is JSONB without id")
         XCTAssertEqual(try records(provider), before, "every table keeps its rows, keys and values")
         XCTAssertEqual(try scalar(provider, "SELECT COUNT(*) FROM record_log_staged_base WHERE _data IS NULL").intValue, 1, "the NULL base stays NULL")
@@ -223,7 +223,7 @@ final class RecordLogJsonbConversionHermeticTests: XCTestCase {
         XCTAssertTrue(plan.contains(viewIndex), "an indexed equality still reads \(viewIndex): \(plan)")
         XCTAssertLessThanOrEqual(try RecordLogPreviousRelease.livePages(provider), pagesBefore, "the store does not grow")
         XCTAssertEqual(lines.value.count, 1, "\(lines.value)")
-        XCTAssertTrue(lines.value.first?.contains("storage version 4") ?? false, lines.value.first ?? "")
+        XCTAssertTrue(lines.value.first?.contains("storage version \(RecordLogSchema.storageVersion)") ?? false, lines.value.first ?? "")
         XCTAssertTrue(lines.value.first?.contains("2 document(s), \(stored) row(s) re-encoded as JSONB without id") ?? false, lines.value.first ?? "")
         XCTAssertFalse(lines.value.first?.contains("resumed") ?? true)
 
@@ -269,7 +269,7 @@ final class RecordLogJsonbConversionHermeticTests: XCTestCase {
         let (blocks, _) = transactions(trace)
         XCTAssertEqual(blocks.filter(isConversion).count, 1, "doc-b only (doc-c holds no row): \(blocks)")
         XCTAssertEqual(trace.statements.filter { $0.contains("UPDATE record_log_rows SET _data = jsonb(") }.count, 1)
-        XCTAssertEqual(try version(provider), "4")
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
         XCTAssertEqual(try unconverted(provider), 0)
         XCTAssertEqual(try records(provider), before, "no row lost or duplicated")
         XCTAssertEqual(lines.value.count, 1, "\(lines.value)")
@@ -287,18 +287,18 @@ final class RecordLogJsonbConversionHermeticTests: XCTestCase {
     func testSetOwnerPurgeAndPurgeAllConvertAVersion2StoreFirst() async throws {
         let owned = try await planted()
         try RecordLogStore.setOwner(host: owned, userId: "user-a")
-        XCTAssertEqual(try version(owned), "4")
+        XCTAssertEqual(try version(owned), String(RecordLogSchema.storageVersion))
         XCTAssertEqual(try unconverted(owned), 0)
 
         let purged = try await planted()
         XCTAssertTrue(try store(purged, "doc-c").purge(force: true).purged)
-        XCTAssertEqual(try version(purged), "4")
+        XCTAssertEqual(try version(purged), String(RecordLogSchema.storageVersion))
         XCTAssertEqual(try unconverted(purged), 0)
 
         let reset = try await planted()
         let trace = try RecordLogStatementTrace.install(on: reset, self)
         XCTAssertEqual(try RecordLogStore.purgeAll(host: reset), 2, "doc-a's two unsent writes")
-        XCTAssertEqual(try version(reset), "4")
+        XCTAssertEqual(try version(reset), String(RecordLogSchema.storageVersion))
         let statements = trace.statements
         let converted = statements.indices.filter { statements[$0].hasPrefix(Self.conversion[0]) }
         let cleared = try XCTUnwrap(statements.firstIndex { $0.hasPrefix("DELETE FROM record_log_rows") })
@@ -342,7 +342,7 @@ final class RecordLogJsonbConversionHermeticTests: XCTestCase {
             let before = try records(provider)
 
             try store(provider, "doc-0001").initialize()
-            XCTAssertEqual(try version(provider), "4")
+            XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
             XCTAssertEqual(try unconverted(provider), 0)
             XCTAssertEqual(try records(provider), before, "\(documents) documents")
             XCTAssertLessThanOrEqual(
@@ -386,7 +386,7 @@ final class RecordLogJsonbConversionHermeticTests: XCTestCase {
 
         try RecordLogPreviousRelease.downgrade(provider)
         try store(provider, "doc-a").initialize()
-        XCTAssertEqual(try version(provider), "4")
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
         XCTAssertEqual(try scalar(provider, "SELECT COUNT(*) FROM record_log_view WHERE typeof(_data) <> 'blob'").intValue, 0)
         XCTAssertEqual(
             try scalar(provider, "SELECT COUNT(*) FROM record_log_view WHERE json_extract(_data, '$.id') IS NOT NULL").intValue, 1,

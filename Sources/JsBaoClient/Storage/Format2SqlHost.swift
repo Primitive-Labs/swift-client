@@ -344,6 +344,11 @@ public final class SQLiteFormat2Connection: Format2SqlConnection {
                 sqlite3_bind_int64(statement, index, value)
             case .real(let value):
                 sqlite3_bind_double(statement, index, value)
+            case .blob(let data) where data.isEmpty:
+                // A zero-length blob is bound as one: a blob from no address binds NULL.
+                sqlite3_bind_zeroblob(statement, index, 0)
+            case .blob(let data):
+                _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, index, $0.baseAddress, Int32($0.count), Self.transient) }
             }
         }
         return statement
@@ -359,6 +364,10 @@ public final class SQLiteFormat2Connection: Format2SqlConnection {
             return .integer(sqlite3_column_int64(statement, index))
         case SQLITE_FLOAT:
             return .real(sqlite3_column_double(statement, index))
+        case SQLITE_BLOB:
+            let count = Int(sqlite3_column_bytes(statement, index))
+            guard count > 0, let bytes = sqlite3_column_blob(statement, index) else { return .blob(Data()) }
+            return .blob(Data(bytes: bytes, count: count))
         default:
             guard let text = sqlite3_column_text(statement, index) else { return .null }
             return .text(String(cString: text))
@@ -405,13 +414,17 @@ public enum Format2SqlValue: Equatable, Sendable {
     case text(String)
     case integer(Int64)
     case real(Double)
+    /// Bytes, bound with `sqlite3_bind_blob` and read from a `BLOB` column:
+    /// a device vector index's vectors and models (#5230). A zero-length
+    /// blob is `.blob(Data())`, never `.null`. `init(json:)` never makes one.
+    case blob(Data)
 
     public var stringValue: String? {
         switch self {
         case .text(let text): return text
         case .integer(let value): return String(value)
         case .real(let value): return String(value)
-        case .null: return nil
+        case .null, .blob: return nil
         }
     }
 
@@ -420,7 +433,7 @@ public enum Format2SqlValue: Equatable, Sendable {
         case .integer(let value): return Int(value)
         case .real(let value): return Int(value)
         case .text(let text): return Int(text)
-        case .null: return nil
+        case .null, .blob: return nil
         }
     }
 

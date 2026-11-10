@@ -11,6 +11,7 @@ import XCTest
 /// alive (behavior 27). Each client has its own `SessionUploadServer`, so the
 /// first client's attempts can be held while the second's are answered. Rows
 /// are read through a second connection to the file (`UploadRows`).
+@available(*, deprecated)
 final class BlobUploadPersistenceHermeticTests: XCTestCase {
     private typealias P = BlobUploadPersistence
     private static let bytes = Data("bytes that outlive the process".utf8)

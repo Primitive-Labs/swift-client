@@ -123,6 +123,7 @@ final class BlobUploadOwnedAttemptHermeticTests: XCTestCase {
         XCTAssertEqual(transport.calls.map(Self.authorization).compactMap { $0 }.filter { $0 != "Bearer token-u-a" }, [])
     }
 
+    @available(*, deprecated)
     func testAFirstPutThatLandsAfterAnotherUserSignedInDeletesTheRowsAndEmitsNothing() async throws {
         let path = try databasePath()
         let server = try server()
@@ -146,6 +147,7 @@ final class BlobUploadOwnedAttemptHermeticTests: XCTestCase {
         XCTAssertEqual(rows.byteKeys, [])
     }
 
+    @available(*, deprecated)
     func testAFirstPutRefusedAfterAnotherUserSignedInStaysQueuedForItsUser() async throws {
         let path = try databasePath()
         let server = try server()
@@ -202,6 +204,7 @@ final class BlobUploadOwnedAttemptHermeticTests: XCTestCase {
         }
     }
 
+    @available(*, deprecated)
     func testAQueuedAttemptAnswered401AfterARefreshIsSentAgainWithTheOwnersNewToken() async throws {
         let tokenA = makeTestJwt(userId: "u-a", exp: 9_999_999_998)
         let tokenA2 = makeTestJwt(userId: "u-a", exp: 9_999_999_999)
@@ -228,6 +231,7 @@ final class BlobUploadOwnedAttemptHermeticTests: XCTestCase {
         XCTAssertEqual(listed.map(\.blobId), [])
     }
 
+    @available(*, deprecated)
     func testAFirstPutAnswered401AfterARefreshIsSentAgainWithTheOwnersNewToken() async throws {
         let tokenA = makeTestJwt(userId: "u-a", exp: 9_999_999_998)
         let tokenA2 = makeTestJwt(userId: "u-a", exp: 9_999_999_999)

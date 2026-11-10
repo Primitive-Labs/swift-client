@@ -121,6 +121,20 @@ public enum JSONValue: Codable, Sendable, Equatable {
         guard case let .array(items) = self else { return nil }
         return items.compactMap { $0.stringValue }
     }
+
+    /// A vector field's numbers as a db3 read answers them (#5225): an `.array`
+    /// of numbers. `nil` for anything else, an array holding a non-number
+    /// included, so a stored value that does not fit the field reads as none.
+    public var floatArrayValue: [Float]? {
+        guard case let .array(items) = self else { return nil }
+        var numbers: [Float] = []
+        numbers.reserveCapacity(items.count)
+        for item in items {
+            guard let number = item.numberValue else { return nil }
+            numbers.append(Float(number))
+        }
+        return numbers
+    }
 }
 
 public extension JSONValue {

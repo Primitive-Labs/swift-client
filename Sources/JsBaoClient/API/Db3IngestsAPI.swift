@@ -49,6 +49,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     ///
     /// - Throws: `JsBaoError` with code `.invalidArgument`, as
     ///   `DocumentIngestsAPI.buildChunks` does.
+    /// - Stability: beta
     public func buildChunks(
         rows: [DocumentIngestRow],
         options: DocumentIngestBuildOptions = DocumentIngestBuildOptions()
@@ -63,6 +64,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func create(
         db3Id: String,
         options: DocumentIngestCreateOptions? = nil
@@ -80,6 +82,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func uploadChunk(
         db3Id: String,
         sessionId: String,
@@ -100,6 +103,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func commit(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .post, path: path(db3Id, sessionId, "commit"))
@@ -110,6 +114,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func abort(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .post, path: path(db3Id, sessionId, "abort"))
@@ -119,6 +124,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func get(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .get, path: path(db3Id, sessionId))
@@ -128,6 +134,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     ///
     /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    /// - Stability: beta
     public func list(db3Id: String, limit: Int? = nil, cursor: String? = nil) async throws -> DocumentIngestPage {
         try await awaitCreate(db3Id)
         var query = URLQuery()

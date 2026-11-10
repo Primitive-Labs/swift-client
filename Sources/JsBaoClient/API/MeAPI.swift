@@ -98,6 +98,7 @@ public final class MeAPI: @unchecked Sendable {
     /// `nil` rather than throwing — the `try?` here is the one intentional
     /// response-body leniency left on the typed path. Non-2xx statuses still
     /// throw, as everywhere else.
+    /// - Stability: production
     public func get(options: FetchCachedOptions? = nil) async throws -> UserProfile? {
         guard let cache = cache else {
             return Self.userProfile(from: try await fetchProfile())
@@ -144,6 +145,7 @@ public final class MeAPI: @unchecked Sendable {
     }
 
     /// Returns cache metadata for the current user's profile entry.
+    /// - Stability: production
     public func cacheInfo() async -> MeCacheInfo {
         guard let cache = cache else { return MeCacheInfo(updatedAt: nil, ageMs: nil) }
         let info = await cache.info(key: "me")
@@ -151,6 +153,7 @@ public final class MeAPI: @unchecked Sendable {
     }
 
     /// Clears the cached profile so the next get() fetches fresh data.
+    /// - Stability: production
     public func clearCache() async {
         guard let cache = cache else { return }
         await cache.clear(key: "me")
@@ -174,6 +177,7 @@ public final class MeAPI: @unchecked Sendable {
     /// non-owner subset of the local cache only. The non-owner predicate is
     /// the discriminator: rows with `permission == "owner"` (or no permission)
     /// belong to `ownedDocuments` and are excluded here.
+    /// - Stability: production
     public func sharedDocuments(
         cursor: String? = nil,
         limit: Int? = nil,
@@ -234,6 +238,7 @@ public final class MeAPI: @unchecked Sendable {
     /// pending-create doc (the creator is the owner).
     ///
     /// See `MeOwnedDocumentsOptions` for the full resolution order.
+    /// - Stability: production
     public func ownedDocuments(
         cursor: String? = nil,
         limit: Int? = nil,
@@ -262,6 +267,7 @@ public final class MeAPI: @unchecked Sendable {
     /// `waitForLoad: .local`) and the offline fallback still answer locally —
     /// they asked for the cache explicitly — returning every matching row with
     /// `nextCursor == nil`, which is also what js-bao does.
+    /// - Stability: production
     public func ownedDocumentsPage(
         cursor: String? = nil,
         limit: Int? = nil,
@@ -547,6 +553,7 @@ public final class MeAPI: @unchecked Sendable {
     /// Update the current user's profile (name and/or external avatar URL).
     /// Mirrors js-bao's `me.update(params)` → `UserProfile`. Pass
     /// `avatarUrl: .clear` to remove the current avatar (JS `avatarUrl: null`).
+    /// - Stability: production
     public func update(params: UpdateMeParams) async throws -> UserProfile {
         // The cache is cleared whether or not the response body decodes: on a
         // 2xx the server-side update has already happened, so a cached profile
@@ -583,6 +590,7 @@ public final class MeAPI: @unchecked Sendable {
     ///
     /// Returns a typed `AvatarUploadResult` carrying the new `avatarUrl`,
     /// mirroring js-bao's `{ avatarUrl }`.
+    /// - Stability: production
     public func uploadAvatar(imageData: Data, contentType: AvatarContentType) async throws -> AvatarUploadResult {
         let (body, status) = try await transport.requestData(
             method: .post,

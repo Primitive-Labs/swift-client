@@ -198,6 +198,7 @@ final class Db3IndexesDeviceLiveTests: XCTestCase {
     func testARefusedDropAndARefusedRegisterReadNoList() async throws {
         let id = try await live.db3Written(0, model: "Note")
         let c = try await live.client("refused", models: [Self.declaredNote])
+        c.setModelDefaultDb3("Note", id)
         let handle = try c.db3.subscribe(id)
         try await handle.ready()
         let listed = try await c.db3.indexes.list(id)
@@ -227,6 +228,7 @@ final class Db3IndexesDeviceLiveTests: XCTestCase {
         let before = try await roomList(id)
         XCTAssertFalse(before.contains { $0.fields == ["title"] }, "no index yet")
         let c = try await live.client("declares", models: [Self.declaredNote])
+        c.setModelDefaultDb3("Note", id)
         let frames = ThreadSafeBox<[String]>([])
         c.recordLogFrameSentForTest = { text in
             if text.contains("\"record.declare\"") { frames.mutate { $0.append(text) } }

@@ -65,7 +65,7 @@ final class Db3LastUseLiveTests: XCTestCase {
         let evicted = ThreadSafeBox<[Db3EvictedEvent]>([])
         let heard = client.eventEmitter.subscribe(Db3EvictedEvent.self) { event in evicted.mutate { $0.append(event) } }
         defer { heard.cancel() }
-        client.db3.setRetentionPolicy(RetentionPolicy(maxDocs: 1))
+        try client.db3.setRetentionPolicy(RetentionPolicy(maxDocs: 1))
         try await eventually(timeout: 15, description: "the retention eviction") { evicted.value.contains { $0.id == b } }
         try await delay(0.5)
         XCTAssertEqual(evicted.value.filter { [a, b].contains($0.id) }, [Db3EvictedEvent(id: b, reason: .retention)])

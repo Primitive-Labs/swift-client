@@ -567,6 +567,7 @@ public enum CursorManager {
         case let .date(s):      return .string(s)
         case let .stringset(s): return .array(Array(s).sorted().map { .string($0) })
         case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
+        case let .vector(v):    return .array(v.map { .number(Double($0)) })
         }
     }
 
@@ -597,6 +598,7 @@ public enum CursorManager {
         case let .date(s):      return s
         case let .stringset(s): return Array(s).joined(separator: ",")
         case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
+        case .vector:           return NSNull()
         }
     }
 }

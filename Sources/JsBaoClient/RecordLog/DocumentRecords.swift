@@ -1,17 +1,20 @@
 import Foundation
 
 /// The records of one open format-3 document by model name, with no model
-/// class: from `client.documents.records(documentId)`.
+/// class: from `client.db3.records(db3Id)`.
 ///
 /// Any model of the document can be written and read, declared or not. A
 /// field holds a ``DocumentRecordValue``: a string, a number, a boolean,
 /// `null` or a string set, and a set can be edited in place with
-/// `.setChange(add:remove:clear:)`. Reads answer from the document's local
+/// `.setChange(add:remove:clear:)`. A vector field the db3's type or a
+/// registered model declares (#5225) is written as `.vector([Float])` and read
+/// as an array of its numbers (`floatArrayValue`); any other field is left as
+/// it is stored. Reads answer from the document's local
 /// copy at once, offline too; writes show there at once and reach the room
 /// when the client is connected.
 ///
 /// ```swift
-/// let records = client.documents.records(documentId)
+/// let records = client.db3.records(db3Id)
 /// let note = try records.put("Note", ["title": "Groceries", "tags": ["home"]])
 /// try records.patch("Note", id: note["id"]!.stringValue!, ["tags": .setChange(add: ["weekly"])])
 /// let page = try records.query("Note", ["tags": ["$contains": "home"]], options: QueryOptions(limit: 20))
@@ -110,7 +113,13 @@ public final class DocumentRecords: Sendable {
 
     /// Record `id` of `model` as the local copy holds it, or `nil`.
     public func get(_ model: String, id: String) throws -> PrimitiveRow? {
-        try readable().store.read(model: model, id: id).map(PrimitiveRow.init(raw:))
+        let binding = try readable()
+        return try binding.store.read(model: model, id: id).map { PrimitiveRow(raw: Self.decoded($0, model, binding)) }
+    }
+
+    /// `row` with each vector field this device knows read as its numbers (#5225).
+    private static func decoded(_ row: RecordLogRow, _ model: String, _ binding: RecordLogDocumentBinding) -> RecordLogRow {
+        binding.decodedVectors(row, model: model, encodings: binding.vectorEncodings(model: model))
     }
 
     /// The records of `model` matching `filter`, one page, answered from the
@@ -121,19 +130,52 @@ public final class DocumentRecords: Sendable {
     /// pages (`limit`, `cursor`, `direction`; a backward page is answered in
     /// sort order), keeps or drops row keys (`projection`; `id` is always
     /// kept), and scopes (`documents`: `nil`, or a list naming this document).
+    /// The page's `drift` says how far behind the server the local copy was;
+    /// with `options.maxDrift`, a copy further behind is refused
+    /// `DB3_DRIFT_EXCEEDED`.
     public func query(_ model: String, _ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws
         -> PagedQueryResult<PrimitiveRow>
     {
-        let page = try readable().store.queryView(model, filter ?? [:], options: options)
+        let binding = try readable()
+        let page = try binding.store.queryView(model, filter ?? [:], options: options)
+        let encodings = binding.vectorEncodings(model: model)
         return PagedQueryResult(
-            data: page.data.map(PrimitiveRow.init(raw:)), nextCursor: page.nextCursor, prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            data: page.data.map { PrimitiveRow(raw: binding.decodedVectors($0, model: model, encodings: encodings)) },
+            nextCursor: page.nextCursor, prevCursor: page.prevCursor, hasMore: page.hasMore, drift: page.drift
         )
     }
 
-    /// How many records of `model` match `filter`, matched as ``query(_:_:options:)`` matches.
-    public func count(_ model: String, _ filter: DocumentFilter? = nil) throws -> Int {
-        try readable().store.countView(model, filter ?? [:])
+    /// How many records of `model` match `filter`, matched as ``query(_:_:options:)`` matches;
+    /// with `maxDrift`, refused as a query is.
+    public func count(_ model: String, _ filter: DocumentFilter? = nil, maxDrift: Db3MaxDrift? = nil) throws -> Int {
+        try readable().store.countView(model, filter ?? [:], maxDrift: maxDrift)
+    }
+
+    /// Explain how this device answers a read of `model`: the read runs on the
+    /// local copy as ``query(_:_:options:)``, ``count(_:_:maxDrift:)`` or an
+    /// aggregate would run it, and the answer names, per statement, SQLite's
+    /// plan, the indexes it used (by their names in the db3's index list) and
+    /// whether it scanned, in the shape the server's explain answers.
+    /// `request.index` forces the read through one field or member index, or
+    /// through none (`"none"`), to compare. Nothing is written or sent. A
+    /// facet tells set fields by the db3's type, or `request.setFields`, for
+    /// the read's model only: the device never facets an include, so an
+    /// include's model has no set fields and reads as the ordinary read's do.
+    ///
+    /// ```swift
+    /// let records = client.db3.records(db3Id)
+    /// let plain = try records.explain("Note", Db3ExplainRequest(op: .query, filter: ["year": 2024]))
+    /// let none = try records.explain("Note", Db3ExplainRequest(op: .query, filter: ["year": 2024], index: "none"))
+    /// print(plain.indexes, none.scanned) // ["idx_records_note_year"] ["Note"]
+    /// ```
+    ///
+    /// - Throws: `JsBaoError` `.db3IndexNotFound` for an index the db3's list
+    ///   does not have for `model`; `.db3IndexCannotServe` (with
+    ///   `details["reason"]`) for one that cannot serve the read;
+    ///   `.invalidArgument` for an empty index name. Refused as a query is on
+    ///   a copy that is not here.
+    public func explain(_ model: String, _ request: Db3ExplainRequest) throws -> Db3Explain {
+        try readable().store.explainView(model, request)
     }
 
     /// Call `callback` after any change to `model`'s records in this document:
@@ -176,6 +218,7 @@ public final class DocumentRecords: Sendable {
             binding.reportRefused(event)
         }
         try assertRecordLogRecordInput(documentId: documentId, model: model, id: id, kind: kind, data: data, report: report)
+        let data = try Self.encodedVectors(data, binding: binding, model: model, id: id, kind: kind)
         if binding.isReadOnly {
             throw JsBaoError(
                 code: .accessDenied,
@@ -194,10 +237,25 @@ public final class DocumentRecords: Sendable {
             }
             try assertRecordLogEntry(documentId: documentId, mutations: mutations, report: report)
             let seq = try binding.commit([RecordLogWrite(mutations: mutations)]).last?.seq
-            return (kind == .delete ? nil : try binding.store.read(model: model, id: id), seq)
+            return (kind == .delete ? nil : try binding.store.read(model: model, id: id).map { Self.decoded($0, model, binding) }, seq)
         }
         // The commit told the change listeners; the model's listeners hear it here.
         binding.notify([RecordLogRecordKey(model: model, id: id)], origin: nil)
         return Written(row: row, seq: seq, binding: binding)
+    }
+
+    /// `data` with each vector's numbers as the stored base64 of its field's
+    /// encoding (#5225), refused as ``RecordLogDocumentBinding/encodedVectors(_:numbers:model:id:kind:)`` refuses.
+    private static func encodedVectors(
+        _ data: [String: DocumentRecordValue], binding: RecordLogDocumentBinding, model: String, id: String,
+        kind: RecordLogRecordWriteKind
+    ) throws -> [String: DocumentRecordValue] {
+        var numbers: [String: [Float]] = [:]
+        for (field, value) in data { if case .vector(let vector) = value { numbers[field] = vector } }
+        guard !numbers.isEmpty else { return data }
+        let encoded = try binding.encodedVectors([:], numbers: numbers, model: model, id: id, kind: kind.mutationKind)
+        var out = data
+        for (field, value) in encoded { if case .string(let text) = value { out[field] = .string(text) } }
+        return out
     }
 }

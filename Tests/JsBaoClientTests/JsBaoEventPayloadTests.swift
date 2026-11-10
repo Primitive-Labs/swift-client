@@ -92,7 +92,18 @@ final class JsBaoEventPayloadTests: XCTestCase {
         Db3ErrorEvent(id: "d1", code: "OPEN_FAILED", message: "boom"),
         Db3CreatedEvent(id: "d1"),
         Db3CreateFailedEvent(code: "DB3_ID_EXISTS", message: "taken", title: "Orders", type: nil, id: "d1"),
+        accessRequestCreated,
+        accessRequestResolved,
+        Db3AccessRequestCreatedEvent(accessRequestCreated),
+        Db3AccessRequestResolvedEvent(accessRequestResolved),
     ]
+
+    private static let accessRequestCreated = DocumentAccessRequestCreatedEvent(
+        requestId: "r1", documentId: "d1", requesterId: "u1", requestedPermission: "reader", status: "pending"
+    )
+    private static let accessRequestResolved = DocumentAccessRequestResolvedEvent(
+        requestId: "r1", documentId: "d1", requesterId: "u1", requestedPermission: "reader", status: "denied"
+    )
 
     private static let blobProgress = BlobUploadProgressEvent(
         documentId: "d1", blobId: "b1", queueId: "q1", filename: "f", contentType: "text/plain",

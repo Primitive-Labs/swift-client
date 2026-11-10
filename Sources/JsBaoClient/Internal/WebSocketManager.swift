@@ -24,6 +24,13 @@ protocol WebSocketManagerDelegate: AnyObject, Sendable {
     func webSocketManagerBuildConnectionRequest(connectionId: String) -> (url: URL, headers: [String: String])
     func webSocketManagerOnStatusChange(_ status: ConnectionStatus)
     func webSocketManagerOnConnecting()
+    /// The socket opened: the server accepted the handshake. The manager stays
+    /// `.connecting` until the server's `ready` frame (#5578), which is what
+    /// `webSocketManagerOnConnected()` reports.
+    ///
+    /// Defaulted to a no-op, so a delegate with no handshake policy — every
+    /// test double — is unaffected.
+    func webSocketManagerOnSocketOpened()
     func webSocketManagerOnConnected()
     func webSocketManagerOnMessage(_ data: Data) async
     func webSocketManagerOnMessage(_ text: String) async
@@ -51,6 +58,7 @@ protocol WebSocketManagerDelegate: AnyObject, Sendable {
 
 extension WebSocketManagerDelegate {
     func webSocketManagerWillDeliverDeliberateClose() {}
+    func webSocketManagerOnSocketOpened() {}
 }
 
 // MARK: - WebSocketManager
@@ -103,7 +111,15 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         case closed(task: ObjectIdentifier, code: Int, reason: String?)
         case completed(task: ObjectIdentifier, failure: WebSocketError)
         case receiveLoopFailed(task: ObjectIdentifier, code: Int?, failure: WebSocketError)
+        /// The server's `ready` frame arrived on `task` (#5578). It joins the
+        /// channel rather than calling in, so it is ordered with the task's own
+        /// open and close and is applied only while `task` is current.
+        case ready(task: ObjectIdentifier)
     }
+
+    /// Longer than any `ready` frame, so recognising one never parses a real
+    /// payload.
+    private static let readyFrameMaxLength = 64
 
     // MARK: - Nonisolated state
 
@@ -174,6 +190,18 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     // Receive loop task
     private var receiveLoopTask: Task<Void, Never>?
 
+    /// How long an open socket may wait for the server's `ready` before it is
+    /// closed and the reconnect loop retries (#5578); `nil` waits forever.
+    private let readyTimeoutMs: Int?
+    private var readyDeadlineTask: Task<Void, Never>?
+
+    /// The current task opened and its `ready` would still connect it. Cleared
+    /// as soon as the manager starts closing that task — a forced reconnect,
+    /// the readiness deadline, `disconnect()` — because the task stays current
+    /// until its close callback lands, and a `ready` already queued behind the
+    /// close request must not bring a socket being torn down up as connected.
+    private var awaitingReady = false
+
     /// Test seam (#2171): the pump reports every event it handled, in handling
     /// order, so the ordering and no-drop behaviors can be observed. Mirrors
     /// `onOutboundFlushedForTest` (#2105).
@@ -227,9 +255,15 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Init
 
-    init(logger: Logger, maxReconnectDelayMs: Int, delegate: (any WebSocketManagerDelegate)? = nil) {
+    init(
+        logger: Logger,
+        maxReconnectDelayMs: Int,
+        readyTimeoutMs: Int? = nil,
+        delegate: (any WebSocketManagerDelegate)? = nil
+    ) {
         self.logger = logger
         self.maxReconnectDelayMs = maxReconnectDelayMs
+        self.readyTimeoutMs = readyTimeoutMs
         var continuation: AsyncStream<DelegateEvent>.Continuation!
         self.events = AsyncStream(DelegateEvent.self, bufferingPolicy: .unbounded) { continuation = $0 }
         self.eventContinuation = continuation
@@ -260,6 +294,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         receiveLoopTask?.cancel()
         reconnectTask?.cancel()
         disconnectTimeoutTask?.cancel()
+        readyDeadlineTask?.cancel()
         // `snapshot.task`, not the isolated `task` accessor: `deinit` may touch
         // isolated *stored* state, but not a computed property.
         snapshot.task?.cancel(with: .goingAway, reason: nil)
@@ -282,6 +317,12 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     nonisolated var isSocketOpen: Bool { snapshot.socketIsOpen }
 
+    /// Whether the socket is open, connected or still waiting for the server's
+    /// `ready` (#5578). `isSocketOpen` is the gate for sends, which wait for
+    /// `ready`; this is the one an applied token is routed by, so a token for
+    /// another user that lands during the wait rebuilds the socket.
+    nonisolated var isTransportOpen: Bool { snapshot.transportIsOpen }
+
     /// The strictly-current values, for callers that would rather take an actor
     /// hop than a snapshot. Undeprecated — the synchronous forms above are not
     /// going away.
@@ -292,6 +333,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     var connectionStatusAsync: ConnectionStatus { snapshot.status }
 
     var isSocketOpenAsync: Bool { snapshot.socketIsOpen }
+
+    var isTransportOpenAsync: Bool { snapshot.transportIsOpen }
 
     /// Whether the manager is currently trying to hold a connection open — the
     /// `shouldConnect` intent, not the live transport state. The WS auth
@@ -588,6 +631,10 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         case .receiveLoopFailed(let taskId, let code, let failure):
             guard currentTask(matching: taskId, "receive loop") != nil else { return }
             handleConnectionClosed(code: code, reason: failure.localizedDescription, error: failure)
+
+        case .ready(let taskId):
+            guard currentTask(matching: taskId, "ready") != nil else { return }
+            handshakeReady()
         }
     }
 
@@ -602,10 +649,32 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         return current
     }
 
+    /// #5578 — open is not connected. The server registers the socket on its
+    /// user's channel behind the 101 and sends `ready` once it has; until then
+    /// a user event can miss this client. The manager stays `.connecting`,
+    /// `connect()` keeps waiting, and the readiness deadline bounds the wait.
     private func handleSocketOpened(_ openedTask: URLSessionWebSocketTask) {
+        snapshot.markOpened()
+        awaitingReady = true
+        logger.debug("[WSM][debug] socket open (didOpenWithProtocol); awaiting ready", connectionId)
+        delegate?.webSocketManagerOnSocketOpened()
+        startReceiveLoop(openedTask)
+        armReadyDeadline(for: ObjectIdentifier(openedTask))
+    }
+
+    /// The connected transition, for the current task's `ready` only (the pump
+    /// has checked the task). A second `ready`, or one for a task the manager
+    /// has started closing, changes nothing.
+    private func handshakeReady() {
+        guard awaitingReady, snapshot.opened, !_connected else {
+            logger.debug("[WSM][debug] ignoring ready: not awaiting one")
+            return
+        }
+        awaitingReady = false
+        cancelReadyDeadline()
         setTransportState(connected: true, connecting: false)
         reconnectAttempts = 0
-        logger.debug("[WSM][debug] socket open (didOpenWithProtocol)", connectionId)
+        logger.debug("[WSM][debug] socket ready", connectionId)
 
         let continuation = connectContinuation
         connectContinuation = nil
@@ -616,8 +685,38 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         delegate?.webSocketManagerOnConnected()
         continuation?.resume()
         for waiter in waiters { waiter.resume() }
+    }
 
-        startReceiveLoop(openedTask)
+    // MARK: - Readiness deadline (#5578)
+
+    private func armReadyDeadline(for taskId: ObjectIdentifier) {
+        cancelReadyDeadline()
+        guard let readyTimeoutMs, readyTimeoutMs > 0 else { return }
+        readyDeadlineTask = makeReadyDeadline(taskId: taskId, delayMs: readyTimeoutMs)
+    }
+
+    private func cancelReadyDeadline() {
+        readyDeadlineTask?.cancel()
+        readyDeadlineTask = nil
+    }
+
+    private nonisolated func makeReadyDeadline(taskId: ObjectIdentifier, delayMs: Int) -> Task<Void, Never> {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            guard !Task.isCancelled, let self = self else { return }
+            await self.fireReadyDeadline(taskId: taskId)
+        }
+    }
+
+    /// A socket that opened and heard no `ready` in time is closed, as the JS
+    /// client's connect deadline closes it: `connect()` throws, and the close
+    /// that follows reaches the pump like any other and schedules the retry.
+    /// A deadline for a task that is no longer current does nothing.
+    private func fireReadyDeadline(taskId: ObjectIdentifier) {
+        readyDeadlineTask = nil
+        guard currentTask(matching: taskId, "ready deadline") != nil, !_connected else { return }
+        logger.warn("[WSM] no ready within the handshake budget; closing the socket", readyTimeoutMs ?? 0)
+        closeSocketNow(initiator: "readyTimeout")
     }
 
     // MARK: - Receive Loop
@@ -645,6 +744,12 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
                     switch message {
                     case .string(let text):
+                        // The manager's own frame (#5578), tagged with the task
+                        // it arrived on and never forwarded.
+                        if Self.isReadyFrame(text) {
+                            self.emit(.ready(task: ObjectIdentifier(wsTask)))
+                            continue
+                        }
                         await self.delegate?.webSocketManagerOnMessage(text)
                     case .data(let data):
                         await self.delegate?.webSocketManagerOnMessage(data)
@@ -673,6 +778,18 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    /// Whether a text frame is the server's `{"type":"ready"}`. Only a short
+    /// frame is parsed, so every other frame costs a length check.
+    nonisolated static func isReadyFrame(_ text: String) -> Bool {
+        guard text.utf8.count <= readyFrameMaxLength, text.contains("\"ready\"") else { return false }
+        return (try? JSONDecoder().decode(FrameType.self, from: Data(text.utf8)))?.type == "ready"
+    }
+
+    /// Just a frame's `type`, for recognising `ready`.
+    private struct FrameType: Decodable {
+        let type: String
+    }
+
     // MARK: - Connection Closed Handler
 
     /// Reached **only** from `handle(_:)` — every terminal path funnels through
@@ -685,6 +802,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         let wasTask = task
         task = nil
         setTransportState(connected: false, connecting: false)
+        cancelReadyDeadline()
 
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
@@ -873,6 +991,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         _connecting = false
         reconnectTask?.cancel()
         reconnectTask = nil
+        cancelReadyDeadline()
+        awaitingReady = false
 
         let hadTask = task != nil
         let currentTask = task
@@ -1022,6 +1142,17 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         try await currentTask.send(.data(data))
     }
 
+    /// Send on the open socket, before the server's `ready` too (#5578). Only
+    /// the in-band token refresh uses it: the server holds a frame that early
+    /// until the handshake's session is stored, then answers it.
+    nonisolated func sendOnOpenSocket(_ text: String) async throws {
+        guard let currentTask = snapshot.openTask else {
+            throw WebSocketError.notConnected
+        }
+        snapshot.sentForTest?(text)
+        try await currentTask.send(.string(text))
+    }
+
     // MARK: - Close Socket
 
     func closeSocket(initiator: String) {
@@ -1033,6 +1164,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// held" contract; actor isolation makes the contract structural.)
     private func closeSocketNow(initiator: String) {
         lastCloseInitiator = initiator
+        awaitingReady = false
         receiveLoopTask?.cancel()
         task?.cancel(with: .goingAway, reason: initiator.data(using: .utf8))
 

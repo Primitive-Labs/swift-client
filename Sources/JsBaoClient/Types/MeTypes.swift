@@ -31,19 +31,48 @@ public struct UserProfile: Decodable, Sendable, Equatable {
     public let avatarUrl: String?
     public let appRole: String
     public let appId: String
+    /// The user's own properties, as the app's `user-properties.toml` lets a
+    /// client read its own row: every field whose `client` is not `none`,
+    /// with the schema's defaults applied. `[:]` when the app declares none,
+    /// and for a profile cached before the field existed.
+    public let properties: [String: JSONValue]
+
+    private enum CodingKeys: String, CodingKey {
+        case userId, email, name, avatarUrl, appRole, appId, properties
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try c.decode(String.self, forKey: .userId)
+        email = try c.decode(String.self, forKey: .email)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        avatarUrl = try c.decodeIfPresent(String.self, forKey: .avatarUrl)
+        appRole = try c.decode(String.self, forKey: .appRole)
+        appId = try c.decode(String.self, forKey: .appId)
+        properties = try c.decodeIfPresent([String: JSONValue].self, forKey: .properties) ?? [:]
+    }
 }
 
 /// Parameters for `me.update(params:)`. Mirrors JS `UpdateMeParams`.
 ///
 /// `avatarUrl` is clearable: pass `.value(url)` to set, `.clear` to remove the
 /// current avatar (JS `avatarUrl: null`), or omit (`nil`) to leave it unchanged.
+///
+/// `properties` sets the caller's own property values by name; `.null`
+/// clears a field so its default shows again, and a stringset is replaced
+/// whole. Only fields whose `client` is `self-write` or `self-write-members`
+/// can be written: any other throws `HttpError` with status 403 and
+/// `serverCode` `USER_PROPERTY_NOT_CLIENT_WRITABLE`, and nothing in the
+/// update is written.
 public struct UpdateMeParams: Encodable, Sendable {
     public var name: String?
     public var avatarUrl: Updatable<String>?
+    public var properties: [String: JSONValue]?
 
-    public init(name: String? = nil, avatarUrl: Updatable<String>? = nil) {
+    public init(name: String? = nil, avatarUrl: Updatable<String>? = nil, properties: [String: JSONValue]? = nil) {
         self.name = name
         self.avatarUrl = avatarUrl
+        self.properties = properties
     }
 }
 

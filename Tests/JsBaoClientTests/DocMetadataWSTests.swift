@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-docmetadata-ws.test.ts
 /// Tests document metadata change events via WebSocket.
+@available(*, deprecated)
 final class DocMetadataWSTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

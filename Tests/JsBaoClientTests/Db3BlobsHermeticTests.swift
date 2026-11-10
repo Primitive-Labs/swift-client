@@ -46,6 +46,7 @@ final class Db3BlobsHermeticTests: XCTestCase {
 
     // MARK: - Behavior 9
 
+    @available(*, deprecated)
     func testEachRequestIsTheDocumentsRequestOnTheDb3Route() async throws {
         let ours = transport()
         let theirs = transport()
@@ -85,6 +86,7 @@ final class Db3BlobsHermeticTests: XCTestCase {
         XCTAssertEqual(ours.calls.map(\.path).dropFirst(), ["/db3/D1/blobs?limit=5&cursor=c%201", "/db3/D1/blobs/B1", "/db3/D1/blobs/B1"])
     }
 
+    @available(*, deprecated)
     func testTheDownloadUrlIsTheDb3Route() {
         let blobs = db3(transport())
         let twin = documents(transport())

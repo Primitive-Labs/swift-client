@@ -16,6 +16,7 @@ import YSwift
 /// state) keeps the conservative guard.
 ///
 /// Server-free: unreachable URLs, memory storage, no connection.
+@available(*, deprecated)
 final class LocalOnlyEvictParityHermeticTests: XCTestCase {
 
     private func makeClient(_ appId: String) -> JsBaoClient {

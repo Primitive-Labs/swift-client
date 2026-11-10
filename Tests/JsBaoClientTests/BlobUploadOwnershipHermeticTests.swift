@@ -10,6 +10,7 @@ import XCTest
 ///
 /// A real client over `SessionUploadServer`, which records each request's
 /// `Authorization`; the queue is driven through the public document members.
+@available(*, deprecated)
 final class BlobUploadOwnershipHermeticTests: XCTestCase {
     private static let bytes = Data("document bytes".utf8)
 

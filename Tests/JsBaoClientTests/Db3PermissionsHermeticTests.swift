@@ -65,6 +65,7 @@ final class Db3PermissionsHermeticTests: XCTestCase {
 
     // MARK: - Behavior 1
 
+    @available(*, deprecated)
     func testEachCallIsTheDocumentsCallOnTheDb3Mount() async throws {
         let ours = transport()
         let theirs = transport()

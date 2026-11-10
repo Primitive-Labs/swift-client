@@ -263,18 +263,20 @@ public extension PrimitiveRecord {
         guard !relatedIds.isEmpty else {
             return PagedQueryResult(
                 data: [], nextCursor: joinPage.nextCursor,
-                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore, drift: joinPage.drift
             )
         }
-        let rows = try target.query(["id": ["$in": .array(relatedIds.map { .string($0) })]], options: nil)
-        let records: [PrimitiveRecord] = rows.compactMap { row in
+        // A page of the target, so its drift comes with its rows (#5221).
+        let targets = try target.queryPaged(["id": ["$in": .array(relatedIds.map { .string($0) })]], options: nil)
+        let records: [PrimitiveRecord] = targets.data.compactMap { row in
             (row["id"]?.stringValue).map {
                 PrimitiveRecord(modelName: target.schema.name, id: $0, model: target)
             }
         }
         return PagedQueryResult(
             data: records, nextCursor: joinPage.nextCursor,
-            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore,
+            drift: mergedDrift(joinPage.drift, targets.drift)
         )
     }
 

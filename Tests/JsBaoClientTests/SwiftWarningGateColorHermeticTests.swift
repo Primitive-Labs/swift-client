@@ -54,11 +54,16 @@ final class SwiftWarningGateColorHermeticTests: XCTestCase {
 
         let scripts = root.appendingPathComponent("scripts")
         let bin = root.appendingPathComponent("bin")
-        for dir in [scripts, bin] {
+        for dir in [scripts.appendingPathComponent("lib"), bin] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         let scriptPath = scripts.appendingPathComponent("check-swift-deprecations.sh")
         try script.write(to: scriptPath, atomically: true, encoding: .utf8)
+        // The family carve-out the gate sources (#5356).
+        try ClientSourceText.repoFile("scripts/lib/swift-allowed-deprecations.sh").write(
+            to: scripts.appendingPathComponent("lib/swift-allowed-deprecations.sh"),
+            atomically: true, encoding: .utf8
+        )
 
         let canned = log.replacingOccurrences(of: "__ROOT__", with: root.path)
         try write(

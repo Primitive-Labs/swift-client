@@ -338,6 +338,7 @@ final class AgentSessionScenarioHarness: @unchecked Sendable {
         func note(_ call: String) { lock.withLock { calls.append(call) } }
     }
 
+    @available(*, deprecated)
     func documentsCalls(of client: JsBaoClient) -> DocumentsCalls {
         let counted = DocumentsCalls()
         let fetch = client.documentManager.fetchDocumentInfo

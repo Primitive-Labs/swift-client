@@ -8,6 +8,7 @@ import XCTest
 ///
 /// Live tests against the dev server, matching the JS coverage in
 /// `tests/client/js-bao-client-link-access.test.ts`.
+@available(*, deprecated)
 final class DocumentLinkAccessTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

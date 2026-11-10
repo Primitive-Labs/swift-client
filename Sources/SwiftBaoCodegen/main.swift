@@ -137,6 +137,7 @@ func run() -> Int32 {
     do {
         rendered = try CodegenRun.render(
             documents: inputs.map { (sourceName: $0.sourceName, source: $0.source) },
+            sharedEnums: CodegenInputs.sharedEnumFiles(for: inputs),
             emptyLabel: args.inputs.map { URL(fileURLWithPath: $0).lastPathComponent + "/" }.joined(separator: ", "),
             accessLevel: args.accessLevel,
             moduleImport: args.moduleImport,

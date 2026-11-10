@@ -14,6 +14,7 @@ public final class SessionAPI: @unchecked Sendable {
     /// Mirrors the JS client's `client.session.get()` which calls
     /// `GET /session` (returns a typed `SessionInfo`), distinct from
     /// `GET /me` (returns the user profile).
+    /// - Stability: production
     public func get() async throws -> SessionInfo {
         try await transport.request(method: .get, path: "/session")
     }

@@ -11,6 +11,9 @@ import XCTest
 ///   terminal, and every other blob call is refused the same.
 /// - 16: the upload events carry the db3 id; a `retainLocal: false` upload is
 ///   fetched again by `read`.
+///
+/// #4968 behavior 6 and E6: `downloadRequest` sent with `URLSession` answers
+/// a reader the blob's bytes; the bare `downloadUrl` answers 401.
 final class Db3BlobsLiveTests: XCTestCase {
 
     private var ctx: TestContext!
@@ -96,6 +99,35 @@ final class Db3BlobsLiveTests: XCTestCase {
         _ = try await owner.db3.delete(db3Id)
         let gone = try await live.authenticatedGet(kept, jwt: live.app.ownerJWT)
         XCTAssertEqual(gone.0, 404)
+    }
+
+    // MARK: - #4968 behavior 6 and E6
+
+    func testTheDownloadRequestAnswersTheBlobToAReaderAndTheBareUrlIsRefused() async throws {
+        let owner = try await live.client("owner", models: [])
+        let db3Id = try await createdOnServer(owner, title: "Pictures").id
+        let bytes = Data((0..<64).map { UInt8($0) })
+        let uploaded = try await owner.db3.blobs(db3Id).upload(
+            data: bytes, options: BlobUploadSourceOptions(filename: "bytes.bin", contentType: "application/octet-stream")
+        )
+        let bob = try await ctx.createTestUser(appId: live.app.appId)
+        _ = try await owner.db3.permissions(db3Id).set(.user(bob.userId, permission: "reader"))
+        let bobClient = try await live.client("bob", models: [], token: bob.jwt)
+        let blobs = bobClient.db3.blobs(db3Id)
+        // No URL cache: a cached 200 would answer the bare URL below.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        let session = URLSession(configuration: configuration)
+
+        let request = try blobs.downloadRequest(blobId: uploaded.blobId, disposition: .inline)
+        let (data, response) = try await session.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(data, bytes)
+
+        // E6: the URL alone carries no credentials.
+        let bare = try XCTUnwrap(URL(string: blobs.downloadUrl(blobId: uploaded.blobId, disposition: .inline)))
+        let (_, bareResponse) = try await session.data(from: bare)
+        XCTAssertEqual((bareResponse as? HTTPURLResponse)?.statusCode, 401)
     }
 
     // MARK: - Behavior 15

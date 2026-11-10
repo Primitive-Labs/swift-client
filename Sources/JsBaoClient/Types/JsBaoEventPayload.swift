@@ -392,6 +392,14 @@ extension CacheUpdateFailedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .cacheUpdateFailed }
 }
 
+extension DocumentAccessRequestCreatedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentAccessRequestCreated }
+}
+
+extension DocumentAccessRequestResolvedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentAccessRequestResolved }
+}
+
 // MARK: - The conformance table
 
 /// Every `JsBaoEventPayload` conformance in the client.
@@ -460,6 +468,10 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     Db3ErrorEvent.self,
     Db3CreatedEvent.self,
     Db3CreateFailedEvent.self,
+    DocumentAccessRequestCreatedEvent.self,
+    DocumentAccessRequestResolvedEvent.self,
+    Db3AccessRequestCreatedEvent.self,
+    Db3AccessRequestResolvedEvent.self,
 ]
 
 /// The event keys that have no payload type, and why.

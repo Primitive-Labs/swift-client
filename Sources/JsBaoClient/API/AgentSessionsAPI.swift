@@ -7,6 +7,7 @@ import Foundation
 public final class AgentsAPI: @unchecked Sendable {
     /// Agent sessions: list, get, open, send, answer, cancel, events, mark
     /// read, rename, delete and members.
+    /// - Stability: beta
     public let sessions: AgentSessionsAPI
 
     /// Designated initializer — the typed transport spine. A sessions API
@@ -61,6 +62,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// List one user's sessions — your own by default — newest first. Pages
     /// may be shorter than `limit` when `scope` filters entries out; follow
     /// `nextCursor` while `hasMore` is true.
+    /// - Stability: beta
     public func list(options: ListAgentSessionsOptions? = nil) async throws -> PaginatedResult<AgentSessionListItem> {
         var query = URLQuery()
         query.appendIfPresent("userId", options?.userId)
@@ -77,6 +79,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// Get one session. Members, the owner, app owners and admins may; anyone
     /// else is answered `AGENT_SESSION_NOT_FOUND`. App owners and admins also
     /// receive `object`, `turnContexts` and `lastTurn`.
+    /// - Stability: beta
     public func get(sessionId: String) async throws -> AgentSessionInfo {
         try await observed(sessionId) {
             try await transport.request(method: .get, path: try Self.sessionPath(sessionId))
@@ -85,6 +88,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
 
     /// Rename a session (owner only). The title changes on the session and in
     /// every member's list.
+    /// - Stability: beta
     public func rename(sessionId: String, title: String) async throws -> AgentSessionRenameResult {
         try Self.require(title, "title")
         return try await observed(sessionId) {
@@ -100,6 +104,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// is refused `AGENT_SESSION_NOT_FOUND`.
     /// Once it returns, this client's queued uploads to the session, and the
     /// messages waiting on them, fail with `AGENT_SESSION_NOT_FOUND`.
+    /// - Stability: beta
     public func delete(sessionId: String) async throws -> AgentSessionDeleteResult {
         let blobs = client?.blobManager
         let identity = await blobs?.captureIdentity()
@@ -117,6 +122,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// Add a member, or change an existing member's role (owner only). The
     /// user must be an existing user of this app; a session holds at most 50
     /// members.
+    /// - Stability: beta
     public func addMember(
         sessionId: String, userId: String, role: AgentSessionMemberRole
     ) async throws -> AgentSessionMembersResult {
@@ -134,6 +140,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// open view of theirs loses the session and its copy on their device.
     /// Removing someone who is not a member succeeds with the members
     /// unchanged.
+    /// - Stability: beta
     public func removeMember(sessionId: String, userId: String) async throws -> AgentSessionMembersResult {
         try Self.require(userId, "userId")
         return try await observed(sessionId) {
@@ -151,6 +158,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// `AGENT_SESSION_PARTICIPANT_ONLY` for a viewer and
     /// `AGENT_SESSION_RATE_LIMITED` past the send limit. A `context` that is
     /// not a JSON object throws `.invalidArgument` before any request.
+    /// - Stability: beta
     public func send(sessionId: String, body: AgentSessionSendBody) async throws -> AgentSessionSendResult {
         let path = try Self.sessionPath(sessionId) + "/messages"
         if let context = body.context, context.objectValue == nil {
@@ -168,6 +176,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// Answer a call the active turn waits on: approve or deny it, or give a
     /// client tool's output or error. The first valid answer wins; a repeat
     /// is refused `AGENT_CALL_ANSWERED`.
+    /// - Stability: beta
     public func answer(
         sessionId: String, callId: String, _ answer: AgentCallAnswer
     ) async throws -> AgentCallAnswerResult {
@@ -183,6 +192,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
 
     /// Cancel the active turn, naming it; a turn that is no longer active is
     /// refused with `AGENT_TURN_STALE`. A view's `cancel()` fills the turn in.
+    /// - Stability: beta
     public func cancel(sessionId: String, turnId: String) async throws -> AgentSessionCancelResult {
         try Self.require(turnId, "turnId")
         return try await observed(sessionId) {
@@ -200,6 +210,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// session; an open view's `markRead()` does the same and updates its
     /// `info`. An app owner or admin who is not in the session is refused
     /// with `AGENT_SESSION_MEMBER_ONLY`.
+    /// - Stability: beta
     @discardableResult
     public func markRead(sessionId: String) async throws -> AgentSessionReadResult {
         try await observed(sessionId) {
@@ -211,6 +222,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
 
     /// Record an event (the owner and participants): a message of one event
     /// part, read by the agent on its next turn. Never starts a turn.
+    /// - Stability: beta
     public func recordEvent(sessionId: String, event: AgentSessionEvent) async throws -> AgentSessionEventResult {
         try await observed(sessionId) {
             try await transport.request(
@@ -229,6 +241,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// `AGENT_SESSION_ATTACHMENT_NOT_FOUND` for an id another session holds.
     /// `view.attachments.upload` queues and retries for you; this is the one
     /// request.
+    /// - Stability: beta
     public func uploadAttachment(
         sessionId: String, blobId: String, _ upload: AgentSessionAttachmentUpload
     ) async throws -> AgentSessionAttachmentUploadResult {
@@ -255,6 +268,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// hold, `AGENT_SESSION_NOT_FOUND` without standing.
     ///
     /// - Parameter disposition: the disposition to serve it with.
+    /// - Stability: beta
     public func downloadAttachment(
         sessionId: String, blobId: String, disposition: BlobDisposition? = nil
     ) async throws -> Data {
@@ -274,6 +288,7 @@ public final class AgentSessionsAPI: @unchecked Sendable {
     /// missing file.
     ///
     /// - Parameter disposition: the disposition the headers describe.
+    /// - Stability: beta
     public func attachmentHeaders(
         sessionId: String, blobId: String, disposition: BlobDisposition? = nil
     ) async throws -> AgentSessionAttachmentHeaders {

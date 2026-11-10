@@ -2,6 +2,7 @@ import XCTest
 @testable import JsBaoClient
 import YSwift
 
+@available(*, deprecated)
 final class DocumentPermissionsTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

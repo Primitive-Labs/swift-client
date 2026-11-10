@@ -23,6 +23,7 @@ public final class GroupsAPI: @unchecked Sendable {
     /// function creates a group on the app routes, so the server refuses
     /// every session's create with a 403 (`FUNCTION_ROUTE_FUNCTION_ONLY`), an
     /// app admin's included.
+    /// - Stability: production
     @available(*, deprecated, message: "A session cannot create a group: create it from a server function or the admin API. Removed by #4718.")
     public func create(params: CreateGroupParams) async throws -> GroupInfo {
         try await transport.request(method: .post, path: "/groups", body: params)
@@ -32,6 +33,7 @@ public final class GroupsAPI: @unchecked Sendable {
     /// or every group in the app for an app owner or admin. Pass
     /// `includeSystem: true` to surface platform-managed internal
     /// `_`-prefixed groups (excluded by default).
+    /// - Stability: production
     public func list(options: ListGroupsOptions? = nil) async throws -> PaginatedResult<GroupInfo> {
         var query = URLQuery()
         query.appendIfPresent("type", options?.typeFilter)
@@ -42,11 +44,13 @@ public final class GroupsAPI: @unchecked Sendable {
     }
 
     /// Retrieves a single group by its ID.
+    /// - Stability: production
     public func get(groupId: String) async throws -> GroupInfo {
         try await transport.request(method: .get, path: Self.path(groupId))
     }
 
     /// Retrieves a single group by its type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use get(groupId:). Removed by #4718.")
     public func get(groupType: String, groupId: String) async throws -> GroupInfo {
         try await transport.request(method: .get, path: Self.path(groupType, groupId))
@@ -54,11 +58,13 @@ public final class GroupsAPI: @unchecked Sendable {
 
     /// Updates a group's name, description or settings. A manager or the
     /// owner may update.
+    /// - Stability: production
     public func update(groupId: String, params: UpdateGroupParams) async throws -> GroupInfo {
         try await transport.request(method: .patch, path: Self.path(groupId), body: params)
     }
 
     /// Updates a group's name or description, addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use update(groupId:params:). Removed by #4718.")
     public func update(groupType: String, groupId: String, params: UpdateGroupParams) async throws -> GroupInfo {
         try await transport.request(method: .patch, path: Self.path(groupType, groupId), body: params)
@@ -66,11 +72,13 @@ public final class GroupsAPI: @unchecked Sendable {
 
     /// Deletes a group by its ID. Only the owner, or an app owner or admin,
     /// may delete. Returns `{ success }`.
+    /// - Stability: production
     public func delete(groupId: String) async throws -> SuccessResult {
         try await transport.request(method: .delete, path: Self.path(groupId))
     }
 
     /// Deletes a group by its type and ID. Returns `{ success }`.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use delete(groupId:). Removed by #4718.")
     public func delete(groupType: String, groupId: String) async throws -> SuccessResult {
         try await transport.request(method: .delete, path: Self.path(groupType, groupId))
@@ -84,6 +92,7 @@ public final class GroupsAPI: @unchecked Sendable {
     ///
     /// - Parameter to: the new custodian, `"user:<userId>"`.
     /// - Returns: the group with its new `custodian`.
+    /// - Stability: production
     public func transfer(groupId: String, to: String) async throws -> GroupInfo {
         try await transport.request(
             method: .post,
@@ -105,6 +114,7 @@ public final class GroupsAPI: @unchecked Sendable {
     /// membership is orphaned). This replaces the per-member `users.getBasic`
     /// fan-out for roster views. The server rejects unknown `include` values
     /// with HTTP 400.
+    /// - Stability: production
     public func listMembers(groupId: String, options: PaginationOptions? = nil, include: GroupMemberInclude? = nil) async throws -> PaginatedResult<GroupMemberInfo> {
         try await transport.request(
             method: .get,
@@ -113,6 +123,7 @@ public final class GroupsAPI: @unchecked Sendable {
     }
 
     /// Lists members of a group addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use listMembers(groupId:options:include:). Removed by #4718.")
     public func listMembers(groupType: String, groupId: String, options: PaginationOptions? = nil, include: GroupMemberInclude? = nil) async throws -> PaginatedResult<GroupMemberInfo> {
         try await transport.request(
@@ -132,11 +143,13 @@ public final class GroupsAPI: @unchecked Sendable {
     ///    app; a `DeferredGroupAdd` row was created (or returned idempotently).
     ///
     /// Build `params` with `.userId(_:role:)` or `.email(_:role:)`.
+    /// - Stability: production
     public func addMember(groupId: String, params: AddGroupMemberParams) async throws -> GroupAddMemberResult {
         try await transport.request(method: .post, path: "\(Self.path(groupId))/members", body: params)
     }
 
     /// Adds a user to a group addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use addMember(groupId:params:). Removed by #4718.")
     public func addMember(groupType: String, groupId: String, params: AddGroupMemberParams) async throws -> GroupAddMemberResult {
         try await transport.request(method: .post, path: "\(Self.path(groupType, groupId))/members", body: params)
@@ -145,6 +158,7 @@ public final class GroupsAPI: @unchecked Sendable {
     /// Changes a member's role to `manager` or `member`. The group's `owner`
     /// row changes only from a server function or the admin API (403
     /// `OWNER_ROW_PROTECTED` from a session).
+    /// - Stability: production
     public func setMemberRole(groupId: String, userId: String, role: GroupRole) async throws -> GroupMemberRole {
         try await transport.request(
             method: .patch,
@@ -155,6 +169,7 @@ public final class GroupsAPI: @unchecked Sendable {
 
     /// Removes a member from a group by user ID. The owner cannot leave (403
     /// `OWNER_MUST_TRANSFER`): transfer the group first. Returns `{ success }`.
+    /// - Stability: production
     public func removeMember(groupId: String, userId: String) async throws -> SuccessResult {
         try await transport.request(
             method: .delete,
@@ -163,6 +178,7 @@ public final class GroupsAPI: @unchecked Sendable {
     }
 
     /// Removes a member from a group addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use removeMember(groupId:userId:). Removed by #4718.")
     public func removeMember(groupType: String, groupId: String, userId: String) async throws -> SuccessResult {
         try await transport.request(
@@ -172,6 +188,7 @@ public final class GroupsAPI: @unchecked Sendable {
     }
 
     /// Removes a member from a group by email address. Returns `{ success }`.
+    /// - Stability: production
     public func removeMemberByEmail(groupId: String, email: String) async throws -> SuccessResult {
         var query = URLQuery()
         query.append("email", email)
@@ -182,6 +199,7 @@ public final class GroupsAPI: @unchecked Sendable {
     }
 
     /// Removes a member by email from a group addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use removeMemberByEmail(groupId:email:). Removed by #4718.")
     public func removeMemberByEmail(groupType: String, groupId: String, email: String) async throws -> SuccessResult {
         var query = URLQuery()
@@ -199,6 +217,7 @@ public final class GroupsAPI: @unchecked Sendable {
     /// - Parameter groupType: optional server-side filter to a single group
     ///   type. Mirrors js-bao's `groups.listUserMemberships(userId, { groupType })`
     ///   (#960).
+    /// - Stability: production
     public func listUserMemberships(userId: String, groupType: String? = nil) async throws -> [GroupMembershipInfo] {
         let escapedUserId = URLEncoding.encodeComponent(userId)
         // Server reads `?type=` (groups-controller.ts:1392); JS sends the same.
@@ -213,11 +232,13 @@ public final class GroupsAPI: @unchecked Sendable {
     // MARK: - Group Documents
 
     /// Lists all documents accessible to a group, with the granted permission.
+    /// - Stability: production
     public func listDocuments(groupId: String) async throws -> [GroupDocumentInfo] {
         try await transport.request(method: .get, path: "\(Self.path(groupId))/documents")
     }
 
     /// Lists the documents of a group addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use listDocuments(groupId:). Removed by #4718.")
     public func listDocuments(groupType: String, groupId: String) async throws -> [GroupDocumentInfo] {
         try await transport.request(method: .get, path: "\(Self.path(groupType, groupId))/documents")
@@ -225,11 +246,13 @@ public final class GroupsAPI: @unchecked Sendable {
 
     /// Lists databases the group has access to (via `DatabaseGroupPermission`).
     /// Mirrors js-bao's `groups.listDatabases(groupId)`.
+    /// - Stability: production
     public func listDatabases(groupId: String) async throws -> [GroupDatabaseInfo] {
         try await transport.request(method: .get, path: "\(Self.path(groupId))/databases")
     }
 
     /// Lists the databases of a group addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use listDatabases(groupId:). Removed by #4718.")
     public func listDatabases(groupType: String, groupId: String) async throws -> [GroupDatabaseInfo] {
         try await transport.request(method: .get, path: "\(Self.path(groupType, groupId))/databases")
@@ -239,6 +262,7 @@ public final class GroupsAPI: @unchecked Sendable {
     /// so callers can render "members + pending" without touching the internal
     /// deferred-grants surface. Mirrors js-bao's
     /// `groups.listPendingInvitations(groupId)`.
+    /// - Stability: production
     public func listPendingInvitations(groupId: String) async throws -> [PendingGroupInvitationEntry] {
         // The server may return a bare array or an `{ items }` envelope —
         // accept both.
@@ -249,7 +273,22 @@ public final class GroupsAPI: @unchecked Sendable {
         return response.items
     }
 
+    /// Revoke one pending invitation's grants on a group: the `invitationId`
+    /// that `listPendingInvitations(groupId:)` lists. The invitation and its
+    /// grants on other resources stay. The grant's adder, an app owner or
+    /// admin, or a caller the group's role table lets manage its members may
+    /// revoke it; a refusal is thrown as an `HttpError`. Mirrors js-bao's
+    /// `groups.revokePendingInvitation(groupId, invitationId)`.
+    /// - Stability: production
+    public func revokePendingInvitation(groupId: String, invitationId: String) async throws -> PendingInvitationRevokeResult {
+        try await transport.request(
+            method: .delete,
+            path: "\(Self.path(groupId))/pending-invitations/\(URLEncoding.encodeComponent(invitationId))"
+        )
+    }
+
     /// Lists pending invitations of a group addressed by type and ID.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are addressed by groupId alone: use listPendingInvitations(groupId:). Removed by #4718.")
     public func listPendingInvitations(groupType: String, groupId: String) async throws -> [PendingGroupInvitationEntry] {
         let response: ItemsEnvelope<PendingGroupInvitationEntry> = try await transport.request(

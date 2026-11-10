@@ -1,0 +1,24 @@
+# The db3 type `VectorNoteRecord.swift` beside this file is generated from
+# (#5225): `SwiftEmitterVectorHermeticTests` holds the two in step, and
+# `Db3VectorHermeticTests` compiles and runs the generated model.
+[type]
+name = "vectornotes"
+
+[models.vector_note]
+
+[models.vector_note.fields.id]
+type = "id"
+
+[models.vector_note.fields.title]
+type = "string"
+
+[models.vector_note.fields.embedding]
+type = "vector"
+dims = 3
+element = "f32"
+
+[models.vector_note.fields.thumb]
+type = "vector"
+dims = 2
+element = "i8"
+required = true

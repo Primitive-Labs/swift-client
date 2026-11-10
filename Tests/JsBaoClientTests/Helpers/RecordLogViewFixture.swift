@@ -86,7 +86,7 @@ final class RecordLogViewFixture {
         return member
     }
 
-    /// `client.documents.records(documentId)` over this document's binding.
+    /// `client.db3.records(documentId)` over this document's binding.
     func records(_ documentId: String) throws -> DocumentRecords {
         let binding = try open(documentId)
         return DocumentRecords(documentId: documentId) { binding }

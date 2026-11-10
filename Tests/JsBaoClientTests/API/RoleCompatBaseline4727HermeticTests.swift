@@ -175,6 +175,7 @@ final class RoleCompatBaseline4727HermeticTests: XCTestCase {
     /// fields it reads typed. Never run, like the frozen body; the name guard
     /// below reads both. It is not deprecated, so a call here to a deprecated
     /// label fails the warning gate.
+    @available(*, deprecated)
     static func callsEveryRoleMethod(client: JsBaoClient) async throws {
         let page: PaginatedResult<GroupInfo> = try await client.groups.list(
             options: ListGroupsOptions(limit: 10, includeSystem: true)
@@ -206,7 +207,14 @@ final class RoleCompatBaseline4727HermeticTests: XCTestCase {
             groupId: "baseline", userId: "user-1", role: .member
         )
         _ = changed.role as GroupRole
-        _ = try await client.groups.listPendingInvitations(groupId: "baseline") as [PendingGroupInvitationEntry]
+        let groupPending: [PendingGroupInvitationEntry] = try await client.groups.listPendingInvitations(
+            groupId: "baseline"
+        )
+        if let invitation = groupPending.first {
+            _ = try await client.groups.revokePendingInvitation(
+                groupId: "baseline", invitationId: invitation.invitationId
+            ).deferredCount as Int
+        }
         let memberships: [GroupMembershipInfo] = try await client.groups.listUserMemberships(userId: "user-1")
         _ = memberships.first?.role as String?
         _ = try await client.groups.listDocuments(groupId: "baseline") as [GroupDocumentInfo]
@@ -278,6 +286,11 @@ final class RoleCompatBaseline4727HermeticTests: XCTestCase {
             collectionId: id
         )
         _ = pending.first?.role as CollectionRole?
+        if let invitation = pending.first {
+            _ = try await client.collections.revokePendingInvitation(
+                collectionId: id, invitationId: invitation.invitationId
+            ).deferredCount as Int
+        }
         _ = try await client.collections.list(options: nil) as PaginatedResult<CollectionInfo>
         _ = try await client.collections.listAll(limit: 10) as PaginatedResult<CollectionInfo>
         _ = try await client.collections.transfer(collectionId: id, to: "user:viewer-1") as CollectionInfo

@@ -136,6 +136,7 @@ public final class AgentSessionAttachments: Sendable {
     /// `AGENT_SESSION_NOT_FOUND`, a size or integrity error) throws
     /// `HttpError` with the server's `serverCode`, and the upload stays in
     /// `uploads()` as `.failed` with its bytes.
+    /// - Stability: beta
     public func upload(
         _ data: Data, options: AgentSessionAttachmentUploadOptions = AgentSessionAttachmentUploadOptions()
     ) async throws -> AgentSessionAttachment {
@@ -147,6 +148,7 @@ public final class AgentSessionAttachments: Sendable {
 
     /// The session's uploads that have not completed, most recently changed
     /// first.
+    /// - Stability: beta
     public func uploads() async -> [AgentSessionUploadStatus] {
         await manager.listSessionUploads(sessionId: sessionId)
     }
@@ -156,6 +158,7 @@ public final class AgentSessionAttachments: Sendable {
     ///
     /// - Returns: `false` for an unknown id or an upload that is not pending
     ///   or uploading.
+    /// - Stability: beta
     @discardableResult
     public func pause(blobId: String) async -> Bool {
         await manager.pauseSessionUpload(blobId: blobId, sessionId: sessionId)
@@ -166,6 +169,7 @@ public final class AgentSessionAttachments: Sendable {
     ///
     /// - Returns: `false` for an unknown id or an upload that is not paused
     ///   or failed.
+    /// - Stability: beta
     @discardableResult
     public func resume(blobId: String) async -> Bool {
         await manager.resumeSessionUpload(blobId: blobId, sessionId: sessionId)
@@ -176,6 +180,7 @@ public final class AgentSessionAttachments: Sendable {
     ///
     /// - Returns: `false` when the id is not queued (completed, cancelled or
     ///   unknown).
+    /// - Stability: beta
     @discardableResult
     public func cancel(blobId: String) async -> Bool {
         await manager.cancelSessionUpload(blobId: blobId, sessionId: sessionId)
@@ -188,6 +193,7 @@ public final class AgentSessionAttachments: Sendable {
     /// `.agentSessionUploadUnknown` for an id this client never uploaded, or
     /// `.unavailable` once the client is destroyed (the upload stays stored
     /// for the next launch).
+    /// - Stability: beta
     @discardableResult
     public func waitUntilUploaded(blobId: String) async throws -> AgentSessionAttachment {
         try await manager.waitUntilSessionUploaded(blobId: blobId, sessionId: sessionId)
@@ -203,6 +209,7 @@ public final class AgentSessionAttachments: Sendable {
     /// - Parameters:
     ///   - force: download again even when a local copy exists.
     ///   - disposition: read the `inline` (default) or `attachment` variant.
+    /// - Stability: beta
     public func read(blobId: String, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> Data {
         try requireOpen()
         return try await manager.readSessionAttachment(
@@ -211,6 +218,7 @@ public final class AgentSessionAttachments: Sendable {
     }
 
     /// Read a file of the session as UTF-8 text.
+    /// - Stability: beta
     public func read(
         blobId: String, as type: String.Type, force: Bool = false, disposition: BlobDisposition? = nil
     ) async throws -> String {
@@ -222,6 +230,7 @@ public final class AgentSessionAttachments: Sendable {
     }
 
     /// Read a file of the session and JSON-decode it.
+    /// - Stability: beta
     public func read<T: Decodable>(
         blobId: String, as type: T.Type, force: Bool = false, disposition: BlobDisposition? = nil
     ) async throws -> T {

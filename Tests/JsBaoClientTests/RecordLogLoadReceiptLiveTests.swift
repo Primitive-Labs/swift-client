@@ -483,6 +483,63 @@ final class RecordLogLoadReceiptLiveTests: XCTestCase {
         XCTAssertTrue(watch.sent("record.catchUp").contains { $0["full"] == true && $0["cursor"] == 0 }, "\(watch.sent("record.catchUp"))")
     }
 
+    // MARK: - #5267 behavior 18: an interrupted receipt continues after a restart
+
+    /// The ordinal of a load chunk's artifact path (`…/Note/{ordinal}.{attempt}`), or `nil` for the manifest.
+    private func ordinal(_ path: String) -> Int? {
+        guard let range = path.range(of: "/Note/") else { return nil }
+        return Int(path[range.upperBound...].prefix { $0.isNumber })
+    }
+
+    func testALoadStoppedAfterThreeOfSixChunksFetchesOnlyTheRestWhenAClientStartsAgainOverItsFile() async throws {
+        let y = try await live.client("y", models: [Self.note, Self.tag])
+        let documentId = try await live.createDocument(y)
+        try await live.open(y, documentId)
+        try create(y, documentId, "x-holder", ["title": .string("holds"), "slug": .string("taken")])
+        try create(y, documentId, "x-patched", ["title": .string("existing"), "slug": .string("mine")])
+        try await live.settled(y, documentId)
+        let file = live.file("resume-5267")
+        let x = try await live.client("x", models: [Self.note, Self.tag], file: file)
+        try await live.open(x, documentId)
+        try await live.untilEqual(x, documentId, "Note", ["title", "slug"])
+        await x.goOffline()
+        let load = RecordLogLoadDriver(ctx: ctx, appId: live.app.appId, documentId: documentId, jwt: live.app.ownerJWT)
+        // Six chunks in id order: the first carries a refused create and a refused patch.
+        let chunks = (0..<6).map { i in
+            RecordLogLoadChunk(
+                model: "Note", index: i,
+                lines: recordLogIds(500, prefix: i == 0 ? "a" : "y\(i)").map { ($0, ["title": .string($0)]) }
+                    + (i == 0 ? [("x-dup", ["title": "refused create", "slug": "taken"]), ("x-patched", ["slug": "taken"])] : [])
+            )
+        }
+        let session = try await load.load(chunks)
+        let sessionId = try XCTUnwrap(session["sessionId"] as? String)
+        let done = try await load.until(sessionId, timeout: 60) { ($0["state"] as? String) == "complete" }
+        XCTAssertEqual((done["refusedRows"] as? NSNumber)?.intValue, 2)
+
+        // x receives chunks 0 to 2 on reconnect and stops while chunk 3 is fetched.
+        let watch = RecordLogClientWatch(x)
+        let held = watch.holdNext { $0.contains("/Note/3.") }
+        await x.goOnline()
+        await held.reached.wait()
+        XCTAssertEqual(watch.fetched.compactMap { ordinal($0.path) }, [0, 1, 2], "\(watch.fetched)")
+        XCTAssertEqual(try live.marks(x, documentId).receipt?.kind, .load)
+        await x.destroy()
+        held.release.open()
+
+        // A client started again over the file continues the download at chunk 3.
+        let x2 = try await live.client("x2", models: [Self.note, Self.tag], file: file)
+        let again = RecordLogClientWatch(x2)
+        try await live.open(x2, documentId)
+        try await recovered(documentId, x2)
+        let opened = again.received("record.opened").first?.frame
+        XCTAssertEqual(opened?["catchUp"]?["mode"], "load")
+        XCTAssertEqual(opened?["catchUp"]?["load"]?["sessionId"]?.stringValue, sessionId)
+        XCTAssertEqual(again.fetched.filter { ordinal($0.path) == nil }.count, 1, "\(again.fetched)")
+        XCTAssertEqual(again.fetched.compactMap { ordinal($0.path) }, [3, 4, 5], "\(again.fetched)")
+        XCTAssertTrue(again.fetched.allSatisfy { $0.status == 200 }, "\(again.fetched)")
+    }
+
     func testAnExpiredGrantFailsOnceAndThePointerTheRoomStillOffersThenCompletes() async throws {
         let (documentId, x, load) = try await behindALoad()
         try await load.test("set-limits", ["expiredGrants": 1])

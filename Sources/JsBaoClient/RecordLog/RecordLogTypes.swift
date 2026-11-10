@@ -639,12 +639,51 @@ enum RecordLogHandBackCode {
         "DOCUMENT_EPOCH_NOT_OPEN", "DOCUMENT_STORE_PURGED", "DOCUMENT_EPOCH_BUDGET",
         "DOCUMENT_ENTRY_TOO_LARGE", "DOCUMENT_ENTRY_INVALID", "WRITE_ACCESS_DENIED",
         "DB3_CONDITION_NOT_MET", "DB3_RECORD_NOT_FOUND", "DB3_TRIGGER_REFUSED", "DB3_MODEL_NOT_DECLARED",
+        "DB3_VECTOR_INVALID",
     ]
 }
 
 /// The wire version this client declares on `record.open`: 2 since the
-/// `increment` entry kind. A room past it refuses the open `DB3_CLIENT_OUTDATED`.
-let recordLogWireVersion = 2
+/// `increment` entry kind, 3 since the room's head (#5221), which a room sends
+/// on `record.opened`, `record.results` and `record.catchUpPage` only to a
+/// client declaring 3 or above. A room whose minimum is above it refuses the
+/// open `DB3_CLIENT_OUTDATED`; a room at a higher version is compatible.
+let recordLogWireVersion = 3
+
+/// What a frame from the room said of its head (#5221): `head`, the room's
+/// last accepted log number when it built the frame, and `receivedAt`, when
+/// this device received the frame (epoch ms), stamped before the frame is
+/// held. js-bao's `RecordLogHeard`.
+struct RecordLogHeard: Sendable, Equatable {
+    var head: Int?
+    var receivedAt: Int64?
+
+    init(head: Int? = nil, receivedAt: Int64? = nil) {
+        self.head = head
+        self.receivedAt = receivedAt
+    }
+}
+
+/// The room's head as a device last heard it (#5221): the log number, and when (epoch ms).
+struct RecordLogKnownHead: Sendable, Equatable {
+    var head: Int
+    var at: Int64
+}
+
+/// One document's sync state as a read captured it (#5221), in the read's
+/// transaction: what a device read's drift is computed from.
+struct RecordLogDocumentSync: Sendable, Equatable {
+    /// The last log number the device applied.
+    var cursor: Int
+    /// The room's head as last heard, or `nil` before one is heard.
+    var knownHead: Int?
+    /// When the head was heard (epoch ms), or `nil`.
+    var knownHeadAt: Int64?
+    /// The device's writes the room has not judged, every writer's.
+    var pendingWrites: Int
+    /// The db3 lives only on this device: it has no head.
+    var localOnly: Bool
+}
 
 // MARK: - JSON
 

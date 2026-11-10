@@ -76,6 +76,13 @@ public struct QueryOptions: Sendable {
     /// set with different values is refused `.invalidArgument`.
     public var db3: [String]?
 
+    /// Refuse a device answer from a db3 copy further behind the server than
+    /// this, `DB3_DRIFT_EXCEEDED`, instead of answering it. Judged on the
+    /// drift read with the rows; it never waits. A synced db3 that has not
+    /// heard the server's position yet is always refused, a db3 that lives
+    /// only on this device always passes, and a format-1 read ignores it.
+    public var maxDrift: Db3MaxDrift?
+
     /// `offset` was removed in #2367: offset paging is unstable in
     /// CRDT-backed datasets, because a concurrent insert from another client
     /// shifts the rows before offset N and makes the same row appear twice or
@@ -91,7 +98,8 @@ public struct QueryOptions: Sendable {
         direction: CursorDirection = .forward,
         documents: [String]? = nil,
         projection: [String: Int]? = nil,
-        db3: [String]? = nil
+        db3: [String]? = nil,
+        maxDrift: Db3MaxDrift? = nil
     ) {
         self.sort = sort
         self.sortOrder = sortOrder
@@ -101,6 +109,7 @@ public struct QueryOptions: Sendable {
         self.documents = documents
         self.projection = projection
         self.db3 = db3
+        self.maxDrift = maxDrift
     }
 
 }

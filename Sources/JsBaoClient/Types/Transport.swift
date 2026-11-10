@@ -107,10 +107,17 @@ final class NetworkGatedTransport: Transport, @unchecked Sendable {
     /// Test seam: hears every request that goes out to the base transport,
     /// after the checks. Internal; never set in production code.
     private var sentForTest: (@Sendable (HTTPMethod, String, Data?) -> Void)?
+    /// Test seam: hears every answer the base transport gives, or its failure. Internal; never set in production code.
+    private var answeredForTest: (@Sendable (HTTPMethod, String, Result<TransportResponse, Error>) -> Void)?
 
     /// Hear every request this transport sends from now on (a test's pass-through observer).
     func observeSentForTest(_ observer: (@Sendable (HTTPMethod, String, Data?) -> Void)?) {
         lock.withLock { sentForTest = observer }
+    }
+
+    /// Hear every answer the base transport gives from now on, its status, headers and body, or its failure (a test's pass-through observer).
+    func observeAnsweredForTest(_ observer: (@Sendable (HTTPMethod, String, Result<TransportResponse, Error>) -> Void)?) {
+        lock.withLock { answeredForTest = observer }
     }
 
     /// Install the check every request's path and JSON body are asked of
@@ -155,7 +162,17 @@ final class NetworkGatedTransport: Transport, @unchecked Sendable {
         }
         try requireNetworking(method: method, path: path)
         lock.withLock({ sentForTest })?(method, path, body)
-        return try await base.execute(method: method, path: path, body: body, options: options)
+        guard let answered = lock.withLock({ answeredForTest }) else {
+            return try await base.execute(method: method, path: path, body: body, options: options)
+        }
+        do {
+            let response = try await base.execute(method: method, path: path, body: body, options: options)
+            answered(method, path, .success(response))
+            return response
+        } catch {
+            answered(method, path, .failure(error))
+            throw error
+        }
     }
 }
 

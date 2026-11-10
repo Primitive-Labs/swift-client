@@ -95,7 +95,7 @@ final class Db3GoneLiveTests: XCTestCase {
         XCTAssertThrowsError(try save(c, id, "after the revocation")) { error in
             XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
         }
-        XCTAssertThrowsError(try c.documents.records(id).put("Note", ["title": "model-free after"])) { error in
+        XCTAssertThrowsError(try c.db3.records(id).put("Note", ["title": "model-free after"])) { error in
             XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
         }
         XCTAssertEqual(refusals.value.map(\.error.code), [.writeAccessDenied, .writeAccessDenied])

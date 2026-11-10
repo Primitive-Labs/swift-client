@@ -83,6 +83,7 @@ final class CollectionsTests: XCTestCase {
 
     // MARK: - Missing from JS parity
 
+    @available(*, deprecated)
     func testListCollectionsForDocument() async throws {
         let created = try await client.collections.create(params: CreateCollectionParams(name: "for-doc-test"))
         let collectionId = created.collectionId
@@ -175,6 +176,7 @@ final class CollectionsTests: XCTestCase {
     /// onto the document. Before the fix Swift never sent
     /// `?includeSystem=true`, so the server had already stripped those rows
     /// and the flag could not return a system group at any input.
+    @available(*, deprecated)
     func testListGroupPermissionsIncludeSystemReturnsCollectionGroups() async throws {
         let created = try await client.collections.create(params: CreateCollectionParams(name: "system-groups-test"))
         let collectionId = created.collectionId

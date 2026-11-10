@@ -140,6 +140,7 @@ final class Db3LocalOnlyHermeticTests: XCTestCase {
 
     // MARK: - Behaviour 20
 
+    @available(*, deprecated)
     func testACreateAnswersAtOnceUnderAnIdMintedHereWithNothingSent() async throws {
         let (client, heard, subs) = try await offlineClient()
         defer { subs.forEach { $0.cancel() } }
@@ -443,6 +444,7 @@ final class Db3LocalOnlyHermeticTests: XCTestCase {
 
     // MARK: - Behaviour 33 (pin)
 
+    @available(*, deprecated)
     func testTheDocumentDoorsStillRefuseFormat3WithLocalOnly() async throws {
         let (client, _, subs) = try await offlineClient()
         defer { subs.forEach { $0.cancel() } }

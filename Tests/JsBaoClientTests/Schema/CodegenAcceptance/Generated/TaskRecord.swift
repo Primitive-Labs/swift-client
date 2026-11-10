@@ -228,7 +228,8 @@ public extension TaskRecord {
             data: PrimitiveRowDecoder.decodeAll(page.data, as: TaskRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            hasMore: page.hasMore,
+            drift: page.drift
         )
     }
 
@@ -240,13 +241,15 @@ public extension TaskRecord {
             data: PrimitiveRowDecoder.decodeAll(page.data, as: TaskRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            hasMore: page.hasMore,
+            drift: page.drift
         )
     }
 
-    /// Count across all open documents.
-    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
-        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)
+    /// Count across all open documents. `options.maxDrift` refuses a
+    /// db3's count `DB3_DRIFT_EXCEEDED` as a page is.
+    static func count(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter, options: options)
     }
 
     /// Every record across all open documents. Synchronous like the

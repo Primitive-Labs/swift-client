@@ -118,6 +118,12 @@ public final class MemoryStorageProvider: StorageProvider, @unchecked Sendable {
         }
     }
 
+    func storeNames(withPrefix prefix: String) async throws -> [String] {
+        lock.withLock {
+            stores.filter { $0.key.hasPrefix(prefix) && !$0.value.isEmpty }.map(\.key)
+        }
+    }
+
     public func has(store: String, key: String) async throws -> Bool {
         lock.withLock {
             stores[store]?.contains(where: { $0.key == key }) ?? false
@@ -137,3 +143,5 @@ public final class MemoryStorageProvider: StorageProvider, @unchecked Sendable {
         return formatter.string(from: Date())
     }
 }
+
+extension MemoryStorageProvider: StoreNameListing {}

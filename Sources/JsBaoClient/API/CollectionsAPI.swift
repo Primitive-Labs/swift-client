@@ -18,12 +18,14 @@ public final class CollectionsAPI: @unchecked Sendable {
 
     /// Create a new collection. `name` is required. The caller becomes its
     /// custodian and holds `owner`.
+    /// - Stability: production
     public func create(params: CreateCollectionParams) async throws -> CollectionInfo {
         try await transport.request(method: .post, path: "/collections", body: params)
     }
 
     /// List collections the caller is a direct member of. Each returned item
     /// carries the caller's `role`. Use `listAll()` for the app-wide set.
+    /// - Stability: production
     public func list(options: PaginationOptions? = nil) async throws -> PaginatedResult<CollectionInfo> {
         let page: CollectionInfoPage = try await transport.request(
             method: .get,
@@ -35,6 +37,8 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// List every collection in the app (admin-only). Non-admin callers
     /// receive a 403. Unlike `list()`, returned items do not carry the
     /// caller's `role`. Mirrors js-bao's `collections.listAll(options)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "GET admin/collections is deprecated and has no successor. It keeps answering until a later removal project. (api-surface-stability)")
     public func listAll(
         limit: Int? = nil,
         cursor: String? = nil
@@ -49,17 +53,20 @@ public final class CollectionsAPI: @unchecked Sendable {
 
     /// Get collection info by ID. Callers without any access receive a 404
     /// (to avoid leaking collection existence).
+    /// - Stability: production
     public func get(collectionId: String) async throws -> CollectionInfo {
         try await transport.request(method: .get, path: "/collections/\(collectionId)")
     }
 
     /// Update a collection's name, description or settings.
+    /// - Stability: production
     public func update(collectionId: String, params: UpdateCollectionParams) async throws -> CollectionInfo {
         try await transport.request(method: .patch, path: "/collections/\(collectionId)", body: params)
     }
 
     /// Delete a collection. Only the owner, or an app owner or admin, may
     /// delete.
+    /// - Stability: production
     public func delete(collectionId: String) async throws -> SuccessResult {
         try await transport.request(method: .delete, path: "/collections/\(collectionId)")
     }
@@ -71,6 +78,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     ///
     /// - Parameter to: the new custodian, `"user:<userId>"`.
     /// - Returns: the collection with its new `custodian`.
+    /// - Stability: production
     public func transfer(collectionId: String, to: String) async throws -> CollectionInfo {
         try await transport.request(
             method: .post,
@@ -82,6 +90,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     // MARK: - Documents
 
     /// Add a document to a collection.
+    /// - Stability: production
     public func addDocument(collectionId: String, documentId: String) async throws -> CollectionDocumentInfo {
         try await transport.request(
             method: .post,
@@ -91,6 +100,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     }
 
     /// Remove a document from a collection.
+    /// - Stability: production
     public func removeDocument(collectionId: String, documentId: String) async throws -> SuccessResult {
         try await transport.request(
             method: .delete,
@@ -100,6 +110,7 @@ public final class CollectionsAPI: @unchecked Sendable {
 
     /// List all documents in a collection, each with the caller's effective
     /// permission.
+    /// - Stability: production
     public func listDocuments(collectionId: String, options: PaginationOptions? = nil) async throws -> PaginatedResult<CollectionDocumentInfo> {
         let page: CollectionDocumentPage = try await transport.request(
             method: .get,
@@ -110,6 +121,8 @@ public final class CollectionsAPI: @unchecked Sendable {
 
     /// List collections that contain a specific document. For non-admin
     /// callers this returns only collections the caller is a direct member of.
+    /// - Stability: production
+    @available(*, deprecated, message: "GET documents/{documentId}/collections is deprecated with the documents family: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listCollectionsForDocument(documentId: String, options: PaginationOptions? = nil) async throws -> PaginatedResult<DocumentCollectionInfo> {
         let page: DocumentCollectionPage = try await transport.request(
             method: .get,
@@ -121,12 +134,14 @@ public final class CollectionsAPI: @unchecked Sendable {
     // MARK: - Access
 
     /// Get the current user's access info for a collection (groups + members).
+    /// - Stability: production
     @available(*, deprecated, message: "Use listMembers(collectionId:), which answers users and groups as principals. Removed by #4718.")
     public func getAccess(collectionId: String) async throws -> CollectionAccessInfo {
         try await transport.request(method: .get, path: "/collections/\(collectionId)/access")
     }
 
     /// Grant a group a permission level on a collection.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are members: use addGroupMember(collectionId:groupId:role:). Removed by #4718.")
     public func grantGroupPermission(collectionId: String, params: GrantCollectionGroupPermissionParams) async throws -> CollectionGroupPermissionInfo {
         try await transport.request(
@@ -137,6 +152,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     }
 
     /// Revoke a group's permission from a collection.
+    /// - Stability: production
     @available(*, deprecated, message: "Groups are members: use removeMember(collectionId:principal:) with group:<groupId>. Removed by #4718.")
     public func revokeGroupPermission(collectionId: String, groupType: String, groupId: String) async throws -> SuccessResult {
         let gType = URLEncoding.encodeComponent(groupType)
@@ -153,6 +169,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// principal with its role — in one answer (the list is complete, with
     /// no cursor). A collection whose `settings.memberList` is `managers`
     /// answers 403 to a member below manager.
+    /// - Stability: production
     public func listMembers(collectionId: String) async throws -> [CollectionMemberEntry] {
         let response: ItemsEnvelope<CollectionMemberEntry> = try await transport.request(
             method: .get,
@@ -170,6 +187,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// email isn't an app user yet (`status == "pending_signup"`, carrying
     /// the `deferredId` / `invitationId` / `inviteToken`). Mirrors the
     /// deferred-grant flow on `documents.updatePermissions` (issue #671).
+    /// - Stability: production
     public func addMember(collectionId: String, params: AddCollectionMemberParams) async throws -> CollectionAddMemberResult {
         try await transport.request(
             method: .post,
@@ -180,6 +198,7 @@ public final class CollectionsAPI: @unchecked Sendable {
 
     /// Give a group a role on a collection, up to `manager`: every member of
     /// the group holds it. The caller must belong to the group.
+    /// - Stability: production
     public func addGroupMember(collectionId: String, groupId: String, role: CollectionRole) async throws -> CollectionGroupMemberAdd {
         try await transport.request(
             method: .post,
@@ -191,6 +210,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// Change a member's role. `principal` is a user's id, or
     /// `group:<groupId>` for a group. The `owner` row changes only by
     /// transfer.
+    /// - Stability: production
     public func setMemberRole(collectionId: String, principal: String, role: CollectionRole) async throws -> CollectionMemberEntry {
         try await transport.request(
             method: .patch,
@@ -202,6 +222,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// Remove a member — a user's id, or `group:<groupId>` for a group. A
     /// member may remove themselves; the owner cannot leave (403
     /// `OWNER_MUST_TRANSFER`): transfer the collection first.
+    /// - Stability: production
     public func removeMember(collectionId: String, principal: String) async throws -> SuccessResult {
         try await transport.request(
             method: .delete,
@@ -210,6 +231,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     }
 
     /// Remove a member from a collection.
+    /// - Stability: production
     @available(*, deprecated, message: "Use removeMember(collectionId:principal:). Removed by #4718.")
     public func removeMember(collectionId: String, userId: String) async throws -> SuccessResult {
         try await transport.request(
@@ -222,6 +244,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// comes from: their own row (`.direct`) or a group. Naming a user other
     /// than the caller needs app authority (403 `SUBJECT_USER_FORBIDDEN`
     /// otherwise). `role` is `nil` when the user holds none.
+    /// - Stability: production
     public func resolveRole(collectionId: String, userId: String? = nil) async throws -> ResolvedCollectionRole {
         var query = URLQuery()
         query.appendIfPresent("userId", userId)
@@ -237,6 +260,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// collection. Mirrors js-bao's
     /// `collections.listPendingInvitations(collectionId)`. The server returns
     /// a bare array; an `{ items }` envelope is also accepted defensively.
+    /// - Stability: production
     public func listPendingInvitations(
         collectionId: String
     ) async throws -> [PendingCollectionInvitationEntry] {
@@ -245,6 +269,21 @@ public final class CollectionsAPI: @unchecked Sendable {
             path: "/collections/\(collectionId)/pending-invitations"
         )
         return response.items
+    }
+
+    /// Revoke one pending invitation's grants on a collection: the
+    /// `invitationId` that `listPendingInvitations(collectionId:)` lists. The
+    /// invitation and its grants on other resources stay. The grant's adder,
+    /// an app owner or admin, or a caller the collection's role table lets
+    /// manage its members may revoke it; a refusal is thrown as an
+    /// `HttpError`. Mirrors js-bao's
+    /// `collections.revokePendingInvitation(collectionId, invitationId)`.
+    /// - Stability: production
+    public func revokePendingInvitation(collectionId: String, invitationId: String) async throws -> PendingInvitationRevokeResult {
+        try await transport.request(
+            method: .delete,
+            path: "\(Self.path(collectionId))/pending-invitations/\(URLEncoding.encodeComponent(invitationId))"
+        )
     }
 
     // MARK: - Helpers

@@ -22,6 +22,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     // MARK: - Bucket CRUD
 
     /// Create a new blob bucket (admin/owner only).
+    /// - Stability: production
     public func createBucket(params: CreateBlobBucketParams) async throws -> BlobBucketInfo {
         try await transport.request(method: .post, path: "/blob-buckets", body: params)
     }
@@ -30,6 +31,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     /// The server returns `{ items: [...] }`; this method unwraps to the
     /// items array to match the JS surface (which also returns the
     /// list directly).
+    /// - Stability: production
     public func listBuckets() async throws -> [BlobBucketInfo] {
         let response: ItemsEnvelope<BlobBucketInfo> = try await transport.request(
             method: .get,
@@ -39,12 +41,14 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     }
 
     /// Get a single bucket by its `bucketId` or `bucketKey`.
+    /// - Stability: production
     public func getBucket(bucketIdOrKey: String) async throws -> BlobBucketInfo {
         let escaped = URLEncoding.encodeComponent(bucketIdOrKey)
         return try await transport.request(method: .get, path: "/blob-buckets/\(escaped)")
     }
 
     /// Update a bucket's preset/rule set or display metadata.
+    /// - Stability: production
     public func updateBucket(
         bucketIdOrKey: String,
         params: UpdateBlobBucketParams
@@ -58,6 +62,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     }
 
     /// Delete a bucket and every blob inside it.
+    /// - Stability: production
     public func deleteBucket(bucketIdOrKey: String) async throws -> BlobDeletedResult {
         let escaped = URLEncoding.encodeComponent(bucketIdOrKey)
         return try await transport.request(method: .delete, path: "/blob-buckets/\(escaped)")
@@ -74,6 +79,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     ///   - filename: original filename for `Content-Disposition`.
     ///   - contentType: MIME type; defaults to `application/octet-stream`.
     ///   - tags: optional array of tag strings.
+    /// - Stability: production
     public func upload(
         bucketIdOrKey: String,
         data: Data,
@@ -108,6 +114,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
 
     /// List blobs in a bucket. Cursor-paginated per R2; response shape:
     /// `{ "items": [...], "hasMore": Bool, "nextCursor"?: String }`.
+    /// - Stability: production
     public func list(
         bucketIdOrKey: String,
         cursor: String? = nil,
@@ -124,6 +131,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     }
 
     /// Fetch a blob's metadata without downloading its bytes.
+    /// - Stability: production
     public func getMetadata(
         bucketIdOrKey: String,
         blobId: String
@@ -137,6 +145,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     }
 
     /// Download a blob's raw bytes.
+    /// - Stability: production
     public func download(
         bucketIdOrKey: String,
         blobId: String
@@ -153,6 +162,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
 
     /// Delete a single blob from a bucket (`DELETE .../blobs/:blobId`).
     /// Returns `{ deleted: Bool }`. Unchanged, back-compatible.
+    /// - Stability: production
     public func delete(
         bucketIdOrKey: String,
         blobId: String
@@ -180,6 +190,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     /// `blobCreatedBy == null`, exactly like the single-blob path — so a
     /// missing id and an existing-but-unauthorized id are indistinguishable
     /// (no existence oracle).
+    /// - Stability: production
     public func delete(
         bucketIdOrKey: String,
         blobIds: [String]
@@ -194,6 +205,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
 
     /// Get a time-limited signed URL for unauthenticated download.
     /// Response carries `url`, `token`, `expiresAt`, `expiresInSeconds`.
+    /// - Stability: production
     public func getSignedUrl(
         bucketIdOrKey: String,
         blobId: String,

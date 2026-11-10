@@ -69,6 +69,7 @@ enum BlobUploadPersistence {
 
     /// Queue a document upload: `upload` throws the scripted failure and the
     /// upload is listed. Returns its blob id.
+    @available(*, deprecated)
     static func queueDocumentUpload(
         _ client: JsBaoClient, documentId: String = "doc-1", data: Data,
         options: BlobUploadSourceOptions = BlobUploadSourceOptions()

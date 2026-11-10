@@ -217,9 +217,10 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
                 return row
             }
         }
-        // The `staged` column a store gains at open (#4701), and the local-only
-        // columns of version 4 (#5155), are no record.
-        let added: Set<String> = ["staged", "local_only", "local_indexes"]
+        // The `staged` column a store gains at open (#4701), the local-only
+        // columns of version 4 (#5155) and the head columns of version 7
+        // (#5221), are no record.
+        let added: Set<String> = ["staged", "local_only", "local_indexes", "known_head", "known_head_at"]
         out["record_log_state"] = out["record_log_state"]?.map { $0.filter { !added.contains($0.key) } }
         return out
     }
@@ -288,7 +289,7 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
     }
 
     private func assertRetired(
-        _ provider: SQLiteStorageProvider, version expected: String = "4", file: StaticString = #filePath, line: UInt = #line
+        _ provider: SQLiteStorageProvider, version expected: String = String(RecordLogSchema.storageVersion), file: StaticString = #filePath, line: UInt = #line
     ) throws {
         let tables = try names(provider, "table")
         for gone in ["Item", "Item__tags", "record_log_projection", "record_log_projection_rule"] {
@@ -324,7 +325,7 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
         XCTAssertEqual(stored.map { $0["kind"]?.stringValue }, ["blob", "blob"])
         XCTAssertEqual(stored.map { $0["no_id"]?.intValue }, [1, 1])
         XCTAssertEqual(lines.value.count, 1, "one line names the version: \(lines.value)")
-        XCTAssertTrue(lines.value.first?.contains("storage version 4") ?? false, lines.value.first ?? "")
+        XCTAssertTrue(lines.value.first?.contains("storage version \(RecordLogSchema.storageVersion)") ?? false, lines.value.first ?? "")
         XCTAssertTrue(
             lines.value.first?.contains("1 document(s), 2 row(s) re-encoded as JSONB without id") ?? false, lines.value.first ?? ""
         )
@@ -353,7 +354,7 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
         // An older build opened the store since: it recreated its layout and
         // left the marker as it found it.
         try provider.withConnection { try projectionLayout($0) }
-        XCTAssertEqual(try version(provider), "4")
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
         lines.value = []
 
         try store(provider).initialize()
@@ -410,6 +411,51 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
         XCTAssertEqual(try names(provider, "table").filter { $0.hasPrefix("record_log_") }, [])
     }
 
+    // MARK: - #5223 behavior 3: a version-1 store with a cached index reaches version 6
+
+    /// The index cache as #4700 created it (storage version 2): no `members`
+    /// (version 5) and no `kind` (version 6).
+    private static let indexCacheAt2 = """
+        CREATE TABLE IF NOT EXISTS record_log_indexes (
+          doc_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          fields TEXT NOT NULL,
+          is_unique INTEGER NOT NULL DEFAULT 0,
+          room_name TEXT,
+          PRIMARY KEY (doc_id, model, fields)
+        )
+        """
+
+    /// A version-1 store holding a cached scalar entry and its view index
+    /// opens at version 6 in one open: the `members` column added before the
+    /// cache is copied, the entry read `scalar`, every record kept.
+    func testAVersion1StoreWithACachedIndexOpensAtTheVersionWithItsEntryScalar() async throws {
+        let provider = try await version1Store()
+        try provider.withConnection { connection in
+            try connection.executeScript(Self.indexCacheAt2)
+            try connection.execute(
+                "INSERT INTO record_log_indexes (doc_id, model, fields, is_unique, room_name) VALUES (?, 'Item', '[\"n\"]', 1, 'idx_records_item_n')",
+                [.text(Self.documentId)]
+            )
+            try connection.executeScript(
+                "CREATE INDEX idx_record_log_view_4_item_1_n ON record_log_view(doc_id, json_extract(_data, '$.n'), _id) WHERE _type = 'Item'"
+            )
+        }
+        let before = try records(provider)
+        try store(provider).initialize()
+        try assertRetired(provider)
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
+        XCTAssertEqual(try records(provider), before, "every record is kept")
+        let cached = try rows(provider, "SELECT doc_id, model, fields, kind, is_unique, room_name, members, text, options FROM record_log_indexes")
+        XCTAssertEqual(cached.count, 1)
+        XCTAssertEqual(cached.first?["kind"]?.stringValue, "scalar")
+        XCTAssertEqual(cached.first?["is_unique"]?.intValue, 1)
+        XCTAssertEqual(cached.first?["room_name"]?.stringValue, "idx_records_item_n")
+        for column in ["members", "text", "options"] { XCTAssertTrue(cached.first?[column]?.isNull ?? false, column) }
+        XCTAssertTrue(try names(provider, "index").contains("idx_record_log_view_4_item_1_n"), "the view index is kept")
+        XCTAssertEqual(try store(provider).indexTuples(), [RecordLogIndexTuple(model: "Item", fields: ["n"], unique: true)])
+    }
+
     // MARK: - #4701 edge 50: the staged replacement's column and table, added without a version change
 
     /// A store at the version without the staged replacement's column and
@@ -425,10 +471,10 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
             try connection.executeScript("DROP TABLE IF EXISTS record_log_staged_base")
         }
         let before = try records(provider)
-        XCTAssertEqual(try version(provider), "4")
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
 
         try store(provider).initialize()
-        XCTAssertEqual(try version(provider), "4", "no version change")
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion), "no version change")
         XCTAssertTrue(try names(provider, "table").contains("record_log_staged_base"))
         let columns = try rows(provider, "SELECT name FROM pragma_table_info('record_log_state')").compactMap { $0["name"]?.stringValue }
         XCTAssertEqual(columns.last, "staged")
@@ -455,11 +501,11 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
         let provider = try await provider()
         let trace = try RecordLogStatementTrace.install(on: provider, self)
         try store(provider).initialize()
-        XCTAssertEqual(try version(provider), "4")
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
         let columns = try rows(provider, "SELECT name FROM pragma_table_info('record_log_state')").compactMap { $0["name"]?.stringValue }
         XCTAssertEqual(
-            Array(columns.suffix(3)), ["staged", "local_only", "local_indexes"],
-            "no marker column: a row's encoding is its marker; version 4's local-only columns follow"
+            Array(columns.suffix(5)), ["staged", "local_only", "local_indexes", "known_head", "known_head_at"],
+            "no marker column: a row's encoding is its marker; version 4's local-only columns follow, then version 7's head"
         )
         XCTAssertFalse(trace.statements.contains { $0.contains("UPDATE record_log_rows") }, "nothing to convert")
         XCTAssertEqual(lines.value, [], "nothing converted or dropped, nothing logged")
@@ -478,19 +524,20 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
     func testAStoreAboveTheBuildsVersionKeepsItsVersionAndIsRetiredWhenAnOlderBuildWasHere() async throws {
         let provider = try await provider()
         try store(provider).initialize()
+        let newer = String(RecordLogSchema.storageVersion + 1)
         try provider.withConnection {
-            try $0.execute("UPDATE record_log_meta SET value = '5' WHERE key = 'storage_version'", [])
+            try $0.execute("UPDATE record_log_meta SET value = ? WHERE key = 'storage_version'", [.text(newer)])
         }
         let trace = try RecordLogStatementTrace.install(on: provider, self)
         try store(provider).initialize()
         let fast = ran(trace)
         XCTAssertEqual(fast.count, 2, "the fast path: \(fast)")
-        XCTAssertEqual(try version(provider), "5", "a newer build's version is kept")
+        XCTAssertEqual(try version(provider), newer, "a newer build's version is kept")
 
         // An older build opened it since: its layout is retired, the version not lowered.
         try provider.withConnection { try projectionLayout($0) }
         try store(provider).initialize()
-        try assertRetired(provider, version: "5")
+        try assertRetired(provider, version: newer)
         XCTAssertEqual(lines.value.count, 1, "the drop is logged once: \(lines.value)")
     }
 }

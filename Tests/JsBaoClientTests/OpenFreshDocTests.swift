@@ -19,6 +19,7 @@ import XCTest
 /// A consuming app (StoryLens) had ~31s added to every scan because its
 /// story-doc open used `.network` on the just-created doc. This pins the
 /// expectation so the handshake can't silently regress back to a timeout.
+@available(*, deprecated)
 final class OpenFreshDocTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

@@ -76,6 +76,7 @@ final class AgentSessionGoneHermeticTests: XCTestCase {
 
     // MARK: - Behavior 16: this client's delete
 
+    @available(*, deprecated)
     func testDeleteFailsTheSessionsQueuedUploadsWithTheNotFoundErrorAndLeavesOthersAlone() async throws {
         let (server, client, script, attachments) = try fixture()
         defer { server.stop() }

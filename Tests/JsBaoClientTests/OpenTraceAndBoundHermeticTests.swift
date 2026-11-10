@@ -144,6 +144,7 @@ final class OpenTraceAndBoundHermeticTests: XCTestCase {
 
     // MARK: - setLogLevel reaches every scoped logger
 
+    @available(*, deprecated)
     func testSetLogLevelAtRuntimeReachesTheScopedLoggersTheOpenPathLogsOn() async throws {
         let client = await makeClient(wsUrl: "ws://127.0.0.1:1", storage: .memory)
         defer { Task { await client.destroy() } }

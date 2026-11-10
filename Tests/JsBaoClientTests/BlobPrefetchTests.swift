@@ -5,6 +5,7 @@ import XCTest
 /// and the typed `read(blobId:as:)` variants. Mirrors JS
 /// `blobs.prefetch([ids], { concurrency })` semantics: best-effort cache
 /// warming, individual failures swallowed.
+@available(*, deprecated)
 final class BlobPrefetchTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

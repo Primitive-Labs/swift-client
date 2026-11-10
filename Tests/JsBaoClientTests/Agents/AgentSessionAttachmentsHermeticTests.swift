@@ -116,6 +116,7 @@ final class AgentSessionAttachmentsHermeticTests: XCTestCase {
         await client.destroy()
     }
 
+    @available(*, deprecated)
     func testAnUploadWhileOfflineQueuesWithNoPutAndAnIdleTimerUntilOnline() async throws {
         let server = try SessionUploadServer()
         defer { server.stop() }
@@ -524,6 +525,7 @@ final class AgentSessionAttachmentsHermeticTests: XCTestCase {
 
     // MARK: - Behavior 8: the document context never sees a session upload
 
+    @available(*, deprecated)
     func testTheDocumentContextNeitherListsNorActsOnASessionUpload() async throws {
         let server = try SessionUploadServer { request in
             if SessionUploadServer.isAttachmentPut(request) { return .status(503, "busy") }
