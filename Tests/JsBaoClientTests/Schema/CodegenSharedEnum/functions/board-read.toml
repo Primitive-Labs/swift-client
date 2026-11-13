@@ -1,0 +1,26 @@
+# A function over the board type's posts (#5896): a declared projection in,
+# the row projection out, and one rendered inline by a `required` override.
+
+[function]
+key = "board-read"
+entry = "functions/board-read.ts"
+
+[function.inputSchema]
+type = "object"
+
+[function.inputSchema.properties.draft]
+ref = "board.posts#declared"
+
+[function.inputSchema.properties.want]
+ref = "Phase"
+
+[function.outputSchema]
+type = "object"
+required = ["post"]
+
+[function.outputSchema.properties.post]
+ref = "board.posts"
+
+[function.outputSchema.properties.strict]
+ref = "board.posts"
+required = ["status"]

@@ -49,6 +49,7 @@ extension JsBaoClient {
             identityPending: { [weak self] in self?.db3IdentityOutgoing ?? false },
             indexesSettled: { [weak self] id in self?.db3IndexRefresher?.settled(id) ?? true },
             lastUsedAt: { [weak self] id in self?.db3LastUsedAt(id) },
+            title: { [weak self] id in self?.documentManager.getLocalMetadata(id)?.title },
             logger: logger
         )
     }
@@ -269,6 +270,47 @@ extension JsBaoClient {
             id: db3Id, title: title, createdBy: userId, createdAt: createdAt, modifiedAt: createdAt, custodian: "user:\(userId)",
             sync: false, type: nil, tags: tags ?? [], metadata: metadata, permission: nil, accessSource: nil, grantedAt: nil,
             localOnly: true
+        )
+    }
+
+    /// `client.db3.update`'s answer reaches the device (#5890): the db3's
+    /// metadata row takes the title, when the device holds a row for it. A
+    /// db3 never stored here gets no row.
+    func noteDb3Title(_ db3Id: String, title: String) async {
+        guard documentManager.getLocalMetadata(db3Id) != nil else { return }
+        await documentManager.applyDocumentMetadataUpdate(
+            documentId: db3Id, metadata: ["title": .string(title)], changedFields: ["title"], action: "updated", source: "local"
+        )
+    }
+
+    /// Rename a db3 that lives only on this device (#5890): its metadata row
+    /// takes `title` (already judged and trimmed), written to storage before
+    /// this returns, and nothing is sent. Answers the db3 as
+    /// `createLocalOnlyDb3` does, with the new title. A db3 whose row is gone
+    /// (known from its store's mark) gets its whole local-only row back
+    /// first, so the title never lands on a row that no longer says the db3
+    /// lives only here.
+    func renameLocalOnlyDb3(_ db3Id: String, title: String) async -> Db3Info {
+        if documentManager.getLocalMetadata(db3Id) == nil {
+            let now = ISO8601DateFormatter().string(from: Date())
+            var row = LocalMetadataEntry(
+                documentId: db3Id, createdBy: authController.getUserId(), createdAt: now, pendingCreate: false, localOnly: true,
+                localBytes: 0, lastKnownPermission: "owner", permissionCachedAt: now, db3Create: true
+            )
+            row.documentFormat = RecordLogTransport.documentFormat
+            await documentManager.restoreLocalOnlyRow(row)
+            noteDb3(db3Id)
+        }
+        await documentManager.applyDocumentMetadataUpdate(
+            documentId: db3Id, metadata: ["title": .string(title)], changedFields: ["title"], action: "updated", source: "local"
+        )
+        let meta = documentManager.getLocalMetadata(db3Id)
+        let userId = meta?.createdBy ?? authController.getUserId() ?? ""
+        let now = ISO8601DateFormatter().string(from: Date())
+        return Db3Info(
+            id: db3Id, title: title, createdBy: userId, createdAt: meta?.createdAt ?? now, modifiedAt: now,
+            custodian: "user:\(userId)", sync: false, type: nil, tags: meta?.tags ?? [], metadata: meta?.docMetadata,
+            permission: nil, accessSource: nil, grantedAt: nil, localOnly: true
         )
     }
 

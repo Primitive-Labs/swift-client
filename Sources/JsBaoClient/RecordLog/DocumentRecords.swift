@@ -220,8 +220,9 @@ public final class DocumentRecords: Sendable {
         try assertRecordLogRecordInput(documentId: documentId, model: model, id: id, kind: kind, data: data, report: report)
         let data = try Self.encodedVectors(data, binding: binding, model: model, id: id, kind: kind)
         if binding.isReadOnly {
+            // #5888 — the code the room's refusal of the same write carries.
             throw JsBaoError(
-                code: .accessDenied,
+                code: .writeAccessDenied,
                 message: "Cannot save \(model) \(id) to document `\(documentId)`: the room allows this client to read it only.",
                 details: ["documentId": .string(documentId)]
             )
@@ -236,6 +237,10 @@ public final class DocumentRecords: Sendable {
                 ))
             }
             try assertRecordLogEntry(documentId: documentId, mutations: mutations, report: report)
+            // A string outside an enforced enum of the db3's type is refused here, as the room would (#5897).
+            try assertRecordLogDeclaredEnums(
+                documentId: documentId, mutations: mutations, enums: binding.declaredType?.enums ?? [:], report: report
+            )
             let seq = try binding.commit([RecordLogWrite(mutations: mutations)]).last?.seq
             return (kind == .delete ? nil : try binding.store.read(model: model, id: id).map { Self.decoded($0, model, binding) }, seq)
         }

@@ -173,6 +173,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - RuleSetsAPI.list — resourceType filter
 
+    @available(*, deprecated)
     func test_ruleSetsList_resourceType_isEncoded() async throws {
         let recorder = PathRecorder()
         let ruleSets = RuleSetsAPI(transport: recorder)
@@ -181,6 +182,7 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     /// A plain resourceType slug stays byte-identical.
+    @available(*, deprecated)
     func test_ruleSetsList_slug_isByteIdentical() async throws {
         let recorder = PathRecorder()
         let ruleSets = RuleSetsAPI(transport: recorder)

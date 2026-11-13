@@ -158,7 +158,7 @@ final class Db3AliasPermissionHermeticTests: XCTestCase {
             _ = try notes.save(id: "n1", values: ["title": .string("mine?")])
             XCTFail("a save on a reader copy should throw")
         } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .accessDenied)
+            XCTAssertEqual(error.code, .writeAccessDenied)
         }
         XCTAssertNil(notes.find(id: "n1"), "nothing is in the store")
         let state = try await client.db3.state(Self.db3Id)

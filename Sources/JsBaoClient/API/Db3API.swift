@@ -6,6 +6,7 @@ public struct Db3SubscribeOptions: Sendable {
     /// `DB3_READY_TIMEOUT`, in seconds (30 by default). Each chunk or page that
     /// arrives starts the wait again; `.infinity` waits for as long as it
     /// takes, and `0` throws at once unless the db3 is already live here.
+    /// - Stability: beta
     public var readyTimeout: TimeInterval
 
     public init(readyTimeout: TimeInterval = 30) {
@@ -17,6 +18,7 @@ public struct Db3SubscribeOptions: Sendable {
 public struct Db3EvictOptions: Sendable {
     /// Remove the db3 even while it holds writes the room has not judged. They
     /// are handed back through `Db3WriteRefusedEvent` as `DOCUMENT_STORE_PURGED`.
+    /// - Stability: beta
     public var force: Bool
 
     public init(force: Bool = false) {
@@ -26,22 +28,35 @@ public struct Db3EvictOptions: Sendable {
 
 /// One db3 this device holds, as `client.db3.stored()` lists it.
 public struct Db3StoredEntry: Sendable, Equatable {
+    /// - Stability: beta
     public let id: String
     /// How many records the local copy holds.
+    /// - Stability: beta
     public let rows: Int
     /// The room's log number the copy has caught up to.
+    /// - Stability: beta
     public let cursor: Int
     /// Writes made here the room has not judged yet.
+    /// - Stability: beta
     public let pendingWrites: Int
     /// When a load or catch-up last completed here, or `nil`.
+    /// - Stability: beta
     public let lastSyncAt: Date?
     /// Whether the copy is readable (see ``Db3State/resident``).
+    /// - Stability: beta
     public let resident: Bool
     /// Whether it lives only on this device (see ``Db3State/localOnly``).
+    /// - Stability: beta
     public let localOnly: Bool
+    /// Its title as this device last heard it: from its create here, a rename
+    /// (``Db3API/update(_:title:)`` here, or another device's, heard while
+    /// connected with a direct grant), or a read; `nil` when the device holds none.
+    /// - Stability: beta
+    public let title: String?
 
     public init(
-        id: String, rows: Int, cursor: Int, pendingWrites: Int, lastSyncAt: Date?, resident: Bool, localOnly: Bool = false
+        id: String, rows: Int, cursor: Int, pendingWrites: Int, lastSyncAt: Date?, resident: Bool, localOnly: Bool = false,
+        title: String? = nil
     ) {
         self.id = id
         self.rows = rows
@@ -50,6 +65,7 @@ public struct Db3StoredEntry: Sendable, Equatable {
         self.lastSyncAt = lastSyncAt
         self.resident = resident
         self.localOnly = localOnly
+        self.title = title
     }
 }
 
@@ -122,6 +138,7 @@ public final class Db3Subscription: @unchecked Sendable {
     // under `lock`; the settlements guard themselves.
 
     /// The db3.
+    /// - Stability: beta
     public let id: String
     private let owner: Db3Lifecycle
     private let readySettlement = Db3Settlement()
@@ -158,6 +175,7 @@ public final class Db3Subscription: @unchecked Sendable {
     }
 
     /// The db3's latest state, as this client last read it.
+    /// - Stability: beta
     public var state: Db3State { owner.current(id) }
 
     /// This db3's events, from now on: each call answers a new stream,
@@ -615,6 +633,59 @@ public final class Db3API: @unchecked Sendable {
         return try await transport.request(method: .get, path: Self.path(db3Id))
     }
 
+    /// Rename a db3 and answer it as ``get(_:)`` does, with the new title and
+    /// `modifiedAt`. Its owner, a `read-write` grant or link, and an app owner
+    /// or admin rename it. The title is stored trimmed. On success this
+    /// device's stored copy takes the new title (``stored()``); on a refusal
+    /// nothing here changes. Connected devices of users who hold a direct
+    /// grant hear the new title; anyone else reads it at their next ``get(_:)``
+    /// or ``listMine(_:)``.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// A db3 that lives only on this device is renamed here with nothing
+    /// sent, and stays renamed after a restart.
+    ///
+    /// ```swift
+    /// let renamed = try await client.db3.update(db3Id, title: "Rivera household")
+    /// print(renamed.title, renamed.modifiedAt)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - title: The new title.
+    /// - Throws: `HttpError` 403 `DOC_ACCESS_DENIED` for a caller who may not
+    ///   write the db3, 400 for a blank title or one over 255 characters, 404
+    ///   for no db3 of this app; `.invalidArgument` for such a title on a db3
+    ///   that lives only on this device.
+    /// - Stability: beta
+    public func update(_ db3Id: String, title: String) async throws -> Db3Info {
+        if let client, await client.isLocalOnlyDb3(db3Id) {
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw JsBaoError(code: .invalidArgument, message: "client.db3.update: title is required", details: ["db3Id": .string(db3Id)])
+            }
+            guard title.utf16.count <= Self.titleMax else {
+                throw JsBaoError(
+                    code: .invalidArgument, message: "client.db3.update: title is over \(Self.titleMax) characters",
+                    details: ["db3Id": .string(db3Id)]
+                )
+            }
+            return await client.renameLocalOnlyDb3(db3Id, title: trimmed)
+        }
+        try await awaitCreate(db3Id)
+        let info: Db3Info = try await transport.request(
+            method: .put, path: Self.path(db3Id), body: JSONValue.object(["title": .string(title)])
+        )
+        await client?.noteDb3Title(db3Id, title: info.title)
+        return info
+    }
+
+    /// The longest title a db3 takes, as the server judges it: in UTF-16
+    /// code units, as the server and the JS client count a string.
+    private static let titleMax = 255
+
     /// Delete a db3 with its records, grants and blobs. Its owner deletes it,
     /// and so does an app owner or admin.
     ///
@@ -664,7 +735,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter options: The listings, the page size and a cursor.
-    /// - Stability: production
+    /// - Stability: beta
     public func listMine(_ options: Db3ListMineOptions = Db3ListMineOptions()) async throws -> PaginatedResult<Db3Info> {
         let sources = Self.listings.filter { options.via.contains($0.via) }
         let at: Db3ListMineCursor
@@ -715,7 +786,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```
     ///
     /// - Parameter options: The page size and the cursor of the page before.
-    /// - Stability: production
+    /// - Stability: beta
     public func listMine(options: PaginationOptions) async throws -> PaginatedResult<Db3Info> {
         if let cursor = options.cursor, Db3ListMineCursor.decode(cursor) != nil {
             return try await listMine(Db3ListMineOptions(limit: options.limit, cursor: cursor))
@@ -751,7 +822,7 @@ public final class Db3API: @unchecked Sendable {
     /// `.owner` (the default), `.readWrite` or `.reader`, which writes no owner
     /// row and one grant at that level. A level other than `.owner` needs an
     /// app owner or admin; a member is refused 403. A `.reader` db3 you create
-    /// for yourself is read-only here at once: a save throws `.accessDenied`
+    /// for yourself is read-only here at once: a save throws `.writeAccessDenied`
     /// and nothing is sent. One created for another user is not stored here.
     ///
     /// ```swift
@@ -1154,8 +1225,10 @@ public struct Db3IndexOrigin: Sendable, Equatable, Decodable {
         case named
     }
 
+    /// - Stability: beta
     public let kind: Kind
     /// Whether this origin asks for the index's fields to be unique.
+    /// - Stability: beta
     public let unique: Bool
 
     public init(kind: Kind, unique: Bool) {
@@ -1203,21 +1276,29 @@ public enum Db3LocalIndexStatus: String, Sendable, Equatable, CaseIterable {
 /// `client.db3.indexes.local(_:)` lists it.
 public struct Db3LocalIndex: Sendable, Equatable {
     /// The index's name, as `client.db3.indexes.list(_:)` names it.
+    /// - Stability: beta
     public let name: String
+    /// - Stability: beta
     public let model: String
     /// The fields, in index order.
+    /// - Stability: beta
     public let fields: [String]
+    /// - Stability: beta
     public let kind: Db3IndexKind
     /// `device` or `both`: an index placed on the server only is not listed.
+    /// - Stability: beta
     public let on: Db3IndexPlacement
+    /// - Stability: beta
     public let status: Db3LocalIndexStatus
     /// Why it is not built: `declined on this device`, the `deviceIndexes` option, or its build's failure.
+    /// - Stability: beta
     public let reason: String?
     /// How a built vector index answers `$near` now: `.exact` from every
     /// vector, or `.ann` from its approximate index once this device has
     /// installed the shared model and finished filling it. `.exact` while
     /// `.building`; `nil` for every other kind and for a vector index that is
     /// not built.
+    /// - Stability: beta
     public let mode: Db3LocalIndexMode?
 
     public init(
@@ -1242,14 +1323,20 @@ public struct Db3LocalIndex: Sendable, Equatable {
 /// than one field, text options it cannot read).
 public struct Db3SkippedIndex: Sendable, Equatable {
     /// The index's name, as `client.db3.indexes.list(_:)` names it.
+    /// - Stability: beta
     public let name: String
+    /// - Stability: beta
     public let model: String
     /// The fields, in index order.
+    /// - Stability: beta
     public let fields: [String]
+    /// - Stability: beta
     public let kind: Db3IndexKind
     /// Where the index list places it: `.server` only here, never in `local(_:)`.
+    /// - Stability: beta
     public let on: Db3IndexPlacement
     /// Why this device builds nothing for it, e.g. `placed on the server only; this device builds nothing for it`.
+    /// - Stability: beta
     public let reason: String
 
     public init(name: String, model: String, fields: [String], kind: Db3IndexKind, on: Db3IndexPlacement, reason: String) {
@@ -1291,37 +1378,50 @@ public struct Db3Index: Sendable, Equatable, Decodable {
     /// `idx_uc_<model>_<constraint>` for a declared compound constraint,
     /// `idx_named_<model>_<name>` for one registered with a name,
     /// `idx_members_<model>_<field>` for a string-set field's member index.
+    /// - Stability: beta
     public let name: String
     /// The model whose records the index covers.
+    /// - Stability: beta
     public let model: String
     /// The fields, in index order.
+    /// - Stability: beta
     public let fields: [String]
     /// Whether uniqueness is enforced: true while any origin asks for it.
+    /// - Stability: beta
     public let unique: Bool
     /// Whether this is a string-set field's member index, which serves
     /// `$contains`, any-of, membership levels and unfiltered facets on the
     /// field in the db3. `false` for every other index.
+    /// - Stability: beta
     public let members: Bool
     /// Every origin keeping the index. It is dropped when the last one goes.
+    /// - Stability: beta
     public let origins: [Db3IndexOrigin]
     /// What the index is: `.members` exactly when `members` is true.
+    /// - Stability: beta
     public let kind: Db3IndexKind
     /// Where the index lives. A declared field's index is on `.both`; every
     /// index of a db3 that lives only on this device is on `.device`.
+    /// - Stability: beta
     public let on: Db3IndexPlacement
     /// A text index's options, every one filled in; `nil` for any other kind.
+    /// - Stability: beta
     public let text: Db3TextIndex?
     /// A vector index's options and its field's encoding; `nil` for any other
     /// kind, and from a server that does not list them.
+    /// - Stability: beta
     public let vector: Db3VectorIndex?
     /// A vector index's generation: it changes when the index is dropped and
     /// registered again, so no model of the old index is used. `nil` for any other kind.
+    /// - Stability: beta
     public let generation: Int?
     /// A vector index's model revision: it moves when the model is deleted,
     /// so every device drops its copy. `nil` for any other kind.
+    /// - Stability: beta
     public let revision: Int?
     /// An `ann` vector index's shared model, once a device (or the app)
     /// uploaded one; `nil` before, and for any other index.
+    /// - Stability: beta
     public let annModel: Db3IndexAnnModel?
 
     private enum CodingKeys: String, CodingKey {
@@ -1353,11 +1453,15 @@ public struct Db3Index: Sendable, Equatable, Decodable {
 /// the registration's `distance` and `index`, filled in, and the field's
 /// encoding.
 public struct Db3VectorIndex: Sendable, Equatable, Decodable {
+    /// - Stability: beta
     public let distance: Db3VectorIndexOptions.Distance
+    /// - Stability: beta
     public let index: Db3VectorIndexOptions.Mode
     /// How many numbers the field holds; `nil` when the room does not know the field's encoding.
+    /// - Stability: beta
     public let dims: Int?
     /// How each number is stored; `nil` when the room does not know the field's encoding.
+    /// - Stability: beta
     public let element: VectorElement?
 
     public init(distance: Db3VectorIndexOptions.Distance, index: Db3VectorIndexOptions.Mode, dims: Int?, element: VectorElement?) {
@@ -1372,10 +1476,15 @@ public struct Db3VectorIndex: Sendable, Equatable, Decodable {
 /// lists it: its revision, when and over how many records it was trained,
 /// its size and its envelope's format (`pvm1`).
 public struct Db3IndexAnnModel: Sendable, Equatable, Decodable {
+    /// - Stability: beta
     public let revision: Int
+    /// - Stability: beta
     public let trainedAt: Date
+    /// - Stability: beta
     public let rows: Int
+    /// - Stability: beta
     public let bytes: Int
+    /// - Stability: beta
     public let format: String
 
     private enum CodingKeys: String, CodingKey { case revision, trainedAt, rows, bytes, format }
@@ -1406,15 +1515,21 @@ public struct Db3IndexAnnModel: Sendable, Equatable, Decodable {
 /// answers it: its bytes (the model in its `pvm1` envelope) and what it was
 /// uploaded with.
 public struct Db3IndexModel: Sendable, Equatable {
+    /// - Stability: beta
     public let bytes: Data
     /// The index's generation it was uploaded for.
+    /// - Stability: beta
     public let generation: Int
     /// The revision it was uploaded under.
+    /// - Stability: beta
     public let revision: Int
     /// How many records it was trained over.
+    /// - Stability: beta
     public let rows: Int
+    /// - Stability: beta
     public let trainedAt: Date
     /// Its envelope's format, `pvm1`.
+    /// - Stability: beta
     public let format: String
 
     public init(bytes: Data, generation: Int, revision: Int, rows: Int, trainedAt: Date, format: String) {
@@ -1431,12 +1546,17 @@ public struct Db3IndexModel: Sendable, Equatable {
 /// `generation` and `revision` as `list` answers them, and how the model was
 /// trained.
 public struct Db3IndexModelUpload: Sendable, Equatable {
+    /// - Stability: beta
     public let generation: Int
+    /// - Stability: beta
     public let revision: Int
     /// How many records the model was trained over.
+    /// - Stability: beta
     public let rows: Int
+    /// - Stability: beta
     public let trainedAt: Date
     /// Its envelope's format: `pvm1`.
+    /// - Stability: beta
     public let format: String
 
     public init(generation: Int, revision: Int, rows: Int, trainedAt: Date, format: String = "pvm1") {
@@ -1450,8 +1570,11 @@ public struct Db3IndexModelUpload: Sendable, Equatable {
 
 /// What `client.db3.indexes.deleteModel` answers: the index's new revision.
 public struct Db3IndexModelDeletion: Sendable, Equatable {
+    /// - Stability: beta
     public let ok: Bool
+    /// - Stability: beta
     public let name: String
+    /// - Stability: beta
     public let revision: Int
 
     public init(ok: Bool, name: String, revision: Int) {
@@ -1479,8 +1602,11 @@ public enum Db3TextTokenizer: String, Sendable, Equatable, Codable, CaseIterable
 /// Db3TextIndexOptions(tokenizer: .porter, weights: ["title": 3])
 /// ```
 public struct Db3TextIndexOptions: Sendable, Equatable, Encodable {
+    /// - Stability: beta
     public let tokenizer: Db3TextTokenizer?
+    /// - Stability: beta
     public let prefix: [Int]?
+    /// - Stability: beta
     public let weights: [String: Double]?
 
     public init(tokenizer: Db3TextTokenizer? = nil, prefix: [Int]? = nil, weights: [String: Double]? = nil) {
@@ -1494,8 +1620,11 @@ public struct Db3TextIndexOptions: Sendable, Equatable, Encodable {
 /// one filled in: the tokenizer, the prefix-index lengths (none by default)
 /// and a weight per covered field.
 public struct Db3TextIndex: Sendable, Equatable, Decodable {
+    /// - Stability: beta
     public let tokenizer: Db3TextTokenizer
+    /// - Stability: beta
     public let prefix: [Int]
+    /// - Stability: beta
     public let weights: [String: Double]
 
     public init(tokenizer: Db3TextTokenizer, prefix: [Int], weights: [String: Double]) {
@@ -1533,20 +1662,30 @@ public struct Db3TextIndex: Sendable, Equatable, Decodable {
 /// )
 /// ```
 public struct Db3IndexRegistration: Sendable, Encodable {
+    /// - Stability: beta
     public let model: String
+    /// - Stability: beta
     public let field: String?
+    /// - Stability: beta
     public let fields: [String]?
+    /// - Stability: beta
     public let unique: Bool?
+    /// - Stability: beta
     public let name: String?
     /// `true` for a string-set field's member index; `nil` for any other index.
+    /// - Stability: beta
     public let members: Bool?
     /// What the index is; `nil` sends none (`.scalar`, or `.members` with `members: true`).
+    /// - Stability: beta
     public let kind: Db3IndexKind?
     /// Where the index lives; `nil` sends none (`.both` for a field index, `.server` for a member index).
+    /// - Stability: beta
     public let on: Db3IndexPlacement?
     /// A text index's options (`kind: .text` only); `nil` sends none, the defaults.
+    /// - Stability: beta
     public let text: Db3TextIndexOptions?
     /// A `.vector` index's options (#5225); `nil` sends none, and on any other kind.
+    /// - Stability: beta
     public let vector: Db3VectorIndexOptions?
 
     /// An index on one field.
@@ -1684,8 +1823,10 @@ public struct Db3VectorIndexOptions: Sendable, Encodable, Equatable {
     }
 
     /// `nil` sends none: the room's default.
+    /// - Stability: beta
     public var distance: Distance?
     /// `nil` sends none: `.exact`.
+    /// - Stability: beta
     public var index: Mode?
 
     public init(distance: Distance? = nil, index: Mode? = nil) {

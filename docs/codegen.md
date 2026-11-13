@@ -153,6 +153,10 @@ model wrapper. Full explanation in
 emits a nested `<Field>Value` enum (advisory typed view; the wire stays a
 plain string) — the type name is sanitized so a keyword/leading-digit
 field name still produces a legal identifier (`default` → `DefaultValue`).
+`enforce_enum = true` beside it (a db3 type's opt-in to refusing values
+outside the set) changes nothing generated: the database enforces it, and a
+device refuses such a write with `.db3ValueNotInEnum`; any value but `true` or
+`false` is refused when the type is read.
 `auto_stamp = "create" | "update" | "both"` rides inside the field's
 `FieldDescriptor` literal, and the shared write path (`DynamicModel.save`)
 stamps `Date.now()`-style epoch millis on insert/update — matching JS

@@ -244,6 +244,20 @@ public enum JsBaoErrorCode: String, Sendable {
     /// "local"`), a typed db3's room hands a write back with it, and
     /// `VectorCodec` throws it.
     case db3VectorInvalid = "DB3_VECTOR_INVALID"
+    /// A write that would leave a value outside a field's enum where the
+    /// db3's type enforces it (`enforce_enum = true`, #5897). A save is
+    /// refused with it before anything commits (`details.scope: "local"`),
+    /// and a typed db3's room hands a write back with it.
+    case db3ValueNotInEnum = "DB3_VALUE_NOT_IN_ENUM"
+    /// A type write to a type at least one db3 is of, refused because it
+    /// would make stored records unreadable: a removed model or field, a
+    /// changed field type, a removed enum value, a field made required or a
+    /// new required one, a changed vector (#6019). `details["reasons"]` lists
+    /// each change as `{ path, change, reason }`.
+    case db3TypeNotAppendOnly = "DB3_TYPE_NOT_APPEND_ONLY"
+    /// A type write that asked for `allowFieldRemoval` on an app whose stored
+    /// settings do not have `allowFieldRemoval = true` (#6019).
+    case db3TypeFieldRemovalNotEnabled = "DB3_TYPE_FIELD_REMOVAL_NOT_ENABLED"
     /// A device read with `QueryOptions.maxDrift` whose db3 copy is further
     /// behind the server than the bound, or has not heard the server's
     /// position yet (`details["drift"]` is then `null`). `details` carry

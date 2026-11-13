@@ -417,6 +417,23 @@ public extension UserTagRecord {
         return copy
     }
 
+    /// The unique constraints `upsertByUnique` may name.
+    enum UniqueConstraint: String, Sendable {
+        case user_tag_unique = "user_tag_unique"
+    }
+
+    /// `upsertByUnique(_:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, mode: UpsertMode = .either, in documentId: String) throws -> UserTagRecord {
+        try upsertByUnique(constraint.rawValue, mode: mode, in: documentId)
+    }
+
+    /// `upsertByUnique(_:lookupValue:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> UserTagRecord {
+        try upsertByUnique(constraint.rawValue, lookupValue: lookupValue, mode: mode, in: documentId)
+    }
+
     /// Delete this record from document `documentId`. Throws if the doc isn't open.
     func delete(in documentId: String) throws {
         try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)

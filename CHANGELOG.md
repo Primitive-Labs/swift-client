@@ -20,6 +20,123 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Added: the codes of a db3 type change that would drop stored data
+
+`JsBaoErrorCode` gains `.db3TypeNotAppendOnly` (`DB3_TYPE_NOT_APPEND_ONLY`)
+and `.db3TypeFieldRemovalNotEnabled` (`DB3_TYPE_FIELD_REMOVAL_NOT_ENABLED`):
+a type write to a type at least one db3 is of is refused with the first when
+it would make stored records unreadable, `details["reasons"]` listing each
+change, and with the second when it asks for `allowFieldRemoval` on an app
+whose stored settings do not enable it. An exhaustive `switch` over
+`JsBaoErrorCode` needs a branch for each.
+### Added: a db3 field's enum can be enforced
+
+A db3 type field with `enforce_enum = true` beside its `enum` refuses any
+write whose value is outside the set. A save, and a model-free
+`client.db3.records(_:)` put or patch, on a synced db3 of that type throws
+`JsBaoError` with the new code `.db3ValueNotInEnum`
+(`details["scope"] == "local"`) before anything commits, in the server's own
+words (a value is a member only when its code units match one, as on the
+server: a canonically equivalent spelling is not), and a write the server
+refuses is handed back under the same code.
+`TomlSchemaLoader` and `swift-bao-codegen` take `enforce_enum = true` or
+`false` and refuse any other value; `TomlSchemaLoader` in strict mode now also
+takes `enum`, as the codegen does. Generated models are unchanged. The client
+now declares wire version 4; a server at version 3 still serves it.
+
+`JsBaoErrorCode`, `TomlSchemaLoaderError` (`.invalidEnforceEnum`) and the
+codegen's error type each gain a case: an exhaustive `switch` over one needs a
+branch for it.
+### Added: `client.db3.update(_:title:)` renames a db3 (beta)
+
+`client.db3.update(db3Id, title:)` sets a db3's title and answers the db3 as
+`client.db3.get` does. Its owner, a `read-write` grant or link, and an app
+owner or admin may rename it; anyone else gets `HttpError` 403
+`DOC_ACCESS_DENIED`. A db3 that lives only on the device is renamed there with
+nothing sent. `Db3StoredEntry` now carries `title`, the title the device last
+heard, or `nil`. Use it in place of the deprecated
+`client.documents.update(documentId:data:)` with a title.
+
+### Changed behaviour: a read-only write refused on the device throws `.writeAccessDenied`
+
+A commit to a db3 the user may only read, through a model or
+`db3.records(_:)`, now throws `JsBaoError` with code `.writeAccessDenied`
+(`WRITE_ACCESS_DENIED`), the code the server's refusal of the same write
+carries. It threw `.accessDenied` before: an app matching `.accessDenied` on a
+save must match `.writeAccessDenied`. Nothing is committed, and no
+write-refused event fires for it.
+
+### Fixed: a member granted again right after losing access stays subscribed
+
+A readable level heard for a db3 while the client's open of it was unanswered
+outlives the database's refusal of that open: the subscription stays out of
+`.gone`, a pending `ready()` keeps waiting, and the client asks the database
+again (at once, then once more about a second later). A `deleted` frame heard
+after the grant still wins.
+### Breaking: the production branch has no experimental members
+
+The `main` branch of the mirror compiles without `client.notifications`,
+`client.resourceMetadata` and `ruleSets.debug(data:)`: they sit behind the
+`PRIMITIVE_EXPERIMENTAL_APIS` compile condition, which that branch's manifest
+turns off, and so do every `NotificationsAPI` and `ResourceMetadataAPI` method,
+push-device registration included. The two types themselves, the payload types
+and the `.notification` event stay. Production does not serve those
+routes. An app that uses them works only outside production: depend on
+`branch: "alpha"`, which keeps them.
+
+### Changed: generated models type their upsert names
+
+A generated model whose schema declares a unique field or constraint gets the
+nested `UniqueField` and `UniqueConstraint` enums and the `save(in:upsertOn:)`
+and `upsertByUnique` overloads that take them, as in `upsertOn: .email`. The
+`String` forms stay.
+
+`UniqueField` and `UniqueConstraint` are now reserved field names, because a
+field with either name makes the struct's uses of it ambiguous: the codegen
+plugin refuses such a schema with `Field '<name>' is reserved (<reason>)`.
+Rename the field and regenerate.
+
+### Changed: Swift markings now match the JS client
+
+- `ruleSets` and every `RuleSetsAPI` method are deprecated, as in JS: rule sets
+  are app configuration, authored in `rule-sets/<name>.toml` and applied with
+  `primitive config push`.
+- `databaseTypeConfigs` is deprecated with the databases family.
+- `AgentSessionView` and `AgentSessionList` properties are marked beta, like
+  their methods. `createDocument` and `commitOfflineCreate` are marked beta.
+
+Nothing changes at run time; uses of the newly deprecated members now warn.
+### Changed: the bundled SQLite compiles without its 190 C warnings
+
+A clean build of an app on the client no longer prints
+`-Wambiguous-macro`, `-Wshorten-64-to-32` or `-Wlogical-op-parentheses`
+warnings from `Vendor/JsBaoSQLite`. The modules conflict behind the first is
+removed (the target compiles with `-fno-modules`); the other two are
+suppressed for that target only. Warnings from Swift code, yours and the
+client's, are reported as before. Nothing to change in your app.
+
+### Changed: push tokens are experimental with the rest of notifications
+
+`notifications.registerDevice(params:)`, `listDevices()` and
+`unregisterDevice(token:)` call `me/push-tokens`, which is now labelled
+experimental with the notifications family instead of production under `me`,
+so their `- Stability:` lines say experimental. Experimental routes are not
+served in production, so these calls answer 404 there, as the rest of
+`notifications` already did.
+
+### Changed: db3 members are beta and documents members are deprecated
+
+Every db3 member now says `- Stability: beta`, including the fields of the
+index, subscription and stored-entry types (`Db3Index`, `Db3LocalIndex`,
+`Db3Subscription`, `Db3StoredEntry` and the rest), `Db3BlobContext.db3Id`,
+`Db3PermissionsAPI.db3Id` and both `db3.listMine` overloads. They read as
+production before because they carried no marking. Every documents member is
+deprecated with the documents family: `client.documents`,
+`DocumentsAPI.aliases`, `ingests` and `uploadConcurrency`,
+`DocumentContext.documentId` and `doc`, and the fields of
+`DocumentSchemaAnswer`. Nothing changes at run time; uses of the newly
+deprecated members now warn. Build on db3 (`client.db3`).
+
 ### Added: revoke one pending invitation on its resource
 
 `documents.revokePendingInvitation(documentId:invitationId:)` (deprecated with

@@ -138,10 +138,10 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
         else { return nil }
         self.id = record.id
         self.email = email
-        self.name = record["name"]?.asString
+        self.name = record.holds("name") == false ? "guest" : record["name"]?.asString
         self.tenantId = record["tenantId"]?.asId
         self.createdAt = record["createdAt"]?.asDateString
-        self.active = record["active"]?.asBoolean
+        self.active = record.holds("active") == false ? true : record["active"]?.asBoolean
         self.related = .empty
         self._changedFields = []
     }
@@ -153,10 +153,10 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
         else { return nil }
         self.id = id
         self.email = email
-        self.name = row["name"]?.stringValue
+        self.name = PrimitiveRecord.holds("name", in: row) == false ? "guest" : row["name"]?.stringValue
         self.tenantId = row["tenantId"]?.stringValue
         self.createdAt = row["createdAt"]?.stringValue
-        self.active = row["active"]?.rowBoolValue
+        self.active = PrimitiveRecord.holds("active", in: row) == false ? true : row["active"]?.rowBoolValue
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }
@@ -567,6 +567,23 @@ public extension UserRecord {
         copy.id = result.record.id
         copy.discardChanges()
         return copy
+    }
+
+    /// The unique constraints `upsertByUnique` may name.
+    enum UniqueConstraint: String, Sendable {
+        case email_per_tenant = "email_per_tenant"
+    }
+
+    /// `upsertByUnique(_:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, mode: UpsertMode = .either, in documentId: String) throws -> UserRecord {
+        try upsertByUnique(constraint.rawValue, mode: mode, in: documentId)
+    }
+
+    /// `upsertByUnique(_:lookupValue:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> UserRecord {
+        try upsertByUnique(constraint.rawValue, lookupValue: lookupValue, mode: mode, in: documentId)
     }
 
     /// Delete this record from document `documentId`. Throws if the doc isn't open.

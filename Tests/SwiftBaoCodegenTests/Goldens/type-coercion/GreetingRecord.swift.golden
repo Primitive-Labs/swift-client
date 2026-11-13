@@ -112,9 +112,9 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
 
     public init?(record: PrimitiveRecord) {
         self.id = record.id
-        self.rocket = record["rocket"]?.asString
-        self.japanese = record["japanese"]?.asString
-        self.accented = record["accented"]?.asString
+        self.rocket = record.holds("rocket") == false ? "🚀" : record["rocket"]?.asString
+        self.japanese = record.holds("japanese") == false ? "こんにちは" : record["japanese"]?.asString
+        self.accented = record.holds("accented") == false ? "café" : record["accented"]?.asString
         self.related = .empty
         self._changedFields = []
     }
@@ -124,9 +124,9 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
         guard let id = row["id"]?.stringValue
         else { return nil }
         self.id = id
-        self.rocket = row["rocket"]?.stringValue
-        self.japanese = row["japanese"]?.stringValue
-        self.accented = row["accented"]?.stringValue
+        self.rocket = PrimitiveRecord.holds("rocket", in: row) == false ? "🚀" : row["rocket"]?.stringValue
+        self.japanese = PrimitiveRecord.holds("japanese", in: row) == false ? "こんにちは" : row["japanese"]?.stringValue
+        self.accented = PrimitiveRecord.holds("accented", in: row) == false ? "café" : row["accented"]?.stringValue
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }

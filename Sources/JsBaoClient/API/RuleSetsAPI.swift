@@ -16,6 +16,7 @@ public final class RuleSetsAPI: @unchecked Sendable {
     ///
     /// - Parameter params: Configuration for the new rule set.
     /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func create(params: CreateRuleSetParams) async throws -> RuleSetInfo {
         try await transport.request(method: .post, path: "/rule-sets", body: params)
     }
@@ -26,6 +27,7 @@ public final class RuleSetsAPI: @unchecked Sendable {
     ///   `ListRuleSetsOptions(resourceType:)` to return only rule sets
     ///   targeting that resource type.
     /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func list(options: ListRuleSetsOptions = ListRuleSetsOptions()) async throws -> [RuleSetInfo] {
         var query = URLQuery()
         query.appendIfPresent("resourceType", options.resourceType)
@@ -34,18 +36,21 @@ public final class RuleSetsAPI: @unchecked Sendable {
 
     /// Retrieves a single rule set by its ID.
     /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func get(ruleSetId: String) async throws -> RuleSetInfo {
         try await transport.request(method: .get, path: "/rule-sets/\(ruleSetId)")
     }
 
     /// Updates a rule set's name, description, or rules.
     /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func update(ruleSetId: String, params: UpdateRuleSetParams) async throws -> RuleSetInfo {
         try await transport.request(method: .patch, path: "/rule-sets/\(ruleSetId)", body: params)
     }
 
     /// Deletes a rule set by its ID.
     /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func delete(ruleSetId: String) async throws -> SuccessResult {
         try await transport.request(method: .delete, path: "/rule-sets/\(ruleSetId)")
     }
@@ -54,6 +59,7 @@ public final class RuleSetsAPI: @unchecked Sendable {
 
     /// Retrieves the rule set schema describing available resource types.
     /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func schema() async throws -> RuleSetSchema {
         try await transport.request(method: .get, path: "/rule-sets/schema")
     }
@@ -65,15 +71,19 @@ public final class RuleSetsAPI: @unchecked Sendable {
     /// - Parameter ruleSetId: The rule set to test.
     /// - Parameter data: Simulated request parameters.
     /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func test(ruleSetId: String, data: TestRuleSetParams) async throws -> RuleSetTestResult {
         try await transport.request(method: .post, path: "/rule-sets/\(ruleSetId)/test", body: data)
     }
 
+    #if PRIMITIVE_EXPERIMENTAL_APIS
     /// Debugs rule evaluation for a real user, returning the full evaluation trace and context.
     ///
     /// - Parameter data: Parameters identifying the user, group, and operation to debug.
     /// - Stability: experimental
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
     public func debug(data: DebugRuleSetParams) async throws -> RuleSetDebugResult {
         try await transport.request(method: .post, path: "/rule-sets/debug", body: data)
     }
+    #endif
 }

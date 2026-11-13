@@ -11,6 +11,8 @@ enum ReservedFieldNames {
     /// Every reserved name, on either client's account, and its reason.
     static let reasons: [String: String] = [
         "CodingKeys": "the generated struct's coding keys on the Swift client",
+        "UniqueConstraint": "the generated struct's upsert constraint names on the Swift client",
+        "UniqueField": "the generated struct's upsert field names on the Swift client",
         "applyAutoStampsForSave": "a record method on the JavaScript client",
         "applyStringSetChangeToYMap": "a record method on the JavaScript client",
         "clearLocalChanges": "a record method on the JavaScript client",

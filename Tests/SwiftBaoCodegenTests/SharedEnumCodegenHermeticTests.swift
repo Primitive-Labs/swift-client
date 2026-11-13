@@ -111,19 +111,23 @@ final class SharedEnumCodegenHermeticTests: XCTestCase {
 
     // MARK: - Behavior 15: render
 
-    func testARefRendersEveryFileByteIdenticalToTheHandExpandedType() throws {
+    /// #5896 replaced byte identity for the ref'd model: its field is typed by
+    /// the shared enum (`SharedEnumModelHermeticTests`). Every other file, and
+    /// the model's schema literal, are still the hand-expanded type's.
+    func testARefRendersTheSharedEnumAndEveryOtherFileAsTheHandExpandedType() throws {
         let shared = index([("common", Self.common)])
         let ref = try render([("workspace.toml", Self.workspace(Self.ref)), ("profile.toml", Self.profile)], sharedEnums: [shared, shared])
         let hand = try render([("workspace.toml", Self.workspace(Self.expanded)), ("profile.toml", Self.profile)])
         XCTAssertEqual(ref.keys.sorted(), ["GeneratedModels.swift", "Person.swift", "Task.swift"])
-        XCTAssertEqual(ref, hand)
-        XCTAssertTrue(ref["Task.swift"]!.contains("case doing"), ref["Task.swift"]!)
-
-        // One document reads the same.
-        XCTAssertEqual(
-            try render([("workspace.toml", Self.workspace(Self.ref))], sharedEnums: [shared]),
-            try render([("workspace.toml", Self.workspace(Self.expanded))])
-        )
+        XCTAssertEqual(ref["Person.swift"], hand["Person.swift"])
+        XCTAssertEqual(ref["GeneratedModels.swift"], hand["GeneratedModels.swift"])
+        let task = try XCTUnwrap(ref["Task.swift"])
+        XCTAssertTrue(hand["Task.swift"]!.contains("case doing"), hand["Task.swift"]!)
+        XCTAssertFalse(task.contains("case doing"), task)
+        XCTAssertTrue(task.contains("public var status: Status? {"), task)
+        let literal = { (source: String) in source.components(separatedBy: "\n    )\n").first ?? "" }
+        XCTAssertEqual(literal(task), literal(hand["Task.swift"]!))
+        XCTAssertTrue(literal(task).contains(#""status": FieldDescriptor(type: .string, indexed: true, default: .scalar(.string("open"))),"#), task)
     }
 
     /// js-bao's sentence for each refusal, as `db3-shared-enums-resolver-5545`
@@ -257,10 +261,9 @@ final class SharedEnumCodegenHermeticTests: XCTestCase {
             XCTAssertEqual(shared.count, 1)
             XCTAssertEqual(shared[0].stems, ["alpha", "common"])
             XCTAssertEqual(shared[0].db3, ["workspace"])
-            XCTAssertEqual(
-                try render(inputs.map { ($0.sourceName, $0.source) }, sharedEnums: shared),
-                try render([("workspace.toml", Self.workspace(Self.expanded))])
-            )
+            let rendered = try render(inputs.map { ($0.sourceName, $0.source) }, sharedEnums: shared)
+            XCTAssertEqual(rendered, try render([("workspace.toml", Self.workspace(Self.ref))], sharedEnums: [index([("common", Self.common)])]))
+            XCTAssertTrue(rendered["Task.swift"]!.contains("public var status: Status? {"), rendered["Task.swift"]!)
         }
     }
 
@@ -311,7 +314,8 @@ final class SharedEnumCodegenHermeticTests: XCTestCase {
         let run = try spawn(["--input", root.appending(path: "db3-types").path, "--output", output.path])
         XCTAssertEqual(run.status, 0, run.output)
         let task = try String(contentsOf: output.appending(path: "Task.swift"), encoding: .utf8)
-        XCTAssertEqual(task, try render([("workspace.toml", Self.workspace(Self.expanded))])["Task.swift"])
+        XCTAssertEqual(task, try render([("workspace.toml", Self.workspace(Self.ref))], sharedEnums: [index([("common", Self.common)])])["Task.swift"])
+        XCTAssertTrue(task.contains("public var status: Status? {"), task)
 
         let check = try spawn(["--input", root.appending(path: "db3-types").path, "--output", output.path, "--check"])
         XCTAssertEqual(check.status, 0, check.output)

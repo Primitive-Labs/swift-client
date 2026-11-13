@@ -1,6 +1,8 @@
 import XCTest
 @testable import JsBaoClient
 
+// The experimental resource-metadata API compiles only under the condition.
+#if PRIMITIVE_EXPERIMENTAL_APIS
 /// Wire-shape and decode tests for `ResourceMetadataAPI` (#1373, parity with
 /// the JS client's `src/client/api/resourceMetadataApi.ts` from #1352/#1402).
 ///
@@ -574,3 +576,4 @@ final class ResourceMetadataAPITests: XCTestCase {
         XCTAssertNotNil(client.resourceMetadata, "client.resourceMetadata must be wired")
     }
 }
+#endif

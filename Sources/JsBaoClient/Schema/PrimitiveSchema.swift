@@ -91,6 +91,13 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
     public var dims: Int?
     /// How each number of a vector field is stored (#5225); `nil` on any other field.
     public var element: VectorElement?
+    /// The generated model reads this field as a default where a db3 record
+    /// does not hold it, though the descriptor declares no `default`: a string
+    /// set's default, which a create does not write (#5896, CSO-5896-019). A
+    /// save counts such a field the record does not hold as present for the
+    /// required check, as it counts a field with a `default`. Not written to
+    /// `_meta`.
+    public var defaultOnRead: Bool
 
     public init(
         type: PrimitiveFieldType,
@@ -103,7 +110,8 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         default: DefaultValue? = nil,
         autoStamp: AutoStamp? = nil,
         dims: Int? = nil,
-        element: VectorElement? = nil
+        element: VectorElement? = nil,
+        defaultOnRead: Bool = false
     ) {
         self.type = type
         self.indexed = indexed
@@ -116,6 +124,7 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         self.autoStamp = autoStamp
         self.dims = dims
         self.element = element
+        self.defaultOnRead = defaultOnRead
     }
 
     /// A vector field's encoding: its `dims` and `element`, or `nil` when the

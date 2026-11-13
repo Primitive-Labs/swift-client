@@ -57,7 +57,7 @@ extension JsBaoClient {
     /// when the answer names none, which is an ordinary document.
     func lookUpDocumentFormat(_ documentId: String) async throws -> Int? {
         if let hook = documentFormatLookupForTest { return try await hook(documentId) }
-        return try await documents.fetchDocumentInfo(documentId: documentId).documentFormat
+        return try await _documents.fetchDocumentInfo(documentId: documentId).documentFormat
     }
 
     /// Drop what a pre-removal build kept for large documents on this device —

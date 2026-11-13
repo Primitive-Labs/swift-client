@@ -323,6 +323,15 @@ final class TestContext: @unchecked Sendable {
     /// seed route `POST /test/function-legacy-config/{appId}/{key}/push`,
     /// which runs the same push with the break off and writes `access` as the
     /// header's rule.
+    ///
+    /// #5775 — the configs push carries what the current CLI sends, as the JS
+    /// helper's `withFunctionSchemaPayload` does: the TOML declares the
+    /// header's `inputSchema` / `outputSchema` (a push with a compiled payload
+    /// binds the header's schemas to the TOML's, so one the TOML left out
+    /// would be cleared), and `compiled` / `provenance` hold their compile. A
+    /// ref-free schema compiles to itself with no provenance, so that is what
+    /// is sent; a schema holding `$ref` or `$defs` is refused here, before
+    /// anything is created, rather than as a mismatch from the server.
     @discardableResult
     func pushFunction(
         appId: String,
@@ -335,6 +344,9 @@ final class TestContext: @unchecked Sendable {
         inputSchema: [String: Any]? = nil,
         outputSchema: [String: Any]? = nil
     ) async throws -> PushedFunction {
+        let schemas = try Self.functionSchemaPayload(
+            functionKey: functionKey, inputSchema: inputSchema, outputSchema: outputSchema
+        )
         let base = "/admin/api/apps/\(appId)/functions"
         var header: [String: Any] = ["functionKey": functionKey]
         if let inputSchema { header["inputSchema"] = inputSchema }
@@ -345,7 +357,7 @@ final class TestContext: @unchecked Sendable {
         }
 
         let entry = "functions/\(functionKey).ts"
-        let toml = "[function]\nkey = \"\(functionKey)\"\n"
+        let toml = "[function]\nkey = \"\(functionKey)\"\n" + schemas.tomlLines.map { "\($0)\n" }.joined()
         let bundleData = Data(bundle.utf8)
         let contentHash = SHA256.hash(data: bundleData)
             .map { String(format: "%02x", $0) }
@@ -356,6 +368,8 @@ final class TestContext: @unchecked Sendable {
             "sources": [["path": entry, "content": bundleData.base64EncodedString()]],
             "bundle": bundleData.base64EncodedString(),
             "contentHash": contentHash,
+            "compiled": schemas.compiled,
+            "provenance": schemas.provenance,
         ]
         var (status, pushed) = try await jsonRequest(
             method: "POST", path: "\(base)/\(functionId)/configs", body: config, jwt: superuserJWT
@@ -375,6 +389,72 @@ final class TestContext: @unchecked Sendable {
             functionKey: functionKey,
             configId: pushed["configId"] as? String
         )
+    }
+
+    /// The schema part of a configs push for `pushFunction` (#5775): the
+    /// `[function]` lines declaring each given schema as a JSON string, and
+    /// the `compiled` / `provenance` payload the server checks against its
+    /// own compile of those lines. Only a ref-free schema compiles to itself,
+    /// so one holding `$ref` or `$defs` is refused naming the keyword.
+    static func functionSchemaPayload(
+        functionKey: String,
+        inputSchema: [String: Any]?,
+        outputSchema: [String: Any]?
+    ) throws -> (tomlLines: [String], compiled: [String: Any], provenance: [String: Any]) {
+        var tomlLines: [String] = []
+        var compiled: [String: Any] = ["inputSchema": NSNull(), "outputSchema": NSNull()]
+        let provenance: [String: Any] = ["inputSchema": [String: Any](), "outputSchema": [String: Any]()]
+        for (field, schema) in [("inputSchema", inputSchema), ("outputSchema", outputSchema)] {
+            guard let schema else { continue }
+            let found = refKeywords(in: schema).sorted()
+            if !found.isEmpty {
+                throw TestSetupError(
+                    "pushFunction cannot push \(functionKey): its \(field) holds \(found.joined(separator: ", ")). "
+                        + "The helper sends a schema as its own compile, which only a ref-free schema is; "
+                        + "inline the definition, or push the function with the CLI."
+                )
+            }
+            let data = try JSONSerialization.data(withJSONObject: schema, options: [.sortedKeys, .withoutEscapingSlashes])
+            tomlLines.append("\(field) = \(tomlBasicString(String(decoding: data, as: UTF8.self)))")
+            compiled[field] = try JSONSerialization.jsonObject(with: data)
+        }
+        return (tomlLines, compiled, provenance)
+    }
+
+    /// The ref keywords (`$ref`, `$defs`) anywhere in `value`.
+    private static func refKeywords(in value: Any) -> Set<String> {
+        var found = Set<String>()
+        if let object = value as? [String: Any] {
+            for (key, child) in object {
+                if key == "$ref" || key == "$defs" { found.insert(key) }
+                found.formUnion(refKeywords(in: child))
+            }
+        } else if let array = value as? [Any] {
+            for child in array { found.formUnion(refKeywords(in: child)) }
+        }
+        return found
+    }
+
+    /// `text` as a TOML basic string: quotes, backslashes and control
+    /// characters escaped, everything else written as itself.
+    static func tomlBasicString(_ text: String) -> String {
+        var out = "\""
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 || scalar.value == 0x7F {
+                    out += String(format: "\\u%04X", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out + "\""
     }
 
     // MARK: - App settings
@@ -481,7 +561,7 @@ final class TestContext: @unchecked Sendable {
     }
 
     @discardableResult
-    private func adminGet(_ path: String) async throws -> [String: Any] {
+    func adminGet(_ path: String) async throws -> [String: Any] {
         try await adminRequest(method: "GET", path: path, body: nil)
     }
 

@@ -36,10 +36,36 @@ struct ParsedField: Equatable {
     /// Auto-timestamp policy (`auto_stamp = "create" | "update" | "both"`).
     /// Mirrors js-bao's `FieldOptions.autoStamp`. `nil` when omitted.
     var autoStamp: ParsedAutoStamp?
+    /// A string set field's `default` members (`default = ["a"]`), which a
+    /// generated model reads where a db3 record does not hold the field, as
+    /// js-bao's getter does; `nil` on any other field or a default that is
+    /// not an array of strings. The field descriptor carries no default for
+    /// it, so a create writes none.
+    var stringSetDefault: [String]? = nil
     /// A vector field's number of numbers (#5225); `nil` on any other field.
     var dims: Int? = nil
     /// A vector field's element type, `f32`, `f16` or `i8` (#5225); `nil` on any other field.
     var element: String? = nil
+    /// The shared enum the field's `ref` named (#5896), beside the
+    /// expansion that filled `type` and `enumValues`; `nil` for a field
+    /// without `ref`, a hand-written `enum = [...]` included.
+    var sharedEnum: SharedEnumRef? = nil
+
+    /// The field as its expanded declaration reads, without the def a `ref`
+    /// named: two declarations of one model compare by this, as js-bao
+    /// compares the expanded tables.
+    var declared: ParsedField {
+        var copy = self
+        copy.sharedEnum = nil
+        return copy
+    }
+}
+
+/// A `schemas/` def a db3 field's `ref` named (#5896): the file's stem
+/// and the def's name, as js-bao's `SharedEnumRef` has them.
+struct SharedEnumRef: Equatable {
+    let file: String
+    let name: String
 }
 
 enum ParsedFieldType: String {

@@ -1,0 +1,98 @@
+# A db3 type whose fields ref the shared enums in ../schemas (#5896). The
+# models' generated files are committed beside this directory and compiled by
+# the client test target; `SharedEnumModelHermeticTests` holds them to what
+# swift-bao-codegen writes for this file.
+
+[type]
+name = "board"
+
+# An optional ref'd field beside a plain one.
+[models.posts]
+class_name = "EnumPostRecord"
+
+[models.posts.fields.title]
+type = "string"
+
+[models.posts.fields.status]
+ref = "Phase"
+indexed = true
+
+# A required ref'd field.
+[models.steps]
+class_name = "EnumStepRecord"
+
+[models.steps.fields.status]
+ref = "Phase"
+required = true
+
+# A field named like the deprecated alias's def: `status` refs `StatusValue`.
+[models.tickets]
+class_name = "EnumTicketRecord"
+
+[models.tickets.fields.status]
+ref = "StatusValue"
+
+# Two shared enums in one model, one named like the other field's alias, and
+# a ref'd field named a Swift keyword.
+[models.issues]
+class_name = "EnumIssueRecord"
+
+[models.issues.fields.status]
+ref = "Phase"
+
+[models.issues.fields.kind]
+ref = "StatusValue"
+
+[models.issues.fields.default]
+ref = "Phase"
+
+# Shared enums named like the model's own members: `status` refs `status`,
+# and `state` refs `stateRaw`, the name of its own stored string.
+[models.labels]
+class_name = "EnumLabelRecord"
+
+[models.labels.fields.status]
+ref = "status"
+
+[models.labels.fields.state]
+ref = "stateRaw"
+required = true
+
+# Defaulted fields: a record that does not hold one reads its default, as
+# js-bao's getter reads a db3 record; a cleared one (stored `null`) does not.
+# `rank` is required, `phase` refs a shared enum, `tags` is a string set whose
+# default the read never fills, and `note` has no default.
+[models.cards]
+class_name = "EnumCardRecord"
+
+[models.cards.fields.title]
+type = "string"
+default = "Untitled"
+
+[models.cards.fields.points]
+type = "number"
+default = 3
+
+[models.cards.fields.ratio]
+type = "number"
+default = 0.5
+
+[models.cards.fields.done]
+type = "boolean"
+default = false
+
+[models.cards.fields.phase]
+ref = "Phase"
+default = "open"
+
+[models.cards.fields.rank]
+type = "number"
+required = true
+default = 1
+
+[models.cards.fields.tags]
+type = "stringset"
+default = ["a"]
+
+[models.cards.fields.note]
+type = "string"

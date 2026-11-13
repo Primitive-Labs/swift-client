@@ -39,7 +39,9 @@ final class DatabasesRetiredHermeticTests: XCTestCase {
     func testTheClientHasNoDatabasesMember() throws {
         let client = try ClientSourceText.code("JsBaoClient.swift")
         XCTAssertFalse(client.contains("let databases:"), "client.databases retired")
-        XCTAssertTrue(client.contains("let databaseTypeConfigs:"), "client.databaseTypeConfigs stays")
+        // #5930 made it a deprecated computed property (the databases family's
+        // deprecation); it still stays.
+        XCTAssertTrue(client.contains("public var databaseTypeConfigs: DatabaseTypeConfigsAPI"), "client.databaseTypeConfigs stays")
         // No inbound `db.*` routing and no reconnect re-subscribe.
         for frame in ["\"db.change\"", "\"db.subscribed\"", "\"db.unsubscribed\"", "resubscribeAll"] {
             XCTAssertFalse(client.contains(frame), "\(frame) left with database subscriptions")

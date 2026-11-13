@@ -95,6 +95,8 @@
     "Set",
     "String",
     "Type",
+    "UniqueConstraint",
+    "UniqueField",
     "UpsertMode",
     "Void"
   ]

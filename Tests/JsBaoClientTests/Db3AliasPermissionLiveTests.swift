@@ -78,7 +78,7 @@ final class Db3AliasPermissionLiveTests: XCTestCase {
             .values.compactMap { $0["title"] as? String }.sorted()
     }
 
-    /// A subscribed reader's save: refused on the device (`.accessDenied`),
+    /// A subscribed reader's save: refused on the device (`.writeAccessDenied`),
     /// or handed back by the room (`WRITE_ACCESS_DENIED`). Answers which.
     private func refusedSave(_ client: JsBaoClient, _ db3Id: String) async throws -> String {
         let refusals = LockedBox<[Db3WriteRefusedEvent]>([])
@@ -118,7 +118,7 @@ final class Db3AliasPermissionLiveTests: XCTestCase {
         XCTAssertThrowsError(
             try owner.codegen.save(Self.note, id: RecordLogLiveApp.ulid(), values: ["title": .string("mine?")], in: db3Id)
         ) { error in
-            XCTAssertEqual((error as? JsBaoError)?.code, .accessDenied)
+            XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
         }
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(frames.value, [], "no record frame for a refused save")

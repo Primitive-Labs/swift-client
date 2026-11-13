@@ -408,6 +408,7 @@ final class RecordLogModelFreeLiveTests: XCTestCase {
 
     // MARK: - Behaviour 21
 
+    @available(*, deprecated)
     func testSchemaAnswersWhatTheRouteAnswers() async throws {
         let (a, documentId) = try await modelFree("a")
         let records = a.db3.records(documentId)

@@ -19,6 +19,7 @@ public final class NotificationsAPI: @unchecked Sendable {
         self.transport = transport
     }
 
+    #if PRIMITIVE_EXPERIMENTAL_APIS
     // MARK: - Inbox
 
     /// List the caller's notifications, newest first.
@@ -69,28 +70,31 @@ public final class NotificationsAPI: @unchecked Sendable {
     // MARK: - Push devices
 
     /// Register (upsert) the calling user's device push token.
-    /// - Stability: production
+    /// - Stability: experimental
     public func registerDevice(params: RegisterPushDeviceParams) async throws -> PushDeviceInfo {
         try await transport.request(method: .post, path: "/me/push-tokens", body: params)
     }
 
     /// List the calling user's registered push devices.
-    /// - Stability: production
+    /// - Stability: experimental
     public func listDevices() async throws -> PushDeviceListResult {
         try await transport.request(method: .get, path: "/me/push-tokens")
     }
 
     /// Unregister one of the calling user's device push tokens (e.g. on logout).
-    /// - Stability: production
+    /// - Stability: experimental
     public func unregisterDevice(token: String) async throws -> UnregisterPushDeviceResult {
         let escaped = URLEncoding.encodeComponent(token)
         return try await transport.request(method: .delete, path: "/me/push-tokens/\(escaped)")
     }
+    #endif
 }
 
+#if PRIMITIVE_EXPERIMENTAL_APIS
 // MARK: - Request shims
 
 /// The `{}` request body the mark-read endpoints have always sent (previously
 /// an empty untyped dictionary literal). A typed `Encodable` keeps the wire
 /// bytes identical without going through `Any`.
 private struct EmptyObjectBody: Encodable, Sendable {}
+#endif

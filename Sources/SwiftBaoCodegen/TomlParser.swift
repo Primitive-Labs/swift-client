@@ -39,9 +39,15 @@ enum CodegenError: Error, CustomStringConvertible {
     case invalidVectorField(model: String, field: String, reason: String)
     /// A unique constraint naming a vector field (#5225).
     case vectorInUniqueConstraint(model: String, constraint: String, field: String)
+    /// An `enforce_enum` that is not `true` or `false` (#5897): it never
+    /// reads as enforcement off.
+    case invalidEnforceEnum(model: String, field: String)
     /// A field `ref` that names no shared enum, or sits beside `type`/`enum`
     /// (#5545); `message` is js-bao's `[models.<model>.fields.<field>]: ref …`.
     case sharedEnumRef(message: String)
+    /// A model whose own names would take or shadow what a ref'd field
+    /// generates (#5896); `message` names the model, the field and the def.
+    case sharedEnumNaming(message: String)
 
     var description: String {
         switch self {
@@ -83,6 +89,8 @@ enum CodegenError: Error, CustomStringConvertible {
             return message
         case let .sharedEnumRef(message):
             return message
+        case let .sharedEnumNaming(message):
+            return message
         case let .conflictingDeclarations(model, first, second, differences):
             return "Model `\(model)` is declared differently in \(first) and \(second): "
                 + "\(differences.joined(separator: "; ")). Declare it in one file, or make both "
@@ -97,6 +105,8 @@ enum CodegenError: Error, CustomStringConvertible {
             return "Model `\(model)` field `\(field)`: a vector field belongs to a db3 type (a schema with a [type] table); a document schema or a database type cannot declare one"
         case let .invalidVectorField(model, field, reason):
             return "Model `\(model)` field `\(field)`: \(reason)"
+        case let .invalidEnforceEnum(model, field):
+            return "[models.\(model).fields.\(field)]: enforce_enum must be true or false"
         case let .vectorInUniqueConstraint(model, constraint, field):
             return "[[models.\(model).unique_constraints]]: unique constraint \"\(constraint)\" names the vector field \"\(field)\", which cannot be unique"
         }
@@ -113,7 +123,7 @@ private enum KnownKeys {
     static let field: Set<String> = [
         "type", "indexed", "unique", "required", "auto_assign",
         "auto_stamp", "max_length", "max_count", "default", "enum",
-        "dims", "element",
+        "enforce_enum", "dims", "element",
     ]
     static let relationship: Set<String> = [
         "type", "model", "related_id_field", "join_model",
@@ -256,7 +266,7 @@ enum TomlParser {
             switch (a.fields[name], b.fields[name]) {
             case (.some, .none): out.append("field `\(name)` is only in \(a.sourceName)")
             case (.none, .some): out.append("field `\(name)` is only in \(b.sourceName)")
-            case let (.some(x), .some(y)) where x != y: out.append("field `\(name)` differs")
+            case let (.some(x), .some(y)) where x.declared != y.declared: out.append("field `\(name)` differs")
             default: break
             }
         }
@@ -281,7 +291,7 @@ enum TomlParser {
             table?["fields"]?.table?[field]?.table?["default"]?.tomlValue
         }
         return a.fieldOrder.compactMap { name in
-            guard let field = a.fields[name], b.fields[name] == field else { return nil }
+            guard let field = a.fields[name], b.fields[name]?.declared == field.declared else { return nil }
             return declared(aTable, name) == declared(bTable, name) ? nil : "field `\(name)` differs"
         }
     }
@@ -304,7 +314,7 @@ enum TomlParser {
         } catch {
             throw CodegenError.parse(String(describing: error))
         }
-        try sharedEnums?.expand(table)
+        let sharedEnumDefs = try sharedEnums?.expand(table) ?? [:]
         let isTypeFile = table["type"]?.table != nil
 
         // A fresh-template schema.toml ships with no models yet (the
@@ -359,6 +369,7 @@ enum TomlParser {
                 schema.fieldOrder.removeAll { $0 == "id" }
                 schema.fieldOrder.insert("id", at: 0)
             }
+            for (field, def) in sharedEnumDefs[key] ?? [:] { schema.fields[field]?.sharedEnum = def }
             schemasByName[key] = schema
             modelOrder.append(key)
         }
@@ -648,6 +659,11 @@ enum TomlParser {
         if let reason = vectorFieldProblem(table, type: typeLiteral) {
             throw CodegenError.invalidVectorField(model: modelName, field: fieldName, reason: reason)
         }
+        // `enforce_enum` takes `true` or `false`, strict or not, as js-bao's loader judges it (#5897).
+        // It changes nothing the codegen emits: the room enforces it.
+        if let flag = table["enforce_enum"], flag.bool == nil {
+            throw CodegenError.invalidEnforceEnum(model: modelName, field: fieldName)
+        }
         let autoStamp = try decodeAutoStamp(
             table["auto_stamp"], modelName: modelName, fieldName: fieldName
         )
@@ -666,6 +682,7 @@ enum TomlParser {
             defaultLiteral: decodeDefault(table["default"]),
             enumValues: enumValues,
             autoStamp: autoStamp,
+            stringSetDefault: type == .stringset ? decodeStringSetDefault(table["default"]) : nil,
             dims: type == .vector ? table["dims"]?.int : nil,
             element: type == .vector ? table["element"]?.string : nil
         )
@@ -756,6 +773,18 @@ enum TomlParser {
                     reason: "values must all be strings"
                 )
             }
+            out.append(s)
+        }
+        return out
+    }
+
+    /// A string set's `default` members, when the default is an array of
+    /// strings; `nil` otherwise, so the field reads as stored.
+    private static func decodeStringSetDefault(_ value: TOMLValue?) -> [String]? {
+        guard let arr = value?.array else { return nil }
+        var out: [String] = []
+        for i in 0..<arr.count {
+            guard let s = arr[i].string else { return nil }
             out.append(s)
         }
         return out

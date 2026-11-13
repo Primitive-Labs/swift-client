@@ -91,6 +91,64 @@ public final class PrimitiveRecord: Sendable {
         return model.fieldNames(recordId: id)
     }
 
+    /// Whether the stored record holds `field`, a stored `null` included.
+    ///
+    /// `false` means the record was never written with the field, so a read
+    /// fills the field's `default`, as js-bao's getter does; a cleared field
+    /// (stored `null`) answers `true`. Answered on a db3 (record-log)
+    /// document, where clearing a field stores `null`; `nil` on a Y.Map
+    /// document, where clearing a field removes it, so a missing field there
+    /// may be a cleared one.
+    ///
+    /// ```swift
+    /// let points = record.holds("points") == false ? 3 : record["points"]?.asNumber
+    /// ```
+    public func holds(_ field: String) -> Bool? {
+        model.holds(recordId: id, field: field)
+    }
+
+    /// Whether the record a query row answers holds `field`, a stored `null`
+    /// included, as ``holds(_:)`` answers for a record.
+    ///
+    /// A row from a db3 (record-log) document carries a cleared field as
+    /// `null` and leaves out a field never written, so a row lacking `field`
+    /// answers `false` when the row's document (`_meta_doc_id`) is one a
+    /// client in this process opened as a db3. The answer depends on the row
+    /// alone, not on which client is the default or whether the document is
+    /// still open, so a row kept and read later reads the same. Any other row
+    /// lacking it answers `nil`: a Y.Map document's rows leave out a cleared
+    /// field too. A row read with a projection leaves out the fields it did
+    /// not ask for, so build a model from a whole row.
+    ///
+    /// A row carries every string set field, as `[]` when the set has no
+    /// members; a db3 row lists the ones its record does not hold under
+    /// `_meta_unheld`, so those answer `false` too.
+    ///
+    /// ```swift
+    /// let points = PrimitiveRecord.holds("points", in: row) == false ? 3 : row["points"]?.numberValue
+    /// ```
+    public static func holds(_ field: String, in row: [String: JSONValue]) -> Bool? {
+        if case .array(let unheld)? = row[unheldFieldsKey], unheld.contains(.string(field)) { return false }
+        if row[field] != nil { return true }
+        guard let document = row["_meta_doc_id"]?.stringValue,
+              RecordLogDocumentIds.contains(document)
+        else { return nil }
+        return false
+    }
+
+    /// The key under which a db3 row lists the string set fields its record
+    /// does not hold. A row carries each such field as `[]`, as it carries a
+    /// set with no members, so ``holds(_:in:)`` reads presence from the list.
+    static let unheldFieldsKey = "_meta_unheld"
+
+    /// Record in `row` that its record does not hold the string set fields
+    /// `fields`; nothing when there are none, so a row whose record holds
+    /// every set keeps the keys it carried.
+    static func markUnheld(_ fields: some Collection<String>, in row: inout [String: JSONValue]) {
+        guard !fields.isEmpty else { return }
+        row[unheldFieldsKey] = .array(fields.sorted().map { .string($0) })
+    }
+
     // MARK: - Snapshot
 
     /// Snapshot every known field into a dictionary of `PrimitiveValue`.

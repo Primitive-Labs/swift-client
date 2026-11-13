@@ -288,6 +288,7 @@ struct SwiftEmitter {
         out += "        copy.discardChanges()\n"
         out += "        return copy\n"
         out += "    }\n\n"
+        out += typedUpsertNames(schema: schema)
         out += "    /// Delete this record from document `documentId`. Throws if the doc isn't open.\n"
         out += "    func delete(in documentId: String) throws {\n"
         out += "        try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)\n"
@@ -347,6 +348,80 @@ struct SwiftEmitter {
         out += "        try await JsBaoClient.requireDefault().codegen.increment(primitiveSchema, id: id, fields: fields, in: documentId, options: options)\n"
         out += "    }\n"
         out += "}\n"
+        return out
+    }
+
+    // MARK: - Typed upsert names
+
+    /// The names a model's upserts take, by the rule the runtime resolves
+    /// them (`PrimitiveSchema.resolvedUniqueConstraints`): `fields` are what
+    /// `save(in:upsertOn:)` accepts, each one a unique constraint covers on
+    /// its own, and `constraints` what `upsertByUnique` looks up,
+    /// `<model>_<field>_unique` per unique field and then each declared
+    /// constraint. A stringset field resolves no constraint.
+    static func upsertNames(schema: ParsedSchema) -> (fields: [String], constraints: [String]) {
+        let isStringSet = { (field: String) in schema.fields[field]?.type == .stringset }
+        var resolved: [ParsedUniqueConstraint] = []
+        for name in schema.fieldOrder {
+            guard let field = schema.fields[name], field.unique, field.type != .stringset else { continue }
+            resolved.append(ParsedUniqueConstraint(name: "\(schema.name)_\(name)_unique", fields: [name]))
+        }
+        for constraint in schema.uniqueConstraints where !constraint.fields.contains(where: isStringSet) {
+            resolved.append(constraint)
+        }
+        var fields: [String] = []
+        var constraints: [String] = []
+        for constraint in resolved {
+            if constraint.fields.count == 1, !fields.contains(constraint.fields[0]) {
+                fields.append(constraint.fields[0])
+            }
+            if !constraints.contains(constraint.name) { constraints.append(constraint.name) }
+        }
+        return (fields, constraints)
+    }
+
+    /// Emit `UniqueField` and `UniqueConstraint` — the model's upsert names
+    /// as `String`-raw enums, the JS model's `<Name>UniqueField` /
+    /// `<Name>UniqueConstraint` — and the upsert overloads that take them,
+    /// each forwarding the raw name to its `String` form. A model with no
+    /// such name gets neither enum (an enum with no cases cannot have a raw
+    /// type) and keeps only the `String` forms.
+    private func typedUpsertNames(schema: ParsedSchema) -> String {
+        let typeName = schema.swiftName
+        let (fields, constraints) = Self.upsertNames(schema: schema)
+        var out = ""
+        if !fields.isEmpty {
+            out += "    /// The fields `save(in:upsertOn:)` may name: each one a unique\n"
+            out += "    /// constraint covers on its own.\n"
+            out += "    enum UniqueField: String, Sendable {\n"
+            for (name, raw) in Naming.enumCaseNames(for: fields) {
+                out += "        case \(name) = \(quoted(raw))\n"
+            }
+            out += "    }\n\n"
+            out += "    /// `save(in:upsertOn:)` by one of the model's unique fields.\n"
+            out += "    @discardableResult\n"
+            out += "    func save(in documentId: String, upsertOn: UniqueField) throws -> \(typeName) {\n"
+            out += "        try save(in: documentId, upsertOn: upsertOn.rawValue)\n"
+            out += "    }\n\n"
+        }
+        if !constraints.isEmpty {
+            out += "    /// The unique constraints `upsertByUnique` may name.\n"
+            out += "    enum UniqueConstraint: String, Sendable {\n"
+            for (name, raw) in Naming.enumCaseNames(for: constraints) {
+                out += "        case \(name) = \(quoted(raw))\n"
+            }
+            out += "    }\n\n"
+            out += "    /// `upsertByUnique(_:mode:in:)` by one of the model's unique constraints.\n"
+            out += "    @discardableResult\n"
+            out += "    func upsertByUnique(_ constraint: UniqueConstraint, mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
+            out += "        try upsertByUnique(constraint.rawValue, mode: mode, in: documentId)\n"
+            out += "    }\n\n"
+            out += "    /// `upsertByUnique(_:lookupValue:mode:in:)` by one of the model's unique constraints.\n"
+            out += "    @discardableResult\n"
+            out += "    func upsertByUnique(_ constraint: UniqueConstraint, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
+            out += "        try upsertByUnique(constraint.rawValue, lookupValue: lookupValue, mode: mode, in: documentId)\n"
+            out += "    }\n\n"
+        }
         return out
     }
 
@@ -551,7 +626,7 @@ struct SwiftEmitter {
         var lines: [String] = []
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname], fname != "id" else { continue }
-            let type = swiftStoredType(f, fieldName: fname)
+            let type = parameterType(f, fieldName: fname)
             let suffix = type.hasSuffix("?") ? " = nil" : ""
             lines.append("        \(propName(fname)): \(type)\(suffix)")
         }
@@ -571,7 +646,8 @@ struct SwiftEmitter {
         }
         out += "        self.id = PrimitiveSchemaRegistry.newId()\n"
         for fname in displayFieldOrder(schema) where fname != "id" {
-            out += "        self.\(propName(fname)) = \(propName(fname))\n"
+            guard let f = schema.fields[fname] else { continue }
+            out += "        self.\(storageName(fname, f)) = \(parameterValue(f, fieldName: fname))\n"
         }
         out += "        self.related = .empty\n"
         out += "        self._explicitId = false\n"
@@ -592,17 +668,22 @@ struct SwiftEmitter {
         // CodingKeys: only the real fields. `_explicitId` is omitted, so
         // it never encodes and decode leaves it at its `true` default.
         out += "    \(access) enum CodingKeys: String, CodingKey {\n"
-        out += "        case " + fields.map { propName($0) }.joined(separator: ", ") + "\n"
+        // A ref'd field's stored string encodes under the field's own key
+        // (#5896), so the JSON is the hand-expanded type's.
+        let storage = fields.map { storageName($0, schema.fields[$0]!) }
+        out += "        case " + zip(fields, storage).map { field, stored in
+            sharedEnumName(field, schema.fields[field]!) == nil ? stored : "\(stored) = \(quoted(field))"
+        }.joined(separator: ", ") + "\n"
         out += "    }\n\n"
         // Equatable: compare only real fields.
         out += "    \(access) static func == (lhs: \(schema.swiftName), rhs: \(schema.swiftName)) -> Bool {\n"
-        let eqLines = fields.map { "        lhs.\(propName($0)) == rhs.\(propName($0))" }
+        let eqLines = storage.map { "        lhs.\($0) == rhs.\($0)" }
         out += eqLines.joined(separator: " &&\n") + "\n"
         out += "    }\n\n"
         // Hashable: hash only real fields.
         out += "    \(access) func hash(into hasher: inout Hasher) {\n"
-        for f in fields {
-            out += "        hasher.combine(\(propName(f)))\n"
+        for stored in storage {
+            out += "        hasher.combine(\(stored))\n"
         }
         out += "    }\n"
         return out
@@ -653,7 +734,7 @@ struct SwiftEmitter {
                 // The foreign key is a field on THIS model — read it off the
                 // struct's own property, exactly like JS reads `this[relatedIdField]`.
                 guard let fk = props["relatedIdField"] else { continue }
-                let fkProp = propName(fk)
+                let fkProp = schema.fields[fk].map { storageName(fk, $0) } ?? propName(fk)
                 out += "    /// Follow the `\(rname)` relationship (refersTo → `\(targetModel)`):\n"
                 out += "    /// resolve the `\(targetType)` this record's `\(fk)` points at, across\n"
                 out += "    /// all open documents. Returns `nil` when the foreign key is unset\n"
@@ -909,9 +990,14 @@ struct SwiftEmitter {
     private func nestedEnums(schema: ParsedSchema) -> String {
         let access = options.accessLevel
         var out = ""
+        let sharedNames = Set(schema.fields.compactMap { sharedEnumName($0.key, $0.value) })
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname], let values = f.enumValues, !values.isEmpty
             else { continue }
+            if let shared = sharedEnumName(fname, f) {
+                out += sharedEnumMembers(fname, shared: shared, values: values, omitAlias: sharedNames.contains(Naming.enumTypeName(forField: fname)))
+                continue
+            }
             // Sanitize the field name into a legal, non-keyword *type*
             // identifier — a keyword-named field (`default`) or a name with
             // a leading digit / punctuation can't ride through `pascalCase`
@@ -996,6 +1082,9 @@ struct SwiftEmitter {
         // A vector field's encoding (#5225), last as the initializer takes it.
         if let dims = f.dims { args.append("dims: \(dims)") }
         if let element = f.element { args.append("element: .\(element)") }
+        // A string set's default is filled on read only (a create writes
+        // none); the save's required check reads this flag (CSO-5896-019).
+        if f.type == .stringset, f.stringSetDefault != nil { args.append("defaultOnRead: true") }
         return "FieldDescriptor(\(args.joined(separator: ", ")))"
     }
 
@@ -1040,6 +1129,10 @@ struct SwiftEmitter {
         var out = ""
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
+            if let shared = sharedEnumName(fname, f) {
+                out += sharedEnumProperties(fname, f, shared: shared)
+                continue
+            }
             out += "    \(access) var \(propName(fname)): \(swiftStoredType(f, fieldName: fname)) {\n"
             out += "        didSet { _changedFields.insert(\(quoted(fname))) }\n"
             out += "    }\n"
@@ -1113,7 +1206,8 @@ struct SwiftEmitter {
             let stored = swiftStoredType(f, fieldName: fname)
             let base = stored.hasSuffix("?") ? String(stored.dropLast()) : stored
             let call = stored.hasSuffix("?") ? "decodeIfPresent" : "decode"
-            out += "        self.\(propName(fname)) = try container.\(call)(\(base).self, forKey: .\(propName(fname)))\n"
+            let storage = storageName(fname, f)
+            out += "        self.\(storage) = try container.\(call)(\(base).self, forKey: .\(storage))\n"
         }
         out += "        self.related = .empty\n"
         out += "        self._changedFields = Set(primitiveValues().keys)\n"
@@ -1145,7 +1239,7 @@ struct SwiftEmitter {
         var lines: [String] = []
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
-            let type = swiftStoredType(f, fieldName: fname)
+            let type = parameterType(f, fieldName: fname)
             let isOptional = type.hasSuffix("?")
             // No defaults for non-optional `id` (caller must provide one).
             // Required non-id fields also have no default — matches the
@@ -1162,7 +1256,8 @@ struct SwiftEmitter {
         out += lines.joined(separator: ",\n")
         out += "\n    ) {\n"
         for fname in displayFieldOrder(schema) {
-            out += "        self.\(propName(fname)) = \(propName(fname))\n"
+            guard let f = schema.fields[fname] else { continue }
+            out += "        self.\(storageName(fname, f)) = \(parameterValue(f, fieldName: fname))\n"
         }
         out += "        self.related = .empty\n"
         // A constructed record is new data: every field it carries counts as
@@ -1185,9 +1280,7 @@ struct SwiftEmitter {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
             if f.required {
-                guards.append(
-                    "let \(propName(fname)) = record[\(quoted(fname))]?.\(asAccessor(f.type))"
-                )
+                guards.append("let \(storageName(fname, f)) = \(recordReadExpression(fname, f))")
             }
         }
         if !guards.isEmpty {
@@ -1202,12 +1295,12 @@ struct SwiftEmitter {
                 out += "        self.id = record.id\n"
                 continue
             }
+            let storage = storageName(fname, f)
             if f.required {
                 // Hoisted from the guard
-                out += "        self.\(propName(fname)) = \(propName(fname))\n"
+                out += "        self.\(storage) = \(storage)\n"
             } else {
-                let acc = asAccessor(f.type)
-                out += "        self.\(propName(fname)) = record[\(quoted(fname))]?.\(acc)\n"
+                out += "        self.\(storage) = \(recordReadExpression(fname, f))\n"
             }
         }
         out += "        self.related = .empty\n"
@@ -1216,6 +1309,39 @@ struct SwiftEmitter {
         out += "        self._changedFields = []\n"
         out += "    }\n"
         return out
+    }
+
+    /// The expression that reads one field out of a `PrimitiveRecord`: the
+    /// stored value, or, for a field with a literal `default`, the default
+    /// where the record does not hold the field (js-bao's getter fills only
+    /// a field the record lacks; a stored `null` reads `nil`).
+    private func recordReadExpression(_ fname: String, _ f: ParsedField) -> String {
+        let read = "record[\(quoted(fname))]?.\(asAccessor(f.type))"
+        guard let literal = readDefaultLiteral(f) else { return read }
+        return "record.holds(\(quoted(fname))) == false ? \(literal) : \(read)"
+    }
+
+    /// The Swift literal a read fills a field with when the stored record
+    /// does not hold it: the field's `default`, when it is a literal of the
+    /// field's own type, or a string set's default members. `nil` for any
+    /// other field (no default, a default of another type), which reads as
+    /// stored.
+    private func readDefaultLiteral(_ f: ParsedField) -> String? {
+        if f.type == .stringset, let members = f.stringSetDefault {
+            return "Set([\(members.map { stringLiteral($0) }.joined(separator: ", "))])"
+        }
+        switch (f.type, f.defaultLiteral) {
+        case let (.string, .string(s)?), let (.id, .string(s)?), let (.date, .string(s)?):
+            return stringLiteral(s)
+        case let (.number, .number(n)?):
+            return formatDouble(n)
+        case let (.number, .integer(i)?):
+            return "\(i)"
+        case let (.boolean, .boolean(b)?):
+            return "\(b)"
+        default:
+            return nil
+        }
     }
 
     /// The right `asXxx` PrimitiveValue accessor for a field type.
@@ -1246,9 +1372,7 @@ struct SwiftEmitter {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
             if f.required {
-                guardClauses.append(
-                    "let \(propName(fname)) = \(rowReadExpression(f, key: quoted(fname)))"
-                )
+                guardClauses.append("let \(storageName(fname, f)) = \(rowFieldExpression(fname, f))")
             }
         }
         out += "        guard "
@@ -1258,10 +1382,11 @@ struct SwiftEmitter {
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
+            let storage = storageName(fname, f)
             if f.required {
-                out += "        self.\(propName(fname)) = \(propName(fname))\n"
+                out += "        self.\(storage) = \(storage)\n"
             } else {
-                out += "        self.\(propName(fname)) = \(rowReadExpression(f, key: quoted(fname)))\n"
+                out += "        self.\(storage) = \(rowFieldExpression(fname, f))\n"
             }
         }
         out += "        self.related = RelatedRecords(raw: row[\"_related\"]?.objectValue ?? [:])\n"
@@ -1269,6 +1394,15 @@ struct SwiftEmitter {
         out += "        self._changedFields = []\n"
         out += "    }\n"
         return out
+    }
+
+    /// ``rowReadExpression(_:key:)``, or, for a field with a literal
+    /// `default`, the default where the row's record does not hold the field,
+    /// as ``recordReadExpression(_:_:)`` reads a record.
+    private func rowFieldExpression(_ fname: String, _ f: ParsedField) -> String {
+        let read = rowReadExpression(f, key: quoted(fname))
+        guard let literal = readDefaultLiteral(f) else { return read }
+        return "PrimitiveRecord.holds(\(quoted(fname)), in: row) == false ? \(literal) : \(read)"
     }
 
     /// The expression that reads one field out of a query row
@@ -1338,13 +1472,14 @@ struct SwiftEmitter {
         } else {
             out += "        \(storageKeyword) values: [String: PrimitiveValue] = [\n"
             for (fname, f) in requiredEntries {
-                out += "            \(quoted(fname)): \(primitiveValueLiteral(f, propRef: propName(fname))),\n"
+                out += "            \(quoted(fname)): \(primitiveValueLiteral(f, propRef: storageName(fname, f))),\n"
             }
             out += "        ]\n"
         }
         for (fname, f) in optionalEntries {
             // String?, Double?, Bool?, Set<String>? — `if let` shorthand
-            out += "        if let \(propName(fname)) { values[\(quoted(fname))] = \(primitiveValueLiteral(f, propRef: propName(fname))) }\n"
+            let storage = storageName(fname, f)
+            out += "        if let \(storage) { values[\(quoted(fname))] = \(primitiveValueLiteral(f, propRef: storage)) }\n"
         }
         out += "        return values\n"
         out += "    }\n"
@@ -1363,6 +1498,165 @@ struct SwiftEmitter {
         }
     }
 
+    // MARK: - Shared enums (#5896)
+
+    /// The Swift name `primitive functions codegen --lang swift` declares a
+    /// `schemas/` def under in `Primitive.generated.swift`: the def's name,
+    /// with `_` appended to a Swift keyword (the CLI's `swiftDefName`). Where
+    /// a collision renames the def there, that file also declares this name
+    /// as an alias of the renamed one.
+    static func sharedEnumTypeName(_ def: SharedEnumRef) -> String {
+        Naming.swiftKeywords.contains(def.name) ? def.name + "_" : def.name
+    }
+
+    /// The name of the property that stores a ref'd field's string.
+    static func rawPropertyName(_ field: String) -> String { field + "Raw" }
+
+    /// The shared enum's Swift name for a field whose `ref` named one, `nil`
+    /// for any other field. `id` is always the record's id.
+    private func sharedEnumName(_ fname: String, _ f: ParsedField) -> String? {
+        guard fname != "id", f.type == .string else { return nil }
+        return f.sharedEnum.map(Self.sharedEnumTypeName)
+    }
+
+    /// The stored property a field's value lives in: `<field>Raw` for a
+    /// ref'd field, the field's own name otherwise.
+    private func storageName(_ fname: String, _ f: ParsedField) -> String {
+        sharedEnumName(fname, f) == nil ? propName(fname) : propName(Self.rawPropertyName(fname))
+    }
+
+    /// An initializer parameter's type: the shared enum for a ref'd field.
+    private func parameterType(_ f: ParsedField, fieldName fname: String) -> String {
+        let stored = swiftStoredType(f, fieldName: fname)
+        guard let shared = sharedEnumName(fname, f) else { return stored }
+        return stored.hasSuffix("?") ? "\(shared)?" : shared
+    }
+
+    /// What an initializer stores from its parameter.
+    private func parameterValue(_ f: ParsedField, fieldName fname: String) -> String {
+        guard sharedEnumName(fname, f) != nil else { return propName(fname) }
+        return f.required ? "\(propName(fname)).rawValue" : "\(propName(fname))?.rawValue"
+    }
+
+    /// A ref'd field's stored string and its typed accessor. Membership is
+    /// advisory on write (#843), so the store may hold any string: it is
+    /// kept as read and written back as is, and the accessor reads `nil`
+    /// for a value outside the enum.
+    private func sharedEnumProperties(_ fname: String, _ f: ParsedField, shared: String) -> String {
+        let access = options.accessLevel
+        let raw = propName(Self.rawPropertyName(fname))
+        let stored = swiftStoredType(f, fieldName: fname)
+        var out = ""
+        out += "    /// The `\(fname)` field as stored: any string, one of `\(shared)`'s\n"
+        out += "    /// values or not. Assign `\(fname)` to change it.\n"
+        out += "    \(access) private(set) var \(raw): \(stored) {\n"
+        out += "        didSet { _changedFields.insert(\(quoted(fname))) }\n"
+        out += "    }\n"
+        out += "    /// The `\(fname)` field as the shared enum `\(shared)`: `nil` when the\n"
+        out += "    /// field is absent or holds a value outside the enum (`\(raw)`\n"
+        out += "    /// keeps the string). Assigning stores the case's raw value.\n"
+        if f.required {
+            out += "    /// Assigning `nil` leaves the stored value unchanged, since the\n"
+            out += "    /// field is required.\n"
+        }
+        out += "    /// `\(shared)` is declared in `Primitive.generated.swift`, which\n"
+        out += "    /// `primitive functions codegen --lang swift` writes.\n"
+        out += "    \(access) var \(propName(fname)): \(shared)? {\n"
+        // The getter builds the case from context (`.init`), never by the
+        // type's name: a def may be named like a member of the model
+        // (`status`), which binds first in an expression.
+        if f.required {
+            out += "        get { .init(rawValue: \(raw)) }\n"
+            out += "        set { if let newValue { \(raw) = newValue.rawValue } }\n"
+        } else {
+            out += "        get { \(raw).flatMap { .init(rawValue: $0) } }\n"
+            out += "        set { \(raw) = newValue?.rawValue }\n"
+        }
+        out += "    }\n"
+        return out
+    }
+
+    /// A ref'd field's deprecated names beside its value set: the nested
+    /// `<Field>Value`, now an alias of the shared enum (left out when a
+    /// shared enum the model refs has that name, which it would shadow), and
+    /// `<field>Enum`, now the typed accessor itself.
+    private func sharedEnumMembers(_ fname: String, shared: String, values: [String], omitAlias: Bool) -> String {
+        let access = options.accessLevel
+        var out = ""
+        if !omitAlias {
+            out += "    /// The `\(fname)` field's values are the shared enum `\(shared)`.\n"
+            out += "    @available(*, deprecated, renamed: \(quoted(shared)))\n"
+            out += "    \(access) typealias \(Naming.enumTypeName(forField: fname)) = \(shared)\n\n"
+        }
+        let setLit = values.map { quoted($0) }.joined(separator: ", ")
+        out += "    /// The raw `enum` value set for `\(fname)`, in declaration order.\n"
+        out += "    \(access) static let allowed\(Naming.pascalCase(fname))Values: Set<String> = [\(setLit)]\n\n"
+        out += "    /// `\(fname)`, which is now typed by `\(shared)`.\n"
+        out += "    @available(*, deprecated, renamed: \(quoted(fname)))\n"
+        out += "    \(access) var \(Naming.escapeIfReserved(fname + "Enum")): \(shared)? {\n"
+        out += "        \(propName(fname))\n"
+        out += "    }\n\n"
+        return out
+    }
+
+    /// Refuse a model whose own names would take or shadow what a ref'd
+    /// field generates: a field named like its `<field>Raw`, a nested type
+    /// the model declares (`CodingKeys`, the upsert-name enums, an inline
+    /// enum's `<Field>Value`) or a model type of the run named like the
+    /// shared enum. Inside the model a nested type binds before the
+    /// module's, so the field would name the wrong type.
+    static func checkSharedEnums(schemas: [ParsedSchema]) throws {
+        let modelTypes = Dictionary(schemas.map { ($0.swiftName, $0.name) }, uniquingKeysWith: { first, _ in first })
+        for schema in schemas {
+            let refs = schema.fieldOrder.compactMap { name -> (field: String, def: SharedEnumRef, swift: String)? in
+                guard name != "id", let f = schema.fields[name], f.type == .string, let def = f.sharedEnum else { return nil }
+                return (name, def, sharedEnumTypeName(def))
+            }
+            guard !refs.isEmpty else { continue }
+            let (upsertFields, constraints) = upsertNames(schema: schema)
+            // What `relationshipAccessors` declares for each relationship: its
+            // accessor, `related<Name>` and `include<Name>`.
+            let relationshipMembers = schema.relationships.filter { rel in rel.descriptor.properties.contains { $0.0 == "model" } }.flatMap { rname, _ in
+                [rname, "related" + Naming.pascalCase(rname), "include" + Naming.pascalCase(rname)].map { (name: rname, member: $0) }
+            }
+            let always = ["CodingKeys"] + (upsertFields.isEmpty ? [] : ["UniqueField"]) + (constraints.isEmpty ? [] : ["UniqueConstraint"])
+            for ref in refs {
+                let source = "schemas/\(ref.def.file).toml#\(ref.def.name)"
+                let raw = rawPropertyName(ref.field)
+                if schema.fields[raw] != nil {
+                    throw CodegenError.sharedEnumNaming(message: "Model `\(schema.name)` field `\(ref.field)` refs the shared enum `\(ref.def.name)`, "
+                        + "so its stored string is the generated property `\(raw)`, and field `\(raw)` takes that name. Rename one of the two fields.")
+                }
+                if let relationship = relationshipMembers.first(where: { $0.member == raw }) {
+                    throw CodegenError.sharedEnumNaming(message: "Model `\(schema.name)` field `\(ref.field)` refs the shared enum `\(ref.def.name)`, "
+                        + "so its stored string is the generated property `\(raw)`, and relationship `\(relationship.name)` generates `\(raw)` too. "
+                        + "Rename the field or the relationship.")
+                }
+                if let model = modelTypes[ref.swift] {
+                    throw CodegenError.sharedEnumNaming(message: "Model `\(schema.name)` field `\(ref.field)` refs the shared enum `\(ref.def.name)` (\(source)), "
+                        + "whose Swift name is the generated model type of `\(model)`. Rename the def, or set the model's class_name.")
+                }
+                if ref.swift == SwiftEmitter.barrelTypeName {
+                    throw CodegenError.sharedEnumNaming(message: "Model `\(schema.name)` field `\(ref.field)` refs the shared enum `\(ref.def.name)` (\(source)), "
+                        + "whose Swift name is the registration barrel's `\(SwiftEmitter.barrelTypeName)`. Rename the def.")
+                }
+                if always.contains(ref.swift) {
+                    throw CodegenError.sharedEnumNaming(message: "Model `\(schema.name)` declares the nested type `\(ref.swift)`, which shadows the shared enum "
+                        + "`\(ref.def.name)` (\(source)) that field `\(ref.field)` refs. Rename the def.")
+                }
+                for name in schema.fieldOrder {
+                    guard let f = schema.fields[name], f.sharedEnum == nil, f.enumValues?.isEmpty == false,
+                          Naming.enumTypeName(forField: name) == ref.swift else { continue }
+                    throw CodegenError.sharedEnumNaming(message: "Model `\(schema.name)` field `\(name)` declares the nested type `\(ref.swift)`, which shadows "
+                        + "the shared enum `\(ref.def.name)` (\(source)) that field `\(ref.field)` refs. Rename the field or the def.")
+                }
+            }
+        }
+    }
+
+    /// The registration barrel's type, which a shared enum cannot be named.
+    static let barrelTypeName = "GeneratedModels"
+
     // MARK: - Helpers
 
     private func propName(_ s: String) -> String {
@@ -1373,6 +1667,25 @@ struct SwiftEmitter {
         // Conservative: the field/model names that survive TOML parsing
         // can't contain `"` or `\`, so a verbatim wrap is safe.
         return "\"\(s)\""
+    }
+
+    /// `s` as a Swift string literal, for a value a schema declares (a
+    /// default), which may hold any character.
+    private func stringLiteral(_ s: String) -> String {
+        var out = "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case _ where scalar.value < 0x20 || scalar.value == 0x7F:
+                out += "\\u{\(String(scalar.value, radix: 16))}"
+            default: out.unicodeScalars.append(scalar)
+            }
+        }
+        return out + "\""
     }
 
     private func formatDouble(_ d: Double) -> String {

@@ -185,6 +185,37 @@ struct RecordLogViewReader {
         return out
     }
 
+    /// `row` with each record its includes attached under `_related` tagged
+    /// with `document` under `_meta_doc_id`, nested includes too, as the
+    /// model API tags a page's own rows: a leg resolves within the parent's
+    /// db3, so an included record is that db3's, and a model built from it
+    /// fills a defaulted field the record does not hold
+    /// (`PrimitiveRecord.holds(_:in:)`) as one read directly does (#5896).
+    static func taggedIncludes(_ row: RecordLogRow, _ includes: [Include], document: String) -> RecordLogRow {
+        guard var related = row["_related"]?.objectValue else { return row }
+        var specs: [String: Include] = [:]
+        for spec in includes { specs[spec.resultKey ?? spec.target.modelName] = spec }
+        for (key, spec) in specs {
+            guard let attached = related[key] else { continue }
+            let tag = { (value: JSONValue) -> JSONValue in
+                guard var included = value.objectValue else { return value }
+                included["_meta_doc_id"] = .string(document)
+                if let nested = spec.include, !nested.isEmpty {
+                    included = taggedIncludes(included, nested, document: document)
+                }
+                return .object(included)
+            }
+            if let rows = attached.arrayValue {
+                related[key] = .array(rows.map(tag))
+            } else {
+                related[key] = tag(attached)
+            }
+        }
+        var out = row
+        out["_related"] = .object(related)
+        return out
+    }
+
     /// Refuse a device read whose filter, or any include spec's filter, uses
     /// `$near` at any depth (#5225): an include leg reads no vector index, so
     /// the read is refused `.queryIndexNotOnDevice` before any statement,
@@ -536,7 +567,12 @@ struct RecordLogViewReader {
                 }
             }
             if case .model = shape {
-                for index in rows.indices { rows[index]["_meta_doc_id"] = .string(rowDocuments[index]) }
+                for index in rows.indices {
+                    rows[index]["_meta_doc_id"] = .string(rowDocuments[index])
+                    if let includes {
+                        rows[index] = Self.taggedIncludes(rows[index], includes, document: rowDocuments[index])
+                    }
+                }
             }
             if backward {
                 rows.reverse()
@@ -819,11 +855,15 @@ struct RecordLogViewReader {
         "\"\(name.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
-    /// `record` as `shape` answers it, and whether that changed it.
+    /// `record` as `shape` answers it, and whether that changed it. A set
+    /// field the record does not hold reads `[]`, as one held as `null` does,
+    /// and is listed as unheld (`PrimitiveRecord.holds(_:in:)`), so a model
+    /// fills its default as js-bao's getter does.
     static func shaped(_ record: RecordLogRow, _ shape: RowShape) -> (RecordLogRow, Bool) {
         guard case .model(let setFields, _) = shape, !setFields.isEmpty else { return (record, false) }
         var row = record
         var changed = false
+        PrimitiveRecord.markUnheld(setFields.filter { record[$0] == nil }, in: &row)
         for field in setFields {
             switch row[field] {
             case .array(let items)?:

@@ -47,7 +47,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// - Stability: production
     public let groups: GroupsAPI
     /// - Stability: production
-    public let ruleSets: RuleSetsAPI
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
+    public var ruleSets: RuleSetsAPI { _ruleSets }
+    private let _ruleSets: RuleSetsAPI
     /// Server functions (invoke / start / getStatus / waitFor / terminate).
     /// A request function answers its result; a task function answers a run
     /// id polled on the function run routes. Mirrors JS `client.functions.*`
@@ -56,6 +58,7 @@ public final class JsBaoClient: @unchecked Sendable {
     public let functions: FunctionsAPI
     /// - Stability: production
     public let invitations: InvitationsAPI
+    #if PRIMITIVE_EXPERIMENTAL_APIS
     /// Sub-API for the notification inbox and push-device registration
     /// (list / unreadCount / markRead / markAllRead / send / registerDevice /
     /// listDevices / unregisterDevice). Live in-app notifications arrive as
@@ -67,10 +70,13 @@ public final class JsBaoClient: @unchecked Sendable {
     /// exposed here. Mirrors JS `client.resourceMetadata.*`.
     /// - Stability: experimental
     public let resourceMetadata: ResourceMetadataAPI
+    #endif
     /// - Stability: production
     public let blobBuckets: BlobBucketsAPI
     /// - Stability: production
-    public let databaseTypeConfigs: DatabaseTypeConfigsAPI
+    @available(*, deprecated, message: "The databases family is deprecated: build on db3 and its types (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public var databaseTypeConfigs: DatabaseTypeConfigsAPI { _databaseTypeConfigs }
+    private let _databaseTypeConfigs: DatabaseTypeConfigsAPI
     /// - Stability: production
     public let analytics: AnalyticsAPI
     /// Deep-link / universal-link routing (#931). Set
@@ -98,6 +104,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Document sub-API. Wired during `init`; never nil for callers.
     /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public var documents: DocumentsAPI { _documents }
     /// Current-user sub-API. Wired during `init`; never nil for callers.
     /// - Stability: production
@@ -799,14 +806,16 @@ public final class JsBaoClient: @unchecked Sendable {
         self.session = SessionAPI(transport: gatedTransport)
         self.links = LinksAPI()
         self.groups = GroupsAPI(transport: gatedTransport)
-        self.ruleSets = RuleSetsAPI(transport: gatedTransport)
+        self._ruleSets = RuleSetsAPI(transport: gatedTransport)
         self.invitations = InvitationsAPI(transport: gatedTransport)
+        #if PRIMITIVE_EXPERIMENTAL_APIS
         self.notifications = NotificationsAPI(transport: gatedTransport)
         self.resourceMetadata = ResourceMetadataAPI(transport: gatedTransport)
+        #endif
         // Blob upload/download go through `Transport.requestData`, which
         // returns the untouched response bytes.
         self.blobBuckets = BlobBucketsAPI(transport: gatedTransport)
-        self.databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: gatedTransport)
+        self._databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: gatedTransport)
         // Server functions ride the same transport, and post their own
         // control routes.
         self.functions = FunctionsAPI(transport: gatedTransport, logger: logger)
@@ -4182,7 +4191,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `createDocument(options): Promise<{ metadata }>` exactly (#1108).
     /// The document id rides inside `metadata.documentId`. Before #1108
     /// this returned a Swift-only `(documentId, doc)` tuple.
-    /// - Stability: production
+    /// - Stability: beta
     @discardableResult
     public func createDocument(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> CreateDocumentResult {
         // The server's `POST /documents` route validates documentId
@@ -4488,7 +4497,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `Db3CreateFailedEvent`), and `["created": false, "reason":
     /// "not_pending"]` when its create had already landed. A transient
     /// failure throws, and the client keeps retrying it with backoff.
-    /// - Stability: production
+    /// - Stability: beta
     public func commitOfflineCreate(documentId: String, onExists: String = "fail") async throws -> [String: Any] {
         if documentManager.getLocalMetadata(documentId)?.db3Create == true {
             guard documentManager.isPendingCreate(documentId) else { return ["created": false, "reason": "not_pending"] }
@@ -6291,7 +6300,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // same source JS uses (`fetchDocumentInfo: () => this.documents.get(id)`).
         documentManager.fetchDocumentInfo = { [weak self] documentId in
             guard let self = self else { throw JsBaoError(code: .unavailable) }
-            return try await self.documents.fetchDocumentInfo(documentId: documentId)
+            return try await self._documents.fetchDocumentInfo(documentId: documentId)
         }
         documentManager.createRemoteDocument = { [weak self] body in
             guard let self = self else { throw JsBaoError(code: .unavailable) }
@@ -6358,6 +6367,11 @@ public final class JsBaoClient: @unchecked Sendable {
         // as above; a level it already took changes nothing.
         documentManager.permissionHeard = { [weak self] documentId, permission in
             guard let self, let binding = self.recordLogBinding(documentId), !binding.isClosed else { return }
+            // #5888 — recorded as a grant before the store takes it: a refusal
+            // of an ask made before it does not end the db3's subscriptions.
+            // Frames are handled one at a time, so it is recorded before a
+            // refusal heard after it is.
+            if let level = Db3Permission(rawValue: permission.rawValue) { self._db3Lifecycle?.grantHeard(documentId, level) }
             do {
                 try binding.applyPermissionChange(permission)
             } catch {
@@ -7618,6 +7632,9 @@ public final class JsBaoClient: @unchecked Sendable {
                 metadata = typed
             }
             let changedFields = json["changedFields"] as? [String]
+            // #5888 — the user lost their access to it: the last frame heard
+            // wins, so a grant heard before no longer stands.
+            if actionStr == "deleted" { _db3Lifecycle?.accessRevoked(docId) }
             await documentManager.applyDocumentMetadataUpdate(
                 documentId: docId,
                 metadata: metadata,
@@ -8594,7 +8611,7 @@ extension JsBaoClient: WebSocketManagerDelegate {
             // document deleted (or revoked) while this client was away leaves
             // the device even for an app that only ever calls the subset
             // listings (#2852). Rate-limited inside `DocumentsAPI`.
-            await documents.reconcileScopeAtConnect()
+            await _documents.reconcileScopeAtConnect()
             // Flush analytics
             await analyticsQueue.flush()
         }
@@ -8802,7 +8819,10 @@ extension JsBaoClient: WsAuthRecoveryHost {
 
 /// Scoped helper for operations on a single document.
 public final class DocumentContext: @unchecked Sendable {
-    public let documentId: String
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public var documentId: String { _documentId }
+    private let _documentId: String
     private weak var client: JsBaoClient?
     private let blobManager: BlobManager
     private let transport: any Transport
@@ -8814,7 +8834,7 @@ public final class DocumentContext: @unchecked Sendable {
         blobManager: BlobManager,
         transport: any Transport
     ) {
-        self.documentId = documentId
+        self._documentId = documentId
         self.client = client
         self.blobManager = blobManager
         self.transport = transport
@@ -8851,6 +8871,8 @@ public final class DocumentContext: @unchecked Sendable {
     }
 
     /// The open `YDocument`, or `nil` when the document is not open.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public var doc: YDocument? {
         client?.getDoc(documentId)
     }

@@ -46,6 +46,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
         self.transport = transport
     }
 
+    #if PRIMITIVE_EXPERIMENTAL_APIS
     // MARK: - Paths
 
     /// Percent-encodes a free-text path parameter before it is interpolated
@@ -219,4 +220,5 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
             path: categoryPath(resourceType, resourceId, category)
         )
     }
+    #endif
 }

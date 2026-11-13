@@ -136,7 +136,7 @@ public struct PostRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
         self.userId = record["userId"]?.asId
         self.title = title
         self.body = record["body"]?.asString
-        self.score = record["score"]?.asNumber
+        self.score = record.holds("score") == false ? 0 : record["score"]?.asNumber
         self.tagIds = record["tagIds"]?.asStringSet
         self.related = .empty
         self._changedFields = []
@@ -151,7 +151,7 @@ public struct PostRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
         self.userId = row["userId"]?.stringValue
         self.title = title
         self.body = row["body"]?.stringValue
-        self.score = row["score"]?.numberValue
+        self.score = PrimitiveRecord.holds("score", in: row) == false ? 0 : row["score"]?.numberValue
         self.tagIds = (row["tagIds"]?.stringArrayValue).map(Set.init)
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []

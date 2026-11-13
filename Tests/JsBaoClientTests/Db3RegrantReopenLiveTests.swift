@@ -189,7 +189,7 @@ final class Db3RegrantReopenLiveTests: XCTestCase {
         // The handle's state is the lifecycle's snapshot, taken before the
         // event is told: the save made inside the event may still be running.
         try await eventually(description: "the save made at live") { atLive.value != nil }
-        XCTAssertEqual(atLive.value, JsBaoErrorCode.accessDenied.rawValue, "refused on the device the moment live is told")
+        XCTAssertEqual(atLive.value, JsBaoErrorCode.writeAccessDenied.rawValue, "refused on the device the moment live is told")
         XCTAssertFalse(entries.value.contains { $0.contains("at live") }, "nothing was sent for it")
         try await eventually(timeout: 20, description: "the queued write handed back") {
             refused.value.contains { $0.error.code == .writeAccessDenied }
@@ -260,5 +260,37 @@ final class Db3RegrantReopenLiveTests: XCTestCase {
             try await eventually(timeout: 10, description: "live") { m.handle.state.phase == .live }
         }
         XCTAssertNotEqual(m.handle.state.permission, .refused)
+    }
+
+    // MARK: - #5888 behaviour 13: a transfer to the app, then a reader grant
+
+    func testATransferToTheAppThenAReaderGrantLeavesTheSubscriptionLiveAsReader() async throws {
+        let member = try await ctx.createTestUser(appId: live.app.appId)
+        let created = try await ctx.appRequest(
+            method: "POST", appId: live.app.appId, path: "/documents", body: ["title": "Custodied", "documentFormat": 3], jwt: member.jwt
+        )
+        let id = try XCTUnwrap(created["documentId"] as? String)
+        let client = try await live.client("member", models: [Self.note], token: member.jwt)
+        let handle = try client.db3.subscribe(id)
+        try await handle.ready()
+
+        _ = try await ctx.appRequest(
+            method: "POST", appId: live.app.appId, path: "/db3/\(id)/transfer", body: ["to": "app"], jwt: live.app.ownerJWT
+        )
+        try await grant(id, member.userId, "reader")
+        try await settles(within: 5, "the handle live as reader") {
+            try await eventually(timeout: 5, description: "live as reader") {
+                handle.state.phase == .live && handle.state.permission == .reader
+            }
+        }
+        let saved: String? = {
+            do {
+                try save(client, id, "after the transfer")
+                return nil
+            } catch {
+                return (error as? JsBaoError)?.code.rawValue ?? "\(error)"
+            }
+        }()
+        XCTAssertEqual(saved, JsBaoErrorCode.writeAccessDenied.rawValue, "refused on the device")
     }
 }

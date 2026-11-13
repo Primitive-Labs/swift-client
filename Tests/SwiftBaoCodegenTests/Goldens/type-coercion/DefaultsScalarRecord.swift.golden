@@ -184,18 +184,18 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
 
     public init?(record: PrimitiveRecord) {
         self.id = record.id
-        self.n_zero = record["n_zero"]?.asNumber
-        self.n_one = record["n_one"]?.asNumber
-        self.n_neg = record["n_neg"]?.asNumber
-        self.n_float = record["n_float"]?.asNumber
-        self.n_sci = record["n_sci"]?.asNumber
-        self.b_true = record["b_true"]?.asBoolean
-        self.b_false = record["b_false"]?.asBoolean
-        self.s_bool_like = record["s_bool_like"]?.asString
-        self.s_int_like = record["s_int_like"]?.asString
-        self.s_empty = record["s_empty"]?.asString
-        self.d_iso = record["d_iso"]?.asDateString
-        self.i_literal = record["i_literal"]?.asId
+        self.n_zero = record.holds("n_zero") == false ? 0 : record["n_zero"]?.asNumber
+        self.n_one = record.holds("n_one") == false ? 1 : record["n_one"]?.asNumber
+        self.n_neg = record.holds("n_neg") == false ? -1 : record["n_neg"]?.asNumber
+        self.n_float = record.holds("n_float") == false ? 3.14 : record["n_float"]?.asNumber
+        self.n_sci = record.holds("n_sci") == false ? 10000000000 : record["n_sci"]?.asNumber
+        self.b_true = record.holds("b_true") == false ? true : record["b_true"]?.asBoolean
+        self.b_false = record.holds("b_false") == false ? false : record["b_false"]?.asBoolean
+        self.s_bool_like = record.holds("s_bool_like") == false ? "true" : record["s_bool_like"]?.asString
+        self.s_int_like = record.holds("s_int_like") == false ? "42" : record["s_int_like"]?.asString
+        self.s_empty = record.holds("s_empty") == false ? "" : record["s_empty"]?.asString
+        self.d_iso = record.holds("d_iso") == false ? "2026-01-01" : record["d_iso"]?.asDateString
+        self.i_literal = record.holds("i_literal") == false ? "fixed-id-ulid" : record["i_literal"]?.asId
         self.related = .empty
         self._changedFields = []
     }
@@ -205,18 +205,18 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
         guard let id = row["id"]?.stringValue
         else { return nil }
         self.id = id
-        self.n_zero = row["n_zero"]?.numberValue
-        self.n_one = row["n_one"]?.numberValue
-        self.n_neg = row["n_neg"]?.numberValue
-        self.n_float = row["n_float"]?.numberValue
-        self.n_sci = row["n_sci"]?.numberValue
-        self.b_true = row["b_true"]?.rowBoolValue
-        self.b_false = row["b_false"]?.rowBoolValue
-        self.s_bool_like = row["s_bool_like"]?.stringValue
-        self.s_int_like = row["s_int_like"]?.stringValue
-        self.s_empty = row["s_empty"]?.stringValue
-        self.d_iso = row["d_iso"]?.stringValue
-        self.i_literal = row["i_literal"]?.stringValue
+        self.n_zero = PrimitiveRecord.holds("n_zero", in: row) == false ? 0 : row["n_zero"]?.numberValue
+        self.n_one = PrimitiveRecord.holds("n_one", in: row) == false ? 1 : row["n_one"]?.numberValue
+        self.n_neg = PrimitiveRecord.holds("n_neg", in: row) == false ? -1 : row["n_neg"]?.numberValue
+        self.n_float = PrimitiveRecord.holds("n_float", in: row) == false ? 3.14 : row["n_float"]?.numberValue
+        self.n_sci = PrimitiveRecord.holds("n_sci", in: row) == false ? 10000000000 : row["n_sci"]?.numberValue
+        self.b_true = PrimitiveRecord.holds("b_true", in: row) == false ? true : row["b_true"]?.rowBoolValue
+        self.b_false = PrimitiveRecord.holds("b_false", in: row) == false ? false : row["b_false"]?.rowBoolValue
+        self.s_bool_like = PrimitiveRecord.holds("s_bool_like", in: row) == false ? "true" : row["s_bool_like"]?.stringValue
+        self.s_int_like = PrimitiveRecord.holds("s_int_like", in: row) == false ? "42" : row["s_int_like"]?.stringValue
+        self.s_empty = PrimitiveRecord.holds("s_empty", in: row) == false ? "" : row["s_empty"]?.stringValue
+        self.d_iso = PrimitiveRecord.holds("d_iso", in: row) == false ? "2026-01-01" : row["d_iso"]?.stringValue
+        self.i_literal = PrimitiveRecord.holds("i_literal", in: row) == false ? "fixed-id-ulid" : row["i_literal"]?.stringValue
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }

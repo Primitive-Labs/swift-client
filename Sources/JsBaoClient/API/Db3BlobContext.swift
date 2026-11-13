@@ -29,6 +29,7 @@ import Foundation
 /// (Kingfisher, Nuke) sends `downloadRequest(blobId:)`, which does.
 public final class Db3BlobContext: Sendable {
     /// The db3.
+    /// - Stability: beta
     public let db3Id: String
     private let transport: any Transport
     private let blobManager: BlobManager
@@ -49,6 +50,7 @@ public final class Db3BlobContext: Sendable {
     /// The client behind this context, for `BlobImage`'s load identity:
     /// `client.db3.blobs(_:)` builds a new context per call, but each holds
     /// its client's one blob manager.
+    /// - Stability: beta
     @_spi(JsBaoClientUI) public var backingClientIdentity: ObjectIdentifier {
         ObjectIdentifier(blobManager)
     }

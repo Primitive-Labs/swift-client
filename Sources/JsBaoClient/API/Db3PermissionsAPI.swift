@@ -17,6 +17,7 @@ import Foundation
 /// ```
 public final class Db3PermissionsAPI: Sendable {
     /// The db3.
+    /// - Stability: beta
     public let db3Id: String
     private let transport: any Transport
     /// The wait for a pending create of the db3 (#5000).

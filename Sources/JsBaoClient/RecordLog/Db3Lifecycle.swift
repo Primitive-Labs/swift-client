@@ -142,6 +142,8 @@ struct Db3LifecycleDeps: Sendable {
     /// subscription), or `nil` when no row says. The retention sweep ranks
     /// the stored copies by it.
     var lastUsedAt: @Sendable (String) -> Int64? = { _ in nil }
+    /// The db3's title as this device holds it (its metadata row's), or `nil` (#5890).
+    var title: @Sendable (String) -> String? = { _ in nil }
     var logger: Logger?
 }
 
@@ -261,6 +263,24 @@ final class Db3Lifecycle: @unchecked Sendable {
     private var granted: Set<String> = []
     /// The refused db3s asked of the room again on a grant, until the room answers.
     private var reopening: Set<String> = []
+    /// A grant heard since the last revoke, with how many refusals it answered (#5888).
+    private struct HeardGrant {
+        var level: Db3Permission
+        var asks: Int
+    }
+    /// The grants heard since the last revoke, by db3 (#5888): a refusal of an
+    /// ask made before one answers an ask older than the grant, so the grant
+    /// stands and the room is asked again, at most twice per grant.
+    private var heardGrants: [String: HeardGrant] = [:]
+    /// The second asks on a grant waiting for their time, by db3, each with its token.
+    private var grantAsks: [String: (token: Int, task: Task<Void, Never>)] = [:]
+    private var grantAskTokens = 0
+    /// The asks on a grant that fell due while the socket was down: made when it opens.
+    private var deferredAsks: Set<String> = []
+    /// How long the second ask of a grant heard before a refusal waits (#5888).
+    static let grantRetryDelay: TimeInterval = 1.0
+    /// How many refusals one grant heard before them may answer with an ask (#5888).
+    private static let grantAskLimit = 2
     /// The db3s whose room refused them because their sync is off (#4806):
     /// when such a db3 turns gone, it is for that reason. Cleared once it is
     /// live, or refused for access instead.
@@ -696,7 +716,8 @@ final class Db3Lifecycle: @unchecked Sendable {
             let state = try await read(id)
             out.append(Db3StoredEntry(
                 id: id, rows: state.rows, cursor: state.cursor, pendingWrites: state.pendingWrites,
-                lastSyncAt: state.lastSyncAt, resident: state.resident, localOnly: state.localOnly
+                lastSyncAt: state.lastSyncAt, resident: state.resident, localOnly: state.localOnly,
+                title: deps.title(id)
             ))
         }
         return out.sorted { $0.id < $1.id }
@@ -764,7 +785,11 @@ final class Db3Lifecycle: @unchecked Sendable {
             handle.timer = nil
             handle.timerGeneration += 1
             handles[db3Id]?.removeAll { $0 === handle }
-            if handles[db3Id]?.isEmpty == true { handles[db3Id] = nil }
+            if handles[db3Id]?.isEmpty == true {
+                handles[db3Id] = nil
+                // #5888 — nothing holds it now: an ask waiting on a grant is not made.
+                if cancelGrantAskLocked(db3Id) { reopening.remove(db3Id) }
+            }
         }
         if again {
             reconcile(db3Id)
@@ -1071,6 +1096,16 @@ final class Db3Lifecycle: @unchecked Sendable {
     func connectionChanged() {
         let (ids, open) = lock.withLock { (Set(handles.keys).union(active), active) }
         let up = deps.socketUp()
+        // #5888 — an ask on a grant that fell due offline is made now (an
+        // idle session open here is asked below in any case).
+        if up {
+            let due = lock.withLock { () -> Set<String> in
+                let due = deferredAsks
+                deferredAsks = []
+                return due
+            }
+            for db3Id in due where !(open.contains(db3Id) && statusFor(db3Id).phase == .idle) { askAgain(db3Id) }
+        }
         let outdated = lock.withLock { self.outdated }
         for db3Id in ids {
             // A db3 whose room needs a newer client is not asked of it again.
@@ -1085,6 +1120,33 @@ final class Db3Lifecycle: @unchecked Sendable {
     func syncFailed(_ db3Id: String, _ reason: String) {
         // A reopen on a grant ended: the next grant may ask again.
         lock.withLock { _ = reopening.remove(db3Id) }
+        // #5888 — a grant heard since the last revoke, while the refused ask
+        // was unanswered: the refusal answered an ask older than the grant, so
+        // the grant stands (the db3 is not `gone`, a pending `ready()` waits)
+        // and the room is asked again, at once, then once more after a wait.
+        if reason == JsBaoErrorCode.accessDenied.rawValue {
+            let asks = lock.withLock { () -> Int? in
+                guard var grant = heardGrants[db3Id], grant.asks < Self.grantAskLimit, grantMayStandLocked(db3Id) else { return nil }
+                _ = cancelGrantAskLocked(db3Id)
+                roomRefused.insert(db3Id)
+                granted.insert(db3Id)
+                grant.asks += 1
+                heardGrants[db3Id] = grant
+                return grant.asks
+            }
+            if let asks {
+                if wantsReopen(db3Id) {
+                    lock.withLock { _ = reopening.insert(db3Id) }
+                    if asks == 1 { askAgain(db3Id) } else { scheduleGrantAsk(db3Id) }
+                }
+                kick(db3Id)
+                return
+            }
+        }
+        lock.withLock {
+            heardGrants[db3Id] = nil
+            _ = cancelGrantAskLocked(db3Id)
+        }
         if reason == JsBaoErrorCode.db3ClientOutdated.rawValue {
             // The room needs a newer client: the db3 is gone for this client's
             // lifetime, its rows kept; nothing retries it.
@@ -1238,6 +1300,8 @@ final class Db3Lifecycle: @unchecked Sendable {
         // of the new user starts ahead of a close this release waits for.
         let (generation, ids, now, changed, closes) = lock.withLock { () -> (Int, [String], Int, Bool, [Task<Void, Never>]) in
             releases += 1
+            // #5888 — the user is changing: no ask waiting on a grant is made.
+            cancelGrantAsksLocked()
             let changed = identityChanged
             identityChanged = false
             let ids = Set(handles.keys).union(active)
@@ -1272,6 +1336,7 @@ final class Db3Lifecycle: @unchecked Sendable {
                 deleted = []
                 deletedUnapplied = []
                 granted = []
+                cancelGrantAsksLocked()
                 reopening = []
             }
         }
@@ -1303,6 +1368,7 @@ final class Db3Lifecycle: @unchecked Sendable {
             deleted = []
             deletedUnapplied = []
             granted = []
+            cancelGrantAsksLocked()
             reopening = []
             return identity
         }
@@ -1347,6 +1413,7 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// The client is being destroyed: every subscription ends.
     func destroy() async {
         guard !lock.withLock({ destroyedFlag }) else { return }
+        lock.withLock { cancelGrantAsksLocked() }
         let held = lock.withLock { handles }
         for (db3Id, list) in held {
             for handle in list {
@@ -1560,6 +1627,11 @@ final class Db3Lifecycle: @unchecked Sendable {
             let grantable = lock.withLock { () -> Bool in
                 guard !outdated.contains(db3Id), !deleted.contains(db3Id), !syncOff.contains(db3Id) else { return false }
                 granted.insert(db3Id)
+                // #5888 — heard after the refusal: an ask made after it
+                // answers it. An ask already running or waiting its time
+                // (`reopening`) is older than the grant: the grant stands,
+                // and that ask carries it.
+                if heardGrants[db3Id]?.asks == 0, !reopening.contains(db3Id) { heardGrants[db3Id] = nil }
                 return true
             }
             if grantable, wantsReopen(db3Id), lock.withLock({ reopening.insert(db3Id).inserted }) {
@@ -1568,6 +1640,99 @@ final class Db3Lifecycle: @unchecked Sendable {
             }
         }
         kick(db3Id)
+    }
+
+    /// A readable level was heard on the socket for the db3 just now (#5888),
+    /// before the store took it: recorded as a grant that outlives the room's
+    /// refusal of an ask made before it. A db3 gone because it was deleted,
+    /// its sync went off or the room needs a newer client records nothing.
+    func grantHeard(_ db3Id: String, _ level: Db3Permission) {
+        guard level != .refused, deps.isBound(db3Id) else { return }
+        lock.withLock {
+            guard grantMayStandLocked(db3Id) else { return }
+            heardGrants[db3Id] = HeardGrant(level: level, asks: 0)
+        }
+    }
+
+    /// The server said the user no longer reaches the db3 (`deleted`, #5888):
+    /// the last frame heard wins, so a grant heard before it no longer stands,
+    /// and an ask waiting on one is not made. A refusal already standing
+    /// turns the db3 `gone` now.
+    func accessRevoked(_ db3Id: String) {
+        lock.withLock {
+            heardGrants[db3Id] = nil
+            if cancelGrantAskLocked(db3Id) { reopening.remove(db3Id) }
+            granted.remove(db3Id)
+        }
+        kick(db3Id)
+    }
+
+    /// Whether a grant may stand for the db3 (under the lock): it is not gone
+    /// because it was deleted, its sync went off or the room needs a newer client.
+    private func grantMayStandLocked(_ db3Id: String) -> Bool {
+        !outdated.contains(db3Id) && !deleted.contains(db3Id) && !syncOff.contains(db3Id)
+    }
+
+    /// Whether a grant heard before a refusal stands for the db3 and may still ask (under the lock).
+    private func grantStandsLocked(_ db3Id: String) -> Bool {
+        guard let grant = heardGrants[db3Id] else { return false }
+        return grant.asks < Self.grantAskLimit && grantMayStandLocked(db3Id)
+    }
+
+    /// Ask the room again for the db3 on its standing grant (#5888); `reopening` holds meanwhile.
+    private func askAgain(_ db3Id: String) {
+        let standing = lock.withLock { heardGrants[db3Id] != nil }
+        guard standing, wantsReopen(db3Id) else {
+            lock.withLock { _ = reopening.remove(db3Id) }
+            kick(db3Id)
+            return
+        }
+        guard deps.socketUp() else {
+            // Offline: the next socket open asks.
+            lock.withLock { _ = deferredAsks.insert(db3Id) }
+            return
+        }
+        deps.logger?.debug("[db3] \(db3Id): the room refused an ask older than a grant heard since; asking again")
+        deps.resync(db3Id)
+    }
+
+    /// The second ask on a grant, made ``grantRetryDelay`` after the second refusal.
+    private func scheduleGrantAsk(_ db3Id: String) {
+        let token = lock.withLock { () -> Int in
+            _ = cancelGrantAskLocked(db3Id)
+            grantAskTokens += 1
+            return grantAskTokens
+        }
+        let task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.grantRetryDelay * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            let due = self.lock.withLock { () -> Bool in
+                guard self.grantAsks[db3Id]?.token == token, !self.destroyedFlag else { return false }
+                self.grantAsks[db3Id] = nil
+                return true
+            }
+            if due { self.askAgain(db3Id) }
+        }
+        lock.withLock {
+            if grantAsks[db3Id] == nil, !destroyedFlag { grantAsks[db3Id] = (token, task) } else { task.cancel() }
+        }
+    }
+
+    /// Cancel an ask on a grant still waiting for its time or for the socket
+    /// (under the lock); answers whether one was.
+    private func cancelGrantAskLocked(_ db3Id: String) -> Bool {
+        let waiting = grantAsks.removeValue(forKey: db3Id)
+        waiting?.task.cancel()
+        let deferred = deferredAsks.remove(db3Id) != nil
+        return waiting != nil || deferred
+    }
+
+    /// Cancel every ask on a grant still waiting, and forget every grant (under the lock).
+    private func cancelGrantAsksLocked() {
+        for db3Id in Set(grantAsks.keys).union(deferredAsks) where cancelGrantAskLocked(db3Id) {
+            reopening.remove(db3Id)
+        }
+        heardGrants = [:]
     }
 
     /// Whether a grant asks the room again for the refused db3 at once: a
@@ -1591,9 +1756,10 @@ final class Db3Lifecycle: @unchecked Sendable {
     }
 
     /// Whether the room's refusal of the db3 stands: its store is marked
-    /// refused and no grant was heard since.
+    /// refused and no grant was heard since, nor one heard before it that may
+    /// still ask (#5888: the mark can land before the lifecycle hears the refusal).
     private func refusedNow(_ db3Id: String, _ marks: Db3SyncMarks?) -> Bool {
-        marks?.permission == RecordLogPermission.refused && !lock.withLock { granted.contains(db3Id) }
+        marks?.permission == RecordLogPermission.refused && !lock.withLock { granted.contains(db3Id) || grantStandsLocked(db3Id) }
     }
 
     /// The db3's index list was applied to its store, or its read settled
@@ -1647,6 +1813,9 @@ final class Db3Lifecycle: @unchecked Sendable {
                 errors[db3Id] = nil
                 granted.remove(db3Id)
                 reopening.remove(db3Id)
+                // #5888 — the room answered: a grant heard before is settled.
+                heardGrants[db3Id] = nil
+                _ = cancelGrantAskLocked(db3Id)
                 syncOff.remove(db3Id)
                 if !deletedUnapplied.contains(db3Id) { deleted.remove(db3Id) }
             }

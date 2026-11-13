@@ -249,6 +249,10 @@ public enum TomlSchemaLoader {
         if let reason = vectorFieldProblem(table, type: typeLiteral) {
             throw TomlSchemaLoaderError.invalidVectorField(model: modelName, field: fieldName, reason: reason)
         }
+        // `enforce_enum` takes `true` or `false`, strict or not, as js-bao's loader judges it (#5897).
+        if let flag = table["enforce_enum"], flag.bool == nil {
+            throw TomlSchemaLoaderError.invalidEnforceEnum(model: modelName, field: fieldName)
+        }
 
         // Parse `auto_stamp = "create" | "update" | "both"`. Fail-fast on
         // an unrecognized literal — mirrors js-bao `tomlLoader.ts`'s
@@ -549,6 +553,10 @@ public enum TomlSchemaLoader {
         "auto_assign", "auto_stamp",
         "max_length", "max_count", "default",
         "dims", "element",
+        // A string field's value set, as js-bao's loader and the codegen parser
+        // take it, and a db3 type's opt-in to enforcing it (#5897), which the
+        // room enforces.
+        "enum", "enforce_enum",
     ]
 
     private static let knownRelationshipKeys: Set<String> = [
@@ -611,6 +619,9 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
     case invalidVectorField(model: String, field: String, reason: String)
     /// A unique constraint naming a vector field (#5225).
     case vectorInUniqueConstraint(model: String, constraint: String, field: String)
+    /// An `enforce_enum` that is not `true` or `false` (#5897): it never
+    /// reads as enforcement off.
+    case invalidEnforceEnum(model: String, field: String)
 
     public var description: String {
         switch self {
@@ -652,6 +663,8 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
             return "Model `\(model)` field `\(field)`: a vector field belongs to a db3 type (a schema with a [type] table); a document schema or a database type cannot declare one"
         case let .invalidVectorField(model, field, reason):
             return "Model `\(model)` field `\(field)`: \(reason)"
+        case let .invalidEnforceEnum(model, field):
+            return "[models.\(model).fields.\(field)]: enforce_enum must be true or false"
         case let .vectorInUniqueConstraint(model, constraint, field):
             return "[[models.\(model).unique_constraints]]: unique constraint \"\(constraint)\" names the vector field \"\(field)\", which cannot be unique"
         }

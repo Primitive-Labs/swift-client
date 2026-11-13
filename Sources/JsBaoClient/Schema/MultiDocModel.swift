@@ -302,10 +302,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         for (docId, model) in localMembers() {
             guard let delegate = model.local,
                   var row = try? delegate.row(id: id) else { continue }
-            for field in stringsetFieldNames {
-                let members = (try? delegate.members(id: id, field: field)) ?? []
-                row[field] = .array(members.map { .string($0) })
-            }
+            Self.fillStringSets(&row, id: id, fields: stringsetFieldNames, delegate: delegate)
             row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
@@ -336,6 +333,11 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             for (fname, _) in schema.fields where fname != "id" {
                 if let v = snap[fname] {
                     row[fname] = rowRepresentation(of: v)
+                } else if !stringsetFieldNames.contains(fname), model.holds(recordId: rec.id, field: fname) == true {
+                    // A db3 record holding the field as `null` (a cleared
+                    // field): its row carries the `null`, as `find` and a
+                    // query's rows do, so a read does not fill its default.
+                    row[fname] = .null
                 }
             }
             // A record with no members has no snapshot entry at all, so give
@@ -344,6 +346,11 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             for fname in stringsetFieldNames where row[fname] == nil {
                 row[fname] = .array([])
             }
+            // A db3 record that does not hold a set is listed as unheld, as
+            // `find`'s and a query's rows list it.
+            PrimitiveRecord.markUnheld(
+                stringsetFieldNames.filter { model.holds(recordId: rec.id, field: $0) == false }, in: &row
+            )
             row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
@@ -629,6 +636,19 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         )
     }
 
+    /// Give `row` each string set field in `fields` as its members (`[]` for
+    /// none), listing those the record does not hold as unheld
+    /// (`PrimitiveRecord.holds(_:in:)`), as the view's rows are shaped.
+    private static func fillStringSets(
+        _ row: inout [String: JSONValue], id: String, fields: Set<String>, delegate: any LocalRecordDelegate
+    ) {
+        PrimitiveRecord.markUnheld(fields.filter { (try? delegate.holds(id: id, field: $0)) == false }, in: &row)
+        for field in fields {
+            let members = (try? delegate.members(id: id, field: field)) ?? []
+            row[field] = .array(members.map { .string($0) })
+        }
+    }
+
     /// Every row a record-log document's member holds, in the shape the engine's
     /// rows use — `_meta_doc_id` tag included, stringsets as arrays.
     private func localRows() -> [[String: JSONValue]] {
@@ -638,10 +658,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
                   let ids = try? delegate.allIds() else { continue }
             for id in ids {
                 guard var row = try? delegate.row(id: id) else { continue }
-                for field in stringsetFieldNames {
-                    let members = (try? delegate.members(id: id, field: field)) ?? []
-                    row[field] = .array(members.map { .string($0) })
-                }
+                Self.fillStringSets(&row, id: id, fields: stringsetFieldNames, delegate: delegate)
                 row["_meta_doc_id"] = .string(docId)
                 out.append(row)
             }

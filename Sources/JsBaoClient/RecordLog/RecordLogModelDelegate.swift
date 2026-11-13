@@ -159,6 +159,14 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
         return staged.contains { $0.id == holder } ? nil : holder
     }
 
+    /// Whether the record's view row holds `field`: clearing a field stores
+    /// `null` here, so a field the row lacks was never written. `nil` for a
+    /// record the view does not hold.
+    func holds(id: String, field: String) throws -> Bool? {
+        guard let row = try handleRow(id: id) else { return nil }
+        return row[field] != nil
+    }
+
     func fieldNames(id: String) throws -> Set<String> {
         guard let row = try handleRow(id: id) else { return [] }
         var names = Set<String>()

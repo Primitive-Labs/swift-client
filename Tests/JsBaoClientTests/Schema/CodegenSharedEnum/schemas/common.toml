@@ -1,0 +1,22 @@
+# The shared enums the board type's fields ref (#5896). Both tools read this
+# directory: swift-bao-codegen for the models, `primitive functions codegen
+# --lang swift` for `Generated/BoardShared.generated.swift`, which declares
+# them.
+
+[defs.Phase]
+type = "string"
+enum = ["open", "closed"]
+
+[defs.StatusValue]
+type = "string"
+enum = ["draft", "on hold", "done"]
+
+# Defs named like a model's members: `status` like the field that refs it,
+# `stateRaw` like the stored string of the field that refs it.
+[defs.status]
+type = "string"
+enum = ["open", "closed"]
+
+[defs.stateRaw]
+type = "string"
+enum = ["on", "off"]

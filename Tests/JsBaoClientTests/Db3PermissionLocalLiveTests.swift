@@ -5,7 +5,7 @@ import XCTest
 /// allows, against the dev server.
 ///
 /// - 6: a member downgraded to `reader` is refused a `codegen.save` and a
-///   `db3.records(id).put` on the device (`.accessDenied`, nothing
+///   `db3.records(id).put` on the device (`.writeAccessDenied`, nothing
 ///   pending, no row on the server); restored to `read-write`, a save with
 ///   `confirm: true` lands with no resubscribe.
 /// - 14: a typed db3 created here, and the same db3 subscribed on a fresh
@@ -103,11 +103,11 @@ final class Db3PermissionLocalLiveTests: XCTestCase {
         let save = await refused {
             _ = try bobClient.codegen.save(Self.note, id: refusedId, values: ["title": .string("while reading")], in: db3Id)
         }
-        XCTAssertEqual(save?.code, .accessDenied)
+        XCTAssertEqual(save?.code, .writeAccessDenied)
         let put = await refused {
             _ = try bobClient.db3.records(db3Id).put("Note", ["id": .string(RecordLogLiveApp.ulid()), "title": .string("model-free")])
         }
-        XCTAssertEqual(put?.code, .accessDenied)
+        XCTAssertEqual(put?.code, .writeAccessDenied)
         XCTAssertEqual(try live.pending(bobClient, db3Id).count, pending)
         try await Task.sleep(nanoseconds: 300_000_000)
         let rows = try await live.roomRows(db3Id, "Note")

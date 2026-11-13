@@ -131,6 +131,13 @@ struct RecordLogMarks: Equatable, Sendable {
     /// for one an older client wrote, whose next open asks the room for the
     /// declarations again.
     var vectorsKnown = true
+    /// A typed db3's enforced enums as the room sent them with its
+    /// declarations (#5897), per model enforcing one; `nil` when none are held.
+    var enums: RecordLogEnumDeclarations? = nil
+    /// Whether the held type entry records the enforced enums (#5897): `false`
+    /// for one an older client wrote, whose next open asks the room for the
+    /// declarations again.
+    var enumsKnown = true
     /// The db3 lives only on this device (#5155): see ``RecordLogStoredState/localOnly``.
     var localOnly = false
     /// A local-only db3's index registrations made on this device, by name.
@@ -147,6 +154,7 @@ struct RecordLogMarks: Equatable, Sendable {
     static func == (a: RecordLogMarks, b: RecordLogMarks) -> Bool {
         a.typed == b.typed && a.models == b.models && a.knownHead == b.knownHead && a.knownHeadAt == b.knownHeadAt && a.db3Type == b.db3Type && a.declarations == b.declarations
             && a.vectors == b.vectors && a.vectorsKnown == b.vectorsKnown
+            && a.enums == b.enums && a.enumsKnown == b.enumsKnown
             && a.localOnly == b.localOnly && a.localIndexes == b.localIndexes
             && a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
             && a.constraints == b.constraints && a.permission == b.permission && a.replacing == b.replacing
@@ -174,13 +182,41 @@ struct RecordLogDb3Type: Equatable, Sendable {
 
 /// What a store is told of a db3's type: untyped, or typed with a name, a
 /// hash and, when the room sent them, the declarations and, per model
-/// declaring one, each vector field's encoding (#5225).
+/// declaring one, each vector field's encoding (#5225) and, per model
+/// enforcing one, each enforced field's enum values (#5897).
 enum RecordLogTypeUpdate: Sendable, Equatable {
     case untyped
     case typed(
         name: String, hash: String?, models: [String: [String: String]]?,
-        vectors: [String: [String: VectorEncoding]]? = nil
+        vectors: [String: [String: VectorEncoding]]? = nil,
+        enums: RecordLogEnumDeclarations? = nil
     )
+}
+
+/// A typed db3's enforced enums, per model each enforced field's values (#5897).
+typealias RecordLogEnumDeclarations = [String: [String: [String]]]
+
+/// Per model, each enforced field's values; `nil` when `json` is not an
+/// object of objects of non-empty string arrays.
+func recordLogEnumDeclarations(_ json: JSONValue) -> RecordLogEnumDeclarations? {
+    guard let models = json.objectValue else { return nil }
+    var out: RecordLogEnumDeclarations = [:]
+    for (model, fields) in models {
+        guard let fields = fields.objectValue else { return nil }
+        var enforced: [String: [String]] = [:]
+        for (field, values) in fields {
+            guard let list = values.arrayValue, !list.isEmpty else { return nil }
+            let strings = list.compactMap(\.stringValue)
+            guard strings.count == list.count else { return nil }
+            enforced[field] = strings
+        }
+        out[model] = enforced
+    }
+    return out
+}
+
+func recordLogEnumDeclarationsJSON(_ enums: RecordLogEnumDeclarations) -> JSONValue {
+    .object(enums.mapValues { .object($0.mapValues { .array($0.map { .string($0) }) }) })
 }
 
 /// A typed db3's vector encodings, per model each vector field's (#5225).
@@ -642,24 +678,33 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
     }
 
     /// The `record_log_meta` key a document's type mark is kept under (#5020):
-    /// a JSON `{ typed, name?, hash?, models?, vectors? }`, absent before any
-    /// room answered. `vectors` (#5225) is the vector encodings or `null`; an
-    /// entry an older client wrote has no `vectors` key.
+    /// a JSON `{ typed, name?, hash?, models?, vectors?, enums? }`, absent
+    /// before any room answered. `vectors` (#5225) is the vector encodings or
+    /// `null`, `enums` (#5897) the enforced enums or `null`; an entry an older
+    /// client wrote has no such key.
     private var typeKey: Format2SqlValue { .text("db3_type:\(docId)") }
 
-    /// The typed mark, the type, its held declarations and vector encodings,
-    /// and whether the entry records the encodings (#5225).
+    /// The typed mark, the type, its held declarations, vector encodings and
+    /// enforced enums, and whether the entry records the encodings (#5225)
+    /// and the enums (#5897).
     func typeState() throws -> (
         typed: RecordLogTyped, db3Type: RecordLogDb3Type?, declarations: [String: [String: String]]?,
-        vectors: RecordLogVectorDeclarations?, vectorsKnown: Bool
+        vectors: RecordLogVectorDeclarations?, vectorsKnown: Bool,
+        enums: RecordLogEnumDeclarations?, enumsKnown: Bool
     ) {
         let text = try sql.first("SELECT value FROM record_log_meta WHERE key = ?", [typeKey])?["value"].stringValue
-        guard let held = text.flatMap({ JSONValue(jsonText: $0) })?.objectValue else { return (.unknown, nil, nil, nil, true) }
+        guard let held = text.flatMap({ JSONValue(jsonText: $0) })?.objectValue else { return (.unknown, nil, nil, nil, true, nil, true) }
         let typed = RecordLogTyped(rawValue: held["typed"]?.stringValue ?? "") ?? .unknown
-        guard typed == .yes, let name = held["name"]?.stringValue else { return (typed, nil, nil, nil, true) }
+        guard typed == .yes, let name = held["name"]?.stringValue else { return (typed, nil, nil, nil, true, nil, true) }
         let declarations = held["models"]?.objectValue?.mapValues { ($0.objectValue ?? [:]).compactMapValues(\.stringValue) }
         let vectors = held["vectors"].flatMap(recordLogVectorDeclarations)
-        return (typed, RecordLogDb3Type(name: name, hash: held["hash"]?.stringValue), declarations, vectors, held["vectors"] != nil)
+        let enums = held["enums"].flatMap(recordLogEnumDeclarations)
+        // An entry with declarations and no `enums` key was written before enforced enums (#5897).
+        let enumsKnown = declarations == nil || held["enums"] != nil
+        return (
+            typed, RecordLogDb3Type(name: name, hash: held["hash"]?.stringValue), declarations, vectors, held["vectors"] != nil,
+            enums, enumsKnown
+        )
     }
 
     /// Record what the room said of the type: untyped clears it; typed keeps
@@ -669,7 +714,7 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
         switch update {
         case .untyped:
             object = ["typed": "no"]
-        case .typed(let name, let hash, let models, let vectors):
+        case .typed(let name, let hash, let models, let vectors, let enums):
             let held = try typeState()
             let keepsHeld = models == nil && hash != nil && held.db3Type?.hash == hash
             let kept = models ?? (keepsHeld ? held.declarations : nil)
@@ -682,6 +727,12 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
                 if held.vectorsKnown { object["vectors"] = held.vectors.map(recordLogVectorDeclarationsJSON) ?? .null }
             } else {
                 object["vectors"] = vectors.map(recordLogVectorDeclarationsJSON) ?? .null
+            }
+            // So do the enforced enums (#5897).
+            if keepsHeld {
+                if held.enumsKnown { object["enums"] = held.enums.map(recordLogEnumDeclarationsJSON) ?? .null }
+            } else {
+                object["enums"] = enums.map(recordLogEnumDeclarationsJSON) ?? .null
             }
         }
         try sql.exec(
@@ -1789,6 +1840,8 @@ final class RecordLogStore: @unchecked Sendable {
             declarations: type.declarations,
             vectors: type.vectors,
             vectorsKnown: type.vectorsKnown,
+            enums: type.enums,
+            enumsKnown: type.enumsKnown,
             localOnly: state?["local_only"].intValue == 1,
             localIndexes: try tables.localIndexes(),
             models: try modelsHeld(sql),

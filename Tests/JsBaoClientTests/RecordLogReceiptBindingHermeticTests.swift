@@ -140,7 +140,7 @@ final class RecordLogReceiptBindingHermeticTests: XCTestCase {
 
         try binding.setState(permission: .some("read"))
         XCTAssertThrowsError(try note.create(id: "n2", values: ["title": .string("as a reader")])) { error in
-            XCTAssertEqual((error as? JsBaoError)?.code, .accessDenied)
+            XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
         }
         XCTAssertEqual(reported.value.count, 1, "a reader's refusal is thrown, not reported")
     }

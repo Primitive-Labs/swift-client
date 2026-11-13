@@ -53,10 +53,14 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// - Stability: production
-    public let aliases: DocumentAliasesAPI
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public var aliases: DocumentAliasesAPI { _aliases }
+    private let _aliases: DocumentAliasesAPI
     /// Bulk loads of a large document.
     /// - Stability: production
-    public let ingests: DocumentIngestsAPI
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public var ingests: DocumentIngestsAPI { _ingests }
+    private let _ingests: DocumentIngestsAPI
 
     /// Designated initializer — the typed transport spine.
     public init(
@@ -69,10 +73,10 @@ public final class DocumentsAPI: @unchecked Sendable {
         self.blobManager = blobManager
         self.documentManager = documentManager
         self.client = client
-        self.aliases = DocumentAliasesAPI(transport: transport) { [weak client] documentId in
+        self._aliases = DocumentAliasesAPI(transport: transport) { [weak client] documentId in
             try await client?.assertNotLocalOnlyDb3(documentId, call: "client.documents.aliases.set")
         }
-        self.ingests = DocumentIngestsAPI(transport: transport)
+        self._ingests = DocumentIngestsAPI(transport: transport)
     }
 
     /// Refuse `call` on a db3 that lives only on this device (#5155), before
@@ -1310,6 +1314,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///
     /// `BlobManager` is an actor, so this is an `async` property: a
     /// synchronous snapshot would answer from a stale image.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public var uploadConcurrency: Int {
         get async { await blobManager.getUploadConcurrency() }
     }
@@ -2053,11 +2059,19 @@ public struct DocumentSchemaAnswer: Codable, Sendable, Equatable {
     }
 
     /// Every model, by name: declared, and (on a format-3 document) observed.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public let schema: Models
     /// The declared and live models' names.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public let modelNames: [String]
     /// How many names `modelNames` holds.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public let modelCount: Int
     /// The models with query tables.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public let tableModels: [String]
 }

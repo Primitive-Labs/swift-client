@@ -130,6 +130,8 @@ enum CodegenRun {
         if modelsByFile[SwiftEmitter.barrelFileName] != nil {
             throw CodegenError.reservedBarrelName(fileName: SwiftEmitter.barrelFileName)
         }
+        // A ref'd field's generated names must not be taken or shadowed (#5896).
+        try SwiftEmitter.checkSharedEnums(schemas: schemas)
 
         // The cross-model name map lets relationship accessors name their
         // typed return types (`task` → `TaskRecord?`), across every input.

@@ -26,6 +26,10 @@ protocol LocalRecordDelegate: AnyObject, Sendable {
     func members(id: String, field: String) throws -> [String]
     func findId(fields: [String], values: [PrimitiveValue]) throws -> String?
     func fieldNames(id: String) throws -> Set<String>
+    /// Whether the stored record holds `field`, a stored `null` included;
+    /// `nil` when the store cannot tell a field never written from one
+    /// cleared, or holds no such record.
+    func holds(id: String, field: String) throws -> Bool?
 
     // Writes
     /// One local write. `upsertOn` names the field a create travels as an

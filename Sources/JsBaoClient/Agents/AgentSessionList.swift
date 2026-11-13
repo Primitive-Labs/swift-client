@@ -133,9 +133,11 @@ public final class AgentSessionList: @unchecked Sendable {
     // MARK: - State
 
     /// The loaded sessions, newest activity first.
+    /// - Stability: beta
     public var items: [AgentSessionWatchedItem] { lock.withLock { view } }
 
     /// Whether a further page remains (`loadMore()`).
+    /// - Stability: beta
     public var hasMore: Bool { lock.withLock { more } }
 
     /// Listen for changes to `items` or `hasMore`. Calls are coalesced over a

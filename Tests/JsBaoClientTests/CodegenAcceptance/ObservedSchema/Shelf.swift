@@ -12,7 +12,7 @@ public struct Shelf: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable,
             "id":    FieldDescriptor(type: .id, autoAssign: true),
             "title": FieldDescriptor(type: .string),
             "code":  FieldDescriptor(type: .string),
-            "tags":  FieldDescriptor(type: .stringset),
+            "tags":  FieldDescriptor(type: .stringset, defaultOnRead: true),
         ]
     )
 
@@ -114,7 +114,7 @@ public struct Shelf: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable,
         self.id = record.id
         self.title = record["title"]?.asString
         self.code = record["code"]?.asString
-        self.tags = record["tags"]?.asStringSet
+        self.tags = record.holds("tags") == false ? Set([]) : record["tags"]?.asStringSet
         self.related = .empty
         self._changedFields = []
     }
@@ -126,7 +126,7 @@ public struct Shelf: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable,
         self.id = id
         self.title = row["title"]?.stringValue
         self.code = row["code"]?.stringValue
-        self.tags = (row["tags"]?.stringArrayValue).map(Set.init)
+        self.tags = PrimitiveRecord.holds("tags", in: row) == false ? Set([]) : (row["tags"]?.stringArrayValue).map(Set.init)
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }

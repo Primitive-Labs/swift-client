@@ -551,8 +551,9 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
             throw error
         }
         if isReadOnly {
+            // #5888 — the code the room's refusal of the same write carries.
             throw JsBaoError(
-                code: .accessDenied,
+                code: .writeAccessDenied,
                 message: "Cannot save to document `\(documentId)`: the room allows this client to read it only.",
                 details: ["documentId": .string(documentId)]
             )
@@ -608,6 +609,19 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     /// keep: `nil` for a number no save of this binding committed.
     func ticket(of seq: Int) -> Int? {
         state.withLock { ticketOfSeq[seq] }
+    }
+
+    /// The highest number a save of this writer took, and the newest save's
+    /// ticket, read together: every save numbered at or below `minted` holds
+    /// a ticket at or below `ticket`. A number a failed group gave back and a
+    /// later save took again carries a newer ticket than the save before it.
+    func savesThrough() -> (minted: Int, ticket: Int) {
+        state.withLock { (_marks.nextSeq - 1, lastTicket) }
+    }
+
+    /// The newest save's ticket.
+    func lastSaveTicket() -> Int {
+        state.withLock { lastTicket }
     }
 
     /// A save's entries and its group's outcome, which arrive in either order:
@@ -914,7 +928,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     var declaredType: RecordLogDeclaredType? {
         let marks = self.marks
         guard marks.typed == .yes, let name = marks.db3Type?.name, let models = marks.declarations else { return nil }
-        return RecordLogDeclaredType(name: name, models: models, vectors: marks.vectors ?? [:])
+        return RecordLogDeclaredType(name: name, models: models, vectors: marks.vectors ?? [:], enums: marks.enums ?? [:])
     }
 
     /// Mark the copy of a db3 the server just created caught up, so it is

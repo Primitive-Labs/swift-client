@@ -2117,6 +2117,11 @@ public final class DynamicModel: @unchecked Sendable {
     ///   the record's state before it is stamped, validated and dirty-checked,
     ///   so a clear-only save is a change and a cleared required field is
     ///   refused. Only a record-log document's save passes any.
+    /// - Parameter unwritten: on an update, the defaulted fields the stored
+    ///   record does not hold, which a read fills with their default (js-bao's
+    ///   getter on a record-log document): a required one of them the save
+    ///   leaves alone is present, as js-bao's validator reads it, and one the
+    ///   save clears is written `null`, so the next read is `nil`.
     /// - Returns: `nil` when the dirty check finds nothing to do.
     private func preparedWrite(
         id: String,
@@ -2125,7 +2130,8 @@ public final class DynamicModel: @unchecked Sendable {
         changedFields: Set<String>?,
         oldData: [String: PrimitiveValue],
         keepUnchanged: Bool = false,
-        cleared: Set<String> = []
+        cleared: Set<String> = [],
+        unwritten: Set<String> = []
     ) throws -> PreparedWrite? {
         var newValues = values
         // Stage 1 of js-bao's two-stage narrowing — `_localChanges` (#2459).
@@ -2212,7 +2218,9 @@ public final class DynamicModel: @unchecked Sendable {
         // A field the caller cleared leaves the state, unless this save writes
         // it again (an `update` stamp, even one equal to the stored value).
         let clearedFields: Set<String> = isUpdate
-            ? cleared.filter { newValues[$0] == nil && !stamped.contains($0) && oldData[$0] != nil }
+            ? cleared.filter {
+                newValues[$0] == nil && !stamped.contains($0) && (oldData[$0] != nil || unwritten.contains($0))
+            }
             : []
         for field in clearedFields { dataToSave.removeValue(forKey: field) }
         for (k, v) in newValues { dataToSave[k] = v }
@@ -2253,7 +2261,8 @@ public final class DynamicModel: @unchecked Sendable {
         // already rejected it, exactly as js-bao's `save()` does before its
         // validator runs.
         for (fname, desc) in self.schema.fields where desc.required {
-            let present = fname == "id" ? !id.isEmpty : dataToSave[fname] != nil
+            let readsDefault = unwritten.contains(fname) && newValues[fname] == nil && !(changedFields?.contains(fname) ?? false)
+            let present = fname == "id" ? !id.isEmpty : dataToSave[fname] != nil || readsDefault
             guard present else {
                 throw FieldValidationError.requiredFieldMissing(
                     field: fname, modelName: self.schema.name
@@ -2328,7 +2337,9 @@ public final class DynamicModel: @unchecked Sendable {
         // pre-transact stamp lands in `_localChanges` before the diff. A
         // pure no-op update of an `auto_stamp = "create"`-only model
         // stays clean (create doesn't fire on update) and is skipped.
-        if isUpdate, dataToSave == oldData, !(keepUnchanged && !newValues.isEmpty) {
+        // A clear of a field the record does not hold leaves `dataToSave`
+        // equal to `oldData`, yet writes `null` over the default a read fills.
+        if isUpdate, dataToSave == oldData, clearedFields.isEmpty, !(keepUnchanged && !newValues.isEmpty) {
             return nil
         }
 
@@ -2380,20 +2391,48 @@ public final class DynamicModel: @unchecked Sendable {
         let wrote = try delegate.withOperation { () throws -> (Bool, Int?) in
             let isUpdate = try requestedIsUpdate ?? delegate.exists(id: id)
             let oldData = try localCurrentValues(delegate, id: id)
+            // A defaulted field the record does not hold reads as its default
+            // (a stored `null` is held): a required one is present, and one
+            // the caller clears is written `null`. A string set the generated
+            // model fills on read (`defaultOnRead`) counts too, though its
+            // descriptor declares no default (CSO-5896-019).
+            var unwritten: Set<String> = []
+            if isUpdate {
+                for (name, field) in schema.fields where name != "id" && (field.default != nil || field.defaultOnRead) {
+                    if try delegate.holds(id: id, field: name) == false { unwritten.insert(name) }
+                }
+            }
+            // A schema not written by swift-bao-codegen does not say which
+            // unheld set a read fills (a set's default is the model's, not
+            // the schema's: a create writes none). A set the caller set to nil that the
+            // record does not hold is therefore treated as one a read fills:
+            // the clear is written `null`, so the next read is `nil` and not
+            // the default again. A set without a default reads the same either
+            // way. Only a set the caller assigned is looked at, so a required
+            // set the save leaves alone is still validated as before.
+            if isUpdate, let changedFields {
+                for name in changedFields where values[name] == nil && oldData[name] == nil
+                    && schema.fields[name]?.type == .stringset && !unwritten.contains(name) {
+                    if try delegate.holds(id: id, field: name) == false { unwritten.insert(name) }
+                }
+            }
             // On a db3, a field the caller assigned and gave no value was set
             // to nil: the save clears it, as js-bao writes a touched field with
-            // no value as null. Only a field the record holds is cleared.
+            // no value as null. A field is cleared when the record holds it or
+            // a read fills it with its default; otherwise it already reads nil.
             var cleared: Set<String> = []
             if isUpdate, delegate is RecordLogModelDelegate, let changedFields {
                 cleared = changedFields.filter {
-                    $0 != "id" && values[$0] == nil && schema.fields[$0] != nil && oldData[$0] != nil
+                    $0 != "id" && values[$0] == nil && schema.fields[$0] != nil
+                        && (oldData[$0] != nil || unwritten.contains($0))
                 }
             }
             guard let prepared = try preparedWrite(
                 id: id, values: values, isUpdate: isUpdate,
                 changedFields: changedFields, oldData: oldData,
                 keepUnchanged: guards?.condition != nil,
-                cleared: cleared
+                cleared: cleared,
+                unwritten: unwritten
             ) else { return (false, nil) }
 
             // Uniqueness against the VIEW, which is the whole document — not
@@ -2621,6 +2660,15 @@ public final class DynamicModel: @unchecked Sendable {
                   let rec  = root.getMap(tx: txn, key: recordId) else { return }
             _ = try? rec.remove(tx: txn, key: field)
         }
+    }
+
+    /// Whether the stored record holds `field`, a stored `null` included, on
+    /// a document that can tell: a record-log (format-3) one, where clearing a
+    /// field stores `null`. `nil` on a Y.Map document, where clearing a field
+    /// removes its key, so a missing key may be a cleared field.
+    internal func holds(recordId: String, field: String) -> Bool? {
+        guard let local else { return nil }
+        return (try? local.holds(id: recordId, field: field)) ?? nil
     }
 
     internal func fieldNames(recordId: String) -> Set<String> {

@@ -371,6 +371,7 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
     /// The window is spent on one user's scope. Sign a different user in and
     /// their cache — never reconciled against their own scope — must not be
     /// skipped because the previous session walked recently.
+    @available(*, deprecated)
     func test_anAccountSwitchReArmsTheReconciliation() async throws {
         let client = makeHermeticClient()
         defer { Task { await client.destroy() } }
@@ -447,6 +448,7 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
     /// with no previous user to compare against. The new user's cache must
     /// still be reconciled rather than skipped on the window the previous
     /// account spent.
+    @available(*, deprecated)
     func test_signingOutAndBackInAsAnotherUserReArmsTheReconciliation() async throws {
         let client = makeHermeticClient()
         defer { Task { await client.destroy() } }
@@ -492,6 +494,7 @@ final class ConnectScopeReconcileHermeticTests: XCTestCase {
     /// pages were fetched for that scope, so merging them authoritatively would
     /// write one account's documents into another's cache — and stamping the
     /// window on its way out would skip the new user's own reconciliation.
+    @available(*, deprecated)
     func test_aWalkOvertakenByAnAccountSwitchNeitherAppliesNorSchedules() async throws {
         let client = makeHermeticClient()
         defer { Task { await client.destroy() } }

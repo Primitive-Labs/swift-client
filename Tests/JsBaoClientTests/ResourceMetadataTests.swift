@@ -1,6 +1,8 @@
 import XCTest
 @testable import JsBaoClient
 
+// The experimental resource-metadata API compiles only under the condition.
+#if PRIMITIVE_EXPERIMENTAL_APIS
 /// Live tests for the resource-metadata value API (`client.resourceMetadata.*`)
 /// against the local dev server — the Swift mirror of the JS client's
 /// `tests/client/js-bao-client-resource-metadata.test.ts` (#1352 / #1402 /
@@ -397,3 +399,4 @@ final class ResourceMetadataTests: XCTestCase {
         }
     }
 }
+#endif

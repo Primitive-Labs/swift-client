@@ -291,19 +291,19 @@ final class RecordLogIncrementHermeticTests: XCTestCase {
 
     // MARK: - Behavior 31: the wire version
 
-    func testEveryOpenDeclaresWireVersionThreeTheBarrierIncluded() async throws {
+    func testEveryOpenDeclaresWireVersionFourTheBarrierIncluded() async throws {
         let h = try await harness()
         try h.save("r1", ["t": 1])
         try h.save("r2", ["t": 2])
         await h.session.start()
-        XCTAssertEqual(h.of("record.open").first?["wireVersion"], 3)
+        XCTAssertEqual(h.of("record.open").first?["wireVersion"], 4) // 4 since #5897
         // The room judged numbers this store never minted: re-minted, and the old
         // id opened again once its owed answers do not come.
         var reopened = H.opened(lsn: 0)
         reopened["lastSeq"] = 7
         await h.feed(reopened)
         await until("the barrier re-open", timeout: 5) { h.of("record.open").count >= 2 }
-        for frame in h.of("record.open") { XCTAssertEqual(frame["wireVersion"], 3, "\(frame)") }
+        for frame in h.of("record.open") { XCTAssertEqual(frame["wireVersion"], 4, "\(frame)") }
         XCTAssertEqual(JsBaoErrorCode.db3ConditionNotMet.rawValue, "DB3_CONDITION_NOT_MET")
         XCTAssertEqual(JsBaoErrorCode.db3RecordNotFound.rawValue, "DB3_RECORD_NOT_FOUND")
         XCTAssertEqual(JsBaoErrorCode.db3ClientOutdated.rawValue, "DB3_CLIENT_OUTDATED")

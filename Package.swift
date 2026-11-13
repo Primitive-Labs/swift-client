@@ -11,6 +11,16 @@
 // `PluginDeprecationHermeticTests` keeps the two in step.
 import PackageDescription
 
+// The experimental APIs (`- Stability: experimental` in `Sources/`) compile
+// only under the `PRIMITIVE_EXPERIMENTAL_APIS` condition. It is defined unless
+// the build environment sets `PRIMITIVE_EXPERIMENTAL_APIS=0` (only the literal
+// `0`), which makes a production build: `PRIMITIVE_EXPERIMENTAL_APIS=0 swift
+// build`. The published mirrors carry this line patched to a constant
+// (`scripts/publish-swift-packages.sh`): `false` on the production branch,
+// `true` on every other channel.
+let experimentalApis = true
+let experimentalApiSettings: [SwiftSetting] = experimentalApis ? [.define("PRIMITIVE_EXPERIMENTAL_APIS")] : []
+
 let package = Package(
     name: "JsBaoClient",
     platforms: [
@@ -138,6 +148,22 @@ let package = Package(
                 // on a branch of the mirror or on a path (CHANGELOG.md, "How
                 // this package is versioned"), and SwiftPM allows both.
                 .unsafeFlags(["-O2"], .when(configuration: .debug)),
+                // Keeps the release sources' warnings out of every app's build
+                // log, without editing files `BundledSQLiteHermeticTests` holds
+                // byte for byte. `-fno-modules` removes the cause of the
+                // `MIN`/`MAX` conflict (`-Wambiguous-macro`): the build systems
+                // compile this target with clang modules on, which makes the
+                // SDK's `sys/param.h` macros visible in `sqlite3.c`, a file that
+                // never includes it; no warning is suppressed for it. The two
+                // `-Wno-` flags name exactly the families the release sources
+                // trip (`sqlite3.c`'s 64-to-32 narrowing, `vec1.c`'s `&&` within
+                // `||`), which only an edit could fix. `jsbao_init.c`, ours,
+                // keeps every other family; no `-w`. A target's own flags
+                // follow the build system's under `swiftbuild`, `native` and
+                // Xcode, so these take effect. `unsafeFlags`: see `-O2` above.
+                // `BundledSQLiteWarningsHermeticTests` compiles each source
+                // with these flags and requires no warning.
+                .unsafeFlags(["-fno-modules", "-Wno-shorten-64-to-32", "-Wno-logical-op-parentheses"]),
             ]
         ),
         .target(
@@ -148,8 +174,9 @@ let package = Package(
                 .product(name: "TOMLKit", package: "TOMLKit"),
             ],
             path: "Sources/JsBaoClient",
-            // No `swiftSettings:` here any more — the whole package is in the
-            // Swift 6 language mode via `swiftLanguageModes: [.v6]` at the
+            // The only setting is the experimental-API condition above; no
+            // language-mode setting here any more — the whole package is in
+            // the Swift 6 language mode via `swiftLanguageModes: [.v6]` at the
             // bottom of this manifest (#2310). This target carried the only
             // per-target opt-in between #1946 and #2310.
             //
@@ -160,6 +187,7 @@ let package = Package(
             // `--require-zero`. `run-tests.sh` runs it that way before the
             // suite. Its first check is that the committed mode is still `.v6`
             // — a silent revert would otherwise read as "zero sites".
+            swiftSettings: experimentalApiSettings
         ),
         .target(
             name: "JsBaoClientUI",
@@ -201,7 +229,8 @@ let package = Package(
             // fixtures (#4727) and the vector codec and rule fixtures (#5225)
             // are JSON the JS and Swift suites both read by path, not bundle
             // resources; the vector codegen golden's TOML is read by path the
-            // same way. `JsBaoSQLiteProbe` is its own executable target too,
+            // same way, and so are the shared-enum model fixture's TOMLs
+            // (#5896). `JsBaoSQLiteProbe` is its own executable target too,
             // and the store the earlier bundled SQLite wrote (#5227) is read
             // by path.
             exclude: [
@@ -209,11 +238,16 @@ let package = Package(
                 "CrossPlatform/E2E",
                 "Fixtures/AgentSessionRows",
                 "Fixtures/BundledSQLite",
+                "Fixtures/Db3Enums",
                 "Fixtures/Db3Vectors",
                 "Fixtures/DocumentIngestChunks",
                 "Fixtures/RoleCompatResponses",
                 "Schema/CodegenVector/vector-note.toml",
-            ]
+                "Schema/CodegenSharedEnum/db3-types",
+                "Schema/CodegenSharedEnum/schemas",
+                "Schema/CodegenSharedEnum/functions",
+            ],
+            swiftSettings: experimentalApiSettings
         ),
         .testTarget(
             name: "SwiftBaoCodegenTests",

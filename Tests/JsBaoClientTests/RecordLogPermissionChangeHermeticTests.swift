@@ -5,7 +5,7 @@ import XCTest
 /// db3 reaches its store: the twin of js-bao's `permissionChanged`.
 ///
 /// `RecordLogDocumentBinding.applyPermissionChange` marks the store `read` on
-/// `.reader` (a commit then throws `.accessDenied` and commits nothing) and
+/// `.reader` (a commit then throws `.writeAccessDenied` and commits nothing) and
 /// lifts it on `.readWrite`, `.admin` and `.owner`. A `refused` mark (a
 /// revoked grant) is the room's to lift and never changes. The client applies
 /// a `permission` frame, and a `docMetadata` frame carrying one, to the bound
@@ -49,7 +49,7 @@ final class RecordLogPermissionChangeHermeticTests: XCTestCase {
         XCTAssertEqual(try binding.refreshMarks().permission, RecordLogPermission.read)
         XCTAssertTrue(binding.isReadOnly)
         XCTAssertThrowsError(try save(binding, "refused")) { error in
-            XCTAssertEqual((error as? JsBaoError)?.code, .accessDenied)
+            XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
         }
         // E1's twin: what was committed before stays for the room to judge.
         XCTAssertEqual(try binding.refreshMarks().pending, pending)

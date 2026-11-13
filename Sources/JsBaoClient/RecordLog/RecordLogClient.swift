@@ -1,6 +1,23 @@
 import Foundation
 import YSwift
 
+/// Every document id any client in this process has bound as a record-log
+/// (format-3) document.
+///
+/// A document's format is fixed when it is created, so an id stays here after
+/// its document closes and after its client is released: a row read from it
+/// is read as a db3 row later too (``PrimitiveRecord/holds(_:in:)``), with no
+/// reference to whichever client is the default by then.
+///
+/// `ids` is read and written only under `lock`.
+enum RecordLogDocumentIds {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var ids: Set<String> = []
+
+    static func note(_ documentId: String) { lock.withLock { _ = ids.insert(documentId) } }
+    static func contains(_ documentId: String) -> Bool { lock.withLock { ids.contains(documentId) } }
+}
+
 /// The client's record-log (format-3) state, built on first use.
 ///
 /// A client that never opens a format-3 document builds none of this — no
@@ -52,6 +69,7 @@ final class RecordLogClientState: @unchecked Sendable {
     var isEmpty: Bool { lock.withLock { _bindings.isEmpty } }
 
     func set(_ binding: RecordLogDocumentBinding, _ session: RecordLogSession, for documentId: String) {
+        RecordLogDocumentIds.note(documentId)
         lock.withLock {
             _bindings[documentId] = binding
             _sessions[documentId] = session

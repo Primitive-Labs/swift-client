@@ -312,7 +312,7 @@ final class RoleSurfacesHermeticTests: XCTestCase {
         XCTAssertFalse(client.contains("groupTypeConfigs"), "JsBaoClient still declares groupTypeConfigs")
         XCTAssertFalse(client.contains("collectionTypeConfigs"), "JsBaoClient still declares collectionTypeConfigs")
         XCTAssertTrue(
-            client.contains("public let databaseTypeConfigs: DatabaseTypeConfigsAPI"),
+            client.contains("public var databaseTypeConfigs: DatabaseTypeConfigsAPI"),
             "databaseTypeConfigs is not declared"
         )
         let sources = ClientSourceText.packageRoot.appendingPathComponent("Sources/JsBaoClient")

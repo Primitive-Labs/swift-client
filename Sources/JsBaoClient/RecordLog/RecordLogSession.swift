@@ -408,6 +408,32 @@ actor RecordLogSession {
     private var commitToken: UUID?
     private var commitFeed: AsyncStream<[RecordLogPendingEntry]>.Continuation?
     private var commitConsumer: Task<Void, Never>?
+    /// The saves the last catch-up dealt with (queued if unjudged, answered
+    /// otherwise), for a commit notice the commit task delivers only after
+    /// it. A save is named by its number and its ticket
+    /// (``RecordLogDocumentBinding/ticket(of:)``): a failed group gives its
+    /// numbers back, and the save that takes one again is a new entry with a
+    /// newer ticket, which still goes.
+    private var handedThrough: HandedThrough?
+
+    /// What ``handedThrough`` holds: every save numbered at or below
+    /// `minted` with a ticket at or below `mintedTicket`, and the saves the
+    /// catch-up read above `minted` (`read`) with a ticket at or below `readTicket`.
+    private struct HandedThrough {
+        let writer: String
+        let minted: Int
+        let mintedTicket: Int
+        let read: Set<Int>
+        let readTicket: Int
+
+        /// Whether the catch-up dealt with the save numbered `seq` that holds `ticket`.
+        func dealtWith(_ seq: Int, ticket: Int) -> Bool {
+            seq <= minted ? ticket <= mintedTicket : read.contains(seq) && ticket <= readTicket
+        }
+    }
+    /// Run once by the next catch-up between reading the watermark and
+    /// reading the pending entries: the hermetic tests' way to commit a write there.
+    private var betweenCatchUpReads: (@Sendable () -> Void)?
     /// The load the room said is applying (`record.load started`): results stall behind its numbers on purpose.
     private var loadInProgress: String?
     /// Completed loads announced while the session was busy, received once it is open.
@@ -744,7 +770,7 @@ actor RecordLogSession {
         // sends them again only for another one.
         // An entry held from before vectors (#5225) lacks the encodings: the
         // room sends the declarations again, with them, when no hash is sent.
-        if marks.typed == .yes, marks.vectorsKnown, let hash = marks.db3Type?.hash { open["db3TypeHash"] = .string(hash) }
+        if marks.typed == .yes, marks.vectorsKnown, marks.enumsKnown, let hash = marks.db3Type?.hash { open["db3TypeHash"] = .string(hash) }
         openedOnConnection += 1
         history.opened.insert(current.writer)
         declaredThisOpen = []
@@ -1046,8 +1072,9 @@ actor RecordLogSession {
 
     /// What a `record.opened` says of the db3's type (#5020): no `db3Type` key
     /// is an untyped room; an object with a string `name` and `hash` (and,
-    /// when sent, `models` of field kinds, and `vectors` of each vector field's
-    /// encoding, #5225) is the room's type. A malformed value changes nothing.
+    /// when sent, `models` of field kinds, `vectors` of each vector field's
+    /// encoding, #5225, and `enums` of each enforced field's values, #5897) is
+    /// the room's type. A malformed value changes nothing.
     private func typeOfOpened(_ frame: [String: JSONValue]) -> RecordLogTypeUpdate? {
         guard let value = frame["db3Type"], value != .null else { return .untyped }
         guard let object = value.objectValue, let name = object["name"]?.stringValue, !name.isEmpty,
@@ -1073,7 +1100,12 @@ actor RecordLogSession {
             guard let read = recordLogVectorDeclarations(sent) else { return malformed() }
             vectors = read
         }
-        return .typed(name: name, hash: hash, models: declarations, vectors: vectors)
+        var enums: RecordLogEnumDeclarations?
+        if let sent = object["enums"], sent != .null {
+            guard let read = recordLogEnumDeclarations(sent) else { return malformed() }
+            enums = read
+        }
+        return .typed(name: name, hash: hash, models: declarations, vectors: vectors, enums: enums)
 
         func malformed() -> RecordLogTypeUpdate? {
             logger?.warn("[record-log]", documentId, "— record.opened carried a db3Type this client cannot read; the type it holds is kept")
@@ -1469,8 +1501,26 @@ actor RecordLogSession {
             logUnderivable(underivable)
             reopenAfterCatchUp = true
         }
+        // The watermark is read before the entries. A commit runs outside this
+        // actor and writes its entry to the store before its number reaches
+        // the marks, so every number at or below `minted` is in `pending`
+        // unless the room already answered it. A commit landing between the
+        // two reads is then in `pending` (queued below) or past the watermark
+        // (its notice sends it), never covered by a watermark that skips it.
+        // The watermark is read with the newest save's ticket: a failed group
+        // gives its numbers back without lowering the watermark, and a save
+        // that takes one again holds a newer ticket, so its notice still sends it.
+        let (minted, mintedTicket) = binding.savesThrough()
+        if let hook = betweenCatchUpReads {
+            betweenCatchUpReads = nil
+            hook()
+        }
         let pending = try binding.store.pendingOf(current.writer)
         let unsent = pending.filter { $0.acked == nil }
+        handedThrough = HandedThrough(
+            writer: current.writer, minted: minted, mintedTicket: mintedTicket,
+            read: Set(pending.map(\.seq).filter { $0 > minted }), readTicket: binding.lastSaveTicket()
+        )
         if let ahead, !ahead.refused {
             // The marks are read again, as the resume check below does, so the
             // open reports them as the catch-up left them.
@@ -2288,12 +2338,30 @@ actor RecordLogSession {
     /// This writer's entries committed: they go to the room once the document is open.
     private func committed(_ entries: [RecordLogPendingEntry]) {
         guard phase == .open else { return }
+        // A notice heard late: the catch-up already queued the entry, or the
+        // room already answered it, and an answered entry must not go again.
+        // A save it cannot place (no ticket) goes: the room answers a number
+        // it holds from its mark.
+        let entries = entries.filter { entry in
+            guard let handed = handedThrough, handed.writer == binding.writer,
+                  let ticket = binding.ticket(of: entry.seq) else { return true }
+            return !handed.dealtWith(entry.seq, ticket: ticket)
+        }
+        guard !entries.isEmpty else { return }
         declareIfChanged()
         for entry in entries {
             declareFirstWrites(entry)
             sender.enqueue(entry.wire)
         }
     }
+
+    /// A commit notice delivered as late as the commit task may run
+    /// (``attach()``): the hermetic tests' way to hold it back.
+    func hearCommitted(_ entries: [RecordLogPendingEntry]) { committed(entries) }
+
+    /// Run `hook` once, inside the next catch-up, between its two reads of
+    /// the store (``caughtUp(_:underivable:)``).
+    func runBetweenCatchUpReads(_ hook: (@Sendable () -> Void)?) { betweenCatchUpReads = hook }
 
     // MARK: - Declarations (#5160)
 

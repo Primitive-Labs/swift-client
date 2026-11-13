@@ -161,10 +161,10 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = requiredTags
         self.email = record["email"]?.asString
         self.boundedName = record["boundedName"]?.asString
-        self.`default` = record["default"]?.asString
+        self.`default` = record.holds("default") == false ? "fallback" : record["default"]?.asString
         self.`where` = record["where"]?.asString
-        self.score = record["score"]?.asNumber
-        self.active = record["active"]?.asBoolean
+        self.score = record.holds("score") == false ? 100 : record["score"]?.asNumber
+        self.active = record.holds("active") == false ? true : record["active"]?.asBoolean
         self.related = .empty
         self._changedFields = []
     }
@@ -179,10 +179,10 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = requiredTags
         self.email = row["email"]?.stringValue
         self.boundedName = row["boundedName"]?.stringValue
-        self.`default` = row["default"]?.stringValue
+        self.`default` = PrimitiveRecord.holds("default", in: row) == false ? "fallback" : row["default"]?.stringValue
         self.`where` = row["where"]?.stringValue
-        self.score = row["score"]?.numberValue
-        self.active = row["active"]?.rowBoolValue
+        self.score = PrimitiveRecord.holds("score", in: row) == false ? 100 : row["score"]?.numberValue
+        self.active = PrimitiveRecord.holds("active", in: row) == false ? true : row["active"]?.rowBoolValue
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }
@@ -489,6 +489,36 @@ public extension CrashTestRecord {
         copy.id = result.record.id
         copy.discardChanges()
         return copy
+    }
+
+    /// The fields `save(in:upsertOn:)` may name: each one a unique
+    /// constraint covers on its own.
+    enum UniqueField: String, Sendable {
+        case email = "email"
+    }
+
+    /// `save(in:upsertOn:)` by one of the model's unique fields.
+    @discardableResult
+    func save(in documentId: String, upsertOn: UniqueField) throws -> CrashTestRecord {
+        try save(in: documentId, upsertOn: upsertOn.rawValue)
+    }
+
+    /// The unique constraints `upsertByUnique` may name.
+    enum UniqueConstraint: String, Sendable {
+        case crashTest_email_unique = "crashTest_email_unique"
+        case name_score_combo = "name_score_combo"
+    }
+
+    /// `upsertByUnique(_:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, mode: UpsertMode = .either, in documentId: String) throws -> CrashTestRecord {
+        try upsertByUnique(constraint.rawValue, mode: mode, in: documentId)
+    }
+
+    /// `upsertByUnique(_:lookupValue:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> CrashTestRecord {
+        try upsertByUnique(constraint.rawValue, lookupValue: lookupValue, mode: mode, in: documentId)
     }
 
     /// Delete this record from document `documentId`. Throws if the doc isn't open.

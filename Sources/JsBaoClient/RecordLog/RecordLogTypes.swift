@@ -639,16 +639,19 @@ enum RecordLogHandBackCode {
         "DOCUMENT_EPOCH_NOT_OPEN", "DOCUMENT_STORE_PURGED", "DOCUMENT_EPOCH_BUDGET",
         "DOCUMENT_ENTRY_TOO_LARGE", "DOCUMENT_ENTRY_INVALID", "WRITE_ACCESS_DENIED",
         "DB3_CONDITION_NOT_MET", "DB3_RECORD_NOT_FOUND", "DB3_TRIGGER_REFUSED", "DB3_MODEL_NOT_DECLARED",
-        "DB3_VECTOR_INVALID",
+        "DB3_VECTOR_INVALID", "DB3_VALUE_NOT_IN_ENUM",
     ]
 }
 
 /// The wire version this client declares on `record.open`: 2 since the
 /// `increment` entry kind, 3 since the room's head (#5221), which a room sends
 /// on `record.opened`, `record.results` and `record.catchUpPage` only to a
-/// client declaring 3 or above. A room whose minimum is above it refuses the
-/// open `DB3_CLIENT_OUTDATED`; a room at a higher version is compatible.
-let recordLogWireVersion = 3
+/// client declaring 3 or above, 4 since `DB3_VALUE_NOT_IN_ENUM` (#5897), which
+/// a room sends only to a client declaring 4 or above (an older one is sent
+/// `DOCUMENT_ENTRY_INVALID` for the same refusal). A room whose minimum is
+/// above it refuses the open `DB3_CLIENT_OUTDATED`; a room at a higher version
+/// is compatible.
+let recordLogWireVersion = 4
 
 /// What a frame from the room said of its head (#5221): `head`, the room's
 /// last accepted log number when it built the frame, and `receivedAt`, when

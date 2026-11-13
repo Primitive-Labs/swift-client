@@ -57,15 +57,29 @@ final class SwiftSixLanguageModeTests: XCTestCase {
         )
     }
 
-    /// A per-target `swiftSettings` override wins over the package pin, so the
+    /// A per-target language-mode setting wins over the package pin, so the
     /// library target must not carry one — with the package at `.v6` the only
-    /// reason to add one back would be to opt out.
+    /// reason to add one back would be to opt out. Its only `swiftSettings`
+    /// are the experimental-API condition (#5360), which defines a compile
+    /// condition and nothing else.
     func testJsBaoClientTargetDoesNotOverrideThePackageMode() throws {
         let target = try Self.jsBaoClientTargetDeclaration()
-        XCTAssertFalse(
-            target.contains("swiftSettings:"),
-            "the JsBaoClient target inherits .v6 from the package pin — a swiftSettings override can only weaken it"
-        )
+        let manifest = ClientSourceText.stripComments(try Self.manifest())
+        if target.contains("swiftSettings:") {
+            XCTAssertTrue(
+                target.contains("swiftSettings: experimentalApiSettings"),
+                "the JsBaoClient target inherits .v6 from the package pin — a swiftSettings override can only weaken it"
+            )
+            XCTAssertTrue(
+                manifest.contains(
+                    "let experimentalApiSettings: [SwiftSetting] = experimentalApis ? [.define(\"PRIMITIVE_EXPERIMENTAL_APIS\")] : []"
+                ),
+                "the experimental-API settings may only define the compile condition"
+            )
+        }
+        for override in ["swiftLanguageMode", ".swiftLanguageVersion", "unsafeFlags"] {
+            XCTAssertFalse(target.contains(override), "the JsBaoClient target must not carry \(override)")
+        }
     }
 
     /// The anchor above has to actually be the target's, or the test before it

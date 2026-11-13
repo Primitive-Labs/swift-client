@@ -34,8 +34,8 @@ struct SharedEnums {
     /// The stems read, in name order.
     var stems: [String] { (Array(defs.keys) + Array(unreadable.keys)).sorted() }
 
-    /// The enum's values in the def's order; throws the refusal's sentence.
-    private func resolve(_ ref: TOMLValue) throws -> [String] {
+    /// The def and its values in the def's order; throws the refusal's sentence.
+    private func resolve(_ ref: TOMLValue) throws -> (def: SharedEnumRef, values: [String]) {
         let fail = { (message: String) in Refusal(message: message) }
         if let text = ref.string, let hash = text.firstIndex(of: "#") {
             throw fail("a projection (\(text[hash...])) applies to a db3 model ref and a shared enum has none; drop the suffix.")
@@ -64,7 +64,7 @@ struct SharedEnums {
         throw fail("no schemas/ file declares \(name); fix the name, or add [defs.\(name)] to a schemas/ file\(note).")
     }
 
-    private func inFile(_ file: String, _ name: String) throws -> [String] {
+    private func inFile(_ file: String, _ name: String) throws -> (def: SharedEnumRef, values: [String]) {
         let source = "schemas/\(file).toml"
         if let line = unreadable[file] { throw Refusal(message: "\(source) could not be read (\(line)); fix the file.") }
         guard let table = defs[file] else {
@@ -75,7 +75,7 @@ struct SharedEnums {
             throw Refusal(message: "\(source) declares no \(name)\(names); fix the name, or add [defs.\(name)] there.")
         }
         do {
-            return try Self.sharedEnumValues(def.table ?? TOMLTable())
+            return (SharedEnumRef(file: file, name: name), try Self.sharedEnumValues(def.table ?? TOMLTable()))
         } catch let what as Refusal {
             throw Refusal(message: "\(source)#\(name) is not a shared enum: it declares \(what.message); a db3 field refs only a def with type = \"string\" and a non-empty enum of distinct strings.")
         }
@@ -105,9 +105,12 @@ struct SharedEnums {
         return value.int.map(String.init) ?? value.debugDescription
     }
 
-    /// Expand every field `ref` of a parsed type document in place.
-    func expand(_ document: TOMLTable) throws {
-        guard let models = document["models"]?.table else { return }
+    /// Expand every field `ref` of a parsed type document in place, and
+    /// answer the def each one named, by model then field (#5896).
+    @discardableResult
+    func expand(_ document: TOMLTable) throws -> [String: [String: SharedEnumRef]] {
+        var named: [String: [String: SharedEnumRef]] = [:]
+        guard let models = document["models"]?.table else { return named }
         for model in models.keys {
             guard let fields = models[model]?.table?["fields"]?.table else { continue }
             for field in fields.keys {
@@ -119,14 +122,16 @@ struct SharedEnums {
                     throw CodegenError.sharedEnumRef(message: "\(prefix)\(beside.joined(separator: " and ")) cannot sit beside ref; the shared enum supplies \(it), so remove \(them).")
                 }
                 do {
-                    let values = try resolve(ref)
+                    let (def, values) = try resolve(ref)
                     table.remove(at: "ref")
                     table["type"] = "string"
                     table["enum"] = TOMLArray(values)
+                    named[model, default: [:]][field] = def
                 } catch let refusal as Refusal {
                     throw CodegenError.sharedEnumRef(message: prefix + refusal.message)
                 }
             }
         }
+        return named
     }
 }

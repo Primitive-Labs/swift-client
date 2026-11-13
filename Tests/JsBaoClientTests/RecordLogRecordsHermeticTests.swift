@@ -119,7 +119,7 @@ final class RecordLogRecordsHermeticTests: XCTestCase {
         _ = try fixture.binding.store.setState(writer: fixture.binding.writer, permission: .some("read"))
         _ = try fixture.binding.refreshMarks()
         XCTAssertThrowsError(try records.put("Memo", ["title": "x"])) { error in
-            XCTAssertEqual((error as? JsBaoError)?.code, .accessDenied)
+            XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
         }
         XCTAssertEqual(try pending(fixture).count, 0, "a read-only document sends nothing")
     }

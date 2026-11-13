@@ -16,6 +16,52 @@ struct RecordLogDeclaredType: Equatable, Sendable {
     var models: [String: [String: String]]
     /// Per model declaring one, each vector field's encoding (#5225).
     var vectors: RecordLogVectorDeclarations = [:]
+    /// Per model enforcing one, each enforced field's enum values (#5897).
+    var enums: RecordLogEnumDeclarations = [:]
+}
+
+/// How many of an enum's values a refusal lists before it says how many more.
+private let recordLogEnumValuesShown = 20
+
+/// The longest written string (UTF-16 code units) a refusal quotes.
+private let recordLogWrittenQuotedMax = 64
+
+/// `text` as JavaScript's `JSON.stringify` writes it: quoted, with `"` and `\`
+/// escaped, `\b \f \n \r \t` by name, any other code unit below U+0020 as
+/// `\u00xx`, and everything else (`/` and non-ASCII included) as it is.
+func recordLogJSONStringify(_ text: String) -> String {
+    var out = "\""
+    for scalar in text.unicodeScalars {
+        switch scalar {
+        case "\"": out += "\\\""
+        case "\\": out += "\\\\"
+        case "\u{08}": out += "\\b"
+        case "\u{0C}": out += "\\f"
+        case "\n": out += "\\n"
+        case "\r": out += "\\r"
+        case "\t": out += "\\t"
+        default:
+            if scalar.value < 0x20 {
+                let hex = String(scalar.value, radix: 16)
+                out += "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
+            } else {
+                out.unicodeScalars.append(scalar)
+            }
+        }
+    }
+    return out + "\""
+}
+
+/// The room's refusal of a value outside an enforced enum, word for word
+/// (#5897): `<model> id=<id>: field "<field>" takes one of <values>; the
+/// write is <value>`, the values cut at 20 (`… and N more`) and a string over
+/// 64 UTF-16 code units named by its length.
+func recordLogEnumRefusalMessage(model: String, id: String, field: String, values: [String], written: String) -> String {
+    let listed = values.count > recordLogEnumValuesShown
+        ? values.prefix(recordLogEnumValuesShown).joined(separator: ", ") + " … and \(values.count - recordLogEnumValuesShown) more"
+        : values.joined(separator: ", ")
+    let value = written.utf16.count > recordLogWrittenQuotedMax ? "a string of \(written.utf16.count) characters" : recordLogJSONStringify(written)
+    return "\(model) id=\(id): field \"\(field)\" takes one of \(listed); the write is \(value)"
 }
 
 /// What a written value is, for a vector refusal's message (#5225): js-bao's
@@ -142,7 +188,10 @@ private func recordLogReceivedKind(_ value: JSONValue) -> String {
 /// and a field the type does not declare are not judged. `m` is the first
 /// mutation, `also[i]` the others. A vector field (#5225) is judged first, by
 /// the room's vector rule (``recordLogVectorMutationsProblem``),
-/// `.db3VectorInvalid`.
+/// `.db3VectorInvalid`. Once a mutation's values are of their declared kinds,
+/// a string of a field whose enum the type enforces that is not one of its
+/// values is `.db3ValueNotInEnum` (#5897; an increment and a delete are not
+/// judged by it), fields in code-unit order as the room judges them.
 func recordLogDeclaredTypeProblem(
     _ mutations: [RecordLogMutation], _ type: RecordLogDeclaredType
 ) -> (code: JsBaoErrorCode, message: String)? {
@@ -183,8 +232,49 @@ func recordLogDeclaredTypeProblem(
                 return refuse(field, declared, "a string-set change")
             }
         }
+        if let outside = recordLogEnumMutationProblem(place, m, type.enums) { return outside }
     }
     return nil
+}
+
+/// Why mutation `m` (named `place`) writes a string outside a field's
+/// enforced enum, or `nil`; fields in code-unit order as the room judges
+/// them. A `null`, absent or non-string value, an increment and a delete
+/// are not judged here: a non-string value of an enforced (string) field is
+/// the type rule's to refuse. Membership is exact, code unit for code unit,
+/// as the room's `Set.has` is: Swift's `==` on `String` takes canonically
+/// equivalent sequences (a composed and a decomposed "é") for equal, the
+/// room does not.
+private func recordLogEnumMutationProblem(
+    _ place: String, _ m: RecordLogMutation, _ enums: RecordLogEnumDeclarations
+) -> (code: JsBaoErrorCode, message: String)? {
+    guard m.kind != .increment, m.kind != .delete, let enforced = enums[m.model], let fields = m.fields else { return nil }
+    for field in enforced.keys.sorted(by: { Array($0.utf16).lexicographicallyPrecedes(Array($1.utf16)) }) {
+        guard let values = enforced[field], case .string(let text)? = fields[field],
+              !values.contains(where: { $0.utf16.elementsEqual(text.utf16) }) else { continue }
+        return (.db3ValueNotInEnum, "\(place): " + recordLogEnumRefusalMessage(model: m.model, id: m.id, field: field, values: values, written: text))
+    }
+    return nil
+}
+
+/// Refuse an entry that writes a string outside an enforced enum of the
+/// db3's type before it commits (#5897), as ``assertRecordLogDeclaredTypes``
+/// refuses it, judging nothing else: the check a model-free write runs,
+/// which leaves the type's other rules to the room. Nothing is judged
+/// without enforced enums.
+func assertRecordLogDeclaredEnums(
+    documentId: String, mutations: [RecordLogMutation], enums: RecordLogEnumDeclarations,
+    report: (DocumentWriteRefusedEvent) -> Void
+) throws {
+    guard !enums.isEmpty else { return }
+    for (at, m) in mutations.enumerated() {
+        guard let problem = recordLogEnumMutationProblem(at == 0 ? "m" : "also[\(at - 1)]", m, enums) else { continue }
+        let error = JsBaoError(
+            code: problem.code, message: problem.message, details: ["documentId": .string(documentId), "scope": "local"]
+        )
+        report(recordLogLocalRefusal(error, documentId: documentId, mutations: mutations))
+        throw error
+    }
 }
 
 /// Refuse an entry that breaks `type` before it commits: the room's code and

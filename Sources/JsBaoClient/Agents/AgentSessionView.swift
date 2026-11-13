@@ -297,15 +297,18 @@ public final class AgentSessionView: @unchecked Sendable {
     /// The session's info as `get` answered it, kept current by the server's
     /// change events (title, last activity, the dot, members, status) and read
     /// again after a reconnect; `refreshInfo()` reads it again on demand.
+    /// - Stability: beta
     public var info: AgentSessionInfo { lock.withLock { _info } }
 
     /// The session's id: also its db3's.
+    /// - Stability: beta
     public var sessionId: String { info.sessionId }
 
     /// The session's files: upload them, follow and control the upload
     /// queue, and read any file of the session, by `blobId`. Send an uploaded
     /// file with `send(text:files:)`. Queued uploads outlive the view; after
     /// `close()`, `upload` and `read` throw `.invalidArgument`.
+    /// - Stability: beta
     public var attachments: AgentSessionAttachments {
         lock.withLock {
             if let attachmentsOf { return attachmentsOf }
@@ -319,33 +322,41 @@ public final class AgentSessionView: @unchecked Sendable {
 
     /// The `Session` row, decoded; `nil` until it has synced or when it does
     /// not decode.
+    /// - Stability: beta
     public var session: AgentSessionRecord? { lock.withLock { sessionRecord } }
 
     /// The `Session` row's status; `nil` until it has synced. A status outside
     /// the vocabulary reads `.unknown(raw)`.
+    /// - Stability: beta
     public var status: AgentSessionStatus? { session?.status }
 
     /// The active turn the `Session` row names, or `nil`.
+    /// - Stability: beta
     public var activeTurnId: String? { session?.activeTurnId }
 
     /// The authors waiting behind the active turn, with their messages: the
     /// messages whose `queueSeq` is set, in its order, one entry per author.
+    /// - Stability: beta
     public var queue: [PrimitiveQueueEntry] { lock.withLock { queueEntries } }
 
     /// The session's members, the owner included: its `Member` rows, in the
     /// order they were added.
+    /// - Stability: beta
     public var members: [AgentSessionMemberRecord] { lock.withLock { memberRecords } }
 
     /// Why the room stopped syncing the session with this client, or `nil`.
     /// On `.permission` you are no longer a member: the view has evicted its
     /// local copy, shows nothing and runs no client tool. On `.syncOff` and
     /// `.clientOutdated` the copy is kept.
+    /// - Stability: beta
     public var gone: Db3GoneEvent? { lock.withLock { goneEvent } }
 
     /// The window's synced messages, oldest first, then your pending ones.
+    /// - Stability: beta
     public var messages: [AgentSessionViewMessage] { lock.withLock { view } }
 
     /// Whether older messages than the window's oldest remain (`loadOlder()`).
+    /// - Stability: beta
     public var hasOlder: Bool { lock.withLock { olderRemain } }
 
     /// Listen for changes: to the window, the session row or your pending
@@ -581,6 +592,7 @@ public final class AgentSessionView: @unchecked Sendable {
     // MARK: - Client tools
 
     /// Call ids a handler of this view is running now, in start order.
+    /// - Stability: beta
     public var runningClientToolCalls: [String] { lock.withLock { runningOrder } }
 
     /// Run client tools for this member: when the active turn is yours, each

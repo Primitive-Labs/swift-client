@@ -483,7 +483,7 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         XCTAssertThrowsError(try fixture.binding.commit([RecordLogWrite(mutations: [
             RecordLogMutation(model: "Note", id: "c", kind: .create, fields: ["title": "c"]),
         ])])) { error in
-            XCTAssertEqual((error as? JsBaoError)?.code, .accessDenied)
+            XCTAssertEqual((error as? JsBaoError)?.code, .writeAccessDenied)
         }
         await fixture.session.adoptWriteAccess()
         XCTAssertFalse(fixture.binding.isReadOnly, "a connect with write access lifts it")
@@ -1280,6 +1280,97 @@ final class RecordLogSessionHermeticTests: XCTestCase {
         await eventually("the entry committed meanwhile") { fixture.connection.last("record.entries") != nil }
         try await Task.sleep(nanoseconds: 20_000_000)
         XCTAssertEqual(fixture.connection.types(), ["record.entries"])
+        XCTAssertEqual(entryFrames(fixture.connection), [[2]])
+    }
+
+    /// The session hears its commits on a task of its own, which a busy machine
+    /// may run only after the catch-up completed: a notice for an entry the
+    /// room already acknowledged sends nothing again, and one for an entry the
+    /// catch-up queued sends it once.
+    func testACommitNoticeHeardAfterTheCatchUpSendsNoAcknowledgedEntryAgain() async throws {
+        let fixture = try await makeFixture()
+        let binding = fixture.binding
+        let first = try write(binding, "r1")
+        await fixture.session.start()
+        await fixture.session.receive(pagedOpened(4))
+        let second = try write(binding, "r2")
+        await fixture.session.receive(acks([1], from: 5, writer: binding.writer))
+        fixture.connection.clear()
+        await fixture.session.receive(lastPage(4))
+        await fixture.session.hearCommitted([first])
+        await fixture.session.hearCommitted([second])
+        await eventually("the entry committed meanwhile") { fixture.connection.last("record.entries") != nil }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(entryFrames(fixture.connection), [[2]])
+    }
+
+    /// A save commits outside the session, while the catch-up reads the
+    /// store: between its read of the watermark and its read of the pending
+    /// entries. The entry still goes to the room, once.
+    func testASaveCommittedWhileTheCatchUpReadsTheStoreStillGoesOnce() async throws {
+        let fixture = try await makeFixture()
+        let binding = fixture.binding
+        try write(binding, "r1")
+        await fixture.session.start()
+        await fixture.session.receive(pagedOpened(4))
+        await fixture.session.receive(acks([1], from: 5, writer: binding.writer))
+        fixture.connection.clear()
+        let committed = LockedBox<Result<Int, Error>?>(nil)
+        await fixture.session.runBetweenCatchUpReads {
+            let outcome = Result { () throws -> Int in
+                let entry = try binding.commit([RecordLogWrite(mutations: [
+                    RecordLogMutation(model: "Note", id: "r2", kind: .create, fields: ["title": "r2"]),
+                ])])[0]
+                try binding.store.flush()
+                return entry.seq
+            }
+            committed.value = outcome
+        }
+        await fixture.session.receive(lastPage(4))
+        XCTAssertEqual(try committed.value?.get(), 2, "the save committed between the catch-up's reads")
+        await eventually("the entry committed between the reads") { fixture.connection.last("record.entries") != nil }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(entryFrames(fixture.connection), [[2]])
+    }
+
+    /// 5897-I4: a group that fails to commit gives its numbers back, and the
+    /// binding's cached watermark does not go down with them. A catch-up that
+    /// runs after the failure covers the number; the next save takes it again
+    /// and is a new entry, which goes to the room once.
+    func testASaveThatReusesAFailedGroupsNumberAfterTheCatchUpIsSentOnce() async throws {
+        let provider = try await makeProvider()
+        try provider.withConnection { connection in
+            try connection.executeScript("PRAGMA foreign_keys=ON")
+            try connection.executeScript("CREATE TABLE commit_parent (id TEXT PRIMARY KEY)")
+            try connection.executeScript(
+                "CREATE TABLE commit_child (pid TEXT REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+            )
+        }
+        let fixture = try await makeFixture(provider: provider)
+        let binding = fixture.binding
+        try write(binding, "r1")
+        await fixture.session.start()
+        await fixture.session.receive(pagedOpened(4))
+        await fixture.session.receive(acks([1], from: 5, writer: binding.writer))
+        // A save whose group fails while the catch-up pages: number 2 goes back.
+        provider.recordLogGroupCommit.commitAfterMs = 60_000
+        let lost = try binding.commit([RecordLogWrite(mutations: [
+            RecordLogMutation(model: "Note", id: "lost", kind: .create, fields: ["title": "lost"]),
+        ])])[0]
+        try binding.store.save { sql in try sql.exec("INSERT INTO commit_child (pid) VALUES ('missing')") }
+        try binding.store.flush()
+        provider.recordLogGroupCommit.commitAfterMs = 0
+        XCTAssertEqual(lost.seq, 2)
+        XCTAssertEqual(try binding.store.pendingOf(binding.writer).map(\.seq), [1], "the failed group's entry rolled back")
+        fixture.connection.clear()
+        await fixture.session.receive(lastPage(4))
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(entryFrames(fixture.connection), [], "nothing unsent when the catch-up ends")
+
+        let kept = try write(binding, "kept")
+        XCTAssertEqual(kept.seq, 2, "the failed group's number is minted again")
+        await eventually("the save under the reused number") { fixture.connection.last("record.entries") != nil }
+        try await Task.sleep(nanoseconds: 20_000_000)
         XCTAssertEqual(entryFrames(fixture.connection), [[2]])
     }
 }

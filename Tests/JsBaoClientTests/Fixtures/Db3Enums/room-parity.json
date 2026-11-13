@@ -1,0 +1,442 @@
+{
+  "type": {
+    "name": "workspace",
+    "models": {
+      "tasks": {
+        "title": "string",
+        "status": "string",
+        "kind": "string",
+        "many": "string",
+        "blank": "string",
+        "valueOf": "string",
+        "accent": "string"
+      },
+      "constructor": {
+        "valueOf": "string"
+      }
+    },
+    "enums": {
+      "tasks": {
+        "status": [
+          "open",
+          "doing",
+          "done"
+        ],
+        "many": [
+          "v0",
+          "v1",
+          "v2",
+          "v3",
+          "v4",
+          "v5",
+          "v6",
+          "v7",
+          "v8",
+          "v9",
+          "v10",
+          "v11",
+          "v12",
+          "v13",
+          "v14",
+          "v15",
+          "v16",
+          "v17",
+          "v18",
+          "v19",
+          "v20",
+          "v21",
+          "v22",
+          "v23",
+          "v24"
+        ],
+        "blank": [
+          "",
+          "a"
+        ],
+        "valueOf": [
+          "x"
+        ],
+        "accent": [
+          "café",
+          "naïve"
+        ]
+      },
+      "constructor": {
+        "valueOf": [
+          "x"
+        ]
+      }
+    }
+  },
+  "cases": [
+    {
+      "label": "an in-set value",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "open"
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "null",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": null
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "an absent field",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "title": "t"
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "a patch of another field",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "patch",
+          "fields": {
+            "title": "t"
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "an unenforced enum's outside value",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "kind": "zzz"
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "a delete",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "delete"
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "the empty string as a member",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "blank": ""
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "an outside value",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "archived"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is \"archived\""
+      }
+    },
+    {
+      "label": "a patch",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "patch",
+          "fields": {
+            "status": "closed"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is \"closed\""
+      }
+    },
+    {
+      "label": "an also mutation",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "open"
+          }
+        },
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "patch",
+          "fields": {
+            "status": "nope"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "also[0]: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is \"nope\""
+      }
+    },
+    {
+      "label": "quotes and a slash",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "a \"q\" / b\\c"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is \"a \\\"q\\\" / b\\\\c\""
+      }
+    },
+    {
+      "label": "non-ASCII",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "café ✓ 😀"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is \"café ✓ 😀\""
+      }
+    },
+    {
+      "label": "a control character",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "a\nb\u0001"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is \"a\\nb\\u0001\""
+      }
+    },
+    {
+      "label": "more than 20 values",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "many": "x"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"many\" takes one of v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19 … and 5 more; the write is \"x\""
+      }
+    },
+    {
+      "label": "64 UTF-16 code units, quoted",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is \"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\""
+      }
+    },
+    {
+      "label": "65 UTF-16 code units, by length",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "status": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"status\" takes one of open, doing, done; the write is a string of 65 characters"
+      }
+    },
+    {
+      "label": "a field named valueOf",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "valueOf": "y"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"valueOf\" takes one of x; the write is \"y\""
+      }
+    },
+    {
+      "label": "a model named constructor",
+      "mutations": [
+        {
+          "model": "constructor",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "valueOf": "y"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: constructor id=01JA5897ENVMDEV1CEXXXXXXXX: field \"valueOf\" takes one of x; the write is \"y\""
+      }
+    },
+    {
+      "label": "the empty string outside",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "blank": "b"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"blank\" takes one of , a; the write is \"b\""
+      }
+    },
+    {
+      "label": "a composed member written composed",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "accent": "café"
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "a decomposed spelling of a composed member",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "accent": "café"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"accent\" takes one of café, naïve; the write is \"café\""
+      }
+    },
+    {
+      "label": "a decomposed member written decomposed",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "accent": "naïve"
+          }
+        }
+      ],
+      "problem": null
+    },
+    {
+      "label": "a composed spelling of a decomposed member",
+      "mutations": [
+        {
+          "model": "tasks",
+          "id": "01JA5897ENVMDEV1CEXXXXXXXX",
+          "kind": "create",
+          "fields": {
+            "accent": "naïve"
+          }
+        }
+      ],
+      "problem": {
+        "code": "DB3_VALUE_NOT_IN_ENUM",
+        "message": "m: tasks id=01JA5897ENVMDEV1CEXXXXXXXX: field \"accent\" takes one of café, naïve; the write is \"naïve\""
+      }
+    }
+  ]
+}

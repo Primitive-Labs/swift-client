@@ -146,7 +146,8 @@ final class RecordLogJsonbReadsHermeticTests: XCTestCase {
         for row in rows {
             let id = try XCTUnwrap(row["id"]?.stringValue)
             let post = try XCTUnwrap(byId(posts)[id])
-            let related = try XCTUnwrap(row["_related"]?.objectValue)
+            // The model API tags each included record with its db3, as it tags the row (#5896).
+            let related = try XCTUnwrap(row["_related"]?.objectValue).mapValues(Self.untagged)
             XCTAssertEqual(related["author"], .object(authors[post["authorId"]?.stringValue ?? ""]!), id)
             XCTAssertEqual(
                 related["tagged"], .array((post["tagIds"]?.arrayValue ?? []).map { .object(authors[$0.stringValue!]!) }), id
@@ -155,6 +156,13 @@ final class RecordLogJsonbReadsHermeticTests: XCTestCase {
             XCTAssertEqual(related["comments"], .array(mine.map(JSONValue.object)), id)
             XCTAssertEqual(related["latest"], .array(mine.reversed().prefix(2).map(JSONValue.object)), id)
         }
+    }
+
+    /// `value` without the `_meta_doc_id` the model API tags an included record with.
+    private static func untagged(_ value: JSONValue) -> JSONValue {
+        if let rows = value.arrayValue { return .array(rows.map(untagged)) }
+        guard let row = value.objectValue else { return value }
+        return .object(row.filter { $0.key != "_meta_doc_id" })
     }
 
     func testTheModelFacadeAnswersEachRowWithItsId() throws {

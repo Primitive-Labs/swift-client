@@ -386,6 +386,35 @@ public extension TagRecord {
         return copy
     }
 
+    /// The fields `save(in:upsertOn:)` may name: each one a unique
+    /// constraint covers on its own.
+    enum UniqueField: String, Sendable {
+        case name = "name"
+    }
+
+    /// `save(in:upsertOn:)` by one of the model's unique fields.
+    @discardableResult
+    func save(in documentId: String, upsertOn: UniqueField) throws -> TagRecord {
+        try save(in: documentId, upsertOn: upsertOn.rawValue)
+    }
+
+    /// The unique constraints `upsertByUnique` may name.
+    enum UniqueConstraint: String, Sendable {
+        case Tag_name_unique = "Tag_name_unique"
+    }
+
+    /// `upsertByUnique(_:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, mode: UpsertMode = .either, in documentId: String) throws -> TagRecord {
+        try upsertByUnique(constraint.rawValue, mode: mode, in: documentId)
+    }
+
+    /// `upsertByUnique(_:lookupValue:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> TagRecord {
+        try upsertByUnique(constraint.rawValue, lookupValue: lookupValue, mode: mode, in: documentId)
+    }
+
     /// Delete this record from document `documentId`. Throws if the doc isn't open.
     func delete(in documentId: String) throws {
         try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)
