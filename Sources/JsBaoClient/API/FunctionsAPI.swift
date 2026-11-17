@@ -3,18 +3,18 @@ import Foundation
 // MARK: - FunctionsAPI
 
 /// Server functions, available as `client.functions`. Mirrors the JS client's
-/// `client.functions` (`src/client/api/functionsApi.ts`) — #3278.
+/// `client.functions` (`src/client/api/functionsApi.ts`).
 ///
 /// A function is TypeScript an app's team authored in its config tree and
 /// pushed with `primitive config push`. A REQUEST function is invoked and
 /// answers its result; a TASK function is started and answers a run id that
 /// is polled on the function run routes. The method set is
 /// JS's and nothing more: `invoke`, `start`, `getStatus`, `waitFor`,
-/// `terminate`, and the run listing's `listRuns` and `listRunSteps` (#4145).
+/// `terminate`, and the run listing's `listRuns` and `listRunSteps`.
 /// There is no client-apply protocol: a function run never enters
 /// `apply_pending`.
 ///
-/// #3565 — the three control methods post the run routes THEMSELVES and
+/// The three control methods post the run routes THEMSELVES and
 /// answer `FunctionRunStatus` / `FunctionRunResult<Output>`. Polling those
 /// routes stays an implementation choice; it used to reach the caller as
 /// vocabulary — a `skipReason` and a `run.workflowId` the server can never set
@@ -47,7 +47,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     static let waitDefaultTimeout: TimeInterval = 15 * 60
 
     /// How long a wait keeps polling a run id the platform reports NO ROW for
-    /// — #3661, and the JS client's `FUNCTION_WAIT_NOT_FOUND_GRACE_MS`.
+    /// — matching the JS client's `FUNCTION_WAIT_NOT_FOUND_GRACE_MS`.
     ///
     /// Bounds one thing only: an eventually consistent read that has not
     /// caught up with a committed row. That is a phenomenon of a replica, not
@@ -81,11 +81,11 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// input, `output` decoded into `Output`.
     ///
     /// This is the ONLY way in, and the binding surface the generated per-key
-    /// Swift types use. #3278 shipped an untyped `[String: Any]` twin beside
-    /// it because no per-key types existed yet to express an invocation with;
-    /// #3344 generated them, and the twin went with the reason for it. A
-    /// caller whose function has no declared schema — or who is genuinely
-    /// dynamic — names the witness: `invoke(key, input: nil as JSONValue?)`
+    /// Swift types use. An earlier change shipped an untyped `[String: Any]`
+    /// twin beside it because no per-key types existed yet to express an
+    /// invocation with; a later one generated them, and the twin went with
+    /// the reason for it. A caller whose function has no declared schema —
+    /// or who is genuinely dynamic — names the witness: `invoke(key, input: nil as JSONValue?)`
     /// bound `as FunctionResult<JSONValue>`.
     ///
     /// `input` is named for what it is on this side of the wire; it travels
@@ -146,8 +146,8 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// exists with `existing == true`, never a second run. There is no
     /// `forceRerun` and no `timeoutMs` on this route.
     ///
-    /// As with `invoke`, the untyped `[String: Any]` twin #3278 shipped is
-    /// gone (#3344): call a generated `<Key>Function`, or name the witness
+    /// As with `invoke`, the untyped `[String: Any]` twin is
+    /// gone: call a generated `<Key>Function`, or name the witness
     /// (`start(key, input: nil as JSONValue?)`) for a dynamic one.
     /// - Stability: production
     @discardableResult
@@ -181,7 +181,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// with `Function run <id> not found`. Every other refusal — a 403 from
     /// the access gate, a 5xx — propagates as it arrived.
     ///
-    /// A task run that has a slice record also carries `slice` (#3388): its
+    /// A task run that has a slice record also carries `slice`: its
     /// refresh count, the current slice's 12-hour ceiling and how the slice
     /// settled. `nil` for a request invocation and for a DSL run.
     /// - Stability: production
@@ -575,7 +575,7 @@ public final class FunctionsAPI: @unchecked Sendable {
         )
     }
 
-    /// Which runtime a call means — #3482. The ROUTE says it: `invoke` posts
+    /// Which runtime a call means. The ROUTE says it: `invoke` posts
     /// to `functions/{key}` and runs the function inside the request, `start`
     /// posts to `functions/{key}/start` and runs it as a task. There is no
     /// body field for it on a current server.
@@ -644,7 +644,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     }
 
     /// How long the finalization re-check waits between fetches, and how many
-    /// times it retries before settling from the run record (#2348). The same
+    /// times it retries before settling from the run record. The same
     /// window the workflow wait uses; spelled here because this class names no
     /// workflow type.
     static let finalizeRecheckIntervalMs: UInt64 = 1000

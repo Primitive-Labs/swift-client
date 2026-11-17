@@ -10,6 +10,7 @@ import XCTest
 ///
 /// Server-free: the client's two hooks (`documentFormatLookupForTest`, the
 /// document manager's `fetchDocumentInfo`) are what it would call, counted.
+@available(*, deprecated)
 final class AgentSessionResourceHeldDb3HermeticTests: XCTestCase {
     private var clients: [JsBaoClient] = []
     private var directories: [String] = []

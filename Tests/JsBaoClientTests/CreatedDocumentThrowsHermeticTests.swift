@@ -17,6 +17,7 @@ import YSwift
 /// Outbound frames are intercepted by replacing
 /// `DocumentManager.sendWebSocketMessage`; a server `syncStep1` is driven
 /// through the real message router (`handleWebSocketMessage`).
+@available(*, deprecated)
 final class CreatedDocumentThrowsHermeticTests: XCTestCase {
 
     // MARK: - Fixtures

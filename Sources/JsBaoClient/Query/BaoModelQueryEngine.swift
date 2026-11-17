@@ -9,7 +9,7 @@ import JsBaoSQLite
 ///
 /// This replaces the JS client's IndexedDB/sql.js approach with native SQLite.
 ///
-/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+/// ## `@unchecked Sendable` — safety argument (Phase C)
 ///
 /// The engine is a class with mutable state and no compiler-visible isolation,
 /// so the conformance is unchecked. What makes it sound is that **every**
@@ -27,7 +27,7 @@ import JsBaoSQLite
 /// re-enters the engine through junction sub-queries and takes `lock` again.
 /// That is why those two methods lock a closure rather than the whole body.
 ///
-/// `final` since #1992: an `@unchecked Sendable` claim on an open class would
+/// `final`: an `@unchecked Sendable` claim on an open class would
 /// be inherited by subclasses that could add unsynchronized state, which would
 /// make the argument above unverifiable. Nothing in the package or its tests
 /// subclassed it.
@@ -37,7 +37,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// supplied (single-doc / legacy mode). Matches js-bao's
     /// `BaseModel.DEFAULT_LEGACY_DOC_ID` ("__legacy_default__") so the
     /// in-memory SQLite mirror's rows are tagged identically on both
-    /// clients (#1117). Mirror-only state — rebuilt per session, never
+    /// clients. Mirror-only state — rebuilt per session, never
     /// persisted or sent over the wire.
     public static let legacyDefaultDocId = "__legacy_default__"
 
@@ -85,7 +85,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
     /// Test-only read of the row-write counter. Takes `lock` so a test
     /// sampling the counter while another thread writes is a synchronized
-    /// read rather than a torn one (#1992: the counter was previously a
+    /// read rather than a torn one (the counter was previously a
     /// `private(set)` property read with no synchronization at all, which the
     /// `@unchecked Sendable` safety argument could not have covered).
     internal var rowWriteCount: Int {
@@ -135,14 +135,14 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         }
     }
 
-    /// An engine over a storage provider's own connection (#3436).
+    /// An engine over a storage provider's own connection.
     ///
     /// The tables are the same tables, in the provider's database file rather
     /// than in memory, so the rows survive the session, and every statement is
     /// serialized with the key-value store's on the provider's queue. No PRAGMA
     /// is issued here: the connection belongs to the provider, which has already
-    /// configured it. The client no longer uses it: a db3 is read from its view
-    /// (#4700), and a format-1 document from the in-memory engine.
+    /// configured it. The client no longer uses it: a db3 is read from its view,
+    /// and a format-1 document from the in-memory engine.
     ///
     /// **Lock order.** A read takes `lock` and then enters the provider's
     /// queue. Nothing that runs ON that queue may take `lock`, which is what
@@ -599,7 +599,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     ///
     /// `sortFields`, when given, names the fields cursors are minted from. Any
     /// of them an inclusion projection omits is additionally selected under the
-    /// internal `_cursor:` alias (#3228) so the cursor carries the row's real
+    /// internal `_cursor:` alias so the cursor carries the row's real
     /// value rather than a false null; `queryPaged` strips those columns from
     /// the rows it returns, so response shapes are unchanged. The fields that
     /// got that treatment come back alongside the column list, so the callers
@@ -876,10 +876,10 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
     /// Paginated variant of `query`. Returns a `PaginatedResult` with
     /// next/prev cursors for forward/backward navigation. Mirrors
-    /// js-bao's `BaseModel.query` Promise<PaginatedResult>.
+    /// js-bao's `BaseModel.query` `Promise<PaginatedResult>`.
     ///
     /// Rows come back as `PrimitiveRow`, the shared row bag, so the page as a
-    /// whole is `Sendable` and can cross an isolation boundary (#1992). Read a
+    /// whole is `Sendable` and can cross an isolation boundary. Read a
     /// field with the same subscript the raw dictionary takes
     /// (`row["field"]?.stringValue`), or reach `row.raw` for the dictionary
     /// itself — the unpaginated `query` above returns those dictionaries
@@ -1152,13 +1152,13 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// nothing. Read for a model whose record-log documents are the ones
     /// connected, where the scope is "these documents", not "this one".
     ///
-    /// The caller's own `options.documents` (#3760) is INTERSECTED with the
+    /// The caller's own `options.documents` is INTERSECTED with the
     /// parameter, which is the facade's idea of the scope, and the result is
     /// combined with `scopedToDocId` the same way — see {@link aggregateScope}.
     /// Preferring the caller's list over the facade's was the defect finding
     /// 3760-REVIEW-05 names: the facade's list is the routed scope, narrowed to
     /// the documents that are CONNECTED, and these query tables also hold the
-    /// rows of record-log documents that are closed (#3756 keeps them), so a request
+    /// rows of record-log documents that are closed (closing keeps them), so a request
     /// naming a closed document answered from it where `query` — which narrows
     /// the same request — answered nothing.
     public func aggregate(

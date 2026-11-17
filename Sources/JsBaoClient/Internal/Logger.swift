@@ -3,7 +3,7 @@ import Foundation
 import OSLog
 #endif
 
-/// The client's internal logger. Module-internal on purpose (#2363): apps
+/// The client's internal logger. Module-internal on purpose: apps
 /// configure logging through the public `LogLevel` (`Types/LogLevel.swift`)
 /// and never construct or call a `Logger` themselves.
 final class Logger: @unchecked Sendable {

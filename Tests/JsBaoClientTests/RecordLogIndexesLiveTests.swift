@@ -6,6 +6,7 @@ import XCTest
 /// when a db3 is opened and again when the room acknowledges a declaration
 /// (`record.declared`). A read that fails keeps the cached list and logs one
 /// warning naming the document; the open never waits for it.
+@available(*, deprecated)
 final class RecordLogIndexesLiveTests: XCTestCase {
 
     private static let note = PrimitiveSchema(name: "db3_ix4700_note", fields: [

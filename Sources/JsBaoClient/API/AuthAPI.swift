@@ -171,8 +171,8 @@ public final class AuthAPI: @unchecked Sendable {
     /// `client.waitForUserId({ timeoutMs })`. Returns immediately if a user id
     /// is already present.
     ///
-    /// `timeout` is a `TimeInterval` in **seconds** (renamed from `timeoutMs`
-    /// in #2367), and its default moved from 5s to **10s** in the same change
+    /// `timeout` is a `TimeInterval` in **seconds** (renamed from `timeoutMs`),
+    /// and its default moved from 5s to **10s** in the same change
     /// so it agrees with the client-level wait it sits beside. JS still
     /// defaults to 5s.
     ///
@@ -208,7 +208,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// a code-only email with `emailSignInRequest(email:target: .codeOnly)`.
     /// A target that is sent must match the app's non-empty
     /// `emailRedirectUris`, or the request is rejected 400
-    /// `Invalid redirect URI` (#2967); the client does not retry without it.
+    /// `Invalid redirect URI`; the client does not retry without it.
     /// - Stability: production
     public func emailSignInRequest(
         _ params: EmailSignInRequestParams
@@ -311,7 +311,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// already applied the returned access token. Mirrors JS
     /// `auth.magicLinkVerify(token, { inviteToken })`.
     ///
-    /// `inviteToken` (#466): when present, accepts the named invitation
+    /// `inviteToken`: when present, accepts the named invitation
     /// server-side during verify and resolves deferred grants to the
     /// signing-in user — even when the magic-link email differs from the
     /// invited email. Threaded through only when the invite-aware closure is
@@ -330,7 +330,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// applied the returned access token. Mirrors JS
     /// `auth.otpVerify(email, code, { inviteToken })`.
     ///
-    /// `inviteToken` (#466): when present, accepts the named invitation
+    /// `inviteToken`: when present, accepts the named invitation
     /// server-side during verify and resolves deferred grants to the
     /// signing-in user — even when the signup email differs from the invited
     /// email. Threaded through only when the invite-aware closure is wired;
@@ -461,7 +461,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// short-lived `challengeToken` to pass back to `passkeyAuthFinish`.
     ///
     /// `rpId` names the relying party the ceremony runs against — pass the
-    /// host in the app's `webcredentials:` entitlement (#3024). Defaults to
+    /// host in the app's `webcredentials:` entitlement. Defaults to
     /// `AuthConfig.passkeyRpId`; with neither, the server picks from the
     /// request's `Origin`, which a native client never sends.
     /// - Stability: production
@@ -510,7 +510,7 @@ public final class AuthAPI: @unchecked Sendable {
     /// `challengeToken` to pass back to `passkeyRegisterFinish`.
     ///
     /// `rpId` names the relying party to register the passkey under, exactly
-    /// as in `passkeyAuthStart(rpId:)` (#3024).
+    /// as in `passkeyAuthStart(rpId:)`.
     /// - Stability: production
     public func passkeyRegisterStart(
         rpId: String? = nil

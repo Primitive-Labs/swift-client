@@ -24,6 +24,7 @@ import XCTest
 /// decoding identically to a miss) and by the JS client suite, which exercises
 /// them against the same endpoints. The partial-success behavior itself IS
 /// covered live below, using an undefined category as the failing entry.
+@available(*, deprecated)
 final class ResourceMetadataTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

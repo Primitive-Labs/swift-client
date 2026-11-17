@@ -16,6 +16,7 @@ import XCTest
 /// another user signed in leaves nothing for that user, and an empty `type`
 /// is sent at commit (second opinion 4921-SO-002, -005, -007). Since #5000
 /// an online create is a pending create too.
+@available(*, deprecated)
 final class Db3OfflineCreateHermeticTests: XCTestCase {
 
     private var directories: [String] = []

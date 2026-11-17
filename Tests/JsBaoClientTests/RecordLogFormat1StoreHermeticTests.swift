@@ -7,6 +7,7 @@ import JsBaoSQLite
 /// holds no record-log table and no `record_log_meta` row after an open, a
 /// write, a close and a reopen, and its schema is the one recorded on the tree
 /// before the storage version and the projection's retirement, byte for byte.
+@available(*, deprecated)
 final class RecordLogFormat1StoreHermeticTests: XCTestCase {
 
     /// `sqlite_master` of a format-1 client's database, recorded on the tree

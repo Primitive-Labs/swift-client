@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-concurrent-writes.test.ts
 /// Tests concurrent multi-client writes for data consistency.
+@available(*, deprecated)
 final class ConcurrentWritesTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

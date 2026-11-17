@@ -14,6 +14,7 @@ import YSwift
 /// Server-free: a loopback WebSocket server the client really connects to,
 /// which never answers the handshake, and the progress the record-log session
 /// reports, driven through the client's own hook.
+@available(*, deprecated)
 final class AvailabilityProgressHermeticTests: XCTestCase {
 
     private var clients: [JsBaoClient] = []

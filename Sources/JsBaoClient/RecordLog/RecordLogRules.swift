@@ -75,7 +75,7 @@ protocol RecordLogTables: AnyObject {
     func countEpoch(_ e: Int) throws
     /// How many unjudged, unwithdrawn entries of epoch `e` the store holds, every writer's.
     func pendingInEpoch(_ e: Int) throws -> Int
-    /// The room's head as last heard, and when (#5221); `nil` before one is heard.
+    /// The room's head as last heard, and when; `nil` before one is heard.
     func knownHead() throws -> RecordLogKnownHead?
     /// Record the room's head as heard at `at` (epoch ms).
     func setKnownHead(_ head: Int, at: Int64) throws
@@ -133,6 +133,22 @@ protocol RecordLogReceiptTables: RecordLogTables {
     /// when there are exactly `rows` of them, as though it had put them.
     /// Answers whether it did; when not, nothing changed.
     func keepConfirmedRange(model: String, firstId: String, lastId: String, rows: Int) throws -> Bool
+}
+
+/// Tables that apply a model clear (#5994): they remove a model's confirmed
+/// rows at once and keep the highest clear applied, so a clear sent again (a
+/// resumed download) changes nothing. Tables without them apply no clear.
+protocol RecordLogClearTables: AnyObject {
+    /// Remove every confirmed row of `model`; answers the records an unjudged
+    /// entry covers, whose view a refresh settles (the others leave the view
+    /// with their rows).
+    func clearModel(_ model: String) throws -> [RecordLogRecordKey]
+    /// The highest log number of a model clear applied, 0 before any.
+    func clearedThrough() throws -> Int
+    /// The highest log number of a clear of `model` applied, 0 before any.
+    func clearedAt(_ model: String) throws -> Int
+    /// Record a clear of `model` at `l` applied: the highest overall, and the model's own.
+    func setClearedThrough(_ l: Int, model: String) throws
 }
 
 /// A record's key compared byte for byte, as SQLite compares `_type` and
@@ -278,6 +294,8 @@ struct RecordLogReceiveOutcome: Sendable {
     var settlements: [RecordLogEntryRef: RecordLogSettlement] = [:]
     /// A compact acknowledgement at the cursor that could not be derived, which holds every later result back.
     var underivable: RecordLogUnderivableAck?
+    /// Models a clear emptied (#5994): every view row of them may have gone, beside `touched`.
+    var cleared: [String] = []
 }
 
 /// A catch-up's content: changed rows, or the whole table.
@@ -352,7 +370,7 @@ final class RecordLogRules {
         try tables.setEpochs(epochs)
     }
 
-    /// Record what a frame said of the room's head (#5221), once the frame
+    /// Record what a frame said of the room's head, once the frame
     /// has applied: the bound becomes the highest of the stored one, the
     /// frame's `head` and the cursor, and is never lowered (a lower `head` is
     /// stale information). It takes the frame's receipt time when the frame
@@ -411,7 +429,8 @@ final class RecordLogRules {
     ///
     /// A compact acknowledgement (no `changes`) is applied, in its turn, by its
     /// pending entry's mutations as plain row operations, the rule by which the
-    /// room vouched for it. With no unwithdrawn pending entry for its `seq` it
+    /// room vouched for it. A model clear empties its model in its turn, once
+    /// (``applyClears(_:)``). With no unwithdrawn pending entry for its `seq` it
     /// stays buffered, the cursor stops below it, and the outcome names it
     /// (`underivable`).
     func receive(_ item: RecordLogResultItem) throws -> RecordLogReceiveOutcome {
@@ -451,9 +470,13 @@ final class RecordLogRules {
                 while let next = tables.buffered(try tables.cursor() + 1) {
                     if !applied { try changedUnderReplacement() }
                     applied = true
-                    if let changes = next.changes {
+                    if let clear = next.clear {
+                        try applyClear(clear.model, l: next.l, &out)
+                    } else if let changes = next.changes {
                         for change in changes {
-                            try recordLogApplyChange(confirmed, change)
+                            // A result older than a clear of its model applied already (by
+                            // another session's catch-up sharing this store) puts nothing back.
+                            if try !clearedPast(change.model, next.l) { try recordLogApplyChange(confirmed, change) }
                             out.touched.append(RecordLogRecordKey(model: change.model, id: change.id))
                         }
                     } else if try !applyOwnEntry(confirmed, next, &out) {
@@ -474,6 +497,57 @@ final class RecordLogRules {
         }
     }
 
+    /// Apply model clears a catch-up carries (#5994), oldest first, before the
+    /// rows, chunks or page they ride with. The cursor does not move: the
+    /// catch-up's completion moves it. A clear at or below the cursor, or at
+    /// or below the highest clear applied (a resumed download is sent the
+    /// clears again), changes nothing.
+    func applyClears(_ clears: [RecordLogClear]) throws -> RecordLogReceiveOutcome {
+        var out = RecordLogReceiveOutcome()
+        for clear in clears.sorted(by: { $0.l < $1.l }) {
+            if clear.l <= (try tables.cursor()) { continue }
+            if try applyClear(clear.model, l: clear.l, &out) { try sawEpoch(clear.e) }
+        }
+        return out
+    }
+
+    /// Empty `model` for the clear at log number `l`, unless a clear at or past
+    /// `l` was applied already; the mark moves with the removal. Answers
+    /// whether it removed.
+    @discardableResult
+    private func applyClear(_ model: String, l: Int, _ out: inout RecordLogReceiveOutcome) throws -> Bool {
+        guard let clearing = tables as? RecordLogClearTables, l > (try clearing.clearedThrough()) else { return false }
+        // Rows change under a replacement other than by its own receipt.
+        try changedUnderReplacement()
+        out.touched.append(contentsOf: try clearing.clearModel(model))
+        try clearing.setClearedThrough(l, model: model)
+        if !out.cleared.contains(model) { out.cleared.append(model) }
+        return true
+    }
+
+    /// Whether a clear of `model` above log number `l` was applied already: a
+    /// catch-up applies the clears it carries before the cursor reaches them,
+    /// so a session sharing this store can still be handed results below one.
+    /// Such a result's rows of the model were removed by the clear on the
+    /// room, and stay removed here.
+    private func clearedPast(_ model: String, _ l: Int) throws -> Bool {
+        guard let clearing = tables as? RecordLogClearTables else { return false }
+        return try clearing.clearedAt(model) > l
+    }
+
+    /// Whether rows of `model` the room read at log number `readAt` (a page's
+    /// `lsn`, a load's last log number, a segment's `C`) predate a clear of it
+    /// applied already. Another session sharing this store applied that clear
+    /// from its own catch-up; the room removed those rows with it and keeps no
+    /// tombstone, so putting them back here would keep them for good; and a row
+    /// of the model the store holds now was written after the clear, so a
+    /// removal read before it does not apply either. Without `readAt` (a caller
+    /// that did not say) everything applies.
+    private func readBeforeClear(_ model: String, _ readAt: Int?) throws -> Bool {
+        guard let readAt else { return false }
+        return try clearedPast(model, readAt)
+    }
+
     /// A compact acknowledgement's changes, derived: the mutations of the
     /// pending entry it names applied in order to the confirmed rows as plain
     /// row operations. Answers `false`, changing nothing, when no unwithdrawn
@@ -485,6 +559,10 @@ final class RecordLogRules {
               let entry = try tables.pendingEntry(w, seq), !entry.isVoid
         else { return false }
         for mutation in entry.mutations {
+            if try clearedPast(mutation.model, item.l) {
+                out.touched.append(mutation.key)
+                continue
+            }
             if let row = recordLogPlainRowAfter(try confirmed.row(mutation.key), mutation) {
                 try confirmed.set(mutation.key, row)
             } else if mutation.kind == .delete {
@@ -663,18 +741,26 @@ final class RecordLogRules {
     /// cursor. A page of receipt `receipt`'s remainder is refused with
     /// ``RecordLogStaleReceiptError`` before anything changes once another
     /// attempt took that receipt over; it does not count as the attempt's change.
-    func applyCatchUpPage(_ page: RecordLogCatchUpInput, generation: Int? = nil, receipt: String? = nil) throws -> [RecordLogRecordKey] {
+    /// A row or gone record of a model whose clear above `readAt` (the log
+    /// number the room read the page at) was applied already changes nothing
+    /// (``readBeforeClear(_:_:)``): a row of it the store holds now was written
+    /// after the clear.
+    func applyCatchUpPage(
+        _ page: RecordLogCatchUpInput, generation: Int? = nil, receipt: String? = nil, readAt: Int? = nil
+    ) throws -> [RecordLogRecordKey] {
         try assertNotDisplaced(receipt)
         try assertGeneration(generation)
         if !page.rows.isEmpty || !page.gone.isEmpty { try changedUnderReplacement(receipt: receipt, generation: generation) }
         let confirmed = try tables.confirmed()
         var touched: [RecordLogRecordKey] = []
         for row in page.rows {
+            if try readBeforeClear(row.model, readAt) { continue }
             let key = RecordLogRecordKey(model: row.model, id: row.id)
             try confirmed.set(key, row.row)
             touched.append(key)
         }
         for key in page.gone {
+            if try readBeforeClear(key.model, readAt) { continue }
             try confirmed.delete(key)
             touched.append(key)
         }
@@ -690,7 +776,7 @@ final class RecordLogRules {
     ///   - generation: The replacement's generation, checked before anything is removed.
     ///   - receipt: The receipt attempt it completes: that attempt's changes are
     ///     the room's now. One another attempt took over is refused as
-    ///     ``applyCatchUpPage(_:generation:receipt:)`` refuses its pages.
+    ///     ``applyCatchUpPage(_:generation:receipt:readAt:)`` refuses its pages.
     ///   - segment: For a segment's replacement, the segment and its chunks: the store holds them from now.
     func completeCatchUp(
         lsn: Int, high: Int?, full: Bool, generation: Int? = nil, receipt: String? = nil, segment: RecordLogHeldSegment? = nil
@@ -719,6 +805,7 @@ final class RecordLogRules {
             out.settled.append(contentsOf: replay.settled)
             out.settlements.merge(replay.settlements) { _, new in new }
             if let underivable = replay.underivable { out.underivable = underivable }
+            for model in replay.cleared where !out.cleared.contains(model) { out.cleared.append(model) }
         }
         try settleAcknowledged(&out)
         return out
@@ -914,18 +1001,22 @@ final class RecordLogRules {
     /// left alone); otherwise the line's fields are set over the row it has,
     /// `null` kept as a present null, the line's own `id` field ignored, a
     /// nested value taken whole and a string set's array in code point order
-    /// with each member once, as the room stores it (#5274). Each key is
+    /// with each member once, as the room stores it. Each key is
     /// remembered for a refresh. An attempt no longer in progress is refused with
-    /// ``RecordLogStaleReceiptError`` before anything changes.
+    /// ``RecordLogStaleReceiptError`` before anything changes. A chunk of a
+    /// model whose clear above `readAt` (the load's last log number) was
+    /// applied already changes no row (``readBeforeClear(_:_:)``); it still
+    /// counts as the attempt's chunk and names its keys.
     ///
     /// - Returns: The records whose confirmed row changed.
-    func applyLoadLines(attempt: String, model: String, lines: [RecordLogLoadLine]) throws -> [RecordLogRecordKey] {
+    func applyLoadLines(attempt: String, model: String, lines: [RecordLogLoadLine], readAt: Int? = nil) throws -> [RecordLogRecordKey] {
         let receiving = try receiptTables()
         try touchReceipt(attempt, chunk: true)
-        let batch = try batchRows(lines.map { RecordLogRecordKey(model: model, id: $0.id) }, read: true)
+        let applying = try readBeforeClear(model, readAt) ? [] : lines
+        let batch = try batchRows(applying.map { RecordLogRecordKey(model: model, id: $0.id) }, read: true)
         let confirmed = batch == nil ? try tables.confirmed() : nil
         var touched: [RecordLogRecordKey] = []
-        for line in lines {
+        for line in applying {
             let key = RecordLogRecordKey(model: model, id: line.id)
             let existing: RecordLogRow?
             if let batch { existing = batch.row(key) } else { existing = try confirmed?.row(key) }
@@ -970,7 +1061,7 @@ final class RecordLogRules {
     /// every confirmed row of `models` no line the attempt applied named (the
     /// remainder then restores what another writer created meanwhile); a merge
     /// removes nothing. The attempt's keys are forgotten either way; one no
-    /// longer in progress is refused as ``applyLoadLines(attempt:model:lines:)`` refuses it.
+    /// longer in progress is refused as ``applyLoadLines(attempt:model:lines:readAt:)`` refuses it.
     func completeLoad(attempt: String, mode: RecordLogLoadMode, models: [String]) throws -> [RecordLogRecordKey] {
         let receiving = try receiptTables()
         try touchReceipt(attempt, completed: true)
@@ -979,10 +1070,16 @@ final class RecordLogRules {
         return touched
     }
 
-    /// Put a segment's rows under the replacement `generation`, as receipt `attempt` when it names one.
-    func applySegmentRows(generation: Int, attempt: String?, rows: [RecordLogCatchUpRow]) throws -> [RecordLogRecordKey] {
+    /// Put a segment's rows under the replacement `generation`, as receipt
+    /// `attempt` when it names one; a row of a model whose clear above
+    /// `readAt` (the segment's `C`) was applied already is not put back
+    /// (``readBeforeClear(_:_:)``).
+    func applySegmentRows(
+        generation: Int, attempt: String?, rows allRows: [RecordLogCatchUpRow], readAt: Int? = nil
+    ) throws -> [RecordLogRecordKey] {
         try assertGeneration(generation)
         if let attempt { try touchReceipt(attempt, chunk: true) }
+        let rows = try allRows.filter { try !readBeforeClear($0.model, readAt) }
         // A segment's rows replace the records' whole: none is read.
         let batch = try batchRows(rows.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, read: false)
         let confirmed = batch == nil ? try tables.confirmed() : nil
@@ -1009,15 +1106,20 @@ final class RecordLogRules {
     ///
     /// - Throws: ``RecordLogStaleReplacementError`` under a superseded
     ///   generation; ``RecordLogStaleReceiptError`` for an attempt no longer in progress.
+    ///
+    /// A chunk of a model whose clear above `readAt` (the segment's `C`) was
+    /// applied already is never kept (``readBeforeClear(_:_:)``): it is read
+    /// instead, and its rows are not put back.
     func keepSegmentChunk(
         generation: Int, attempt: String, object: String, sha256: String, model: String, firstId: String, lastId: String,
-        rows: Int
+        rows: Int, readAt: Int? = nil
     ) throws -> RecordLogKeepOutcome {
         try assertGeneration(generation)
         let receiving = try receiptTables()
         guard let state = try receiving.receipts(), state.attempts.contains(where: { $0.attempt == attempt }) else {
             throw RecordLogStaleReceiptError(attempt: attempt)
         }
+        if try readBeforeClear(model, readAt) { return .mismatch }
         let entry = try receiving.heldSegment()?.chunks.first { $0.object == object }
         let same = entry.map {
             $0.model == model && $0.sha256 == sha256 && $0.rows == rows && $0.firstId == firstId && $0.lastId == lastId
@@ -1033,13 +1135,18 @@ final class RecordLogRules {
 
     /// Apply a segment's corrections under the replacement `generation`: a row
     /// replaces the record's, a `nil` deletes it (one the chunks did not carry
-    /// changes nothing).
-    func applySegmentCorrections(generation: Int, attempt: String?, lines: [RecordLogCorrection]) throws -> [RecordLogRecordKey] {
+    /// changes nothing). A line of a model whose clear above `readAt` (the
+    /// segment's `C`) was applied already changes nothing
+    /// (``readBeforeClear(_:_:)``).
+    func applySegmentCorrections(
+        generation: Int, attempt: String?, lines: [RecordLogCorrection], readAt: Int? = nil
+    ) throws -> [RecordLogRecordKey] {
         try assertGeneration(generation)
         if let attempt { try touchReceipt(attempt, completed: true) }
         let confirmed = try tables.confirmed()
         var touched: [RecordLogRecordKey] = []
         for line in lines {
+            if try readBeforeClear(line.model, readAt) { continue }
             let key = RecordLogRecordKey(model: line.model, id: line.id)
             if var row = line.row {
                 row["id"] = .string(line.id)
@@ -1070,7 +1177,7 @@ final class RecordLogRules {
 }
 
 /// A client's state in memory: what a replay of the golden traces drives.
-class RecordLogMemoryTables: RecordLogReceiptTables {
+class RecordLogMemoryTables: RecordLogReceiptTables, RecordLogClearTables {
     private var cursorValue: Int
     private var epochValue: RecordLogEpochs
     private var constraintList: [RecordLogConstraint] = []
@@ -1091,6 +1198,8 @@ class RecordLogMemoryTables: RecordLogReceiptTables {
     private var writers: [String: Writer] = [:]
     private var counts: [Int: Int] = [:]
     private var headValue: RecordLogKnownHead?
+    private var clearedValue = 0
+    private var clearedModels: [String: Int] = [:]
 
     private struct Writer {
         var nextSeq = 1
@@ -1169,6 +1278,23 @@ class RecordLogMemoryTables: RecordLogReceiptTables {
 
     func noteLoadKeys(_ attempt: String, _ keys: [RecordLogRecordKey]) {
         loadKeys[attempt, default: []].formUnion(keys)
+    }
+
+    func clearModel(_ model: String) -> [RecordLogRecordKey] {
+        for key in rows.order where key.model == model {
+            rows.delete(key)
+            replacingSet.remove(key)
+        }
+        replaced?.removeAll { $0.model == model }
+        // The view is the rows with the guesses over them, read when asked.
+        return []
+    }
+
+    func clearedThrough() -> Int { clearedValue }
+    func clearedAt(_ model: String) -> Int { clearedModels[model] ?? 0 }
+    func setClearedThrough(_ l: Int, model: String) {
+        clearedValue = max(clearedValue, l)
+        clearedModels[model] = max(clearedModels[model] ?? 0, l)
     }
 
     func removeUnnamed(_ attempt: String, models: [String]) -> [RecordLogRecordKey] {

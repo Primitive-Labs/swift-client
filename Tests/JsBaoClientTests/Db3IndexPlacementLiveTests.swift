@@ -6,6 +6,7 @@ import XCTest
 /// a `text` registration throws `HttpError` with `serverCode`
 /// `DB3_INDEX_PLACEMENT_UNSUPPORTED`, and the subscribed copy builds a view
 /// index for an index placed `both` and none for one placed `server`.
+@available(*, deprecated)
 final class Db3IndexPlacementLiveTests: XCTestCase {
 
     private var ctx: TestContext!

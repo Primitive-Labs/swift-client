@@ -11,6 +11,7 @@ import XCTest
 ///   `ready()`, `entriesBehind` is 0 and `asOf` advanced.
 /// - A second client over the same store file, kept offline, reports the
 ///   stored drift and refuses `maxDrift(age: 0.001)`.
+@available(*, deprecated)
 final class Db3DriftLiveTests: XCTestCase {
 
     private var ctx: TestContext!

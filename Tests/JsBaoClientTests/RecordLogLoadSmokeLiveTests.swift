@@ -5,6 +5,7 @@ import XCTest
 /// chunk encoded in Swift (`GzipFixture`, CryptoKit sha256) is accepted by a
 /// format-3 document's multipart ingest route, the session completes, and the
 /// room counts its rows.
+@available(*, deprecated)
 final class RecordLogLoadSmokeLiveTests: XCTestCase {
 
     private var ctx: TestContext!

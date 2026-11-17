@@ -1,0 +1,36 @@
+# A db3 type whose fields ref the object defs in ../schemas (#5899). The
+# models' generated files are committed beside this directory and compiled by
+# the client test target; `JsonFieldCodegenHermeticTests` holds them to what
+# swift-bao-codegen writes for this file.
+
+[type]
+name = "jsonshop"
+
+[models.json_orders]
+class_name = "JsonOrderRecord"
+
+[models.json_orders.fields.title]
+type = "string"
+
+[models.json_orders.fields.shipping_address]
+ref = "ShipAddress"
+
+[models.json_orders.fields.parcel]
+ref = "common.ShipParcel"
+
+[models.json_orders.fields.meta]
+ref = "ShipMeta"
+
+[models.json_orders.fields.needs]
+ref = "schemas.common.ShipNeedsKind"
+
+[models.json_orders.fields.invoice]
+ref = "billing-v2.ShipInvoice"
+
+# A required JSON field.
+[models.json_receipts]
+class_name = "JsonReceiptRecord"
+
+[models.json_receipts.fields.address]
+ref = "ShipAddress"
+required = true

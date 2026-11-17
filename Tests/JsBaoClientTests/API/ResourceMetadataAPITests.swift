@@ -11,6 +11,7 @@ import XCTest
 /// `Transport` decode policy — so the union decodes and the partial-success
 /// batch shapes can be pinned without a server. The live behavior lives in
 /// `ResourceMetadataTests.swift`.
+@available(*, deprecated)
 final class ResourceMetadataAPITests: XCTestCase {
 
     private func api(_ transport: RecordingTransport) -> ResourceMetadataAPI {

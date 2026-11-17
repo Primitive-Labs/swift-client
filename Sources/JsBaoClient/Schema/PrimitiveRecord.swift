@@ -10,7 +10,7 @@ import Yniffi
 /// are scoped to the same transaction dispatch policy (sync or
 /// client-integrated) the model was set up with.
 ///
-/// ## `Sendable` — plain and checked (#1992, Phase C)
+/// ## `Sendable` — plain and checked (Phase C)
 ///
 /// No `@unchecked` here, and none is needed: every stored property is `let`
 /// and `Sendable` (`String`s, `Int?`s, and `DynamicModel`, which is
@@ -20,7 +20,7 @@ import Yniffi
 ///
 /// It stays a **live handle**, not a value snapshot: a subscript read goes
 /// through the model to the CRDT and so reflects concurrent writes, and the
-/// subscript setter writes through (#1156). Sending a `PrimitiveRecord` across
+/// subscript setter writes through. Sending a `PrimitiveRecord` across
 /// an isolation boundary sends the handle; the data it reads through stays
 /// serialized by the model's locks.
 public final class PrimitiveRecord: Sendable {
@@ -128,6 +128,8 @@ public final class PrimitiveRecord: Sendable {
     /// let points = PrimitiveRecord.holds("points", in: row) == false ? 3 : row["points"]?.numberValue
     /// ```
     public static func holds(_ field: String, in row: [String: JSONValue]) -> Bool? {
+        // A field the row's db3 clears reads as unset: neither held nor never written, so no default fills it (#6021).
+        if case .array(let cleared)? = row[clearedFieldsKey], cleared.contains(.string(field)) { return nil }
         if case .array(let unheld)? = row[unheldFieldsKey], unheld.contains(.string(field)) { return false }
         if row[field] != nil { return true }
         guard let document = row["_meta_doc_id"]?.stringValue,
@@ -140,6 +142,17 @@ public final class PrimitiveRecord: Sendable {
     /// does not hold. A row carries each such field as `[]`, as it carries a
     /// set with no members, so ``holds(_:in:)`` reads presence from the list.
     static let unheldFieldsKey = "_meta_unheld"
+
+    /// The key under which a db3 row lists the fields its db3's held revision
+    /// clears (#6021): the row leaves them out, and ``holds(_:in:)`` answers
+    /// `nil` for them, so a model fills no default there.
+    static let clearedFieldsKey = "_meta_cleared"
+
+    /// Record in `row` that its db3 clears `fields`; nothing when there are none.
+    static func markCleared(_ fields: some Collection<String>, in row: inout [String: JSONValue]) {
+        guard !fields.isEmpty else { return }
+        row[clearedFieldsKey] = .array(fields.sorted().map { .string($0) })
+    }
 
     /// Record in `row` that its record does not hold the string set fields
     /// `fields`; nothing when there are none, so a row whose record holds

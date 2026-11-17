@@ -10,6 +10,7 @@ import YSwift
 /// compression on. JS gunzips (`decompressGzip`, `JsBaoClient.ts` handleUpdate).
 ///
 /// Server-free: `LoopbackHTTPServer` stands in for the R2 origin.
+@available(*, deprecated)
 final class CompressedUpdateDownloadTests: XCTestCase {
 
     private func newDocId() -> String { "compressed-\(UUID().uuidString.prefix(8))" }

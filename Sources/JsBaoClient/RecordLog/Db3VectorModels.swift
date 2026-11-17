@@ -1,6 +1,6 @@
 import Foundation
 
-/// What the model loop needs of the client (#5230), js-bao's `Db3VectorModelsDeps`.
+/// What the model loop needs of the client, js-bao's `Db3VectorModelsDeps`.
 struct Db3VectorModelsDeps: Sendable {
     /// What a bound db3's `ann` vector entries want; `nil` when it is not bound.
     var wants: @Sendable (String) async throws -> [RecordLogVectorWant]?
@@ -28,7 +28,7 @@ struct Db3VectorModelsDeps: Sendable {
     var logger: Logger?
 }
 
-/// The client's work on its db3s' shared ANN models (#5230), the Swift port
+/// The client's work on its db3s' shared ANN models, the Swift port
 /// of the JS client's `db3VectorModels.ts`: for each `ann` vector index a
 /// bound db3's store wants a model for, fetch the one its room lists, or
 /// train one, once per index at a time.

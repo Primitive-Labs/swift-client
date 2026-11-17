@@ -21,6 +21,7 @@ import XCTest
 ///   params do not match the registration, or with a NaN, is refused and not
 ///   fetched again; a `bq` model installs.
 /// - 47: bytes are installed under the identity their `GET` answer names.
+@available(*, deprecated)
 final class Db3VectorSharedModelLiveTests: XCTestCase {
 
     private typealias V = Db3VectorLive

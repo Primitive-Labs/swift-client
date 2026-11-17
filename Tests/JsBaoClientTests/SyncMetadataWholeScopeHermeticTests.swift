@@ -11,6 +11,7 @@ import XCTest
 ///
 /// Server-free (`*HermeticTests`): a `LoopbackAPIServer` answers the client's
 /// real HTTP requests, so the path under test is the shipped one.
+@available(*, deprecated)
 final class SyncMetadataWholeScopeHermeticTests: XCTestCase {
     private var clients: [JsBaoClient] = []
     private var servers: [LoopbackAPIServer] = []

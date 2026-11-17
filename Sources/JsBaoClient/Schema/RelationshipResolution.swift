@@ -18,7 +18,7 @@ public enum RelationshipError: Error, Equatable, Sendable {
     case missingRequiredProperty(relationship: String, property: String)
 }
 
-/// Shared D7 / Fork B (#1607) guard for relationship pagination: warn when a
+/// Shared D7 / Fork B guard for relationship pagination: warn when a
 /// pagination order field is nullable / optional on the model being paged.
 /// Kept as one helper so the cross-document shared path
 /// (`JsBaoClient.hasManyThroughShared`) and the dynamic path
@@ -34,7 +34,7 @@ public enum RelationshipError: Error, Equatable, Sendable {
 /// deterministically; only a value that is *actually* NULL on a boundary row
 /// is a hazard, and that isn't detectable from the `required` flag alone
 /// (`createdAt` is not marked `required` yet is always present in practice).
-/// Full NULL-ordering semantics are deferred to #1316.
+/// Full NULL-ordering semantics are deferred to future work.
 ///
 /// Only warns about a field we can positively see is not marked required:
 /// `id` / `type` are always present, and an order field absent from
@@ -200,14 +200,14 @@ public extension PrimitiveRecord {
     /// `$in`-resolves the page's ids against `target`. The dynamic-path
     /// counterpart to `JsBaoClient.hasManyThroughShared`'s paginated
     /// overload; both delegate the page cut to the same engine so the
-    /// tie-straddle skip/duplicate defect (#1607) can't recur.
+    /// tie-straddle skip/duplicate defect can't recur.
     ///
     /// Cursors are the engine's **opaque** tokens (a `String?`), not raw
     /// join-scalar values — so a cursor minted here or by the JS client
     /// round-trips through the same composite `(field, id)` decoder. The
     /// wrapper copies the join leg's `nextCursor` / `prevCursor` / `hasMore`
     /// verbatim and replaces `data` with the resolved targets. Targets come
-    /// back **target `id ASC`** (the `$in` tiebreaker, #1201) — the join
+    /// back **target `id ASC`** (the `$in` tiebreaker) — the join
     /// order picks page membership, not intra-page order. `hasMore` is the
     /// engine's over-fetch signal: more rows remain in the CURRENT paging
     /// direction (forward → later rows, backward → earlier rows).

@@ -121,7 +121,7 @@ final class NetworkGatedTransport: Transport, @unchecked Sendable {
     }
 
     /// Install the check every request's path and JSON body are asked of
-    /// before anything else (#5155: a db3 that lives only on this device is
+    /// before anything else (a db3 that lives only on this device is
     /// never named to the server).
     func setRequestCheck(_ check: @escaping RequestCheck) {
         lock.withLock { requestCheck = check }
@@ -184,7 +184,7 @@ private extension Transport {
     /// the error-body extraction exist in exactly one place.
     ///
     /// Non-2xx is surfaced as `HttpError` with `{serverCode, serverMessage}`
-    /// extracted by the existing `HttpError.parseBody` (#850) — the same
+    /// extracted by the existing `HttpError.parseBody` — the same
     /// mapping `HttpClient.request` has always applied.
     func executeValidated(
         method: HTTPMethod,

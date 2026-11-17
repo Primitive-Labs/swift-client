@@ -15,7 +15,7 @@ public struct JsBaoClientOptions: Sendable {
     /// (5 minutes), the same ceiling js-bao uses (`src/client/JsBaoClient.ts`,
     /// `maxReconnectDelay` → `300_000` ms). Both clients compute the same
     /// backoff, so a lower ceiling here just means retrying more often forever
-    /// against a server that is down (#2364). Pass a smaller value if your app
+    /// against a server that is down. Pass a smaller value if your app
     /// wants to reconnect sooner.
     public let maxReconnectDelay: TimeInterval
     public let globalAdminAppId: String
@@ -28,7 +28,7 @@ public struct JsBaoClientOptions: Sendable {
     public let commitRetryBackoff: CommitRetryBackoff
     public let autoNetwork: Bool
     /// Per-feature gating for the analytics auto-events the client emits
-    /// without explicit app calls (#963). Mirrors js-bao's
+    /// without explicit app calls. Mirrors js-bao's
     /// `analyticsAutoEvents` option.
     public let analyticsAutoEvents: AnalyticsAutoEventsConfig
     /// Which of the indexes a synced db3's room places on this device the
@@ -175,7 +175,7 @@ public struct AuthConfig: Sendable {
     public let storageKeyPrefix: String?
     public let refreshProxy: RefreshProxyConfig?
     /// The relying party every passkey ceremony runs against, unless a call
-    /// names another one (#3024).
+    /// names another one.
     ///
     /// Set it to the host in the app's `webcredentials:` associated-domains
     /// entitlement. A native request carries no `Origin` header, so without
@@ -298,7 +298,7 @@ public struct OpenDocumentOptions: Sendable {
     /// When `true`, syncStep1 messages for this document carry
     /// `requestPerf: true`, asking the server for a `syncPerf` telemetry
     /// frame after each sync round-trip (delivered via the `.syncPerf`
-    /// event). Mirrors JS `openDocument`'s `requestSyncPerf` option (#996).
+    /// event). Mirrors JS `openDocument`'s `requestSyncPerf` option.
     public var requestSyncPerf: Bool
 
     public init(
@@ -447,9 +447,9 @@ public struct PaginationOptions: Sendable {
 
 public struct PaginatedResult<T: Sendable>: Sendable {
     public let items: [T]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     public init(
@@ -545,7 +545,7 @@ public struct RetentionPolicy: Sendable {
 }
 
 extension RetentionPolicy {
-    /// The one `maxDocs` rule (#5112): `nil` is no cap, `1` or more is a cap,
+    /// The one `maxDocs` rule: `nil` is no cap, `1` or more is a cap,
     /// and `0` or a negative is refused. Answers the `.invalidArgument` error
     /// `call` refuses with, or `nil` when the value is accepted.
     func maxDocsRefusal(call: String) -> JsBaoError? {
@@ -557,7 +557,7 @@ extension RetentionPolicy {
         )
     }
 
-    /// The one `ttl` rule (#5421), beside the `maxDocs` one: `nil` is no TTL,
+    /// The one `ttl` rule, beside the `maxDocs` one: `nil` is no TTL,
     /// a finite number of seconds above `0` (a fraction included) is a TTL,
     /// and `0`, a negative, `nan` or an infinity is refused. Answers the
     /// `.invalidArgument` error `call` refuses with, or `nil` when the value
@@ -740,7 +740,7 @@ public struct OfflineGrantStatus: Sendable {
 ///
 /// A cached value is never held back waiting on the network: with
 /// `waitForLoad` at its default, a cache hit returns right away and any
-/// refresh the other options ask for runs in the background (#2364). Use
+/// refresh the other options ask for runs in the background. Use
 /// `waitForLoad: .network` when the call must wait for fresh server data.
 ///
 /// The one entry with nothing to serve is a cached "no such record" (an empty

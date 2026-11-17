@@ -1,6 +1,6 @@
 import Foundation
 
-/// A db3's device vector indexes (#5230): what every part of them agrees on,
+/// A db3's device vector indexes: what every part of them agrees on,
 /// with no store state. The Swift port of js-bao's
 /// `record-log-client/vectorIndex.ts`, names, text and defaults and all, so a
 /// store file reads the same on either client.
@@ -53,7 +53,7 @@ enum RecordLogVectorIndex {
     static let renewSeconds: TimeInterval = 300
 
     /// Why a vector entry is not built while its room's list does not say how
-    /// (#5230, js-bao's `RECORD_LOG_VECTOR_UNBUILT`): a room from before device
+    /// (js-bao's `RECORD_LOG_VECTOR_UNBUILT`): a room from before device
     /// vector indexes, or a field whose encoding the room does not know, lists
     /// no `vector` options; and a store converted from version 8 caches its
     /// entries so until the next list.
@@ -156,7 +156,7 @@ enum RecordLogVectorIndex {
     }
 }
 
-/// A vector index's options as a device builds it (#5230): the
+/// A vector index's options as a device builds it: the
 /// registration's `distance` and `index`, and the field's encoding. js-bao's
 /// `RecordLogVectorOptions`.
 struct RecordLogVectorOptions: Equatable, Sendable {
@@ -263,7 +263,7 @@ struct RecordLogVectorOptions: Equatable, Sendable {
 
 // MARK: - Training
 
-/// What a training run uses: its buckets, codebooks and quantizer (#5230).
+/// What a training run uses: its buckets, codebooks and quantizer.
 struct RecordLogVectorTrainingParams: Equatable, Sendable {
     var nbucket: Int
     var codesize: Int

@@ -5,6 +5,7 @@ import XCTest
 /// its tables, its writer, its commits, and the rules it runs inside its
 /// commands — refusals, results, catch-up, the epoch budget and the writer
 /// re-mint. No server: the room's answers are the JS wire's shapes, built here.
+@available(*, deprecated)
 final class RecordLogStoreHermeticTests: XCTestCase {
 
     private var directories: [String] = []
@@ -109,6 +110,8 @@ final class RecordLogStoreHermeticTests: XCTestCase {
             "receipt TEXT", "segment TEXT", "staged INTEGER", "local_only INTEGER", "local_indexes TEXT",
             // Since #5221 (storage version 7): the room's head as last heard, and when.
             "known_head INTEGER", "known_head_at INTEGER",
+            // Since #5994 (storage version 11): the highest model clear applied, and each cleared model's.
+            "cleared_lsn INTEGER", "cleared_models TEXT",
         ])
         XCTAssertEqual(try columns(provider, "record_log_writers"), [
             "doc_id TEXT", "client_id TEXT", "writer TEXT", "next_seq INTEGER", "resumed_at INTEGER",

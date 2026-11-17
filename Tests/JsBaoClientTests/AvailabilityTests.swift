@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-availability.test.ts
 /// Tests availability gating: waitForLocalOrNetwork behavior.
+@available(*, deprecated)
 final class AvailabilityTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

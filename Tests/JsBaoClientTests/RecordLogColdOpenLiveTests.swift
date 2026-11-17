@@ -12,6 +12,7 @@ import XCTest
 /// client opens again at once. Each ends with the room's rows. The rows are
 /// written through the room's `submit` test route, and the documents' change
 /// checks are held off so that no segment built for change races the opens.
+@available(*, deprecated)
 final class RecordLogColdOpenLiveTests: XCTestCase {
 
     private var ctx: TestContext!

@@ -31,7 +31,7 @@ enum RecordLogLocalOnly {
         "idx_named_\(model.lowercased())_\(name.lowercased())"
     }
 
-    /// The room's name of a member index (#5156): `idx_members_<model>_<field>`
+    /// The room's name of a member index: `idx_members_<model>_<field>`
     /// lowercased, then `_2`, `_3`, … while an index of `taken` holds the name.
     private static func memberIndexName(model: String, field: String, taken: [String]) -> String {
         let held = Set(taken.map { $0.lowercased() })
@@ -77,9 +77,9 @@ enum RecordLogLocalOnly {
         var unique: Bool
         var members = false
         var origins: [Db3IndexOrigin]
-        /// A text index's options (#5223); `nil` for any other kind.
+        /// A text index's options; `nil` for any other kind.
         var text: RecordLogTextIndexOptions?
-        /// A vector index's options with its field's encoding (#5230); `nil` for any other kind.
+        /// A vector index's options with its field's encoding; `nil` for any other kind.
         var vector: RecordLogVectorOptions?
 
         var kind: Db3IndexKind { vector != nil ? .vector : text != nil ? .text : members ? .members : .scalar }
@@ -136,7 +136,7 @@ enum RecordLogLocalOnly {
     /// with `members` and its named origin alone, in place of any index a
     /// declaration would keep over its field, as the room keeps no declaration
     /// origin on a member index. A text registration is listed beside any
-    /// index over the same fields (#5223). Sorted by name, as the room lists
+    /// index over the same fields. Sorted by name, as the room lists
     /// its registry.
     static func indexList(_ schemas: [PrimitiveSchema], _ registrations: [RecordLogLocalIndex]) -> [Db3Index] {
         listings(schemas, registrations).map(\.index)
@@ -215,13 +215,13 @@ enum RecordLogLocalOnly {
         var fields: [String]
         var unique: Bool
         var name: String?
-        /// A member index on the one field (#5156).
+        /// A member index on the one field.
         var members = false
-        /// What the index is (#5220).
+        /// What the index is.
         var kind: Db3IndexKind = .scalar
-        /// A text index's options, filled in (#5223).
+        /// A text index's options, filled in.
         var text: RecordLogTextIndexOptions?
-        /// A vector index's options as sent (#5230), checked against the field's declaration when it is registered.
+        /// A vector index's options as sent, checked against the field's declaration when it is registered.
         var vector: Db3VectorIndexOptions?
     }
 
@@ -229,15 +229,15 @@ enum RecordLogLocalOnly {
         JsBaoError(code: .db3IndexInvalid, message: message)
     }
 
-    /// A registration checked by the room's rules, in the room's order (#5220):
+    /// A registration checked by the room's rules, in the room's order:
     /// its shape, `DB3_INDEX_INVALID` naming what is wrong (a member or text
     /// index takes no `unique` or `name`, a member index no `fields`;
     /// `members: true` is `kind: .members`; `text` options go with `kind:
-    /// .text` only, and are checked and filled in, #5223); then `on: .server`
+    /// .text` only, and are checked and filled in; then `on: .server`
     /// or `.both` `DB3_LOCAL_ONLY` (`details.on`), as every index of a
     /// local-only db3 lives on the device. A vector index covers one field
     /// and its options' `nbucket` and `codesize` are positive and at most
-    /// ``RecordLogVectorOptions/maxCount`` (#5230). A
+    /// ``RecordLogVectorOptions/maxCount``. A
     /// unique index is allowed: the device enforces it.
     static func parse(_ body: Db3IndexRegistration) throws -> Registration {
         guard RecordLogSchema.isValidIdentifier(body.model) else {
@@ -383,7 +383,7 @@ enum RecordLogLocalOnly {
         return (next, index)
     }
 
-    /// Register a member index on a local-only db3 (#5156), by the room's
+    /// Register a member index on a local-only db3, by the room's
     /// rules (`registerMemberIndex`), in the room's order: the registration
     /// the field holds answers first, its member index again (registrations
     /// unchanged) whatever the field's declaration has become since, a scalar
@@ -420,7 +420,7 @@ enum RecordLogLocalOnly {
         return (next, index)
     }
 
-    /// Register a text index on a local-only db3 (#5223), by the room's rules
+    /// Register a text index on a local-only db3, by the room's rules
     /// (js-bao's `registerTextIndex`): one per model, so a text index of the
     /// model over other fields is `DB3_INDEX_EXISTS` (`details.index`), and the
     /// same fields again answer the index as it is. Its name is
@@ -459,7 +459,7 @@ enum RecordLogLocalOnly {
         return (next, index)
     }
 
-    /// Register a vector index on a local-only db3 (#5230), by js-bao's rules
+    /// Register a vector index on a local-only db3, by js-bao's rules
     /// (`registerVectorIndex`): one per vector field, so the field's again
     /// answers the index as it is; a field the model's registered schema does
     /// not declare `type: vector` with its encoding is `DB3_INDEX_INVALID`.
@@ -594,7 +594,7 @@ extension Db3IndexRegistration {
 }
 
 extension Db3Index {
-    /// An index as a local-only db3's list answers it (#5155), on the device (#5220).
+    /// An index as a local-only db3's list answers it, on the device.
     init(
         name: String, model: String, fields: [String], unique: Bool, members: Bool, origins: [Db3IndexOrigin], kind: Db3IndexKind,
         on: Db3IndexPlacement, text: Db3TextIndex? = nil, vector: Db3VectorIndex? = nil

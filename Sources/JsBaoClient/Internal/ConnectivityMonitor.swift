@@ -1,7 +1,7 @@
 import Foundation
 import Network
 
-/// Internal seam for automatic connectivity monitoring (#1987, Phase 2).
+/// Internal seam for automatic connectivity monitoring (Phase 2).
 ///
 /// Not public: injection is internal-only (tests supply a fake), so publishing
 /// the protocol would freeze a concurrency/lifecycle contract with no consumer

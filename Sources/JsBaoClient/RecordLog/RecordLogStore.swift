@@ -11,7 +11,7 @@ import Foundation
 // command is one transaction of its own. A save's pending entry and its view
 // row commit together or not at all.
 
-/// Which documents' sessions are open (#5221), per host: a device read's
+/// Which documents' sessions are open, per host: a device read's
 /// drift is `live` while its document's is. A binding's session marks it.
 /// The client also says, per host, whether its room can reach it now: offline
 /// mode can leave the socket, and so the session, open, and a read then is
@@ -69,10 +69,10 @@ struct RecordLogStoredState: Equatable, Sendable {
     /// The replacement in progress is staged: the view keeps the previous
     /// completed generation until it commits.
     var staged = false
-    /// The db3 lives only on this device (#5155): its store judges and
+    /// The db3 lives only on this device: its store judges and
     /// confirms its own writes, and nothing of it is ever sent.
     var localOnly = false
-    /// The room's head as this device last heard it (#5221), or `nil` before one is heard.
+    /// The room's head as this device last heard it, or `nil` before one is heard.
     var knownHead: Int? = nil
     /// When ``knownHead`` was heard (epoch ms), or `nil`.
     var knownHeadAt: Int64? = nil
@@ -117,7 +117,7 @@ struct RecordLogMarks: Equatable, Sendable {
     var segment: RecordLogHeldSegment? = nil
     /// The full replacement in progress is staged (see ``RecordLogStoredState/staged``).
     var staged = false
-    /// What the room last said of the db3's type (#5020): `unknown` before any
+    /// What the room last said of the db3's type: `unknown` before any
     /// `record.opened` answered on this device.
     var typed: RecordLogTyped = .unknown
     /// A typed db3's type: its name, and the revision hash whose declarations are held (`nil` when none are).
@@ -125,28 +125,36 @@ struct RecordLogMarks: Equatable, Sendable {
     /// A typed db3's declarations as the room sent them, per model each declared field's kind.
     var declarations: [String: [String: String]]? = nil
     /// A typed db3's vector encodings as the room sent them with its
-    /// declarations (#5225), per model declaring one; `nil` when none are held.
+    /// declarations, per model declaring one; `nil` when none are held.
     var vectors: RecordLogVectorDeclarations? = nil
-    /// Whether the held type entry records the vector encodings (#5225): `false`
+    /// Whether the held type entry records the vector encodings: `false`
     /// for one an older client wrote, whose next open asks the room for the
     /// declarations again.
     var vectorsKnown = true
     /// A typed db3's enforced enums as the room sent them with its
-    /// declarations (#5897), per model enforcing one; `nil` when none are held.
+    /// declarations, per model enforcing one; `nil` when none are held.
     var enums: RecordLogEnumDeclarations? = nil
-    /// Whether the held type entry records the enforced enums (#5897): `false`
+    /// Whether the held type entry records the enforced enums: `false`
     /// for one an older client wrote, whose next open asks the room for the
     /// declarations again.
     var enumsKnown = true
-    /// The db3 lives only on this device (#5155): see ``RecordLogStoredState/localOnly``.
+    /// A typed db3's cleared and tombstoned fields as the room sent them with
+    /// its declarations, per model hiding any the sorted names; `nil`
+    /// when none are held. Reads leave them out of every row.
+    var cleared: RecordLogClearedDeclarations? = nil
+    /// Whether the held type entry records the cleared fields: `false`
+    /// for one an older client wrote, whose next open asks the room for the
+    /// declarations again.
+    var clearedKnown = true
+    /// The db3 lives only on this device: see ``RecordLogStoredState/localOnly``.
     var localOnly = false
     /// A local-only db3's index registrations made on this device, by name.
     var localIndexes: [RecordLogLocalIndex] = []
     /// The models the copy holds, sorted and distinct: those with a view or a
     /// confirmed row, and those an unjudged entry of any writer touches. An
-    /// untyped open declares these (#5160).
+    /// untyped open declares these.
     var models: [String] = []
-    /// The room's head as this device last heard it (#5221), or `nil` before one is heard.
+    /// The room's head as this device last heard it, or `nil` before one is heard.
     var knownHead: Int? = nil
     /// When ``knownHead`` was heard (epoch ms), or `nil`.
     var knownHeadAt: Int64? = nil
@@ -155,6 +163,7 @@ struct RecordLogMarks: Equatable, Sendable {
         a.typed == b.typed && a.models == b.models && a.knownHead == b.knownHead && a.knownHeadAt == b.knownHeadAt && a.db3Type == b.db3Type && a.declarations == b.declarations
             && a.vectors == b.vectors && a.vectorsKnown == b.vectorsKnown
             && a.enums == b.enums && a.enumsKnown == b.enumsKnown
+            && a.cleared == b.cleared && a.clearedKnown == b.clearedKnown
             && a.localOnly == b.localOnly && a.localIndexes == b.localIndexes
             && a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
             && a.constraints == b.constraints && a.permission == b.permission && a.replacing == b.replacing
@@ -182,18 +191,40 @@ struct RecordLogDb3Type: Equatable, Sendable {
 
 /// What a store is told of a db3's type: untyped, or typed with a name, a
 /// hash and, when the room sent them, the declarations and, per model
-/// declaring one, each vector field's encoding (#5225) and, per model
-/// enforcing one, each enforced field's enum values (#5897).
+/// declaring one, each vector field's encoding and, per model
+/// enforcing one, each enforced field's enum values.
 enum RecordLogTypeUpdate: Sendable, Equatable {
     case untyped
     case typed(
         name: String, hash: String?, models: [String: [String: String]]?,
         vectors: [String: [String: VectorEncoding]]? = nil,
-        enums: RecordLogEnumDeclarations? = nil
+        enums: RecordLogEnumDeclarations? = nil,
+        cleared: RecordLogClearedDeclarations? = nil
     )
 }
 
-/// A typed db3's enforced enums, per model each enforced field's values (#5897).
+/// A typed db3's cleared and tombstoned fields, per model the sorted names.
+typealias RecordLogClearedDeclarations = [String: [String]]
+
+/// Per model, the names it hides; `nil` when `json` is not an object of
+/// non-empty string arrays.
+func recordLogClearedDeclarations(_ json: JSONValue) -> RecordLogClearedDeclarations? {
+    guard let models = json.objectValue else { return nil }
+    var out: RecordLogClearedDeclarations = [:]
+    for (model, names) in models {
+        guard let list = names.arrayValue, !list.isEmpty else { return nil }
+        let strings = list.compactMap(\.stringValue)
+        guard strings.count == list.count else { return nil }
+        out[model] = strings
+    }
+    return out
+}
+
+func recordLogClearedDeclarationsJSON(_ cleared: RecordLogClearedDeclarations) -> JSONValue {
+    .object(cleared.mapValues { .array($0.map { .string($0) }) })
+}
+
+/// A typed db3's enforced enums, per model each enforced field's values.
 typealias RecordLogEnumDeclarations = [String: [String: [String]]]
 
 /// Per model, each enforced field's values; `nil` when `json` is not an
@@ -219,7 +250,7 @@ func recordLogEnumDeclarationsJSON(_ enums: RecordLogEnumDeclarations) -> JSONVa
     .object(enums.mapValues { .object($0.mapValues { .array($0.map { .string($0) }) }) })
 }
 
-/// A typed db3's vector encodings, per model each vector field's (#5225).
+/// A typed db3's vector encodings, per model each vector field's.
 typealias RecordLogVectorDeclarations = [String: [String: VectorEncoding]]
 
 extension VectorEncoding {
@@ -326,7 +357,7 @@ struct RecordLogCommitReply: Sendable {
     var entries: [RecordLogPendingEntry]
     var changed: [RecordLogRowChange]
     var cursor: Int
-    /// A local-only store's (#5155) entries it confirmed in the commit itself,
+    /// A local-only store's entries it confirmed in the commit itself,
     /// as a `receive` would have answered them: the acknowledged entries,
     /// those that left the pending log, and their records' confirmed rows.
     /// `nil` in a synced store's reply, whose entries wait for the room.
@@ -339,7 +370,7 @@ struct RecordLogCommitReply: Sendable {
     var aliases: [RecordLogAlias] = []
 }
 
-/// An index registration made on a local-only db3 (#5155), as the store
+/// An index registration made on a local-only db3, as the store
 /// keeps it: the room's registry, kept on the device. Stored as js-bao's
 /// `RecordLogLocalIndex`, field for field.
 struct RecordLogLocalIndex: Equatable, Sendable {
@@ -351,14 +382,14 @@ struct RecordLogLocalIndex: Equatable, Sendable {
     var unique: Bool
     /// The `name` the registration gave, when it gave one.
     var named: String?
-    /// A member index on the one field (#5156): its members kept in a table of their own on the device.
+    /// A member index on the one field: its members kept in a table of their own on the device.
     var members: Bool
-    /// What the index is (#5223): `.text` for a text index; stored as `kind`
+    /// What the index is: `.text` for a text index; stored as `kind`
     /// only then, a member index keeping `members: true`.
     var kind: Db3IndexKind
-    /// A text index's options, filled in (#5223); stored as `text`.
+    /// A text index's options, filled in; stored as `text`.
     var text: RecordLogTextIndexOptions?
-    /// A vector index's options with its field's encoding, filled in (#5230); stored as `vector`.
+    /// A vector index's options with its field's encoding, filled in; stored as `vector`.
     var vector: RecordLogVectorOptions?
 
     var json: JSONValue {
@@ -587,7 +618,7 @@ struct RecordLogOrderedMap<Key: Hashable, Value> {
 ///
 /// Every method runs on the provider's queue inside one of the store's calls,
 /// on the connection that call bound (`sql`).
-final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables {
+final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables, RecordLogClearTables {
     /// How many results held ahead of the cursor make the store say so, once.
     static let heldWarn = 10_000
 
@@ -677,33 +708,37 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
         )
     }
 
-    /// The `record_log_meta` key a document's type mark is kept under (#5020):
-    /// a JSON `{ typed, name?, hash?, models?, vectors?, enums? }`, absent
-    /// before any room answered. `vectors` (#5225) is the vector encodings or
-    /// `null`, `enums` (#5897) the enforced enums or `null`; an entry an older
+    /// The `record_log_meta` key a document's type mark is kept under:
+    /// a JSON `{ typed, name?, hash?, models?, vectors?, enums?, cleared? }`, absent
+    /// before any room answered. `vectors` is the vector encodings or
+    /// `null`, `enums` the enforced enums or `null`; an entry an older
     /// client wrote has no such key.
     private var typeKey: Format2SqlValue { .text("db3_type:\(docId)") }
 
     /// The typed mark, the type, its held declarations, vector encodings and
-    /// enforced enums, and whether the entry records the encodings (#5225)
-    /// and the enums (#5897).
+    /// enforced enums, and whether the entry records the encodings
+    /// and the enums.
     func typeState() throws -> (
         typed: RecordLogTyped, db3Type: RecordLogDb3Type?, declarations: [String: [String: String]]?,
         vectors: RecordLogVectorDeclarations?, vectorsKnown: Bool,
-        enums: RecordLogEnumDeclarations?, enumsKnown: Bool
+        enums: RecordLogEnumDeclarations?, enumsKnown: Bool,
+        cleared: RecordLogClearedDeclarations?, clearedKnown: Bool
     ) {
         let text = try sql.first("SELECT value FROM record_log_meta WHERE key = ?", [typeKey])?["value"].stringValue
-        guard let held = text.flatMap({ JSONValue(jsonText: $0) })?.objectValue else { return (.unknown, nil, nil, nil, true, nil, true) }
+        guard let held = text.flatMap({ JSONValue(jsonText: $0) })?.objectValue else { return (.unknown, nil, nil, nil, true, nil, true, nil, true) }
         let typed = RecordLogTyped(rawValue: held["typed"]?.stringValue ?? "") ?? .unknown
-        guard typed == .yes, let name = held["name"]?.stringValue else { return (typed, nil, nil, nil, true, nil, true) }
+        guard typed == .yes, let name = held["name"]?.stringValue else { return (typed, nil, nil, nil, true, nil, true, nil, true) }
         let declarations = held["models"]?.objectValue?.mapValues { ($0.objectValue ?? [:]).compactMapValues(\.stringValue) }
         let vectors = held["vectors"].flatMap(recordLogVectorDeclarations)
         let enums = held["enums"].flatMap(recordLogEnumDeclarations)
         // An entry with declarations and no `enums` key was written before enforced enums (#5897).
         let enumsKnown = declarations == nil || held["enums"] != nil
+        let cleared = held["cleared"].flatMap(recordLogClearedDeclarations)
+        // An entry with declarations and no `cleared` key was written before cleared fields (#6021).
+        let clearedKnown = declarations == nil || held["cleared"] != nil
         return (
             typed, RecordLogDb3Type(name: name, hash: held["hash"]?.stringValue), declarations, vectors, held["vectors"] != nil,
-            enums, enumsKnown
+            enums, enumsKnown, cleared, clearedKnown
         )
     }
 
@@ -714,7 +749,7 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
         switch update {
         case .untyped:
             object = ["typed": "no"]
-        case .typed(let name, let hash, let models, let vectors, let enums):
+        case .typed(let name, let hash, let models, let vectors, let enums, let cleared):
             let held = try typeState()
             let keepsHeld = models == nil && hash != nil && held.db3Type?.hash == hash
             let kept = models ?? (keepsHeld ? held.declarations : nil)
@@ -734,6 +769,12 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
             } else {
                 object["enums"] = enums.map(recordLogEnumDeclarationsJSON) ?? .null
             }
+            // And the cleared fields (#6021).
+            if keepsHeld {
+                if held.clearedKnown { object["cleared"] = held.cleared.map(recordLogClearedDeclarationsJSON) ?? .null }
+            } else {
+                object["cleared"] = cleared.map(recordLogClearedDeclarationsJSON) ?? .null
+            }
         }
         try sql.exec(
             "INSERT INTO record_log_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -751,7 +792,7 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
         try sql.exec("UPDATE record_log_state SET last_catch_up_at = ? WHERE doc_id = ?", [.integer(at), doc])
     }
 
-    /// Whether the db3 lives only on this device (#5155).
+    /// Whether the db3 lives only on this device.
     func localOnly() throws -> Bool { try state()?["local_only"].intValue == 1 }
 
     func setLocalOnly(_ localOnly: Bool) throws {
@@ -839,6 +880,76 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
                 )
             }
         }
+    }
+
+    /// Remove every confirmed row of `model` (a model clear, #5994), set-based:
+    /// a record no unjudged entry covers leaves the view at once with its row,
+    /// and the view's triggers keep the member, text and vector tables. Answers
+    /// the records an unjudged entry covers, whose view a refresh guesses again
+    /// over no row (every record of the model when an unjudged upsert of it
+    /// may land on one). Under a staged replacement, the previous completed
+    /// generation's row of each record is kept as none, so the view shows no
+    /// row of the model now and the replacement's completion keeps none.
+    func clearModel(_ model: String) throws -> [RecordLogRecordKey] {
+        let m: Format2SqlValue = .text(model)
+        let keysOf = { (rows: [Format2SqlRow]) in
+            rows.compactMap { $0["_id"].stringValue }.map { RecordLogRecordKey(model: model, id: $0) }
+        }
+        if try staged() {
+            try stageBase(keysOf(try sql.rows(
+                "SELECT _id FROM record_log_view WHERE doc_id = ? AND _type = ? UNION SELECT _id FROM record_log_rows WHERE doc_id = ? AND _type = ?",
+                [doc, m, doc, m]
+            )))
+            try sql.exec("UPDATE record_log_staged_base SET _data = NULL WHERE doc_id = ? AND _type = ?", [doc, m])
+        }
+        let upserts = try sql.first(
+            "SELECT 1 AS hit FROM record_log_pending_values WHERE doc_id = ? AND _type = ? AND upsert = 1 LIMIT 1", [doc, m]
+        ) != nil
+        let guessed = upserts
+            ? keysOf(try sql.rows(
+                "SELECT _id FROM record_log_view WHERE doc_id = ? AND _type = ? UNION SELECT _id FROM record_log_pending_keys WHERE doc_id = ? AND _type = ?",
+                [doc, m, doc, m]
+            ))
+            : keysOf(try sql.rows("SELECT DISTINCT _id FROM record_log_pending_keys WHERE doc_id = ? AND _type = ?", [doc, m]))
+        try sql.exec("DELETE FROM record_log_rows WHERE doc_id = ? AND _type = ?", [doc, m])
+        try sql.exec(
+            """
+            DELETE FROM record_log_view WHERE doc_id = ? AND _type = ? AND NOT EXISTS (
+              SELECT 1 FROM record_log_pending_keys k
+               WHERE k.doc_id = record_log_view.doc_id AND k._type = record_log_view._type AND k._id = record_log_view._id)
+            """,
+            [doc, m]
+        )
+        return guessed
+    }
+
+    func clearedThrough() throws -> Int { try state()?["cleared_lsn"].intValue ?? 0 }
+
+    func clearedAt(_ model: String) throws -> Int { try clearedModels()[model] ?? 0 }
+
+    func setClearedThrough(_ l: Int, model: String) throws {
+        try ensureState()
+        var models = try clearedModels()
+        models[model] = max(models[model] ?? 0, l)
+        // A JSON list of `[model, l]`, as js-bao keeps it, so any model name reads back as it is.
+        let list = JSONValue.array(models.keys.sorted().map { .array([.string($0), .number(Double(models[$0] ?? 0))]) })
+        try sql.exec(
+            "UPDATE record_log_state SET cleared_lsn = ?, cleared_models = ? WHERE doc_id = ?",
+            [.integer(Int64(max(try clearedThrough(), l))), .text(RecordLogJSON.text(list)), doc]
+        )
+    }
+
+    /// Each cleared model's highest clear applied; an unreadable value reads as none.
+    private func clearedModels() throws -> [String: Int] {
+        guard let text = try state()?["cleared_models"].stringValue,
+              let pairs = RecordLogJSON.parse(text)?.arrayValue else { return [:] }
+        var out: [String: Int] = [:]
+        for pair in pairs {
+            guard let items = pair.arrayValue, items.count == 2, case .string(let model) = items[0],
+                  case .number(let l) = items[1] else { continue }
+            out[model] = Int(l)
+        }
+        return out
     }
 
     func removeUnnamed(_ attempt: String, models: [String]) throws -> [RecordLogRecordKey] {
@@ -1321,7 +1432,7 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables 
     }
 }
 
-/// Whether a purge keeps the device's index policy for the document (#5322):
+/// Whether a purge keeps the device's index policy for the document:
 /// an evict keeps it, the document's deletion clears it.
 enum RecordLogPurgePolicy: Sendable, Equatable {
     case keep
@@ -1338,7 +1449,7 @@ final class RecordLogStore: @unchecked Sendable {
     let host: any Format2SqlHost
     let documentId: String
     let clientId: String
-    /// The client's default for the device indexes it has not built yet (#5322).
+    /// The client's default for the device indexes it has not built yet.
     let deviceIndexes: Db3DeviceIndexes
     let logger: Logger?
     private let group: RecordLogGroupCommit
@@ -1383,7 +1494,7 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Run a read of the view (``RecordLogViewReader``) on this store's
-    /// connection, in one read transaction (#5221): a deferred `BEGIN` …
+    /// connection, in one read transaction: a deferred `BEGIN` …
     /// `COMMIT` of its own when nothing is open on the connection, else the
     /// open group's or transaction's, whose writes it sees. A nested call
     /// joins the outer one, so a page's rows, include legs and sync state are
@@ -1395,8 +1506,8 @@ final class RecordLogStore: @unchecked Sendable {
     /// The connection's group commit, for a test that holds a group open.
     var groupCommitForTest: RecordLogGroupCommit { group }
 
-    /// A test's turn between a vector command's read of an entry and its use
-    /// (#5230): an install's check, a fill slice's read and a `$near`'s
+    /// A test's turn between a vector command's read of an entry and its use:
+    /// an install's check, a fill slice's read and a `$near`'s
     /// judgement of its index run before it, the install's and the slice's
     /// writes and the `$near`'s statement after, so an index list the test
     /// applies here lands where one applied by another task may.
@@ -1404,7 +1515,7 @@ final class RecordLogStore: @unchecked Sendable {
 
     // MARK: - Live
 
-    /// Whether this client's session of the document is open now (#5221):
+    /// Whether this client's session of the document is open now:
     /// a device read's drift is `live` only then. Kept per host and document,
     /// so a read over several documents of one host asks each.
     var isLive: Bool { RecordLogLiveness.isLive(host, documentId) }
@@ -1414,7 +1525,7 @@ final class RecordLogStore: @unchecked Sendable {
 
     // MARK: - Sync state
 
-    /// Each of `documents`' sync state (#5221), in one statement: its cursor,
+    /// Each of `documents`' sync state, in one statement: its cursor,
     /// the room's head as last heard and when, its unjudged writes (every
     /// writer's, as ``storedState()`` counts them) and whether it lives only
     /// on this device; a document with no state reads as one with nothing
@@ -1473,7 +1584,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// A store at or above the version is answered by one read of its version
     /// and one `sqlite_master` probe for the projection rule table an older
     /// build creates on every open and the staged replacement's base table
-    /// (#4701, added with no version change): when neither says otherwise,
+    /// (added with no version change): when neither says otherwise,
     /// nothing else runs; when one does, one transaction creates the tables
     /// and retires the layout, and the version is left as it is (a newer
     /// build's is never lowered).
@@ -1491,7 +1602,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// is retired again at the next open, and a row it wrote as text reads as
     /// any other and is stored as JSONB when it is next written. A store at
     /// version 3 has nothing to convert: the first transaction adds the
-    /// local-only columns (#5155) and the version is written after it, every
+    /// local-only columns and the version is written after it, every
     /// db3 it holds reading synced.
     func initialize() throws {
         try onConnection { sql in
@@ -1622,7 +1733,7 @@ final class RecordLogStore: @unchecked Sendable {
         }
     }
 
-    /// Drop what the query projection kept beside the view (#4700): every
+    /// Drop what the query projection kept beside the view: every
     /// table with a `_meta_doc_id` column (in this database each is a db3's
     /// query table or its string-set junction, since format-1 documents query
     /// an in-memory mirror), the projection marks and rule, and the view
@@ -1769,8 +1880,8 @@ final class RecordLogStore: @unchecked Sendable {
     /// Remove everything the store keeps of this document: its rows, view,
     /// unjudged entries, writers, epoch counts and cached index list. Refused
     /// while it holds unjudged writes, unless `force`; a forced purge answers
-    /// what it dropped. The device's index policy for the document is kept
-    /// (#5322), so an evict keeps a decline; `policy: .clear` removes it too,
+    /// what it dropped. The device's index policy for the document is kept,
+    /// so an evict keeps a decline; `policy:.clear` removes it too,
     /// as the document's deletion does.
     func purge(force: Bool, policy: RecordLogPurgePolicy = .keep) throws -> RecordLogPurgeReply {
         // A store an older build wrote lacks tables the purge clears.
@@ -1842,6 +1953,8 @@ final class RecordLogStore: @unchecked Sendable {
             vectorsKnown: type.vectorsKnown,
             enums: type.enums,
             enumsKnown: type.enumsKnown,
+            cleared: type.cleared,
+            clearedKnown: type.clearedKnown,
             localOnly: state?["local_only"].intValue == 1,
             localIndexes: try tables.localIndexes(),
             models: try modelsHeld(sql),
@@ -2049,11 +2162,15 @@ final class RecordLogStore: @unchecked Sendable {
     /// model or field name that is not an identifier, throws
     /// `JsBaoError(.invalidArgument)` before any SQL runs; a cursor minted under
     /// another sort throws `InvalidCursorError`.
-    func queryView(_ model: String, _ filter: DocumentFilter = [:], options: QueryOptions? = nil) throws
-        -> PagedQueryResult<RecordLogRow>
-    {
-        let page = try RecordLogViewReader(store: self, documents: scope(options?.documentScope()))
-            .page(model, filter, options: options, shape: .stored)
+    ///
+    /// `cleared` is the fields the db3's held revision clears (#6021), as its
+    /// binding holds them: read as unset, and left out of every row.
+    func queryView(
+        _ model: String, _ filter: DocumentFilter = [:], options: QueryOptions? = nil, cleared: RecordLogClearedDeclarations? = nil
+    ) throws -> PagedQueryResult<RecordLogRow> {
+        var reader = RecordLogViewReader(store: self, documents: scope(try options?.documentScope()))
+        if let cleared { reader.cleared = [documentId: cleared] }
+        let page = try reader.page(model, filter, options: options, shape: .stored)
         return PagedQueryResult(
             data: page.rows, nextCursor: page.nextCursor, prevCursor: page.prevCursor, hasMore: page.hasMore, drift: page.drift
         )
@@ -2061,18 +2178,25 @@ final class RecordLogStore: @unchecked Sendable {
 
     /// How many records of `model` in the view match `filter`, as
     /// ``queryView(_:_:options:)`` matches them, in the `documents` scope;
-    /// with `maxDrift`, refused `DB3_DRIFT_EXCEEDED` as a page is (#5221).
-    func countView(_ model: String, _ filter: DocumentFilter = [:], documents: [String]? = nil, maxDrift: Db3MaxDrift? = nil) throws -> Int {
-        try RecordLogViewReader(store: self, documents: scope(documents)).count(model, filter, maxDrift: maxDrift)
+    /// with `maxDrift`, refused `DB3_DRIFT_EXCEEDED` as a page is.
+    func countView(
+        _ model: String, _ filter: DocumentFilter = [:], documents: [String]? = nil, maxDrift: Db3MaxDrift? = nil,
+        cleared: RecordLogClearedDeclarations? = nil
+    ) throws -> Int {
+        var reader = RecordLogViewReader(store: self, documents: scope(documents))
+        if let cleared { reader.cleared = [documentId: cleared] }
+        return try reader.count(model, filter, maxDrift: maxDrift)
     }
 
-    /// Explain a read of `model` over this document's copy (#5241): the read
+    /// Explain a read of `model` over this document's copy: the read
     /// `request` describes, run for real and forced as `request.index` asks,
     /// with SQLite's plan of each statement and the registry indexes it used,
     /// in the server explain's shape (``RecordLogExplain``). The root model's
     /// set fields are `request.setFields` when given, else the ones the
     /// room-sent declarations of a typed db3 give it. Nothing is written.
-    func explainView(_ model: String, _ request: Db3ExplainRequest) throws -> Db3Explain {
+    /// `cleared` is the fields the db3's held revision clears (#6021), read
+    /// as unset as ``queryView(_:_:options:cleared:)`` reads them.
+    func explainView(_ model: String, _ request: Db3ExplainRequest, cleared: RecordLogClearedDeclarations? = nil) throws -> Db3Explain {
         let setFields: Set<String>
         if let given = request.setFields {
             setFields = Set(given)
@@ -2080,7 +2204,7 @@ final class RecordLogStore: @unchecked Sendable {
             let declared = try reading { _ in try tables.typeState().declarations?[model] } ?? [:]
             setFields = Set(declared.filter { $0.value == "stringset" }.keys)
         }
-        return try RecordLogExplain.explain(store: self, model: model, request: request, setFields: setFields)
+        return try RecordLogExplain.explain(store: self, model: model, request: request, setFields: setFields, cleared: cleared)
     }
 
     /// This document, when a read's `documents` scope admits it.
@@ -2094,9 +2218,9 @@ final class RecordLogStore: @unchecked Sendable {
     /// view indexes and member tables over every document's cached list
     /// (``RecordLogIndexes``); `nil` reconciles from the cache. The cache and
     /// the drops are one command; each build is a command of its own, so a
-    /// build that fails (a full disk) loses only itself (#5322). When it built
+    /// build that fails (a full disk) loses only itself. When it built
     /// a member table, the store gathers statistics in another, once it has
-    /// committed (#5156).
+    /// committed.
     @discardableResult
     func syncIndexes(_ entries: [RecordLogIndexEntry]?) throws -> RecordLogIndexSync {
         let (sync, built) = try RecordLogIndexes.sync(
@@ -2116,18 +2240,18 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Each index the document's room places on this device, with how it
-    /// stands here (#5322): `built`, `unbuilt` (with why) or `declined` (with why).
+    /// stands here: `built`, `unbuilt` (with why) or `declined` (with why).
     func localIndexes() throws -> [Db3LocalIndex] {
         try readView { sql in try RecordLogIndexes.statuses(sql, documentId: documentId, deviceIndexes: deviceIndexes) }
     }
 
     /// Each entry of the document's room's list this copy skipped when it
-    /// last applied it, with why (#5241): what ``localIndexes()`` does not list.
+    /// last applied it, with why: what ``localIndexes()`` does not list.
     func localIndexSkips() throws -> [Db3SkippedIndex] {
         try readView { sql in try RecordLogIndexes.skips(sql, documentId: documentId) }
     }
 
-    /// Decline the index the room names `name` on this device (#5322): its
+    /// Decline the index the room names `name` on this device: its
     /// verdict is kept by its identity `(model, fields, kind)` and its table
     /// or index dropped; it is not built again until accepted. Declining it
     /// again changes nothing. The room's registry is not told.
@@ -2143,7 +2267,7 @@ final class RecordLogStore: @unchecked Sendable {
         return try readView { try RecordLogIndexes.status($0, documentId: documentId, name: name, deviceIndexes: deviceIndexes) }
     }
 
-    /// Accept the index the room names `name` on this device (#5322): its
+    /// Accept the index the room names `name` on this device: its
     /// verdict becomes `accepted`, whatever left it unbuilt, and it is built
     /// when it is not. A build that fails answers `unbuilt` with why; an index
     /// already built answers `built` and nothing is rebuilt.
@@ -2161,7 +2285,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// `reply`, once statistics were gathered if the view has grown past its
     /// mark (``gatherStatisticsIfGrown()``): the catch-up, load and segment
     /// commands grow a synced db3's view as a local commit grows a local-only
-    /// one's (#5223, js-bao's `statisticsAfter`). Called after the command's
+    /// one's (js-bao's `statisticsAfter`). Called after the command's
     /// transaction, never inside it.
     private func statisticsAfter<T>(_ reply: T) -> T {
         gatherStatisticsIfGrown()
@@ -2169,7 +2293,7 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Gather statistics once the view has grown past its mark, in a store
-    /// holding a member index (#5156): one cheap read, and a command of its
+    /// holding a member index: one cheap read, and a command of its
     /// own (the open group of saves commits first) only when they are due.
     /// Never throws.
     private func gatherStatisticsIfGrown() {
@@ -2512,7 +2636,7 @@ final class RecordLogStore: @unchecked Sendable {
     ///   may write into are full; nothing of the save lands. A db3 that lives
     ///   only on this device commits through ``commitLocally(_:writer:writes:ts:)``
     ///   and throws what it throws; in a store holding a member index it then
-    ///   gathers statistics once the view has grown past its mark (#5156),
+    ///   gathers statistics once the view has grown past its mark,
     ///   outside the save.
     func commitEntries(
         writer: String, writes: [RecordLogWrite],
@@ -2561,7 +2685,7 @@ final class RecordLogStore: @unchecked Sendable {
         return reply
     }
 
-    /// Commit the writes of a db3 that lives only on this device (#5155), in
+    /// Commit the writes of a db3 that lives only on this device, in
     /// the save's transaction. No room will judge them, so the store does, as
     /// the room would (``judgeLocally(_:_:)``). An accepted write is written
     /// and confirmed at once by a result of the store's own making (the next
@@ -2604,7 +2728,7 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Judge one write of a local-only db3 against the confirmed rows, as the
-    /// room judges an entry (#5155): an upsert lands on the live record
+    /// room judges an entry: an upsert lands on the live record
     /// holding its value; `ifNotExists` fails on a live record, a `condition`
     /// on no live record or one it does not match, an increment on a record
     /// neither live nor created by the entry; the rows the entry leaves are
@@ -2736,6 +2860,7 @@ final class RecordLogStore: @unchecked Sendable {
             for item in items {
                 let out = try rules.receive(item)
                 touched.append(contentsOf: out.touched)
+                for model in out.cleared where !reply.models.contains(model) { reply.models.append(model) }
                 reply.acknowledged.append(contentsOf: out.acknowledged)
                 reply.settled.append(contentsOf: out.settled)
                 reply.settlements.merge(out.settlements) { _, new in new }
@@ -2744,6 +2869,26 @@ final class RecordLogStore: @unchecked Sendable {
             // The frame's head, in the transaction that applied it (#5221).
             try rules.noteHead(heard)
             reply.changed = try settleView(sql, touched)
+            reply.cursor = try tables.cursor()
+            return reply
+        }
+    }
+
+    /// Apply the model clears a catch-up carries (#5994), in one transaction,
+    /// before the rows, chunks or page they ride with: every confirmed row of
+    /// each model goes, its member, text and vector index entries with it, a
+    /// record an unjudged entry touches is guessed again, and the highest
+    /// clear applied is recorded with the removal. The cursor does not move.
+    /// A clear at or below the cursor or the mark changes nothing, so one sent
+    /// again (a resumed download) leaves the rows read since it alone. The
+    /// reply names the models emptied in `models`, and in `changed` only the
+    /// records an unjudged entry touches.
+    func applyClears(writer: String, clears: [RecordLogClear]) throws -> RecordLogChangeReply {
+        try command { sql in
+            let out = try rules(writer).applyClears(clears)
+            var reply = RecordLogChangeReply()
+            reply.changed = try settleView(sql, out.touched)
+            reply.models = out.cleared
             reply.cursor = try tables.cursor()
             return reply
         }
@@ -2831,7 +2976,10 @@ final class RecordLogStore: @unchecked Sendable {
             }
             let staged = try generation != nil && tables.staged()
             if staged { try tables.stageBase(rows.map { RecordLogRecordKey(model: $0.model, id: $0.id) } + gone) }
-            let touched = try rules.applyCatchUpPage(RecordLogCatchUpInput(rows: rows, gone: gone), generation: generation, receipt: receipt)
+            // Rows of a model another session's catch-up cleared past `lsn` stay gone (#5994).
+            let touched = try rules.applyCatchUpPage(
+                RecordLogCatchUpInput(rows: rows, gone: gone), generation: generation, receipt: receipt, readAt: lsn
+            )
             try rules.noteHead(heard)
             // A staged replacement's pages reach the view at its completion.
             return RecordLogChangeReply(changed: staged ? [] : try settleView(sql, touched), cursor: try tables.cursor())
@@ -2875,6 +3023,8 @@ final class RecordLogStore: @unchecked Sendable {
             reply.settlements = out.settlements
             reply.underivable = out.underivable
             reply.changed = staged ? try settleReplacement(sql, out.touched) : try settleView(sql, out.touched)
+            // A clear replayed from the held results emptied these models (#5994).
+            reply.models = out.cleared
             reply.cursor = try tables.cursor()
             return reply
         })
@@ -2928,12 +3078,15 @@ final class RecordLogStore: @unchecked Sendable {
     /// model, and in `changed` only the records an unjudged entry touches. An
     /// attempt the store no longer has in progress (a full replacement or its
     /// own completion ended it) is answered `stale` and changes nothing.
+    ///
+    /// `readAt` is the load's last log number: a chunk of a model cleared past
+    /// it changes no row (#5994).
     func applyLoadChunk(
-        writer: String, sessionId: String, attempt: String, model: String, lines: [RecordLogLoadLine]
+        writer: String, sessionId: String, attempt: String, model: String, lines: [RecordLogLoadLine], readAt: Int? = nil
     ) throws -> RecordLogChunkReply {
         statisticsAfter(try command { sql in
             if let stale = try staleReceipt(writer, attempt) { return stale }
-            let touched = try rules(writer).applyLoadLines(attempt: attempt, model: model, lines: lines)
+            let touched = try rules(writer).applyLoadLines(attempt: attempt, model: model, lines: lines, readAt: readAt)
             // A delete is touched only when it removed a record.
             let touchedIds = Set(touched.map(\.id))
             let removed = lines.filter { $0.patch["_deleted"] == .bool(true) && touchedIds.contains($0.id) }.count
@@ -2954,7 +3107,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// refresh removes the confirmed rows of `models` no line the attempt
     /// applied named, from the view too (an unjudged
     /// entry's guess stays); a merge removes nothing. `stale` as
-    /// ``applyLoadChunk(writer:sessionId:attempt:model:lines:)``.
+    /// ``applyLoadChunk(writer:sessionId:attempt:model:lines:readAt:)``.
     func completeLoad(
         writer: String, sessionId: String, attempt: String, mode: RecordLogLoadMode, models: [String]
     ) throws -> RecordLogChunkReply {
@@ -2974,9 +3127,10 @@ final class RecordLogStore: @unchecked Sendable {
     /// view rows with it (a staged replacement's reach the view at its
     /// completion). Under a generation another replacement superseded, or as
     /// an attempt no longer in progress, it is answered `stale` and changes
-    /// nothing.
+    /// nothing. `readAt` is the segment's `C`: rows of a model cleared past it
+    /// are not put back (#5994).
     func applySegmentChunk(
-        writer: String, generation: Int, attempt: String? = nil, rows: [RecordLogCatchUpRow]
+        writer: String, generation: Int, attempt: String? = nil, rows: [RecordLogCatchUpRow], readAt: Int? = nil
     ) throws -> RecordLogChunkReply {
         statisticsAfter(try command { sql in
             let cursor = try tables.cursor()
@@ -2984,7 +3138,7 @@ final class RecordLogStore: @unchecked Sendable {
             if let stale = try staleReceipt(writer, attempt) { return stale }
             let staged = try tables.staged()
             if staged { try tables.stageBase(rows.map { RecordLogRecordKey(model: $0.model, id: $0.id) }) }
-            let touched = try rules(writer).applySegmentRows(generation: generation, attempt: attempt, rows: rows)
+            let touched = try rules(writer).applySegmentRows(generation: generation, attempt: attempt, rows: rows, readAt: readAt)
             var reply = RecordLogChunkReply()
             reply.applied = touched.count
             if staged { reply.cursor = cursor; return reply }
@@ -3000,15 +3154,16 @@ final class RecordLogStore: @unchecked Sendable {
 
     /// Keep one chunk of segment `segmentId` from the confirmed rows instead of
     /// reading it, in one transaction, as
-    /// ``RecordLogRules/keepSegmentChunk(generation:attempt:object:sha256:model:firstId:lastId:rows:)``
+    /// ``RecordLogRules/keepSegmentChunk(generation:attempt:object:sha256:model:firstId:lastId:rows:readAt:)``
     /// decides: the reply's `applied` is the rows kept, or it answers
     /// `mismatch` and nothing changed. `stale` as
-    /// ``applySegmentChunk(writer:generation:attempt:rows:)``, and for
+    /// ``applySegmentChunk(writer:generation:attempt:rows:readAt:)``, and for
     /// an attempt no longer in progress. The view rows are already the kept
-    /// rows'.
+    /// rows'. `readAt` is the segment's `C`: a chunk of a model cleared past
+    /// it is never kept (#5994).
     func keepSegmentChunk(
         writer: String, generation: Int, attempt: String, segmentId: String, object: String, sha256: String, model: String,
-        firstId: String, lastId: String, rows: Int
+        firstId: String, lastId: String, rows: Int, readAt: Int? = nil
     ) throws -> RecordLogChunkReply {
         try command { _ in
             let cursor = try tables.cursor()
@@ -3016,7 +3171,7 @@ final class RecordLogStore: @unchecked Sendable {
             if let stale = try staleReceipt(writer, attempt) { return stale }
             let out = try rules(writer).keepSegmentChunk(
                 generation: generation, attempt: attempt, object: object, sha256: sha256, model: model,
-                firstId: firstId, lastId: lastId, rows: rows
+                firstId: firstId, lastId: lastId, rows: rows, readAt: readAt
             )
             var reply = RecordLogChunkReply()
             reply.cursor = cursor
@@ -3032,9 +3187,11 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Apply a segment's corrections under the replacement `generation`;
-    /// `stale` as ``applySegmentChunk(writer:generation:attempt:rows:)``.
+    /// `stale` as ``applySegmentChunk(writer:generation:attempt:rows:readAt:)``.
+    /// `readAt` is the segment's `C`: lines of a model cleared past it change
+    /// nothing (#5994).
     func applySegmentCorrections(
-        writer: String, generation: Int, attempt: String? = nil, lines: [RecordLogCorrection]
+        writer: String, generation: Int, attempt: String? = nil, lines: [RecordLogCorrection], readAt: Int? = nil
     ) throws -> RecordLogChunkReply {
         statisticsAfter(try command { sql in
             let cursor = try tables.cursor()
@@ -3042,7 +3199,7 @@ final class RecordLogStore: @unchecked Sendable {
             if let stale = try staleReceipt(writer, attempt) { return stale }
             let staged = try tables.staged()
             if staged { try tables.stageBase(lines.map { RecordLogRecordKey(model: $0.model, id: $0.id) }) }
-            let touched = try rules(writer).applySegmentCorrections(generation: generation, attempt: attempt, lines: lines)
+            let touched = try rules(writer).applySegmentCorrections(generation: generation, attempt: attempt, lines: lines, readAt: readAt)
             let hit = Set(touched)
             let removed = lines.filter { $0.row == nil && hit.contains(RecordLogRecordKey(model: $0.model, id: $0.id)) }.count
             var reply = RecordLogChunkReply()
@@ -3170,7 +3327,7 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Record what the room said about epochs, constraints and the db3's type, and the permission the client holds.
-    /// `localOnly` marks the db3 as living only on this device (#5155): from
+    /// `localOnly` marks the db3 as living only on this device: from
     /// then on its writes are judged and confirmed here.
     @discardableResult
     func setState(
@@ -3191,7 +3348,7 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// Replace a local-only db3's index registrations and the constraints it
-    /// enforces, in one transaction (#5155), only while its registrations are
+    /// enforces, in one transaction, only while its registrations are
     /// still `from` and, when `unique` names a key, no two records of the view
     /// share it: a registration is judged against the registrations and rows
     /// it changes, and no write lands between the check and the constraint.
@@ -3217,7 +3374,7 @@ final class RecordLogStore: @unchecked Sendable {
 
     /// Up to `limit` keys over `fields` that records of `model` in the view
     /// share, null-free keys only, in key order: what a unique registration on
-    /// a local-only db3 is refused for (#5155), as the room reads its records.
+    /// a local-only db3 is refused for, as the room reads its records.
     private func duplicateKeys(
         _ sql: RecordLogSql, model: String, fields: [String], limit: Int
     ) throws -> [(values: [JSONValue], count: Int)] {
@@ -3236,7 +3393,7 @@ final class RecordLogStore: @unchecked Sendable {
         }
     }
 
-    /// Mark the copy of a db3 the server just created caught up (#4806): the
+    /// Mark the copy of a db3 the server just created caught up: the
     /// room's log is empty at create, so this store holds all of it and the
     /// first open asks from its cursor (0). A store already marked keeps its
     /// mark.
@@ -3320,7 +3477,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// The db3s living only on this device that belong to `userId` (its owner
     /// tag, else the store's owner, as ``isVisible(host:documentId:userId:)``
     /// reads it), sorted by id; `[]`, creating nothing, on a database with no
-    /// record-log tables (#5155).
+    /// record-log tables.
     static func localOnlyDocumentIds(host: any Format2SqlHost, userId: String) throws -> [String] {
         let store = try migrated(host: host, documentId: "")
         return try store.reading { sql in
@@ -3341,7 +3498,7 @@ final class RecordLogStore: @unchecked Sendable {
 
     /// A store for `documentId` whose tables, when an older build wrote them,
     /// are brought to ``RecordLogSchema/storageVersion`` first, so a read of
-    /// the local-only columns (#5155) meets them; a database with no
+    /// the local-only columns meets them; a database with no
     /// record-log table is left without one. A store at the version costs one
     /// version read and one probe.
     private static func migrated(host: any Format2SqlHost, documentId: String) throws -> RecordLogStore {
@@ -3351,7 +3508,7 @@ final class RecordLogStore: @unchecked Sendable {
     }
 
     /// The `record_log_meta` key a local-only db3's owner is kept under once
-    /// another user signed in on this device (#5155).
+    /// another user signed in on this device.
     static func localOwnerKey(_ documentId: String) -> String { "local_owner:\(documentId)" }
 
     /// Whether `userId` may read `documentId` here: any db3 that syncs; one
@@ -3407,7 +3564,7 @@ final class RecordLogStore: @unchecked Sendable {
     /// table is left without one.
     ///
     /// A db3 that lives only on this device has no copy anywhere else, so the
-    /// reset keeps it (#5155): one with no owner tag is tagged `previousOwner`'s
+    /// reset keeps it: one with no owner tag is tagged `previousOwner`'s
     /// (the user the store belonged to), and it is listed and bound for that
     /// user alone (``storedDocumentIds(host:userId:)``,
     /// ``isVisible(host:documentId:userId:)``).

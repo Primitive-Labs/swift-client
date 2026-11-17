@@ -21,6 +21,7 @@ import XCTest
 /// Server-free: an in-process loopback WebSocket server accepts the socket, and
 /// the pending create's server call is the injected
 /// `DocumentManager.createRemoteDocument`.
+@available(*, deprecated)
 final class ReconnectFlushAndPendingCreateTests: XCTestCase {
 
     private func newDocId() -> String { "reconnect-\(UUID().uuidString.prefix(8))" }

@@ -18,8 +18,8 @@ import Foundation
 /// be observed under a key it is never delivered on — the mistake that made a
 /// mis-annotated `events.on` handler silently never fire.
 ///
-/// Every event the client emits has exactly one conforming payload type. Since
-/// #2367 there are no exceptions — the never-emitted `auth` /
+/// Every event the client emits has exactly one conforming payload type.
+/// There are no exceptions — the never-emitted `auth` /
 /// `blobsUploadQueued` cases and the Swift-only `remoteUpdate` case were
 /// removed along with the rest of the deprecated surface.
 public protocol JsBaoEventPayload: Sendable {
@@ -206,7 +206,7 @@ public struct OfflineAuthRevokedEvent: JsBaoEventPayload {
 /// Payload for `.blobsQueueDrained`. Fires when the blob upload queue has no
 /// remaining work. Carries no fields.
 ///
-/// Field-level divergence from JS (#2241): the JS client's payload carries a
+/// Field-level divergence from JS: the JS client's payload carries a
 /// `timestamp` (epoch milliseconds) that the Swift emit sites do not produce.
 /// The Swift struct stays field-free until the Swift queue has a timestamp to
 /// report.

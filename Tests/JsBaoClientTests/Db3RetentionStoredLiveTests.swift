@@ -19,6 +19,7 @@ import XCTest
 ///
 /// `lastOpenedAt` has second precision, so the uses are spaced more than a
 /// second apart.
+@available(*, deprecated)
 final class Db3RetentionStoredLiveTests: XCTestCase {
 
     private var ctx: TestContext!

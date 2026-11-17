@@ -4,7 +4,7 @@ import Foundation
 
 /// How `WebSocketManager` calls back into `JsBaoClient`.
 ///
-/// Module-internal on purpose (#2363). While this was `public`, `JsBaoClient`'s
+/// Module-internal on purpose. While this was `public`, `JsBaoClient`'s
 /// conformance put all 13 `webSocketManagerOn*` / `webSocketManagerBuild*`
 /// methods on the client's public API: app code could read the bearer token out
 /// of `webSocketManagerBuildConnectionRequest(connectionId:)`'s `?token=` URL,
@@ -12,20 +12,19 @@ import Foundation
 /// app's own observers would treat as real. Nothing outside the module
 /// implements or calls this, and tests reach it through `@testable import`.
 ///
-/// Refined to `Sendable` by #2171: the manager is an `actor` now and calls the
+/// Refined to `Sendable`: the manager is an `actor` now and calls the
 /// delegate from `nonisolated` context, so the reference genuinely crosses
 /// isolation domains. `JsBaoClient` — the only conformer — is already
 /// `@unchecked Sendable`, so it conforms for free. Every method keeps its
 /// signature, including the eleven synchronous ones: an `await` inside
-/// `connect()`'s decision region would reopen the double-connect race (#1993
-/// decision 2).
+/// `connect()`'s decision region would reopen the double-connect race.
 protocol WebSocketManagerDelegate: AnyObject, Sendable {
     func webSocketManagerHasAccessToken() -> Bool
     func webSocketManagerBuildConnectionRequest(connectionId: String) -> (url: URL, headers: [String: String])
     func webSocketManagerOnStatusChange(_ status: ConnectionStatus)
     func webSocketManagerOnConnecting()
     /// The socket opened: the server accepted the handshake. The manager stays
-    /// `.connecting` until the server's `ready` frame (#5578), which is what
+    /// `.connecting` until the server's `ready` frame, which is what
     /// `webSocketManagerOnConnected()` reports.
     ///
     /// Defaulted to a no-op, so a delegate with no handshake policy — every
@@ -42,7 +41,7 @@ protocol WebSocketManagerDelegate: AnyObject, Sendable {
     /// because what follows a deliberate close and what follows the server
     /// refusing a token look identical from outside: a socket that went away
     /// before its handshake completed. Reading the second into the first cost a
-    /// hydrated session its connection outright (#3437) — the auth recovery
+    /// hydrated session its connection outright — the auth recovery
     /// refreshed a token nobody had rejected and, on the 401 a fixed-token
     /// client gets, stopped reconnecting.
     ///
@@ -65,7 +64,7 @@ extension WebSocketManagerDelegate {
 
 /// The client's WebSocket transport and its reconnect state machine.
 ///
-/// An `actor` since #2171. The `NSLock` it used to hold is gone; every piece of
+/// An `actor`. The `NSLock` it used to hold is gone; every piece of
 /// connection state below is actor-isolated. Two things that could not follow
 /// it into isolation are enumerated in `WebSocketTransportBoxes.swift`, each
 /// with its own written safety argument: the transport snapshot the synchronous
@@ -111,7 +110,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         case closed(task: ObjectIdentifier, code: Int, reason: String?)
         case completed(task: ObjectIdentifier, failure: WebSocketError)
         case receiveLoopFailed(task: ObjectIdentifier, code: Int?, failure: WebSocketError)
-        /// The server's `ready` frame arrived on `task` (#5578). It joins the
+        /// The server's `ready` frame arrived on `task`. It joins the
         /// channel rather than calling in, so it is ordered with the task's own
         /// open and close and is applied only while `task` is current.
         case ready(task: ObjectIdentifier)
@@ -191,7 +190,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     private var receiveLoopTask: Task<Void, Never>?
 
     /// How long an open socket may wait for the server's `ready` before it is
-    /// closed and the reconnect loop retries (#5578); `nil` waits forever.
+    /// closed and the reconnect loop retries; `nil` waits forever.
     private let readyTimeoutMs: Int?
     private var readyDeadlineTask: Task<Void, Never>?
 
@@ -202,9 +201,9 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// close request must not bring a socket being torn down up as connected.
     private var awaitingReady = false
 
-    /// Test seam (#2171): the pump reports every event it handled, in handling
+    /// Test seam: the pump reports every event it handled, in handling
     /// order, so the ordering and no-drop behaviors can be observed. Mirrors
-    /// `onOutboundFlushedForTest` (#2105).
+    /// `onOutboundFlushedForTest`.
     var onDelegateEventHandledForTest: (@Sendable (DelegateEvent) -> Void)?
 
     // MARK: - Transport state, stored in the snapshot box
@@ -318,7 +317,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     nonisolated var isSocketOpen: Bool { snapshot.socketIsOpen }
 
     /// Whether the socket is open, connected or still waiting for the server's
-    /// `ready` (#5578). `isSocketOpen` is the gate for sends, which wait for
+    /// `ready`. `isSocketOpen` is the gate for sends, which wait for
     /// `ready`; this is the one an applied token is routed by, so a token for
     /// another user that lands during the wait rebuilds the socket.
     nonisolated var isTransportOpen: Bool { snapshot.transportIsOpen }
@@ -339,7 +338,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// Whether the manager is currently trying to hold a connection open — the
     /// `shouldConnect` intent, not the live transport state. The WS auth
     /// recovery reads it so it never revives a connection the caller
-    /// deliberately took down (#2637).
+    /// deliberately took down.
     var desiredConnection: Bool { shouldConnect }
 
     func setMaxReconnectDelay(_ ms: Int) {
@@ -406,7 +405,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// touching the socket — `setDesiredConnection` is the form that also
     /// connects or disconnects. Mirrors JS `setShouldConnectFlag`. Its caller
     /// is the auth transition: a token arriving where there was none re-arms a
-    /// connection an earlier logout took down (#2663).
+    /// connection an earlier logout took down.
     func setShouldConnectFlag(_ value: Bool) {
         logger.debug("[WSM][debug] setShouldConnectFlag", value)
         shouldConnect = value
@@ -574,7 +573,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     ///
     /// Built from `JsBaoNetworkError(transport:)` — the client's one
     /// error-to-(message, code) mapping — so the WS and HTTP failure paths
-    /// cannot report the same underlying failure differently (#2367).
+    /// cannot report the same underlying failure differently.
     private nonisolated static func transportFailure(from error: Error) -> WebSocketError {
         let normalized = JsBaoNetworkError(transport: error)
         return .transportFailure(message: normalized.message, code: normalized.urlErrorCode)
@@ -1075,7 +1074,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     ///
     /// Callers that need a particular outcome must order the calls themselves
     /// — await one before making the next. The JS client's `setShouldConnect`
-    /// follows the same rule, coalescing exception included (#2568).
+    /// follows the same rule, coalescing exception included.
     func setDesiredConnection(shouldConnect: Bool) async {
         logger.debug(
             "[WSM][debug] setDesiredConnection", shouldConnect,
@@ -1142,7 +1141,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         try await currentTask.send(.data(data))
     }
 
-    /// Send on the open socket, before the server's `ready` too (#5578). Only
+    /// Send on the open socket, before the server's `ready` too. Only
     /// the in-band token refresh uses it: the server holds a frame that early
     /// until the handshake's session is stored, then answers it.
     nonisolated func sendOnOpenSocket(_ text: String) async throws {

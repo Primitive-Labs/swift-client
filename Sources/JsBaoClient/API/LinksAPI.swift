@@ -3,7 +3,7 @@ import Foundation
 // MARK: - LinkTarget
 
 /// A typed routing target parsed from an incoming Primitive link
-/// (universal link, custom-scheme URL, or pasted share link). Issue #931.
+/// (universal link, custom-scheme URL, or pasted share link).
 ///
 /// `LinksAPI` is transport-only: it identifies *what* a link points at;
 /// the app decides how to navigate there.
@@ -30,7 +30,7 @@ public enum LinkTarget: Sendable, Equatable {
     ///
     /// A `/document/{segment}` link whose trailing segment is not a ULID
     /// parses as `.unknown`: alias-based share links were built on
-    /// app-scoped aliases, which were removed in #1168. A user-scoped
+    /// app-scoped aliases, which were removed. A user-scoped
     /// alias is keyed to its owner, and a share URL carries no owner user
     /// id, so a recipient would resolve the key against their *own*
     /// aliases — the wrong document, or none.
@@ -49,7 +49,7 @@ public enum LinkTarget: Sendable, Equatable {
 
 // MARK: - LinksAPI
 
-/// Deep-link / universal-link routing for the Swift client (#931).
+/// Deep-link / universal-link routing for the Swift client.
 ///
 /// ```swift
 /// client.links.appBaseURL = URL(string: "https://notes.example.com")
@@ -77,8 +77,8 @@ public enum LinkTarget: Sendable, Equatable {
 /// > Primitive-managed hosting (no domain of their own), who serves the
 /// > `applinks` AASA is unresolved — the platform domain can't vouch for an
 /// > arbitrary tenant's bundle id from a shared root. This is the same
-/// > domain-ownership problem tracked for passkey `webcredentials` in
-/// > Primitive-Labs/js-bao-wss#1130; universal links need the same answer.
+/// > domain-ownership problem tracked for passkey `webcredentials`;
+/// > universal links need the same answer.
 public final class LinksAPI: @unchecked Sendable {
     private let lock = NSLock()
     private var _appBaseURL: URL?
@@ -188,7 +188,7 @@ public final class LinksAPI: @unchecked Sendable {
     // MARK: - Resolution
 
     /// Resolve an incoming URL to a routing target. Since alias share
-    /// links were removed (#1168) every target parses purely — this is
+    /// links were removed every target parses purely — this is
     /// now equivalent to `parse(url:)`. The `async throws` signature is
     /// kept so existing `try await` call sites stay source-compatible.
     /// - Stability: production
@@ -220,8 +220,8 @@ public final class LinksAPI: @unchecked Sendable {
     /// matching the share link the reference web app copies to the
     /// clipboard (sample-app `ShareDialog.tsx:130-132`).
     ///
-    /// The former `alias:` variant was removed with app-scoped aliases
-    /// (#1168): a user-scoped alias key is meaningless to a recipient,
+    /// The former `alias:` variant was removed with app-scoped aliases:
+    /// a user-scoped alias key is meaningless to a recipient,
     /// so an alias-based link cannot work as a share URL.
     ///
     /// Returns `nil` until `appBaseURL` is configured.

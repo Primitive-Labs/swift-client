@@ -1,6 +1,6 @@
 import Foundation
 
-/// A db3 vector index's shared ANN model over HTTP (#5230), the Swift port of
+/// A db3 vector index's shared ANN model over HTTP, the Swift port of
 /// the JS client's `db3IndexModels.ts`: `PUT|GET|DELETE
 /// db3/:db3Id/indexes/:name/model` with the `X-Index-Model-*` headers the
 /// model travels with. A claim (no body) comes before a device trains, a

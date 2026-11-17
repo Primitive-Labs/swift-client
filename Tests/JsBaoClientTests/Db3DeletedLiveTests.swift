@@ -9,6 +9,7 @@ import XCTest
 /// gone with that code, its rows stay readable, and a subscribe while gone
 /// throws `.db3Deleted` with no second gone event. A revoked grant on a db3
 /// that still exists reports `.permission`.
+@available(*, deprecated)
 final class Db3DeletedLiveTests: XCTestCase {
 
     private var ctx: TestContext!

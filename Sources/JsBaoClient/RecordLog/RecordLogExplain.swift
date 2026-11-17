@@ -89,7 +89,7 @@ public struct Db3Explain: Sendable, Equatable {
     public let sqlite: String
 }
 
-/// One explained read's force and recorder (#5241, js-bao's `ViewReadForce`):
+/// One explained read's force and recorder (js-bao's `ViewReadForce`):
 /// what each model's statements read in place of what the store would pick,
 /// and who hears each statement before it runs. A reader is given one only by
 /// an explain, so an ordinary read never sees it; the read it serves runs on
@@ -113,7 +113,7 @@ final class RecordLogReadForce {
     }
 }
 
-/// A db3 read explained on the device (#5241), the port of js-bao's
+/// A db3 read explained on the device, the port of js-bao's
 /// `record-log-client/explain.ts`: the store's own query, count or aggregate
 /// over one db3's copy, run for real through a reader carrying a
 /// ``RecordLogReadForce``, then each statement it ran planned with its run's
@@ -261,9 +261,14 @@ enum RecordLogExplain {
     /// and explain every statement it ran.
     ///
     /// - Parameter setFields: The root model's string-set fields.
+    /// - Parameter cleared: The fields the db3's held revision clears (#6021),
+    ///   read as unset as the ordinary read reads them.
     /// - Throws: `JsBaoError` `.db3IndexNotFound`, `.db3IndexCannotServe` or
     ///   `.invalidArgument` for a force that cannot serve the read; the read's own refusals.
-    static func explain(store: RecordLogStore, model: String, request: Db3ExplainRequest, setFields: Set<String>) throws -> Db3Explain {
+    static func explain(
+        store: RecordLogStore, model: String, request: Db3ExplainRequest, setFields: Set<String>,
+        cleared: RecordLogClearedDeclarations? = nil
+    ) throws -> Db3Explain {
         if let index = request.index, index.isEmpty {
             throw JsBaoError(code: .invalidArgument, message: "index must be an index name or none", details: ["index": ""])
         }
@@ -273,7 +278,8 @@ enum RecordLogExplain {
             indexedBy: planned?.indexedBy ?? { _ in nil }, memberTables: planned?.memberTables ?? { _ in nil },
             record: { model, sql, bindings in runs.append(Run(model: model, sql: sql, bindings: bindings)) }
         )
-        let reader = RecordLogViewReader(store: store, documents: [store.documentId], force: force)
+        var reader = RecordLogViewReader(store: store, documents: [store.documentId], force: force)
+        if let cleared { reader.cleared = [store.documentId: cleared] }
         let answered: Int
         do {
             switch request.op {

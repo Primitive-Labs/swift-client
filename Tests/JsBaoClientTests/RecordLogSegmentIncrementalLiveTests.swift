@@ -12,6 +12,7 @@ import XCTest
 /// and writes the rewritten range and a tail chunk; a record of a reused range
 /// is patched after S2 completes. Pointed at S2, the client fetches only S2's
 /// two own chunks and its corrections, equals the room, and its marks name S2.
+@available(*, deprecated)
 final class RecordLogSegmentIncrementalLiveTests: XCTestCase {
 
     private var ctx: TestContext!

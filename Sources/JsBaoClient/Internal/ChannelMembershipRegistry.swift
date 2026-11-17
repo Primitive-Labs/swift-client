@@ -1,11 +1,11 @@
 import Foundation
 
-/// The client's channel memberships (#3278): the grants it holds, the joins
+/// The client's channel memberships: the grants it holds, the joins
 /// waiting for the server's answer, the per-channel generation that a leave
 /// bumps, and the per-channel chain that serializes joins. Swift port of the
 /// bookkeeping the JS client keeps in `channelGrants` /
 /// `pendingChannelSubscribes` / `channelEpochs` / `channelSubscribeChain`
-/// (`src/client/JsBaoClient.ts`, #3184).
+/// (`src/client/JsBaoClient.ts`).
 ///
 /// Self-contained and synchronous: it never touches the network. `JsBaoClient`
 /// sends the frames, decides the outcomes, and resumes the continuations this
@@ -128,7 +128,7 @@ final class ChannelMembershipRegistry: @unchecked Sendable {
     /// released. Reading the predecessor and installing the replacement
     /// separately would let two concurrent `subscribeToChannel` calls for the
     /// same channel read the same predecessor and both send, so the first
-    /// answer would settle both (CSO-001 on #3278).
+    /// answer would settle both (CSO-001 on).
     ///
     /// `make` only creates a `Task`, which never blocks; the task body takes
     /// this lock again, from another thread, after this section ends.
@@ -164,7 +164,7 @@ final class ChannelMembershipRegistry: @unchecked Sendable {
     /// Park one caller. `false` once destroyed — the caller must resume its
     /// own continuation then, because `destroy()` has already handed out
     /// everything it will ever resume, and a join added afterwards would
-    /// hang its caller forever (CSO-003 on #3278).
+    /// hang its caller forever (CSO-003 on).
     func addPending(_ channel: String, _ join: PendingJoin) -> Bool {
         lock.withLock {
             guard !_isDestroyed else { return false }

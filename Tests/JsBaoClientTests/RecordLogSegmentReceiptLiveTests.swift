@@ -13,6 +13,7 @@ import XCTest
 /// receipt and is resubmitted after — handed back
 /// `DOCUMENT_OFFLINE_WINDOW_EXPIRED` when written below the floor, accepted
 /// when above it.
+@available(*, deprecated)
 final class RecordLogSegmentReceiptLiveTests: XCTestCase {
 
     private var ctx: TestContext!

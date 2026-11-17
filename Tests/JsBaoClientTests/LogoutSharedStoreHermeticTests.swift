@@ -121,6 +121,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
     /// Two open local-only documents holding three rows between them — the
     /// shape of the issue's repro (a per-user "library" document plus a
     /// second one, read unscoped through the facade).
+    @available(*, deprecated)
     private func makeClientWithTwoPopulatedDocuments(
         _ appId: String
     ) async throws -> (client: JsBaoClient, docA: String, docB: String, ydocA: YDocument?) {
@@ -145,6 +146,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
 
     // MARK: - Behavior 1: unscoped reads return nothing after the logout
 
+    @available(*, deprecated)
     func testWipeLocalLogoutEmptiesUnscopedFacadeReads() async throws {
         let (client, _, _, _) = try await makeClientWithTwoPopulatedDocuments("logout-store-reads")
         defer { Task { await client.destroy() } }
@@ -172,6 +174,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
     /// The documents must be *closed*, not merely dropped from the open-doc
     /// map: the `wipeLocal` purge empties that map on its own, so the closed
     /// event is what tells the two apart.
+    @available(*, deprecated)
     func testWipeLocalLogoutClosesEveryOpenDocument() async throws {
         let (client, docA, docB, _) = try await makeClientWithTwoPopulatedDocuments("logout-store-closes")
         defer { Task { await client.destroy() } }
@@ -188,6 +191,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
 
     // MARK: - Behavior 3: a write naming a closed document throws
 
+    @available(*, deprecated)
     func testFacadeWriteAfterLogoutThrowsNotOpen() async throws {
         let (client, docA, _, _) = try await makeClientWithTwoPopulatedDocuments("logout-store-write")
         defer { Task { await client.destroy() } }
@@ -214,6 +218,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
     /// `wipeLocal: true` on purpose — it is the assertion that distinguishes
     /// "the sweep closed the documents" from "the wipe merely emptied the
     /// maps", which is exactly what the close-before-wipe ordering buys.
+    @available(*, deprecated)
     func testRetainedYDocumentEditAfterWipeLocalLogoutIsInert() async throws {
         let (client, docA, _, ydocA) = try await makeClientWithTwoPopulatedDocuments("logout-store-retained")
         defer { Task { await client.destroy() } }
@@ -242,6 +247,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
 
     // MARK: - Behavior 5: a plain logout cleans up too (JS parity)
 
+    @available(*, deprecated)
     func testPlainLogoutAlsoEmptiesSharedStoreAndClosesDocuments() async throws {
         let (client, docA, docB, ydocA) = try await makeClientWithTwoPopulatedDocuments("logout-store-plain")
         defer { Task { await client.destroy() } }
@@ -266,6 +272,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
 
     // MARK: - Behavior 6: the next user in the same process sees only their rows
 
+    @available(*, deprecated)
     func testNextUserReadsOnlyTheirOwnRowsInTheSameProcess() async throws {
         let (client, _, _, _) = try await makeClientWithTwoPopulatedDocuments("logout-store-next-user")
         defer { Task { await client.destroy() } }
@@ -285,6 +292,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
 
     // MARK: - Behavior 7: completion fires only after the cleanup
 
+    @available(*, deprecated)
     func testLogoutCompleteSubscriberObservesEmptyStore() async throws {
         let (client, _, _, _) = try await makeClientWithTwoPopulatedDocuments("logout-store-complete")
         defer { Task { await client.destroy() } }
@@ -309,6 +317,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
     /// A signed-out user's failed create may not retry under a later
     /// session's transport (JS `resetUserScopedState`). Plain `logout()` —
     /// the reset runs on every logout, not only under `wipeLocal`.
+    @available(*, deprecated)
     func testPlainLogoutClearsPendingCreateRetryState() async throws {
         let client = makeClient("logout-store-pending-create")
         defer { Task { await client.destroy() } }
@@ -355,6 +364,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
     /// warns about). A logout sweep reading the open-document map would skip
     /// those documents and leave the signed-out user's rows readable, so the
     /// sweep reads the retained-document set instead.
+    @available(*, deprecated)
     private func assertLogoutClosesDocumentsHeldPastEvictAllLocal(
         appId: String,
         wipeLocal: Bool
@@ -403,12 +413,14 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
         XCTAssertEqual(try LogoutNote.count(), 0)
     }
 
+    @available(*, deprecated)
     func testPlainLogoutClosesDocumentsHeldPastEvictAllLocal() async throws {
         try await assertLogoutClosesDocumentsHeldPastEvictAllLocal(
             appId: "logout-store-evicted-plain", wipeLocal: false
         )
     }
 
+    @available(*, deprecated)
     func testWipeLocalLogoutClosesDocumentsHeldPastEvictAllLocal() async throws {
         try await assertLogoutClosesDocumentsHeldPastEvictAllLocal(
             appId: "logout-store-evicted-wipe", wipeLocal: true
@@ -423,6 +435,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
     /// without the reload the same user signing back in — same process, no
     /// relaunch — would leave their offline-created documents silently
     /// uncommitted until the app restarted.
+    @available(*, deprecated)
     func testSameUserSignInAfterPlainLogoutRehydratesPendingCreates() async throws {
         let userId = "user-a"
         let client = JsBaoClient(options: JsBaoClientOptions(
@@ -476,6 +489,7 @@ final class LogoutSharedStoreHermeticTests: XCTestCase {
 
     // MARK: - Edge case: a `retainLocal: false` document is open at logout
 
+    @available(*, deprecated)
     func testLogoutCompletesWithARetainLocalFalseDocumentOpen() async throws {
         let client = makeClient("logout-store-retain-false")
         defer { Task { await client.destroy() } }

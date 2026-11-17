@@ -186,7 +186,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     /// (`status == "added"` / `"already_member"`), or `.deferred` when the
     /// email isn't an app user yet (`status == "pending_signup"`, carrying
     /// the `deferredId` / `invitationId` / `inviteToken`). Mirrors the
-    /// deferred-grant flow on `documents.updatePermissions` (issue #671).
+    /// deferred-grant flow on `documents.updatePermissions`.
     /// - Stability: production
     public func addMember(collectionId: String, params: AddCollectionMemberParams) async throws -> CollectionAddMemberResult {
         try await transport.request(
@@ -294,7 +294,7 @@ public final class CollectionsAPI: @unchecked Sendable {
     }
 
     /// Build a `?limit=…&cursor=…` query string from pagination options,
-    /// routing both values through the shared `URLQuery` builder (#2076).
+    /// routing both values through the shared `URLQuery` builder.
     private static func queryString(_ options: PaginationOptions?) -> String {
         guard let options else { return "" }
         var query = URLQuery()

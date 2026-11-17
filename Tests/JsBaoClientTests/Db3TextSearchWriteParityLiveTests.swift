@@ -11,6 +11,7 @@ import XCTest
 /// on a Swift device that subscribes after the writes. Each comparison waits
 /// first until both devices hold the server's rows (``converged(_:js:id:)``):
 /// a writer's settlement does not wait for the other device's rows.
+@available(*, deprecated)
 final class Db3TextSearchWriteParityLiveTests: XCTestCase {
 
     private var ctx: TestContext!

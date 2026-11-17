@@ -37,7 +37,7 @@ func assertRequestedDocumentFormat(_ documentFormat: Int?) throws {
 ///
 /// The document doors on a record-log document are deprecated: a db3 that
 /// lives only on this device is created with
-/// `client.db3.create(title:localOnly: true)` (#5155). The combination is
+/// `client.db3.create(title:localOnly: true)`. The combination is
 /// refused where every other impossible `localOnly` combination is, with the
 /// same code, and the message names that door.
 ///

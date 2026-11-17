@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-disconnect-reconnect.test.ts
 /// Tests disconnect/reconnect stress scenarios.
+@available(*, deprecated)
 final class DisconnectReconnectTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

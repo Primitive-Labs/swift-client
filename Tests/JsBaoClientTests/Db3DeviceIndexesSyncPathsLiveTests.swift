@@ -10,6 +10,7 @@ import XCTest
 /// corrections, the oracle on a copy of the store file finds no drift, the
 /// client's rows equal the room's, and `$search` and `$contains` answer the
 /// rows the room holds.
+@available(*, deprecated)
 final class Db3DeviceIndexesSyncPathsLiveTests: XCTestCase {
 
     private var ctx: TestContext!

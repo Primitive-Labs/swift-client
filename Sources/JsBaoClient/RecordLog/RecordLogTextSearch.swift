@@ -1,6 +1,6 @@
 import Foundation
 
-/// How a text index splits and folds words (#5223): js-bao's `TextIndexTokenizer`.
+/// How a text index splits and folds words: js-bao's `TextIndexTokenizer`.
 typealias RecordLogTextTokenizer = Db3TextTokenizer
 
 extension Db3TextTokenizer {
@@ -10,7 +10,7 @@ extension Db3TextTokenizer {
     }
 }
 
-/// A db3 text index's options (#5223), js-bao's `record-log/textIndex.ts`:
+/// A db3 text index's options, js-bao's `record-log/textIndex.ts`:
 /// the tokenizer, FTS5's prefix-index lengths and a weight per covered
 /// field, checked once where a registration enters (a local-only db3's
 /// registry, the store's cache of the room's list) and kept filled in, so
@@ -143,7 +143,7 @@ extension Db3TextIndexOptions {
     }
 }
 
-/// `$search`, the filter key a text index answers (#5223): its parser and
+/// `$search`, the filter key a text index answers: its parser and
 /// the MATCH text built from it over an index's FTS5 column aliases. The
 /// Swift port of js-bao's `query/textSearch.ts`, so a `$search` builds the
 /// same statement from the same input on either client.
@@ -313,8 +313,8 @@ enum RecordLogTextSearch {
         )
     }
 
-    /// A `$search` on `model` whose text index this device declined (#5322,
-    /// js-bao's `DeviceIndexDeclinedError`): `JsBaoError(.db3IndexDeclinedOnDevice)`
+    /// A `$search` on `model` whose text index this device declined
+    /// (js-bao's `DeviceIndexDeclinedError`): `JsBaoError(.db3IndexDeclinedOnDevice)`
     /// with `details` `{model, index, kind: "text"}`, naming `accept`.
     static func declined(model: String, index: String, reason: String) -> JsBaoError {
         JsBaoError(

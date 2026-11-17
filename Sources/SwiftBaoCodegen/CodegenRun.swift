@@ -45,7 +45,8 @@ enum CodegenInputs {
 
     /// The `schemas/` each input's shared-enum refs resolve against (#5545):
     /// `<input's directory>/../schemas`, its `*.toml` in name order, each
-    /// directory read once; the inputs' type names are the db3 keys.
+    /// directory read once; the inputs' type names are the db3 keys. A ref
+    /// may name an object def too (#5899).
     static func sharedEnumFiles(for inputs: [CodegenInput]) -> [SharedEnums] {
         let db3 = typeNames(inputs)
         var byDirectory: [String: SharedEnums] = [:]
@@ -58,7 +59,7 @@ enum CodegenInputs {
                 ? ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".toml") }.sorted()
                     .map { (String($0.dropLast(5)), (try? String(contentsOf: url.appending(path: $0), encoding: .utf8)) ?? "") }
                 : nil
-            byDirectory[dir] = SharedEnums(files: files, dir: "\(dir)/", db3: db3)
+            byDirectory[dir] = SharedEnums(files: files, dir: "\(dir)/", db3: db3, objects: true)
             return byDirectory[dir]!
         }
     }
@@ -132,6 +133,8 @@ enum CodegenRun {
         }
         // A ref'd field's generated names must not be taken or shadowed (#5896).
         try SwiftEmitter.checkSharedEnums(schemas: schemas)
+        // A JSON field's generated `<field>Raw` must not be taken (#5899).
+        try SwiftEmitter.checkJSONFields(schemas: schemas)
 
         // The cross-model name map lets relationship accessors name their
         // typed return types (`task` → `TaskRecord?`), across every input.

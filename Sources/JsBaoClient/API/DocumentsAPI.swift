@@ -29,7 +29,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// scope by asking which cached documents the response failed to account
     /// for, and before the load that index is empty, so a launch-time
     /// `documents.list()` would find nothing to evict and the server-deleted
-    /// row would be restored from disk right after (#2827).
+    /// row would be restored from disk right after.
     ///
     /// Wired once by `JsBaoClient.setupSubApis`, before any call can reach the
     /// API; `nil` when `DocumentsAPI` is constructed in isolation (tests),
@@ -79,7 +79,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         self._ingests = DocumentIngestsAPI(transport: transport)
     }
 
-    /// Refuse `call` on a db3 that lives only on this device (#5155), before
+    /// Refuse `call` on a db3 that lives only on this device, before
     /// anything local changes or any request is made: it has no server
     /// record to name.
     private func refuseLocalOnlyDb3(_ documentId: String, _ call: String) async throws {
@@ -97,8 +97,8 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///
     /// The new document is **not open**. Call `open(_:)` before querying or
     /// writing it — a write to an unopened document throws
-    /// `JsBaoError(code: .notFound, "Document `<id>` is not open…")`, exactly
-    /// as in the JS client (#3200).
+    /// `JsBaoError(code: .notFound, "Document <id> is not open…")`, exactly
+    /// as in the JS client.
     ///
     /// The response carries the document's `metadata` blob, with the new id
     /// inside it (`metadata.documentId`). When no owning client is wired
@@ -136,7 +136,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// `syncMetadata({ scope: "all", payload, authoritative })`
     /// (`src/client/api/documentsApi.ts`). Swift kept the listing purely as a
     /// return value, so a document deleted server-side stayed on the device
-    /// through every later launch (#2827).
+    /// through every later launch.
     private func reconcileIntoLocalCache(
         _ items: [DocumentInfo],
         authoritative: Bool,
@@ -209,7 +209,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// stops advancing, the page cap — evicts nothing at all. Nor does a
     /// completed walk whose union is empty: the walk asks `includeRoot=true`,
     /// so zero rows is an anomalous answer rather than a user with no
-    /// documents (#2859).
+    /// documents.
     ///
     /// `seenIds` is what the caller's response already accounted for. When no
     /// cached document is missing from it there is nothing an authoritative
@@ -330,11 +330,11 @@ public final class DocumentsAPI: @unchecked Sendable {
     }
 
     /// Reconcile the local cache against the user's whole document scope,
-    /// evicting the documents the server no longer has (#2852).
+    /// evicting the documents the server no longer has.
     ///
     /// Eviction used to happen only inside `documents.list()`, whose response
     /// is what gets reconciled. Both clients steer developers off that method
-    /// (#628) and onto `me.ownedDocuments` / `me.sharedDocuments`, which are
+    /// and onto `me.ownedDocuments` / `me.sharedDocuments`, which are
     /// strict subsets of the cached scope and so merge only — correct for a
     /// subset, but it left an app that never calls the deprecated method with
     /// no eviction path at all: `meta` rows and multi-megabyte `yjs_docs`
@@ -427,7 +427,7 @@ public final class DocumentsAPI: @unchecked Sendable {
         var retainIds: Set<String> = []
         // The walk asks for the root, so the union carries it — retaining it by
         // id as well covers a token whose payload has no `rootDocId` claim.
-        if let rootDocId = client?.rootDocId { retainIds.insert(rootDocId) }
+        if let rootDocId = client?.currentRootDocId { retainIds.insert(rootDocId) }
         await reconcileByWalkingScope(
             seenIds: [],
             retainIds: retainIds,
@@ -573,7 +573,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// literal (or `.userId(...)`) targets a user id; `.email(...)` cancels an
     /// email-targeted permission (live `DocumentPermission` if the email
     /// resolves to a member, otherwise the matching unresolved
-    /// `DeferredDocumentPermission` rows — issue #619).
+    /// `DeferredDocumentPermission` rows).
     /// - Stability: production
     @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func removePermission(documentId: String, _ target: DocumentPermissionTarget) async throws {
@@ -625,14 +625,14 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// - Parameter includeSystem: when `true`, platform-managed internal
     ///   groups (those whose `groupType` is prefixed with `_`, e.g. the
     ///   `_col-*` groups backing collection sharing) are included. They are
-    ///   excluded by default. Mirrors js-bao's `{ includeSystem }` option
-    ///   (#506).
+    ///   excluded by default. Mirrors js-bao's `{ includeSystem }` option.
     ///
     /// The flag is sent as `?includeSystem=true` because the server decides
-    /// what to return — it strips system rows unless asked (#2360; JS has sent
-    /// the param since #506). The client-side `_`-prefix filter runs only on
-    /// the default (`false`) branch, where it guards against a server
-    /// predating #506 that returns system rows unconditionally.
+    /// what to return — it strips system rows unless asked, and JS has
+    /// been sending the param for some time now. The client-side `_`-prefix
+    /// filter runs only on the default (`false`) branch, where it guards
+    /// against a server predating that filter, which returns system rows
+    /// unconditionally.
     /// - Stability: production
     @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func listGroupPermissions(documentId: String, includeSystem: Bool = false) async throws -> [DocumentGroupPermissionEntry] {
@@ -669,9 +669,9 @@ public final class DocumentsAPI: @unchecked Sendable {
     ///
     /// Sends `POST /documents/:documentId/validate-access` — the same route
     /// js-bao uses (`documentsApi.ts` `validateAccess`). There is no
-    /// `/documents/:documentId/access` route on the server (#2358).
+    /// `/documents/:documentId/access` route on the server.
     ///
-    /// Passing `userId` asks about THAT user instead of the caller (#3658):
+    /// Passing `userId` asks about THAT user instead of the caller:
     /// the answer is what the document routes would enforce for them, across
     /// direct grants, group grants (collection membership included) and
     /// "anyone with the link" access. An app owner or admin may name anyone;
@@ -718,8 +718,8 @@ public final class DocumentsAPI: @unchecked Sendable {
 
     /// List pending deferred-grant invitations for a document. Returns
     /// rows from the `DeferredDocumentPermission` model, which replaced the
-    /// per-document invitation model removed in #2951.
-    /// Mirrors js-bao's `documents.listPendingInvitations` (issue #619).
+    /// per-document invitation model, since removed.
+    /// Mirrors js-bao's `documents.listPendingInvitations`.
     /// Sends `GET /documents/:documentId/pending-invitations`.
     /// - Stability: production
     @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
@@ -845,7 +845,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// (`client.rootDocId`) and fetches that document, matching js-bao
     /// (`documentsApi.ts` `getRoot`). The server has no `/documents/root`
     /// alias — that path resolves as `GET /documents/:documentId` with the
-    /// literal id `"root"` and fails (#2358).
+    /// literal id `"root"` and fails.
     /// - Stability: production
     @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getRoot() async throws -> DocumentInfo {
@@ -1088,7 +1088,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// Get the pending-create entry for a single document, or `nil` when
     /// the document has no uncommitted local create. Same entry shape as
     /// `listPendingCreates()` (`{ documentId, title?, createdAt }`),
-    /// sourced from local metadata — no network (#1111).
+    /// sourced from local metadata — no network.
     /// - Stability: production
     @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getPendingCreate(documentId: String) async -> PendingCreateInfo? {
@@ -1424,7 +1424,7 @@ public final class DocumentsAPI: @unchecked Sendable {
     /// When `options.evictLocal` is set, the document's local data is only
     /// evicted if the server already has all of this client's writes —
     /// matching js-bao, which skips eviction (and reports `evicted: false`)
-    /// when local writes are still outstanding (#961).
+    /// when local writes are still outstanding.
     /// - Stability: production
     @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
@@ -1598,7 +1598,7 @@ public final class DocumentsAPI: @unchecked Sendable {
 public final class DocumentAliasesAPI: @unchecked Sendable {
     private let transport: any Transport
     /// Refuses a `documentId` no request may name (a db3 that lives only on
-    /// this device, #5155).
+    /// this device).
     private var refuseDocument: @Sendable (String) async throws -> Void = { _ in }
 
     /// Designated initializer — the typed transport spine.
@@ -1673,7 +1673,7 @@ public final class DocumentAliasesAPI: @unchecked Sendable {
     /// List all aliases for a document.
     ///
     /// Decodes each entry independently and drops entries that fail —
-    /// a server deployed before #1168's server-side filter can still
+    /// a server deployed before the server-side filter can still
     /// return retained legacy `scope: "app"` rows, and one such row must
     /// not fail the whole response (the remaining user aliases are valid).
     /// - Stability: production
@@ -1708,7 +1708,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
     private let transport: any Transport
     private let blobManager: BlobManager
     /// Why no request may name the document (a db3 that lives only on this
-    /// device, #5155), asked before each call that would send one.
+    /// device), asked before each call that would send one.
     private var refusal: @Sendable () async -> JsBaoError? = { nil }
 
     /// Designated initializer — the typed transport spine.
@@ -1722,7 +1722,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
         self.blobManager = blobManager
     }
 
-    /// A context whose calls first ask `refusal` (#5155).
+    /// A context whose calls first ask `refusal`.
     convenience init(
         documentId: String, transport: any Transport, blobManager: BlobManager,
         refusal: @escaping @Sendable () async -> JsBaoError?
@@ -1984,7 +1984,7 @@ public final class DocumentBlobContext: @unchecked Sendable {
 /// Body of `POST /documents/get-or-create-with-alias`. Every optional is
 /// omitted when `nil`, matching the conditional inserts the untyped dictionary
 /// body used — and required now that the route REFUSES a top-level key it does
-/// not read (#3757), so a key sent as `null` is still a key.
+/// not read, so a key sent as `null` is still a key.
 private struct GetOrCreateWithAliasBody: Encodable, Sendable {
     struct Alias: Encodable, Sendable {
         let scope: String

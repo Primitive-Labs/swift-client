@@ -23,6 +23,7 @@ import YSwift
 /// through a socket: which callback emits the status is exactly what the bug
 /// is about, and a live close fires them both within a millisecond of each
 /// other, so only the split can distinguish the fix from the defect.
+@available(*, deprecated)
 final class DisconnectStateTransitionsTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

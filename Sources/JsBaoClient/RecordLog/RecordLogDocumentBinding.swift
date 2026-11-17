@@ -60,7 +60,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     private var _writer: String
     private var _marks: RecordLogMarks
     private var schemas: [String: PrimitiveSchema] = [:]
-    /// The vector fields whose stored value did not fit, warned about once (#5225).
+    /// The vector fields whose stored value did not fit, warned about once.
     private var vectorMisfits: Set<String> = []
     /// This writer's entries the room has not acknowledged, with the records each touches.
     private var unacked: [Int: [RecordLogRecordKey]] = [:]
@@ -209,6 +209,8 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     /// and anything else (a writer that disagreed with the schema) as it is
     /// stored, warned about once per model and field.
     func decodedVectors(_ row: RecordLogRow, model: String, encodings: [String: VectorEncoding]) -> RecordLogRow {
+        // A field the db3's held revision clears leaves the row first (#6021).
+        let row = hidingCleared(row, model: model)
         guard !encodings.isEmpty else { return row }
         var out = row
         for (field, encoding) in encodings {
@@ -224,6 +226,26 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
                 )
             }
         }
+        return out
+    }
+
+    // MARK: - Cleared fields (#6021)
+
+    /// The db3's held cleared and tombstoned fields, per model the names; `nil`
+    /// when the db3 is not typed or its held revision hides none. Read from the
+    /// in-memory marks: no statement.
+    var heldCleared: RecordLogClearedDeclarations? {
+        let marks = self.marks
+        guard marks.typed == .yes, let cleared = marks.cleared, !cleared.isEmpty else { return nil }
+        return cleared
+    }
+
+    /// `row` of `model` without the fields the db3's held revision clears:
+    /// the same row when it holds none of them.
+    func hidingCleared(_ row: RecordLogRow, model: String) -> RecordLogRow {
+        guard let names = heldCleared?[model], names.contains(where: { row[$0] != nil }) else { return row }
+        var out = row
+        for name in names { out.removeValue(forKey: name) }
         return out
     }
 
@@ -428,6 +450,15 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     private func noticeChange(_ notice: RecordLogChangeNotice) {
+        // A change carries no field the db3's held revision clears (#6021).
+        var notice = notice
+        if heldCleared != nil {
+            notice.changes = notice.changes.map { change in
+                var change = change
+                change.row = change.row.map { hidingCleared($0, model: change.model) }
+                return change
+            }
+        }
         if notice.origin == .local { vectorsChanged(.rows) }
         let listeners = state.withLock { Array(changeListeners.values) }
         for listener in listeners { listener(notice) }
@@ -444,7 +475,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     /// Hear every change to this writer's unjudged entries: an acknowledgement
     /// or a hand-back, whether or not a row changed; and every results frame
-    /// that changed no row but may have moved the cursor or the head heard (#5221).
+    /// that changed no row but may have moved the cursor or the head heard.
     @discardableResult
     func onPendingChanged(_ listener: @escaping @Sendable () -> Void) -> UUID {
         let token = UUID()
@@ -453,7 +484,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     /// A results frame changed no row but may have moved the cursor or the
-    /// head heard (#5221): the pending listeners read the db3's state again.
+    /// head heard: the pending listeners read the db3's state again.
     func noticeHeard() { noticePending() }
 
     private func noticePending() {
@@ -528,7 +559,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     /// reported with its writes and thrown.
     ///
     /// On a db3 that lives only on this device the store judges the writes
-    /// and confirms them in the commit (#5155): its group commits before this
+    /// and confirms them in the commit: its group commits before this
     /// returns, and only then are the entries acknowledged and settled here
     /// (no sender is handed one); a refusal is reported and thrown as the
     /// room's would be, and a group whose `COMMIT` fails throws its
@@ -868,7 +899,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     /// Record what the room said about epochs, constraints, the db3's type,
-    /// its head (`heard`, a `record.opened`'s, #5221) and this client's permission.
+    /// its head (`heard`, a `record.opened`'s) and this client's permission.
     @discardableResult
     func setState(
         notice: (current: Int, next: Int?, entries: Int?)? = nil,
@@ -886,15 +917,15 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         return marks
     }
 
-    /// Whether this document's session is open now (#5221): a device read's
+    /// Whether this document's session is open now: a device read's
     /// drift is `live` only then. The session marks it as its phase changes.
     var isLive: Bool { store.isLive }
 
     /// Mark the document's session open (`true`) or not.
     func setLive(_ live: Bool) { store.setLive(live) }
 
-    /// Take a permission the client heard for this db3 while it is bound
-    /// (#5020): the store's mark follows it, `read` on `.reader` (saves are
+    /// Take a permission the client heard for this db3 while it is bound:
+    /// the store's mark follows it, `read` on `.reader` (saves are
     /// refused here from now) and lifted on a write-capable one, as the
     /// room's `WRITE_ACCESS_DENIED` and a connect with write access set and
     /// lift it. A `refused` mark is the room's to lift.
@@ -915,7 +946,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         }
     }
 
-    /// Take the type this db3 was created with here (#5020): a store the room
+    /// Take the type this db3 was created with here: a store the room
     /// has not yet told whether the db3 is typed is marked typed by `type`,
     /// so its first open declares nothing. A mark the room set is kept.
     func seedType(_ type: String) throws {
@@ -932,7 +963,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
     }
 
     /// Mark the copy of a db3 the server just created caught up, so it is
-    /// resident (#4806); a copy already marked keeps its mark.
+    /// resident; a copy already marked keeps its mark.
     func markCaughtUpAtCreate() throws {
         let at = Int64(Date().timeIntervalSince1970 * 1000)
         let marks = try withOperation { try store.markCaughtUpAtCreate(at: at) }

@@ -175,7 +175,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         )
     }
 
-    /// Batch-delete blobs from a bucket (#1455). Routes to
+    /// Batch-delete blobs from a bucket. Routes to
     /// `POST .../blobs/delete` with body `{ blobIds }` and returns
     /// `{ deleted, blobIds, bucketId }`. Mirrors the JS array overload of
     /// `blobBuckets.delete(bucket, blobIds)`.

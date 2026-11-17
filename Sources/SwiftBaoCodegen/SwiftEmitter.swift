@@ -62,6 +62,8 @@ struct SwiftEmitter {
     private func crossDocumentFacade(schema: ParsedSchema) -> String {
         let typeName = schema.swiftName
         let access = options.accessLevel
+        // A model with a JSON field saves its values encoded and validated (#5899).
+        let valuesCall = hasJSONFields(schema) ? "try _validatedPrimitiveValues()" : "primitiveValues()"
         var out = ""
         out += "/// The app-facing API for `\(typeName)` — one model, like the JS client.\n"
         out += "/// Reads span every open document by default (scope to specific docs with\n"
@@ -211,7 +213,7 @@ struct SwiftEmitter {
         out += "    /// after the save; `self` itself still holds the values you had.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String) throws -> \(typeName) {\n"
-        out += "        let record = try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields)\n"
+        out += "        let record = try JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: \(valuesCall), in: documentId, changedFields: _changedFields)\n"
         out += "        guard var saved = \(typeName)(record: record) else {\n"
         out += "            var fallback = self\n"
         out += "            fallback.discardChanges()\n"
@@ -238,7 +240,7 @@ struct SwiftEmitter {
         out += "    /// its fields reflect the merged state, NOT necessarily `self`.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String, upsertOn: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().codegen.upsert(Self.primitiveSchema, id: id, values: primitiveValues(), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
+        out += "        let result = try JsBaoClient.requireDefault().codegen.upsert(Self.primitiveSchema, id: id, values: \(valuesCall), on: upsertOn, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
@@ -267,7 +269,7 @@ struct SwiftEmitter {
         out += "    /// EXISTING record's id and its fields reflect the merged state.\n"
         out += "    @discardableResult\n"
         out += "    func upsertByUnique(_ constraint: String, mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
+        out += "        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: \(valuesCall), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
@@ -281,7 +283,7 @@ struct SwiftEmitter {
         out += "    /// when you want to make the lookup key explicit at the call site.\n"
         out += "    @discardableResult\n"
         out += "    func upsertByUnique(_ constraint: String, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> \(typeName) {\n"
-        out += "        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: primitiveValues(), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue, changedFields: _changedFields)\n"
+        out += "        let result = try JsBaoClient.requireDefault().codegen.upsertByUnique(Self.primitiveSchema, id: id, values: \(valuesCall), constraint: constraint, mode: mode, in: documentId, explicitId: _explicitId, uniqueLookupValue: lookupValue, changedFields: _changedFields)\n"
         out += "        if let resolved = \(typeName)(record: result.record) { return resolved }\n"
         out += "        var copy = self\n"
         out += "        copy.id = result.record.id\n"
@@ -309,7 +311,7 @@ struct SwiftEmitter {
         out += "    /// the options are ignored and it saves as `save(in:)` does.\n"
         out += "    @discardableResult\n"
         out += "    func save(in documentId: String, options: JsBaoClient.Db3WriteOptions) async throws -> \(typeName) {\n"
-        out += "        let record = try await JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields, options: options)\n"
+        out += "        let record = try await JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: \(valuesCall), in: documentId, changedFields: _changedFields, options: options)\n"
         out += "        guard var saved = \(typeName)(record: record) else {\n"
         out += "            var fallback = self\n"
         out += "            fallback.discardChanges()\n"
@@ -573,6 +575,10 @@ struct SwiftEmitter {
         out += "\n"
         out += primitiveValuesFn(schema: schema)
         out += "\n"
+        if hasJSONFields(schema) {
+            out += validatedPrimitiveValuesFn(schema: schema)
+            out += "\n"
+        }
         out += codableDecodeInit(schema: schema)
         out += "\n"
         out += equatableHashableCodableConformance(schema: schema)
@@ -678,11 +684,13 @@ struct SwiftEmitter {
         // Equatable: compare only real fields.
         out += "    \(access) static func == (lhs: \(schema.swiftName), rhs: \(schema.swiftName)) -> Bool {\n"
         let eqLines = storage.map { "        lhs.\($0) == rhs.\($0)" }
+        // A JSON field's def type need not be `Hashable` (#5899): only whether it holds a value is hashed.
+        let hashed = zip(fields, storage).map { field, stored in jsonDef(field, schema.fields[field]!) == nil ? stored : "\(stored) != nil" }
         out += eqLines.joined(separator: " &&\n") + "\n"
         out += "    }\n\n"
         // Hashable: hash only real fields.
         out += "    \(access) func hash(into hasher: inout Hasher) {\n"
-        for stored in storage {
+        for stored in hashed {
             out += "        hasher.combine(\(stored))\n"
         }
         out += "    }\n"
@@ -1133,6 +1141,12 @@ struct SwiftEmitter {
                 out += sharedEnumProperties(fname, f, shared: shared)
                 continue
             }
+            if let def = jsonDef(fname, f) {
+                out += jsonFieldProperties(fname, f, def: def)
+                continue
+            }
+            // A deprecated field is still read and written; its property says so.
+            if f.deprecated { out += "    @available(*, deprecated)\n" }
             out += "    \(access) var \(propName(fname)): \(swiftStoredType(f, fieldName: fname)) {\n"
             out += "        didSet { _changedFields.insert(\(quoted(fname))) }\n"
             out += "    }\n"
@@ -1220,6 +1234,8 @@ struct SwiftEmitter {
     /// optional. `id` always becomes `String` (PrimitiveRecord exposes
     /// it as `record.id`).
     private func swiftStoredType(_ f: ParsedField, fieldName: String) -> String {
+        // A JSON field is always Optional; `required` is checked at save (#5899).
+        if let def = jsonDef(fieldName, f) { return "\(def.aliasName)?" }
         let base: String
         switch f.type {
         case .string, .id, .date: base = "String"
@@ -1279,7 +1295,7 @@ struct SwiftEmitter {
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
-            if f.required {
+            if f.required, jsonDef(fname, f) == nil {
                 guards.append("let \(storageName(fname, f)) = \(recordReadExpression(fname, f))")
             }
         }
@@ -1296,7 +1312,9 @@ struct SwiftEmitter {
                 continue
             }
             let storage = storageName(fname, f)
-            if f.required {
+            if let def = jsonDef(fname, f) {
+                out += jsonFieldRead(fname, def: def, text: "record[\(quoted(fname))]?.asString")
+            } else if f.required {
                 // Hoisted from the guard
                 out += "        self.\(storage) = \(storage)\n"
             } else {
@@ -1371,7 +1389,7 @@ struct SwiftEmitter {
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
-            if f.required {
+            if f.required, jsonDef(fname, f) == nil {
                 guardClauses.append("let \(storageName(fname, f)) = \(rowFieldExpression(fname, f))")
             }
         }
@@ -1383,7 +1401,9 @@ struct SwiftEmitter {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
             let storage = storageName(fname, f)
-            if f.required {
+            if let def = jsonDef(fname, f) {
+                out += jsonFieldRead(fname, def: def, text: "row[\(quoted(fname))]?.stringValue")
+            } else if f.required {
                 out += "        self.\(storage) = \(storage)\n"
             } else {
                 out += "        self.\(storage) = \(rowFieldExpression(fname, f))\n"
@@ -1456,7 +1476,7 @@ struct SwiftEmitter {
         for fname in displayFieldOrder(schema) {
             guard let f = schema.fields[fname] else { continue }
             if fname == "id" { continue }
-            if f.required {
+            if f.required, jsonDef(fname, f) == nil {
                 requiredEntries.append((fname, f))
             } else {
                 optionalEntries.append((fname, f))
@@ -1479,6 +1499,13 @@ struct SwiftEmitter {
         for (fname, f) in optionalEntries {
             // String?, Double?, Bool?, Set<String>? — `if let` shorthand
             let storage = storageName(fname, f)
+            if let def = jsonDef(fname, f) {
+                // The stored text while the field is unassigned, else the value's canonical text (#5899).
+                let raw = propName(Self.rawPropertyName(fname))
+                out += "        if let \(raw) { values[\(quoted(fname))] = .string(\(raw)) } "
+                    + "else if let \(storage), let text = \(def.bindingName).canonicalText(\(storage)) { values[\(quoted(fname))] = .string(text) }\n"
+                continue
+            }
             out += "        if let \(storage) { values[\(quoted(fname))] = \(primitiveValueLiteral(f, propRef: storage)) }\n"
         }
         out += "        return values\n"
@@ -1495,6 +1522,95 @@ struct SwiftEmitter {
         case .date:      return ".date(\(propRef))"
         case .stringset: return ".stringset(\(propRef))"
         case .vector:    return ".vector(\(propRef))"
+        }
+    }
+
+    // MARK: - JSON fields (#5899)
+
+    /// The object def a JSON field's `ref` named, `nil` for any other field.
+    private func jsonDef(_ fname: String, _ f: ParsedField) -> Db3JSONRef? {
+        guard fname != "id", f.type == .string else { return nil }
+        return f.json
+    }
+
+    /// Whether the model has a JSON field.
+    private func hasJSONFields(_ schema: ParsedSchema) -> Bool {
+        schema.fieldOrder.contains { name in schema.fields[name].map { jsonDef(name, $0) != nil } ?? false }
+    }
+
+    /// A JSON field's value, typed by its def's alias, and its stored text.
+    private func jsonFieldProperties(_ fname: String, _ f: ParsedField, def: Db3JSONRef) -> String {
+        let access = options.accessLevel
+        let prop = propName(fname)
+        let raw = propName(Self.rawPropertyName(fname))
+        var out = ""
+        out += "    /// The `\(fname)` field as its def's type (`schemas/\(def.file).toml#\(def.name)`):\n"
+        out += "    /// `nil` when the field holds no value, or text that does not decode\n"
+        out += "    /// (`\(raw)` keeps it). Saving encodes an assigned value as\n"
+        out += "    /// canonical JSON and validates it against the def, throwing\n"
+        out += "    /// `Db3JSONValueError` and writing nothing when it does not match.\n"
+        if f.required {
+            out += "    /// The field is required: saving a record without a value is refused.\n"
+        }
+        out += "    /// `\(def.aliasName)` is declared in `Primitive.generated.swift`,\n"
+        out += "    /// which `primitive functions codegen --lang swift` writes.\n"
+        out += "    \(access) var \(prop): \(def.aliasName)? {\n"
+        out += "        didSet {\n"
+        out += "            _changedFields.insert(\(quoted(fname)))\n"
+        out += "            \(raw) = nil\n"
+        out += "        }\n"
+        out += "    }\n"
+        out += "    /// The `\(fname)` field's text as read from the store, whether or\n"
+        out += "    /// not it decodes; `nil` once `\(fname)` is assigned. A save that\n"
+        out += "    /// did not assign `\(fname)` leaves the stored text as it is.\n"
+        out += "    \(access) private(set) var \(raw): String?\n"
+        return out
+    }
+
+    /// A JSON field read from `text`: the stored text, and the value it decodes to through the def's binding.
+    private func jsonFieldRead(_ fname: String, def: Db3JSONRef, text: String) -> String {
+        let prop = propName(fname)
+        let raw = propName(Self.rawPropertyName(fname))
+        var out = "        self.\(raw) = \(text)\n"
+        out += "        self.\(prop) = \(def.bindingName).value(fromStored: \(text), model: Self.modelName, field: \(quoted(fname)))\n"
+        return out
+    }
+
+    /// `primitiveValues()` with each assigned JSON field encoded and validated against its def: what every write door saves.
+    private func validatedPrimitiveValuesFn(schema: ParsedSchema) -> String {
+        let access = options.accessLevel
+        var out = ""
+        out += "    /// `primitiveValues()` with each JSON field assigned since the record\n"
+        out += "    /// was read encoded as canonical JSON and validated against its def:\n"
+        out += "    /// what every write door saves. Throws `Db3JSONValueError` when a value\n"
+        out += "    /// does not match its def or JSON cannot hold it exactly.\n"
+        out += "    \(access) func _validatedPrimitiveValues() throws -> [String: PrimitiveValue] {\n"
+        out += "        var values = primitiveValues()\n"
+        for fname in displayFieldOrder(schema) {
+            guard let f = schema.fields[fname], let def = jsonDef(fname, f) else { continue }
+            let prop = propName(fname)
+            let raw = propName(Self.rawPropertyName(fname))
+            out += "        if \(raw) == nil, let \(prop) {\n"
+            out += "            values[\(quoted(fname))] = .string(try \(def.bindingName).storedText(for: \(prop), model: Self.modelName, field: \(quoted(fname))))\n"
+            out += "        }\n"
+        }
+        out += "        return values\n"
+        out += "    }\n"
+        return out
+    }
+
+    /// Refuse a model field named like a JSON field's `<field>Raw`, which the
+    /// field generates.
+    static func checkJSONFields(schemas: [ParsedSchema]) throws {
+        for schema in schemas {
+            for name in schema.fieldOrder {
+                guard name != "id", let f = schema.fields[name], f.type == .string, let def = f.json else { continue }
+                let raw = rawPropertyName(name)
+                if schema.fields[raw] != nil {
+                    throw CodegenError.sharedEnumNaming(message: "Model `\(schema.name)` field `\(name)` refs the object def `\(def.name)`, "
+                        + "so its stored text is the generated property `\(raw)`, and field `\(raw)` takes that name. Rename one of the two fields.")
+                }
+            }
         }
     }
 
@@ -1561,6 +1677,8 @@ struct SwiftEmitter {
         }
         out += "    /// `\(shared)` is declared in `Primitive.generated.swift`, which\n"
         out += "    /// `primitive functions codegen --lang swift` writes.\n"
+        // A deprecated field is still read and written; its typed accessor says so (#6021).
+        if f.deprecated { out += "    @available(*, deprecated)\n" }
         out += "    \(access) var \(propName(fname)): \(shared)? {\n"
         // The getter builds the case from context (`.init`), never by the
         // type's name: a def may be named like a member of the model

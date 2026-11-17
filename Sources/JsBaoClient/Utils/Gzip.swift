@@ -4,7 +4,7 @@ import Foundation
 /// Gzip (RFC 1952) decoding for update payloads the server parks in R2 and
 /// stamps `X-Compressed: true`. The JS client gunzips these
 /// (`decompressGzip` in `src/client/utils/binary.ts`); Swift used to drop the
-/// frame, which is silently lossy the moment compression is turned on (#2661).
+/// frame, which is silently lossy the moment compression is turned on.
 ///
 /// Encoding is for the chunks of a bulk load (`DocumentIngestsAPI.buildChunks`),
 /// which upload gzipped.

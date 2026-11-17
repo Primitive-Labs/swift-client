@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-interleaved-operations.test.ts
 /// Tests interleaved open/close/write operations.
+@available(*, deprecated)
 final class InterleavedTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

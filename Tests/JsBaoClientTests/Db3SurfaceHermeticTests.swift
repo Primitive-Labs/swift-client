@@ -157,6 +157,8 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let _: () async throws -> LinkAccessResult = sharing.getLinkAccess
         let _: (DocumentLinkAccessLevel) async throws -> LinkAccessResult = sharing.setLinkAccess(_:)
         let _: () async throws -> LinkAccessResult = sharing.clearLinkAccess
+        // #5842 — public access, set and cleared by one call.
+        let _: (Db3PublicAccessLevel?) async throws -> Db3PublicAccessChange = sharing.setPublicAccess(_:)
         let _: (RequestAccessOptions) async throws -> DocumentAccessRequestResponse = sharing.requestAccess(_:)
         let _: () async throws -> [DocumentAccessRequest] = sharing.listAccessRequests
         let _: (String, ApproveAccessRequestOptions?) async throws -> AccessRequestResult = sharing.approveAccessRequest(_:options:)

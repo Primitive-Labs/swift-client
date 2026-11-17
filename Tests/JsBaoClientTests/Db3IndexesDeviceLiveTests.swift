@@ -21,6 +21,7 @@ import XCTest
 ///
 /// "Uses the index" is the store's view-index tuples: Swift has no dev-mode
 /// scan warning.
+@available(*, deprecated)
 final class Db3IndexesDeviceLiveTests: XCTestCase {
 
     private var ctx: TestContext!

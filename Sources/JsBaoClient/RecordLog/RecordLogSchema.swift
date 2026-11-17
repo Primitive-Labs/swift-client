@@ -14,7 +14,7 @@ import Foundation
 ///   constraints the room declared, the full replacement in progress, the
 ///   receipts of a load's or a segment's chunks begun and not completed, and
 ///   the segment the confirmed rows were last replaced from; and, for a db3
-///   that lives only on this device (`local_only` 1, #5155), the index
+///   that lives only on this device (`local_only` 1), the index
 ///   registrations made on it here (`local_indexes`, the room's registry kept
 ///   on the device).
 /// - `record_log_writers`: per document and client, its writer and next
@@ -32,8 +32,8 @@ import Foundation
 ///   last read it, keyed by `(model, fields, kind)`, from which the view's
 ///   lookup indexes are built (``RecordLogIndexes``); a member index placed
 ///   on the device is a row whose `members` names the table its members are
-///   kept in (#5156), a text index one whose `text` names its FTS5 table and
-///   whose `options` hold its options (#5223).
+///   kept in, a text index one whose `text` names its FTS5 table and
+///   whose `options` hold its options.
 /// - `record_log_staged_base`: per document and record, the previous
 ///   completed generation's confirmed row (`_data` NULL when it had none) of
 ///   each record a staged full replacement has rewritten: the base a view
@@ -46,7 +46,7 @@ import Foundation
 /// store-wide, as js-bao's: the storage version (``storageVersion``), a store
 /// without it being version 1; and, in a store holding a member index, the
 /// view's highest rowid when statistics were last gathered
-/// (`statistics_rowid`, #5156).
+/// (`statistics_rowid`).
 enum RecordLogSchema {
     /// Every table the JS store keeps, in its order.
     static let clientTables = [
@@ -72,59 +72,72 @@ enum RecordLogSchema {
         ("record_log_state", "receipt", "ALTER TABLE record_log_state ADD COLUMN receipt TEXT"),
         ("record_log_state", "segment", "ALTER TABLE record_log_state ADD COLUMN segment TEXT"),
         ("record_log_state", "staged", "ALTER TABLE record_log_state ADD COLUMN staged INTEGER"),
-    ] + localOnlyColumns + memberIndexColumns + knownHeadColumns + vectorIndexColumns
+    ] + localOnlyColumns + memberIndexColumns + knownHeadColumns + vectorIndexColumns + clearColumns
 
-    /// The columns storage version 4 adds (#5155): the mark of a db3 that
+    /// The columns storage version 4 adds: the mark of a db3 that
     /// lives only on this device, and the index registrations made on it here.
     static let localOnlyColumns: [(table: String, column: String, add: String)] = [
         ("record_log_state", "local_only", "ALTER TABLE record_log_state ADD COLUMN local_only INTEGER NOT NULL DEFAULT 0"),
         ("record_log_state", "local_indexes", "ALTER TABLE record_log_state ADD COLUMN local_indexes TEXT"),
     ]
 
-    /// The column storage version 5 adds (#5156): the device table a local-only
+    /// The column storage version 5 adds: the device table a local-only
     /// db3's member index is kept in, NULL for a scalar entry. Kept for a store
     /// from before version 5, whose cache the version-6 step copies with it.
     static let memberIndexColumns: [(table: String, column: String, add: String)] = [
         ("record_log_indexes", "members", "ALTER TABLE record_log_indexes ADD COLUMN members TEXT"),
     ]
 
-    /// The columns storage version 7 adds (#5221): the room's head as this
+    /// The columns storage version 7 adds: the room's head as this
     /// device last heard it, and when (epoch ms). NULL until a head is heard.
     static let knownHeadColumns: [(table: String, column: String, add: String)] = [
         ("record_log_state", "known_head", "ALTER TABLE record_log_state ADD COLUMN known_head INTEGER"),
         ("record_log_state", "known_head_at", "ALTER TABLE record_log_state ADD COLUMN known_head_at INTEGER"),
     ]
 
-    /// The column storage version 9 adds (#5230, js-bao's
+    /// The column storage version 9 adds (js-bao's
     /// `RECORD_LOG_VECTOR_INDEX_COLUMNS`): the vec1 flat table a vector entry
     /// is kept in on this device, NULL for every other kind.
     static let vectorIndexColumns: [(table: String, column: String, add: String)] = [
         ("record_log_indexes", "vector", "ALTER TABLE record_log_indexes ADD COLUMN vector TEXT"),
     ]
 
+    /// The columns storage version 11 adds (#5994, js-bao's version 12): the
+    /// highest model clear applied, written with the removal, so a clear sent
+    /// again changes nothing; and each cleared model's highest clear applied
+    /// (a JSON list of `[model, l]`), so a result older than a model's clear,
+    /// handed late to another session sharing the store, puts no row of it
+    /// back. NULL until a clear is applied.
+    static let clearColumns: [(table: String, column: String, add: String)] = [
+        ("record_log_state", "cleared_lsn", "ALTER TABLE record_log_state ADD COLUMN cleared_lsn INTEGER"),
+        ("record_log_state", "cleared_models", "ALTER TABLE record_log_state ADD COLUMN cleared_models TEXT"),
+    ]
+
     /// The table naming the user the record-log tables belong to.
     static let ownerTable = "record_log_owner"
 
-    /// The storage version a store is brought to at open: 10 (#5241) adds the
-    /// entries each db3's copy skipped, `record_log_index_skips`; 9 (#5230) adds the
-    /// vector entry's flat table, `record_log_indexes.vector`; 8 (#5322) adds the
-    /// device's index policy, `record_log_index_policy`; 7 (#5221) adds the
-    /// room's head as last heard to `record_log_state`; 6 (#5223) keys
+    /// The storage version a store is brought to at open: 11 adds the
+    /// highest model clear applied, `record_log_state.cleared_lsn`, and each
+    /// cleared model's, `cleared_models`; 10 adds the
+    /// entries each db3's copy skipped, `record_log_index_skips`; 9 adds the
+    /// vector entry's flat table, `record_log_indexes.vector`; 8 adds the
+    /// device's index policy, `record_log_index_policy`; 7 adds the
+    /// room's head as last heard to `record_log_state`; 6 keys
     /// `record_log_indexes` by `(doc_id, model, fields, kind)` and adds its
-    /// `text` and `options` (``rebuildIndexCache``); 5 (#5156) adds the
-    /// member table's name to `record_log_indexes`; 4 (#5155) adds the
+    /// `text` and `options` (``rebuildIndexCache``); 5 adds the
+    /// member table's name to `record_log_indexes`; 4 adds the
     /// local-only mark and registrations to `record_log_state`. Version 3
-    /// (#5136) keeps each record's `_data` as JSONB without `id`, which `_id`
+    /// keeps each record's `_data` as JSONB without `id`, which `_id`
     /// holds. Version 2
-    /// (#4700) kept it as JSON text with `id`, a db3's rows in its view only
+    /// kept it as JSON text with `id`, a db3's rows in its view only
     /// and its indexes from the room's list; version 1 also kept the query
     /// projection (model tables with `_meta_doc_id`, their marks and rule, and
     /// indexes built from declarations). A build that changes the tables
     /// raises it: a store at or above the version runs no DDL at open.
-    static let storageVersion = 10
+    static let storageVersion = 11
 
     /// The version from which every row is JSONB without `id`: a store at it
-    /// or above has nothing to convert (#5136).
+    /// or above has nothing to convert.
     static let jsonbVersion = 3
 
     /// The statements that create the tables. Each is idempotent.
@@ -166,7 +179,9 @@ enum RecordLogSchema {
           local_only INTEGER NOT NULL DEFAULT 0,
           local_indexes TEXT,
           known_head INTEGER,
-          known_head_at INTEGER
+          known_head_at INTEGER,
+          cleared_lsn INTEGER,
+          cleared_models TEXT
         )
         """,
         """
@@ -276,7 +291,7 @@ enum RecordLogSchema {
 
     /// The index cache as storage version 9 keeps it, js-bao's
     /// `RECORD_LOG_INDEXES_DDL`: `kind` is `scalar`, `members`, `text` or
-    /// `vector`; `vector` names a vector entry's flat table (#5230).
+    /// `vector`; `vector` names a vector entry's flat table.
     static let indexCacheDDL = """
         CREATE TABLE IF NOT EXISTS record_log_indexes (
           doc_id TEXT NOT NULL,
@@ -294,7 +309,7 @@ enum RecordLogSchema {
         """
 
     /// The registry entries a db3's copy skipped when it last applied its
-    /// room's list (storage version 10, #5241, js-bao's
+    /// room's list (storage version 10, js-bao's
     /// `RECORD_LOG_INDEX_SKIPS_DDL`): one row per entry, with the placement
     /// the list gave it and why nothing is cached or built for it. Replaced
     /// with the cache, in the same transaction; one of ``clientTables``.
@@ -310,7 +325,7 @@ enum RecordLogSchema {
         )
         """
 
-    /// The device's index policy (storage version 8, #5322, js-bao's
+    /// The device's index policy (storage version 8, js-bao's
     /// `RECORD_LOG_INDEX_POLICY_DDL`): one row per `(doc_id, model, fields,
     /// kind)` this device declined or accepted, and when. Not one of
     /// ``clientTables``: an evict keeps it, and only `client.db3.delete` clears it.
@@ -329,7 +344,7 @@ enum RecordLogSchema {
     /// The table ``rebuildIndexCache(_:)`` builds the version-6 cache in before it takes the cache's name.
     static let indexCacheV6 = "record_log_indexes_v6"
 
-    /// Storage version 6 (#5223, js-bao's `rebuildIndexCache`): a cache
+    /// Storage version 6 (js-bao's `rebuildIndexCache`): a cache
     /// without `kind` is copied into a new table of the version-6 shape with
     /// `kind` backfilled (`members` where `members` is set, else `scalar`),
     /// which takes the old table's name. A cache that has `kind`, or no cache

@@ -9,6 +9,7 @@ import XCTest
 /// `Db3GoneEvent(reason: .deleted)` after the owner deletes the db3 over HTTP
 /// and the member subscribes again; that `ready()` throws `.db3Deleted`, and
 /// the rows stay readable.
+@available(*, deprecated)
 final class Db3DeletedAfterGoneLiveTests: XCTestCase {
 
     private var ctx: TestContext!

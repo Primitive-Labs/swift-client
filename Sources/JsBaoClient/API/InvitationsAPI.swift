@@ -3,7 +3,7 @@ import Foundation
 // MARK: - InvitationsAPI
 
 /// Mirrors the JS `InvitationsAPI` — app-level invitation lifecycle plus
-/// deferred-grant browsing for the deferred-grant flow (#466). Distinct
+/// deferred-grant browsing for the deferred-grant flow. Distinct
 /// from the per-document invitation methods on `client.documents.*`,
 /// which were the only invitation surface before this PR.
 public final class InvitationsAPI: @unchecked Sendable {
@@ -59,7 +59,7 @@ public final class InvitationsAPI: @unchecked Sendable {
         try await transport.request(method: .delete, path: "/invitations/\(invitationId)")
     }
 
-    /// Accept an invitation via its invite token (#466). For an
+    /// Accept an invitation via its invite token. For an
     /// authenticated user whose session already exists; the server marks
     /// the invitation accepted (write-once) and resolves any pending
     /// deferred grants to the caller's `userId`. The result's
@@ -89,8 +89,8 @@ public final class InvitationsAPI: @unchecked Sendable {
     ///   - type: Filter to `.document` or `.group` only.
     ///   - email: Filter to grants targeting this email.
     ///   - limit: Page size.
-    ///   - cursor: Continuation token from a previous page's `nextCursor`
-    ///     (#1316). Without it the server's real position cursor is
+    ///   - cursor: Continuation token from a previous page's `nextCursor`.
+    ///     Without it the server's real position cursor is
     ///     unreachable and a caller can never advance past page one.
     /// - Stability: production
     @available(*, deprecated, message: "The deferred-grants API is deprecated: revoke a pending invitation from its resource (documents, db3.permissions, groups, collections). It keeps answering until a later removal project. (api-surface-stability)")

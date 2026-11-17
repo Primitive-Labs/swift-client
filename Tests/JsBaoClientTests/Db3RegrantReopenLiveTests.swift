@@ -20,6 +20,7 @@ import XCTest
 /// The connection serves a document's permission from a cache for up to 5 s,
 /// so a contact that must see a revocation waits that out first; a reopen's
 /// `record.open` asks the db3's permission afresh.
+@available(*, deprecated)
 final class Db3RegrantReopenLiveTests: XCTestCase {
 
     private var ctx: TestContext!

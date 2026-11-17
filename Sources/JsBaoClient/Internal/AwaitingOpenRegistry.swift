@@ -37,7 +37,7 @@ final class AwaitingOpenRegistry: @unchecked Sendable {
     }
 
     /// Attach the availability budget of the wait `token` registered, so
-    /// progress on its document starts the budget again (#4609).
+    /// progress on its document starts the budget again.
     func attach(_ deadline: AvailabilityDeadline, to token: UUID) {
         lock.withLock {
             guard let documentId = waits[token]?.documentId else { return }
@@ -65,8 +65,8 @@ final class AwaitingOpenRegistry: @unchecked Sendable {
     }
 }
 
-/// An open's availability budget, which bounds its wait WITHOUT progress
-/// (#4609): it runs from the start of the wait, and again from each progress
+/// An open's availability budget, which bounds its wait WITHOUT progress:
+/// it runs from the start of the wait, and again from each progress
 /// report — a `building` answer, a catch-up page, a segment or load chunk.
 /// Measured on a monotonic clock, so a wall-clock correction neither cuts the
 /// budget short nor stretches it.
@@ -95,7 +95,7 @@ final class AvailabilityDeadline: @unchecked Sendable {
     }
 }
 
-/// A refusal that may arrive before the wait that has to hear it (#3764, D9).
+/// A refusal that may arrive before the wait that has to hear it (D9).
 ///
 /// `openDocument` suspends inside `wsManager.send` while its handshake goes out,
 /// and the room can answer before the availability wait exists. The registry

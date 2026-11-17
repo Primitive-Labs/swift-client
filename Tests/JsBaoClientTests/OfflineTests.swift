@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-node-offline.test.ts
 /// Tests offline-first behavior, local persistence, and sync.
+@available(*, deprecated)
 final class OfflineTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

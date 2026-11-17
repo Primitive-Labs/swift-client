@@ -42,7 +42,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// Phase C landed (`Types/DocumentTypes.swift`) — because a `Task`
     /// result crosses an isolation boundary and `YDocument` is not
     /// `Sendable`. It still carries the one live document, so the
-    /// coalescing guarantee above is unchanged (#1993, Phase D1).
+    /// coalescing guarantee above is unchanged (Phase D1).
     private var pendingOpens: [String: Task<ConfinedYDocument, Error>] = [:]
     private var docSyncStates: [String: Bool] = [:]
     // In-flight syncStep1->syncComplete cycles, keyed by send time. Mirrors
@@ -56,7 +56,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// `openDocument`'s `hasLocalNow`, which is deliberately read "BEFORE
     /// openDocument creates IndexedDB persistence" — reading it afterwards
     /// would report every document as claiming a local copy, since attaching
-    /// the provider is itself one of the claim's conditions (#2664, C14).
+    /// the provider is itself one of the claim's conditions (C14).
     private var localCopyClaimedAtOpen: Set<String> = []
     private var docPermissions: [String: DocumentPermission] = [:]
     /// Db3s a resource holds (`noteResourceHeld`): their open reads no document info.
@@ -77,7 +77,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// open. js-bao destroys the document's persistence provider on evict, so
     /// later edits and the eventual close write nothing back until the document
     /// is reopened. Without this, retention "reclaiming" an open document was
-    /// undone by its own next persist (#2668).
+    /// undone by its own next persist.
     private var persistenceSuspended: Set<String> = []
 
     /// Whether local storage has finished binding a provider. Flipped by
@@ -85,7 +85,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// the two skip paths below — that shared hold is what makes the handoff
     /// race-free: a skip either enqueues (not ready) or retries at once
     /// (ready), so a provider that binds between the nil read and the enqueue
-    /// cannot strand the entry in an already-drained set (#3200, review F3).
+    /// cannot strand the entry in an already-drained set (review F3).
     private var storageReady = false
 
     /// Documents whose debounced persist ran while no storage provider was
@@ -94,7 +94,7 @@ public final class DocumentManager: @unchecked Sendable {
     private var persistsAwaitingStorage: Set<String> = []
 
     /// Documents whose metadata put found no bound provider. Since
-    /// `documents.create` is metadata-only (#3200), that row is the create's
+    /// `documents.create` is metadata-only, that row is the create's
     /// only durable artifact — dropping it loses the document id, its
     /// pending-create state and its commit retry information.
     private var metadataAwaitingStorage: Set<String> = []
@@ -103,7 +103,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// stored snapshot and metadata row. Persistence is held for as long as an
     /// id is in here.
     ///
-    /// The observer is installed before the document is reachable (#3200), so a
+    /// The observer is installed before the document is reachable, so a
     /// write made during the open — from a `DocumentOpenedEvent` handler, or by
     /// a caller the already-open fast path handed the document to — schedules a
     /// persist while the document still holds nothing but that write. Letting
@@ -146,13 +146,13 @@ public final class DocumentManager: @unchecked Sendable {
     private var pendingCreateRetryTimers: [String: Task<Void, Never>] = [:]
     /// Set when a logout dropped in-memory user-scoped state whose persisted
     /// records survived, so the next sign-in must reload metadata even for an
-    /// unchanged user (#2874). Read through `needsLocalMetadataReload`.
+    /// unchanged user. Read through `needsLocalMetadataReload`.
     private var localMetadataReloadPending = false
     private var localOnlyDocs: Set<String> = []
     /// Documents opened before their stored metadata could be read at all — a
     /// cold start whose storage provider is not bound yet. For these,
     /// local-only is *unknown*, not known-false, and an edit must be held
-    /// rather than sent until the classification lands (#2691). Emptied by
+    /// rather than sent until the classification lands. Emptied by
     /// `resolveLocalOnlyClassifications()` once startup metadata has loaded.
     private var localOnlyClassificationPending: Set<String> = []
 
@@ -201,7 +201,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// `docLoadedEmitted` flag (`documentManager.ts:475`): JS announces a
     /// server-side load once per open, not once per `syncComplete`, so a
     /// document held open across several reconnects does not tell its
-    /// subscribers it was freshly loaded on every resync (#2666).
+    /// subscribers it was freshly loaded on every resync.
     ///
     /// Reset at open and cleared at close, so a reopen is a new cycle and
     /// does announce the load again.
@@ -269,7 +269,7 @@ public final class DocumentManager: @unchecked Sendable {
     var userId: String = ""
     weak var emitter: EventEmitter?
     var sendWebSocketMessage: ((String) async throws -> Void)?
-    /// Offload one outbound payload too large to travel inline (#3559), and
+    /// Offload one outbound payload too large to travel inline, and
     /// answer the `uploadId` the frame names it by — `nil` when it could not
     /// be uploaded, which leaves the update queued rather than sending a frame
     /// the server cannot resolve.
@@ -282,7 +282,7 @@ public final class DocumentManager: @unchecked Sendable {
     var uploadLargeUpdate: ((String, [UInt8]) async -> String?)?
 
     /// The size at which an outbound payload stops travelling inline and is
-    /// uploaded instead — the server's default `MAX_UPDATE_SIZE` (#3559).
+    /// uploaded instead — the server's default `MAX_UPDATE_SIZE`.
     ///
     /// The SAME number the JS client switches at (`this.env.MAX_UPDATE_SIZE`,
     /// `src/client/JsBaoClient.ts`), applied on BOTH outbound paths, so one
@@ -309,9 +309,9 @@ public final class DocumentManager: @unchecked Sendable {
     var onDb3CreateCommitted: ((String, Db3Info) async -> Void)?
     /// #4921 — the server refused a pending db3 create for good: announce it.
     var onDb3CreateRefused: ((String, Db3CreateFailedEvent) -> Void)?
-    /// The pending creates whose commit attempt is running now: one at a time per id (#4921).
+    /// The pending creates whose commit attempt is running now: one at a time per id.
     private var commitAttemptsInFlight: Set<String> = []
-    /// The `POST db3` of each pending db3 create that is out now (#5000): a
+    /// The `POST db3` of each pending db3 create that is out now: a
     /// second commit of the id waits for it instead of sending another.
     private var db3CommitsInFlight: [String: Task<Db3CommitAnswer, Error>] = [:]
     /// Fires once a `pendingCreate` document exists server-side. The
@@ -326,7 +326,7 @@ public final class DocumentManager: @unchecked Sendable {
     var onPendingCreateCommitted: ((String) -> Void)?
     /// Fires once an open has settled a document's local-only classification
     /// that it had claimed as unknown. An edit made while the answer was
-    /// unknown is held rather than sent (#2691), and this is what tells the
+    /// unknown is held rather than sent, and this is what tells the
     /// client to flush the held batch — the per-document counterpart of the
     /// startup-wide `resolveLocalOnlyClassifications()` release.
     var onLocalOnlyClassificationResolved: ((String) -> Void)?
@@ -389,7 +389,7 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// `openDocument` plus the `OpenOrigin` of the document it returns, for
     /// the client's open path — it installs a failure cleanup that must only
-    /// fire for a document this invocation itself opened (#2667).
+    /// fire for a document this invocation itself opened.
     public func openDocumentReportingOrigin(
         documentId: String,
         options: OpenDocumentOptions
@@ -782,8 +782,8 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Attach the per-document update observer — equivalent to JS
     /// `doc.on("update", handler)`. It captures ALL writes and forwards local
-    /// ones for WebSocket sync; it is the single owner of that forwarding
-    /// (#3200), so `_openDocumentImpl` installs it before the document is
+    /// ones for WebSocket sync; it is the single owner of that forwarding,
+    /// so `_openDocumentImpl` installs it before the document is
     /// reachable by anyone.
     ///
     /// Lock discipline: the entry is replaced under `lock`, and any
@@ -838,7 +838,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// concurrent local write happened to commit in the meantime: since the
     /// observer became the single forwarding owner, that write was simply
     /// dropped — not sent, not marked unsynced, on a document still reporting
-    /// itself synced (#3200).
+    /// itself synced.
     ///
     /// Raw transaction rather than `transactSync` for the same reason
     /// `transactAndSyncAsync` uses one: the FFI lock is the real mutual
@@ -940,7 +940,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// report. Mirrors js-bao's `removeOpenDoc`, which `openDocument` calls
     /// when a later step of the open throws so the next attempt re-runs the
     /// full initialization instead of short-circuiting to a half-open
-    /// document (#2667).
+    /// document.
     public func removeOpenDoc(_ documentId: String) {
         // Removed under the lock, cancelled after it is released — see
         // `registerUpdateObserver` for the FFI-lock/manager-lock inversion this
@@ -1150,7 +1150,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// Mark every open document unsynced and report each one. The transport
     /// paths (connecting, close, deliberate disconnect) call this; mirrors the
     /// `forEachOpenDoc(... _updateSynced(id, false))` sweep JS runs in all
-    /// three (#2663).
+    /// three.
     public func markAllOpenDocumentsUnsynced() {
         for documentId in listOpenDocuments() {
             applySyncState(documentId, isSynced: false)
@@ -1252,7 +1252,7 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     /// Decide how to answer a server-initiated `syncStep1`, mirroring JS
-    /// `handleSyncStep1` (`src/client/JsBaoClient.ts:6883-7001`; #2665).
+    /// `handleSyncStep1` (`src/client/JsBaoClient.ts:6883-7001`).
     ///
     /// A diff goes back only when the server's `docHash` differs from ours AND
     /// the document is writable. The other two cases end the sync locally:
@@ -1285,7 +1285,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// Synchronous, and separable from the build for that reason: nothing in it
     /// is I/O, while building the diff can mean uploading it. The `syncStep1`
     /// handler runs this on the socket's receive loop and hands only the build
-    /// to the document's outbound lane (#3559), so a document that owes nothing
+    /// to the document's outbound lane, so a document that owes nothing
     /// is still marked synced in the frame's own turn — an application parked
     /// on `.sync` must not wait on an unrelated queue for it.
     func owesSyncStep2Diff(documentId: String, serverDocHash: String?) -> Bool {
@@ -1334,7 +1334,7 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Build a syncStep2 response message given the server's state vector.
     /// This sends the client's diff back to the server so it gets any data we have that it doesn't.
-    /// `async` since #3559: a diff over `MAX_UPDATE_SIZE` is uploaded and named
+    /// This is `async`: a diff over `MAX_UPDATE_SIZE` is uploaded and named
     /// by its `uploadId` rather than sent inline, which is what the JS client
     /// has always done. The outbound size decision has
     /// to be the same on both paths, and the upload is I/O.
@@ -1442,7 +1442,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// frame's optional `synced` field. A frame without the field means
     /// success, which is why the parameter defaults to `true` — JS resolves it
     /// the same way (`data.synced === false ? false : true`,
-    /// `JsBaoClient.ts:7440`). Before #2666 Swift recorded every completion as
+    /// `JsBaoClient.ts:7440`). Earlier, Swift recorded every completion as
     /// a success, so a document the server reported as NOT synced was still
     /// treated as up to date.
     public func handleSyncComplete(documentId: String, synced: Bool = true) {
@@ -1521,7 +1521,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// server-side: a cold document room reconstructs the full document once
     /// per concurrently-arriving message, so a burst of N tiny updates (the
     /// fresh-open `_meta_*` registration writes) triggers N concurrent
-    /// multi-second reconstructions and starves the initial sync (#2584).
+    /// multi-second reconstructions and starves the initial sync.
     public func mergeUpdates(_ updates: [[UInt8]]) -> [UInt8] {
         guard updates.count > 1 else { return updates.first ?? [] }
         let scratch = YDocument()
@@ -1611,8 +1611,8 @@ public final class DocumentManager: @unchecked Sendable {
         lock.withLock { openDocs.map { (documentId: $0.key, doc: $0.value) } }
     }
 
-    /// Every document id this manager still holds for the logout sweep
-    /// (#2874): the open ones **plus** every document whose update observer is
+    /// Every document id this manager still holds for the logout sweep:
+    /// the open ones **plus** every document whose update observer is
     /// still installed.
     ///
     /// The two sets differ after `evictAllLocalData()`, which clears
@@ -1637,7 +1637,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// from its stored metadata rather than from the persistence provider the
     /// open itself attaches. Combined with an empty ydoc this is the "claims
     /// local data but has none" signal that JS's stale-persistence recovery
-    /// keys off (#2664, C14).
+    /// keys off (C14).
     public func claimedLocalCopyAtOpen(_ documentId: String) -> Bool {
         lock.withLock { localCopyClaimedAtOpen.contains(documentId) }
     }
@@ -1659,7 +1659,7 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Mark a document as no longer in sync with the server and tell
     /// subscribers. Mirrors JS `_updateSynced(documentId, false)` — used by the
-    /// sync watchdog when a `syncStep1` gets no answer (#2664, C7).
+    /// sync watchdog when a `syncStep1` gets no answer (C7).
     public func markUnsynced(_ documentId: String) {
         let changed: Bool = lock.withLock {
             guard docSyncStates[documentId] != false else { return false }
@@ -1673,7 +1673,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// Discard a document's local Yjs persistence and reset its sync state, so
     /// the next `syncStep1` carries an empty state vector and the server sends
     /// the full document. Mirrors JS `resetYjsPersistenceAndResync`'s first
-    /// half; the caller sends the follow-up `syncStep1` (#2664, C14).
+    /// half; the caller sends the follow-up `syncStep1` (C14).
     ///
     /// The open `YDocument` is deliberately left in place: this only runs when
     /// the ydoc has already been observed empty, so there is nothing to clear,
@@ -1727,15 +1727,15 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     /// Hears a document's permission as it is recorded, before its
-    /// `PermissionEvent`: the client applies it to a bound db3's store (#5020).
+    /// `PermissionEvent`: the client applies it to a bound db3's store.
     var permissionApplied: ((String, DocumentPermission) -> Void)?
 
     /// Hears every permission a server `docMetadata` frame carries, whether
-    /// or not it changed the recorded level (#5101): a grant heard for a
+    /// or not it changed the recorded level: a grant heard for a
     /// refused db3 asks its room again.
     var permissionHeard: ((String, DocumentPermission) -> Void)?
 
-    /// Note a db3 a resource holds (an agent session's, #4884): its open takes
+    /// Note a db3 a resource holds (an agent session's): its open takes
     /// `reader` and runs no `fetchDocumentInfo`.
     func noteResourceHeld(_ documentId: String) {
         lock.withLock { _ = resourceHeld.insert(documentId) }
@@ -1766,7 +1766,7 @@ public final class DocumentManager: @unchecked Sendable {
         }
     }
 
-    /// The format of `documentId`, as this client last learned it (#3436), or
+    /// The format of `documentId`, as this client last learned it, or
     /// `nil` when no handshake has ever answered for it.
     public func documentFormat(_ documentId: String) -> Int? {
         lock.withLock { metadataIndex[documentId]?.documentFormat }
@@ -1845,7 +1845,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// while the listing was being fetched.
     ///
     /// `sessionEnded` is the caller's fence for an answer fetched for one
-    /// signed-in user (#4150): the merge suspends on every row's persist, so a
+    /// signed-in user: the merge suspends on every row's persist, so a
     /// logout and the next sign-in can land mid-listing. It is asked in the
     /// critical section of every row write and every eviction claim — the
     /// session ends before the next user's state is reset, so a write that
@@ -2087,7 +2087,7 @@ public final class DocumentManager: @unchecked Sendable {
         public let documentId: String
         /// `nil` for a row restored from disk that no server confirmation has
         /// touched since — which is exactly the state the document deleted
-        /// server-side is in at launch (#2827).
+        /// server-side is in at launch.
         public let metadataTouch: UInt64?
     }
 
@@ -2299,14 +2299,14 @@ public final class DocumentManager: @unchecked Sendable {
     /// Create a document locally (offline or local-only): write its metadata
     /// row and nothing else. Pass `tags` to carry them through the eventual
     /// server commit (`commitOfflineCreate`) — mirrors js-bao's local-first
-    /// create path (#852), which is metadata-only ("create document metadata
+    /// create path, which is metadata-only ("create document metadata
     /// only (no Y.Doc open)", `src/client/JsBaoClient.ts`).
     ///
     /// No `YDocument` is built here, and the document is deliberately NOT
     /// registered in `openDocs`: opening is always an explicit step. Until
     /// `openDocument` runs there is no update observer for the document, so a
     /// write accepted here could never reach the server — it would be applied
-    /// locally, read back, and lost on the next launch (#3200). Every write
+    /// locally, read back, and lost on the next launch. Every write
     /// funnel already guards on openness (`requireMember`, `transactAndSync`),
     /// so leaving the document closed is what makes those guards fire, exactly
     /// as they do in JS.
@@ -2407,7 +2407,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// A `manual` document — opened with `deferNetworkSync` or
     /// `enableNetworkSync: false` — is left untouched: the caller owns its
     /// sync timing, and an unrequested syncStep1 here would pull server state
-    /// into a ydoc at a moment the caller did not choose (#2475).
+    /// into a ydoc at a moment the caller did not choose.
     private func applyPostCommitPolicy(_ documentId: String) {
         guard startNetworkMode(documentId) == .immediate else { return }
         lock.withLock { _ = pendingSyncOperations.removeValue(forKey: documentId) }
@@ -2651,7 +2651,7 @@ public final class DocumentManager: @unchecked Sendable {
         }
     }
 
-    /// Whether a failed db3 commit is retried (#4921): a transport failure (any
+    /// Whether a failed db3 commit is retried: a transport failure (any
     /// error that is not an HTTP answer), a 5xx, 408, 429, or 409
     /// `DB3_CREATE_IN_PROGRESS`. Any other refusal is terminal.
     static func isRetryableDb3CommitFailure(_ error: Error) -> Bool {
@@ -2660,7 +2660,7 @@ public final class DocumentManager: @unchecked Sendable {
         return http.status == 409 && http.serverCode == "DB3_CREATE_IN_PROGRESS"
     }
 
-    /// Commit a db3 `client.db3.create` made on this device (#4921): `POST db3`
+    /// Commit a db3 `client.db3.create` made on this device: `POST db3`
     /// with `{ id, title, tags?, metadata?, type? }`. Committed (201, or 200
     /// for this caller's own create whose first answer was lost), it settles
     /// as a documents commit does and hands the server's row to
@@ -2737,7 +2737,7 @@ public final class DocumentManager: @unchecked Sendable {
         return .created
     }
 
-    /// The db3 create's commit that is out now, or a new one (#5000): a caller
+    /// The db3 create's commit that is out now, or a new one: a caller
     /// arriving while the backoff's attempt is in flight (an explicit
     /// `commitOfflineCreate`, a `client.db3` call waiting for the create) gets
     /// that attempt's answer, and one `POST db3` is sent. With none out, a new
@@ -2766,7 +2766,7 @@ public final class DocumentManager: @unchecked Sendable {
         return try await attempt.value
     }
 
-    /// Commit a pending db3 create now and answer its outcome (#4921, #5000),
+    /// Commit a pending db3 create now and answer its outcome,
     /// for `commitOfflineCreate(documentId:)`. A refusal mark goes first, so a
     /// create the server refused is tried again; an attempt already in flight
     /// is joined, not doubled. A transient failure throws, and the backoff
@@ -3076,7 +3076,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// Mirrors js-bao's `hasLocalCopy` (`src/client/internal/documentManager.ts`):
     /// persistence wired up, a pending local create, a local-only document, an
     /// open document holding data, or recorded `localBytes`. A metadata row on
-    /// its own is not a local copy — before #2668 every document that had ever
+    /// its own is not a local copy — earlier, every document that had ever
     /// appeared in a server listing reported `true` with zero CRDT bytes on
     /// disk.
     public func hasLocalCopy(_ documentId: String) -> Bool {
@@ -3096,7 +3096,7 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     /// Evict one document's local data: the metadata row, the in-memory
-    /// bookkeeping, and — since #2668 — the persisted CRDT snapshot in
+    /// bookkeeping, and the persisted CRDT snapshot in
     /// `yjs_docs`. Leaving that row behind meant an evicted document rehydrated
     /// its old content on the next open, and `maxBytes` enforcement reduced the
     /// accounted total without reclaiming any disk.
@@ -3116,7 +3116,7 @@ public final class DocumentManager: @unchecked Sendable {
     ///
     /// `sessionEnded` is asked in that same critical section: a decision made
     /// for a user who has since signed out is not applied to whoever is
-    /// signed in now (#4150). The persisted row is deleted from the store of
+    /// signed in now. The persisted row is deleted from the store of
     /// the user the claim was made for.
     @discardableResult
     func evictLocalData(
@@ -3199,7 +3199,7 @@ public final class DocumentManager: @unchecked Sendable {
         return true
     }
 
-    /// Whether `documentId`'s metadata row is a db3 that lives only on this device (#5155).
+    /// Whether `documentId`'s metadata row is a db3 that lives only on this device.
     func isLocalOnlyDb3Row(_ documentId: String) -> Bool {
         lock.withLock {
             metadataIndex[documentId].map { $0.localOnly == true && $0.documentFormat == RecordLogTransport.documentFormat } ?? false
@@ -3207,7 +3207,7 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     /// Put back the metadata row of a db3 that lives only on this device
-    /// after a sweep took every row (#5155): its copy stays, and so does what
+    /// after a sweep took every row: its copy stays, and so does what
     /// classifies it.
     func restoreLocalOnlyRow(_ row: LocalMetadataEntry) async {
         lock.withLock {
@@ -3417,7 +3417,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// `docSyncStates` does not reset on a later *edit* (only on a transport
     /// change — see `applySyncState`), so it alone can't protect a just-made
     /// edit from eviction. It was originally needed because `docSyncStates`
-    /// stuck at `true` through a disconnect as well; #2663 fixed that half.
+    /// stuck at `true` through a disconnect as well; since fixed.
     public func hasUnsyncedLocalChanges(_ documentId: String) -> Bool {
         lock.withLock {
             if pendingCreates.contains(documentId) { return true }
@@ -3697,10 +3697,10 @@ public final class DocumentManager: @unchecked Sendable {
     /// issued before it finishes used to be lost with no error and no retry.
     /// It also takes nothing while no user is bound — the window between the
     /// provider attaching and the signed-in user binding — because a row is
-    /// never persisted without an owner (#4829). Every metadata write the
+    /// never persisted without an owner. Every metadata write the
     /// manager makes goes through here, and the same enqueue-or-retry latch
     /// the skipped persist uses decides what happens to the ones storage could
-    /// not take (#3200): the storage-ready drain runs after the bind and
+    /// not take: the storage-ready drain runs after the bind and
     /// writes them under the bound user. With storage ready and still no user
     /// (no token, no session), the one retry is refused too and the row stays
     /// in memory for the process, as in the JS client.
@@ -3777,7 +3777,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// snapshotted the user-scoped state. The flag flip and the set handover
     /// happen under one lock hold, and every skip path decides enqueue-or-retry
     /// under that same lock, so no interleaving can leave an entry in a set
-    /// that has already been drained (#3200, review F3).
+    /// that has already been drained (review F3).
     public func storageDidBecomeReady() async {
         let (persists, metadataIds) : (Set<String>, Set<String>) = lock.withLock {
             storageReady = true
@@ -3831,10 +3831,10 @@ public final class DocumentManager: @unchecked Sendable {
 
     /// Test seam awaited inside `handleServerDocuments` after each row's
     /// persist, so a test can hold a merge mid-listing across a logout and the
-    /// next sign-in (#4150, finding 4150-SO-001). Never set in production code.
+    /// next sign-in (finding 4150-SO-001). Never set in production code.
     var onServerDocumentPersistedForTest: (@Sendable (String) async -> Void)?
 
-    /// Drop the retry state a logout leaves behind (#2874). JS parity with
+    /// Drop the retry state a logout leaves behind. JS parity with
     /// `resetUserScopedState` (`documentManager.ts`), run on EVERY logout:
     /// cancel the pending-create retry timers and clear the in-memory
     /// pending-create set, so a signed-out user's failed create cannot commit
@@ -3859,7 +3859,7 @@ public final class DocumentManager: @unchecked Sendable {
     }
 
     /// Whether a logout dropped in-memory user-scoped state that the persisted
-    /// metadata still holds (#2874). The sign-in rebind reads this so the same
+    /// metadata still holds. The sign-in rebind reads this so the same
     /// user signing back in — same process, no relaunch — rehydrates their
     /// pending creates instead of leaving them silently uncommitted.
     public var needsLocalMetadataReload: Bool {
@@ -3870,7 +3870,7 @@ public final class DocumentManager: @unchecked Sendable {
     /// deleting the previous user's persisted metadata (unlike
     /// `evictAllLocalData`, which purges disk). Used when the signed-in user
     /// changes before any document is opened — e.g. the test bootstrap where
-    /// OTP signs in a different account than the restored session (#1780). The
+    /// OTP signs in a different account than the restored session. The
     /// caller reloads the new user's metadata via `loadLocalMetadata()` after.
     public func resetInMemoryUserState(userId newUserId: String) async {
         lock.withLock {
@@ -3964,7 +3964,7 @@ public final class YjsSQLitePersistence: @unchecked Sendable {
     }
 }
 
-/// One db3 commit attempt's answer (#5000), shared by every caller that
+/// One db3 commit attempt's answer, shared by every caller that
 /// joined the attempt: `created`, `refused` with the server's message, or
 /// `not_pending` once the create belongs to no one pending here.
 struct Db3CommitAnswer: Sendable {

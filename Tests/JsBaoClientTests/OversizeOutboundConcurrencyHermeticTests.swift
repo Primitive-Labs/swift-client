@@ -29,6 +29,7 @@ import YSwift
 /// cannot show a receive loop blocking — the deadlock is in the transport, so
 /// the transport is real. (2) runs at the `DocumentManager` seam, because what
 /// it pins is which settlement one claim gets.
+@available(*, deprecated)
 final class OversizeOutboundConcurrencyHermeticTests: XCTestCase {
 
     /// The threshold both clients switch at — the server's `MAX_UPDATE_SIZE`.

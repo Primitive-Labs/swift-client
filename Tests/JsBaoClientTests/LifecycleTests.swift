@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-lifecycle-edge-cases.test.ts
 /// Tests lifecycle edge cases: destroy, double-open, close-while-syncing, etc.
+@available(*, deprecated)
 final class LifecycleTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

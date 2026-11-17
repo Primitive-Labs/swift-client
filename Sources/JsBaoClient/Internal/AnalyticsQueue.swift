@@ -16,7 +16,7 @@ import Foundation
 /// * **Everything here is async.** The public analytics surface —
 ///   `client.analytics` (`AnalyticsAPI`) and the `…Async` members on
 ///   `JsBaoClient` — awaits into this actor. The synchronous forms that bridged
-///   the conversion were removed in #2367.
+///   the conversion were since removed.
 public actor AnalyticsQueue {
     public static let unauthenticatedUser = "UNAUTHENTICATED"
 
@@ -67,7 +67,7 @@ public actor AnalyticsQueue {
     /// Test-observability hook: invoked with the fully-prepared event right
     /// before it is buffered. Internal (visible only via `@testable import`)
     /// — the live-integration analytics tests use it to observe auto-events
-    /// (#963) the same way the JS tests observe `client.analyticsQueue`.
+    /// the same way the JS tests observe `client.analyticsQueue`.
     /// Never set in production code.
     private var onEventLogged: (@Sendable ([String: JSONValue]) -> Void)?
 

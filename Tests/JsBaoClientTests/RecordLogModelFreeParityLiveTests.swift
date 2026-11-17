@@ -5,6 +5,7 @@ import XCTest
 /// ``ModelFreeJSChild``) on one format-3 document of a live app: each sees the
 /// other's writes to a model nobody declared, and the two agree on every
 /// record (intent criterion 1, Swift part).
+@available(*, deprecated)
 final class RecordLogModelFreeParityLiveTests: XCTestCase {
 
     private var ctx: TestContext!

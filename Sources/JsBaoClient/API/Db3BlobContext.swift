@@ -33,8 +33,8 @@ public final class Db3BlobContext: Sendable {
     public let db3Id: String
     private let transport: any Transport
     private let blobManager: BlobManager
-    /// Why no request may name the db3 (one that lives only on this device,
-    /// #5155), asked before each call that would send one; `nil` lets it go.
+    /// Why no request may name the db3 (one that lives only on this device),
+    /// asked before each call that would send one; `nil` lets it go.
     private let refusal: @Sendable () async -> JsBaoError?
 
     init(

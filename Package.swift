@@ -230,7 +230,7 @@ let package = Package(
             // are JSON the JS and Swift suites both read by path, not bundle
             // resources; the vector codegen golden's TOML is read by path the
             // same way, and so are the shared-enum model fixture's TOMLs
-            // (#5896). `JsBaoSQLiteProbe` is its own executable target too,
+            // (#5896) and the JSON-field model fixture's (#5899). `JsBaoSQLiteProbe` is its own executable target too,
             // and the store the earlier bundled SQLite wrote (#5227) is read
             // by path.
             exclude: [
@@ -239,6 +239,7 @@ let package = Package(
                 "Fixtures/AgentSessionRows",
                 "Fixtures/BundledSQLite",
                 "Fixtures/Db3Enums",
+                "Fixtures/Db3Json",
                 "Fixtures/Db3Vectors",
                 "Fixtures/DocumentIngestChunks",
                 "Fixtures/RoleCompatResponses",
@@ -246,6 +247,8 @@ let package = Package(
                 "Schema/CodegenSharedEnum/db3-types",
                 "Schema/CodegenSharedEnum/schemas",
                 "Schema/CodegenSharedEnum/functions",
+                "Schema/CodegenJson/db3-types",
+                "Schema/CodegenJson/schemas",
             ],
             swiftSettings: experimentalApiSettings
         ),

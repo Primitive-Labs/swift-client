@@ -14,6 +14,7 @@ import XCTest
 /// - A vector index registers on a synced db3 the client declared its vector
 ///   fields to (with its first write) with its options, and is listed
 ///   `kind: .vector, on: .device`; the device builds its flat table (#5230).
+@available(*, deprecated)
 final class Db3VectorLiveTests: XCTestCase {
 
     private var ctx: TestContext!

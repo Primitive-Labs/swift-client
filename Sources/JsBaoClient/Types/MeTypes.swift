@@ -107,7 +107,7 @@ public enum AvatarContentType: String, Sendable, Equatable, CaseIterable {
 /// - `localOnly` — return only docs with local data on this device, ignoring
 ///   the server entirely.
 /// - `serverTimeout` — bound on a server fetch, a `TimeInterval` in
-///   **seconds** (default `10`; renamed from `serverTimeoutMs: Int` in #2367,
+///   **seconds** (default `10`; renamed from `serverTimeoutMs: Int`,
 ///   which was 10000 milliseconds). Exceeding it throws
 ///   `JsBaoError(code: .listTimeout)`; `0` means unbounded, matching how the
 ///   client's cache reads the same option. The wire field is still `timeoutMs`.
@@ -134,7 +134,7 @@ public struct MeOwnedDocumentsOptions: Sendable, Equatable {
     public var waitForLoad: WaitForLoadMode?
     public var forward: Bool?
 
-    /// `returnPage` was deprecated in #2360 and removed in #2367 — a runtime
+    /// `returnPage` was deprecated and removed — a runtime
     /// flag can't change a return type in Swift. Call
     /// `me.ownedDocumentsPage(...)` for the `{ items, hasMore, nextCursor? }`
     /// page.
@@ -173,8 +173,8 @@ public struct SharedDocument: Decodable, Sendable, Equatable {
     public let document: DocumentInfo
     /// Who granted access (the actor) — always present on shared rows.
     public let grantedBy: String
-    /// Always `"permission"`: the row is a direct, non-owner grant. #2951
-    /// removed the pending legacy invitation rows this list used to merge in.
+    /// Always `"permission"`: the row is a direct, non-owner grant — the
+    /// pending legacy invitation rows this list used to merge in were removed.
     public let source: String?
 
     private enum CodingKeys: String, CodingKey {
@@ -193,9 +193,9 @@ public struct SharedDocument: Decodable, Sendable, Equatable {
 /// (`{ items, hasMore, nextCursor? }`, raw-JSON cursor).
 public struct SharedDocumentListResult: Decodable, Sendable, Equatable {
     public let items: [SharedDocument]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {

@@ -30,7 +30,7 @@ import CryptoKit
 /// * **Everything else on the queue surface is `async`.** The public forms are
 ///   the `…Async` members on `JsBaoClient`, `DocumentsAPI` and
 ///   `DocumentBlobContext`. The synchronous forms that bridged the conversion
-///   were removed in #2367; `DocumentsAPI` keeps a few as unavailable-renamed
+///   were removed; `DocumentsAPI` keeps a few as unavailable-renamed
 ///   stubs so the compiler points a migrating call at its twin (see the note
 ///   above its app-wide upload-queue verbs).
 public actor BlobManager {
@@ -79,7 +79,7 @@ public actor BlobManager {
     /// consult it.
     nonisolated let networkingAllowed: (@Sendable () -> Bool)?
     /// Whether a db3 is one created here whose create the server does not
-    /// have yet (#5000): its uploads wait in the queue until it does.
+    /// have yet: its uploads wait in the queue until it does.
     nonisolated let pendingDb3Create: (@Sendable (String) -> Bool)?
     /// Where the queue is kept across launches: the client's own database,
     /// one record and one bytes row per upload in the stores of the app and
@@ -146,8 +146,8 @@ public actor BlobManager {
     private nonisolated let backoffMax: Int
 
     /// The one designated initializer. Every collaborator is supplied here —
-    /// there is no post-construction setter, because an `actor` cannot have one
-    /// (#2172), and this is also why the previous `convenience init` is gone:
+    /// there is no post-construction setter, because an `actor` cannot have one,
+    /// and this is also why the previous `convenience init` is gone:
     /// the Swift 6 language mode rejects convenience initializers on an actor
     /// (`KvCache.swift`'s two designated inits record the same precedent).
     ///
@@ -200,7 +200,7 @@ public actor BlobManager {
 
     /// Cancel the pending queue timer.
     ///
-    /// The safety argument is **rewritten** for the actor (#2172), not carried
+    /// The safety argument is **rewritten** for the actor, not carried
     /// over: the pre-conversion one was "the lock makes this read safe", which
     /// says nothing once there is no lock. The argument now is that `deinit`
     /// runs only when no reference to the actor remains, so no isolated work
@@ -213,7 +213,7 @@ public actor BlobManager {
     /// in-flight uploads and emitting `blobs:queue-drained` needs `await`, and
     /// a `deinit` cannot await — the same limitation `AnalyticsQueue.deinit`
     /// records. Queued uploads are dropped from memory with the manager; what
-    /// the write chain already applied stays in storage (#4592).
+    /// the write chain already applied stays in storage.
     deinit {
         queueTimerTask?.cancel()
     }
@@ -935,8 +935,8 @@ public actor BlobManager {
     /// alike, so the timer is armed only for work selection can take: not
     /// paused and not in flight; for a document task with a user, owned by the
     /// signed-in user under the current generation, and for a db3 task only
-    /// while the client may use the network (JS) and the server has the db3
-    /// (#5000); for a session task also not failed, owned, and only while the
+    /// while the client may use the network (JS) and the server has the db3;
+    /// for a session task also not failed, owned, and only while the
     /// client may use the network.
     private func isRunnable(_ task: UploadTask, in context: RunContext) -> Bool {
         guard !task.paused, !task.uploading else { return false }
@@ -1576,12 +1576,12 @@ public actor BlobManager {
 
     /// The client's networking may be allowed again: arm the timer for
     /// whatever is runnable now (the session and db3 uploads that waited).
-    /// Whether an upload to `db3Id` waits for that db3's create to commit (#5000).
+    /// Whether an upload to `db3Id` waits for that db3's create to commit.
     private nonisolated func isHeldForDb3Create(_ db3Id: String) -> Bool {
         pendingDb3Create?(db3Id) ?? false
     }
 
-    /// The create of `db3Id` committed (#5000): its uploads, held while the
+    /// The create of `db3Id` committed: its uploads, held while the
     /// server did not have the db3, go now.
     func db3Committed(_ db3Id: String) {
         guard uploadQueue.values.contains(where: { $0.family == .db3 && $0.documentId == db3Id }) else { return }
@@ -1862,7 +1862,7 @@ public actor BlobManager {
     // MARK: - Cleanup
 
     /// Drop every locally-retained blob. Async-only — there is no synchronous
-    /// form and no twin (#2172): the facade path (`JsBaoClient.evictAllLocal`)
+    /// form and no twin: the facade path (`JsBaoClient.evictAllLocal`)
     /// was already `async`, and a direct holder of the manager is taking the
     /// all-members-async break anyway.
     public func clearCache() {
@@ -2044,7 +2044,7 @@ public actor BlobManager {
     /// fires no later than the requested deadline is kept rather than replaced.
     /// The previous implementation spawned a fresh detached `Task` per failure,
     /// so a repeatedly failing upload accumulated concurrent retry passes —
-    /// each of which re-selected the same task and bumped its `attempts` (#2056).
+    /// each of which re-selected the same task and bumped its `attempts`.
     ///
     /// **The whole method is one isolated, `await`-free decision region.** Under
     /// the lock this took two or three separate holds — `nextQueueDelayMs()`
@@ -2054,7 +2054,7 @@ public actor BlobManager {
     /// this generation is still current" step the third hold needed is gone with
     /// it: the task is created and assigned inside this region, and its body
     /// cannot re-enter the actor before the region returns (its first act is a
-    /// suspension). An `await` anywhere in here would reopen the #2056
+    /// suspension). An `await` anywhere in here would reopen the
     /// double-arming class, which is why the structural test slices it.
     func scheduleQueueProcessing(delayMs: Int = 0) {
         guard !isShutdown else {
@@ -2206,7 +2206,7 @@ public actor BlobManager {
     /// Select tasks and mark them in-flight in **one isolated, `await`-free
     /// region**, so concurrent passes can never select the same task twice.
     /// `now` is read inside the region too — reading it outside left a window
-    /// where two passes filtered against different clocks (#2056). This is the
+    /// where two passes filtered against different clocks. This is the
     /// #2056 guard itself; an `await` in here reopens the double-selection class.
     ///
     /// An owned task's credentials are taken here too, session or document,
@@ -2396,7 +2396,7 @@ public actor BlobManager {
 
     /// Emit `blobs:upload-progress` with the full queue record, mirroring
     /// JS `emitUploadProgress` (`src/client/internal/blobManager.ts`).
-    /// `status` ∈ `"queued" | "uploading" | "pending" | "paused"` (#996).
+    /// `status` ∈ `"queued" | "uploading" | "pending" | "paused"`.
     ///
     /// `nonisolated`, like every emit helper here: the closure runs app code.
     private nonisolated func emitUploadProgress(_ task: UploadTask, status: String) {
@@ -2424,7 +2424,7 @@ public actor BlobManager {
     ///
     /// The state half — dropping the queue record and releasing the
     /// locally-retained bytes — is the caller's, and it happens in an isolated
-    /// step. The two used to be one method; they are split (#2172) because the
+    /// step. The two used to be one method; they are split because the
     /// state work belongs on the actor and the emit must not run there.
     private nonisolated func emitTerminalUploadFailure(_ task: UploadTask) {
         emit?(BlobUploadFailedEvent(
@@ -2494,8 +2494,8 @@ public actor BlobManager {
     /// A refresh-time transport failure takes that last branch: no HTTP
     /// response was received, so the error carries `status == 0` and never
     /// reaches the terminal `status >= 400` case. It used to arrive here as a
-    /// synthetic `HttpError(status: 401)`, which is what dropped the upload
-    /// (#2366); the fix is at the throw site in `HttpClient.fetchWithRefresh`,
+    /// synthetic `HttpError(status: 401)`, which is what dropped the upload;
+    /// the fix is at the throw site in `HttpClient.fetchWithRefresh`,
     /// so no rule here needs to know how that failure is spelled.
     /// `BlobRefreshOutageTests` pins the behavior end to end.
     static func shouldQueueError(_ error: Error, family: BlobRouteFamily) -> Bool {
@@ -2534,7 +2534,7 @@ public actor BlobManager {
     /// Doing the `min` in `Int` (the old `min(Int(delay), maxMs)`) traps once
     /// `baseMs * 2^(attempts-1)` exceeds `Int.max` — from `attempts == 54` on
     /// with the production 2000ms base — and the trap aborts the whole process
-    /// before the cap can clamp anything (#2056). In `Double`, an overflowing
+    /// before the cap can clamp anything. In `Double`, an overflowing
     /// `pow` simply yields `.infinity`, which `min` discards in favour of the
     /// finite cap, so the final `Int(...)` is always in range. The explicit
     /// non-finite guard covers a NaN input as well.
@@ -2579,7 +2579,7 @@ struct UploadTask: Sendable {
     /// when a `processQueue()` pass selects the task, and cleared on every exit
     /// path (success removes the task outright; failure clears it; a cancelled
     /// task is already gone). Without it, concurrent passes re-select the same
-    /// task and each bumps `attempts` (#2056).
+    /// task and each bumps `attempts`.
     var uploading: Bool = false
     var nextAttemptAt: TimeInterval = 0
     var updatedAt: TimeInterval = Date().timeIntervalSince1970
@@ -2595,7 +2595,7 @@ struct UploadTask: Sendable {
     /// The user the upload was queued by: always set for a session upload,
     /// and for a document upload queued while a user was signed in. It is
     /// listed and attempted only while that user is signed in, with their
-    /// token. `nil` is an unbound document upload, as before #4592.
+    /// token. `nil` is an unbound document upload, as before.
     var userId: String?
     /// The identity generation the task was queued or re-adopted under.
     var generation: UInt64 = 0

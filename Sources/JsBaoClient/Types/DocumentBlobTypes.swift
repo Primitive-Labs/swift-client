@@ -15,9 +15,9 @@ import Foundation
 /// nextCursor? }`). `nextCursor` is `nil` when there are no further pages.
 public struct DocumentBlobListResult: Decodable, Sendable {
     public let items: [BlobInfo]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {

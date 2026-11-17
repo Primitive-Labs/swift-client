@@ -68,7 +68,7 @@ public struct FunctionRunError: Decodable, Sendable, Equatable {
 
     /// Read a raw `status.error` value, or `nil` when there is none to publish.
     ///
-    /// NEVER throws and never fails the read around it — the #3449 rule, and
+    /// NEVER throws and never fails the read around it — the same rule, and
     /// the whole reason that child existed. Delegates to
     /// ``RunErrorEnvelope/read(_:)``, which is the one parser for this field,
     /// and adds the two function-side projections: the wire's `code` key is
@@ -103,7 +103,7 @@ public struct FunctionRunError: Decodable, Sendable, Equatable {
 /// `failedStep*` fields are DSL vocabulary the server never sets for a function
 /// row, so they are not declared and do not reach a caller. The retired
 /// `executionMode` is not declared either: ``runtime`` is what the server
-/// sends in its place (#3190).
+/// sends in its place.
 public struct FunctionRunInfo: Decodable, Sendable, Equatable {
     public let runId: String
     public let runKey: String
@@ -227,10 +227,10 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
 /// OWNED BY THIS SURFACE, as ``FunctionRunSlice`` is: the workflow surface it
 /// once shared the field with retired with the DSL engine.
 ///
-/// NEVER throws and never fails the read around it — the #3449 rule. A value
+/// NEVER throws and never fails the read around it — this rule. A value
 /// of another JSON kind, and an object whose `message` is not a string, are
 /// both "no error the client can describe", the same reading the `slice`
-/// block takes (#3388): a status is an answer about a run, and a field the
+/// block takes: a status is an answer about a run, and a field the
 /// client cannot vouch for must not cost the caller the answer.
 struct RunErrorEnvelope {
     let name: String?
@@ -267,7 +267,7 @@ struct RunErrorEnvelope {
     }
 }
 
-/// The task slice's record on a function run (#3381). Mirrors the JS client's
+/// The task slice's record on a function run. Mirrors the JS client's
 /// status `slice` field for field.
 ///
 /// OWNED BY THIS SURFACE. Only a function run has a slice record, so the block
@@ -318,7 +318,7 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
     /// instead of yielding. `0` for a run short enough never to need one.
     public let refreshCount: Int
     /// How many of this run's slices the platform tore down and restarted — a
-    /// platform deploy resets the engine's Durable Object under every executing
+    /// platform deploy resets the engine's runtime under every executing
     /// slice, and an isolate eviction does the same.
     ///
     /// The engine re-runs the interrupted step as a further attempt, so a run
@@ -442,8 +442,8 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
 
 /// What `functions.getStatus` answers.
 ///
-/// Decoded FIELD BY FIELD through the nested `status` container, the #3449
-/// rule: a surprise in one field cannot cost the caller the read, so a
+/// Decoded FIELD BY FIELD through the nested `status` container, following
+/// this rule: a surprise in one field cannot cost the caller the read, so a
 /// malformed `error` or `slice` drops to `nil` with the status kept. An
 /// already-flattened payload decodes by the same rule.
 public struct FunctionRunStatus: Decodable, Sendable, Equatable {
@@ -607,7 +607,7 @@ public struct FunctionRunListOptions: Sendable, Equatable {
 /// One page of `functions.listRuns`. Mirrors JS `FunctionRunPage`.
 ///
 /// An item this client cannot decode is dropped rather than failing the page
-/// (the #3449 rule): a listing is many answers, and one field the client
+/// (the same rule): a listing is many answers, and one field the client
 /// cannot vouch for must not cost the caller the rest.
 public struct FunctionRunPage: Decodable, Sendable, Equatable {
     public let items: [FunctionRunInfo]

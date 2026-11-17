@@ -10,6 +10,7 @@ import XCTest
 /// Server-free: an in-process loopback WebSocket server accepts the socket and
 /// records the frames the client sends, so the assertions are on the real wire
 /// rather than on an internal flag.
+@available(*, deprecated)
 final class PostCommitResyncWiringTests: XCTestCase {
 
     private func newDocId() -> String { "post-commit-\(UUID().uuidString.prefix(8))" }

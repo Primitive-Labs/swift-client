@@ -5,6 +5,7 @@ import XCTest
 /// (#4484 behavior 14): every entry is acknowledged, the room holds the 200
 /// rows, and a second client sees all of them. The wall time is printed; the
 /// frames themselves are the hermetic sender tests' subject.
+@available(*, deprecated)
 final class RecordLogBurstLiveTests: XCTestCase {
 
     private var ctx: TestContext!

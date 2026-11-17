@@ -12,6 +12,7 @@ import XCTest
 /// real HTTP requests and holds the sync's answer until the test releases it,
 /// so the order — request sent as A, logout, answer — is fixed rather than a
 /// timing guess.
+@available(*, deprecated)
 final class SyncMetadataLogoutFenceHermeticTests: XCTestCase {
     private static let userA = "user-a"
     private static let userB = "user-b"

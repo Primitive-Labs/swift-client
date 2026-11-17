@@ -7,6 +7,7 @@ import XCTest
 /// is a real record-log binding on SQLite with a real `Db3Lifecycle`
 /// (`SessionDb3`); the room's writes reach it as the session applies them.
 /// The JS client's `sessionView.ts` is the reference.
+@available(*, deprecated)
 final class AgentSessionViewHermeticTests: XCTestCase {
     private var clients: [JsBaoClient] = []
     private var db3s: [SessionDb3] = []

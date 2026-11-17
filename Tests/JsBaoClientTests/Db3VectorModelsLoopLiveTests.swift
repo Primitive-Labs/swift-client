@@ -18,6 +18,7 @@ import XCTest
 /// - 43: a user change ends a claim wait, its retry and its kept bytes; a
 ///   destroy ends the loop's timers; an unbind forgets the db3's waits and
 ///   kept bytes.
+@available(*, deprecated)
 final class Db3VectorModelsLoopLiveTests: XCTestCase {
 
     private typealias V = Db3VectorLive

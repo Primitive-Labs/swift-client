@@ -17,6 +17,7 @@ import XCTest
 ///   gone with `reason: .clientOutdated`.
 /// - 33: a save into a format-1 document logs the deprecation warning once per
 ///   model per document, and writes what it wrote before.
+@available(*, deprecated)
 final class RecordLogIncrementHermeticTests: XCTestCase {
     typealias H = RecordLogReceiptHarness
 
@@ -296,14 +297,14 @@ final class RecordLogIncrementHermeticTests: XCTestCase {
         try h.save("r1", ["t": 1])
         try h.save("r2", ["t": 2])
         await h.session.start()
-        XCTAssertEqual(h.of("record.open").first?["wireVersion"], 4) // 4 since #5897
+        XCTAssertEqual(h.of("record.open").first?["wireVersion"], .number(Double(recordLogWireVersion))) // 4 since #5897, 5 since #5994
         // The room judged numbers this store never minted: re-minted, and the old
         // id opened again once its owed answers do not come.
         var reopened = H.opened(lsn: 0)
         reopened["lastSeq"] = 7
         await h.feed(reopened)
         await until("the barrier re-open", timeout: 5) { h.of("record.open").count >= 2 }
-        for frame in h.of("record.open") { XCTAssertEqual(frame["wireVersion"], 4, "\(frame)") }
+        for frame in h.of("record.open") { XCTAssertEqual(frame["wireVersion"], .number(Double(recordLogWireVersion)), "\(frame)") }
         XCTAssertEqual(JsBaoErrorCode.db3ConditionNotMet.rawValue, "DB3_CONDITION_NOT_MET")
         XCTAssertEqual(JsBaoErrorCode.db3RecordNotFound.rawValue, "DB3_RECORD_NOT_FOUND")
         XCTAssertEqual(JsBaoErrorCode.db3ClientOutdated.rawValue, "DB3_CLIENT_OUTDATED")

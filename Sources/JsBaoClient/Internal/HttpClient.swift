@@ -113,7 +113,7 @@ public final class HttpClient: @unchecked Sendable {
     private let config: HttpClientConfig
     private let logger: Logger
     /// Module-internal rather than private so the cache settings `init` forces
-    /// on it are assertable under `@testable import` (#3170).
+    /// on it are assertable under `@testable import`.
     let session: URLSession
 
     public init(config: HttpClientConfig) {
@@ -192,7 +192,7 @@ public final class HttpClient: @unchecked Sendable {
     /// `HttpError(401, "Invalid credentials")`. The JS client issues all of
     /// them with a raw `fetch` for exactly this reason
     /// (`src/client/internal/authController.ts`); this set is the port of that
-    /// behavior (#2658).
+    /// behavior.
     ///
     /// `/auth/email/request` starts email sign-in: it is unauthenticated
     /// credential issuance, so an expiring token on a signed-in client must
@@ -204,7 +204,7 @@ public final class HttpClient: @unchecked Sendable {
     /// made the two provider paths disagree — the server's own rejection code
     /// (`ADDED_TO_WAITLIST`, `APPLE_IDENTITY_INVALID`, …) was replaced by
     /// `HttpError(401, "Invalid credentials")`, and a sign-in attempt made with
-    /// no session emitted `authFailed` (#3084).
+    /// no session emitted `authFailed`.
     ///
     /// Authenticated passkey management (`/passkey/register/*`,
     /// `/passkey/list`, `/passkey/{id}`) is deliberately absent: those requests
@@ -273,9 +273,10 @@ public final class HttpClient: @unchecked Sendable {
     /// escape (`100%zz`, a trailing `%`).
     ///
     /// This is a guard, not an escaper: escaping here would double-encode the
-    /// segments every sub-API already escapes, which is exactly the bug #1601
-    /// fixed. Callers pre-encode their path parameters; this only makes a
-    /// caller that forgot get a catchable `HttpError` instead of a crash.
+    /// segments every sub-API already escapes — exactly the bug this guard
+    /// exists to avoid. Callers pre-encode their path parameters; this only
+    /// makes a caller that forgot get a catchable `HttpError` instead of a
+    /// crash.
     static func validatePercentEncoded(
         _ value: String,
         allowed: CharacterSet,

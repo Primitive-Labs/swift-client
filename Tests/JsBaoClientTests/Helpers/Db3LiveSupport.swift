@@ -37,6 +37,7 @@ extension RecordLogLiveApp {
     }
 
     /// A db3 created by its own client, with `rows` records of `model` written through the room, paged `pageRows` to a page.
+    @available(*, deprecated)
     func db3Written(_ rows: Int, model: String, pageRows: Int = 100) async throws -> String {
         let creator = try await client("creator-\(Self.ulid().suffix(4))", models: [])
         let documentId = try await createDocument(creator)

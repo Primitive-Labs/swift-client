@@ -24,14 +24,14 @@ public struct AuthUser: Decodable, Sendable, Equatable {
 
 // MARK: Email sign-in
 
-/// Parameters for `auth.emailSignInRequest(...)` (#2884). Mirrors JS
+/// Parameters for `auth.emailSignInRequest(...)`. Mirrors JS
 /// `emailSignInRequest({ email, redirectUri })`.
 ///
 /// `redirectUri` is where the link lands. `nil` (or an empty string) lets
 /// `emailSignInLinkTarget` choose; ask for a code-only email with
 /// `emailSignInRequest(email:target: .codeOnly)`. A target that is sent must
 /// match the app's non-empty `emailRedirectUris` allow-list, or the request is
-/// rejected 400 `Invalid redirect URI` (#2967).
+/// rejected 400 `Invalid redirect URI`.
 public struct EmailSignInRequestParams: Sendable {
     public var email: String
     public var redirectUri: String?
@@ -127,7 +127,7 @@ public struct MagicLinkVerifyResult: Decodable, Sendable, Equatable {
 public struct OtpVerifyParams: Sendable {
     public var email: String
     public var code: String
-    /// Optional invitation token (#466): when present, the server accepts
+    /// Optional invitation token: when present, the server accepts
     /// the named invitation during verify and resolves deferred grants to
     /// the signing-in user — even when the signup email differs from the
     /// invited email. Mirrors JS `otpVerify(email, code, { inviteToken })`.
@@ -150,7 +150,7 @@ public struct OtpVerifyResult: Decodable, Sendable, Equatable {
 
 // MARK: Auth config
 
-/// One Google client, as `GET settings/sign-in` publishes it (#2891).
+/// One Google client, as `GET settings/sign-in` publishes it.
 ///
 /// A projection of the stored entry, not the entry itself: no `clientSecret`
 /// is ever published, and `usable` is the server's SHAPE verdict — a client id,
@@ -180,7 +180,7 @@ public struct GoogleClientConfig: Decodable, Sendable, Equatable {
     }
 }
 
-/// The Google client map, keyed by client type (#2891).
+/// The Google client map, keyed by client type.
 ///
 /// Google registers a client PER PLATFORM — `web`, `ios`, `android`,
 /// `desktop`, `chrome-extension` — so there is no single "is Google available"
@@ -211,16 +211,16 @@ let nativeGoogleClientType = "ios"
 /// The app's auth configuration, returned by `auth.getAuthConfig()`. Mirrors
 /// the object JS `AuthController.getAuthConfig()` resolves to (the
 /// `GET settings/sign-in` envelope). The passkey fields pair with the native
-/// passkey flows (#929 — see `AuthAPI+NativePasskeys.swift`); the OAuth
-/// fields pair with native Google sign-in (#928); the Apple fields pair
-/// with `signInWithApple` (#409 port).
+/// passkey flows (see `AuthAPI+NativePasskeys.swift`); the OAuth
+/// fields pair with native Google sign-in; the Apple fields pair
+/// with `signInWithApple`.
 public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     public let appId: String
     public let name: String
     public let mode: String
     public let waitlistEnabled: Bool
     public let googleOAuthEnabled: Bool
-    /// The typed client map (#2891). `nil` only against a server that predates
+    /// The typed client map. `nil` only against a server that predates
     /// it — which reports unavailable, the documented client-version floor.
     public let googleClients: GoogleClientsConfig?
     public let passkeyEnabled: Bool
@@ -228,12 +228,12 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     /// because the shape is configuration data the SDK never introspects.
     public let passkeyRpConfig: JSONValue?
     public let hasPasskey: Bool
-    /// Sign in with Apple (#409): enabled flag + the fully-configured
+    /// Sign in with Apple: enabled flag + the fully-configured
     /// gate (`appleAudiences` present AND not explicitly disabled).
     /// `false` against servers that predate the Apple port.
     public let appleSignInEnabled: Bool
     public let hasApple: Bool
-    /// Is email sign-in available at all (#2884)? ONE flag: one request sends
+    /// Is email sign-in available at all? ONE flag: one request sends
     /// one email carrying a code and, when a link can be issued, a link, so
     /// there is no per-method availability to report.
     public let emailSignInEnabled: Bool
@@ -297,7 +297,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
     public let mode: String
     public let waitlistEnabled: Bool
     /// Whether THIS (native) client can start Google sign-in — the provider
-    /// enabled and the `ios` entry usable (#2891). It replaced the server's
+    /// enabled and the `ios` entry usable. It replaced the server's
     /// `hasOAuth`, which could not tell a web-configured app from a
     /// native-configured one and so was wrong in one direction or the other.
     public let googleAvailable: Bool

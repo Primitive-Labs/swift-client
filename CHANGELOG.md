@@ -20,6 +20,161 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Added: `client.db3.cancelPendingCreate(_:evictLocal:)` (beta)
+
+`client.db3.cancelPendingCreate(db3Id, evictLocal:)` cancels a db3's pending
+create on this device: the db3 is no longer pending, and neither a retry nor a
+reconnect commits it. Nothing is sent, so it works offline, and a db3 already
+on the server is left as it is. Use it in place of the deprecated
+`client.cancelPendingCreate(_:evictLocal:)`.
+
+### Added: `client.db3.commitCreate(_:)` (beta)
+
+`client.db3.commitCreate(db3Id)` commits a db3's pending create now and
+answers a `Db3CommitResult`: `created` once the server has it, `refused` with
+the server's `reason` for a refusal, or `reason` `"not_pending"` when nothing
+is pending, with nothing sent. A refused create is tried again, and a commit
+already out is joined; a transient failure throws and the client keeps
+retrying. Use it in place of the deprecated
+`client.commitOfflineCreate(documentId:onExists:)`.
+
+Both members wait for the client's storage setup before they decide, so a
+pending create stored in an earlier session counts right after start-up: it is
+cancelled, or committed, never answered as not pending.
+
+### Deprecated: the client members that work only on a document
+
+Every `JsBaoClient` member that works only on a (non-db3) document is now
+`@available(*, deprecated)`, and its message names the member to use instead,
+or says why none applies. Each keeps working until a later removal project:
+
+- `openDocument(_:options:)`, `startNetworkSync(documentId:)`,
+  `waitForInitialSync(documentId:timeout:pollInterval:)`:
+  `client.db3.subscribe(_:options:)`;
+- `openDocumentByAlias(_:options:)`: `client.db3.aliases`, then
+  `client.db3.subscribe(_:options:)`;
+- `closeDocument(_:options:)`: `client.db3.unsubscribe(_:)`;
+- `createDocument(options:)`: `client.db3.create(title:)`;
+- `isSynced(_:)`, `isDocumentOpen(_:)`, `isPendingCreate(_:)`,
+  `isLocalOnly(_:)`, `hasLocalCopy(_:)`, `getOfflineInfo(_:)`,
+  `isDocumentReadOnly(_:)`, `getDocumentPermission(_:)`:
+  `client.db3.state(_:)`;
+- `listOpenDocuments()`, `listLocalDocuments()`, `listPendingCreates()`:
+  `client.db3.stored()`;
+- `evictLocalDocument(_:)`: `client.db3.evict(_:options:)`;
+- `getDocumentSchema(documentId:modelNames:)`: `client.db3.schema(_:)`;
+- `addDocumentModelMapping(modelName:documentId:)`:
+  `client.setModelDefaultDb3(_:_:)`;
+- `setDefaultDocumentId(_:)`: `client.setDefaultDb3(_:)`;
+- `cancelPendingCreate(_:evictLocal:)`: `client.db3.cancelPendingCreate`;
+- `commitOfflineCreate(documentId:onExists:)`: `client.db3.commitCreate(_:)`;
+- with no db3 counterpart: `getDoc(_:)`, `transactAndSync(_:_:)`,
+  `transactAndSyncAsync(_:_:)`, `getDocHash(documentId:)`, `rootDocId`,
+  `isRootDocument(_:)`, `markMetadataDeleted(_:)`, `syncMetadata(options:)`,
+  `getAwarenessStates(documentId:)` and `document(_:)`.
+
+`clearDocumentModelMapping(modelName:)`, `getDocumentModelMapping(modelName:)`,
+`clearDefaultDocumentId()` and `defaultDocumentId` stay: a db3 app still uses
+them for the defaults `setModelDefaultDb3` and `setDefaultDb3` set.
+### Added: renaming a db3 field (`storedAs`)
+
+A db3 type field renamed by changing its key keeps its records when the new
+table names the old name in `storedAs = "<old name>"`. A device keeps reading
+and writing the stored name through its generated models, so a build from
+before the rename keeps working. `swift-bao-codegen` refuses a type file that
+declares `storedAs`: generate from the file as it was before the rename.
+### Added: the code of a create the caller's role may not make
+
+`JsBaoErrorCode` takes `.db3CreateRoleRequired` (`"DB3_CREATE_ROLE_REQUIRED"`).
+A db3 type whose file says `create = "admins"` is created only by app admins
+and owners, and with `[app] untypedDb3Create = "admins"` the same holds for
+db3s with no type. A member's `client.db3.create(title:type:)` returns at once,
+then the refusal arrives as `Db3CreateFailedEvent` with the db3's `id`, the
+code and the `type` (`nil` for an untyped db3); rows saved on the device stay
+readable. `client.db3.getOrCreateWithAlias` whose alias names nothing throws
+the code. Server functions create for members as before, and local-only
+creates are never judged.
+
+### Added: db3 JSON fields (beta)
+
+A db3 field whose `ref` names a `schemas/` object def is a JSON field: the
+record stores the value as canonical JSON text in a `string` field, and the
+model `swift-bao-codegen` writes reads and writes it as the def's Swift type.
+`primitive functions codegen --lang swift` declares, in
+`Primitive.generated.swift`, a `Db3JSON_<file>_<Name>` alias of the def's type
+and a `Db3JSONDef_<file>_<Name>` enum conforming to the new `Db3JSONDef`
+protocol, which carries the def's id and compiled schema. The model's property
+is `Db3JSON_<file>_<Name>?` (Optional even when the field is `required`, which
+the save checks), and `<field>Raw` holds the stored text.
+
+Every save encodes an assigned value, validates it against the def and throws
+the new `Db3JSONValueError` (`code` `DB3_JSON_INVALID`, `model`, `field`,
+`def`, `path`, `reason`, `kind`) without writing anything when it does not
+match or JSON cannot hold it exactly: an integer above 2^53 in magnitude is
+refused, never rounded. Stored text that does not decode reads `nil`, is logged
+once per model and field, stays in `<field>Raw`, and is not overwritten by a
+save that did not assign the field. The model stays `Equatable`, `Hashable` and
+`Codable`; its hash combines only whether a JSON field holds a value.
+### Added: retiring a db3 field (deprecated, cleared, removedFields)
+
+`swift-bao-codegen` and `TomlSchemaLoader` take a db3 type field's
+`deprecated = true` and `cleared = true` and a model's `removedFields` in
+strict mode. A deprecated field is generated `@available(*, deprecated)`; a
+cleared or removed field is not generated and is no field of the loaded
+schema. A model generated while a field was `required` returns `nil` from
+`init?(record:)` for a record without it, so make the field optional and
+ship that build before clearing it.
+
+A device that holds a db3 type revision clearing a field leaves the field
+out of every local read: `db3.records` `get`, `query` and `count`, model
+reads and queries, include legs and change notices. Local filters, sorts and
+aggregates read it as unset, a value the device's copy kept from before the
+clear included; over several db3s, only on the rows of the db3s that clear
+it. A type entry stored by an earlier version asks the room for the type's
+declarations once on its next open.
+### Added: `client.db3.permissions(_:).setPublicAccess(_:)` marks a db3 public (beta)
+
+An app owner or admin calls `setPublicAccess(.reader)` to let server functions
+serve the db3 to callers who are not signed in, and `setPublicAccess(nil)` to
+clear it. It answers `Db3PublicAccessChange` (`id`, `level`, `changed`,
+`signedOutAccess`); `signedOutAccess` reports whether the app's setting is on,
+which public access needs to take effect. A member, the db3's owner included,
+is refused 403. `Db3Info` gains the optional `publicAccess`,
+`publicAccessUpdatedBy` and `publicAccessUpdatedAt`, which `client.db3.get(_:)`
+answers to a caller who manages the db3's sharing while it is public.
+
+### Added: empty a db3 model in one call (experimental)
+
+`client.db3.clearModel(_:model:drop:)` removes every record of a model in one
+operation: the server writes one log entry, not one per record, and every
+device holding the db3 removes the model's rows from that one entry. With
+`drop: true` the model itself goes too (an untyped db3 only). On a db3 this
+client has open and syncing, the call returns once this device has applied
+the clear; if that has not happened 10 seconds after the server answered, it
+throws `Db3ClearError.clearApplyPending` carrying the server's answer (the
+server did clear the model: do not retry). A record another device created
+offline before it applied the clear is discarded when it syncs. The client now
+declares wire version 5, and the local store keeps the highest clear it
+applied (storage version 11); a store opened by an earlier build is brought
+forward at open.
+### Added: the code of a create of an archived db3 type
+
+`JsBaoErrorCode` gains `.db3TypeArchived` (`DB3_TYPE_ARCHIVED`). An app
+archives a db3 type with `archived = true` in its `db3-types/<name>.toml` (or
+`primitive db3-types archive <name>`); the type then takes no new db3s, and
+existing db3s of it keep working. A local-first `db3.create(title:type:)`
+returns at once and the refusal arrives as `Db3CreateFailedEvent` with
+`code` `DB3_TYPE_ARCHIVED`, the db3's `id` and the `type`; a sync-off or
+custodian-naming create, `getOrCreateWithAlias` whose alias names nothing,
+and `setType` on an untyped db3 throw `HttpError` with that `serverCode`. An
+exhaustive `switch` over `JsBaoErrorCode` needs a branch for it.
+### Deprecated: `client.resourceMetadata`
+
+`client.resourceMetadata` and every `ResourceMetadataAPI` method (`get`,
+`set`, `getBatch`, `list`, `resolve`, `delete`) are deprecated, and stay
+experimental. Keep per-user data in user properties, and group or collection
+data in a db3 keyed by the group or collection id. Every call keeps working.
+
 ### Added: the codes of a db3 type change that would drop stored data
 
 `JsBaoErrorCode` gains `.db3TypeNotAppendOnly` (`DB3_TYPE_NOT_APPEND_ONLY`)

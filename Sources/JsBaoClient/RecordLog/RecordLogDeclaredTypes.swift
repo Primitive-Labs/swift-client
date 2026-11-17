@@ -1,6 +1,6 @@
 import Foundation
 
-/// A typed db3's declarations judged on the device (#5020): the rules the
+/// A typed db3's declarations judged on the device: the rules the
 /// room applies to a socket entry on a typed db3, run before a model write
 /// commits, with the room's codes and words. js-bao's `declared-types.ts`.
 ///
@@ -14,7 +14,7 @@ struct RecordLogDeclaredType: Equatable, Sendable {
     var name: String
     /// Per declared model, each declared field's kind.
     var models: [String: [String: String]]
-    /// Per model declaring one, each vector field's encoding (#5225).
+    /// Per model declaring one, each vector field's encoding.
     var vectors: RecordLogVectorDeclarations = [:]
     /// Per model enforcing one, each enforced field's enum values (#5897).
     var enums: RecordLogEnumDeclarations = [:]
@@ -64,7 +64,7 @@ func recordLogEnumRefusalMessage(model: String, id: String, field: String, value
     return "\(model) id=\(id): field \"\(field)\" takes one of \(listed); the write is \(value)"
 }
 
-/// What a written value is, for a vector refusal's message (#5225): js-bao's
+/// What a written value is, for a vector refusal's message: js-bao's
 /// `vectorWrittenLabel`.
 private func recordLogVectorWrittenLabel(_ value: JSONValue) -> String {
     switch value {
@@ -91,7 +91,7 @@ func recordLogVectorWriteProblem(model: String, id: String, field: String, encod
     "\(model) id=\(id): field \"\(field)\" is declared \(VectorCodec.describeField(encoding)); the write is \(written)"
 }
 
-/// Why an entry's mutations break a vector field, or `nil` (#5225): a value
+/// Why an entry's mutations break a vector field, or `nil`: a value
 /// that is neither `null` nor the field's canonical base64, a string-set
 /// change of the field, or an increment of it. `m` is the first mutation,
 /// `also[i]` the others. js-bao's `vectorMutationsProblem`, the rule the room
@@ -186,7 +186,7 @@ private func recordLogReceivedKind(_ value: JSONValue) -> String {
 /// take, a scalar in a string set or a string-set change of a scalar
 /// (`.documentEntryInvalid`). An increment writes numbers; a delete, an `id`
 /// and a field the type does not declare are not judged. `m` is the first
-/// mutation, `also[i]` the others. A vector field (#5225) is judged first, by
+/// mutation, `also[i]` the others. A vector field is judged first, by
 /// the room's vector rule (``recordLogVectorMutationsProblem``),
 /// `.db3VectorInvalid`. Once a mutation's values are of their declared kinds,
 /// a string of a field whose enum the type enforces that is not one of its

@@ -3,6 +3,7 @@ import XCTest
 import YSwift
 
 /// Core client tests ported from tests/client/js-bao-client.test.ts
+@available(*, deprecated)
 final class JsBaoClientTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

@@ -13,6 +13,7 @@ import XCTest
 ///   `client.db3.delete` clears the policy; with the store's connection
 ///   limited so a scalar build fails, `ready()` returns and the field's query
 ///   answers, and the build succeeds once the limit is put back.
+@available(*, deprecated)
 final class Db3IndexPolicyLiveTests: XCTestCase {
 
     private var ctx: TestContext!

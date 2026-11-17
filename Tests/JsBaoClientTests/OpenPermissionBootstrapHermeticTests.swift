@@ -12,6 +12,7 @@ import XCTest
 ///
 /// Server-free (`*HermeticTests`): the `fetchDocumentInfo` hook is injected,
 /// which is the same seam `JsBaoClient` wires to `documents.get`.
+@available(*, deprecated)
 final class OpenPermissionBootstrapHermeticTests: XCTestCase {
 
     private var clients: [JsBaoClient] = []

@@ -16,6 +16,7 @@ import YSwift
 /// Server-free: the client is built with unreachable URLs and never connects.
 /// Outbound frames are intercepted by replacing
 /// `DocumentManager.sendWebSocketMessage`.
+@available(*, deprecated)
 final class LocalOnlyOutboundHermeticTests: XCTestCase {
 
     /// Collects outbound frames from whichever thread the flush runs on.

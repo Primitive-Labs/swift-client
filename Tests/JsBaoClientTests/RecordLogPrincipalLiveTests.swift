@@ -9,6 +9,7 @@ import YSwift
 /// are not sent, are gone from the store, and raise nothing for B, and B's
 /// writes land. A returning to their own store keeps it, and its unsent writes
 /// are resubmitted.
+@available(*, deprecated)
 final class RecordLogPrincipalLiveTests: XCTestCase {
 
     private var ctx: TestContext!

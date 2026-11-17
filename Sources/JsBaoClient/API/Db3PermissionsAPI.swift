@@ -1,9 +1,10 @@
 import Foundation
 
 /// A db3's sharing, as `client.db3.permissions(_:)`: its users' grants and
-/// pending invitations, its groups' grants, its "anyone with the link" level
-/// and its access requests. Each call answers what the same call on
-/// `client.documents` answers, over the db3's own routes.
+/// pending invitations, its groups' grants, its "anyone with the link" level,
+/// its access requests and its public access. Each sharing call answers what
+/// the same call on `client.documents` answers, over the db3's own routes;
+/// public access is the db3's own.
 ///
 /// A refusal throws the route's `HttpError`, its `serverCode` naming why:
 /// 403 for a caller who may not share, 409 `DB3_SYNC_OFF_NO_SHARING` for a
@@ -20,7 +21,7 @@ public final class Db3PermissionsAPI: Sendable {
     /// - Stability: beta
     public let db3Id: String
     private let transport: any Transport
-    /// The wait for a pending create of the db3 (#5000).
+    /// The wait for a pending create of the db3.
     private let awaitCreate: @Sendable (String) async throws -> Void
 
     init(db3Id: String, transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void = { _ in }) {
@@ -184,6 +185,32 @@ public final class Db3PermissionsAPI: Sendable {
     public func clearLinkAccess() async throws -> LinkAccessResult {
         try await awaitCreate(db3Id)
         return try await transport.request(method: .delete, path: path("link-access"))
+    }
+
+    // MARK: - Public access
+
+    /// Mark the db3 public at `.reader`, or clear it with `nil`. While the
+    /// app's `signedOutAccess` is on, a server function may then serve it to
+    /// callers who hold no sharing level on it, signed out included; public
+    /// access never lets anyone open, sync, list or read it through a db3
+    /// route. An app owner or admin only: a member, the db3's owner included,
+    /// is refused 403.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// let change = try await client.db3.permissions(db3Id).setPublicAccess(.reader)
+    /// if !change.signedOutAccess { print("stored; honoured once signedOutAccess is on") }
+    /// ```
+    ///
+    /// - Parameter level: `.reader`, or `nil` to clear it.
+    /// - Stability: beta
+    @discardableResult
+    public func setPublicAccess(_ level: Db3PublicAccessLevel?) async throws -> Db3PublicAccessChange {
+        try await awaitCreate(db3Id)
+        let value: JSONValue = level.map { .string($0.rawValue) } ?? .null
+        return try await transport.request(method: .put, path: path("public-access"), body: JSONValue.object(["level": value]))
     }
 
     // MARK: - Access requests

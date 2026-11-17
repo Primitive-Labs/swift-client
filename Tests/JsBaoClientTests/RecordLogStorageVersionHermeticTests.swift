@@ -219,8 +219,10 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
         }
         // The `staged` column a store gains at open (#4701), the local-only
         // columns of version 4 (#5155) and the head columns of version 7
-        // (#5221), are no record.
-        let added: Set<String> = ["staged", "local_only", "local_indexes", "known_head", "known_head_at"]
+        // (#5221), and the clear marks of version 11 (#5994), are no record.
+        let added: Set<String> = [
+            "staged", "local_only", "local_indexes", "known_head", "known_head_at", "cleared_lsn", "cleared_models",
+        ]
         out["record_log_state"] = out["record_log_state"]?.map { $0.filter { !added.contains($0.key) } }
         return out
     }
@@ -504,8 +506,9 @@ final class RecordLogStorageVersionHermeticTests: XCTestCase {
         XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
         let columns = try rows(provider, "SELECT name FROM pragma_table_info('record_log_state')").compactMap { $0["name"]?.stringValue }
         XCTAssertEqual(
-            Array(columns.suffix(5)), ["staged", "local_only", "local_indexes", "known_head", "known_head_at"],
-            "no marker column: a row's encoding is its marker; version 4's local-only columns follow, then version 7's head"
+            Array(columns.suffix(7)),
+            ["staged", "local_only", "local_indexes", "known_head", "known_head_at", "cleared_lsn", "cleared_models"],
+            "no marker column: a row's encoding is its marker; version 4's local-only columns follow, then version 7's head, then version 11's clear marks"
         )
         XCTAssertFalse(trace.statements.contains { $0.contains("UPDATE record_log_rows") }, "nothing to convert")
         XCTAssertEqual(lines.value, [], "nothing converted or dropped, nothing logged")

@@ -1,6 +1,6 @@
 import Foundation
 
-/// What a shared model's envelope says of it (#5230): vec1's version that
+/// What a shared model's envelope says of it: vec1's version that
 /// trained it, the field and index it serves, how it was trained, over how
 /// many rows and when. js-bao's `VectorModelParams`.
 struct RecordLogVectorModelParams: Equatable, Sendable {
@@ -28,7 +28,7 @@ struct RecordLogVectorModelParams: Equatable, Sendable {
 }
 
 /// The `pvm1` envelope a shared model travels in, and the check every model
-/// passes before vec1 reads a byte of it (#5230): js-bao's
+/// passes before vec1 reads a byte of it: js-bao's
 /// `encodeVectorModelEnvelope`, `checkVectorModelEnvelope`, `vec1Codebooks`
 /// and `vec1BqCodesize`, reasons text for text (a shared fixture pins them).
 ///

@@ -38,7 +38,7 @@ public struct TriggerDefInfo: Codable, Sendable, Equatable {
 ///
 /// NOTE: `ModelRulesInfo` models **triggers**, not rule-set operation
 /// expressions. Rule-set `rules` values are per-operation CEL expressions and
-/// use ``CategoryRules`` / ``RuleExpression`` instead (issue #1525).
+/// use ``CategoryRules`` / ``RuleExpression`` instead.
 public struct ModelRulesInfo: Codable, Sendable, Equatable {
     public var triggers: [TriggerDefInfo]?
 
@@ -73,8 +73,8 @@ public struct PathDeclaration: Codable, Sendable, Equatable {
     }
 }
 
-/// Per-rule declared loads colocated on a rule-set operation entry (issue
-/// #1525). Mirrors JS `RuleLoads`. Carries **only** `paths` (Fork 4A):
+/// Per-rule declared loads colocated on a rule-set operation entry.
+/// Mirrors JS `RuleLoads`. Carries **only** `paths` (Fork 4A):
 /// memberships are inferred from `memberGroupsOf`, and `secrets`/`vars` stay on
 /// the config-level `metadataManifest` allowlist — a per-rule
 /// `loads.secrets`/`loads.vars` is a save-time 400.
@@ -89,7 +89,7 @@ public struct RuleLoads: Codable, Sendable, Equatable {
 /// A rule-set operation entry value. Mirrors JS
 /// `RuleExpression = string | { expr, loads? }`. Either a bare CEL string
 /// (unchanged legacy form, stored verbatim) or an object carrying the
-/// expression plus its declared `loads` (issue #1525). Parse-on-read: bare
+/// expression plus its declared `loads`. Parse-on-read: bare
 /// strings are never rewritten to the object form, so the two cases round-trip
 /// back to the same wire shape they decoded from.
 public enum RuleExpression: Codable, Sendable, Equatable {

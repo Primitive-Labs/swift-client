@@ -1,14 +1,14 @@
 import Foundation
 import JsBaoSQLite
 
-/// One training run's answer (#5230): vec1's model bytes, and vec1's version
+/// One training run's answer: vec1's model bytes, and vec1's version
 /// (`0.8`), which the model's envelope names.
 struct RecordLogVec1Trained: Sendable {
     var model: Data
     var vec1: String
 }
 
-/// What trains a device vector index's model off the store's queue (#5230):
+/// What trains a device vector index's model off the store's queue:
 /// vec1's `vec1_train` over a sample, on a detached task with its own
 /// in-memory connection to the bundled SQLite, so the provider's serial queue
 /// answers the store's queries while a model trains (seconds to minutes on a

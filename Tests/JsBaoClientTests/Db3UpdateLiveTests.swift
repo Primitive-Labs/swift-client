@@ -11,6 +11,7 @@ import XCTest
 ///   leaves the reader's stored title as it was.
 /// - Offline, `update` on a db3 whose create is pending throws
 ///   `.pendingCreate`; online, it renames once the create commits.
+@available(*, deprecated)
 final class Db3UpdateLiveTests: XCTestCase {
 
     private var ctx: TestContext!

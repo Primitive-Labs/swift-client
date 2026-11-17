@@ -45,6 +45,7 @@ func waitForConnection(client: JsBaoClient, timeout: TimeInterval = 5) async thr
 }
 
 /// Wait for a document to be synced.
+@available(*, deprecated)
 func waitForSync(client: JsBaoClient, documentId: String, timeout: TimeInterval = 10) async throws {
     if client.isSynced(documentId) { return }
 
@@ -126,6 +127,7 @@ func delay(_ seconds: TimeInterval) async throws {
 
 // MARK: - createDocument test convenience (#1108)
 
+@available(*, deprecated)
 extension JsBaoClient {
     /// Test convenience over the JS-parity `createDocument` (which returns
     /// `{ metadata }` only, like js-bao — #1108): extracts the documentId from

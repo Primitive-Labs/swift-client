@@ -17,6 +17,7 @@ import XCTest
 ///   page stream slowed past the budget still reaches `live`.
 /// - 40: two subscribes while the open is in flight share one `record.open`;
 ///   disposing one before `record.opened` leaves the other to resolve.
+@available(*, deprecated)
 final class Db3LifecycleLiveTests: XCTestCase {
 
     private var ctx: TestContext!

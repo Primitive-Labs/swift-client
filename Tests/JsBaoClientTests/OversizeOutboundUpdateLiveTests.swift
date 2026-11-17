@@ -19,6 +19,7 @@ import YSwift
 /// says that it ran. Without it this case would pass on the inline path too
 /// now that the server half of #3559 stores an oversize inline payload
 /// durably — and then it would be evidence for the server, not for the client.
+@available(*, deprecated)
 final class OversizeOutboundUpdateLiveTests: XCTestCase {
     private var ctx: TestContext!
     private var testApp: TestApp!

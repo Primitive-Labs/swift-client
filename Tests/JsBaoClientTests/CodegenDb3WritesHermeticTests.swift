@@ -9,6 +9,7 @@ import XCTest
 /// checked here is the local view, the facade's error routing and the
 /// format-1 pass-through. What the room judges is in
 /// `CodegenDb3WritesLiveTests`.
+@available(*, deprecated)
 final class CodegenDb3WritesHermeticTests: XCTestCase {
 
     private static let db3Id = "01JD4942C0DEGENXXXXXXXXXXX"

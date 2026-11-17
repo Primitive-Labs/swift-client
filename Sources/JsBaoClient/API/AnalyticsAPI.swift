@@ -9,7 +9,7 @@ import Foundation
 ///
 /// ## Every member is async and carries the Async suffix
 ///
-/// `AnalyticsQueue` is an `actor` (#1993, Phase D3), so each member does its
+/// `AnalyticsQueue` is an `actor` (Phase D3), so each member does its
 /// work on the caller's task. Two awaited calls are ordered, and an event
 /// logged before a flush is in that flush's batch.
 ///
@@ -21,7 +21,7 @@ import Foundation
 /// transmitted.
 ///
 /// The suffix is how the members arrived: Phase D3 added them as twins beside
-/// synchronous originals, which #2367 removed. The twins took a distinct name
+/// synchronous originals, since removed. The twins took a distinct name
 /// rather than being `async` overloads of the same name on purpose: Swift
 /// prefers an `async` overload in an asynchronous context, so a same-name twin
 /// would have turned every existing un-`await`ed call inside an `async`

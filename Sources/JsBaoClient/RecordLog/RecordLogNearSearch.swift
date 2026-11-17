@@ -1,6 +1,6 @@
 import Foundation
 
-/// `$near` (#5230): a filter asking for the `k` records nearest a query
+/// `$near`: a filter asking for the `k` records nearest a query
 /// vector, which a device answers from a vector index it built. The Swift
 /// port of js-bao's `query/nearSearch.ts`, messages and statements and all.
 ///
@@ -128,7 +128,7 @@ enum RecordLogNearSearch {
         )
     }
 
-    /// A `$near` on a vector index this device declined (#5322): `JsBaoError(.db3IndexDeclinedOnDevice)`, naming `accept`.
+    /// A `$near` on a vector index this device declined: `JsBaoError(.db3IndexDeclinedOnDevice)`, naming `accept`.
     static func declined(model: String, index: String, reason: String) -> JsBaoError {
         JsBaoError(
             code: .db3IndexDeclinedOnDevice,

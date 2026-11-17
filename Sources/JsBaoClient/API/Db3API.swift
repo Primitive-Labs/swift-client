@@ -240,6 +240,24 @@ public final class Db3Subscription: @unchecked Sendable {
     }
 }
 
+/// What `client.db3.commitCreate(_:)` answers: whether the server has the
+/// db3 now, whether it refused the create, and why not.
+public struct Db3CommitResult: Sendable, Equatable {
+    /// The server has the db3 now.
+    public let created: Bool
+    /// The server refused the create; it stays pending on this device.
+    public let refused: Bool
+    /// The server's reason for a refusal, or `not_pending` for a db3 with no
+    /// pending create here; `nil` once created.
+    public let reason: String?
+
+    public init(created: Bool, refused: Bool, reason: String?) {
+        self.created = created
+        self.refused = refused
+        self.reason = reason
+    }
+}
+
 /// The db3 API, as `client.db3`: a db3's lifecycle (create, get, delete, its
 /// alias, sync, type, app access and custody), its sharing and blobs,
 /// subscribing to it, and its copy on this device.
@@ -274,7 +292,7 @@ public final class Db3API: @unchecked Sendable {
     public let aliases: Db3AliasesAPI
     private let lifecycle: Db3Lifecycle
     private let transport: any Transport
-    /// The client a created db3 is adopted into (#4806); `nil` adopts nothing.
+    /// The client a created db3 is adopted into; `nil` adopts nothing.
     private weak var client: JsBaoClient?
     /// The client's upload queue and local blob copies, which `blobs(_:)`
     /// reaches the db3's blobs through.
@@ -419,7 +437,8 @@ public final class Db3API: @unchecked Sendable {
     /// retried with backoff, and `Db3CreatedEvent` fires once the server has
     /// it; with `type`, the type's current revision is installed then. A
     /// refusal only the server can decide (`DB3_TYPE_NOT_FOUND`,
-    /// `DB3_TYPE_REFUSED`, a quota, a taken id) does not throw: it arrives as
+    /// `DB3_TYPE_REFUSED`, `DB3_TYPE_ARCHIVED` for a type the app archived, a
+    /// quota, a taken id) does not throw: it arrives as
     /// `Db3CreateFailedEvent` naming the db3's `id`, and the rows stay
     /// readable until `commitOfflineCreate(documentId:)` succeeds or a forced
     /// evict removes them.
@@ -468,7 +487,7 @@ public final class Db3API: @unchecked Sendable {
     ///   identity change in progress. A sync-off or custodian-naming create
     ///   throws the route's `HttpError`, its `serverCode` naming why: 403 for
     ///   a member's sync-off create, 404 `DB3_TYPE_NOT_FOUND`, 409
-    ///   `DB3_TYPE_REFUSED` or `DB3_TYPE_REVISION_CONFLICT`.
+    ///   `DB3_TYPE_REFUSED`, `DB3_TYPE_ARCHIVED` or `DB3_TYPE_REVISION_CONFLICT`.
     /// - Stability: beta
     public func create(
         title: String,
@@ -500,7 +519,7 @@ public final class Db3API: @unchecked Sendable {
         return info
     }
 
-    /// A create of the caller's own synced db3 (#4921, #5000): kept here under
+    /// A create of the caller's own synced db3: kept here under
     /// an id minted here as a pending create, networking on or off, and
     /// answered at once. Its `POST db3` starts now when networking is allowed,
     /// otherwise when it is back, and retries with backoff. A `Db3API` with no
@@ -563,7 +582,7 @@ public final class Db3API: @unchecked Sendable {
         return try await createLocalOnly(title: title, type: type, sync: sync, custodian: custodian, tags: tags, metadata: metadata)
     }
 
-    /// A db3 kept on this device only (#5155): created under an id minted
+    /// A db3 kept on this device only: created under an id minted
     /// here, answered at once, and never sent to the server. What only the
     /// server can hold (a type, sync off, a custodian) is refused before
     /// anything is created.
@@ -685,6 +704,69 @@ public final class Db3API: @unchecked Sendable {
     /// The longest title a db3 takes, as the server judges it: in UTF-16
     /// code units, as the server and the JS client count a string.
     private static let titleMax = 255
+
+    /// Cancel a db3's pending create: the create `client.db3.create` made on
+    /// this device that the server does not have yet. It is local and works
+    /// offline: nothing is sent, the db3 is no longer pending, and no later
+    /// attempt commits it, a reconnect included. With `evictLocal`, its copy
+    /// on this device is removed too. A db3 with no pending create here
+    /// (already on the server, or unknown) is left as it is: nothing is
+    /// deleted on the server, which only ``delete(_:)`` does. Called right
+    /// after the client starts, it first waits for storage setup, so a
+    /// pending create stored in an earlier session is cancelled too.
+    ///
+    /// ```swift
+    /// let draft = try await client.db3.create(title: "Draft")
+    /// // Changed our mind before it reached the server:
+    /// await client.db3.cancelPendingCreate(draft.id, evictLocal: true)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3 whose create to cancel.
+    ///   - evictLocal: Also remove its copy on this device.
+    /// - Stability: beta
+    public func cancelPendingCreate(_ db3Id: String, evictLocal: Bool = false) async {
+        guard let client else { return }
+        // A pending create stored in an earlier session is restored by the
+        // storage setup: decide only once it has run (5365-F4).
+        _ = await client.waitForStorageReady()
+        guard client.documentManager.isPendingCreate(db3Id) else { return }
+        await client.cancelPendingCreateLocally(db3Id, evictLocal: evictLocal)
+    }
+
+    /// Commit a db3's pending create now and answer the server's verdict: the
+    /// create `client.db3.create` made on this device, whether it is still
+    /// waiting or the server refused it. A refused create is tried again (the
+    /// refusal is cleared first), and a commit already out is joined, so one
+    /// `POST db3` is sent. It answers `created` once the server has the db3,
+    /// `refused` with the server's `reason` when the server refused it
+    /// (`Db3CreateFailedEvent` fires too), and `reason` `not_pending` for a
+    /// db3 with no pending create here (already on the server, unknown, or
+    /// not a db3), with nothing sent. A transient failure throws, and the
+    /// client keeps retrying it with backoff. Called right after the client
+    /// starts, it first waits for storage setup, so a pending create stored
+    /// in an earlier session is never answered `not_pending`.
+    ///
+    /// ```swift
+    /// let db3 = try await client.db3.create(title: "Orders", type: "orders")
+    /// let answer = try await client.db3.commitCreate(db3.id)
+    /// if answer.refused { print("the server refused the db3:", answer.reason ?? "") }
+    /// ```
+    ///
+    /// - Parameter db3Id: The db3 whose create to commit.
+    /// - Stability: beta
+    public func commitCreate(_ db3Id: String) async throws -> Db3CommitResult {
+        guard let client else { return Db3CommitResult(created: false, refused: false, reason: "not_pending") }
+        // A pending create stored in an earlier session is restored by the
+        // storage setup: never answer `not_pending` before it has run (5365-F4).
+        _ = await client.waitForStorageReady()
+        let answer = try await client.commitPendingCreateNow(db3Id, db3Only: true)
+        return Db3CommitResult(
+            created: answer["created"] as? Bool == true,
+            refused: answer["refused"] as? Bool == true,
+            reason: answer["reason"] as? String
+        )
+    }
 
     /// Delete a db3 with its records, grants and blobs. Its owner deletes it,
     /// and so does an app owner or admin.
@@ -838,8 +920,12 @@ public final class Db3API: @unchecked Sendable {
     ///
     /// - Parameter options: The alias, and what a created db3 starts with.
     /// - Throws: `HttpError` 409 `DB3_TYPE_MISMATCH` when the alias names a
-    ///   db3 of another type, 404 `DB3_TYPE_NOT_FOUND`, 403 for a member
-    ///   passing a `permission` other than `.owner`.
+    ///   db3 of another type, 409 `DB3_TYPE_ARCHIVED` when the alias names
+    ///   nothing and the type is archived, 404 `DB3_TYPE_NOT_FOUND`, 403 for a
+    ///   member passing a `permission` other than `.owner`, and 403
+    ///   `DB3_CREATE_ROLE_REQUIRED` when the alias names nothing and the
+    ///   caller may not create it (`create = "admins"` on the type, or
+    ///   `untypedDb3Create = "admins"` for an untyped db3).
     /// - Stability: beta
     public func getOrCreateWithAlias(_ options: Db3GetOrCreateWithAliasOptions) async throws -> Db3GetOrCreateWithAliasResult {
         var alias: [String: JSONValue] = [
@@ -938,7 +1024,8 @@ public final class Db3API: @unchecked Sendable {
     ///   - db3Id: The db3.
     ///   - type: A db3 type of this app.
     /// - Throws: `HttpError` 409 `DB3_TYPE_REFUSED` (`details.reasons`) when
-    ///   the db3's records break the type, `DB3_TYPED` when it has another type.
+    ///   the db3's records break the type, `DB3_TYPED` when it has another type,
+    ///   `DB3_TYPE_ARCHIVED` when the db3 is untyped and the type is archived.
     /// - Stability: beta
     public func setType(_ db3Id: String, type: String) async throws -> Db3TypeChange {
         try await awaitCreate(db3Id)
@@ -1684,7 +1771,7 @@ public struct Db3IndexRegistration: Sendable, Encodable {
     /// A text index's options (`kind: .text` only); `nil` sends none, the defaults.
     /// - Stability: beta
     public let text: Db3TextIndexOptions?
-    /// A `.vector` index's options (#5225); `nil` sends none, and on any other kind.
+    /// A `.vector` index's options; `nil` sends none, and on any other kind.
     /// - Stability: beta
     public let vector: Db3VectorIndexOptions?
 
@@ -1740,7 +1827,7 @@ public struct Db3IndexRegistration: Sendable, Encodable {
         self.vector = nil
     }
 
-    /// A vector index on the vector field `field` (#5225), searched as
+    /// A vector index on the vector field `field`, searched as
     /// `vector` says; a vector index lives on the device. It takes no
     /// `unique` or `name`. The field's `dims` and `element` come from its
     /// declaration.
@@ -1758,7 +1845,7 @@ public struct Db3IndexRegistration: Sendable, Encodable {
     }
 }
 
-/// A `vector` index's options (#5225): how a device searches a vector field.
+/// A `vector` index's options: how a device searches a vector field.
 public struct Db3VectorIndexOptions: Sendable, Encodable, Equatable {
     /// How nearness is measured.
     public enum Distance: String, Sendable, Codable, Equatable, CaseIterable {
@@ -1835,7 +1922,7 @@ public struct Db3VectorIndexOptions: Sendable, Encodable, Equatable {
     }
 }
 
-/// The indexes a db3's room places on this device (#5322): their statuses
+/// The indexes a db3's room places on this device: their statuses
 /// here, and this device's decline or accept of one.
 struct Db3DeviceIndexDoor: Sendable {
     var list: @Sendable (String) async throws -> [Db3LocalIndex]
@@ -1843,7 +1930,7 @@ struct Db3DeviceIndexDoor: Sendable {
     var change: @Sendable (_ db3Id: String, _ name: String, _ decline: Bool) async throws -> Db3LocalIndex
 }
 
-/// The indexes of a db3 that lives only on this device (#5155): its list,
+/// The indexes of a db3 that lives only on this device: its list,
 /// registrations and drops, kept on the device by the room's rules.
 struct Db3LocalIndexDoor: Sendable {
     var isLocalOnly: @Sendable (String) async -> Bool
@@ -1872,15 +1959,15 @@ struct Db3LocalIndexDoor: Sendable {
 /// ```
 public final class Db3IndexesAPI: Sendable {
     private let transport: any Transport
-    /// The wait for a pending create of the db3 a call names (#5000).
+    /// The wait for a pending create of the db3 a call names.
     private let awaitCreate: @Sendable (String) async throws -> Void
     /// Read the db3's list again into its local store when this client holds
-    /// it open (#5101), after a registration, a drop or a model upload or
+    /// it open, after a registration, a drop or a model upload or
     /// delete the route answered.
     private let applyLocally: @Sendable (String) async throws -> Void
-    /// The indexes of a db3 that lives only on this device, kept there (#5155).
+    /// The indexes of a db3 that lives only on this device, kept there.
     private let local: Db3LocalIndexDoor?
-    /// The indexes placed on this device, and this device's policy over them (#5322).
+    /// The indexes placed on this device, and this device's policy over them.
     private let device: Db3DeviceIndexDoor?
 
     init(
@@ -2188,8 +2275,8 @@ public final class Db3IndexesAPI: Sendable {
 /// ```
 public final class Db3AliasesAPI: @unchecked Sendable {
     private let transport: any Transport
-    /// The wait for a pending create of the db3 `set` names (#5000), which
-    /// also refuses a db3 that lives only on this device (#5155).
+    /// The wait for a pending create of the db3 `set` names, which
+    /// also refuses a db3 that lives only on this device.
     private let awaitCreate: @Sendable (String) async throws -> Void
 
     /// `client.db3.aliases`: `set` waits first for a pending create of its db3.
@@ -2265,3 +2352,127 @@ public final class Db3AliasesAPI: @unchecked Sendable {
         }
     }
 }
+
+#if PRIMITIVE_EXPERIMENTAL_APIS
+// MARK: - Clearing a model
+
+/// What `client.db3.clearModel` answers: the server's clear of one model.
+/// - Stability: experimental
+public struct Db3ClearResult: Decodable, Sendable, Equatable {
+    /// The model cleared.
+    /// - Stability: experimental
+    public let model: String
+    /// The live records the clear removed.
+    /// - Stability: experimental
+    public let rows: Int
+    /// The clear's log number; `nil` when the model held no live record and nothing was written.
+    /// - Stability: experimental
+    public let lsn: Int?
+    /// The clear's epoch; `nil` when nothing was written.
+    /// - Stability: experimental
+    public let epoch: Int?
+    /// Whether the model itself was dropped too (`drop: true`).
+    /// - Stability: experimental
+    public let dropped: Bool
+    /// The rows the clear read and wrote.
+    /// - Stability: experimental
+    public let cost: Db3Cost?
+}
+
+/// Why `client.db3.clearModel` threw after the server answered.
+/// - Stability: experimental
+public enum Db3ClearError: Error, Sendable, Equatable {
+    /// The server cleared the model (do not retry to make that happen), but
+    /// this device has not applied the clear 10 seconds after the answer. It
+    /// applies it from its next relayed item or catch-up; until it has, a
+    /// record it creates in the model is stamped before the clear and is
+    /// discarded. Carries the server's answer.
+    case clearApplyPending(Db3ClearResult)
+}
+
+/// How long `clearModel` waits for this device to apply the clear it asked for, from the server's answer.
+let db3ClearApplyWaitMs = 10_000
+
+/// How often `clearModel` reads this device's cursor while it waits.
+let db3ClearPollMs = 50
+
+/// The clock `clearModel`'s wait reads and sleeps on: the wall clock, or a test's.
+protocol Db3ClearWaitClock: Sendable {
+    /// Now, in epoch milliseconds.
+    func now() -> Int64
+    /// Sleep `ms` milliseconds.
+    func sleep(ms: Int) async
+}
+
+/// The wall clock.
+struct Db3ClearWallClock: Db3ClearWaitClock {
+    func now() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+    func sleep(ms: Int) async { try? await Task.sleep(nanoseconds: UInt64(max(0, ms)) * 1_000_000) }
+}
+
+/// Wait until this device has applied the clear `result` names: until the
+/// open db3's applied log number (`cursor`) reaches its `lsn`. At once when
+/// the clear wrote nothing or `cursor` is `nil` (the db3 is not open here,
+/// its sync is off, or it lives only on this device).
+///
+/// - Throws: ``Db3ClearError/clearApplyPending(_:)`` when it has not 10 s after the answer.
+func db3AwaitClearApplied(
+    _ result: Db3ClearResult, db3Id: String, cursor: (@Sendable () async throws -> Int)?,
+    clock: any Db3ClearWaitClock = Db3ClearWallClock()
+) async throws {
+    guard let lsn = result.lsn, let cursor else { return }
+    let deadline = clock.now() + Int64(db3ClearApplyWaitMs)
+    while true {
+        if try await cursor() >= lsn { return }
+        let left = deadline - clock.now()
+        if left <= 0 { throw Db3ClearError.clearApplyPending(result) }
+        await clock.sleep(ms: Int(min(Int64(db3ClearPollMs), left)))
+    }
+}
+
+extension Db3API {
+    /// Empty one model of a db3 in one operation: the server removes every
+    /// record of `model` in one transaction that takes one log number, and
+    /// every device holding the db3 removes the model's rows from that one
+    /// entry, not one change per record. Needs write access. With
+    /// `drop: true` the model itself goes too (its declaration, observed
+    /// fields and indexes), so it is no longer listed: that needs the index
+    /// gate (the db3's owner, an app owner or admin) and is refused
+    /// `DB3_MODEL_DROP_REFUSED_TYPED` on a db3 that has a type.
+    ///
+    /// On a db3 this client has open and syncing, it returns once this device
+    /// has applied the clear, so a record saved right after it is kept. If the
+    /// device has not applied it 10 seconds after the server answered, it
+    /// throws ``Db3ClearError/clearApplyPending(_:)`` with the answer: the
+    /// server did clear the model, so do not retry. A write that races the
+    /// clear ends as it would against a deleted record: a record another
+    /// device created before it applied the clear is discarded when it syncs,
+    /// and an increment of a cleared record is refused `DB3_RECORD_NOT_FOUND`.
+    /// No trigger or hook runs. Not idempotent: a second call clears whatever
+    /// the model holds then.
+    ///
+    /// ```swift
+    /// let result = try await client.db3.clearModel(db3Id, model: "Embedding")
+    /// print(result.rows)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - model: The model to empty.
+    ///   - drop: Also remove the model itself from an untyped db3.
+    /// - Throws: `HttpError` 409 `DOCUMENT_INGEST_ACTIVE` while a bulk load is in
+    ///   flight, 409 `DB3_MODEL_DROP_REFUSED_TYPED`, 403 without access;
+    ///   ``Db3ClearError/clearApplyPending(_:)`` as above.
+    /// - Stability: experimental
+    public func clearModel(_ db3Id: String, model: String, drop: Bool = false) async throws -> Db3ClearResult {
+        try await awaitCreate(db3Id)
+        let result: Db3ClearResult = try await transport.request(
+            method: .post,
+            path: Self.path(db3Id, "/records/\(URLEncoding.encodeComponent(model))/clear"),
+            body: drop ? JSONValue.object(["drop": true]) : JSONValue.object([:])
+        )
+        try await db3AwaitClearApplied(result, db3Id: db3Id, cursor: client?.db3AppliedCursor(db3Id))
+        return result
+    }
+}
+#endif

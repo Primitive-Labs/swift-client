@@ -9,6 +9,7 @@ import XCTest
 /// version 5 (the cache without `kind`, the text table dropped) opens,
 /// converts to 6, keeps its member table and rebuilds the text index from the
 /// list at subscribe.
+@available(*, deprecated)
 final class Db3DeviceIndexRestartLiveTests: XCTestCase {
 
     private var ctx: TestContext!

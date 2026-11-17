@@ -22,6 +22,7 @@ import XCTest
 ///   before `ready()` returns, and the room's schema lists no model.
 /// - 18: a new client over the store file of one that saved M1 into X
 ///   declares M1 at X's first open, before any write, and not M2.
+@available(*, deprecated)
 final class Db3DeclareScopeLiveTests: XCTestCase {
 
     private var ctx: TestContext!

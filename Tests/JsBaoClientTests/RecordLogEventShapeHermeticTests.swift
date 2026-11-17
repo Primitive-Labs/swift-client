@@ -6,6 +6,7 @@ import YSwift
 /// only — and a format-3 open on a real socket (a loopback server): it says
 /// `record.open`, never `syncStep1` or a Yjs update, and a
 /// `DOCUMENT_FORMAT_UNSUPPORTED` answer fails the waiting open with the typed code.
+@available(*, deprecated)
 final class RecordLogEventShapeHermeticTests: XCTestCase {
 
     private var directories: [String] = []

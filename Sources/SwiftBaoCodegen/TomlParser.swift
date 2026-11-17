@@ -42,6 +42,8 @@ enum CodegenError: Error, CustomStringConvertible {
     /// An `enforce_enum` that is not `true` or `false` (#5897): it never
     /// reads as enforcement off.
     case invalidEnforceEnum(model: String, field: String)
+    /// A field declares `storedAs` (a renamed db3 field), which generated models do not map yet.
+    case storedAsNotSupported(model: String, field: String)
     /// A field `ref` that names no shared enum, or sits beside `type`/`enum`
     /// (#5545); `message` is js-bao's `[models.<model>.fields.<field>]: ref …`.
     case sharedEnumRef(message: String)
@@ -107,6 +109,8 @@ enum CodegenError: Error, CustomStringConvertible {
             return "Model `\(model)` field `\(field)`: \(reason)"
         case let .invalidEnforceEnum(model, field):
             return "[models.\(model).fields.\(field)]: enforce_enum must be true or false"
+        case let .storedAsNotSupported(model, field):
+            return "Model `\(model)` field `\(field)` declares storedAs: generated models cannot map a renamed field yet, so codegen stops rather than generate a build that writes `\(field)` where records hold its stored name. Generate from the type file as it was before the rename."
         case let .vectorInUniqueConstraint(model, constraint, field):
             return "[[models.\(model).unique_constraints]]: unique constraint \"\(constraint)\" names the vector field \"\(field)\", which cannot be unique"
         }
@@ -118,12 +122,12 @@ enum CodegenError: Error, CustomStringConvertible {
 /// rejects in strict mode is rejected here too, and vice versa.
 private enum KnownKeys {
     static let model: Set<String> = [
-        "fields", "relationships", "unique_constraints", "class_name",
+        "fields", "relationships", "unique_constraints", "class_name", "removedFields",
     ]
     static let field: Set<String> = [
         "type", "indexed", "unique", "required", "auto_assign",
         "auto_stamp", "max_length", "max_count", "default", "enum",
-        "enforce_enum", "dims", "element",
+        "enforce_enum", "dims", "element", "deprecated", "cleared", "storedAs",
     ]
     static let relationship: Set<String> = [
         "type", "model", "related_id_field", "join_model",
@@ -314,7 +318,7 @@ enum TomlParser {
         } catch {
             throw CodegenError.parse(String(describing: error))
         }
-        let sharedEnumDefs = try sharedEnums?.expand(table) ?? [:]
+        let (sharedEnumDefs, jsonDefs) = try sharedEnums?.expandAll(table) ?? ([:], [:])
         let isTypeFile = table["type"]?.table != nil
 
         // A fresh-template schema.toml ships with no models yet (the
@@ -370,6 +374,7 @@ enum TomlParser {
                 schema.fieldOrder.insert("id", at: 0)
             }
             for (field, def) in sharedEnumDefs[key] ?? [:] { schema.fields[field]?.sharedEnum = def }
+            for (field, def) in jsonDefs[key] ?? [:] { schema.fields[field]?.json = def }
             schemasByName[key] = schema
             modelOrder.append(key)
         }
@@ -412,6 +417,13 @@ enum TomlParser {
             modelName: name, table: table, strict: strict,
             rejectReservedFieldNames: rejectReservedFieldNames, vectors: vectors
         )
+        // A cleared field is no field of a generated model; a tombstoned
+        // name (`removedFields`) is never in `fields`.
+        let cleared = Set(fields.filter { $0.value.cleared }.map(\.key))
+        if !cleared.isEmpty {
+            fields = fields.filter { !cleared.contains($0.key) }
+            fieldOrder.removeAll { cleared.contains($0) }
+        }
         // A db3 type file's model with no `id` is read as declaring
         // `type = "id", auto_assign = true`, before anything that judges the
         // model's fields (a unique constraint may name `id`), as js-bao does.
@@ -425,7 +437,7 @@ enum TomlParser {
         }
         let constraints = try buildUniqueConstraints(
             modelName: name, table: table, fieldNames: Set(fields.keys),
-            strict: strict
+            strict: strict, clearedNames: cleared
         )
         if let message = uniqueStringsetViolation(
             modelName: name, fields: fields, constraints: constraints
@@ -659,6 +671,10 @@ enum TomlParser {
         if let reason = vectorFieldProblem(table, type: typeLiteral) {
             throw CodegenError.invalidVectorField(model: modelName, field: fieldName, reason: reason)
         }
+        // A renamed field (`storedAs`) stops codegen, strict or not: generated models do not map it yet.
+        if table["storedAs"] != nil {
+            throw CodegenError.storedAsNotSupported(model: modelName, field: fieldName)
+        }
         // `enforce_enum` takes `true` or `false`, strict or not, as js-bao's loader judges it (#5897).
         // It changes nothing the codegen emits: the room enforces it.
         if let flag = table["enforce_enum"], flag.bool == nil {
@@ -684,7 +700,9 @@ enum TomlParser {
             autoStamp: autoStamp,
             stringSetDefault: type == .stringset ? decodeStringSetDefault(table["default"]) : nil,
             dims: type == .vector ? table["dims"]?.int : nil,
-            element: type == .vector ? table["element"]?.string : nil
+            element: type == .vector ? table["element"]?.string : nil,
+            deprecated: table["deprecated"]?.bool ?? false,
+            cleared: table["cleared"]?.bool ?? false
         )
     }
 
@@ -805,7 +823,8 @@ enum TomlParser {
         modelName: String,
         table: TOMLTable,
         fieldNames: Set<String>,
-        strict: Bool
+        strict: Bool,
+        clearedNames: Set<String> = []
     ) throws -> [ParsedUniqueConstraint] {
         guard let arr = table["unique_constraints"]?.array else { return [] }
         var out: [ParsedUniqueConstraint] = []
@@ -836,6 +855,9 @@ enum TomlParser {
                 }
                 fields.append(s)
             }
+            // A single-field constraint over a cleared field goes with the
+            // field, as the room's install drops it.
+            if fields.count == 1, clearedNames.contains(fields[0]) { continue }
             for f in fields where !fieldNames.contains(f) {
                 throw CodegenError.uniqueConstraintUnknownField(
                     model: modelName, constraint: name, field: f

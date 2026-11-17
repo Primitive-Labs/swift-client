@@ -492,7 +492,7 @@ func recordLogJSONBytes(_ value: JSONValue) -> Int { RecordLogJSON.bytes(value) 
 
 /// The refusal a client makes before sending, reported as the room's are:
 /// with the record holding the key and the record whose guard failed, when
-/// the refusal names them (a local-only db3's store does, #5155).
+/// the refusal names them (a local-only db3's store does).
 func recordLogLocalRefusal(
     _ error: JsBaoError, documentId: String, mutations: [RecordLogMutation]
 ) -> DocumentWriteRefusedEvent {

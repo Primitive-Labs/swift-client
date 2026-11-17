@@ -18,6 +18,7 @@ import XCTest
 ///   `.db3RecordNotFound` with `current.row == nil`.
 /// - `delete(in:options:)` with a failing condition keeps the record; with a
 ///   passing one the record is gone.
+@available(*, deprecated)
 final class CodegenDb3WritesLiveTests: XCTestCase {
 
     private var ctx: TestContext!

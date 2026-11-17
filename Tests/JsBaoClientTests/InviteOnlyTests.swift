@@ -3,6 +3,7 @@ import XCTest
 
 /// Port of tests/client/js-bao-client-invite-only-flow.test.ts
 /// Tests behavior with invite-only apps.
+@available(*, deprecated)
 final class InviteOnlyTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

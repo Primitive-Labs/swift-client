@@ -67,17 +67,17 @@ public struct QueryTranslator {
     /// built. js-bao's `JsonQueryTranslator` with `stringSets: "json_each"`.
     ///
     /// `memberIndexTable` names the device table a field's members are kept in
-    /// (a member index placed on the device, #5156, #5223), or `nil` for a
+    /// (a member index placed on the device), or `nil` for a
     /// field with none: `$contains` on such a field is a rowid probe of the
     /// table, binding the member alone as the `_data` statement does.
     ///
-    /// `textIndex` is the text index a top-level `$search` reads (#5223): it
+    /// `textIndex` is the text index a top-level `$search` reads: it
     /// keeps the rows whose rowid the index matches, binding the MATCH text
     /// (``RecordLogTextSearch``). A `$search` inside `$and` or `$or` throws
     /// `JsBaoError(.invalidArgument)`; one with no `textIndex` throws
     /// `JsBaoError(.queryIndexNotOnDevice)` naming `model`.
     ///
-    /// `vectorIndex` is the vector index a top-level `$near` reads (#5230): it
+    /// `vectorIndex` is the vector index a top-level `$near` reads: it
     /// keeps the `$near`'s rows (`rowid IN` its nearest rows), binding the
     /// query vector. A `$near` with no `vectorIndex`, or inside `$and` or
     /// `$or`, throws as ``RecordLogViewReader/nearIndex(_:_:)`` refuses it.
@@ -92,7 +92,7 @@ public struct QueryTranslator {
         )
     }
 
-    /// The text index a view read's `$search` reads (#5223): its FTS5 table,
+    /// The text index a view read's `$search` reads: its FTS5 table,
     /// its fields in index order (column `f<i>` keeps field `i`) and a
     /// positive weight per field, in the same order.
     struct ViewTextIndex: Equatable, Sendable {
@@ -106,7 +106,7 @@ public struct QueryTranslator {
     /// `$and` or `$or`.
     private struct ViewSearch {
         var index: ViewTextIndex?
-        /// The vector index a `$near` reads (#5230).
+        /// The vector index a `$near` reads.
         var vector: RecordLogNearSearch.Read? = nil
         var model: String
         var nested: Bool
@@ -463,7 +463,7 @@ public struct QueryTranslator {
     /// the caller) so its bind params land after any JOIN params. An empty
     /// list is a scope that admits nothing, not one that admits everything:
     /// it is what a model with no connected document of the kind being read
-    /// asks for (#3436).
+    /// asks for.
     public static func buildAggregation(
         tableName: String,
         options: AggregateOptions,
@@ -886,14 +886,14 @@ public struct QueryTranslator {
                 throw viewOperatorError("$exists operator requires a boolean value for field \(field)", field: field, op: op)
             }
             // A stored null exists; only a field the record lacks does not.
-            let probe = viewSystemFields.contains(field) ? column : "json_type(_data, '$.\(field)')"
+            let probe = viewSystemFields.contains(field) ? column : "json_type(_data, \(viewPath(field)))"
             return (exists ? "\(probe) IS NOT NULL" : "\(probe) IS NULL", [])
         case "$contains":
             guard let member = value.stringValue else {
                 throw viewOperatorError("$contains operator requires a string value for field \(field)", field: field, op: op)
             }
             // An opted-in field's members are read from its member index (#5156).
-            if !viewSystemFields.contains(field), let index = memberIndexTable?(field) {
+            if !viewSystemFields.contains(field), !viewReadsUnset(field), let index = memberIndexTable?(field) {
                 return (viewMemberProbe(index, table: table), [member])
             }
             return (viewSetMember(try viewDataPath(field, table: table), "_set.value = ?"), [member])
@@ -935,23 +935,58 @@ public struct QueryTranslator {
     /// The fields a view row keeps in its own columns.
     private static let viewSystemFields: Set<String> = ["id", "type"]
 
+    /// The fields a view statement reads as absent from records, whatever
+    /// `_data` holds (#6021): a db3's cleared and tombstoned fields. For a
+    /// field `documents` names, only rows of those db3s read it as unset;
+    /// any other field of `fields` is unset on every row.
+    struct ViewUnset: Sendable, Equatable {
+        var fields: Set<String>
+        var documents: [String: [String]] = [:]
+    }
+
+    /// The fields the view statements built in this scope read as unset;
+    /// `nil` (the default) leaves every statement as it was. Set by
+    /// ``RecordLogViewReader`` around one model's statements.
+    @TaskLocal static var viewUnset: ViewUnset?
+
+    /// The JSON path an unset field is read at: a leading `_` is a name no
+    /// record field may hold, so it never addresses a stored value.
+    private static let unsetPath = "$._unset"
+
+    /// Whether the scope's statements read `field` as unset on any row.
+    static func viewReadsUnset(_ field: String) -> Bool {
+        viewUnset?.fields.contains(field) ?? false
+    }
+
+    /// The JSON path of `field` in `_data` as SQL: the quoted path, or for an
+    /// unset field the unset path, picked per row by its document when only
+    /// some db3s clear it. `table` qualifies the document column.
+    static func viewPath(_ field: String, table: String? = nil) -> String {
+        guard let unset = viewUnset, unset.fields.contains(field) else { return "'$.\(field)'" }
+        guard let documents = unset.documents[field] else { return "'\(unsetPath)'" }
+        if documents.isEmpty { return "'$.\(field)'" }
+        let column = table.map { "\($0).doc_id" } ?? "doc_id"
+        let ids = documents.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+        return "(CASE WHEN \(column) IN (\(ids)) THEN '\(unsetPath)' ELSE '$.\(field)' END)"
+    }
+
     /// A field as the view mode reads it: `id` and `type` from their columns,
     /// any other identifier from the record's JSON. Also what a view query
     /// sorts and pages on.
     static func viewField(_ field: String) throws -> String {
         if viewSystemFields.contains(field) { return quoted("_\(field)") }
         try requireViewIdentifier(field)
-        return "json_extract(_data, '$.\(field)')"
+        return "json_extract(_data, \(viewPath(field)))"
     }
 
     /// `<table>._data, '$.<field>'`: the arguments that address a field's stored JSON.
     private static func viewDataPath(_ field: String, table: String) throws -> String {
         try requireViewIdentifier(field)
-        return "\(table)._data, '$.\(field)'"
+        return "\(table)._data, \(viewPath(field, table: table))"
     }
 
     /// A record holds `?` in the set `index` keeps: a rowid probe of the member
-    /// index (#5156), driven by the member, never a correlated `EXISTS`.
+    /// index, driven by the member, never a correlated `EXISTS`.
     static func viewMemberProbe(_ index: String, table: String = "record_log_view") -> String {
         "\(table).rowid IN (SELECT rid FROM \(quoted(index)) WHERE value = ?)"
     }
@@ -1071,7 +1106,7 @@ public struct QueryTranslator {
     /// validation failure throws. Carries `field` / `operator` /
     /// `fieldType` in `details`, mirroring js-bao's `InvalidOperatorError`
     /// structured fields and reusing the `.invalidArgument` code the
-    /// projection precedent (#1118) chose for query-input errors.
+    /// projection precedent chose for query-input errors.
     private static func substringError(
         _ message: String, field: String, op: String, fieldType: String
     ) -> JsBaoError {

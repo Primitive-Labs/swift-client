@@ -7,7 +7,7 @@ public final class MeAPI: @unchecked Sendable {
     private let cache: CacheFacade?
     /// Snapshot of the local document-metadata cache (`documentId` →
     /// `LocalMetadataEntry`). Drives the offline-first merge in
-    /// `ownedDocuments` / `sharedDocuments` (#938). Defaults to empty when
+    /// `ownedDocuments` / `sharedDocuments`. Defaults to empty when
     /// MeAPI is constructed standalone (e.g. in unit tests), which makes both
     /// methods degrade gracefully to a bare network fetch.
     private let localMetadata: () -> [String: LocalMetadataEntry]
@@ -17,13 +17,13 @@ public final class MeAPI: @unchecked Sendable {
     /// construction so the network path is taken.
     private let isOnline: () -> Bool
     /// Writes a freshly-fetched server list back into the local document
-    /// metadata cache, so the next local-first `ownedDocuments` call sees it
-    /// (#2360). Wired to `DocumentManager.handleServerDocuments` by
+    /// metadata cache, so the next local-first `ownedDocuments` call sees it.
+    /// Wired to `DocumentManager.handleServerDocuments` by
     /// `JsBaoClient.setupSubApis`; a no-op for standalone construction.
     private let syncServerDocuments: ([DocumentInfo]) async -> Void
     /// The token's `rootDocId`, so the local-first paths can apply the same
-    /// root predicate the server applies to `/me/owned-documents` (#848 /
-    /// #2360). Wired to `JsBaoClient.getRootDocId()`; `nil` for standalone
+    /// root predicate the server applies to `/me/owned-documents`.
+    /// Wired to `JsBaoClient.getRootDocId()`; `nil` for standalone
     /// construction, where the `__ROOT_TAG__` sentinel still catches a
     /// tagged root row.
     private let rootDocId: () -> String?
@@ -170,7 +170,7 @@ public final class MeAPI: @unchecked Sendable {
     ///   - limit: page size
     ///   - tag: filter to documents bearing this tag
     ///
-    /// Offline-first (#938): when online, fetches the server page AND merges
+    /// Offline-first: when online, fetches the server page AND merges
     /// in non-owner rows from the local metadata cache (deduped by
     /// `documentId`, server rows winning on conflict) so locally-known shares
     /// the server page didn't return still appear. When offline, returns the
@@ -222,11 +222,11 @@ public final class MeAPI: @unchecked Sendable {
     /// `DocumentInfo[]`. Accepts both a bare-array response and the
     /// `{ items, hasMore, nextCursor? }` envelope.
     ///
-    /// Offline-first (#938, widened in #2360): the default `waitForLoad`
+    /// Offline-first: the default `waitForLoad`
     /// (`.localIfAvailableElseNetwork`) returns the local metadata cache's
     /// owner rows immediately when it has any and refreshes from the server in
     /// the background, so the next call is fresh — js-bao parity, and a
-    /// freshness change from the pre-#2360 Swift behavior, which always
+    /// freshness change from the earlier Swift behavior, which always
     /// blocked on the server. Pass `waitForLoad: .network` for the old
     /// always-fresh semantics. A server fetch merges its rows with the local
     /// ones (deduped by `documentId`, server rows winning) so freshly-created
@@ -295,7 +295,7 @@ public final class MeAPI: @unchecked Sendable {
     /// 3. Default `.localIfAvailableElseNetwork` with a non-empty local
     ///    cache → return the local rows immediately and refresh from the
     ///    server in the background so the next call is fresh (js-bao
-    ///    `_listImpl` parity — sponsor decision on #2360; before this the
+    ///    `_listImpl` parity — sponsor decision; before this the
     ///    default always blocked on the server).
     /// 4. Otherwise (`.network`, or an empty local cache) → blocking server
     ///    fetch merged with the local rows, server rows winning by
@@ -321,11 +321,11 @@ public final class MeAPI: @unchecked Sendable {
     /// those rows on every page (js-bao returns before its union at
     /// `documentsApi.ts:1338-1340`).
     ///
-    /// The app root document is filtered identically on every path (#848):
+    /// The app root document is filtered identically on every path:
     /// local rows and server rows alike drop it unless `includeRoot` is set,
     /// matched by id (`getRootDocId()`) or the `__ROOT_TAG__` sentinel rather
     /// than by permission, since the root's permission is `read-write` and
-    /// never `owner` (#875). And a local-first call that asked for
+    /// never `owner`. And a local-first call that asked for
     /// `includeRoot` whose cache lacks the root falls through to the server
     /// instead of quietly answering without it — js-bao `_listImpl` parity.
     private func ownedDocumentsImpl(

@@ -586,7 +586,7 @@ extension JsBaoClient {
     /// (the cached list stands): js-bao's `DB3_INDEX_LIST_TIMEOUT_MS`.
     static let db3IndexListTimeout: TimeInterval = RecordLogIndexRefresher.listTimeout
 
-    /// The index refresher's deps over this client (#5101): the list is read
+    /// The index refresher's deps over this client: the list is read
     /// with `GET db3/:id/indexes`, bounded by ``db3IndexListTimeout``, and
     /// handed to the db3's bound store, which builds its view's lookup
     /// indexes from it. Every closure holds the client weakly.
@@ -633,7 +633,7 @@ extension JsBaoClient {
         )
     }
 
-    /// The model loop's deps over this client (#5230): a bound db3's store
+    /// The model loop's deps over this client: a bound db3's store
     /// answers its wants, sample and installs, the model routes go through
     /// the gated transport, and every closure holds the client weakly.
     func makeDb3VectorModelsDeps() -> Db3VectorModelsDeps {
@@ -673,7 +673,7 @@ extension JsBaoClient {
         )
     }
 
-    /// Run the model loop for every db3 bound here (#5230): the socket opened, or networking was allowed again.
+    /// Run the model loop for every db3 bound here: the socket opened, or networking was allowed again.
     func runDb3VectorModels() {
         guard let models = db3VectorModels else { return }
         for (documentId, _) in recordLogState.bindings { Task { await models.run(documentId) } }
@@ -681,10 +681,21 @@ extension JsBaoClient {
 
     /// Read the index list of a db3 this client holds open (subscribed, or
     /// held by a document door) again and apply it to its local store
-    /// (`client.db3.indexes.register`/`drop`, #5101): returns once it is
+    /// (`client.db3.indexes.register`/`drop`): returns once it is
     /// applied. A db3 not held open here reads nothing: a copy kept bound
     /// reads the list at its next open. A failed read throws, and the list is
     /// owed: read again as the socket allows.
+    /// A reader of `db3Id`'s applied log number on this device, when the db3
+    /// is open here and syncing (#5994): what `client.db3.clearModel` waits
+    /// on. `nil` when it is not open here, is gone (its sync is off, or access
+    /// was refused), or lives only on this device.
+    func db3AppliedCursor(_ db3Id: String) -> (@Sendable () async throws -> Int)? {
+        guard let binding = recordLogBinding(db3Id), !binding.isClosed, _db3Lifecycle.holdsOpen(db3Id),
+              _db3Lifecycle.current(db3Id).phase != .gone, !binding.marks.localOnly
+        else { return nil }
+        return { try binding.refreshMarks().cursor }
+    }
+
     func refreshDb3IndexesIfHeldOpen(_ db3Id: String) async throws {
         guard recordLogBinding(db3Id).map({ !$0.isClosed }) == true, _db3Lifecycle.holdsOpen(db3Id) else { return }
         try await db3IndexRefresher.refresh(db3Id)
@@ -702,7 +713,7 @@ extension JsBaoClient {
         return out
     }
 
-    /// The declarations an untyped open of `documentId` carries (#5160): the
+    /// The declarations an untyped open of `documentId` carries: the
     /// models in `held` this client has a schema for, the models bound to the
     /// db3 (``setModelDefaultDb3(_:_:)``), and, when it is the default db3,
     /// every model bound to none. A model used only in another db3 is left out.
@@ -950,7 +961,7 @@ extension JsBaoClient {
     }
 
     /// Stop `documentId`'s conversation with its room and keep its store
-    /// bound: what a db3's close does (#4701). The open group of saves commits.
+    /// bound: what a db3's close does. The open group of saves commits.
     func releaseRecordLogSession(_ documentId: String) async {
         guard let binding = recordLogState.binding(documentId) else { return }
         await recordLogState.session(documentId)?.release()

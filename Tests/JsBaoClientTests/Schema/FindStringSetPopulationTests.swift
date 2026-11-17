@@ -13,6 +13,7 @@ import Yniffi
 /// as `[String]`, and `[]` for a record with no members — so `Model.find(_:)`
 /// and `Model.findByUnique(_:_:)` return the record `Model.query` returns.
 /// That matches js-bao, where `find` and `query` yield equivalent records.
+@available(*, deprecated)
 final class FindStringSetPopulationTests: XCTestCase {
 
     private let schema = PrimitiveSchema(

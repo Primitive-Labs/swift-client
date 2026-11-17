@@ -1,6 +1,6 @@
 import Foundation
 
-/// A db3 binding's background work on its device vector indexes (#5230), the
+/// A db3 binding's background work on its device vector indexes, the
 /// Swift port of js-bao's `VectorJobs`: the fill of an ANN table a slice at a
 /// time, each slice a store command on a task of its own so the store
 /// answers its queries between slices, and what each `ann` entry wants,

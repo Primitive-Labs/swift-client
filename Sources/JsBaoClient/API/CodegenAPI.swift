@@ -10,7 +10,7 @@ import Foundation
 /// so ~20 codegen-backing entry points stay out of `client.`'s autocomplete
 /// without hiding them from the generated code that needs them.
 ///
-/// ## Why a facade rather than `@_spi(Codegen)` (#2367)
+/// ## Why a facade rather than `@_spi(Codegen)`
 ///
 /// SPI narrows *discoverability*, not access, and — decisively — it is not
 /// re-exported through `@_exported import JsBaoClient`. `PrimitiveApp`
@@ -96,7 +96,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// rows to the model type while preserving `nextCursor`/`prevCursor`/
     /// `hasMore` — so a caller passing `options.cursor`/`options.limit` can
     /// actually obtain the next page. Mirrors js-bao's `BaseModel.query()`
-    /// return shape (#946); ``query(_:filter:options:)`` stays the flat-array
+    /// return shape; ``query(_:filter:options:)`` stays the flat-array
     /// convenience.
     /// - Stability: production
     public func queryPaged(
@@ -121,7 +121,7 @@ public final class CodegenAPI: @unchecked Sendable {
 
     /// Cross-document count. `options` scopes it (`documents`, `db3`) and
     /// bounds a db3's drift (`maxDrift`, refused `DB3_DRIFT_EXCEEDED` as a
-    /// page is, #5221); sort and paging do not apply to a count.
+    /// page is); sort and paging do not apply to a count.
     /// - Stability: production
     public func count(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
         try requireClient("count").sharedModel(for: schema).count(filter, options: options)
@@ -187,7 +187,7 @@ public final class CodegenAPI: @unchecked Sendable {
 
     /// Subscribe to any add/update/delete in any open doc's copy of the model.
     ///
-    /// The callback is `@Sendable` (#1992): it runs on whichever thread
+    /// The callback is `@Sendable`: it runs on whichever thread
     /// committed the change — a local writer's thread, or the observer-drain
     /// queue — so state it captures must be safe to touch from either.
     ///
@@ -210,7 +210,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// - Parameter changedFields: the fields the caller actually assigned,
     ///   js-bao's `_localChanges`. On an update only these are written, so a
     ///   save built from a stale fetch doesn't re-write — and clobber — the
-    ///   fields another device changed concurrently (#2459). `nil` means "no
+    ///   fields another device changed concurrently. `nil` means "no
     ///   tracking information": every supplied value counts as a change.
     ///   Either way an update still drops values that already equal what's
     ///   persisted — see `DynamicModel.save(id:values:changedFields:)`.
@@ -220,7 +220,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// than assuming its own values won: on an update the fields it didn't
     /// write keep whatever another device put there, and on an insert the
     /// schema defaults and `auto_stamp` values are filled in. The generated
-    /// `save(in:)` rebuilds its return value from this (#2459).
+    /// `save(in:)` rebuilds its return value from this.
     /// - Stability: production
     @discardableResult
     public func save(
@@ -471,7 +471,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// The cursor is the engine's **opaque** token (a `String?`), the same
     /// composite `(field, id)` cursor `queryPaged` mints — so a cursor issued
     /// here or by the JS client round-trips through the shared decoder. This
-    /// fixes the tie-straddle skip/duplicate defect (#1607) the old
+    /// fixes the tie-straddle skip/duplicate defect the old
     /// hand-rolled raw-scalar cursor had. `limit` is required so a bare
     /// `hasManyThrough(...)` call still binds to the unpaginated overload
     /// above.
@@ -479,7 +479,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Envelope contract: the returned `nextCursor` / `prevCursor` / `hasMore`
     /// are COPIED verbatim from the join leg's paged result, and `data` is
     /// REPLACED with the `$in`-resolved targets. Targets come back **target
-    /// `id ASC`** (the `$in` tiebreaker, #1201) — the join order governs which
+    /// `id ASC`** (the `$in` tiebreaker) — the join order governs which
     /// rows are on the page, not the intra-page order. `hasMore` is the
     /// engine's over-fetch signal: more rows remain in the CURRENT paging
     /// direction (forward → later rows, backward → earlier rows) — it is NOT

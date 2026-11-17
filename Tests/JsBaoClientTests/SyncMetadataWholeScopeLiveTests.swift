@@ -6,6 +6,7 @@ import XCTest
 /// document deleted and the shared one revoked in between, keeping the rest.
 /// The hermetic twin, `SyncMetadataWholeScopeHermeticTests`, pins the walk's
 /// edge cases.
+@available(*, deprecated)
 final class SyncMetadataWholeScopeLiveTests: XCTestCase {
     private var ctx: TestContext!
     private var client: JsBaoClient?

@@ -16,6 +16,7 @@ import XCTest
 /// - E4: it ends by the client's destruction; a relaunch over the same file
 ///   ranks by it.
 /// - E9: a dispose followed in the same turn by a logout still stamps it.
+@available(*, deprecated)
 final class Db3LastUseLiveTests: XCTestCase {
 
     private var ctx: TestContext!

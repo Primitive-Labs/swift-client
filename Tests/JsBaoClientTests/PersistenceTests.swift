@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-node-persistence.test.ts
 /// Tests SQLite persistence across client sessions.
+@available(*, deprecated)
 final class PersistenceTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

@@ -460,6 +460,52 @@ struct RecordLogResult: Equatable, Sendable {
     var w: String?
     /// The writer's sequence number, on the acknowledging connection only.
     var seq: Int?
+    /// A model clear (#5994): every confirmed row of the model goes in this
+    /// result's turn, and `changes` is absent.
+    var clear: RecordLogClearItem? = nil
+}
+
+/// What a relayed model clear names (#5994): the model emptied, and whether
+/// the room dropped the model itself too.
+struct RecordLogClearItem: Equatable, Sendable {
+    var model: String
+    var dropped: Bool
+
+    init(model: String, dropped: Bool) {
+        self.model = model
+        self.dropped = dropped
+    }
+
+    init?(json: JSONValue?) {
+        guard let object = json?.objectValue, let model = object["model"]?.stringValue else { return nil }
+        self.init(model: model, dropped: object["dropped"]?.boolValue == true)
+    }
+}
+
+/// A model clear a catch-up carries (#5994), on `record.opened` and on a
+/// catch-up page: its model, log number and epoch. js-bao's `RecordLogClear`.
+struct RecordLogClear: Equatable, Sendable {
+    var model: String
+    var l: Int
+    var e: Int
+
+    init(model: String, l: Int, e: Int) {
+        self.model = model
+        self.l = l
+        self.e = e
+    }
+
+    init?(json: JSONValue?) {
+        guard let object = json?.objectValue, let model = object["model"]?.stringValue,
+              let l = object["l"]?.wholeNumber, let e = object["e"]?.wholeNumber
+        else { return nil }
+        self.init(model: model, l: l, e: e)
+    }
+
+    /// The well-formed clears of a frame's `clears`; none when it carries none.
+    static func list(_ value: JSONValue?) -> [RecordLogClear] {
+        (value?.arrayValue ?? []).compactMap { RecordLogClear(json: $0) }
+    }
 }
 
 /// One item of a `record.results` frame.
@@ -487,7 +533,8 @@ enum RecordLogResultItem: Equatable, Sendable {
             changes: object["changes"]?.arrayValue.map { $0.compactMap { RecordLogChange(json: $0) } },
             alias: RecordLogAlias(json: object["alias"]),
             w: object["w"]?.stringValue,
-            seq: object["seq"]?.wholeNumber
+            seq: object["seq"]?.wholeNumber,
+            clear: RecordLogClearItem(json: object["clear"])
         ))
     }
 }
@@ -644,16 +691,19 @@ enum RecordLogHandBackCode {
 }
 
 /// The wire version this client declares on `record.open`: 2 since the
-/// `increment` entry kind, 3 since the room's head (#5221), which a room sends
+/// `increment` entry kind, 3 since the room's head, which a room sends
 /// on `record.opened`, `record.results` and `record.catchUpPage` only to a
 /// client declaring 3 or above, 4 since `DB3_VALUE_NOT_IN_ENUM` (#5897), which
 /// a room sends only to a client declaring 4 or above (an older one is sent
-/// `DOCUMENT_ENTRY_INVALID` for the same refusal). A room whose minimum is
-/// above it refuses the open `DB3_CLIENT_OUTDATED`; a room at a higher version
-/// is compatible.
-let recordLogWireVersion = 4
+/// `DOCUMENT_ENTRY_INVALID` for the same refusal), 5 since a model clear
+/// (#5994): a room relays it as one result item and sends the clears kept
+/// above the cursor on `record.opened` and on a catch-up page only to a client
+/// declaring 5 or above (an older one is released and caught up through the
+/// whole table). A room whose minimum is above it refuses the open
+/// `DB3_CLIENT_OUTDATED`; a room at a higher version is compatible.
+let recordLogWireVersion = 5
 
-/// What a frame from the room said of its head (#5221): `head`, the room's
+/// What a frame from the room said of its head: `head`, the room's
 /// last accepted log number when it built the frame, and `receivedAt`, when
 /// this device received the frame (epoch ms), stamped before the frame is
 /// held. js-bao's `RecordLogHeard`.
@@ -667,13 +717,13 @@ struct RecordLogHeard: Sendable, Equatable {
     }
 }
 
-/// The room's head as a device last heard it (#5221): the log number, and when (epoch ms).
+/// The room's head as a device last heard it: the log number, and when (epoch ms).
 struct RecordLogKnownHead: Sendable, Equatable {
     var head: Int
     var at: Int64
 }
 
-/// One document's sync state as a read captured it (#5221), in the read's
+/// One document's sync state as a read captured it, in the read's
 /// transaction: what a device read's drift is computed from.
 struct RecordLogDocumentSync: Sendable, Equatable {
     /// The last log number the device applied.

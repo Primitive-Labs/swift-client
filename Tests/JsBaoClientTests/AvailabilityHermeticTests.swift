@@ -14,6 +14,7 @@ import YSwift
 /// Server-free (`*HermeticTests`): every case here is decided client-side —
 /// before any frame could reach a server — so the client points at a closed
 /// local port and the document ids are arbitrary.
+@available(*, deprecated)
 final class AvailabilityHermeticTests: XCTestCase {
 
     private var clients: [JsBaoClient] = []

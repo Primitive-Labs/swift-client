@@ -7,6 +7,7 @@ import YSwift
 /// acknowledgements: the Swift twins of js-bao's offline-window, budget,
 /// constraints, upsert and confirm suites. The room's `rotate`, `checkpoint`
 /// and `set-limits` test routes stand in for days passing.
+@available(*, deprecated)
 final class RecordLogCriteriaLiveTests: XCTestCase {
 
     private var ctx: TestContext!

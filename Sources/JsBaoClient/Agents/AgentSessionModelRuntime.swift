@@ -25,7 +25,7 @@ public struct PrimitiveQueueEntry: Sendable, Equatable, Hashable {
     }
 }
 
-/// The read rules the generated session records share (#3802; #4884) — the
+/// The read rules the generated session records share — the
 /// Swift half of `src/client/agents/sessionModelRuntime.ts`.
 ///
 /// `AgentSessionModels.generated.swift` calls through here so each rule is

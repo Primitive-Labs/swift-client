@@ -1,6 +1,6 @@
 import Foundation
 
-/// What a store wants for one `ann` entry (#5230): its room's model fetched,
+/// What a store wants for one `ann` entry: its room's model fetched,
 /// or one trained here. js-bao's `RecordLogVectorWant`.
 struct RecordLogVectorWant: Equatable, Sendable {
     enum Kind: String, Sendable { case fetch, train }
@@ -26,7 +26,7 @@ struct RecordLogVectorWant: Equatable, Sendable {
     }
 }
 
-/// What an install did (#5230): its fill began, the model was refused (with
+/// What an install did: its fill began, the model was refused (with
 /// why), the entry is not the one it was for, or the device failed it (a
 /// full disk, a locked or unwritable file), when the same model is installed
 /// again later. js-bao's `RecordLogVectorInstall`.
@@ -38,7 +38,7 @@ struct RecordLogVectorInstall: Equatable, Sendable {
     var reason: String?
 }
 
-/// A training run's input (#5230): the index's identity, the params it trains
+/// A training run's input: the index's identity, the params it trains
 /// with, and its sample, `count` vectors of `dims` binary32 numbers one after
 /// another. js-bao's `RecordLogVectorSample`.
 struct RecordLogVectorSample: Sendable {
@@ -54,7 +54,7 @@ struct RecordLogVectorSample: Sendable {
     var count: Int
 }
 
-/// A db3's device vector indexes' shared ANN models in the store (#5230), the
+/// A db3's device vector indexes' shared ANN models in the store, the
 /// Swift port of js-bao's `vectorModels.ts`: what each `ann` entry wants (a
 /// model to fetch, or one to train), the sample a training run reads, the
 /// install of a model the envelope check admits, the fill of its ANN table

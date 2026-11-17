@@ -215,8 +215,7 @@ public final class GroupsAPI: @unchecked Sendable {
     /// Lists all group memberships for a given user, each with its `role`.
     ///
     /// - Parameter groupType: optional server-side filter to a single group
-    ///   type. Mirrors js-bao's `groups.listUserMemberships(userId, { groupType })`
-    ///   (#960).
+    ///   type. Mirrors js-bao's `groups.listUserMemberships(userId, { groupType })`.
     /// - Stability: production
     public func listUserMemberships(userId: String, groupType: String? = nil) async throws -> [GroupMembershipInfo] {
         let escapedUserId = URLEncoding.encodeComponent(userId)

@@ -8,7 +8,7 @@ import YSwift
 ///
 /// Values are spelled as format 1 spells them (`PrimitiveValue.encodedForYrs`
 /// and `PrimitiveValue.decode`), so one schema and one decoder describe every
-/// format. A vector field (#5225) is the exception: a save writes its numbers
+/// format. A vector field is the exception: a save writes its numbers
 /// as the base64 of the field's encoding, and every read answers them decoded,
 /// an array of numbers. A model's declaration reaches the room in `record.declare`, never
 /// through the `YDocument`: a format-3 document carries no Yjs traffic.
@@ -69,7 +69,10 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
 
     /// The reader over this document's view, narrowed to `requested`.
     private func reader(_ requested: [String]?) -> RecordLogViewReader {
-        RecordLogViewReader(store: store, documents: scope(narrowedTo: requested))
+        var reader = RecordLogViewReader(store: store, documents: scope(narrowedTo: requested))
+        // The fields the db3's held revision clears read as unset (#6021).
+        if let cleared = binding.heldCleared { reader.cleared = [binding.documentId: cleared] }
+        return reader
     }
 
     /// How the model API answers a record: declared sets as arrays, vectors as
@@ -163,6 +166,9 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     /// `null` here, so a field the row lacks was never written. `nil` for a
     /// record the view does not hold.
     func holds(id: String, field: String) throws -> Bool? {
+        // A field the db3's held revision clears reads as unset: neither held
+        // nor never written, so a generated model fills no default (#6021).
+        if binding.heldCleared?[modelName]?.contains(field) == true { return nil }
         guard let row = try handleRow(id: id) else { return nil }
         return row[field] != nil
     }
@@ -344,7 +350,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
 
     /// Whether the local pre-check holds a save to a unique constraint. A db3
     /// that lives only on this device is judged by its store, which refuses
-    /// with the room's code and details (#5155): no pre-check runs.
+    /// with the room's code and details: no pre-check runs.
     func constraintInForce(_ name: String) -> Bool { !binding.isLocalOnly && binding.constraintInForce(name) }
 
     var viewStore: RecordLogStore { binding.store }

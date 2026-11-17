@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-events.test.ts
 /// Tests document lifecycle events: documentLoaded, sync, documentClosed.
+@available(*, deprecated)
 final class EventTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

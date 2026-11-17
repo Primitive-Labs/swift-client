@@ -30,7 +30,7 @@ import YSwift
 /// store through `JsBaoClient.queryShared`/`saveShared`/etc. (and the
 /// generated facade methods that call them).
 ///
-/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+/// ## `@unchecked Sendable` — safety argument (Phase C)
 ///
 /// A class with mutable state, so the conformance is unchecked. Every stored
 /// property is either immutable-and-`Sendable` or confined to a named lock:
@@ -73,7 +73,7 @@ import YSwift
 /// being connected/disconnected. That is the same visibility contract a remote
 /// change already has, not a new one.
 ///
-/// Listener closures are `@Sendable` (#1992): confining the `activeSubs`
+/// Listener closures are `@Sendable`: confining the `activeSubs`
 /// dictionary under a lock says nothing about state a callback captures, so
 /// the closure type carries the requirement instead.
 final class MultiDocModel: IncludeTarget, @unchecked Sendable {
@@ -303,6 +303,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             guard let delegate = model.local,
                   var row = try? delegate.row(id: id) else { continue }
             Self.fillStringSets(&row, id: id, fields: stringsetFieldNames, delegate: delegate)
+            markHeldCleared(&row, model: model)
             row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
@@ -351,10 +352,19 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             PrimitiveRecord.markUnheld(
                 stringsetFieldNames.filter { model.holds(recordId: rec.id, field: $0) == false }, in: &row
             )
+            markHeldCleared(&row, model: model)
             row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
         return nil
+    }
+
+    /// List in `row` the fields `model`'s db3 holds cleared (#6021), so a
+    /// model built from the row reads them unset and fills no default
+    /// (`PrimitiveRecord.holds(_:in:)`). Nothing for a db3 that clears none.
+    private func markHeldCleared(_ row: inout [String: JSONValue], model: DynamicModel) {
+        guard let names = (model.local as? RecordLogModelDelegate)?.binding.heldCleared?[schema.name] else { return }
+        PrimitiveRecord.markCleared(names, in: &row)
     }
 
     /// Cross-doc "find by constraint OR create" — mirrors js-bao's
@@ -583,7 +593,12 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             )
         }
         for (_, model) in large { model.local?.settle() }
-        return RecordLogViewReader(store: store, documents: large.map(\.docId))
+        var reader = RecordLogViewReader(store: store, documents: large.map(\.docId))
+        // Each db3's held cleared fields read as unset on its own rows only (#6021).
+        for (docId, model) in large {
+            if let cleared = (model.local as? RecordLogModelDelegate)?.binding.heldCleared { reader.cleared[docId] = cleared }
+        }
+        return reader
     }
 
     /// The options the in-memory mirror reads: a `db3` scope folded into
@@ -597,7 +612,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     }
 
     /// How the model API answers a db3's record.
-    /// Each record-log member's vector fields read as their numbers (#5225),
+    /// Each record-log member's vector fields read as their numbers,
     /// an included record's as its own model's in the same db3.
     private func viewShape(_ include: [Include]? = nil) -> RecordLogViewReader.RowShape {
         let models = RecordLogViewReader.models(schema.name, include)
@@ -659,6 +674,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             for id in ids {
                 guard var row = try? delegate.row(id: id) else { continue }
                 Self.fillStringSets(&row, id: id, fields: stringsetFieldNames, delegate: delegate)
+                markHeldCleared(&row, model: model)
                 row["_meta_doc_id"] = .string(docId)
                 out.append(row)
             }
@@ -759,7 +775,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     private let subscribeLock = NSLock()
 
     /// How many `subscribe` registrations are live. Internal — lets a test
-    /// prove a failed open left no subscription behind (#3810).
+    /// prove a failed open left no subscription behind.
     var activeSubscriptionCount: Int {
         subscribeLock.lock()
         defer { subscribeLock.unlock() }
@@ -941,7 +957,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// came out of a SQL query. In particular a stringset is `[String]`, the
     /// shape the engine's junction-table population pass writes and the
     /// generated row decoder casts to — a comma-joined `String` would fail
-    /// that cast and silently drop the field (#2485).
+    /// that cast and silently drop the field.
     private func rowRepresentation(of value: PrimitiveValue) -> JSONValue {
         switch value {
         case let .string(s):    return .string(s)

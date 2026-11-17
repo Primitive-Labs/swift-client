@@ -11,6 +11,7 @@ import XCTest
 /// every other refusal is thrown. `set` naming a db3 that lives only on this
 /// device throws `.db3LocalOnly` before any request, and one naming a db3
 /// whose create has not committed throws `.pendingCreate` offline.
+@available(*, deprecated)
 final class Db3AliasesHermeticTests: XCTestCase {
 
     private static let db3Id = "01JD5361DB3ALIASESXXXXXXXX"

@@ -12,6 +12,7 @@ import XCTest
 ///   answer the same ids in the same order with `_distance` equal to 1e-6;
 /// - a cursor a Swift `$near` page minted pages the JS client, and the JS
 ///   client's pages Swift.
+@available(*, deprecated)
 final class Db3VectorCrossClientParityLiveTests: XCTestCase {
 
     private typealias V = Db3VectorLive

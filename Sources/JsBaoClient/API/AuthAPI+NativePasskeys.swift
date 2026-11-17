@@ -49,7 +49,7 @@ extension AuthAPI {
     ///     `webcredentials:` entitlement. Defaults to `AuthConfig.passkeyRpId`.
     ///     A native request sends no `Origin` header, so with neither the
     ///     server picks among the app's configured relying parties on its own
-    ///     and a multi-RP app can get the wrong one (#3024).
+    ///     and a multi-RP app can get the wrong one.
     ///   - preferImmediatelyAvailableCredentials: When `true`, only consult
     ///     passkeys already on this device — if none exist the request fails
     ///     fast with `PasskeyError.canceled` instead of showing the
@@ -111,13 +111,13 @@ extension AuthAPI {
     ///   - deviceName: Optional human-readable label stored server-side for
     ///     this passkey (e.g. `"Rhett's iPhone"`). Maps to the wire field
     ///     `deviceName`; defaults server-side to `"Unknown device"`.
-    ///   - inviteToken: Optional invitation token (#466) — folds invitation
+    ///   - inviteToken: Optional invitation token — folds invitation
     ///     acceptance into the registration call.
     ///   - presentationAnchor: The window to present the system sheet from.
     ///     Pass `nil` to let the system pick a default anchor.
     ///   - rpId: The relying party to register the passkey under — the host in
     ///     the app's `webcredentials:` entitlement. Defaults to
-    ///     `AuthConfig.passkeyRpId` (#3024).
+    ///     `AuthConfig.passkeyRpId`.
     /// - Throws: `PasskeyError.canceled` when the user dismisses the sheet;
     ///   `HttpError` for server-side verification failures.
     /// - Stability: production

@@ -188,10 +188,10 @@ final class RecordLogDriftHermeticTests: XCTestCase {
     // MARK: - Behavior 17: receipt stamps through the session (edge cases 24 and 32)
 
     func testTheSessionDeclaresWireVersionFourAndStampsFramesWhenTheyArrive() async throws {
-        XCTAssertEqual(recordLogWireVersion, 4) // 4 since #5897 (DB3_VALUE_NOT_IN_ENUM)
+        XCTAssertGreaterThanOrEqual(recordLogWireVersion, 4) // 4 since #5897 (DB3_VALUE_NOT_IN_ENUM), 5 since #5994
         let h = try await harness()
         await h.session.start()
-        XCTAssertEqual(h.of("record.open").first?["wireVersion"], 4)
+        XCTAssertEqual(h.of("record.open").first?["wireVersion"], .number(Double(recordLogWireVersion)))
         h.clock.value = 1_000
         var opened = H.opened(lsn: 0)
         opened["wireVersion"] = 3

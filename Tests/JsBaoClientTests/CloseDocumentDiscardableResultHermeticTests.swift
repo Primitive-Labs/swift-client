@@ -26,8 +26,11 @@ final class CloseDocumentDiscardableResultHermeticTests: XCTestCase {
     func testCloseDocumentCarriesDiscardableResult() throws {
         let source = try ClientSourceText.clientSource("JsBaoClient.swift")
 
+        // #5365 deprecated `closeDocument` (client.db3.unsubscribe is its
+        // successor); its deprecation attribute sits beside this one.
         XCTAssertEqual(
-            ClientSourceText.attributes(before: Self.closeDocument, in: source),
+            ClientSourceText.attributes(before: Self.closeDocument, in: source)
+                .filter { !$0.hasPrefix("@available(*, deprecated") },
             ["@discardableResult"],
             """
             `closeDocument` must carry @discardableResult: it returns \

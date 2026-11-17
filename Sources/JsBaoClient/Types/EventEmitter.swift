@@ -13,8 +13,8 @@ import Foundation
 ///   asynchronous and changed the timing every consumer sees, so both shapes
 ///   fan out from the same `emit` instead.
 ///
-/// The untyped `on` / `onAny` shim this registry also used to serve was removed
-/// in #2367; only the typed shapes above remain.
+/// The untyped `on` / `onAny` shim this registry also used to serve was
+/// removed; only the typed shapes above remain.
 public final class EventEmitter: @unchecked Sendable {
     private struct CallbackEntry {
         let id: UInt64
@@ -102,7 +102,7 @@ public final class EventEmitter: @unchecked Sendable {
     /// that cancels its subscriptions re-enters the emitter through
     /// ``removeClosure(event:id:)`` — on the same thread, against the same
     /// non-recursive `NSLock`. Doing that inside the critical section parks the
-    /// thread forever (issue #2574). This is the same discipline
+    /// thread forever. This is the same discipline
     /// `EventSubscription.cancel()` and `finishAllStreams()` already follow.
     public func removeAll() {
         let claimed = lock.withLock { () -> [String: [CallbackEntry]] in
@@ -497,8 +497,8 @@ final class StreamMeter: @unchecked Sendable {
 ///
 /// Construct one directly when wrapping a non-`EventEmitter` cancel
 /// closure — most commonly `DynamicModel.subscribe()`'s unsubscribe
-/// block — for use with `BaoDataLoader`'s `.custom` trigger
-/// (issue #854). Owns the closure and cancels exactly once on
+/// block — for use with `BaoDataLoader`'s `.custom` trigger.
+/// Owns the closure and cancels exactly once on
 /// `cancel()` or `deinit`.
 public final class EventSubscription: @unchecked Sendable {
     /// Guards `cancellation` so `cancel()` racing `deinit` (or two concurrent
@@ -599,7 +599,7 @@ final class SubscriptionHolder: @unchecked Sendable {
     /// Store a teardown closure run once, however the wait settles.
     ///
     /// For state a wait registers OUTSIDE itself and must withdraw whichever
-    /// way it ends — the `openDocument` refusal registration (#3436). Runs
+    /// way it ends — the `openDocument` refusal registration. Runs
     /// immediately when the wait has already settled, so a late registration
     /// cannot leave the entry behind.
     func set(onSettled: @escaping @Sendable () -> Void) {
@@ -713,7 +713,7 @@ extension EventEmitter {
 
     /// Wait for one pending create to commit — the wait behind
     /// `documents.validateAccess` on a document whose create has not reached
-    /// the server yet (#4159).
+    /// the server yet.
     ///
     /// Built like `waitForNextEvent`, with one addition: inside the
     /// continuation body it subscribes FIRST and only then asks `stillPending`,
@@ -777,7 +777,7 @@ extension EventEmitter {
         }
     }
 
-    /// Wait until a pending db3 create (#5000) has committed: resolved by its
+    /// Wait until a pending db3 create has committed: resolved by its
     /// `PendingCreateCommittedEvent`, or at once when `stillPending` answers
     /// false. Throws `refusal()`'s error once the server refused the create
     /// (its `Db3CreateFailedEvent`, or a refusal already recorded), and

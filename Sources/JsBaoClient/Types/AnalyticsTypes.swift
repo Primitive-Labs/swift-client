@@ -62,7 +62,7 @@ public struct AnalyticsEventInput: Encodable, Sendable {
     }
 
     /// The event as the typed `[String: JSONValue]` row the `AnalyticsQueue`
-    /// buffers since #1993 Phase D3. Nil fields are dropped (so the queue's
+    /// buffers. Nil fields are dropped (so the queue's
     /// defaulting and override logic still applies) and keys stay snake_case
     /// exactly as the queue expects.
     ///

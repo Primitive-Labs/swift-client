@@ -1,13 +1,13 @@
 import Foundation
 
 /// Projection and merge helpers behind the offline-first `me.*` document
-/// lists (#938 / #1058, widened by #2360).
+/// lists.
 ///
 /// Deliberately narrow: this owns only the two things both `me.ownedDocuments`
 /// and `me.sharedDocuments` do to local metadata rows — classify + project
 /// them into result elements, and merge them behind a server page. Endpoint
 /// routing, query construction, offline policy, and timeout policy stay with
-/// the calling API, which is where they differ (sponsor decision on #2360:
+/// the calling API, which is where they differ (sponsor decision:
 /// no generalized listing subsystem for two non-identical consumers).
 enum LocalFirstListing {
 
@@ -154,7 +154,7 @@ enum LocalFirstListing {
 
     /// The untyped payload `DocumentManager.handleServerDocuments` consumes,
     /// built from a typed server list row. This is how a background refresh
-    /// makes the *next* local-first call fresh (#2360): the rows it fetched
+    /// makes the *next* local-first call fresh: the rows it fetched
     /// land in the local metadata cache the local-first path reads.
     static func serverDocumentPayload(_ info: DocumentInfo) -> [String: Any] {
         // Every optional-on-the-wire field is guarded: `DocumentInfo` decodes

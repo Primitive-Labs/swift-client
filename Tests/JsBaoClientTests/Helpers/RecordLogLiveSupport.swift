@@ -112,6 +112,7 @@ final class RecordLogLiveApp {
         return client
     }
 
+    @available(*, deprecated)
     func createDocument(_ client: JsBaoClient) async throws -> String {
         let created = try await client.createDocument(options: CreateDocumentOptions(title: "record log", documentFormat: 3))
         let documentId = try XCTUnwrap(created.metadata?["documentId"]?.stringValue)
@@ -119,6 +120,7 @@ final class RecordLogLiveApp {
         return documentId
     }
 
+    @available(*, deprecated)
     func open(_ client: JsBaoClient, _ documentId: String) async throws {
         _ = try await client.openDocument(documentId, options: OpenDocumentOptions(waitForLoad: .network, enableNetworkSync: true))
         try await waitForSync(client: client, documentId: documentId, timeout: 30)
@@ -202,7 +204,7 @@ func heldDb3Commit(_ client: JsBaoClient) -> HeldDb3Commit {
 /// #5000 — `client.db3.create`, returning once the server has the db3. A
 /// local-first create returns before its commit lands, so a test that reads
 /// the server's copy right after one waits here. It asks
-/// `commitOfflineCreate(documentId:)` for the verdict: `created`, or
+/// `client.db3.commitCreate(_:)` for the verdict: `created`, or
 /// `not_pending` once the create is no longer pending (the commit landed
 /// first), returns; `refused` throws; a transient failure waits for the
 /// backoff's commit, until `timeout`.
@@ -210,19 +212,19 @@ func createdOnServer(
     _ client: JsBaoClient, title: String, type: String? = nil, tags: [String]? = nil, timeout: TimeInterval = 10
 ) async throws -> Db3Info {
     let info = try await client.db3.create(title: title, type: type, tags: tags)
-    let verdict: [String: Any]
+    let verdict: Db3CommitResult?
     do {
-        verdict = try await client.commitOfflineCreate(documentId: info.id)
+        verdict = try await client.db3.commitCreate(info.id)
     } catch {
-        verdict = [:]
+        verdict = nil
     }
-    if verdict["created"] as? Bool == true { return info }
-    if verdict["refused"] as? Bool == true {
-        throw TestSetupError("the server refused \(info.id): \(verdict["reason"] as? String ?? "")")
+    if verdict?.created == true { return info }
+    if verdict?.refused == true {
+        throw TestSetupError("the server refused \(info.id): \(verdict?.reason ?? "")")
     }
     let deadline = Date().addingTimeInterval(timeout)
-    while client.isPendingCreate(info.id) {
-        guard Date() < deadline else { throw TestSetupError("timed out waiting for \(info.id) on the server (last: \(verdict))") }
+    while try await client.db3.state(info.id).pendingCreate {
+        guard Date() < deadline else { throw TestSetupError("timed out waiting for \(info.id) on the server (last: \(verdict.map { "\($0)" } ?? "none"))") }
         try await Task.sleep(nanoseconds: 100_000_000)
     }
     return info

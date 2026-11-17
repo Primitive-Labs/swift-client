@@ -10,6 +10,7 @@ import JsBaoSQLite
 ///
 /// No server: clients run over a temporary `.sqlite` directory with
 /// `autoNetwork: false`, against a socket URL nothing listens on.
+@available(*, deprecated)
 final class DocumentFormatTwoRefusedHermeticTests: XCTestCase {
 
     private var directories: [String] = []

@@ -5,6 +5,7 @@ import XCTest
 /// Swift form of js-bao's `BaseModel.setModelDefaultDb3`, and the declarations
 /// the client answers for one db3: the models its copy holds, the models
 /// bound to it, and, on the default db3, every model bound nowhere.
+@available(*, deprecated)
 final class Db3ModelDefaultDb3HermeticTests: XCTestCase {
 
     private static let x = "01JD5160SCOPEDDECLARE0000X"

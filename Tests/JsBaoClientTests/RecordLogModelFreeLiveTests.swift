@@ -6,6 +6,7 @@ import XCTest
 /// and `client.db3.schema(documentId)` (#4624 behaviours 10, 11, 13,
 /// 14, 15, 16, 17, 18, 21). The Swift twin of
 /// `tests/client/js-bao-client-model-free-4623.test.ts`.
+@available(*, deprecated)
 final class RecordLogModelFreeLiveTests: XCTestCase {
 
     private var ctx: TestContext!

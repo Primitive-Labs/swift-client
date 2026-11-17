@@ -92,7 +92,7 @@ public enum StartNetworkMode: String, Sendable {
 /// Every event key the client can deliver.
 ///
 /// Each key has exactly one `JsBaoEventPayload` type, which is what
-/// `client.stream(for:)` resolves a subscription from. Since #2367 there are no
+/// `client.stream(for:)` resolves a subscription from. There are no
 /// exceptions: the three never-emitted or Swift-only cases (`auth`,
 /// `blobsUploadQueued`, `remoteUpdate`) were removed with the rest of the
 /// deprecated surface.
@@ -124,20 +124,20 @@ public enum JsBaoEvent: String, Sendable {
     case blobsQueueDrained = "blobs:queue-drained"
     case permission
     case meUpdated
-    /// Live mirror of a durable in-app notification (#779 / #1601). Payload:
+    /// Live mirror of a durable in-app notification. Payload:
     /// `NotificationEvent`. Emitted when the signed-in user receives an in-app
     /// notification while connected. Mirrors the JS client's `notification`
     /// event; fetch older rows via `client.notifications.list()`.
     case notification
-    /// A message a server function published to a channel this client joined
-    /// (#3278). Payload: `ChannelMessageEvent`. Mirrors JS `channelMessage`.
+    /// A message a server function published to a channel this client joined.
+    /// Payload: `ChannelMessageEvent`. Mirrors JS `channelMessage`.
     case channelMessage
     /// A channel subscribe the server refused when nothing was waiting on it
-    /// — the reconnect re-issue of an expired grant (#3278). Payload:
+    /// — the reconnect re-issue of an expired grant. Payload:
     /// `ChannelSubscribeFailedEvent`. Mirrors JS `channelSubscribeFailed`.
     case channelSubscribeFailed
     /// A message a server function sent straight to this user or connection
-    /// with `ctx.users.send` / `ctx.connections.send` (#3278). Payload:
+    /// with `ctx.users.send` / `ctx.connections.send`. Payload:
     /// `DirectMessageEvent`. Mirrors JS `directMessage`.
     case directMessage
     case documentMetadataChanged
@@ -179,7 +179,7 @@ public enum JsBaoEvent: String, Sendable {
     // inserted into an enum shifts every later ordinal, and a stale incremental
     // test build then reads each one as its neighbour (#3436's hazard).
     /// The platform refused a document because the format this client believed
-    /// it had is not the format the platform resolved (#3764). The document is
+    /// it had is not the format the platform resolved. The document is
     /// closed when this arrives, with its store intact; an open that was waiting
     /// on the network throws the same error as well. The JS client's
     /// `document:format-mismatch`, by that name.
@@ -298,7 +298,7 @@ public struct SyncEvent: Sendable {
 /// `client.getAwarenessStates(documentId:)` with the delivered IDs —
 /// same pattern as JS.
 ///
-/// (#996: this replaced the previous Swift-only full-snapshot `states`
+/// (this replaced the previous Swift-only full-snapshot `states`
 /// payload, which JS never delivered.)
 public struct AwarenessEvent: Sendable {
     public let documentId: String
@@ -316,7 +316,7 @@ public struct AwarenessEvent: Sendable {
 
 /// Payload for `.permission`. JS delivers `permission` as a plain string
 /// (`"owner" | "read-write" | "reader" | "admin"`); Swift keeps a typed
-/// enum whose `rawValue`s are exactly those wire strings (#996 decision:
+/// enum whose `rawValue`s are exactly those wire strings (decision:
 /// typed accessor with matching observable value). Read
 /// `event.permission.rawValue` for the JS-identical string — also exposed
 /// directly as `permissionRaw`.
@@ -339,7 +339,7 @@ public struct DocumentMetadataChangedEvent: Sendable {
     public let action: String
     public let metadata: [String: JSONValue]?
     public let changedFields: [String]?
-    /// Where the change originated. Always present (#996). Matches js-bao's
+    /// Where the change originated. Always present. Matches js-bao's
     /// `documentMetadataChanged.source` vocabulary field-for-field:
     /// - `"local"`  — write originated on this device
     /// - `"server"` — the server pushed it over the WebSocket
@@ -577,7 +577,7 @@ public struct BlobUploadFailedEvent: Sendable {
 /// Payload for `.notification`
 /// (`for await e in client.stream(for: NotificationEvent.self)`).
 ///
-/// Real-time mirror of a durable in-app notification (#779 / #1601). Mirrors
+/// Real-time mirror of a durable in-app notification. Mirrors
 /// the JS client's `NotificationEvent` (`src/client/JsBaoClient.ts`)
 /// field-for-field, including optionality. Emitted over the `notification`
 /// channel when the signed-in user receives an in-app notification while
@@ -839,8 +839,8 @@ public struct DocumentOpenedEvent: Sendable {
 /// A local mutation on a record-log document that was refused, reported
 /// through the one channel a non-throwing verb has.
 ///
-/// Raised for EVERY refused write, not only for the verbs that cannot throw
-/// (#3758). `DynamicModel.delete(id:)` is declared without `throws`, as are a
+/// Raised for EVERY refused write, not only for the verbs that cannot throw.
+/// `DynamicModel.delete(id:)` is declared without `throws`, as are a
 /// `PrimitiveRecord` field assignment and an explicit clear, so for those the
 /// event is the only channel there is; `create`, `update`, `save`, `upsert`,
 /// `addMember` and `removeMember` throw the same error AND raise this, so an
@@ -907,7 +907,7 @@ public struct DocumentWriteRefusedEvent: Sendable {
     }
 }
 
-/// The platform and this client disagree about a document's format (#3764).
+/// The platform and this client disagree about a document's format.
 ///
 /// Fired when the room refuses a document because the format this client
 /// declared is not the one the platform resolved. The document is CLOSED when
@@ -1003,7 +1003,7 @@ public struct SchemaDiscoveredEvent: Sendable {
 /// yet instrument per-phase sync timings (no `getSyncTimings` analog), so
 /// it is `nil` today; the field exists for cross-platform payload parity.
 ///
-/// (#996: the previous Swift-only `phase`/`elapsedMs` pair was removed —
+/// (the previous Swift-only `phase`/`elapsedMs` pair was removed —
 /// JS never carried those fields.)
 public struct SyncPerfEvent: Sendable {
     public let documentId: String
@@ -1028,14 +1028,14 @@ public struct SyncPerfEvent: Sendable {
 /// `"syncing" | "synced" | "stale" | "error"`.
 ///
 /// This is the supported in-client replacement for the deprecated
-/// `.remoteUpdate` event (#1120): a `"synced"` change is emitted each time a
+/// `.remoteUpdate` event: a `"synced"` change is emitted each time a
 /// remote Yjs update lands for an open document, so reload-on-remote-write
 /// loaders can subscribe here instead of `.remoteUpdate`.
 ///
 /// `"error"` is emitted when an open document misses the sync handshake budget
 /// (`SyncConfig.handshakeTimeout`) — the client keeps retrying at a capped
 /// backoff, but what the app is rendering has stopped converging, so it can
-/// tell the user instead of showing stale state as if it were current (#3390).
+/// tell the user instead of showing stale state as if it were current.
 /// A document that recovers reports `"synced"` once, so the app can clear the
 /// warning it surfaced.
 public struct DocumentSyncStateChangedEvent: Sendable {

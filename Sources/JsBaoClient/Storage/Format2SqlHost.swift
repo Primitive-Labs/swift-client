@@ -2,7 +2,7 @@ import Foundation
 import JsBaoSQLite
 
 /// Direct, serialized SQL access to a storage provider's own database
-/// connection (#3436).
+/// connection.
 ///
 /// A record-log document's records live in real SQL tables, not in the
 /// `kv_store` key-value API the public ``StorageProvider`` protocol exposes —
@@ -70,7 +70,7 @@ public protocol Format2SqlConnection: AnyObject {
     /// For the ONE caller that speaks SQLite's C API directly rather than
     /// through the statements above: the file-backed query engine, which
     /// builds its SELECTs column by column and binds its own parameters
-    /// (#3436, behavior 13). It gets the same connection so its statements are
+    /// (behavior 13). It gets the same connection so its statements are
     /// serialized with the record store's and join whatever transaction is
     /// open — which is what lets a projected row commit with its merged row.
     ///
@@ -415,7 +415,7 @@ public enum Format2SqlValue: Equatable, Sendable {
     case integer(Int64)
     case real(Double)
     /// Bytes, bound with `sqlite3_bind_blob` and read from a `BLOB` column:
-    /// a device vector index's vectors and models (#5230). A zero-length
+    /// a device vector index's vectors and models. A zero-length
     /// blob is `.blob(Data())`, never `.null`. `init(json:)` never makes one.
     case blob(Data)
 

@@ -8,6 +8,7 @@ import JsBaoSQLite
 /// reset when another user signs in (intent decision 18). Clients run over a
 /// temporary `.sqlite` directory with `autoNetwork: false`; creates are
 /// intercepted so nothing is posted.
+@available(*, deprecated)
 final class RecordLogClientHermeticTests: XCTestCase {
 
     private var directories: [String] = []

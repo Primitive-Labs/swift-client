@@ -10,6 +10,7 @@ import XCTest
 /// models generated from it reads every existing record through them, a value
 /// that does not fit its type as missing; what the export omitted stays
 /// readable through `db3.records`.
+@available(*, deprecated)
 final class ObservedSchemaCodegenLiveTests: XCTestCase {
 
     private var ctx: TestContext!

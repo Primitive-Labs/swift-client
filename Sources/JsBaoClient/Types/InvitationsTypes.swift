@@ -81,9 +81,9 @@ public struct CreateInvitationParams: Encodable, Sendable {
 /// `InvitationListResult` (`{ items, hasMore, nextCursor? }`).
 public struct InvitationListResult: Decodable, Sendable, Equatable {
     public let items: [AppInvitationInfo]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -115,7 +115,7 @@ public struct InvitationDeleteResult: Decodable, Sendable, Equatable {
     public let message: String
 }
 
-/// Result of `invitations.accept` (#466). The invitation is marked accepted
+/// Result of `invitations.accept`. The invitation is marked accepted
 /// (write-once) and all linked deferred grants resolve to the authenticated
 /// user. Mirrors JS `AcceptInviteResult`.
 public struct AcceptInviteResult: Decodable, Sendable, Equatable {
@@ -204,14 +204,13 @@ public enum DeferredGrant: Decodable, Sendable, Equatable {
 }
 
 /// A page of deferred grants. Mirrors JS `DeferredGrantListResult`
-/// (`{ items, hasMore, nextCursor? }`). The cursor is a real position token
-/// (#1316).
+/// (`{ items, hasMore, nextCursor? }`). The cursor is a real position token.
 public struct DeferredGrantListResult: Decodable, Sendable, Equatable {
     /// The page's grants. Mirrors JS `DeferredGrantListResult.items`.
     public let items: [DeferredGrant]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {

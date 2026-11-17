@@ -84,8 +84,9 @@ final class ModelDefaultReadHermeticTests: XCTestCase {
 
     /// js-bao reads a string set through the getter that fills a scalar's
     /// default, so a db3 record without the field reads the default's members.
-    /// The read fills it; the field descriptor still declares no default, so
-    /// a create writes none, as before.
+    /// The read fills it; the field descriptor declares no default, so a create
+    /// writes none, and marks the set `defaultOnRead` so a save counts it as
+    /// present (#5896, CSO-5896-019).
     func testAStringSetWithADefaultFallsBackToItsMembersOnEachRead() throws {
         let source = try model("""
             [models.cards.fields.tags]
@@ -94,6 +95,6 @@ final class ModelDefaultReadHermeticTests: XCTestCase {
             """)
         XCTAssertTrue(source.contains("        self.tags = record.holds(\"tags\") == false ? Set([\"a\", \"b \\\"c\\\"\"]) : record[\"tags\"]?.asStringSet\n"), source)
         XCTAssertTrue(source.contains("        self.tags = PrimitiveRecord.holds(\"tags\", in: row) == false ? Set([\"a\", \"b \\\"c\\\"\"]) : (row[\"tags\"]?.stringArrayValue).map(Set.init)\n"), source)
-        XCTAssertTrue(source.contains("\"tags\": FieldDescriptor(type: .stringset),\n"), source)
+        XCTAssertTrue(source.contains("\"tags\": FieldDescriptor(type: .stringset, defaultOnRead: true),\n"), source)
     }
 }

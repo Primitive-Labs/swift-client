@@ -7,6 +7,7 @@ import XCTest
 /// only the `both` one; `$contains`, an any-of count, a facet and a
 /// membership level answer as before, and the any-of count as the room's
 /// HTTP count route; the oracle on a copy of the store file finds no drift.
+@available(*, deprecated)
 final class Db3DeviceMemberIndexLiveTests: XCTestCase {
 
     private var ctx: TestContext!

@@ -20,6 +20,7 @@ enum Db3DeviceIndexLiveFixture {
 
     /// A db3 of `live`'s, subscribed by a new client `name` (over `file` when given, logging at `logLevel` from
     /// before it subscribes when given), the rows written when `write`.
+    @available(*, deprecated)
     static func subscribed(
         _ live: RecordLogLiveApp, _ name: String, documentId: String? = nil, file: String? = nil, write: Bool = true,
         logLevel: LogLevel? = nil

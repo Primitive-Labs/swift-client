@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/app-cleanup.test.ts and app-delete-simple.test.ts
 /// Tests app lifecycle: create, store data, delete, verify cleanup.
+@available(*, deprecated)
 final class AppCleanupTests: XCTestCase {
     var ctx: TestContext!
 

@@ -8,6 +8,7 @@ import XCTest
 /// answers ranked rows with `_score`, and `count`; a prefix search finds
 /// `Running notes`; `list` shows the index; `drop` removes the table before
 /// it returns, after which a `$search` is refused `.queryIndexNotOnDevice`.
+@available(*, deprecated)
 final class Db3DeviceTextIndexLiveTests: XCTestCase {
 
     private var ctx: TestContext!

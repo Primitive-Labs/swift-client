@@ -46,19 +46,19 @@ struct RecordLogSessionHost: Sendable {
     /// The room acknowledged this session's declarations (`record.declared`):
     /// an index it created for them is in its list from now.
     var declared: @Sendable (String) -> Void = { _ in }
-    /// The room said the document's index list changed (`record.indexes`,
-    /// #5322): an index was registered or dropped there, by anyone, and the
+    /// The room said the document's index list changed (`record.indexes`):
+    /// an index was registered or dropped there, by anyone, and the
     /// list is read again.
     var indexesChanged: @Sendable (String) -> Void = { _ in }
     /// The session's status changed: its phase, or a progress step.
     var status: @Sendable (String, RecordLogSessionStatus) -> Void = { _, _ in }
     /// Whether an open of a store the room has not yet told whether its db3
     /// is typed (its typed mark `unknown`) waits for `record.opened` before
-    /// it declares, as the client's does (#5020): a typed room refuses every
+    /// it declares, as the client's does: a typed room refuses every
     /// declaration. Without it the first open of a connection sends the
     /// declaration ahead whatever the mark says, as before.
     var waitsForTypeBeforeDeclaring = false
-    /// The per-db3 form of ``declarations`` (#5160): the declarations of the
+    /// The per-db3 form of ``declarations``: the declarations of the
     /// models one db3 uses, given the document and the models its copy holds
     /// or its entries in hand write (sorted). With it an untyped open declares
     /// that answer, a model's first write while open declares it, and an
@@ -66,7 +66,7 @@ struct RecordLogSessionHost: Sendable {
     /// session sends today's frames: every open and registration declares
     /// ``declarations`` whole, and the drain declares nothing.
     var scopedDeclarations: (@Sendable (_ documentId: String, _ held: [String]) -> [String: JSONValue])? = nil
-    /// The clock a frame's receipt is stamped with (#5221), epoch ms.
+    /// The clock a frame's receipt is stamped with, epoch ms.
     var now: @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
 }
 
@@ -189,7 +189,7 @@ func recordLogShownPath(_ path: String) -> String {
 /// A format-3 document's conversation with its room over the client's socket:
 /// the port of js-bao's `session.ts`, rule for rule.
 ///
-/// A paged catch-up starts as a stream (#4556): `record.catchUp` carries a
+/// A paged catch-up starts as a stream: `record.catchUp` carries a
 /// fresh `stream` id, the room pushes every page marked with it, and the
 /// session credits every ``recordLogStreamCreditPages``th page that has
 /// `next`. A page marked with another id is ignored, so an abandoned attempt's
@@ -241,17 +241,17 @@ actor RecordLogSession {
 
     /// An answer held until the catch-up completes, applied in arrival order.
     private enum HeldAnswer {
-        /// Results, with what their frame said of the head and when it arrived (#5221).
+        /// Results, with what their frame said of the head and when it arrived.
         case results([RecordLogResultItem], RecordLogHeard)
         case refused(RecordLogRefusal)
     }
 
-    /// What `frame` said of the room's head (#5221), stamped with when it arrived.
+    /// What `frame` said of the room's head, stamped with when it arrived.
     private static func heard(_ frame: [String: JSONValue], at receivedAt: Int64) -> RecordLogHeard {
         RecordLogHeard(head: frame["head"]?.wholeNumber.flatMap { $0 >= 0 ? $0 : nil }, receivedAt: receivedAt)
     }
 
-    /// When the frame being handled arrived (#5221), epoch ms.
+    /// When the frame being handled arrived, epoch ms.
     private var receivedAt: Int64 = 0
 
     /// What the open in progress sent ahead of its `record.opened`.
@@ -259,7 +259,7 @@ actor RecordLogSession {
         /// The server answered them `DOCUMENT_NOT_OPEN`: the catch-up's end sends them again.
         var refused = false
         /// The declaration that went with them, or `nil` when none did (none
-        /// goes to a typed db3, #5020).
+        /// goes to a typed db3).
         var declarations: [String: JSONValue]?
         /// A declaration went with them.
         var declared: Bool { declarations != nil }
@@ -352,7 +352,7 @@ actor RecordLogSession {
     private let timings: RecordLogSessionTimings
     private let logger: Logger?
 
-    /// The binding is live exactly while this is `open` (#5221).
+    /// The binding is live exactly while this is `open`.
     private var phase: Phase = .idle {
         didSet { if phase != oldValue { binding.setLive(phase == .open) } }
     }
@@ -402,8 +402,8 @@ actor RecordLogSession {
     private var nextClockHandle = 0
     /// The binding's declaration version the room was last sent in `record.declare`.
     private var declaredVersion = -1
-    /// The models this open declared, for a host that scopes declarations
-    /// (#5160): a model's first write while open is declared once.
+    /// The models this open declared, for a host that scopes declarations:
+    /// a model's first write while open is declared once.
     private var declaredThisOpen = Set<String>()
     private var commitToken: UUID?
     private var commitFeed: AsyncStream<[RecordLogPendingEntry]>.Continuation?
@@ -770,7 +770,7 @@ actor RecordLogSession {
         // sends them again only for another one.
         // An entry held from before vectors (#5225) lacks the encodings: the
         // room sends the declarations again, with them, when no hash is sent.
-        if marks.typed == .yes, marks.vectorsKnown, marks.enumsKnown, let hash = marks.db3Type?.hash { open["db3TypeHash"] = .string(hash) }
+        if marks.typed == .yes, marks.vectorsKnown, marks.enumsKnown, marks.clearedKnown, let hash = marks.db3Type?.hash { open["db3TypeHash"] = .string(hash) }
         openedOnConnection += 1
         history.opened.insert(current.writer)
         declaredThisOpen = []
@@ -999,7 +999,7 @@ actor RecordLogSession {
     // MARK: - Frames
 
     /// One frame the room sent about this document, stamped with its receipt
-    /// before it waits for the session (#5221): the head it carries was heard
+    /// before it waits for the session: the head it carries was heard
     /// then, however long the session was busy.
     nonisolated func deliver(_ frame: [String: JSONValue]) async {
         await receive(frame, receivedAt: host.now())
@@ -1070,10 +1070,10 @@ actor RecordLogSession {
         }
     }
 
-    /// What a `record.opened` says of the db3's type (#5020): no `db3Type` key
+    /// What a `record.opened` says of the db3's type: no `db3Type` key
     /// is an untyped room; an object with a string `name` and `hash` (and,
     /// when sent, `models` of field kinds, `vectors` of each vector field's
-    /// encoding, #5225, and `enums` of each enforced field's values, #5897) is
+    /// encoding, and `enums` of each enforced field's values) is
     /// the room's type. A malformed value changes nothing.
     private func typeOfOpened(_ frame: [String: JSONValue]) -> RecordLogTypeUpdate? {
         guard let value = frame["db3Type"], value != .null else { return .untyped }
@@ -1105,7 +1105,12 @@ actor RecordLogSession {
             guard let read = recordLogEnumDeclarations(sent) else { return malformed() }
             enums = read
         }
-        return .typed(name: name, hash: hash, models: declarations, vectors: vectors, enums: enums)
+        var cleared: RecordLogClearedDeclarations?
+        if let sent = object["cleared"], sent != .null {
+            guard let read = recordLogClearedDeclarations(sent) else { return malformed() }
+            cleared = read
+        }
+        return .typed(name: name, hash: hash, models: declarations, vectors: vectors, enums: enums, cleared: cleared)
 
         func malformed() -> RecordLogTypeUpdate? {
             logger?.warn("[record-log]", documentId, "— record.opened carried a db3Type this client cannot read; the type it holds is kept")
@@ -1165,6 +1170,10 @@ actor RecordLogSession {
         let mode = catchUp["mode"]?.stringValue
         if mode == "building" { return waitForSegment(catchUp) }
         buildingSince = nil
+        // The model clears kept above the cursor (#5994), before anything else
+        // of the catch-up: its rows, or the first chunk of a load or segment.
+        let clears = RecordLogClear.list(catchUp["clears"])
+        if !clears.isEmpty { try applyClears(clears, writer: current.writer) }
         phase = .catchingUp
         if mode == "load" {
             guard let pointer = RecordLogLoadPointer(json: catchUp["load"]) else {
@@ -1300,14 +1309,22 @@ actor RecordLogSession {
                 heard: heard
             )
         }
-        notify(reply.changed)
+        notify(reply.changed, models: reply.models)
         binding.noteSettled(reply)
         return reply
     }
 
-    private func notify(_ changed: [RecordLogRowChange]) {
-        guard !changed.isEmpty else { return }
-        binding.notify(changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, changes: changed)
+    /// Tell the listeners of the rows that changed, and of each model a clear emptied (#5994).
+    private func notify(_ changed: [RecordLogRowChange], models: [String] = []) {
+        guard !changed.isEmpty || !models.isEmpty else { return }
+        binding.notify(changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, models: models, changes: changed)
+    }
+
+    /// Apply the model clears a catch-up carries (#5994), oldest first and
+    /// each once, before the rows, chunks or page they ride with.
+    private func applyClears(_ clears: [RecordLogClear], writer: String) throws {
+        let reply = try binding.withOperation { try binding.store.applyClears(writer: writer, clears: clears) }
+        notify(reply.changed, models: reply.models)
     }
 
     /// Another client of this store applied results past the log number the
@@ -1408,6 +1425,10 @@ actor RecordLogSession {
             return try sendOpen()
         }
         let lsn = frame["lsn"]?.wholeNumber ?? 0
+        // The clears committed after the catch-up began (#5994), before the
+        // page's rows; every later page carries them again, and they apply once.
+        let clears = RecordLogClear.list(frame["clears"])
+        if !clears.isEmpty { try applyClears(clears, writer: current.writer) }
         let page = try applyPage(frame, lsn: lsn, writer: current.writer, generation: paging.generation, receipt: receipt?.attempt)
         if page.stale {
             let replacing = paging.generation
@@ -1673,7 +1694,7 @@ actor RecordLogSession {
         let reply = try binding.withOperation {
             try binding.store.receive(writer: writer, items: items, heard: heard)
         }
-        notify(reply.changed)
+        notify(reply.changed, models: reply.models)
         // No row changed, yet the cursor or the head heard may have: the drift did (#5221).
         if reply.changed.isEmpty { binding.noticeHeard() }
         // Every number the room answered is one its frame no longer owes.
@@ -1884,7 +1905,7 @@ actor RecordLogSession {
     /// The access refusal the connection sends for a record frame of a document the user may no longer read.
     private static let accessRefusedMessage = "Access denied to document"
     /// The codes of a terminal access refusal. `DB3_SYNC_OFF`: the db3's sync
-    /// is off, so no socket reaches it until it is on again (#4806, js-bao's #4799).
+    /// is off, so no socket reaches it until it is on again (js-bao's).
     private static let accessRefusedCodes: Set<String> = ["ACCESS_DENIED", "DOC_ACCESS_DENIED", "DB3_SYNC_OFF", "DOCUMENT_DELETED"]
 
     /// Whether an `error` frame is the room's access refusal of a record frame:
@@ -2389,8 +2410,8 @@ actor RecordLogSession {
 
     /// A committed entry's models this open has not declared go in a
     /// `record.declare` queued before it, so the room holds their indexes and
-    /// constraints before it applies the entry. A typed db3 takes none
-    /// (#5020), nor does a model the host has no declaration of.
+    /// constraints before it applies the entry. A typed db3 takes none,
+    /// nor does a model the host has no declaration of.
     private func declareFirstWrites(_ entry: RecordLogPendingEntry) {
         guard let scoped = host.scopedDeclarations, binding.marks.typed != .yes else { return }
         let fresh = Self.modelsOf(entry).filter { !declaredThisOpen.contains($0) }
@@ -2406,7 +2427,7 @@ actor RecordLogSession {
     /// session may have written them offline after its open declared what the
     /// copy held and had bound then, so none is left out. A host that does
     /// not scope declared every model at the earlier open, and the drain keeps
-    /// today's frames. A typed db3 takes none (#5020).
+    /// today's frames. A typed db3 takes none.
     private func orphanDeclarations(_ unsent: [RecordLogPendingEntry]) -> [String: JSONValue]? {
         guard let scoped = host.scopedDeclarations, binding.marks.typed != .yes else { return nil }
         let written = Set(unsent.flatMap(Self.modelsOf))
@@ -2494,9 +2515,11 @@ actor RecordLogSession {
                         try RecordLogChunkReader.readLoadChunk($0, chunk)
                     }, apply: { session, lines in
                         try session.binding.withOperation {
+                            // The rows are the load's as of its last number: a model
+                            // another session cleared past it keeps none of them (#5994).
                             try session.binding.store.applyLoadChunk(
                                 writer: writer, sessionId: pointer.sessionId, attempt: attempt, model: chunk.model,
-                                lines: lines
+                                lines: lines, readAt: pointer.lastLsn
                             )
                         }
                     })
@@ -2592,7 +2615,7 @@ actor RecordLogSession {
                         try binding.store.keepSegmentChunk(
                             writer: writer, generation: generation, attempt: attempt, segmentId: segment.segmentId,
                             object: mine.object, sha256: mine.sha256, model: mine.model, firstId: mine.firstId,
-                            lastId: mine.lastId, rows: mine.rows
+                            lastId: mine.lastId, rows: mine.rows, readAt: segment.completedLsn
                         )
                     }
                     guard receiving(receipt) else { return }
@@ -2611,7 +2634,7 @@ actor RecordLogSession {
                 }, apply: { session, rows in
                     try session.binding.withOperation {
                         try session.binding.store.applySegmentChunk(
-                            writer: writer, generation: generation, attempt: attempt, rows: rows
+                            writer: writer, generation: generation, attempt: attempt, rows: rows, readAt: segment.completedLsn
                         )
                     }
                 })
@@ -2630,7 +2653,7 @@ actor RecordLogSession {
                 }, apply: { session, lines in
                     try session.binding.withOperation {
                         try session.binding.store.applySegmentCorrections(
-                            writer: writer, generation: generation, attempt: attempt, lines: lines
+                            writer: writer, generation: generation, attempt: attempt, lines: lines, readAt: segment.completedLsn
                         )
                     }
                 })

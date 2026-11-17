@@ -182,7 +182,7 @@ public struct CreateCollectionParams: Encodable, Sendable {
     /// entry fails the whole create.
     ///
     /// The values are staged before the collection type's `collection.create`
-    /// rule runs (issue #1876), so a CEL create rule can gate on them via
+    /// rule runs, so a CEL create rule can gate on them via
     /// `md.self.<category>.<key>`. Mirrors js-bao's
     /// `CreateCollectionParams.initialMetadata`. This is how a collection is
     /// bound to an external entity (a class, a project): stamp a category here
@@ -250,7 +250,7 @@ public struct GrantCollectionGroupPermissionParams: Encodable, Sendable {
 /// user) *or* `email` (existing user OR yet-to-sign-up) — never both — and
 /// the role they get. Use the `.user(_:role:…)` / `.email(_:role:…)`
 /// factories for the common cases; mutual exclusion is enforced server-side.
-/// Mirrors JS's `AddCollectionMemberParams` discriminated union (#671).
+/// Mirrors JS's `AddCollectionMemberParams` discriminated union.
 public struct AddCollectionMemberParams: Encodable, Sendable {
     public var userId: String?
     public var email: String?
@@ -407,7 +407,7 @@ public struct DeferredCollectionAdd: Decodable, Sendable, Equatable {
 
 /// Result of `addMember` — either a direct or a deferred add, distinguished
 /// by `status` (`"pending_signup"` ⇒ deferred). Mirrors JS's
-/// `CollectionAddMemberResult` discriminated union (#671).
+/// `CollectionAddMemberResult` discriminated union.
 public enum CollectionAddMemberResult: Decodable, Sendable, Equatable {
     case direct(DirectCollectionAdd)
     case deferred(DeferredCollectionAdd)

@@ -8,6 +8,7 @@ import YSwift
 /// client over the network; a second client's writes arrive as results; the
 /// format is resolved before the handshake on a device that never saw the
 /// document; no Yjs frame is ever sent; eviction and a wiping logout purge.
+@available(*, deprecated)
 final class RecordLogLiveTests: XCTestCase {
 
     private var ctx: TestContext!

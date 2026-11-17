@@ -10,6 +10,7 @@ import XCTest
 ///   existing alias, one created here and one plainly subscribed each reopen
 ///   with `record.open`, no Yjs `syncStep1` goes out for any of them, and a
 ///   confirmed save lands in each.
+@available(*, deprecated)
 final class Db3ReconnectRecordOpenLiveTests: XCTestCase {
 
     private var ctx: TestContext!

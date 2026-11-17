@@ -17,6 +17,7 @@ import XCTest
 /// - `save(... options: Db3WriteOptions(condition:))` passes and is refused
 ///   `DB3_CONDITION_NOT_MET` with `current`, an unchanged value included; `ifNotExists` lands on a free id
 ///   and is refused on a live one; `delete(id:options:)` takes a condition.
+@available(*, deprecated)
 final class RecordLogIncrementLiveTests: XCTestCase {
 
     private var ctx: TestContext!

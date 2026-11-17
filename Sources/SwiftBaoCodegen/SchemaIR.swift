@@ -46,14 +46,24 @@ struct ParsedField: Equatable {
     var dims: Int? = nil
     /// A vector field's element type, `f32`, `f16` or `i8` (#5225); `nil` on any other field.
     var element: String? = nil
+    /// Declared `deprecated = true`: still read and written, and generated
+    /// `@available(*, deprecated)`.
+    var deprecated: Bool = false
+    /// Declared `cleared = true` (beside `deprecated`): the field reads as
+    /// unset everywhere, so the parser drops it from the model it returns.
+    var cleared: Bool = false
     /// The shared enum the field's `ref` named (#5896), beside the
     /// expansion that filled `type` and `enumValues`; `nil` for a field
     /// without `ref`, a hand-written `enum = [...]` included.
     var sharedEnum: SharedEnumRef? = nil
+    /// The object def a JSON field's `ref` named (#5899), beside the
+    /// expansion to a plain `string` field; `nil` for any other field.
+    var json: Db3JSONRef? = nil
 
-    /// The field as its expanded declaration reads, without the def a `ref`
-    /// named: two declarations of one model compare by this, as js-bao
-    /// compares the expanded tables.
+    /// The field as its expanded declaration reads, without the shared enum
+    /// a `ref` named: two declarations of one model compare by this, as
+    /// js-bao compares the expanded tables. A JSON field's def is kept: two
+    /// declarations binding a field to different defs differ (#5899).
     var declared: ParsedField {
         var copy = self
         copy.sharedEnum = nil
@@ -66,6 +76,28 @@ struct ParsedField: Equatable {
 struct SharedEnumRef: Equatable {
     let file: String
     let name: String
+}
+
+/// The `schemas/` object def a db3 JSON field's `ref` named (#5899): the
+/// file's stem and the def's name, as js-bao's `SharedObjectRef` has them.
+struct Db3JSONRef: Equatable {
+    let file: String
+    let name: String
+
+    /// `schemas.<file>.<Name>`.
+    var id: String { "schemas.\(file).\(name)" }
+
+    /// The file stem as a Swift identifier's part: every character that is
+    /// not a letter, digit or `_` written `_`.
+    var stemPart: String {
+        String(file.map { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") ? $0 : "_" })
+    }
+
+    /// `Db3JSON_<file>_<Name>`: the alias `Primitive.generated.swift` declares for the def's type.
+    var aliasName: String { "Db3JSON_\(stemPart)_\(name)" }
+
+    /// `Db3JSONDef_<file>_<Name>`: the binding enum that carries the def's id and schema.
+    var bindingName: String { "Db3JSONDef_\(stemPart)_\(name)" }
 }
 
 enum ParsedFieldType: String {

@@ -25,26 +25,26 @@ public enum JsBaoErrorCode: String, Sendable {
     case functionWaitTimeout = "FUNCTION_WAIT_TIMEOUT"
     /// `openDocument` waited out its `availabilityWait` budget without the
     /// document's sync completing — the server never answered. Mirrors JS
-    /// `waitForAvailability`'s `NETWORK_TIMEOUT` (#2667, parity C8).
+    /// `waitForAvailability`'s `NETWORK_TIMEOUT` (parity C8).
     case networkTimeout = "NETWORK_TIMEOUT"
     /// `openDocument` needed the network, but the WebSocket is neither up nor
     /// able to come up — no token, or `setShouldConnect(false)` (the state an
     /// auth failure or a logout leaves behind). Mirrors JS
-    /// `waitForAvailability`'s `CONNECTION_DISABLED` (#2667, parity C8).
+    /// `waitForAvailability`'s `CONNECTION_DISABLED` (parity C8).
     case connectionDisabled = "CONNECTION_DISABLED"
     /// `openDocument` had no local copy of the document and no way to fetch
     /// one — `waitForLoad: .localIfAvailableElseNetwork` with the document's
     /// sync left to the caller (`enableNetworkSync: false`). Mirrors JS
-    /// `waitForAvailability`'s `NO_LOCAL_AND_NO_NETWORK` (#2667, parity C8).
+    /// `waitForAvailability`'s `NO_LOCAL_AND_NO_NETWORK` (parity C8).
     case noLocalAndNoNetwork = "NO_LOCAL_AND_NO_NETWORK"
     /// `openDocument` asked for the network path (`waitForLoad: .network`)
     /// with `enableNetworkSync: false`, so nothing would ever start the sync
     /// it is waiting for. Mirrors JS `waitForAvailability`'s
-    /// `NETWORK_REQUIRES_AUTOSTART` (#2667, parity C8).
+    /// `NETWORK_REQUIRES_AUTOSTART` (parity C8).
     case networkRequiresAutostart = "NETWORK_REQUIRES_AUTOSTART"
     /// `subscribeToChannel` did not get its channel's ack: the server's
     /// uniform refusal, the 20 s ack timeout, the channel was left while the
-    /// join was in flight, or the socket closed while joining (#3278).
+    /// join was in flight, or the socket closed while joining.
     /// `details` carry `channel`; the message is the server's refusal text
     /// when there was one.
     case channelSubscribeFailed = "CHANNEL_SUBSCRIBE_FAILED"
@@ -84,7 +84,7 @@ public enum JsBaoErrorCode: String, Sendable {
     // neighbour (#3436's linker hazard, sixty tests' worth of it). At the end,
     // nothing that already exists moves.
     /// This client opened a document as one format and the platform resolved the
-    /// other (#3764). The document is NOT served: a format-1 client fed a
+    /// other. The document is NOT served: a format-1 client fed a
     /// record-log document's frames is a client silently reading the wrong
     /// document. The connection is not closed — the disagreement is about one
     /// document — and the document is closed under the app with its store
@@ -237,7 +237,7 @@ public enum JsBaoErrorCode: String, Sendable {
     /// built here, with `details.engine` (`swift-sqlite`) and
     /// `details.reason`; every other query answers.
     case db3IndexPlacementUnsupported = "DB3_INDEX_PLACEMENT_UNSUPPORTED"
-    /// A vector field's value does not fit its encoding (#5225): the wrong
+    /// A vector field's value does not fit its encoding: the wrong
     /// number of numbers, a number that is not finite, an `f16` value past
     /// 65504, or stored text that is not the encoding's canonical base64. A
     /// save is refused with it before anything commits (`details.scope:
@@ -245,19 +245,32 @@ public enum JsBaoErrorCode: String, Sendable {
     /// `VectorCodec` throws it.
     case db3VectorInvalid = "DB3_VECTOR_INVALID"
     /// A write that would leave a value outside a field's enum where the
-    /// db3's type enforces it (`enforce_enum = true`, #5897). A save is
+    /// db3's type enforces it (`enforce_enum = true`). A save is
     /// refused with it before anything commits (`details.scope: "local"`),
     /// and a typed db3's room hands a write back with it.
     case db3ValueNotInEnum = "DB3_VALUE_NOT_IN_ENUM"
     /// A type write to a type at least one db3 is of, refused because it
     /// would make stored records unreadable: a removed model or field, a
     /// changed field type, a removed enum value, a field made required or a
-    /// new required one, a changed vector (#6019). `details["reasons"]` lists
+    /// new required one, a changed vector. `details["reasons"]` lists
     /// each change as `{ path, change, reason }`.
     case db3TypeNotAppendOnly = "DB3_TYPE_NOT_APPEND_ONLY"
     /// A type write that asked for `allowFieldRemoval` on an app whose stored
-    /// settings do not have `allowFieldRemoval = true` (#6019).
+    /// settings do not have `allowFieldRemoval = true`.
     case db3TypeFieldRemovalNotEnabled = "DB3_TYPE_FIELD_REMOVAL_NOT_ENABLED"
+    /// A create, alias create or type attach of a db3 type the app archived
+    /// (`archived = true` in its file): the type takes no new db3s,
+    /// and existing db3s of it keep working. `details["type"]` names the
+    /// type. A local-first create returns first and reports it as
+    /// `Db3CreateFailedEvent`.
+    case db3TypeArchived = "DB3_TYPE_ARCHIVED"
+    /// A create, alias create or type attach the caller's role may not make:
+    /// the type says `create = "admins"` in its file, or the db3 is
+    /// untyped and the app says `untypedDb3Create = "admins"` in app.toml.
+    /// `details["type"]` names the type (`null` for an untyped db3). App
+    /// admins, owners and server functions create as before. A local-first
+    /// create returns first and reports it as `Db3CreateFailedEvent`.
+    case db3CreateRoleRequired = "DB3_CREATE_ROLE_REQUIRED"
     /// A device read with `QueryOptions.maxDrift` whose db3 copy is further
     /// behind the server than the bound, or has not heard the server's
     /// position yet (`details["drift"]` is then `null`). `details` carry
@@ -345,8 +358,7 @@ public func isJsBaoError(_ error: Error) -> Bool {
 /// Auth error codes. The first block is client-side (token lifecycle
 /// inside the SDK); the second block mirrors js-bao's `AUTH_CODES`
 /// (see `authController.ts`) — server-returned codes that surface
-/// in the JSON error body so apps can switch on them
-/// (#850 / issue #466).
+/// in the JSON error body so apps can switch on them.
 public enum AuthCode: String, Sendable {
     // Client-side (SDK-generated)
     case tokenExpired = "TOKEN_EXPIRED"
@@ -361,16 +373,16 @@ public enum AuthCode: String, Sendable {
     case invalidToken = "INVALID_TOKEN"
     case passkeyNotEnabled = "PASSKEY_NOT_ENABLED"
     /// A passkey start call named an `rpId` the app does not configure
-    /// (#3024) — the app asked for a relying party that isn't the
+    /// — the app asked for a relying party that isn't the
     /// server's, rather than the server failing to work out which one.
     case passkeyRpNotConfigured = "PASSKEY_RP_NOT_CONFIGURED"
     /// The passkey provider returned a credential it had not verified the
-    /// user for, while the ceremony required verification (#3027). Ask the
+    /// user for, while the ceremony required verification. Ask the
     /// user to try again and complete Face ID / their passcode — a generic
     /// sign-in failure gives them nothing to act on.
     case passkeyUserVerificationFailed = "PASSKEY_USER_VERIFICATION_FAILED"
     case magicLinkNotEnabled = "MAGIC_LINK_NOT_ENABLED"
-    /// Native Sign in with Apple (`POST /auth/apple/callback`, #3084). The
+    /// Native Sign in with Apple (`POST /auth/apple/callback`). The
     /// callback is a Swift-only surface — the JS client has no Apple path —
     /// so these mirror `AUTH_CODES` in `src/auth/auth-codes.ts` directly.
     /// `APPLE_IDENTITY_INVALID` (401) is the signature/claims/nonce
@@ -559,7 +571,7 @@ public extension HttpError {
 // MARK: - Raw-bytes transfers
 
 extension HttpError {
-    /// The error for a refused RAW-BYTES transfer (#3403).
+    /// The error for a refused RAW-BYTES transfer.
     ///
     /// Blob and avatar transfers read bytes rather than JSON, so they never
     /// reach the parse `HttpClient` applies to every failure on the typed
@@ -592,13 +604,13 @@ extension HttpError: LocalizedError {
 
 /// Errors thrown by the client's WebSocket connect and send paths. Public
 /// because apps catch it; the `WebSocketManager` that raises it is
-/// module-internal (#2363), so the error type lives here with the client's
+/// module-internal, so the error type lives here with the client's
 /// other public errors rather than in `Internal/`.
 public enum WebSocketError: Error, Sendable {
     case notConnected
     case connectionFailed(String)
     /// A transport-level failure, reduced to a `Sendable` value at the
-    /// `URLSession` delegate boundary (#2171). `URLSession` hands the client a
+    /// `URLSession` delegate boundary. `URLSession` hands the client a
     /// bare `Error`, which is not `Sendable` and so cannot travel on the
     /// manager's ordered delegate-event channel; the message and the
     /// `URLError` code are carried instead.
@@ -636,7 +648,7 @@ extension WebSocketError: LocalizedError {
 /// and decode failures. Treat it as *retryable*, not as proof of no side
 /// effect.
 ///
-/// Before #2367 these surfaced as the raw `URLError` `URLSession` produced, so
+/// These used to surface as the raw `URLError` `URLSession` produced, so
 /// apps had to catch a Foundation type to handle them. They are now normalized
 /// through one internal helper, so `URLError` no longer escapes the client's
 /// HTTP paths.
@@ -719,7 +731,7 @@ extension JsBaoNetworkError {
 /// The one place the client calls `URLSession`'s async data methods.
 ///
 /// Every HTTP path in the client goes through here so `URLError` is normalized
-/// in exactly one place (#2367). Calling `URLSession.data(...)` directly
+/// in exactly one place. Calling `URLSession.data(...)` directly
 /// anywhere else re-introduces the raw-`URLError` leak this exists to close —
 /// `TransportSpineTests` asserts that it doesn't happen.
 enum NetworkSession {
@@ -730,7 +742,7 @@ enum NetworkSession {
     /// disk-backed on iOS and keyed by URL alone, ignoring `Authorization`.
     /// An authenticated response stored there is readable by a request
     /// carrying a different token or none, and survives app restarts
-    /// unencrypted (#3170). The paths that ride this default are the client's
+    /// unencrypted. The paths that ride this default are the client's
     /// most sensitive: blob bytes, the OAuth code exchange's access token, the
     /// refresh proxy, and oversized document updates.
     ///

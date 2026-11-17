@@ -22,6 +22,7 @@ import XCTest
 ///   nothing of the signed-out user's db3s answers, while the file keeps them
 ///   for the same user's next sign-in; a start-up binding a logout raced is
 ///   discarded; a sign-in as another user unbinds the previous user's db3s.
+@available(*, deprecated)
 final class Db3EvictStoredLiveTests: XCTestCase {
 
     private var ctx: TestContext!

@@ -17,11 +17,11 @@ import Yniffi
 /// _meta_{modelName} (Y.Map — written by SchemaSync.syncModelMeta)
 /// ```
 ///
-/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+/// ## `@unchecked Sendable` — safety argument (Phase C)
 ///
 /// `DynamicModel` is deliberately a class guarded by locks, not an actor:
-/// generated reads are synchronous by design (#1156) and the fork's sync
-/// transaction API is first-class (#1911). The conformance is therefore
+/// generated reads are synchronous by design and the fork's sync
+/// transaction API is first-class. The conformance is therefore
 /// unchecked, and this is the argument a reviewer should check it against.
 ///
 /// | State | Confinement |
@@ -30,7 +30,7 @@ import Yniffi
 /// | `doc` (`YDocument`) | `let`. `YDocument` is a reference type that is not `Sendable`; **every** FFI touch goes through `doc.withExclusiveAccess` / `doc.transact` / `doc.transactSync`, all of which serialize on the doc's single `ffiLock` (`yswift-fork/Sources/YSwift/YDocument.swift:53,61`) |
 /// | `queryEngine` | `let`; `BaoModelQueryEngine` is itself `@unchecked Sendable` under its own `NSLock` |
 /// | `recordSubscriptions`, `rootSubscription` | mutated and read under `observerLock` — including the `init`-time installs, which take it *inside* the open transaction (`ffiLock → observerLock`, the same order `installRecordObserverUnlocked` / `cancelRecordObserverUnlocked` use) — except in `deinit` (see below) |
-/// | `docUpdateSubscription` | assigned in `init` under `observerLock`; read-and-cleared in `deinit` under `observerLock`, with the `cancel()` FFI call made after the lock is released (#1992 — it was previously touched with no lock at all) |
+/// | `docUpdateSubscription` | assigned in `init` under `observerLock`; read-and-cleared in `deinit` under `observerLock`, with the `cancel()` FFI call made after the lock is released (it was previously touched with no lock at all) |
 /// | `listeners` | mutated and read under `listenerLock`; the snapshot taken there is invoked **outside** the lock so a callback may (un)subscribe re-entrantly |
 /// | `observerDrainQueue`, `reconcileQueue`, `drainQueueKey` | `let` Dispatch primitives, themselves thread-safe |
 /// | the `activeTx` / `pendingNotify` transaction bookkeeping | thread-local (`Thread.current.threadDictionary`), so it is per-thread by construction and never shared |
@@ -48,9 +48,9 @@ import Yniffi
 /// instance exists, so there is nothing to exclude; they are instead dropped
 /// under the doc's `ffiLock` (`withExclusiveAccess`), which is what actually
 /// matters there: observer deregistration must be serialized against
-/// transactions on the shared doc (#1126).
+/// transactions on the shared doc.
 ///
-/// **Listener closures are `@Sendable` (#1992).** Confining the `listeners`
+/// **Listener closures are `@Sendable`.** Confining the `listeners`
 /// dictionary under `listenerLock` says nothing about state a callback
 /// captures, and callbacks run on whichever thread committed the change (a
 /// local writer's thread, or the observer-drain queue), so the closure type
@@ -187,7 +187,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// Guarded by `observerLock` like the other subscription handles — it was
     /// previously assigned in `init` and cancelled in `deinit` with no lock at
     /// all, which the `@unchecked Sendable` argument above could not have
-    /// covered (#1992).
+    /// covered.
     private var docUpdateSubscription: YSwift.YSubscription?
 
     // MARK: - Per-record observation
@@ -216,7 +216,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// The callback runs on whichever thread committed the change:
     /// local writes fire synchronously on the writing thread AFTER the
     /// write transaction commits (matching js-bao, which notifies
-    /// post-commit — see #1116); remote changes fire from the
+    /// post-commit); remote changes fire from the
     /// observer-drain queue. A batch (`transact`) notifies once per
     /// model, not once per write. Callbacks may safely re-enter the
     /// model (query, write) since no transaction is open when they
@@ -248,7 +248,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// Notify listeners of a local write, deferring until the
     /// enclosing write transaction commits. js-bao notifies after the
     /// Y.Doc transaction closes; firing synchronously *inside* the
-    /// open yrs transaction (the previous behavior, #1116) meant a
+    /// open yrs transaction (the previous behavior) meant a
     /// subscriber observed half-committed batch state — and could
     /// deadlock if its callback touched anything that needs a new
     /// transaction (`query()` draining an observer task that calls
@@ -337,7 +337,7 @@ public final class DynamicModel: @unchecked Sendable {
 
     /// Thread-local list of models with listener notifications queued
     /// while a write transaction is open. Flushed by the outermost
-    /// transaction wrapper after `transactSync` returns (#1116).
+    /// transaction wrapper after `transactSync` returns.
     fileprivate static let pendingNotifyKey = "JsBaoClient.DynamicModel.pendingNotify"
 
     /// Open yrs transactions on this thread, keyed by the YDocument's
@@ -663,7 +663,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// - Parameter changedFields: the fields the caller actually assigned,
     ///   js-bao's `_localChanges`. On the **update** path only these are
     ///   written, so a save built from a stale fetch doesn't re-write — and
-    ///   clobber — fields another device changed concurrently (#2459). `nil`
+    ///   clobber — fields another device changed concurrently. `nil`
     ///   means "no tracking information": every supplied value counts as a
     ///   change, which is the contract for untyped callers that already pass
     ///   just the fields they mean to write. The insert path ignores the set
@@ -965,7 +965,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// `upsertOn` lookup, and `upsertByUnique` assigns `dataToUpsert` onto
     /// the matched record so an empty `id` there trips that same check on
     /// the merge path. So an empty key is rejected whether or not the
-    /// unique value already names a record (#2885).
+    /// unique value already names a record.
     ///
     /// "Supplied" follows the same precedence the insert paths use to
     /// resolve the id: the explicit `id:` argument first, then an `id`
@@ -1213,7 +1213,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// Paginated include variant. Same batching semantics, but the
     /// result carries cursors.
     ///
-    /// Rows come back as the shared `Sendable` row bag (`PrimitiveRow`, #1992)
+    /// Rows come back as the shared `Sendable` row bag (`PrimitiveRow`)
     /// with the `_related` attachment inside `raw` exactly as before.
     public func queryPaged(
         _ filter: DocumentFilter? = nil,
@@ -1258,8 +1258,8 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     /// How many of this document's records match `filter`. On a db3,
-    /// `options.maxDrift` refuses the count `DB3_DRIFT_EXCEEDED` as a page is
-    /// (#5221); the other options do not apply to a count.
+    /// `options.maxDrift` refuses the count `DB3_DRIFT_EXCEEDED` as a page is;
+    /// the other options do not apply to a count.
     public func count(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
         if let local { return try local.count(filter: filter, options: options) }
         awaitObserverDrain()
@@ -1384,8 +1384,8 @@ public final class DynamicModel: @unchecked Sendable {
     ///   the view for the row holding those values — so a caller
     ///   that wants an answer from one has to pass them. Without them a large
     ///   document answers `nil`, which is "no owner here". On the nested-map
-    ///   path the same values feed the mirror fallback in `readableOwner`
-    ///   (#3252); without them only the index entry is vetted.
+    ///   path the same values feed the mirror fallback in `readableOwner`;
+    ///   without them only the index entry is vetted.
     func existingRecordId(
         constraintName name: String,
         key: String,
@@ -1420,7 +1420,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// The record that readably owns `key` under `constraint`, or `nil`.
     ///
     /// The `_uniqueIdx_*` map is a cache over the records, not the record
-    /// store, and the two can disagree (#3252): a replica can hold an index
+    /// store, and the two can disagree: a replica can hold an index
     /// entry for a record whose structs have not landed yet, or an entry a
     /// field change or delete left behind. The app then sees a `query` that
     /// returns no row for the key and a save refused for that same row —
@@ -1908,7 +1908,7 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     /// Refuse a write for a schema that declares a unique constraint on a
-    /// stringset field (#3719), BEFORE the transaction that would write the
+    /// stringset field, BEFORE the transaction that would write the
     /// record and record the declaration into `_meta_<model>`.
     ///
     /// The public `PrimitiveSchema` initializer cannot throw (the read path
@@ -1923,7 +1923,7 @@ public final class DynamicModel: @unchecked Sendable {
     }
 
     /// Refuse a save of a model declaring a vector field to a document that
-    /// is not a db3 (#5225), before anything is written: a vector field
+    /// is not a db3, before anything is written: a vector field
     /// belongs to a db3, and a format-1 document holds no vectors. js-bao's
     /// `VectorFieldFormatError`.
     private func refuseVectorFieldsOffDb3() throws {
@@ -2630,7 +2630,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// record untouched and callers that need the error use
     /// `DynamicModel.update(id:values:)` directly. On a record-log document a
     /// refusal past the offline window reaches the app as
-    /// `DocumentWriteRefusedEvent` rather than vanishing (#3437, behavior 2a);
+    /// `DocumentWriteRefusedEvent` rather than vanishing (behavior 2a);
     /// an ordinary document's path is unchanged.
     internal func assignFieldFromRecord(
         recordId: String, field: String, value: PrimitiveValue
@@ -2849,8 +2849,7 @@ public final class DynamicModel: @unchecked Sendable {
     /// `query()`, for example), the `sync` would self-deadlock — and
     /// it's also unnecessary, because the mirror already reflects
     /// every change applied before the current task. We detect that
-    /// case via the queue-specific marker and return immediately
-    /// (#1116).
+    /// case via the queue-specific marker and return immediately.
     internal func awaitObserverDrain() {
         if DispatchQueue.getSpecific(key: drainQueueKey) == true { return }
         observerDrainQueue.sync {}

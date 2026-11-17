@@ -9,6 +9,7 @@ import XCTest
 /// `DB3_ACCESS_REFUSED` within a few seconds under a two-minute ready
 /// timeout, told as `Db3ErrorEvent`, with nothing stored; after a grant a new
 /// subscribe becomes ready. A 404 (no such document) throws `NOT_FOUND`.
+@available(*, deprecated)
 final class Db3SubscribeRefusedLiveTests: XCTestCase {
 
     private var ctx: TestContext!

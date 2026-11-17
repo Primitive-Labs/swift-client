@@ -170,7 +170,7 @@ final class RecordLogGroupCommit: @unchecked Sendable {
         return try body()
     }
 
-    /// Run `body` as a read in one read transaction (#5221): a deferred
+    /// Run `body` as a read in one read transaction: a deferred
     /// `BEGIN` … `COMMIT` of its own when nothing is open on the connection,
     /// so every statement of it reads one snapshot; inside an open group, a
     /// command or another read (or a transaction the connection holds) it

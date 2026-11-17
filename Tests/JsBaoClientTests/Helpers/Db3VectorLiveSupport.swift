@@ -30,6 +30,7 @@ enum Db3VectorLive {
     ] }
 
     /// A synced db3 holding `count` notes with embeddings, written over HTTP.
+    @available(*, deprecated)
     static func seeded(
         _ live: RecordLogLiveApp, count: Int = rows, vectors: [[Float]] = vectors, embedded: (Int) -> Bool = { _ in true }, other: Bool = false
     ) async throws -> String {

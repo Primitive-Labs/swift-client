@@ -1,0 +1,9 @@
+# A file stem with `-` (#5899): its alias and binding write it `_`.
+[defs.ShipInvoice]
+type = "object"
+[defs.ShipInvoice.properties.number]
+type = "integer"
+# A numeric enum is `JSONValue` in Swift, so a value outside it can be assigned
+# and is refused at save.
+[defs.ShipInvoice.properties.priority]
+enum = [1, 2, 3]

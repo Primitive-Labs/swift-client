@@ -75,12 +75,25 @@ public struct Db3Info: Decodable, Sendable, Equatable {
     public let via: Db3Via?
     /// `true` for a db3 that lives only on this device (`create(title:localOnly: true)`).
     public let localOnly: Bool
+    /// `.reader` while the db3 is public, when `get` answers it: only to a
+    /// caller who manages its sharing (an app owner or admin, a function, its
+    /// owner or a read-write grantee); `nil` otherwise.
+    /// - Stability: beta
+    public let publicAccess: Db3PublicAccessLevel?
+    /// Who last changed its public access (a user id, or `sys:<appId>` for a
+    /// function), beside `publicAccess`; `nil` otherwise.
+    /// - Stability: beta
+    public let publicAccessUpdatedBy: String?
+    /// When its public access last changed, beside `publicAccess`; `nil` otherwise.
+    /// - Stability: beta
+    public let publicAccessUpdatedAt: String?
 
     public init(
         id: String, title: String, createdBy: String, createdAt: String, modifiedAt: String, custodian: String?,
         sync: Bool, type: String?, tags: [String], metadata: JSONValue?, permission: DocumentPermission?,
         accessSource: DocumentAccessSource?, grantedAt: String?, grantedBy: String? = nil, via: Db3Via? = nil,
-        localOnly: Bool = false
+        localOnly: Bool = false, publicAccess: Db3PublicAccessLevel? = nil, publicAccessUpdatedBy: String? = nil,
+        publicAccessUpdatedAt: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -98,11 +111,15 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         self.grantedBy = grantedBy
         self.via = via
         self.localOnly = localOnly
+        self.publicAccess = publicAccess
+        self.publicAccessUpdatedBy = publicAccessUpdatedBy
+        self.publicAccessUpdatedAt = publicAccessUpdatedAt
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, title, createdBy, createdAt, modifiedAt, custodian, sync, type, tags, metadata, permission, accessSource, grantedAt
         case grantedBy
+        case publicAccess, publicAccessUpdatedBy, publicAccessUpdatedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -123,6 +140,9 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         grantedBy = try c.decodeIfPresent(String.self, forKey: .grantedBy)
         via = nil
         localOnly = false
+        publicAccess = try? c.decodeIfPresent(Db3PublicAccessLevel.self, forKey: .publicAccess)
+        publicAccessUpdatedBy = try c.decodeIfPresent(String.self, forKey: .publicAccessUpdatedBy)
+        publicAccessUpdatedAt = try c.decodeIfPresent(String.self, forKey: .publicAccessUpdatedAt)
     }
 
     /// This row as the `via` listing answered it.
@@ -130,7 +150,8 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         Db3Info(
             id: id, title: title, createdBy: createdBy, createdAt: createdAt, modifiedAt: modifiedAt, custodian: custodian,
             sync: sync, type: type, tags: tags, metadata: metadata, permission: permission, accessSource: accessSource,
-            grantedAt: grantedAt, grantedBy: grantedBy, via: via
+            grantedAt: grantedAt, grantedBy: grantedBy, via: via, publicAccess: publicAccess,
+            publicAccessUpdatedBy: publicAccessUpdatedBy, publicAccessUpdatedAt: publicAccessUpdatedAt
         )
     }
 }
@@ -385,6 +406,32 @@ public struct Db3AppAccessChange: Decodable, Sendable, Equatable {
         self.id = id
         self.level = level
         self.changed = changed
+    }
+}
+
+/// The level a db3's public access carries: `.reader`, the only one. A
+/// property of the db3, not a sharing level: it lets nobody open, sync, list
+/// or read the db3 through a db3 route.
+/// - Stability: beta
+public enum Db3PublicAccessLevel: String, Codable, Sendable {
+    case reader
+}
+
+/// What `client.db3.permissions(_:).setPublicAccess(_:)` answers: the level
+/// now, whether this call changed it, and the app's `signedOutAccess`
+/// setting, which decides whether public access is honoured yet.
+/// - Stability: beta
+public struct Db3PublicAccessChange: Decodable, Sendable, Equatable {
+    public let id: String
+    public let level: Db3PublicAccessLevel?
+    public let changed: Bool
+    public let signedOutAccess: Bool
+
+    public init(id: String, level: Db3PublicAccessLevel?, changed: Bool, signedOutAccess: Bool) {
+        self.id = id
+        self.level = level
+        self.changed = changed
+        self.signedOutAccess = signedOutAccess
     }
 }
 

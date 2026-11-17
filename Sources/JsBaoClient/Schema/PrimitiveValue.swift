@@ -13,7 +13,7 @@ public enum PrimitiveFieldType: String, Codable, Sendable, Equatable, Hashable, 
     case id
     case stringset
     case json
-    /// A db3 vector field (#5225): `dims` numbers of an `element` type,
+    /// A db3 vector field: `dims` numbers of an `element` type,
     /// stored as base64 text (`VectorCodec`) and read as `[Float]`.
     case vector
 }
@@ -32,7 +32,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     case id(String)
     case stringset(Set<String>)
     case json(Data)
-    /// A vector field's numbers (#5225). A save to a db3 encodes them with the
+    /// A vector field's numbers. A save to a db3 encodes them with the
     /// field's encoding; a read answers them decoded.
     case vector([Float])
 
@@ -278,7 +278,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     }
 
     /// Encode a `Double` the way JSON.stringify in JS does — byte-for-
-    /// byte identical to `Number.prototype.toString(10)` (#1117).
+    /// byte identical to `Number.prototype.toString(10)`.
     ///
     /// Returns `nil` for **non-finite** values (NaN, ±Infinity). Those
     /// don't have a valid JSON representation, and the yrs FFI parses
@@ -293,7 +293,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     }
 
     /// `encodeNumber`, adjusted for the one place the JS string is not a
-    /// legal input: the yrs FFI (#3456).
+    /// legal input: the yrs FFI.
     ///
     /// `YrsMap.insert` / `tryUpdate` parse their `value` with
     /// `Any::from_json(...).unwrap()` (yniffi `lib/src/map.rs`), and a
@@ -344,7 +344,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     /// would stop them colliding with the entries a JS client writes.
     ///
     /// - Returns: the literal, or `nil` for a value that must not be
-    ///   written — a non-finite number (skipped on write, #1117) or, past
+    ///   written — a non-finite number (skipped on write) or, past
     ///   `2^64`, one of the rare doubles this parser cannot be made to
     ///   reproduce. `DynamicModel` rejects the latter with a
     ///   field-naming error before it mutates anything.

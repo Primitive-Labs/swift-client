@@ -55,14 +55,14 @@ import TOMLKit
 ///    `.unknownJoinModel`.
 ///  - Every field in a unique constraint must exist on its model →
 ///    `.uniqueConstraintUnknownField`.
-///  - A `vector` field (#5225) belongs to a db3 type file (one with a
+///  - A `vector` field belongs to a db3 type file (one with a
 ///    `[type]` table) → `.vectorFieldOutsideDb3Type`; it needs `dims` (an
 ///    integer of at least 1) and `element`, and takes no index, uniqueness,
 ///    default, stamp or length option, and any other field takes neither
 ///    `dims` nor `element` → `.invalidVectorField`; no unique constraint
 ///    names one → `.vectorInUniqueConstraint`.
 /// > **Codegen is the recommended path.** Prefer `swift-bao-codegen` at
-/// > build time — see [`docs/codegen.md`](../../../docs/codegen.md). The
+/// > build time — see the codegen guide in the monorepo's `docs/`. The
 /// > runtime TOML loader is fully supported and kept as public API for
 /// > the cases where build-time codegen doesn't fit (loading schemas
 /// > you don't own, programmatic / dynamic schema construction, tests,
@@ -173,7 +173,8 @@ public enum TomlSchemaLoader {
         let constraints = try buildUniqueConstraints(
             modelName: name, table: table,
             fieldNames: Set(fields.keys),
-            strict: strict
+            strict: strict,
+            clearedNames: clearedFieldNames(in: table)
         )
         // A vector cannot be part of a unique key (#5225).
         for constraint in constraints.values.sorted(by: { $0.name < $1.name }) {
@@ -197,6 +198,12 @@ public enum TomlSchemaLoader {
 
     // MARK: - Fields
 
+    /// The fields of a model's table declared `cleared = true`.
+    private static func clearedFieldNames(in table: TOMLTable) -> Set<String> {
+        guard let fieldsTable = table["fields"]?.table else { return [] }
+        return Set(fieldsTable.keys.filter { fieldsTable[$0]?.table?["cleared"]?.bool == true })
+    }
+
     private static func buildFields(
         modelName: String,
         table: TOMLTable,
@@ -207,10 +214,14 @@ public enum TomlSchemaLoader {
         var out: [String: FieldDescriptor] = [:]
         for fieldName in fieldsTable.keys {
             guard let field = fieldsTable[fieldName]?.table else { continue }
-            out[fieldName] = try buildField(
+            let descriptor = try buildField(
                 modelName: modelName, fieldName: fieldName,
                 table: field, strict: strict, vectors: vectors
             )
+            // A cleared field reads as unset everywhere: it is no field of
+            // the model (a tombstoned name, in `removedFields`, never is).
+            if field["cleared"]?.bool == true { continue }
+            out[fieldName] = descriptor
         }
         return out
     }
@@ -348,7 +359,8 @@ public enum TomlSchemaLoader {
         modelName: String,
         table: TOMLTable,
         fieldNames: Set<String>,
-        strict: Bool
+        strict: Bool,
+        clearedNames: Set<String> = []
     ) throws -> [String: ConstraintDescriptor] {
         // `[[models.X.unique_constraints]]` lands under `unique_constraints`
         // as a TOMLArray of TOMLTables.
@@ -383,6 +395,9 @@ public enum TomlSchemaLoader {
                 }
                 fields.append(s)
             }
+            // A single-field constraint over a cleared field goes with the
+            // field, as the room's install drops it.
+            if fields.count == 1, clearedNames.contains(fields[0]) { continue }
             for f in fields where !fieldNames.contains(f) {
                 throw TomlSchemaLoaderError.uniqueConstraintUnknownField(
                     model: modelName, constraint: name, field: f
@@ -546,6 +561,8 @@ public enum TomlSchemaLoader {
 
     private static let knownModelKeys: Set<String> = [
         "fields", "relationships", "unique_constraints", "class_name",
+        // A db3 type's tombstoned field names.
+        "removedFields",
     ]
 
     private static let knownFieldKeys: Set<String> = [
@@ -557,6 +574,8 @@ public enum TomlSchemaLoader {
         // take it, and a db3 type's opt-in to enforcing it (#5897), which the
         // room enforces.
         "enum", "enforce_enum",
+        // A field on its way out, and one cleared from a db3 type.
+        "deprecated", "cleared",
     ]
 
     private static let knownRelationshipKeys: Set<String> = [
@@ -574,7 +593,7 @@ public enum TomlSchemaLoader {
     // MARK: - Allowed values
 
     /// The wire-level field types js-bao's TOML loader accepts (`vector` in a
-    /// db3 type file only, #5225).
+    /// db3 type file only).
     /// `.json` is supported in-memory in Swift but isn't part of the
     /// TOML surface — js-bao never declares json columns in TOML.
     private static let allowedFieldTypes: Set<PrimitiveFieldType> = [
@@ -608,18 +627,18 @@ public enum TomlSchemaLoaderError: Error, CustomStringConvertible {
     )
     case unknownKey(context: String, key: String, allowed: [String])
     case invalidAutoStamp(model: String, field: String, value: String)
-    /// A unique constraint on a stringset field (#3719); `message` is the
+    /// A unique constraint on a stringset field; `message` is the
     /// sentence js-bao's loader answers.
     case uniqueOnStringset(message: String)
-    /// A `vector` field outside a db3 type file (#5225): a schema with no
+    /// A `vector` field outside a db3 type file: a schema with no
     /// `[type]` table describes documents, which carry no vectors.
     case vectorFieldOutsideDb3Type(model: String, field: String)
     /// A vector field the loader cannot encode, or `dims`/`element` on
-    /// another field (#5225); `reason` is js-bao's sentence.
+    /// another field; `reason` is js-bao's sentence.
     case invalidVectorField(model: String, field: String, reason: String)
-    /// A unique constraint naming a vector field (#5225).
+    /// A unique constraint naming a vector field.
     case vectorInUniqueConstraint(model: String, constraint: String, field: String)
-    /// An `enforce_enum` that is not `true` or `false` (#5897): it never
+    /// An `enforce_enum` that is not `true` or `false`: it never
     /// reads as enforcement off.
     case invalidEnforceEnum(model: String, field: String)
 

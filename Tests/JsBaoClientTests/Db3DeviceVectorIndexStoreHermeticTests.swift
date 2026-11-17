@@ -171,7 +171,7 @@ final class Db3DeviceVectorIndexStoreHermeticTests: XCTestCase {
     // MARK: - 4: storage version 9 (10 since #5241's skip table)
 
     func testTheVersionIs9AndAFreshCacheHasTheVectorColumn() async throws {
-        XCTAssertEqual(RecordLogSchema.storageVersion, 10)
+        XCTAssertGreaterThanOrEqual(RecordLogSchema.storageVersion, 10) // 11 since #5994's clear mark
         let world = try await world()
         try world.store("db3-a")
         let columns = try world.rows("SELECT name FROM pragma_table_info('record_log_indexes') ORDER BY cid").compactMap { $0["name"].stringValue }
@@ -224,9 +224,10 @@ final class Db3DeviceVectorIndexStoreHermeticTests: XCTestCase {
     func testAStoreFromALaterVersionIsNeverLowered() async throws {
         let world = try await world()
         try world.store("db3-a")
-        try world.exec("UPDATE record_log_meta SET value = '10' WHERE key = 'storage_version'")
+        let later = String(RecordLogSchema.storageVersion + 1)
+        try world.exec("UPDATE record_log_meta SET value = ? WHERE key = 'storage_version'", [.text(later)])
         _ = try world.reopen("db3-a")
-        XCTAssertEqual(try world.version(), "10")
+        XCTAssertEqual(try world.version(), later)
     }
 
     // MARK: - 5: the room's listing

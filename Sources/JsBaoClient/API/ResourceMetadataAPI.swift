@@ -2,10 +2,15 @@ import Foundation
 
 // MARK: - ResourceMetadataAPI
 
+/// Deprecated: resource metadata is deprecated, with every method on this
+/// type. Use user properties for per-user data, and a db3 database keyed by
+/// the group or collection id for group or collection data, instead. Every
+/// call keeps answering as before.
+///
 /// Sub-API for reading and writing typed resource metadata
 /// (`client.resourceMetadata.*`). Mirrors the JS client's
-/// `ResourceMetadataAPI` (`src/client/api/resourceMetadataApi.ts`, issues #1352
-/// and #1402) method-for-method over the same REST endpoints.
+/// `ResourceMetadataAPI` (`src/client/api/resourceMetadataApi.ts`)
+/// method-for-method over the same REST endpoints.
 ///
 /// Metadata is grouped into named **categories** defined by an app admin (via
 /// TOML sync or the admin-gated `metadata-categories` route). This namespace
@@ -50,12 +55,12 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     // MARK: - Paths
 
     /// Percent-encodes a free-text path parameter before it is interpolated
-    /// into a path, the convention every sub-API follows (#1601 / #2042) — the
+    /// into a path, the convention every sub-API follows — the
     /// transport assembles the path from segments and does not escape them
     /// (`HttpClient.buildURLRequest` sets `.percentEncodedPath`, which passes
     /// its input through verbatim).
     ///
-    /// Routes through the shared `URLEncoding.encodeComponent` (#2076), which
+    /// Routes through the shared `URLEncoding.encodeComponent`, which
     /// escapes everything outside the `encodeURIComponent` unreserved set — the
     /// same bytes the JS client's `encodeURIComponent` puts on the wire
     /// (`src/client/api/resourceMetadataApi.ts`). In particular a `/` inside a
@@ -74,7 +79,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
         _ resourceId: String,
         _ category: String
     ) -> String {
-        "\(resourcePath(resourceType, resourceId))/metadata/\(escape(category))"
+        "/resources/\(escape(resourceType))/\(escape(resourceId))/metadata/\(escape(category))"
     }
 
     // MARK: - Single read / write
@@ -86,6 +91,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// defined for the resource type, and 403 when the category's `readRule`
     /// denies the caller.
     /// - Stability: experimental
+    @available(*, deprecated, message: "Use user properties for per-user data, and a db3 database keyed by the group or collection id for group or collection data, instead. (api-surface-stability)")
     public func get(
         resourceType: String,
         resourceId: String,
@@ -103,6 +109,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// data is validated against the category's schema, and the category's
     /// `writeRule` gates the write (403 on denial).
     /// - Stability: experimental
+    @available(*, deprecated, message: "Use user properties for per-user data, and a db3 database keyed by the group or collection id for group or collection data, instead. (api-surface-stability)")
     public func set(
         resourceType: String,
         resourceId: String,
@@ -126,6 +133,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// Otherwise this is a partial-success call: per-item 403/404 problems come
     /// back as structured `ok: false` entries and do **not** throw.
     /// - Stability: experimental
+    @available(*, deprecated, message: "Use user properties for per-user data, and a db3 database keyed by the group or collection id for group or collection data, instead. (api-surface-stability)")
     public func getBatch(
         requests: [ResourceMetadataBatchRequestItem]
     ) async throws -> ResourceMetadataBatchResult {
@@ -167,6 +175,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// }
     /// ```
     /// - Stability: experimental
+    @available(*, deprecated, message: "Use user properties for per-user data, and a db3 database keyed by the group or collection id for group or collection data, instead. (api-surface-stability)")
     public func resolve(
         resourceType: String,
         category: String,
@@ -194,6 +203,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// metadata comes back with an empty `categories` array rather than an
     /// error.
     /// - Stability: experimental
+    @available(*, deprecated, message: "Use user properties for per-user data, and a db3 database keyed by the group or collection id for group or collection data, instead. (api-surface-stability)")
     public func list(
         resourceType: String,
         resourceId: String
@@ -210,6 +220,7 @@ public final class ResourceMetadataAPI: @unchecked Sendable {
     /// deleting an item that does not exist succeeds with `deleted == false`
     /// rather than failing with 404.
     /// - Stability: experimental
+    @available(*, deprecated, message: "Use user properties for per-user data, and a db3 database keyed by the group or collection id for group or collection data, instead. (api-surface-stability)")
     public func delete(
         resourceType: String,
         resourceId: String,

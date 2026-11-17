@@ -1,6 +1,6 @@
 import Foundation
 
-/// A db3's vector index on `model.field` as a `$near` reads it (#5230): its
+/// A db3's vector index on `model.field` as a `$near` reads it: its
 /// tables when built, and what its refusal names when not. js-bao's
 /// `RecordLogVectorIndexOf`.
 struct RecordLogVectorIndexOf: Equatable, Sendable {
@@ -12,7 +12,7 @@ struct RecordLogVectorIndexOf: Equatable, Sendable {
     var vector: RecordLogVectorOptions?
     /// The room's name for the index, which a refusal names.
     var roomName: String
-    /// Why this device does not build it (#5322): declined here, or left out by the `deviceIndexes` default with nothing built.
+    /// Why this device does not build it: declined here, or left out by the `deviceIndexes` default with nothing built.
     var declined: String?
     /// Why it is not built, when it is not.
     var unbuilt: String?
@@ -21,7 +21,7 @@ struct RecordLogVectorIndexOf: Equatable, Sendable {
 // MARK: - Vector indexes (#5230)
 
 /// The vector family's half of a reconcile, the Swift port of js-bao's
-/// `dropUnwantedVectors` and `buildVectors` (#5229). A vector entry's cached
+/// `dropUnwantedVectors` and `buildVectors`. A vector entry's cached
 /// options are js-bao's `RecordLogVectorEntryOptions`, key for key: what the
 /// room lists of it (`on`, `vector`, `generation`, `revision`, `annModel`) and
 /// how it stands on this device (`flat`, the flat table's definition as

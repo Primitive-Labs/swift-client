@@ -15,6 +15,7 @@ import YSwift
 ///
 /// Server-free: unreachable URLs, memory storage, and a large outbound debounce
 /// so nothing flushes while the enqueues are being counted.
+@available(*, deprecated)
 final class OutboundForwardingOwnerHermeticTests: XCTestCase {
 
     /// Counts `queueOutboundUpdate` calls per document, from whichever thread

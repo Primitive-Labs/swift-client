@@ -12,6 +12,7 @@ import XCTest
 ///   subscribe on the destroyed client throws `destroyed`;
 ///   `client.closeDocument(id)` → `closed`; a forced `client.db3.evict(id)` →
 ///   `evicted`.
+@available(*, deprecated)
 final class Db3DisposedReasonLiveTests: XCTestCase {
 
     private var ctx: TestContext!

@@ -7,6 +7,7 @@ import XCTest
 /// disposed and closed on the room before the next. `ready()` waits for the
 /// open's index list (and its declaration's acknowledgment) since #5101; the
 /// figure is printed, not bounded.
+@available(*, deprecated)
 final class Db3ReadyLatencyLiveTests: XCTestCase {
 
     private var ctx: TestContext!

@@ -9,24 +9,24 @@ struct RecordLogIndexEntry: Equatable, Sendable {
     var unique: Bool
     /// A string-set field's member index: a table of the room's own when
     /// placed `.server`, and of each device's when placed `.device` or
-    /// `.both` (#5223); a local-only db3's store keeps one of its own (#5156).
+    /// `.both`; a local-only db3's store keeps one of its own.
     var members: Bool
-    /// What the index is (#5220): `.members` for a member index.
+    /// What the index is: `.members` for a member index.
     var kind: Db3IndexKind
-    /// Where it lives (#5220): a synced db3's store builds an entry placed
+    /// Where it lives: a synced db3's store builds an entry placed
     /// `.device` or `.both` and skips one placed `.server`.
     var on: Db3IndexPlacement
-    /// A text index's options (#5223), as the room lists them; absent reads as the defaults.
+    /// A text index's options, as the room lists them; absent reads as the defaults.
     var text: JSONValue?
-    /// A vector index's options and its field's encoding (#5230), as the room
+    /// A vector index's options and its field's encoding, as the room
     /// lists them (`distance`, `index`, `dims`, `element`); absent when the
     /// room does not say how to build it.
     var vector: JSONValue?
-    /// A vector index's generation (#5230): a model of another generation is never this index's.
+    /// A vector index's generation: a model of another generation is never this index's.
     var generation: Int?
-    /// A vector index's model revision (#5230): a model of another revision is dropped.
+    /// A vector index's model revision: a model of another revision is dropped.
     var revision: Int?
-    /// A vector index's shared ANN model, when one is uploaded (#5230):
+    /// A vector index's shared ANN model, when one is uploaded:
     /// `{ revision, trainedAt, rows, bytes, format }` as the room lists it.
     var annModel: JSONValue?
 
@@ -66,7 +66,7 @@ struct RecordLogIndexEntry: Equatable, Sendable {
         )
     }
 
-    /// A text entry's options over its fields, filled in (#5223).
+    /// A text entry's options over its fields, filled in.
     ///
     /// - Throws: `JsBaoError(.db3IndexInvalid)` as ``RecordLogTextIndexOptions/parse(fields:raw:)``.
     func textOptions() throws -> RecordLogTextIndexOptions {
@@ -101,7 +101,7 @@ final class RecordLogIndexReadOrder: @unchecked Sendable {
     private let lock = NSLock()
     private let applying = NSLock()
     private var reads: [String: (issued: Int, applied: Int)] = [:]
-    /// The reads of each binding of a db3's store (#5101), numbered apart
+    /// The reads of each binding of a db3's store, numbered apart
     /// from `issue`/`apply`'s: what the refresher issues and accepts.
     private var bindings: [String: RecordLogIndexReads] = [:]
     private var generations: [String: Int] = [:]
@@ -339,8 +339,8 @@ struct RecordLogIndexRefresherDeps: Sendable {
     var logger: Logger?
 }
 
-/// A db3's index-list reads on this client (#5101), the port of js-bao's
-/// `Db3IndexRefresher` (#5070): reads numbered per binding
+/// A db3's index-list reads on this client, the port of js-bao's
+/// `Db3IndexRefresher`: reads numbered per binding
 /// (``RecordLogIndexReadOrder``), a failed read asked again on a backoff while
 /// the store is bound and the socket up (1 s, doubling, 10 s at most), an
 /// owed read asked again at the socket's open and when networking is allowed
@@ -407,7 +407,7 @@ final class RecordLogIndexRefresher: @unchecked Sendable {
     private var reopened: Set<String> = []
     /// The db3s being opened whose store is not bound yet.
     private var binding: Set<String> = []
-    /// The bindings a notice came for while a read was on its way: one more read once it settles (#5322).
+    /// The bindings a notice came for while a read was on its way: one more read once it settles.
     private var followUps: Set<String> = []
     private var destroyed = false
 
@@ -447,7 +447,7 @@ final class RecordLogIndexRefresher: @unchecked Sendable {
         return start(documentId)
     }
 
-    /// The room said the db3's index list changed (`record.indexes`, #5322,
+    /// The room said the db3's index list changed (`record.indexes`,
     /// js-bao's `Db3IndexRefresher.noticed`). With no read of the binding on
     /// its way the list is read now; with one, one more read is issued once it
     /// settles, however many notices come meanwhile. A notice for a db3 not
@@ -831,14 +831,14 @@ final class RecordLogIndexRefresher: @unchecked Sendable {
 /// - an index of the store's family (`idx_record_log_view_…`,
 ///   `idx_record_log_rows_…`) whose definition no cached entry wants is dropped.
 ///
-/// A member index placed on the device (a local-only db3's, #5156, or a
-/// synced db3's placed `.device` or `.both`, #5223) is a table of its own per
+/// A member index placed on the device (a local-only db3's, or a
+/// synced db3's placed `.device` or `.both`) is a table of its own per
 /// `(db3, model, field)`, in the room's shape (`(value, rid)` keyed by the
 /// record's view rowid), named in the entry's cached row and kept equal to the
 /// view's arrays by three triggers on `record_log_view`, so every write that
 /// touches the view keeps it. A table or trigger of that family no cached row
 /// names is dropped. A store holding a member table gathers SQLite's
-/// statistics for the view and its member tables, as the room does (#5150).
+/// statistics for the view and its member tables, as the room does.
 enum RecordLogIndexes {
 
     /// The tables a store's lookup indexes are on, with the prefix of their names.
@@ -881,10 +881,10 @@ enum RecordLogIndexes {
         return nil
     }
 
-    /// Why a vector entry is not built while its room's list does not say how (#5230): ``RecordLogVectorIndex/unbuilt``.
+    /// Why a vector entry is not built while its room's list does not say how: ``RecordLogVectorIndex/unbuilt``.
     static let vectorUnbuilt = RecordLogVectorIndex.unbuilt
 
-    /// What the store does with a cached entry (#5322): `build` it (no
+    /// What the store does with a cached entry: `build` it (no
     /// verdict, or `accepted`), `keep` it only when built (the client's
     /// `deviceIndexes` default leaves its kind out and no verdict says
     /// otherwise), or `decline` it (drop what is built). A db3 that lives only
@@ -931,7 +931,7 @@ enum RecordLogIndexes {
         row["options"].stringValue.flatMap(RecordLogJSON.parse)?.objectValue ?? [:]
     }
 
-    /// A scalar or member entry's options as cached (#5322): its placement
+    /// A scalar or member entry's options as cached: its placement
     /// when not `both`, and why it is not built; NULL when it has neither.
     private static func entryOptions(on: Db3IndexPlacement?, unbuilt: String?) -> Format2SqlValue {
         var object: [String: JSONValue] = [:]
@@ -944,12 +944,12 @@ enum RecordLogIndexes {
     private static func identity(_ model: String, _ fields: String, _ kind: String) -> String { "\(kind)\u{0}\(model)\u{0}\(fields)" }
 
     /// Replace `documentId`'s cached list with `entries` (when given), then
-    /// reconcile the store's indexes (#5322, js-bao's `syncRecordLogIndexes`):
+    /// reconcile the store's indexes (js-bao's `syncRecordLogIndexes`):
     /// the cache is replaced and every index no entry wants is dropped in one
     /// transaction; then each index to build is built in a transaction of its
     /// own (a scalar definition's view index and a unique one's rows index, a
     /// member table with its triggers, a text table with its triggers, a
-    /// vector index's vec1 flat table with its triggers, #5230), which
+    /// vector index's vec1 flat table with its triggers), which
     /// writes its table's name on the entry's row, so a row names a table only
     /// while the device holds it. A build that fails (a full disk) rolls back
     /// with nothing of it left, the entry is kept unbuilt with the reason
@@ -981,13 +981,13 @@ enum RecordLogIndexes {
         return (RecordLogIndexSync(created: built.created, dropped: dropped), built.members > 0)
     }
 
-    /// Why the store skips a synced db3's entry placed `.server` (#5241).
+    /// Why the store skips a synced db3's entry placed `.server`.
     static let skipServerOnly = "placed on the server only; this device builds nothing for it"
 
-    /// Why the store skips an entry on `id` alone (#5241).
+    /// Why the store skips an entry on `id` alone.
     static let skipIdOnly = "the primary key serves id; no index of its own is built"
 
-    /// Why the store builds nothing for `entry` (#5241, js-bao's `judgeEntry`),
+    /// Why the store builds nothing for `entry` (js-bao's `judgeEntry`),
     /// one rule after another, or `nil` when it caches it: a synced db3's entry
     /// placed `.server`; a model or field that is not an identifier, or no
     /// field (warned about); a vector entry over other than one field; a text
@@ -1020,7 +1020,7 @@ enum RecordLogIndexes {
 
     /// Replace `documentId`'s cached rows with `entries`, and its skipped
     /// entries with those ``skipReason(_:localOnly:documentId:logger:)``
-    /// skips (#5241), in the caller's transaction.
+    /// skips, in the caller's transaction.
     private static func replace(_ sql: RecordLogSql, documentId: String, _ entries: [RecordLogIndexEntry], logger: Logger?) throws {
         let localOnly = try sql.first("SELECT local_only FROM record_log_state WHERE doc_id = ?", [.text(documentId)])?["local_only"].intValue == 1
         // What each entry's row held before: its table (kept while the device holds it) and why it was not built.
@@ -1144,7 +1144,7 @@ enum RecordLogIndexes {
         var build: Bool
     }
 
-    /// Every scalar definition the cached rows want (#5322): a row to build
+    /// Every scalar definition the cached rows want: a row to build
     /// wants its definition built; a row the default leaves out wants it kept
     /// only when its view index is held; a declined row wants nothing.
     private static func wantedScalars(_ sql: RecordLogSql, _ deviceIndexes: Db3DeviceIndexes, held: [String: String]) throws -> RecordLogOrderedMap<String, WantedScalar> {
@@ -1171,7 +1171,7 @@ enum RecordLogIndexes {
         tables.contains(table) && memberTriggerSuffixes.allSatisfy { triggers.contains("\(table)\($0)") }
     }
 
-    /// The drop half of a reconcile (#5322), in the cache's transaction: every
+    /// The drop half of a reconcile, in the cache's transaction: every
     /// index, member table and text table (with its triggers) no cached row
     /// wants is dropped, and a row whose table is not held as wanted, or whose
     /// entry is declined, has its pointer cleared. Answers how many were
@@ -1279,7 +1279,7 @@ enum RecordLogIndexes {
         }
     }
 
-    /// Log that a build failed: a warning when the reason is new, at debug while it stays (#5322).
+    /// Log that a build failed: a warning when the reason is new, at debug while it stays.
     static func reportUnbuilt(_ row: Format2SqlRow, kind: String, reason: String, logger: Logger?) {
         let line = "[record-log] \(row["doc_id"].stringValue ?? ""): \(kind) index \(row["room_name"].stringValue ?? "") on "
             + "\(row["model"].stringValue ?? "") is not built: \(reason); \(consequence(kind))"
@@ -1306,7 +1306,7 @@ enum RecordLogIndexes {
         case vector(Format2SqlRow)
     }
 
-    /// The build half of a reconcile (#5322): each index to build that the
+    /// The build half of a reconcile: each index to build that the
     /// store does not hold, in a transaction of its own; a failure recorded on
     /// its rows in a small transaction after, and the next build goes on.
     private static func buildWanted(
@@ -1602,7 +1602,7 @@ extension RecordLogIndexes {
     }
 
     /// Drop `documentId`'s device tables, member, text and vector, and their
-    /// triggers (#5156, #5223, #5230), before a purge deletes its view rows
+    /// triggers, before a purge deletes its view rows
     /// and cached rows. A store whose cache has no `members` column holds no
     /// member table; one with no `text` column no text table; one with no
     /// `vector` column no vector table.
@@ -1637,10 +1637,10 @@ extension RecordLogIndexes {
     /// The `record_log_meta` key of the view's highest rowid when the store last gathered statistics.
     static let statisticsRowidMeta = "statistics_rowid"
 
-    /// The fewest view rows a store holding a member table gathers statistics at by growth, as the room's (#5150).
+    /// The fewest view rows a store holding a member table gathers statistics at by growth, as the room's.
     static let growthStatisticsMinRows = 1000
 
-    /// How many times its rowid mark the view must grow to before statistics are due again, as the room's (#5150).
+    /// How many times its rowid mark the view must grow to before statistics are due again, as the room's.
     static let growthStatisticsFactor = 10
 
     private static func highestViewRowid(_ sql: RecordLogSql) throws -> Int {
@@ -1701,7 +1701,7 @@ extension RecordLogIndexes {
 
 // MARK: - Text indexes (#5223)
 
-/// A db3's text index on a model as a read uses it (#5223): its table when
+/// A db3's text index on a model as a read uses it: its table when
 /// built, and what its refusal names when not. js-bao's `RecordLogTextIndexOf`.
 struct RecordLogTextIndexOf: Equatable, Sendable {
     /// The FTS5 table, or `nil` when the store holds none for it.
@@ -1710,7 +1710,7 @@ struct RecordLogTextIndexOf: Equatable, Sendable {
     var options: RecordLogTextIndexOptions
     /// The room's name for the index, which a refusal names.
     var roomName: String = ""
-    /// Why this device does not build it (#5322): declined here, or left out by the `deviceIndexes` default with nothing built.
+    /// Why this device does not build it: declined here, or left out by the `deviceIndexes` default with nothing built.
     var declined: String? = nil
 }
 
@@ -1739,7 +1739,7 @@ extension RecordLogIndexes {
         var options: RecordLogTextIndexOptions
     }
 
-    /// A text index's table, js-bao's `textTableDDL` (#5224): contentless,
+    /// A text index's table, js-bao's `textTableDDL`: contentless,
     /// one column per field named by its alias, its tokenizer and prefix
     /// lengths. Rows leave it only through FTS5's `'delete'` command with the
     /// values they were indexed with (``textDeleteSQL(_:_:)``), which keeps
@@ -1773,7 +1773,7 @@ extension RecordLogIndexes {
     /// scoped to its db3 and model: an insertion indexes the row's values, an
     /// update of `_data` removes the old row's values through FTS5's
     /// `'delete'` command and indexes the new, a deletion removes the row's
-    /// the same way (#5224), so the totals `bm25` reads stay those of the
+    /// the same way, so the totals `bm25` reads stay those of the
     /// view's rows. js-bao's `textTriggersDDL`, text for text.
     private static func textTriggersDDL(_ table: String, _ wanted: WantedText) -> [String] {
         let t = quotedName(table)
@@ -1820,7 +1820,7 @@ extension RecordLogIndexes {
 
     /// `documentId`'s text index on `model`, as its cached row names it, with
     /// this device's verdict on it read in the same statement, or `nil` when
-    /// the cache holds none (#5223, #5322). Its `table` is `nil` when the store
+    /// the cache holds none. Its `table` is `nil` when the store
     /// holds no table for it (unbuilt, declined, or its table gone); `declined`
     /// says why this device does not build it, when it does not.
     static func textIndex(
@@ -1860,10 +1860,10 @@ extension Db3DeviceIndexes {
 
 extension RecordLogIndexes {
 
-    /// Why a declined index is not built (#5322).
+    /// Why a declined index is not built.
     static let declinedHere = "declined on this device"
 
-    /// Why an index the client's `deviceIndexes` default leaves out is not built (#5322).
+    /// Why an index the client's `deviceIndexes` default leaves out is not built.
     static func excludedByOption(_ kind: Db3IndexKind) -> String { "the client's deviceIndexes option excludes \(kind.rawValue)" }
 
     /// Where a cached row's index lives: a local-only db3's are on the device;
@@ -1881,7 +1881,7 @@ extension RecordLogIndexes {
         var memberTables: Set<String>
         var memberTriggers: Set<String>
         var texts: Set<String>
-        /// A flat table with its triggers, and each ANN table beside one (#5230).
+        /// A flat table with its triggers, and each ANN table beside one.
         var vectors: Set<String>
     }
 
@@ -1936,12 +1936,12 @@ extension RecordLogIndexes {
     }
 
     /// Each index `documentId`'s room places on this device, by name, with how
-    /// it stands here (#5322, js-bao's `recordLogIndexStatuses`): `declined`
+    /// it stands here (js-bao's `recordLogIndexStatuses`): `declined`
     /// (declined on this device, or left out by the `deviceIndexes` default and
     /// not built), `built`, or `unbuilt` with why. An entry placed on the
     /// server only is not cached, so not listed; a local-only db3's are all
     /// listed, never `declined`. A vector index is `.building` while a model's
-    /// ANN table is being filled, and names its `mode` (#5230): `.exact` until
+    /// ANN table is being filled, and names its `mode`: `.exact` until
     /// a fill finished, then `.ann`. Every other build runs within the list's
     /// reconcile.
     static func statuses(_ sql: RecordLogSql, documentId: String, deviceIndexes: Db3DeviceIndexes) throws -> [Db3LocalIndex] {
@@ -1953,7 +1953,7 @@ extension RecordLogIndexes {
     }
 
     /// Each entry of `documentId`'s room's list the copy skipped when it last
-    /// applied it (#5241, js-bao's `recordLogIndexSkips`), sorted by name:
+    /// applied it (js-bao's `recordLogIndexSkips`), sorted by name:
     /// what ``statuses(_:documentId:deviceIndexes:)`` does not list.
     static func skips(_ sql: RecordLogSql, documentId: String) throws -> [Db3SkippedIndex] {
         try sql.rows(
@@ -1991,7 +1991,7 @@ extension RecordLogIndexes {
         return row
     }
 
-    /// The index `documentId`'s cached list names `name` (#5241), with how it
+    /// The index `documentId`'s cached list names `name`, with how it
     /// stands here and the device object a statement reads it through (the
     /// view index of a scalar entry, the table of a member entry, when built),
     /// or `nil` when the cache holds none of that name.
@@ -2010,7 +2010,7 @@ extension RecordLogIndexes {
     }
 
     /// Every device object `documentId`'s cached list names, each with the
-    /// registry name this db3 gives it (#5241): a view index by the definition
+    /// registry name this db3 gives it: a view index by the definition
     /// a scalar row wants (one physical index may serve several db3s, each
     /// naming it its own way), a member, text or vector table (and a vector
     /// index's ANN table) by the row that points at it.
@@ -2031,7 +2031,7 @@ extension RecordLogIndexes {
         return names
     }
 
-    /// The model the entry `documentId`'s list (cached or skipped) names `name` is on, or `nil` (#5241).
+    /// The model the entry `documentId`'s list (cached or skipped) names `name` is on, or `nil`.
     static func registryModel(_ sql: RecordLogSql, documentId: String, name: String) throws -> String? {
         try sql.first(
             "SELECT model FROM record_log_indexes WHERE doc_id = ? AND room_name = ? UNION ALL SELECT model FROM record_log_index_skips WHERE doc_id = ? AND room_name = ?",

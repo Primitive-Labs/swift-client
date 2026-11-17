@@ -25,14 +25,14 @@ public enum CursorDirection: Sendable, Equatable {
 /// base64-encoded as the on-wire token.
 ///
 /// A sort field whose value is SQL NULL — absent from the record, or stored as
-/// null — is represented by the ABSENCE of its key in `values` (#3228).
+/// null — is represented by the ABSENCE of its key in `values`.
 /// `PrimitiveValue` has no null case, and it needs none: the payload's null is
 /// written and read off `sortFields`, and `buildPaginationConditions` already
 /// looks values up optionally. On the wire the key is always present and
 /// carries an explicit JSON `null`, byte-compatible with js-bao.
 ///
 /// `sortDirections` are the declared per-field directions (1 or -1, one per
-/// `sortFields` entry) the cursor was minted under (#4504). A cursor is valid
+/// `sortFields` entry) the cursor was minted under. A cursor is valid
 /// only under that sort; one without them predates the field and is checked
 /// on `sortFields` alone.
 public struct CursorData: Equatable, Sendable {
@@ -89,7 +89,7 @@ public enum CursorManager {
     /// Decodes with js-bao's `decodeCursor` — standard base64 over ASCII
     /// JSON: every character above 0x7F is written as a `\uXXXX` escape, as
     /// js-bao writes it, because js-bao decodes with `atob`, which reads each
-    /// byte as one character (#4504).
+    /// byte as one character.
     public static func encodeCursor(_ data: CursorData) throws -> String {
         // The JSON shape is fixed:
         //   {"values":{...},"sortFields":[...],"direction":1|-1}
@@ -148,8 +148,8 @@ public enum CursorManager {
     }
 
     /// ``decodeCursor(_:)`` with the values as the cursor's JSON carries them.
-    /// An explicit JSON `null` is a SQL NULL, recorded as an absent key
-    /// (#3228); as a primitive it must NOT go through `jsonToPrimitive`, whose
+    /// An explicit JSON `null` is a SQL NULL, recorded as an absent key;
+    /// as a primitive it must NOT go through `jsonToPrimitive`, whose
     /// fallback would turn it into `.string("")` and compare `field = ''` — a
     /// js-bao-minted null cursor would then match nothing here.
     private static func decodePayload(_ cursor: String) throws
@@ -221,10 +221,10 @@ public enum CursorManager {
     /// for that level. Values bound to `?` come from the cursor's
     /// `values` dict.
     ///
-    /// NULL-aware (#3228), matching js-bao rule for rule. SQLite orders NULL
+    /// NULL-aware, matching js-bao rule for rule. SQLite orders NULL
     /// before every value, so absent and null sort values sit at the FRONT of
     /// an ascending output order and at the TAIL of a descending one — here,
-    /// in the Cloudflare DO's SQLite and in better-sqlite3 alike, which is why
+    /// in the server's SQLite and in better-sqlite3 alike, which is why
     /// the ORDER BY does not change. What changes is that a null cursor value
     /// no longer binds `NSNull` into a comparison, which SQLite evaluates as
     /// UNKNOWN so the next page matched nothing:
@@ -242,7 +242,7 @@ public enum CursorManager {
     /// they were.
     ///
     /// A cursor whose `sortFields`, or whose `sortDirections`, differ from the
-    /// query's throws `InvalidCursorError` (#4504): paging from it would skip
+    /// query's throws `InvalidCursorError`: paging from it would skip
     /// and repeat rows. A cursor without `sortDirections` is checked on its
     /// fields only.
     public static func buildPaginationConditions(
@@ -375,11 +375,11 @@ public enum CursorManager {
     /// - `hasMore`: `nextCursor` is only emitted when there could be
     ///   another page.
     /// - `aliasedSortFields`: the sort fields this SELECT carried under an
-    ///   internal alias because the projection omits them (#3228). Only these
+    ///   internal alias because the projection omits them. Only these
     ///   are read from their alias, so nothing a caller stored under a
     ///   similar-looking name is mistaken for a sort value.
     /// - `sortDirections`: the query's declared per-field directions, written
-    ///   into each cursor so another sort refuses it (#4504).
+    ///   into each cursor so another sort refuses it.
     public static func generateResultCursors(
         rows: [[String: JSONValue]],
         sortFields: [String],
@@ -417,7 +417,7 @@ public enum CursorManager {
     /// Build a cursor from one result row.
     ///
     /// A sort field the row does not carry is a SQL NULL and is recorded as
-    /// such (#3228) instead of throwing: `executeQuery` omits NULL columns from
+    /// such instead of throwing: `executeQuery` omits NULL columns from
     /// its row dictionaries, so every record that never wrote the sort field
     /// arrives here with no key, and a page that had already been read was
     /// failing at cursor-minting time.

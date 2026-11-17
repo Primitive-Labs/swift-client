@@ -342,7 +342,9 @@ final class TestContext: @unchecked Sendable {
         /// #3454 — `"request"`, `"task"` or `"any"`; not sent (see above).
         mode: String? = nil,
         inputSchema: [String: Any]? = nil,
-        outputSchema: [String: Any]? = nil
+        outputSchema: [String: Any]? = nil,
+        /// Extra `[function]` lines, such as `public = true`.
+        tomlExtra: String = ""
     ) async throws -> PushedFunction {
         let schemas = try Self.functionSchemaPayload(
             functionKey: functionKey, inputSchema: inputSchema, outputSchema: outputSchema
@@ -357,7 +359,7 @@ final class TestContext: @unchecked Sendable {
         }
 
         let entry = "functions/\(functionKey).ts"
-        let toml = "[function]\nkey = \"\(functionKey)\"\n" + schemas.tomlLines.map { "\($0)\n" }.joined()
+        let toml = "[function]\nkey = \"\(functionKey)\"\n" + schemas.tomlLines.map { "\($0)\n" }.joined() + tomlExtra
         let bundleData = Data(bundle.utf8)
         let contentHash = SHA256.hash(data: bundleData)
             .map { String(format: "%02x", $0) }
@@ -558,6 +560,17 @@ final class TestContext: @unchecked Sendable {
             )
         }
         return refreshToken
+    }
+
+    /// `PUT /app/{appId}/api/settings` with `body`, as the test superuser
+    /// (for example, turning `signedOutAccess` on).
+    func updateAppSettings(appId: String, body: [String: Any]) async throws {
+        let (status, answer) = try await jsonRequest(
+            method: "PUT", path: "/app/\(appId)/api/settings", body: body, jwt: superuserJWT
+        )
+        guard (200..<300).contains(status) else {
+            throw TestSetupError("Failed to update settings of \(appId): HTTP \(status) \(answer)")
+        }
     }
 
     @discardableResult

@@ -56,7 +56,7 @@ extension JsBaoClient {
 
     /// When the db3 was last used here, in epoch ms: its metadata row's
     /// `lastOpenedAt`, which its open and the close at the end of its last
-    /// subscription stamp; `nil` when no row says (#5085).
+    /// subscription stamp; `nil` when no row says.
     func db3LastUsedAt(_ documentId: String) -> Int64? {
         guard let stamp = documentManager.getLocalMetadata(documentId)?.lastOpenedAt else { return nil }
         let fractional = ISO8601DateFormatter()
@@ -153,7 +153,7 @@ extension JsBaoClient {
     /// The user a create is made for, once no identity change is in progress
     /// (a sign-out, another user's sign-in), so what it keeps here is kept in
     /// that user's storage, never in the previous user's that the change is
-    /// about to reset (#5204). The user is read when the create is called: a
+    /// about to reset. The user is read when the create is called: a
     /// further change beginning meanwhile is waited for too while the same
     /// user stays signed in, and one that signs another user in, or signs out,
     /// throws `.invalidArgument`, so nothing of the create reaches that user.
@@ -200,14 +200,14 @@ extension JsBaoClient {
         documentManager.isPendingCreate(documentId) && documentManager.documentFormat(documentId) == RecordLogTransport.documentFormat
     }
 
-    /// Why the server refused committing a db3 created here (#4921), or `nil`.
+    /// Why the server refused committing a db3 created here, or `nil`.
     func db3CreateRefusal(_ documentId: String) -> Db3StateError? {
         guard let meta = documentManager.getLocalMetadata(documentId), meta.commitRefused == true, let error = meta.commitError else { return nil }
         return Db3StateError(code: error.code ?? "DB3_CREATE_FAILED", message: error.message)
     }
 
     /// Keep a db3 `client.db3.create` makes on this device under the id it
-    /// minted (#4921): its metadata row is a pending create that commits
+    /// minted: its metadata row is a pending create that commits
     /// through `POST db3`, and its store is bound as created here, so saves
     /// and queries work at once. `commitNow` starts the commit (an online
     /// create whose request failed in a way worth retrying); otherwise the
@@ -237,7 +237,7 @@ extension JsBaoClient {
     }
 
     /// Keep a db3 `client.db3.create(title:localOnly: true)` makes under the
-    /// id it minted (#5155): its metadata row is local-only (never listed as
+    /// id it minted: its metadata row is local-only (never listed as
     /// unaccounted, never committed, never opened with sync) and its store is
     /// bound and marked local-only, so it judges and confirms its own writes.
     /// Nothing is sent. `Db3CreatedEvent` fires once. A device that cannot
@@ -315,7 +315,7 @@ extension JsBaoClient {
     }
 
     /// Whether `documentId`'s metadata row is a db3 that lives only on this
-    /// device and belongs to the signed-in user (#5155). This client's
+    /// device and belongs to the signed-in user. This client's
     /// metadata rows are app-wide, so another user's is not one.
     func isLocalOnlyDb3Row(_ documentId: String) -> Bool {
         guard let meta = documentManager.getLocalMetadata(documentId),
@@ -325,7 +325,7 @@ extension JsBaoClient {
     }
 
     /// Whether `documentId`'s metadata row is a db3 that lives only on this
-    /// device and belongs to another user (#5155): nothing of this user's
+    /// device and belongs to another user: nothing of this user's
     /// may remove its only copy.
     func isOtherUsersLocalOnlyDb3Row(_ documentId: String) -> Bool {
         guard let meta = documentManager.getLocalMetadata(documentId),
@@ -334,15 +334,15 @@ extension JsBaoClient {
         return !isLocalOnlyDb3Row(documentId)
     }
 
-    /// Whether a db3 lives only on this device, as this client knows now
-    /// (#5155): its metadata row says so, or its bound store's mark does.
+    /// Whether a db3 lives only on this device, as this client knows now:
+    /// its metadata row says so, or its bound store's mark does.
     func isLocalOnlyDb3Known(_ documentId: String) -> Bool {
         if isLocalOnlyDb3Row(documentId) { return true }
         guard let binding = recordLogBinding(documentId), !binding.isClosed else { return false }
         return binding.isLocalOnly
     }
 
-    /// Whether a db3 lives only on this device (#5155), read without the
+    /// Whether a db3 lives only on this device, read without the
     /// network: its metadata row or its bound store's mark says so, else,
     /// with no row to say otherwise, the store's stored state (a row lost
     /// while the store kept its mark).
@@ -353,7 +353,7 @@ extension JsBaoClient {
     }
 
     /// `DB3_LOCAL_ONLY`: `call` would reach the server about a db3 that lives
-    /// only on this device (#5155). `details.db3Id` names it.
+    /// only on this device. `details.db3Id` names it.
     static func db3LocalOnlyError(_ db3Id: String, call: String, instead: String? = nil) -> JsBaoError {
         JsBaoError(
             code: .db3LocalOnly,
@@ -364,7 +364,7 @@ extension JsBaoClient {
     }
 
     /// Refuse `call` on a db3 that lives only on this device, before anything
-    /// local changes or any request is made (#5155). Read without the network.
+    /// local changes or any request is made. Read without the network.
     func assertNotLocalOnlyDb3(_ documentId: String, call: String, instead: String? = nil) async throws {
         guard await isLocalOnlyDb3(documentId) else { return }
         throw Self.db3LocalOnlyError(
@@ -374,14 +374,14 @@ extension JsBaoClient {
     }
 
     /// A db3 living only on this device that a request's path or JSON body
-    /// names, as this client knows now, or `nil` (#5155): the client's
+    /// names, as this client knows now, or `nil`: the client's
     /// transport refuses every such request, so no member naming a document
     /// by its id can send one.
     func localOnlyDb3Named(path: String, body: Data?) -> String? {
         Self.db3IdsNamed(path: path, body: body).first { isLocalOnlyDb3Known($0) }
     }
 
-    /// ``localOnlyDb3Named(path:body:)``, read durably (#5155): besides what
+    /// ``localOnlyDb3Named(path:body:)``, read durably: besides what
     /// this client knows now, the local-only db3s the signed-in user's store
     /// holds, so a request made before the stored db3s are bound or their
     /// rows read (at start-up, or with a row lost) is checked against the
@@ -401,7 +401,7 @@ extension JsBaoClient {
 
     /// The local-only db3s the signed-in user's store held when first asked
     /// this session, read once per user once storage setup has restored the
-    /// session (#5155). A read that fails is not kept, so the next request reads again.
+    /// session. A read that fails is not kept, so the next request reads again.
     private func storedLocalOnlyDb3Ids() async -> Set<String> {
         _ = await waitForStorageReady()
         guard let userId = authController.getUserId(), !userId.isEmpty else { return [] }
@@ -432,7 +432,7 @@ extension JsBaoClient {
         }
     }
 
-    /// A local-only db3 bound here, binding it first when it is stored and not yet bound (#5155).
+    /// A local-only db3 bound here, binding it first when it is stored and not yet bound.
     private func boundLocalOnlyDb3(_ documentId: String) async throws -> RecordLogDocumentBinding {
         if recordLogBinding(documentId) == nil { try await bindStoredDb3(documentId) }
         guard let binding = recordLogBinding(documentId), !binding.isClosed, binding.isLocalOnly else {
@@ -441,7 +441,7 @@ extension JsBaoClient {
         return binding
     }
 
-    /// A local-only db3's refusal of an index call, naming the db3 (#5155).
+    /// A local-only db3's refusal of an index call, naming the db3.
     private func localIndexRefusal(_ documentId: String, _ error: Error) -> Error {
         guard let refused = error as? JsBaoError else { return error }
         var details = refused.details ?? [:]
@@ -450,7 +450,7 @@ extension JsBaoClient {
     }
 
     /// The indexes the db3's room places on this device, with how each stands
-    /// here (#5322, `client.db3.indexes.local`): read from the bound store, so
+    /// here (`client.db3.indexes.local`): read from the bound store, so
     /// nothing is sent. `.db3NotResident` for a db3 not bound here.
     func deviceDb3Indexes(_ documentId: String) async throws -> [Db3LocalIndex] {
         guard let binding = recordLogBinding(documentId), !binding.isClosed else { throw db3NotResidentError([documentId]) }
@@ -458,15 +458,15 @@ extension JsBaoClient {
     }
 
     /// The entries of the db3's room's list its copy here skipped, with why
-    /// (#5241, `client.db3.indexes.skipped`): read from the bound store, so
+    /// (`client.db3.indexes.skipped`): read from the bound store, so
     /// nothing is sent. `.db3NotResident` for a db3 not bound here, as `local` is.
     func deviceDb3IndexSkips(_ documentId: String) async throws -> [Db3SkippedIndex] {
         guard let binding = recordLogBinding(documentId), !binding.isClosed else { throw db3NotResidentError([documentId]) }
         return try binding.withOperation { try binding.store.localIndexSkips() }
     }
 
-    /// Decline or accept an index on this device (#5322,
-    /// `client.db3.indexes.decline`/`accept`): the store drops or builds it in
+    /// Decline or accept an index on this device
+    /// (`client.db3.indexes.decline`/`accept`): the store drops or builds it in
     /// the one call, its state is read again, and nothing is sent.
     func changeDeviceDb3Index(_ documentId: String, name: String, decline: Bool) async throws -> Db3LocalIndex {
         guard let binding = recordLogBinding(documentId), !binding.isClosed else { throw db3NotResidentError([documentId]) }
@@ -482,12 +482,12 @@ extension JsBaoClient {
         return status
     }
 
-    /// A local-only db3's index list, kept on the device (#5155).
+    /// A local-only db3's index list, kept on the device.
     func localDb3Indexes(_ documentId: String) async throws -> [Db3Index] {
         try await boundLocalOnlyDb3(documentId).localIndexes
     }
 
-    /// Register an index on a local-only db3 on the device, by the room's rules (#5155).
+    /// Register an index on a local-only db3 on the device, by the room's rules.
     func registerLocalDb3Index(_ documentId: String, _ registration: Db3IndexRegistration) async throws -> Db3Index {
         let binding = try await boundLocalOnlyDb3(documentId)
         do {
@@ -497,7 +497,7 @@ extension JsBaoClient {
         }
     }
 
-    /// Drop an index of a local-only db3 on the device, by the room's rules (#5155).
+    /// Drop an index of a local-only db3 on the device, by the room's rules.
     func dropLocalDb3Index(_ documentId: String, name: String) async throws {
         let binding = try await boundLocalOnlyDb3(documentId)
         do {
@@ -520,7 +520,7 @@ extension JsBaoClient {
     /// A ULID, as the ids a request's path or body may name are written.
     private static let ulidText = try! NSRegularExpression(pattern: "[0-9A-HJKMNP-TV-Z]{26}")
 
-    /// A pending db3 create committed (#4921): adopt the server's answer,
+    /// A pending db3 create committed: adopt the server's answer,
     /// read the db3's state again and fire `Db3CreatedEvent`.
     func db3CreateCommitted(_ db3Id: String, info: Db3Info) async {
         await adoptServerCreatedDb3(db3Id, info: info, session: metadataSessionToken)
@@ -589,7 +589,7 @@ extension JsBaoClient {
         connectToSharedModels(documentId: documentId, doc: YDocument())
     }
 
-    /// Adopt a db3 the server just created for this account (#4806): write its
+    /// Adopt a db3 the server just created for this account: write its
     /// metadata row from the answer, bind its store, and mark a fresh store
     /// caught up at cursor 0, so it is resident from the answer on: it
     /// answers reads and takes writes before any socket, and its first
@@ -604,7 +604,7 @@ extension JsBaoClient {
     /// (which refuses every member of a sync-off db3) and is answered by its
     /// room.
     ///
-    /// Only a db3 the signed-in user holds is adopted (#5054, the JS rule): one
+    /// Only a db3 the signed-in user holds is adopted (the JS rule): one
     /// created for another user or held by the app is only known as a db3.
     /// `permission` is the level the create asked for, which the answer does
     /// not carry: it is the metadata row's level, and a `.reader` copy's store
@@ -744,8 +744,8 @@ extension JsBaoClient {
         return empty ? nil : state
     }
 
-    /// Clear the device's index policy for a db3 deleted by this client
-    /// (#5322): only `client.db3.delete` does; an evict keeps it.
+    /// Clear the device's index policy for a db3 deleted by this client:
+    /// only `client.db3.delete` does; an evict keeps it.
     func clearDb3IndexPolicy(_ documentId: String) async {
         guard let host = await db3Host() else { return }
         do {

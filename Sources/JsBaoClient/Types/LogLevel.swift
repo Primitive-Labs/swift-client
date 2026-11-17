@@ -8,7 +8,7 @@ import Foundation
 /// `.none` silences the client entirely.
 ///
 /// Lives here rather than next to the internal `Logger` it configures: the
-/// logger is module-internal plumbing, this enum is public API (#2363).
+/// logger is module-internal plumbing, this enum is public API.
 public enum LogLevel: Int, Sendable, Comparable {
     case verbose = 0
     case debug = 1

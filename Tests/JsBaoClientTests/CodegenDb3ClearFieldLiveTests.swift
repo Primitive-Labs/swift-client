@@ -6,6 +6,7 @@ import XCTest
 ///
 /// The room's row shows the field null (or absent) while the other fields
 /// stay, and a second client opening the db3 afterwards reads it as nil.
+@available(*, deprecated)
 final class CodegenDb3ClearFieldLiveTests: XCTestCase {
 
     private var ctx: TestContext!

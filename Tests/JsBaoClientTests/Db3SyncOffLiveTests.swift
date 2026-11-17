@@ -13,6 +13,7 @@ import XCTest
 /// that was offline across the flip hears the same once it reconnects, and
 /// its queued write still needs `force` to evict. A revoked grant on a synced
 /// db3 still reports `.permission`.
+@available(*, deprecated)
 final class Db3SyncOffLiveTests: XCTestCase {
 
     private var ctx: TestContext!

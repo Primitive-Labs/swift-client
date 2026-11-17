@@ -11,6 +11,7 @@ import XCTest
 /// leaves the state the save validates, so a cleared required field is
 /// refused and a unique constraint over it is not enforced. A format-1
 /// document saves as before.
+@available(*, deprecated)
 final class CodegenDb3ClearFieldHermeticTests: XCTestCase {
 
     private static let db3Id = "01JD5021C1EARF1E1DXXXXXXXX"

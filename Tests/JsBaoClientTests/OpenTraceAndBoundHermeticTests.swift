@@ -14,6 +14,7 @@ import YSwift
 /// Server-free: a loopback WebSocket server the client really connects to,
 /// frames pushed through it onto the client's own receive loop, and a loopback
 /// HTTP server standing in for the R2 download.
+@available(*, deprecated)
 final class OpenTraceAndBoundHermeticTests: XCTestCase {
 
     /// Lines captured off every logger in the process, with their scope.

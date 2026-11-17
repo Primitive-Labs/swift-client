@@ -10,6 +10,7 @@ import XCTest
 /// `_score` (to 1e-9) for a string, `all`, `any`, `prefix`, `fields`, a
 /// phrase and every hostile input; a ranked cursor either mints pages the
 /// other's query.
+@available(*, deprecated)
 final class Db3TextSearchParityLiveTests: XCTestCase {
 
     private var ctx: TestContext!

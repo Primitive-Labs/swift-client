@@ -136,9 +136,9 @@ public struct BucketBlobInfo: Decodable, Sendable, Equatable {
 /// Mirrors JS `BucketBlobListResult`.
 public struct BucketBlobListResult: Decodable, Sendable, Equatable {
     public let items: [BucketBlobInfo]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -195,7 +195,7 @@ public struct BlobDeletedResult: Decodable, Sendable, Equatable {
     public let deleted: Bool
 }
 
-/// Result of a batch blob delete (#1455) via `delete(bucketIdOrKey:blobIds:)`.
+/// Result of a batch blob delete via `delete(bucketIdOrKey:blobIds:)`.
 /// Mirrors JS's `BatchBlobDeleteResult` — `{ deleted, blobIds, bucketId }`,
 /// returned by `POST /blob-buckets/:bucketId/blobs/delete`.
 public struct BatchBlobDeleteResult: Decodable, Sendable, Equatable {

@@ -65,7 +65,7 @@ final class WebSocketTransportSnapshot: @unchecked Sendable {
     }
 
     /// The current task's socket has opened (`didOpenWithProtocol`). Before
-    /// the server's `ready` (#5578) it is open without being connected.
+    /// the server's `ready` it is open without being connected.
     var opened: Bool { lock.withLock { _opened } }
 
     /// Record the current task's open.
@@ -99,7 +99,7 @@ final class WebSocketTransportSnapshot: @unchecked Sendable {
     }
 
     /// Whether the socket is open, connected or still waiting for the server's
-    /// `ready` (#5578): the live `state`, like `socketIsOpen`, but not gated on
+    /// `ready`: the live `state`, like `socketIsOpen`, but not gated on
     /// `connected`. What decides that an applied token goes to the socket
     /// rather than to the next handshake.
     var transportIsOpen: Bool {

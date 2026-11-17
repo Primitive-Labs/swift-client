@@ -18,6 +18,7 @@ import XCTest
 ///
 /// The connection serves a document's permission from a cache for up to 5 s,
 /// so each contact that must see a grant change waits that out first.
+@available(*, deprecated)
 final class Db3GoneLiveTests: XCTestCase {
 
     private var ctx: TestContext!

@@ -45,7 +45,7 @@ struct DocumentListEnvelope: Decodable, Sendable {
     /// the *whole* scope — `documents.list`'s reconciliation walk — must treat
     /// a bare array as "completeness unknown", because the unpaged
     /// `GET /documents` truncates at the server's default query limit and says
-    /// nothing about it (#2827).
+    /// nothing about it.
     let isBareArray: Bool
     /// The envelope's own answer to "are there more rows after these?" —
     /// `hasMore` when the body carried it, otherwise inferred from the presence
@@ -57,7 +57,7 @@ struct DocumentListEnvelope: Decodable, Sendable {
     /// A JSON object without it decodes to an empty page, and an empty page
     /// read as the whole scope evicts every cached document — so a body that
     /// never mentioned the rows it is supposed to be listing must not be read
-    /// as one (#2827).
+    /// as one.
     let listsItems: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -90,7 +90,7 @@ struct DocumentListEnvelope: Decodable, Sendable {
 /// A bare array carries no continuation token, so it normalizes to a single
 /// page — `hasMore: false`, no cursor — which is what the JS client, the CLI,
 /// and web-admin all do with the same body. Without this the published client
-/// throws while a rolling upgrade is in flight (#2245).
+/// throws while a rolling upgrade is in flight.
 ///
 /// As with `DocumentListEnvelope`, the probe is shape tolerance, not
 /// malformed-body tolerance: the array is tried first because the keyed

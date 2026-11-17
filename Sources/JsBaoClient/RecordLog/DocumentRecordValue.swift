@@ -3,7 +3,7 @@ import Foundation
 /// A value a model-free write (`client.db3.records(_:)`) carries in a
 /// field of a format-3 document: a string, a number, a boolean, `null`, a
 /// string set, a change that edits a string set in place, or a vector's
-/// numbers (#5225).
+/// numbers.
 ///
 /// Literals build the first five, so a write reads as data:
 ///
@@ -29,7 +29,7 @@ public enum DocumentRecordValue: Sendable {
     /// then `remove` the ones named, then `add` adds. A create takes `add` only.
     /// A change of nothing still makes the field a string set.
     case setChange(add: [String] = [], remove: [String] = [], clear: Bool = false)
-    /// A vector field's numbers (#5225): written as the base64 of the field's
+    /// A vector field's numbers: written as the base64 of the field's
     /// encoding, the db3's type's or a registered model's. Numbers for a field
     /// this device does not know to be a vector are refused
     /// `.documentEntryInvalid`; its stored base64 can be written as a string.

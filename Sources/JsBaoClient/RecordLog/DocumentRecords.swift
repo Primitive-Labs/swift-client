@@ -7,7 +7,7 @@ import Foundation
 /// field holds a ``DocumentRecordValue``: a string, a number, a boolean,
 /// `null` or a string set, and a set can be edited in place with
 /// `.setChange(add:remove:clear:)`. A vector field the db3's type or a
-/// registered model declares (#5225) is written as `.vector([Float])` and read
+/// registered model declares is written as `.vector([Float])` and read
 /// as an array of its numbers (`floatArrayValue`); any other field is left as
 /// it is stored. Reads answer from the document's local
 /// copy at once, offline too; writes show there at once and reach the room
@@ -117,7 +117,7 @@ public final class DocumentRecords: Sendable {
         return try binding.store.read(model: model, id: id).map { PrimitiveRow(raw: Self.decoded($0, model, binding)) }
     }
 
-    /// `row` with each vector field this device knows read as its numbers (#5225).
+    /// `row` with each vector field this device knows read as its numbers.
     private static func decoded(_ row: RecordLogRow, _ model: String, _ binding: RecordLogDocumentBinding) -> RecordLogRow {
         binding.decodedVectors(row, model: model, encodings: binding.vectorEncodings(model: model))
     }
@@ -137,7 +137,7 @@ public final class DocumentRecords: Sendable {
         -> PagedQueryResult<PrimitiveRow>
     {
         let binding = try readable()
-        let page = try binding.store.queryView(model, filter ?? [:], options: options)
+        let page = try binding.store.queryView(model, filter ?? [:], options: options, cleared: binding.heldCleared)
         let encodings = binding.vectorEncodings(model: model)
         return PagedQueryResult(
             data: page.data.map { PrimitiveRow(raw: binding.decodedVectors($0, model: model, encodings: encodings)) },
@@ -148,7 +148,8 @@ public final class DocumentRecords: Sendable {
     /// How many records of `model` match `filter`, matched as ``query(_:_:options:)`` matches;
     /// with `maxDrift`, refused as a query is.
     public func count(_ model: String, _ filter: DocumentFilter? = nil, maxDrift: Db3MaxDrift? = nil) throws -> Int {
-        try readable().store.countView(model, filter ?? [:], maxDrift: maxDrift)
+        let binding = try readable()
+        return try binding.store.countView(model, filter ?? [:], maxDrift: maxDrift, cleared: binding.heldCleared)
     }
 
     /// Explain how this device answers a read of `model`: the read runs on the
@@ -175,7 +176,8 @@ public final class DocumentRecords: Sendable {
     ///   `.invalidArgument` for an empty index name. Refused as a query is on
     ///   a copy that is not here.
     public func explain(_ model: String, _ request: Db3ExplainRequest) throws -> Db3Explain {
-        try readable().store.explainView(model, request)
+        let binding = try readable()
+        return try binding.store.explainView(model, request, cleared: binding.heldCleared)
     }
 
     /// Call `callback` after any change to `model`'s records in this document:
@@ -250,7 +252,7 @@ public final class DocumentRecords: Sendable {
     }
 
     /// `data` with each vector's numbers as the stored base64 of its field's
-    /// encoding (#5225), refused as ``RecordLogDocumentBinding/encodedVectors(_:numbers:model:id:kind:)`` refuses.
+    /// encoding, refused as ``RecordLogDocumentBinding/encodedVectors(_:numbers:model:id:kind:)`` refuses.
     private static func encodedVectors(
         _ data: [String: DocumentRecordValue], binding: RecordLogDocumentBinding, model: String, id: String,
         kind: RecordLogRecordWriteKind

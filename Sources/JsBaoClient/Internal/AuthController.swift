@@ -2,14 +2,14 @@ import Foundation
 
 /// Manages authentication state, token lifecycle, OAuth flows, and offline access.
 ///
-/// ## A sync-adjacent boundary type (#1993 Phase D)
+/// ## A sync-adjacent boundary type
 ///
 /// The concurrency epic actorized the async service managers (`OfflineStore`,
 /// `KvCache`, `AnalyticsQueue`). This controller was deliberately left out of
 /// that set by the sponsor (Fork 2, Option A): it has 13 synchronous public
 /// members that callers reach from synchronous contexts, and `HttpClient`'s
 /// 401 path calls into it, so converting it belongs in its own change. That
-/// conversion is tracked as #2173. Until then the class-plus-lock model here is
+/// conversion is tracked separately. Until then the class-plus-lock model here is
 /// the contract, and this argument is what stands in for compiler checking.
 ///
 /// ## `@unchecked Sendable` safety argument
@@ -65,10 +65,10 @@ import Foundation
 /// deallocation. Same exception, same reasoning, as the sync domain's
 /// `DynamicModel`.
 ///
-/// Known gap, closed: the design pass for #1993 recorded an unsynchronized read
-/// of the backoff delay while building the `authRefreshDeferred` payload
-/// (#2174). #2022's rewrite replaced that read with the `Decision` enum above,
-/// which carries the delay out of the locked region as a value, so the race no
+/// Known gap, closed: an earlier design pass recorded an unsynchronized read
+/// of the backoff delay while building the `authRefreshDeferred` payload. A
+/// later rewrite replaced that read with the `Decision` enum above, which
+/// carries the delay out of the locked region as a value, so the race no
 /// longer exists on this tree.
 public final class AuthController: @unchecked Sendable {
     private let lock = NSLock()
@@ -227,7 +227,7 @@ public final class AuthController: @unchecked Sendable {
     /// Called with every token the controller applies, from any path —
     /// bootstrap, an interactive login, a background refresh, a token the
     /// server pushed — together with the token it replaced. `JsBaoClient`
-    /// installs a handler that re-authenticates an open WebSocket (#2660); the
+    /// installs a handler that re-authenticates an open WebSocket; the
     /// previous token is what lets it tell a rotation of the same identity,
     /// which the socket can adopt in band, from a switch to a different user,
     /// which it cannot.
@@ -318,7 +318,7 @@ public final class AuthController: @unchecked Sendable {
     /// it, so nothing changed from the app's point of view, and the client
     /// opens its own socket during init. This mirrors JS
     /// `authController.bootstrapToken`, which deliberately skips
-    /// `applyTokenEffects` (#2657, audit item A10).
+    /// `applyTokenEffects` (audit item A10).
     ///
     /// Silent on events, NOT on storage: the constructor token still has to
     /// reach the JWT store, or the next session has nothing to restore
@@ -386,7 +386,7 @@ public final class AuthController: @unchecked Sendable {
     ///
     /// An unnamed cause is `"manual"` — the JS client's default for a direct
     /// `setToken` (`JsBaoClient.setToken`), which is what this entry point is
-    /// (#2657, audit item A10).
+    /// (audit item A10).
     ///
     /// This is the app handing the client a token it obtained itself, so it is
     /// an explicit sign-in whatever the caller names it: the cause travels on
@@ -428,7 +428,7 @@ public final class AuthController: @unchecked Sendable {
     /// token it obtained itself, which is a sign-in and not the in-flight
     /// refresh the guard exists to catch. Leaving it out meant an app doing
     /// its own auth could never sign back in after a `logout()` — JS, which
-    /// has no guard at all, just signs in (#2657, audit item A3). Internal
+    /// has no guard at all, just signs in (audit item A3). Internal
     /// applications keep their own causes (`httpRefresh`,
     /// `persisted-hydrate`, `token_refresh` for the server push), so they stay
     /// blocked.
@@ -453,7 +453,7 @@ public final class AuthController: @unchecked Sendable {
     /// (`authController.getUserId`); `sub` is the last resort JS keeps in
     /// `extractUserIdFromPayload` and swift-client has always had. Reading only
     /// the top level meant a token carrying just the canonical claim — what the
-    /// server issues — looked signed out (#2657, audit item A11).
+    /// server issues — looked signed out (audit item A11).
     static func extractUserId(from payload: [String: Any]?) -> String? {
         guard let payload else { return nil }
         let nested = (payload["user"] as? [String: Any])?["userId"] as? String
@@ -483,7 +483,7 @@ public final class AuthController: @unchecked Sendable {
     ///   empty session, and an app that shows a login screen at launch can
     ///   complete `otpVerify` while that refresh is still in flight. Without
     ///   the guard an older `rt-{appId}` cookie — possibly a different user's —
-    ///   would replace the session the user just signed into (#2656).
+    ///   would replace the session the user just signed into.
     /// - Parameter explicitSignIn: the application came through the public
     ///   token API, so it is a sign-in whatever its cause string says. Only
     ///   `updateToken` passes it.
@@ -627,8 +627,7 @@ public final class AuthController: @unchecked Sendable {
     /// Queue the configured JWT persistence for a token that has just been
     /// installed. Every path that installs one calls this, `bootstrapToken`
     /// included — that path emits nothing, but a constructor token never
-    /// written to storage leaves the next session with nothing to restore
-    /// (#2657).
+    /// written to storage leaves the next session with nothing to restore.
     private func schedulePersist(_ token: String?) {
         guard let token else { return }
         lock.withLock { schedulePersistLocked(token) }
@@ -640,7 +639,7 @@ public final class AuthController: @unchecked Sendable {
     ///
     /// Each write is chained onto the one before it rather than replacing the
     /// handle. `awaitPendingPersistence()` is the barrier the sign-out paths
-    /// take before deleting the record (#2655), and a bare "latest task wins"
+    /// take before deleting the record, and a bare "latest task wins"
     /// handle would let an earlier, slower write finish AFTER that delete and
     /// resurrect the session the user just ended. Chaining also keeps two
     /// writes from reaching the store out of order. The read-modify-write of
@@ -723,7 +722,7 @@ public final class AuthController: @unchecked Sendable {
     }
 
     /// Causes that identify the launch-time refresh — the one that runs before
-    /// the app has a session, rather than refreshing an existing one (#2656).
+    /// the app has a session, rather than refreshing an existing one.
     ///
     /// Two consequences hang off it: its rejection is a silent signed-out start
     /// (no `authFailed`, the port of JS's `shouldEmitAuthFailed` check in
@@ -748,7 +747,7 @@ public final class AuthController: @unchecked Sendable {
 
     /// The `authFailed` event a rejected refresh delivers to the app, or `nil`
     /// when this cause delivers none. Port of the JS client's TWO emit sites,
-    /// which between them decide the whole table (#2723):
+    /// which between them decide the whole table:
     ///
     ///   * `handleRefreshOutcome` (src/client/internal/authController.ts) emits
     ///     for every cause EXCEPT `"http-request"` and `"bootstrap:refresh"`,
@@ -853,7 +852,6 @@ public final class AuthController: @unchecked Sendable {
     /// dropped — which emits `authState{authenticated:false}` through
     /// `applyToken` — and the persisted JWT record is deleted so the next
     /// launch does not restore a session the server has already ended.
-    /// Issue #2655.
     ///
     /// `sessionAtStart` is the token the refresh set out to renew, and the
     /// sign-out is a compare-and-clear against it. A refresh round trip is not
@@ -864,7 +862,7 @@ public final class AuthController: @unchecked Sendable {
     /// the rejection refers to a session that is no longer current, and clearing
     /// the token — or deleting the persisted record, which belongs to the new
     /// session — would sign out a user the server never rejected. This is the
-    /// rejection-side mirror of the `applyToken(onlyWhenSignedOut:)` guard #2656
+    /// rejection-side mirror of the `applyToken(onlyWhenSignedOut:)` guard
     /// added on the success side; JS, single-threaded, cannot interleave here.
     private func handleRefreshFailure(sessionAtStart: String?) async {
         // Checked inside `applyToken`'s critical section: reading the current
@@ -1068,7 +1066,7 @@ public final class AuthController: @unchecked Sendable {
     }
 
     /// Refresh the access token in answer to a server auth challenge — an HTTP
-    /// 401, or an `auth_required` / `auth_failed` WebSocket frame (#2660).
+    /// 401, or an `auth_required` / `auth_failed` WebSocket frame.
     ///
     /// The cause is the fixed string `"ws-challenge"`, matching the JS client,
     /// so an app watching `authRefreshDeferred` reads the same value on both
@@ -1224,7 +1222,7 @@ public final class AuthController: @unchecked Sendable {
     /// Exchange a native Sign in with Apple credential for a session token.
     /// `POST /auth/apple/callback` with the JSON body
     /// `{identityToken, nonce, user, email?, firstName?, lastName?, inviteToken?}` —
-    /// the contract of the server's `AppleAuthController` (#409):
+    /// the contract of the server's `AppleAuthController`:
     ///  * `identityToken` — Apple's JWT (`credential.identityToken`, UTF-8).
     ///  * `nonce` — the **raw** nonce; the client put its SHA-256 (lowercase
     ///    hex) on `ASAuthorizationAppleIDRequest.nonce`, and the server
@@ -1232,7 +1230,7 @@ public final class AuthController: @unchecked Sendable {
     ///  * `user` — Apple's stable user identifier (`credential.user`).
     ///  * `email` / `firstName` / `lastName` — first-authorization hints
     ///    (Apple only provides them once per user+app).
-    ///  * `inviteToken` — optional invitation token (#1467); the server
+    ///  * `inviteToken` — optional invitation token; the server
     ///    accepts the invitation and resolves its deferred grants during a
     ///    first sign-in. Omitted from the body when nil or empty.
     /// The response is `{token, isNewUser}` plus the `rt-{appId}` HttpOnly
@@ -1477,7 +1475,7 @@ public final class AuthController: @unchecked Sendable {
     /// or empty `redirectUri` takes the configured default. A target that is
     /// sent must match the app's non-empty `emailRedirectUris` allow-list, or
     /// the request is rejected 400 `Invalid redirect URI`; the client does not
-    /// retry without it (#2967).
+    /// retry without it.
     public func emailSignInRequest(
         email: String,
         redirectUri: String? = nil
@@ -1631,7 +1629,7 @@ public final class AuthController: @unchecked Sendable {
     // `AuthAPI+NativePasskeys.swift`; these methods only speak HTTP.
 
     /// The body a passkey `start` request carries: `{ rpId }` when a relying
-    /// party is named for this ceremony, else `{}` (#3024).
+    /// party is named for this ceremony, else `{}`.
     ///
     /// The call's `rpId` wins over `AuthConfig.passkeyRpId`; a blank one names
     /// nothing, and the server then falls back to the request's `Origin` —
@@ -1649,7 +1647,7 @@ public final class AuthController: @unchecked Sendable {
     /// straight to `PasskeyWire` / AuthenticationServices.
     ///
     /// `rpId` names the relying party the ceremony runs against, defaulting to
-    /// `AuthConfig.passkeyRpId` (#3024).
+    /// `AuthConfig.passkeyRpId`.
     public func passkeyAuthStart(
         rpId: String? = nil
     ) async throws -> PasskeyAuthStartResult {
@@ -1695,7 +1693,7 @@ public final class AuthController: @unchecked Sendable {
     /// `POST /passkey/register/start` (requires auth). WebAuthn creation
     /// options plus `challengeToken`, same split as `passkeyAuthStart` —
     /// including the optional `rpId` naming the relying party to register the
-    /// passkey under (#3024).
+    /// passkey under.
     public func passkeyRegisterStart(
         rpId: String? = nil
     ) async throws -> PasskeyRegisterStartResult {
@@ -1728,7 +1726,7 @@ public final class AuthController: @unchecked Sendable {
     }
 
     /// `POST /passkey/register/finish` (requires auth). Returns
-    /// `{ success, credentialBackedUp?, invitation? }`. `inviteToken` (#466)
+    /// `{ success, credentialBackedUp?, invitation? }`. `inviteToken`
     /// folds invitation acceptance into the registration call.
     public func passkeyRegisterFinish(
         credential: JSONValue,
@@ -1851,7 +1849,7 @@ public final class AuthController: @unchecked Sendable {
     var onLogoutDisconnect: (@Sendable () async -> Void)?
 
     /// Client-owned logout cleanup, awaited on EVERY logout before
-    /// `onLogoutDisconnect` and before `AuthLogoutCompleteEvent` (#2874).
+    /// `onLogoutDisconnect` and before `AuthLogoutCompleteEvent`.
     /// Mirrors the JS `onLogoutCleanup` dependency: close every open
     /// document, reset user-scoped document state, and — under `wipeLocal` —
     /// purge the local stores. Wired by `JsBaoClient` the same way
@@ -1912,7 +1910,7 @@ public final class AuthController: @unchecked Sendable {
 
     /// A persisted access token is refused this close to its expiry, on both
     /// the read and the write side. Port of the JS client's
-    /// `jwtPersistenceLeewayMs = 120_000` (#2656): a token about to expire is
+    /// `jwtPersistenceLeewayMs = 120_000`: a token about to expire is
     /// worth less than the refresh it would suppress, and one already in
     /// storage would only be handed to the network a moment before it lapses.
     private static let jwtPersistenceLeewaySeconds: TimeInterval = 120
@@ -1998,9 +1996,9 @@ public final class AuthController: @unchecked Sendable {
     ///
     /// Step 2 runs whenever there is no usable token — it is **not** gated on
     /// `persistJwtInStorage` (off by default) and not on a persisted record
-    /// existing. That gate was #2656: with the default options every launch
-    /// started signed out even though the refresh cookie was sitting right
-    /// there, while the same app on the JS client resumed. JS's
+    /// existing. That gate was removed: with the default options every
+    /// launch started signed out even though the refresh cookie was sitting
+    /// right there, while the same app on the JS client resumed. JS's
     /// `runAuthBootstrap` refreshes whenever `this.token` is empty, and this is
     /// the port of that.
     ///
@@ -2255,8 +2253,8 @@ public final class AuthController: @unchecked Sendable {
     ///
     /// Strips a single trailing slash off the base so a trailing-slash config
     /// (`.../proxy/`) yields `.../proxy/auth/refresh` rather than a
-    /// double-slash `.../proxy//auth/refresh` that strict proxy routes 404
-    /// (#1983). Matches the JS client's `new URL(suffix, proxyBase)`.
+    /// double-slash `.../proxy//auth/refresh` that strict proxy routes 404.
+    /// Matches the JS client's `new URL(suffix, proxyBase)`.
     static func proxyUrl(proxy: RefreshProxyConfig, suffix: String) -> String {
         let base = proxy.baseUrl.hasSuffix("/") ? String(proxy.baseUrl.dropLast()) : proxy.baseUrl
         return "\(base)/\(suffix)"
@@ -2267,7 +2265,7 @@ public final class AuthController: @unchecked Sendable {
     /// The proxy endpoints are absolute URLs, and the transport's `path` is
     /// always resolved against `apiUrl + /app/{appId}/api` — passing one as a
     /// path produced `https://api…/app/{id}/api/https://proxy…` and no verify
-    /// could ever succeed in proxy mode (#2658). These requests also carry no
+    /// could ever succeed in proxy mode. These requests also carry no
     /// bearer token, so they intentionally never run the refresh interceptor.
     ///
     /// Non-2xx surfaces as `HttpError` with the server's `{error, code}`
@@ -2350,7 +2348,6 @@ public final class AuthController: @unchecked Sendable {
     /// The direct (non-proxy) path gets the same classification from
     /// `Transport.decodeOptional`, which also decodes into an Optional so a
     /// bare `null` reads as "no document" rather than a decode failure.
-    /// Issue #2655.
     static func tokenFromRefreshBody(_ data: Data) throws -> String {
         // Zero bytes or nothing but JSON whitespace: no document at all, the
         // `text ? … : null` arm. (`Transport.isEffectivelyEmpty` applies the
@@ -2375,7 +2372,7 @@ public final class AuthController: @unchecked Sendable {
     /// cookie and a later launch cannot mint a new access token from it.
     /// Mirrors step 1 of the JS `JsBaoClient.logout()`; every failure is
     /// swallowed, because a server that cannot be reached must not stop the
-    /// local sign-out. Issue #2655.
+    /// local sign-out.
     private func postServerLogout() async {
         if let proxy = refreshProxy, proxy.enabled {
             let base = proxy.baseUrl.hasSuffix("/") ? String(proxy.baseUrl.dropLast()) : proxy.baseUrl
@@ -2432,7 +2429,7 @@ struct RefreshResponse: Decodable, Sendable {
 
 /// A refresh that succeeded at the HTTP level but carried no usable token.
 /// Distinguishes the JS `"invalid"` case from the decode failures that stay
-/// retryable. Issue #2655.
+/// retryable.
 struct RefreshTokenMissingError: Error {}
 
 // The three verify envelopes below carry no `token` field: the token is read

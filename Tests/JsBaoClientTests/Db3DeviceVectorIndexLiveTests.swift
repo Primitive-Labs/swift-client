@@ -13,6 +13,7 @@ import XCTest
 ///   building, built ann and declined; `accept` builds it and installs the
 ///   listed model; `decline` drops its tables; `Db3StateEvent` fires at the
 ///   install, the fill's end and the model's drop.
+@available(*, deprecated)
 final class Db3DeviceVectorIndexLiveTests: XCTestCase {
 
     private typealias V = Db3VectorLive

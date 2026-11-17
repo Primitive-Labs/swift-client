@@ -17,6 +17,7 @@ import XCTest
 /// - 6: a stored copy with no metadata row, subscribed with networking
 ///   stopped, is a db3 by its store: the open binds it, `available()` returns
 ///   and its format is recorded as 3.
+@available(*, deprecated)
 final class Db3AvailableReadableLiveTests: XCTestCase {
 
     private var ctx: TestContext!

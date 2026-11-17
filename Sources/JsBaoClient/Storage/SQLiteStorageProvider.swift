@@ -545,9 +545,9 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     /// provider hands it is a plain `() throws -> Output` built from generic
     /// parameters the public ``StorageProvider`` protocol does not constrain to
     /// `Sendable`. Without this box the compiler reports the capture
-    /// (`#SendableClosureCaptures`, 11 diagnostics from the one site — #2318);
+    /// (`#SendableClosureCaptures`, 11 diagnostics from the one site);
     /// constraining the protocol instead would push the same annotation onto
-    /// every caller of `iterate` (#2318, Fork 1).
+    /// every caller of `iterate` (Fork 1).
     ///
     /// **What the `@unchecked` claim means here.** It contains the storage
     /// layer's *existing* API contract at the queue boundary; it is not a proof
@@ -597,7 +597,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
 
     /// Stable default SQLite file path for a given `appId`, used by
     /// `JsBaoClient.setupStorage()` when no explicit storage directory
-    /// is supplied (issue #853). Keyed on `appId` only — NOT the full
+    /// is supplied. Keyed on `appId` only — NOT the full
     /// `initialize(namespace:)` string — so auth-scoped and
     /// user-scoped initialize calls resolve to the same file and the
     /// shared provider doesn't trip the re-bind guard. Logical

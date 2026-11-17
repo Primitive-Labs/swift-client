@@ -22,7 +22,7 @@ import Foundation
 /// ```
 public final class Db3IngestsAPI: @unchecked Sendable {
     private let transport: any Transport
-    /// The wait for a pending create of the db3 a call names (#5000).
+    /// The wait for a pending create of the db3 a call names.
     private let awaitCreate: @Sendable (String) async throws -> Void
 
     /// Designated initializer — the typed transport spine.
@@ -31,7 +31,7 @@ public final class Db3IngestsAPI: @unchecked Sendable {
         self.awaitCreate = { _ in }
     }
 
-    /// `client.db3.ingests`: each call waits first for a pending create of its db3 (#5000).
+    /// `client.db3.ingests`: each call waits first for a pending create of its db3.
     init(transport: any Transport, awaitCreate: @escaping @Sendable (String) async throws -> Void) {
         self.transport = transport
         self.awaitCreate = awaitCreate

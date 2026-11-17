@@ -9,6 +9,7 @@ import XCTest
 /// thrown as the server answered it. The documents call refuses a db3 that
 /// lives only on this device before any request; the db3 call waits for a
 /// pending create and throws `.pendingCreate` offline.
+@available(*, deprecated)
 final class PendingInvitationRevokeHermeticTests: XCTestCase {
 
     private static let answer = """

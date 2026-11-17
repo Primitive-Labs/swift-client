@@ -1,7 +1,7 @@
 import Foundation
 import JsBaoSQLite
 
-/// `record_log_vec_f32(value, element, dims)` (#5230), the SQL function a
+/// `record_log_vec_f32(value, element, dims)`, the SQL function a
 /// device vector index's triggers and fill convert a stored vector value
 /// with: js-bao's `recordLogVecF32`, rule for rule, over ``VectorCodec`` (the
 /// codec the #5225 fixture pins).

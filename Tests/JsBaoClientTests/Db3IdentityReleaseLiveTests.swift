@@ -20,6 +20,7 @@ import XCTest
 /// - E12: a subscribe made after `updateToken(B)` but before
 ///   `rebindUserScopedStorage()` belongs to A: it never reads A's binding as
 ///   available and ends with `identity-changed` at the rebind.
+@available(*, deprecated)
 final class Db3IdentityReleaseLiveTests: XCTestCase {
 
     private var ctx: TestContext!

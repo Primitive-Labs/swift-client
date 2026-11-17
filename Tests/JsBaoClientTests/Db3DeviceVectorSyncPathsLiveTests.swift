@@ -15,6 +15,7 @@ import XCTest
 /// from the room's own rows equals brute force over them (exact to equality,
 /// ann to a mean recall at least 0.8, the row itself first). A store planted at version 8 converts and builds; a
 /// restarted client rebuilds nothing and takes the writes made meanwhile.
+@available(*, deprecated)
 final class Db3DeviceVectorSyncPathsLiveTests: XCTestCase {
 
     private typealias Support = Db3VectorTestSupport

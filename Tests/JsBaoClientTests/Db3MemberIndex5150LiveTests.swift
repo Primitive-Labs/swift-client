@@ -4,6 +4,7 @@ import XCTest
 /// #5150 behaviour 18 (live): `client.db3.indexes.register` with
 /// `members: true` against the dev server answers the member index, `list`
 /// returns it, and the subscribed copy's indexes are unchanged by it.
+@available(*, deprecated)
 final class Db3MemberIndex5150LiveTests: XCTestCase {
 
     private var ctx: TestContext!

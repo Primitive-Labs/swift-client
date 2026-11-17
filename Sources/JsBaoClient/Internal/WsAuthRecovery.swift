@@ -39,7 +39,7 @@ protocol WsAuthRecoveryHost: AnyObject, Sendable {
 /// (`maybeStartHandshakeRecovery` / `recoverFromHandshakeFailure` in
 /// `src/client/JsBaoClient.ts`). Without it the reconnect loop reused the
 /// expired token indefinitely: the server rejected every upgrade and the client
-/// stayed offline until the app was relaunched (#2637).
+/// stayed offline until the app was relaunched.
 ///
 /// Two differences from the JS policy, both because the Swift transport sees a
 /// signal the browser one does not:

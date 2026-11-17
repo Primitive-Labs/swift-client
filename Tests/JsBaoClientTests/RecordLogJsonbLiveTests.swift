@@ -12,6 +12,7 @@ import XCTest
 ///   2, the db3's rows JSON text with `id`, its cursor at the room's log
 ///   number) converts at open, stays resident without a full replacement,
 ///   equals the room, and its next write lands.
+@available(*, deprecated)
 final class RecordLogJsonbLiveTests: XCTestCase {
 
     private var ctx: TestContext!

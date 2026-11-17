@@ -12,7 +12,7 @@ import YSwift
 // MARK: Aliases
 
 /// Document alias scope. Only `.user` is supported — app-scoped aliases were
-/// removed in #1168 (they conferred no access and named a document every caller
+/// removed (they conferred no access and named a document every caller
 /// had to already be permitted to open).
 public enum DocumentAliasScope: String, Codable, Sendable {
     case user
@@ -135,9 +135,9 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
 /// back as `cursor` to fetch the next page.
 public struct DocumentListPage: Decodable, Sendable, Equatable {
     public let items: [DocumentInfo]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -167,7 +167,7 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
 
 /// The one holder that carries a live `YDocument` across an isolation
 /// boundary, and the one place the safety argument for doing so is written
-/// down (#1992, Phase C).
+/// down (Phase C).
 ///
 /// `YDocument` (from the `YSwift` fork) is a reference type wrapping yrs FFI
 /// state and is not `Sendable`. Rather than let each type that needs to hand a
@@ -176,7 +176,7 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
 /// unverifiable) arguments appear — every such type wraps the document in this
 /// value and becomes plainly `Sendable` itself. `OpenDocumentResult` below is
 /// the first adopter; `DocumentManager`'s document handoffs are the next
-/// (#1993, Phase D).
+/// (Phase D).
 ///
 /// ## `@unchecked Sendable` — safety argument
 ///
@@ -216,7 +216,7 @@ public struct ConfinedYDocument: @unchecked Sendable {
 /// `open`/`openAlias`): the live `YDocument` plus the document's locally
 /// cached metadata at open time (`nil` when no metadata is stored yet).
 ///
-/// Plainly `Sendable` since #1992: the live document is carried in a
+/// Plainly `Sendable`: the live document is carried in a
 /// `ConfinedYDocument`, so this type owns no unchecked claim of its own and
 /// the compiler checks the rest (`LocalMetadataEntry` is `Sendable`).
 public struct OpenDocumentResult: Sendable {
@@ -247,7 +247,7 @@ public struct OpenDocumentResult: Sendable {
 /// Options for `createWithAlias` — title and alias are both required.
 ///
 /// `tags`, `metadata` and `documentFormat` mean here exactly what they mean on
-/// `CreateDocumentOptions` (#3757): applied when the call creates the document,
+/// `CreateDocumentOptions`: applied when the call creates the document,
 /// under the same limits, refused with the same codes. Each is `nil` by default
 /// and encoded only when set, so an ordinary create's request body is exactly
 /// what it was before they existed — which matters, because the route now
@@ -471,7 +471,7 @@ public struct CancelPendingCreateOptions: Sendable {
 
 /// Result of `createWithAlias`.
 ///
-/// The last three are echoed only when the call applied them (#3757), which is
+/// The last three are echoed only when the call applied them, which is
 /// the rule every document read follows: an absent `documentFormat` means an
 /// ordinary document.
 public struct CreateWithAliasResult: Decodable, Sendable {
@@ -501,7 +501,7 @@ public struct GetOrCreateWithAliasResult: Decodable, Sendable {
     public let created: Bool
     /// `3` for a record-log document, absent for an ordinary one — echoed on a
     /// create, and on an existing binding when the caller stated a format that
-    /// agreed with the stored one (#3757).
+    /// agreed with the stored one.
     public let documentFormat: Int?
     /// Echoed when this call created the document and applied tags.
     public let tags: [String]?
@@ -585,7 +585,7 @@ public struct LinkAccessResult: Decodable, Sendable, Equatable {
 ///
 /// `name` is `nil` for a user who has none — the server omits the key rather
 /// than sending an empty string, and a user provisioned through the
-/// email-code flow gets no name (#2980) — so display code should fall back
+/// email-code flow gets no name — so display code should fall back
 /// to `email`. Mirrors js-bao's `DocumentPermissionEntry.name?: string`.
 public struct DocumentPermissionEntry: Decodable, Sendable, Equatable {
     public let userId: String
@@ -763,7 +763,7 @@ public struct ValidateAccessSubjectParams: Encodable, Sendable {
 }
 
 /// Result of `validateAccess` — the caller's access, or the access of the
-/// user named by `userId` (#3658).
+/// user named by `userId`.
 public struct DocumentAccessResult: Decodable, Sendable {
     public let success: Bool
     public let hasAccess: Bool

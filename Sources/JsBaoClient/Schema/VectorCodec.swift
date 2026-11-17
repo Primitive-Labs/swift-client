@@ -1,6 +1,6 @@
 import Foundation
 
-/// How each number of a db3 `vector` field is stored (#5225): `f32` (IEEE 754
+/// How each number of a db3 `vector` field is stored: `f32` (IEEE 754
 /// binary32), `f16` (binary16) or `i8` (a signed byte per number, with one
 /// binary32 scale for the vector).
 public enum VectorElement: String, Sendable, Codable, Hashable, CaseIterable {
@@ -22,7 +22,7 @@ public struct VectorEncoding: Sendable, Codable, Hashable {
     }
 }
 
-/// The vector codec (#5225): how a db3 `vector` field's numbers become the
+/// The vector codec: how a db3 `vector` field's numbers become the
 /// base64 text stored in the record, and back. js-bao's `encodeVector`,
 /// `decodeVector` and `vectorBytes`, byte for byte (a shared fixture pins the
 /// layout).

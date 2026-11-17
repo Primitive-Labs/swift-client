@@ -3,7 +3,7 @@ import Foundation
 /// Manages offline storage for metadata, grants, analytics, and JWT persistence.
 /// Replaces IndexedDB-based OfflineStore from the JS client with SQLite-backed storage.
 ///
-/// ## An actor since #1993, Phase D2
+/// ## An actor (Phase D2)
 ///
 /// This is one of the async-domain service managers: every operation on it
 /// already awaited the storage provider, so there was nothing synchronous worth
@@ -20,9 +20,9 @@ public actor OfflineStore {
     private var isInitialized = false
 
     // Store names matching JS constants
-    /// The store every user's document metadata shared before #4829, keyed
-    /// by document id alone. Quarantined: nothing reads it, and only a
-    /// `wipeLocal` logout (`clearAllDocumentData`) clears it. A row in it
+    /// The store every user's document metadata shared before per-user
+    /// storage, keyed by document id alone. Quarantined: nothing reads it,
+    /// and only a `wipeLocal` logout (`clearAllDocumentData`) clears it. A row in it
     /// carries no owner, and the first user to sign in after an upgrade is
     /// not necessarily the one who wrote it, so loading or adopting it would
     /// hand one user's pending creates to another.
@@ -162,7 +162,7 @@ public actor OfflineStore {
     ///
     /// `nil` means two different things on a cold start: "no row for this
     /// document" and "no provider bound yet, so nothing could be read". The
-    /// local-only classification (#2691) has to tell them apart — the second is
+    /// local-only classification has to tell them apart — the second is
     /// *unknown*, not "ordinary", and a document whose classification is
     /// unknown may not have its content put on the wire. With no user bound
     /// yet there is no store to read, which is unknown in the same way.
@@ -192,9 +192,9 @@ public actor OfflineStore {
     /// the file, so its rows are told apart by the metadata stores: a row
     /// another user's store lists is theirs too and stays, and every other
     /// row goes — the ones only this user listed, and the ones no user lists
-    /// (written before #4829, or left without a row), so a prior account's
+    /// (written before per-user storage, or left without a row), so a prior account's
     /// content cannot hydrate a reused document id. Clearing the table
-    /// outright took another user's unsynced pending creates with it (#5366).
+    /// outright took another user's unsynced pending creates with it.
     /// A failed read of the stores throws before any row is deleted, since a
     /// partial list would pass another user's rows off as unowned.
     public func clearAllDocumentData(appId: String, userId: String) async throws {
@@ -255,8 +255,8 @@ public actor OfflineStore {
 
     /// Persist the buffered analytics events.
     ///
-    /// The payload is `[[String: JSONValue]]`, not `[[String: Any]]` (#1993,
-    /// Phase D2): the events cross this type's new isolation boundary, and an
+    /// The payload is `[[String: JSONValue]]`, not `[[String: Any]]`:
+    /// the events cross this type's new isolation boundary, and an
     /// `Any` cannot do that under Swift 6. `JSONValue` is also what the events
     /// already had to be — they are serialized to JSON on the very next line —
     /// so the type now states a constraint the storage format always imposed.
@@ -471,7 +471,7 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// `documents.create({ metadata })` / `createDocument(metadata:)`.
     /// Stashed locally so `commitOfflineCreate` can replay it into the
     /// server POST body instead of dropping it. Mirrors js-bao's
-    /// `LocalMetadataEntry.docMetadata` (#673).
+    /// `LocalMetadataEntry.docMetadata`.
     public var docMetadata: JSONValue?
     /// The document's format, once this client knows it: `3` for a record-log
     /// document, `1` for an ordinary one. `2` names a large document, which is
@@ -516,7 +516,7 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// Mirrors js-bao `grantedAt`.
     public var grantedAt: String?
     /// ISO-8601 timestamp of when a pending create actually committed to the
-    /// server. Mirrors js-bao `createCommittedAt`, the #1953 GSI-lag bridge:
+    /// server. Mirrors js-bao `createCommittedAt`, the GSI-lag bridge:
     /// the owned-docs merge recency-gates on the later of this and
     /// `createdAt`, so a slow-to-commit offline create is still bridged while
     /// the server's `permissionsForUser` GSI catches up.
@@ -525,12 +525,12 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// js-bao's `hasIndexedDbSnapshot`; Swift's local store is SQLite, and the
     /// field keeps the JS name so cross-platform consumers read one vocabulary.
     public var hasIndexedDbSnapshot: Bool?
-    /// #4921 — a db3 `client.db3.create` made on this device: its pending
+    /// A db3 `client.db3.create` made on this device: its pending
     /// create commits through `POST db3` under its id, not `POST /documents`.
     public var db3Create: Bool?
-    /// #4921 — the db3 type that commit asks the server to install.
+    /// The db3 type that commit asks the server to install.
     public var db3Type: String?
-    /// #4921 — the server refused this pending db3 create for good (the
+    /// The server refused this pending db3 create for good (the
     /// refusal is in `commitError`): reconnects do not repeat it, and
     /// `commitOfflineCreate(documentId:)` tries again.
     public var commitRefused: Bool?
@@ -597,9 +597,9 @@ public struct LocalMetadataEntry: Codable, Sendable {
 public struct CommitError: Codable, Sendable {
     public var message: String
     public var at: String
-    /// The server's refusal code, for a pending db3 create the server refused (#4921).
+    /// The server's refusal code, for a pending db3 create the server refused.
     public var code: String?
-    /// The refusal's HTTP status (#5000), which a `client.db3` call waiting
+    /// The refusal's HTTP status, which a `client.db3` call waiting
     /// for the create throws with.
     var status: Int?
 

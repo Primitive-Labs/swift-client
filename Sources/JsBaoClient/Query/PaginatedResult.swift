@@ -54,10 +54,10 @@ public struct PagedQueryResult<Row> {
 /// of `Sendable` rows (`PrimitiveRow`, `PrimitiveRecord`, a generated model
 /// struct) is `Sendable`; a page of some non-`Sendable` row type still
 /// compiles and simply can't be sent — which is the honest answer rather than
-/// a compile error at the declaration. (#1992, Phase C.)
+/// a compile error at the declaration. (Phase C.)
 extension PagedQueryResult: Sendable where Row: Sendable {}
 
-/// A page that read two models' rows (a `hasManyThrough`, #5221): its drift
+/// A page that read two models' rows (a `hasManyThrough`): its drift
 /// names every db3 either read, the second read's entry kept where both name
 /// one; `nil` when neither was answered from db3 copies.
 func mergedDrift(_ first: [String: Db3Drift]?, _ second: [String: Db3Drift]?) -> [String: Db3Drift]? {

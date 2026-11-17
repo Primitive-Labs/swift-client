@@ -17,6 +17,7 @@ import YSwift
 /// Server-free: an in-process loopback WebSocket server records the frames the
 /// client sends, and the storage-facing tests drive a bare `DocumentManager`
 /// over a temp-file `SQLiteStorageProvider`.
+@available(*, deprecated)
 final class CloseEvictLifecycleTests: XCTestCase {
     var tempDir: String!
 

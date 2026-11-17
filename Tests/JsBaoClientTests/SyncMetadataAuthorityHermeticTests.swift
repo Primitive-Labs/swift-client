@@ -14,6 +14,7 @@ import XCTest
 /// Server-free (`*HermeticTests`): a `LoopbackAPIServer` answers the client's
 /// real HTTP requests from a per-test script, so the whole path under test —
 /// `syncMetadata` → `HttpClient` → `DocumentManager` — is the shipped one.
+@available(*, deprecated)
 final class SyncMetadataAuthorityHermeticTests: XCTestCase {
     private var clients: [JsBaoClient] = []
     private var servers: [LoopbackAPIServer] = []

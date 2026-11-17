@@ -8,6 +8,7 @@ import XCTest
 /// `CrashTestRecord.UniqueConstraint` the constraints `upsertByUnique`
 /// looks up: `crashTest_email_unique` and `name_score_combo`. The typed
 /// overloads upsert exactly as the `String` forms do.
+@available(*, deprecated)
 final class CodegenUpsertNamesHermeticTests: XCTestCase {
 
     func testTheEnumsCarryTheModelsNames() {

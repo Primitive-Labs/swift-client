@@ -23,6 +23,7 @@ import XCTest
 /// the room. Rows compare as canonical JSON: the room's `type` and the
 /// client's `_meta*` keys dropped, and (for the include fixture) an empty
 /// `tagIds`, absent on the room and `[]` on the client.
+@available(*, deprecated)
 final class Db3ParityLiveTests: XCTestCase {
 
     private var ctx: TestContext!

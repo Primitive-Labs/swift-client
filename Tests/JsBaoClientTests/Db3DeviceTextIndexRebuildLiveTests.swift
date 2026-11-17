@@ -8,6 +8,7 @@ import XCTest
 /// table and its three triggers in the new form, answers the same `$search`
 /// ids as before the restart, logs one build at info, and a sync after
 /// builds nothing.
+@available(*, deprecated)
 final class Db3DeviceTextIndexRebuildLiveTests: XCTestCase {
 
     private var ctx: TestContext!

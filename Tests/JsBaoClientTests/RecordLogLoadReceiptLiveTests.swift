@@ -18,6 +18,7 @@ import XCTest
 ///   a refresh on reconnect removes what no line named and keeps what it must.
 /// - The client's artifact read resolves the grant path against the API URL
 ///   and answers only a 200.
+@available(*, deprecated)
 final class RecordLogLoadReceiptLiveTests: XCTestCase {
 
     private var ctx: TestContext!

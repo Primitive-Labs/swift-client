@@ -87,13 +87,13 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
     /// write path (`DynamicModel.save`) to stamp `Date.now()`-style epoch
     /// milliseconds on insert / update, mirroring js-bao's `BaseModel.save`.
     public var autoStamp: AutoStamp?
-    /// A vector field's number of numbers (#5225); `nil` on any other field.
+    /// A vector field's number of numbers; `nil` on any other field.
     public var dims: Int?
-    /// How each number of a vector field is stored (#5225); `nil` on any other field.
+    /// How each number of a vector field is stored; `nil` on any other field.
     public var element: VectorElement?
     /// The generated model reads this field as a default where a db3 record
     /// does not hold it, though the descriptor declares no `default`: a string
-    /// set's default, which a create does not write (#5896, CSO-5896-019). A
+    /// set's default, which a create does not write. A
     /// save counts such a field the record does not hold as present for the
     /// required check, as it counts a field with a `default`. Not written to
     /// `_meta`.
@@ -263,7 +263,7 @@ public struct PrimitiveSchema: Equatable, Sendable {
     /// itself as `unique = true`). But both are enforced at write time
     /// via `_uniqueIdx_{modelName}_{constraintName}` indexes.
     ///
-    /// A constraint over a stringset field is never resolved (#3719): no
+    /// A constraint over a stringset field is never resolved: no
     /// writer can build that key consistently, so one recorded by an older
     /// client is ignored rather than enforced.
     public var resolvedUniqueConstraints: [ConstraintDescriptor] {
@@ -287,7 +287,7 @@ public struct PrimitiveSchema: Equatable, Sendable {
 
     /// The first unique constraint this schema declares over a stringset
     /// field, with the sentence js-bao's `uniqueStringsetMessage` answers —
-    /// or `nil` when it declares none (#3719).
+    /// or `nil` when it declares none.
     ///
     /// The one rule the three Swift declaration boundaries share: the TOML
     /// loader throws it, and `DynamicModel` refuses a write for it before any

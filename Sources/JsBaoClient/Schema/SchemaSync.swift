@@ -48,7 +48,7 @@ public enum SchemaSync {
 
     /// Same as above, but reuses an existing transaction. Prefer this form
     /// when already inside a `transactSync` / `transactAsync` block — the
-    /// record-write path (#2587) uses it so `_meta_*` is written at save-time
+    /// record-write path uses it so `_meta_*` is written at save-time
     /// like js-bao (`BaseModel.save` -> `syncModelMeta`) rather than at
     /// doc-connect, which keeps a client that only reads a document from
     /// writing into it.
@@ -226,7 +226,7 @@ public enum SchemaSync {
     /// schema against a doc that already carries matching `_meta_*` (every
     /// synced existing doc) must be op-free: an unconditional write emits a
     /// fresh CRDT op per field per launch, growing the doc's update log and
-    /// pushing redundant frames to the server (#2587).
+    /// pushing redundant frames to the server.
     private static func setEncodedIfChanged(
         _ map: YrsMap, key: String, encoded: String, tx: YrsTransaction
     ) {
@@ -258,7 +258,7 @@ public enum SchemaSync {
     /// Goes through `encodeNumberForYrs`, like every other write the FFI
     /// parses: a `default` past `2^53` needs a float literal the parser
     /// turns back into exactly this Double — the bare integer form is one
-    /// it reads as an `i64`, and past `2^63` aborts on (#3456). The rare
+    /// it reads as an `i64`, and past `2^63` aborts on. The rare
     /// double that has no such literal is skipped like a non-finite one:
     /// this path publishes metadata and has no caller to throw to, and a
     /// default stored as a neighbor of itself would be worse than an

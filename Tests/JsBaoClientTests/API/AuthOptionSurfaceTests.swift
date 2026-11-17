@@ -13,6 +13,7 @@ import XCTest
 /// shape the JS client builds; the magic-link tests stub
 /// `AuthController.makeRequest` and assert the exact POST body; the logout
 /// tests assert the option bag is forwarded to the controller.
+@available(*, deprecated)
 final class AuthOptionSurfaceTests: XCTestCase {
 
     // MARK: - OAuth state bag: waitlist + inviteToken (#466)

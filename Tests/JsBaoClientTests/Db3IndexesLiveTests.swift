@@ -13,6 +13,7 @@ import XCTest
 ///   subscribe;
 /// - binding a stored db3 at start-up reads no list; the first read is the
 ///   subscribe's.
+@available(*, deprecated)
 final class Db3IndexesLiveTests: XCTestCase {
 
     private var ctx: TestContext!

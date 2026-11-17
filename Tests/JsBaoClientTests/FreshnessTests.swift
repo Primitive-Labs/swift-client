@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-document-freshness.test.ts
 /// Tests that documents are fresh after open/sync.
+@available(*, deprecated)
 final class FreshnessTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

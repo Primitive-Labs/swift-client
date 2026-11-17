@@ -20,6 +20,7 @@ import Yniffi
 ///
 /// Server-free: the client is built with unreachable URLs and never connects; the
 /// outbound send is intercepted by replacing `DocumentManager.sendWebSocketMessage`.
+@available(*, deprecated)
 final class OutboundUnsyncedFlagRaceTests: XCTestCase {
 
     /// Collect update frames off a doc's observer (which fires on the writing

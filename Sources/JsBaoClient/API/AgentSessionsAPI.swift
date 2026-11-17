@@ -3,7 +3,7 @@ import Foundation
 // MARK: - AgentsAPI
 
 /// Agents, available as `client.agents`. Mirrors the JS client's
-/// `client.agents` (#3810).
+/// `client.agents`.
 public final class AgentsAPI: @unchecked Sendable {
     /// Agent sessions: list, get, open, send, answer, cancel, events, mark
     /// read, rename, delete and members.

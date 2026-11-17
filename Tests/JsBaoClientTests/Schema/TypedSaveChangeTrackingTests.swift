@@ -10,6 +10,7 @@ import YSwift
 /// (`CodegenAcceptance/Generated/TaskRecord.swift`) so it exercises the real
 /// emitted code, and against an offline in-memory client so `save(in:)` takes
 /// its real path through `JsBaoClient.codegen.save`.
+@available(*, deprecated)
 final class TypedSaveChangeTrackingTests: XCTestCase {
 
     override func setUp() {

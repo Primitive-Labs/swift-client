@@ -83,7 +83,7 @@ public struct QueryOptions: Sendable {
     /// only on this device always passes, and a format-1 read ignores it.
     public var maxDrift: Db3MaxDrift?
 
-    /// `offset` was removed in #2367: offset paging is unstable in
+    /// `offset` was removed: offset paging is unstable in
     /// CRDT-backed datasets, because a concurrent insert from another client
     /// shifts the rows before offset N and makes the same row appear twice or
     /// be skipped across a page boundary. Page with `cursor` + `direction`
@@ -233,7 +233,7 @@ public struct AggregateOptions {
     /// Optional cap on returned groups.
     public var limit: Int?
     /// Aggregate only these documents, with exactly the meaning `documents`
-    /// has on `QueryOptions` (#3760). `nil` applies no scope of its own; an
+    /// has on `QueryOptions`. `nil` applies no scope of its own; an
     /// explicit EMPTY list matches nothing.
     ///
     /// On a model bound to ONE document the option NARROWS rather than

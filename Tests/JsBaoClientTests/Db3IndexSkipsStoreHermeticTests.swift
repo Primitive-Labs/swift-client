@@ -131,12 +131,12 @@ final class Db3IndexSkipsStoreHermeticTests: XCTestCase {
     func testStorageVersion10CreatesTheTableOnAVersion9StoreAndTheNextSyncFillsIt() async throws {
         let world = try await world("version")
         _ = try store(world)
-        XCTAssertEqual(RecordLogSchema.storageVersion, 10)
+        XCTAssertGreaterThanOrEqual(RecordLogSchema.storageVersion, 10) // 11 since #5994's clear mark
         // The store as #5230's version 9 left it: no skip table.
         try world.exec("DROP TABLE record_log_index_skips")
         try world.exec("UPDATE record_log_meta SET value = '9' WHERE key = 'storage_version'")
         let reopened = try world.reopen(Self.doc)
-        XCTAssertEqual(try world.rows("SELECT value FROM record_log_meta WHERE key = 'storage_version'").first?["value"].stringValue, "10")
+        XCTAssertEqual(try world.rows("SELECT value FROM record_log_meta WHERE key = 'storage_version'").first?["value"].stringValue, String(RecordLogSchema.storageVersion))
         XCTAssertEqual(
             try world.rows("SELECT name FROM pragma_table_info('record_log_index_skips') ORDER BY cid").compactMap { $0["name"].stringValue },
             ["doc_id", "room_name", "model", "fields", "kind", "on", "reason"]
@@ -152,7 +152,7 @@ final class Db3IndexSkipsStoreHermeticTests: XCTestCase {
         try world.exec("DROP TABLE record_log_index_skips")
         try world.exec("UPDATE record_log_meta SET value = '7' WHERE key = 'storage_version'")
         let reopened = try world.reopen(Self.doc)
-        XCTAssertEqual(try world.rows("SELECT value FROM record_log_meta WHERE key = 'storage_version'").first?["value"].stringValue, "10")
+        XCTAssertEqual(try world.rows("SELECT value FROM record_log_meta WHERE key = 'storage_version'").first?["value"].stringValue, String(RecordLogSchema.storageVersion))
         try reopened.syncIndexes(skipped)
         XCTAssertEqual(try reopened.localIndexSkips().count, 6)
     }

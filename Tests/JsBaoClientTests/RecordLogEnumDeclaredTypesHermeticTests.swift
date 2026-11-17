@@ -69,7 +69,7 @@ final class RecordLogEnumDeclaredTypesHermeticTests: XCTestCase {
     func testTheCodeIsHandedBackUnderItselfAndTheClientDeclaresWireVersionFour() {
         XCTAssertEqual(JsBaoErrorCode(rawValue: "DB3_VALUE_NOT_IN_ENUM"), .db3ValueNotInEnum)
         XCTAssertTrue(RecordLogHandBackCode.all.contains("DB3_VALUE_NOT_IN_ENUM"))
-        XCTAssertEqual(recordLogWireVersion, 4)
+        XCTAssertGreaterThanOrEqual(recordLogWireVersion, 4) // 5 since #5994
     }
 
     func testAThrownRefusalIsLocalAndReportedOnce() throws {
@@ -187,7 +187,7 @@ final class RecordLogEnumDeclaredTypesHermeticTests: XCTestCase {
         XCTAssertEqual(try held()?["enums"], enums)
         let first = await reopen()
         XCTAssertEqual(first?["db3TypeHash"]?.stringValue, "h1")
-        XCTAssertEqual(first?["wireVersion"], 4)
+        XCTAssertEqual(first?["wireVersion"], .number(Double(recordLogWireVersion)))
 
         // The entry as a client from before enforced enums wrote it: no `enums` key.
         try provider.withConnection { connection in

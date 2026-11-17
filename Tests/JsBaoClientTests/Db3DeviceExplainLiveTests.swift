@@ -6,6 +6,7 @@ import XCTest
 /// .explain(_:_:)` and the server's `POST db3/:id/records/:model/explain`
 /// name the same `indexes` and the same `scanned` for the plain read, the
 /// read forced onto the index by its registry name, and `none`.
+@available(*, deprecated)
 final class Db3DeviceExplainLiveTests: XCTestCase {
 
     private var ctx: TestContext!

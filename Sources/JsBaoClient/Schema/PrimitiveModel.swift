@@ -42,7 +42,7 @@ public extension PrimitiveRowDecodable {
     /// Decode from the shared row bag. Same decode as `init?(row:)` — the bag
     /// is a wrapper around exactly that dictionary — so generated
     /// `compactMap { Model(row: $0) }` call sites bind unchanged whether the
-    /// page hands them `[String: JSONValue]` or a `PrimitiveRow` (#1992).
+    /// page hands them `[String: JSONValue]` or a `PrimitiveRow`.
     init?(row: PrimitiveRow) {
         self.init(row: row.raw)
     }
@@ -61,7 +61,7 @@ public extension PrimitiveRowDecodable {
 /// ## Row values are `JSONValue`
 ///
 /// Every leaf is a `JSONValue`, so the bag is `Sendable` by checked
-/// conformance rather than by argument (#2546). Read a column with the typed
+/// conformance rather than by argument. Read a column with the typed
 /// accessors — `row["title"]?.stringValue`, `row["priority"]?.numberValue`,
 /// `row["done"]?.rowBoolValue`, `row["tags"]?.stringArrayValue` — or reach
 /// `raw` for the dictionary itself.
@@ -126,15 +126,15 @@ public struct PrimitiveRow: Sendable, Codable, Equatable, Hashable {
 /// `one(_:as:)` and `many(_:as:)`.
 ///
 /// The `_related` spelling of the shared `PrimitiveRow` bag — same type, kept
-/// so generated models and existing call sites read as before (#1992).
+/// so generated models and existing call sites read as before.
 public typealias RelatedRecords = PrimitiveRow
 
 /// A stored row exists but no longer decodes as its generated typed model —
 /// the persisted data has drifted from the typed schema (e.g. a required
 /// field is missing or holds the wrong type).
 ///
-/// Thrown by the generated `Model.find(_:)` / `Model.findAll()` facade
-/// (#992). JS has no decode step — `Model.find` resolves `null` *only* for
+/// Thrown by the generated `Model.find(_:)` / `Model.findAll()` facade.
+/// JS has no decode step — `Model.find` resolves `null` *only* for
 /// "not found" and `Model.findAll` returns every stored row — so the Swift
 /// facade keeps `nil`/omission strictly for "not found" and surfaces a
 /// drifted row as this error instead of silently dropping it.
@@ -148,7 +148,7 @@ public struct PrimitiveDecodeError: Error, Sendable, Equatable {
     public let documentId: String?
     /// The required field(s) the row could not supply — missing, NULL, or
     /// holding a value the declared type can't read. Sorted, and empty when
-    /// the error was built without a schema to check against (#2825).
+    /// the error was built without a schema to check against.
     public let fields: [String]
 
     public init(
@@ -175,7 +175,7 @@ public struct PrimitiveDecodeError: Error, Sendable, Equatable {
 
     /// Build from a row plus the schema it failed against, so the error names
     /// the offending field(s) — the difference between "a row vanished" and a
-    /// one-line diagnosis (#2825).
+    /// one-line diagnosis.
     public init(modelName: String, row: [String: JSONValue], schema: PrimitiveSchema) {
         self.init(
             modelName: modelName,

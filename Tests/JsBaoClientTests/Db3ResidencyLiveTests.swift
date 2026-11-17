@@ -24,6 +24,7 @@ import XCTest
 /// - 23: subscribing offline; the save destination and the default-document
 ///   setters on a resident, unsubscribed db3; the scope conflict.
 /// - 44: a db3 whose format nothing local knows, subscribed offline.
+@available(*, deprecated)
 final class Db3ResidencyLiveTests: XCTestCase {
 
     private var ctx: TestContext!

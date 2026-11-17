@@ -11,6 +11,7 @@ import YSwift
 /// way `NotificationsAPITests` drives its `notification` frame), and the one
 /// behavior that is only observable on the wire — the awareness re-broadcast —
 /// runs against the in-process `LoopbackWebSocketServer`.
+@available(*, deprecated)
 final class ServerPushFramesTests: XCTestCase {
 
     private func newDocId() -> String { "push-frames-\(UUID().uuidString.prefix(8))" }
