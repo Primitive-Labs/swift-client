@@ -20,6 +20,41 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Breaking: an illegal app version stops construction
+
+`JsBaoClient(options:)` now reads the app's version from the bundle's
+`CFBundleShortVersionString` and its platform from the OS (`ios` or `macos`),
+and stops with a precondition failure, naming the value, when either is not
+legal. A version is one to three dot-separated numbers of one to six digits,
+such as `1.4` or `2.0.1`; a platform is a lowercase letter followed by up to 31
+lowercase letters, digits or hyphens. A bundle whose
+`CFBundleShortVersionString` is present but empty, or reads like `1.0-beta`,
+stops here after the update. A bundle with no `CFBundleShortVersionString` at
+all reports no version.
+
+Fix: set `MARKETING_VERSION` to a legal version, or pass one as
+`JsBaoClientOptions(appVersion:)`, which replaces the bundle's and skips its
+check. The `appVersion` and `platform` options are checked the same way. The
+initialiser's signature does not change.
+
+### Added: `client.appVersion` (beta)
+
+`client.appVersion` reports the version and platform this copy of the app
+sends, and its status against the app's version policy (`[clients.<platform>]`
+in `app.toml`): `getStatus()`, `getPolicy()`, `refresh()` and
+`onStatusChange(_:)`, with the new `AppVersionStatus` and
+`ClientPlatformVersions` types. Nothing is fetched until the first ask; after
+it, the client refetches shortly after a reconnect (a random wait of up to 30
+seconds, so clients that reconnect together do not all fetch at once), on
+return to the foreground and hourly, and keeps the last policy for offline use. Every app-API request carries the
+`X-Primitive-App-Version` and `X-Primitive-App-Platform` headers, the socket
+URL carries the same two names, and analytics events carry the version as
+`app_version` (`setAnalyticsAppVersionOverrideAsync` still wins). An HTTP 426
+with code `CLIENT_UPDATE_REQUIRED`, or a socket close with code 4426, sets
+`updateRequired` at once and holds the client's own reconnects until a later
+fetch moves the status; `connect()`, `setShouldConnect(true)` and
+`forceReconnectAsync()` still connect.
+
 ### Added: `client.db3.cancelPendingCreate(_:evictLocal:)` (beta)
 
 `client.db3.cancelPendingCreate(db3Id, evictLocal:)` cancels a db3's pending
@@ -81,8 +116,18 @@ them for the defaults `setModelDefaultDb3` and `setDefaultDb3` set.
 A db3 type field renamed by changing its key keeps its records when the new
 table names the old name in `storedAs = "<old name>"`. A device keeps reading
 and writing the stored name through its generated models, so a build from
-before the rename keeps working. `swift-bao-codegen` refuses a type file that
-declares `storedAs`: generate from the file as it was before the rename.
+before the rename keeps working.
+
+`swift-bao-codegen` generates from a renamed type: the property takes the
+current name, `CodingKeys` and the generated runtime keys take the stored
+name, and `primitiveSchema` carries `fieldNames` and `fieldNameTypes`
+(`PrimitiveSchema` gains both through a new initializer; the four-argument one
+is unchanged). `client.db3.records(id)` takes and
+answers the current name for a model the client registered, on a db3 of one of
+those types; elsewhere it keeps stored names. Through a generated model, a
+write's `condition` takes the current name, `upsert(on:)` names a unique
+constraint first and otherwise a field, and `increment` answers each value
+under the current name.
 ### Added: the code of a create the caller's role may not make
 
 `JsBaoErrorCode` takes `.db3CreateRoleRequired` (`"DB3_CREATE_ROLE_REQUIRED"`).

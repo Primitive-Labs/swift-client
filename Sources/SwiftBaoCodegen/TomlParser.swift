@@ -42,8 +42,9 @@ enum CodegenError: Error, CustomStringConvertible {
     /// An `enforce_enum` that is not `true` or `false` (#5897): it never
     /// reads as enforcement off.
     case invalidEnforceEnum(model: String, field: String)
-    /// A field declares `storedAs` (a renamed db3 field), which generated models do not map yet.
-    case storedAsNotSupported(model: String, field: String)
+    /// A misused `storedAs` (a renamed db3 field's stored name); `message`
+    /// is js-bao's `[models.<model>.fields.<field>]: storedAs …` sentence.
+    case invalidStoredAs(message: String)
     /// A field `ref` that names no shared enum, or sits beside `type`/`enum`
     /// (#5545); `message` is js-bao's `[models.<model>.fields.<field>]: ref …`.
     case sharedEnumRef(message: String)
@@ -109,8 +110,8 @@ enum CodegenError: Error, CustomStringConvertible {
             return "Model `\(model)` field `\(field)`: \(reason)"
         case let .invalidEnforceEnum(model, field):
             return "[models.\(model).fields.\(field)]: enforce_enum must be true or false"
-        case let .storedAsNotSupported(model, field):
-            return "Model `\(model)` field `\(field)` declares storedAs: generated models cannot map a renamed field yet, so codegen stops rather than generate a build that writes `\(field)` where records hold its stored name. Generate from the type file as it was before the rename."
+        case let .invalidStoredAs(message):
+            return message
         case let .vectorInUniqueConstraint(model, constraint, field):
             return "[[models.\(model).unique_constraints]]: unique constraint \"\(constraint)\" names the vector field \"\(field)\", which cannot be unique"
         }
@@ -205,6 +206,7 @@ enum TomlParser {
             let parsed = try naming(document.sourceName) {
                 try parseModels(
                     tomlString: document.source,
+                    sourceName: document.sourceName,
                     sharedEnums: position < (sharedEnums?.count ?? 0) ? sharedEnums![position] : nil,
                     swiftNameSuffix: swiftNameSuffix,
                     strict: strict,
@@ -248,6 +250,7 @@ enum TomlParser {
                     continue
                 }
                 let first = merged[index]
+                merged[index].typeNames = Array(Set(first.typeNames + schema.typeNames)).sorted()
                 let differences = declarationDifferences(first, schema)
                     + defaultDifferences(first, mergedTables[index], schema, table)
                 if !differences.isEmpty {
@@ -256,6 +259,20 @@ enum TomlParser {
                         second: schema.sourceName, differences: differences
                     )
                 }
+            }
+        }
+        // A type that names a model declared in another file (`[type]
+        // models = [...]`) holds that model too.
+        for document in documents {
+            guard let type = (try? TOMLTable(string: document.source))?["type"]?.table,
+                  let listed = type["models"]?.array else { continue }
+            let declared = type["name"]?.string ?? ""
+            let stem = ((document.sourceName as NSString).lastPathComponent as NSString).deletingPathExtension
+            let typeName = declared.isEmpty ? stem : declared
+            guard !typeName.isEmpty else { continue }
+            for position in 0..<listed.count {
+                guard let model = listed[position].string, let index = indexByName[model] else { continue }
+                merged[index].typeNames = Array(Set(merged[index].typeNames + [typeName])).sorted()
             }
         }
         return merged
@@ -307,6 +324,7 @@ enum TomlParser {
     /// js-bao's loader reads the same file.
     private static func parseModels(
         tomlString: String,
+        sourceName: String = "",
         sharedEnums: SharedEnums? = nil,
         swiftNameSuffix: String,
         strict: Bool,
@@ -320,6 +338,10 @@ enum TomlParser {
         }
         let (sharedEnumDefs, jsonDefs) = try sharedEnums?.expandAll(table) ?? ([:], [:])
         let isTypeFile = table["type"]?.table != nil
+        // A type file's db3 type name: its `[type] name`, else its file's stem.
+        let declaredTypeName = table["type"]?.table?["name"]?.string ?? ""
+        let stem = ((sourceName as NSString).lastPathComponent as NSString).deletingPathExtension
+        let typeName: String? = isTypeFile ? (declaredTypeName.isEmpty ? (stem.isEmpty ? nil : stem) : declaredTypeName) : nil
 
         // A fresh-template schema.toml ships with no models yet (the
         // user adds the first `[models.<name>]` block as their next
@@ -375,6 +397,7 @@ enum TomlParser {
             }
             for (field, def) in sharedEnumDefs[key] ?? [:] { schema.fields[field]?.sharedEnum = def }
             for (field, def) in jsonDefs[key] ?? [:] { schema.fields[field]?.json = def }
+            if let typeName { schema.typeNames = [typeName] }
             schemasByName[key] = schema
             modelOrder.append(key)
         }
@@ -630,6 +653,7 @@ enum TomlParser {
             )
             order.append(fieldName)
         }
+        try checkStoredNames(modelName: modelName, order: order, fields: out)
         return (order, out)
     }
 
@@ -671,10 +695,8 @@ enum TomlParser {
         if let reason = vectorFieldProblem(table, type: typeLiteral) {
             throw CodegenError.invalidVectorField(model: modelName, field: fieldName, reason: reason)
         }
-        // A renamed field (`storedAs`) stops codegen, strict or not: generated models do not map it yet.
-        if table["storedAs"] != nil {
-            throw CodegenError.storedAsNotSupported(model: modelName, field: fieldName)
-        }
+        // `storedAs`, strict or not, as js-bao's loader judges it.
+        let storedAs = try storedAsOf(table, modelName: modelName, fieldName: fieldName)
         // `enforce_enum` takes `true` or `false`, strict or not, as js-bao's loader judges it (#5897).
         // It changes nothing the codegen emits: the room enforces it.
         if let flag = table["enforce_enum"], flag.bool == nil {
@@ -702,8 +724,57 @@ enum TomlParser {
             dims: type == .vector ? table["dims"]?.int : nil,
             element: type == .vector ? table["element"]?.string : nil,
             deprecated: table["deprecated"]?.bool ?? false,
-            cleared: table["cleared"]?.bool ?? false
+            cleared: table["cleared"]?.bool ?? false,
+            storedAs: storedAs
         )
+    }
+
+    /// A field's `storedAs`: js-bao's `storedAsOf`, sentence for sentence. A
+    /// non-empty identifier that is not reserved and not `id`, never on the
+    /// `id` field; equal to the field's own key, it means nothing (`nil`).
+    private static func storedAsOf(_ table: TOMLTable, modelName: String, fieldName: String) throws -> String? {
+        guard let raw = table["storedAs"] else { return nil }
+        let context = "[models.\(modelName).fields.\(fieldName)]"
+        guard let value = raw.string, !value.isEmpty else {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs must be a non-empty string naming the field's stored name")
+        }
+        if fieldName == "id" {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs cannot be set on the id field")
+        }
+        if value == "id" {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs \"id\" names the record's id; a field's stored name is never id")
+        }
+        if let reserved = reservedFieldProblem(value) {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(value)) is reserved: \(reserved)")
+        }
+        if value.range(of: "^[A-Za-z][A-Za-z0-9_]*$", options: .regularExpression) == nil {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(value)) is not an identifier (a letter, then letters, digits or _)")
+        }
+        return value == fieldName ? nil : value
+    }
+
+    /// A model's stored names, as js-bao's `storedNamesProblem` judges them:
+    /// two fields never share one, and a field's `storedAs` never names
+    /// another declared field's key.
+    private static func checkStoredNames(modelName: String, order: [String], fields: [String: ParsedField]) throws {
+        var storedBy: [String: String] = [:]
+        for field in order {
+            guard let stored = fields[field]?.storedAs else { continue }
+            let context = "[models.\(modelName).fields.\(field)]"
+            if fields[stored] != nil {
+                throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(stored)) is the key of another declared field; a stored name belongs to one field")
+            }
+            if let other = storedBy[stored] {
+                throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(stored)) is also the stored name of \(other); a stored name belongs to one field")
+            }
+            storedBy[stored] = field
+        }
+    }
+
+    /// `value` as `JSON.stringify` writes a string.
+    private static func jsonQuoted(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value), let text = String(data: data, encoding: .utf8) else { return "\"\(value)\"" }
+        return text.replacingOccurrences(of: "\\/", with: "/")
     }
 
     /// The element types a vector field may declare (#5225).

@@ -604,7 +604,12 @@ final class TransportSpineTests: XCTestCase {
             // and `workflowStarted` frame handlers left with
             // `client.workflows`, and with them their two `meta` casts.
             // Removed surface, not a new lowering.
-            "JsBaoClient.swift": (18, 7, 0),
+            // #5365 took it 18 -> 19: `commitPendingCreateNow`, the one
+            // implementation behind the deprecated `commitOfflineCreate` and
+            // `client.db3.commitCreate`, returns the same `[String: Any]` the
+            // deprecated public method always has. An internal seam, not new
+            // untyped surface.
+            "JsBaoClient.swift": (19, 7, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP

@@ -26,6 +26,13 @@ public struct HttpClientConfig {
     /// without a live server.
     public let sessionConfiguration: URLSessionConfiguration?
 
+    /// The client's version and platform, sent on every request.
+    let versionHeaders: ClientVersionHeaders
+
+    /// Told when the server refuses the client as outdated (a 426 with code
+    /// `CLIENT_UPDATE_REQUIRED`).
+    let onUpdateRequired: (@Sendable () -> Void)?
+
     // Internal: takes the module-internal `Logger` (#2363).
     init(
         apiUrl: String,
@@ -35,7 +42,9 @@ public struct HttpClientConfig {
         getGlobalAdminAppId: @escaping () -> String,
         logger: Logger,
         refreshAccessToken: @escaping () async -> RefreshOutcome,
-        sessionConfiguration: URLSessionConfiguration? = nil
+        sessionConfiguration: URLSessionConfiguration? = nil,
+        versionHeaders: ClientVersionHeaders = .none,
+        onUpdateRequired: (@Sendable () -> Void)? = nil
     ) {
         self.apiUrl = apiUrl
         self.appId = appId
@@ -45,6 +54,8 @@ public struct HttpClientConfig {
         self.logger = logger
         self.refreshAccessToken = refreshAccessToken
         self.sessionConfiguration = sessionConfiguration
+        self.versionHeaders = versionHeaders
+        self.onUpdateRequired = onUpdateRequired
     }
 }
 
@@ -206,6 +217,9 @@ public final class HttpClient: @unchecked Sendable {
     /// `HttpError(401, "Invalid credentials")`, and a sign-in attempt made with
     /// no session emitted `authFailed`.
     ///
+    /// The app's version policy (`/settings/client-versions`) is a public read,
+    /// like `/settings/sign-in`: asking for it must not refresh a token.
+    ///
     /// Authenticated passkey management (`/passkey/register/*`,
     /// `/passkey/list`, `/passkey/{id}`) is deliberately absent: those requests
     /// do carry a bearer token, so an expired one should still refresh.
@@ -217,6 +231,7 @@ public final class HttpClient: @unchecked Sendable {
         "/passkey/auth/start",
         "/passkey/auth/finish",
         "/settings/sign-in",
+        "/settings/client-versions",
         "/oauth/callback",
         "/auth/oauth/callback",
         "/auth/apple/callback",
@@ -409,6 +424,7 @@ public final class HttpClient: @unchecked Sendable {
             urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         urlRequest.setValue(config.getGlobalAdminAppId(), forHTTPHeaderField: "X-Global-Admin-App-Id")
+        config.versionHeaders.apply(to: &urlRequest)
 
         if let connId = config.getConnectionId(), !connId.isEmpty {
             urlRequest.setValue(connId, forHTTPHeaderField: "X-JB-Connection-Id")
@@ -489,6 +505,12 @@ public final class HttpClient: @unchecked Sendable {
                     message: "Token refresh failed due to a network error"
                 )
             }
+        }
+
+        if ClientVersionRules.isUpdateRequiredRefusal(
+            status: (response as? HTTPURLResponse)?.statusCode ?? 0, body: responseData
+        ) {
+            config.onUpdateRequired?()
         }
 
         return (responseData, response)

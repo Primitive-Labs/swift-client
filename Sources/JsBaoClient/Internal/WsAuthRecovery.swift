@@ -73,6 +73,11 @@ final class WsAuthRecovery: @unchecked Sendable {
     /// connection stays down.
     static let terminalAuthCloseCodes: Set<Int> = [4001, 4003]
 
+    /// The close code the server uses to refuse an outdated client. It says
+    /// nothing about the token, before or after the handshake, so recovery
+    /// leaves it to the client's version policy.
+    static let updateRequiredCloseCode = 4426
+
     /// Refreshes allowed inside one recovery window. Matches the JS client's
     /// `wsHandshakeMaxRefreshAttempts`.
     static let maxRefreshAttempts = 2
@@ -229,6 +234,9 @@ final class WsAuthRecovery: @unchecked Sendable {
                 // the transport's normal reconnect — which since #2660 runs on
                 // every close code — is the right response, unassisted.
                 return .skip("terminal auth close \(code)")
+            }
+            if code == Self.updateRequiredCloseCode {
+                return .skip("the server refused this client as outdated")
             }
             if !shouldConnect { return .skip("client does not want a connection") }
             if !hasToken { return .skip("no access token to refresh") }

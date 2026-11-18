@@ -17,6 +17,9 @@ struct ParsedSchema {
     /// The basename of the input file that declared the model, which its
     /// generated file's header names. Empty for a schema parsed on its own.
     var sourceName: String = ""
+    /// The db3 types (type files) that declare this model, sorted: what a
+    /// renamed model's `primitiveSchema.fieldNameTypes` lists.
+    var typeNames: [String] = []
 }
 
 struct ParsedField: Equatable {
@@ -52,6 +55,10 @@ struct ParsedField: Equatable {
     /// Declared `cleared = true` (beside `deprecated`): the field reads as
     /// unset everywhere, so the parser drops it from the model it returns.
     var cleared: Bool = false
+    /// The field's stored name (`storedAs`) when it was renamed: records,
+    /// the socket and the generated code's runtime keys use it; the Swift
+    /// property keeps the field's key. `nil` when never renamed.
+    var storedAs: String? = nil
     /// The shared enum the field's `ref` named (#5896), beside the
     /// expansion that filled `type` and `enumValues`; `nil` for a field
     /// without `ref`, a hand-written `enum = [...]` included.

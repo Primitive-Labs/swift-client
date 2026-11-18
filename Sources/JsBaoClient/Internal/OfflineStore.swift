@@ -417,6 +417,40 @@ public actor OfflineStore {
         try await provider.delete(store: Self.storeAuth, key: "session")
     }
 
+    // MARK: - Client version policy
+
+    /// The store and key of the app's last fetched version policy: beside the
+    /// session in the auth store, which no sign-out clears, because the policy
+    /// is public app-level data and not the user's.
+    private static let clientVersionsKey = "client-versions"
+
+    /// The auth provider, bound for use. The provider is initialized only when
+    /// it is not ready yet: initializing a ready memory provider empties it.
+    private func readyAuthProvider(appId: String) async throws -> StorageProvider? {
+        guard let provider = authStorageProvider ?? storageProvider else { return nil }
+        if !provider.isReady() {
+            try await provider.initialize(namespace: "auth:\(appId):\(Self.clientVersionsKey)")
+        }
+        return provider
+    }
+
+    /// The last version policy stored for `appId`, or `nil`.
+    func loadClientVersions(appId: String) async -> ClientVersionPolicyRecord? {
+        guard let provider = try? await readyAuthProvider(appId: appId) else { return nil }
+        let row: StorageRecord<ClientVersionPolicyRecord>? = try? await provider.get(
+            store: Self.storeAuth, key: "\(Self.clientVersionsKey):\(appId)"
+        )
+        return row?.value
+    }
+
+    /// Store `record` as the version policy for `appId`, replacing the last.
+    func persistClientVersions(appId: String, record: ClientVersionPolicyRecord) async {
+        guard let provider = try? await readyAuthProvider(appId: appId) else { return }
+        try? await provider.put(
+            store: Self.storeAuth, key: "\(Self.clientVersionsKey):\(appId)", value: record, metadata: nil
+        )
+    }
+
     // MARK: - Lifecycle
 
     public func closeStorage() async {

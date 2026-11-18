@@ -366,7 +366,8 @@ struct SwiftEmitter {
         var resolved: [ParsedUniqueConstraint] = []
         for name in schema.fieldOrder {
             guard let field = schema.fields[name], field.unique, field.type != .stringset else { continue }
-            resolved.append(ParsedUniqueConstraint(name: "\(schema.name)_\(name)_unique", fields: [name]))
+            // Named from the stored name, as the server names the constraint it enforces.
+            resolved.append(ParsedUniqueConstraint(name: "\(schema.name)_\(field.storedAs ?? name)_unique", fields: [name]))
         }
         for constraint in schema.uniqueConstraints where !constraint.fields.contains(where: isStringSet) {
             resolved.append(constraint)
@@ -677,8 +678,11 @@ struct SwiftEmitter {
         // A ref'd field's stored string encodes under the field's own key
         // (#5896), so the JSON is the hand-expanded type's.
         let storage = fields.map { storageName($0, schema.fields[$0]!) }
+        // A renamed field encodes under its stored name, as records hold it.
         out += "        case " + zip(fields, storage).map { field, stored in
-            sharedEnumName(field, schema.fields[field]!) == nil ? stored : "\(stored) = \(quoted(field))"
+            let f = schema.fields[field]!
+            if let wire = f.storedAs { return "\(stored) = \(quoted(wire))" }
+            return sharedEnumName(field, f) == nil ? stored : "\(stored) = \(quoted(field))"
         }.joined(separator: ", ") + "\n"
         out += "    }\n\n"
         // Equatable: compare only real fields.
@@ -951,10 +955,10 @@ struct SwiftEmitter {
         out += "        fields: [\n"
         // Preserve TOML insertion order for determinism, but collect the
         // longest key length for column-aligned readability.
-        let keyWidth = displayFieldOrder(schema).map { $0.count + 2 }.max() ?? 0
+        let keyWidth = displayFieldOrder(schema).map { (schema.fields[$0]?.storedAs ?? $0).count + 2 }.max() ?? 0
         for fname in displayFieldOrder(schema) {
             guard let field = schema.fields[fname] else { continue }
-            let key = quoted(fname)
+            let key = wireKey(fname, field)
             let pad = String(repeating: " ", count: max(0, keyWidth - key.count))
             out += "            \(key):\(pad) \(fieldDescriptorLiteral(field)),\n"
         }
@@ -962,7 +966,7 @@ struct SwiftEmitter {
         if !schema.uniqueConstraints.isEmpty {
             out += ",\n        constraints: [\n"
             for c in schema.uniqueConstraints {
-                let fieldsLit = c.fields.map { quoted($0) }.joined(separator: ", ")
+                let fieldsLit = c.fields.map { name in schema.fields[name].map { wireKey(name, $0) } ?? quoted(name) }.joined(separator: ", ")
                 out += "            \(quoted(c.name)): ConstraintDescriptor(name: \(quoted(c.name)), fields: [\(fieldsLit)]),\n"
             }
             out += "        ]"
@@ -975,8 +979,21 @@ struct SwiftEmitter {
             }
             out += "        ]"
         }
+        // A model that renames a field carries its current-to-stored names
+        // and the db3 types they come from, for `client.db3.records`.
+        let renamed = displayFieldOrder(schema).compactMap { name in schema.fields[name]?.storedAs.map { (name, $0) } }
+        if !renamed.isEmpty {
+            out += ",\n        fieldNames: [" + renamed.map { "\(quoted($0.0)): \(quoted($0.1))" }.joined(separator: ", ") + "]"
+            out += ",\n        fieldNameTypes: [" + schema.typeNames.map { quoted($0) }.joined(separator: ", ") + "]"
+        }
         out += "\n    )\n"
         return out
+    }
+
+    /// The key generated code names `fname` by to the runtime: its stored
+    /// name when renamed, else the field's key.
+    private func wireKey(_ fname: String, _ f: ParsedField) -> String {
+        quoted(f.storedAs ?? fname)
     }
 
     // MARK: - Nested enums (`enum = [...]` on a string field)
@@ -1061,7 +1078,7 @@ struct SwiftEmitter {
         out += "    /// (`create` / `update` / `both`). Declared via TOML `auto_stamp`.\n"
         out += "    \(access) static let autoStampFields: [String: String] = [\n"
         for (fname, stamp) in stamped {
-            out += "        \(quoted(fname)): \(quoted(stamp.rawValue)),\n"
+            out += "        \(wireKey(fname, schema.fields[fname]!)): \(quoted(stamp.rawValue)),\n"
         }
         out += "    ]\n\n"
         return out
@@ -1148,7 +1165,7 @@ struct SwiftEmitter {
             // A deprecated field is still read and written; its property says so.
             if f.deprecated { out += "    @available(*, deprecated)\n" }
             out += "    \(access) var \(propName(fname)): \(swiftStoredType(f, fieldName: fname)) {\n"
-            out += "        didSet { _changedFields.insert(\(quoted(fname))) }\n"
+            out += "        didSet { _changedFields.insert(\(wireKey(fname, f))) }\n"
             out += "    }\n"
         }
         return out
@@ -1313,7 +1330,7 @@ struct SwiftEmitter {
             }
             let storage = storageName(fname, f)
             if let def = jsonDef(fname, f) {
-                out += jsonFieldRead(fname, def: def, text: "record[\(quoted(fname))]?.asString")
+                out += jsonFieldRead(fname, def: def, text: "record[\(wireKey(fname, f))]?.asString")
             } else if f.required {
                 // Hoisted from the guard
                 out += "        self.\(storage) = \(storage)\n"
@@ -1334,9 +1351,9 @@ struct SwiftEmitter {
     /// where the record does not hold the field (js-bao's getter fills only
     /// a field the record lacks; a stored `null` reads `nil`).
     private func recordReadExpression(_ fname: String, _ f: ParsedField) -> String {
-        let read = "record[\(quoted(fname))]?.\(asAccessor(f.type))"
+        let read = "record[\(wireKey(fname, f))]?.\(asAccessor(f.type))"
         guard let literal = readDefaultLiteral(f) else { return read }
-        return "record.holds(\(quoted(fname))) == false ? \(literal) : \(read)"
+        return "record.holds(\(wireKey(fname, f))) == false ? \(literal) : \(read)"
     }
 
     /// The Swift literal a read fills a field with when the stored record
@@ -1402,7 +1419,7 @@ struct SwiftEmitter {
             if fname == "id" { continue }
             let storage = storageName(fname, f)
             if let def = jsonDef(fname, f) {
-                out += jsonFieldRead(fname, def: def, text: "row[\(quoted(fname))]?.stringValue")
+                out += jsonFieldRead(fname, def: def, text: "row[\(wireKey(fname, f))]?.stringValue")
             } else if f.required {
                 out += "        self.\(storage) = \(storage)\n"
             } else {
@@ -1420,9 +1437,9 @@ struct SwiftEmitter {
     /// `default`, the default where the row's record does not hold the field,
     /// as ``recordReadExpression(_:_:)`` reads a record.
     private func rowFieldExpression(_ fname: String, _ f: ParsedField) -> String {
-        let read = rowReadExpression(f, key: quoted(fname))
+        let read = rowReadExpression(f, key: wireKey(fname, f))
         guard let literal = readDefaultLiteral(f) else { return read }
-        return "PrimitiveRecord.holds(\(quoted(fname)), in: row) == false ? \(literal) : \(read)"
+        return "PrimitiveRecord.holds(\(wireKey(fname, f)), in: row) == false ? \(literal) : \(read)"
     }
 
     /// The expression that reads one field out of a query row
@@ -1492,7 +1509,7 @@ struct SwiftEmitter {
         } else {
             out += "        \(storageKeyword) values: [String: PrimitiveValue] = [\n"
             for (fname, f) in requiredEntries {
-                out += "            \(quoted(fname)): \(primitiveValueLiteral(f, propRef: storageName(fname, f))),\n"
+                out += "            \(wireKey(fname, f)): \(primitiveValueLiteral(f, propRef: storageName(fname, f))),\n"
             }
             out += "        ]\n"
         }
@@ -1502,11 +1519,11 @@ struct SwiftEmitter {
             if let def = jsonDef(fname, f) {
                 // The stored text while the field is unassigned, else the value's canonical text (#5899).
                 let raw = propName(Self.rawPropertyName(fname))
-                out += "        if let \(raw) { values[\(quoted(fname))] = .string(\(raw)) } "
-                    + "else if let \(storage), let text = \(def.bindingName).canonicalText(\(storage)) { values[\(quoted(fname))] = .string(text) }\n"
+                out += "        if let \(raw) { values[\(wireKey(fname, f))] = .string(\(raw)) } "
+                    + "else if let \(storage), let text = \(def.bindingName).canonicalText(\(storage)) { values[\(wireKey(fname, f))] = .string(text) }\n"
                 continue
             }
-            out += "        if let \(storage) { values[\(quoted(fname))] = \(primitiveValueLiteral(f, propRef: storage)) }\n"
+            out += "        if let \(storage) { values[\(wireKey(fname, f))] = \(primitiveValueLiteral(f, propRef: storage)) }\n"
         }
         out += "        return values\n"
         out += "    }\n"
@@ -1556,7 +1573,7 @@ struct SwiftEmitter {
         out += "    /// which `primitive functions codegen --lang swift` writes.\n"
         out += "    \(access) var \(prop): \(def.aliasName)? {\n"
         out += "        didSet {\n"
-        out += "            _changedFields.insert(\(quoted(fname)))\n"
+        out += "            _changedFields.insert(\(wireKey(fname, f)))\n"
         out += "            \(raw) = nil\n"
         out += "        }\n"
         out += "    }\n"
@@ -1591,7 +1608,7 @@ struct SwiftEmitter {
             let prop = propName(fname)
             let raw = propName(Self.rawPropertyName(fname))
             out += "        if \(raw) == nil, let \(prop) {\n"
-            out += "            values[\(quoted(fname))] = .string(try \(def.bindingName).storedText(for: \(prop), model: Self.modelName, field: \(quoted(fname))))\n"
+            out += "            values[\(wireKey(fname, f))] = .string(try \(def.bindingName).storedText(for: \(prop), model: Self.modelName, field: \(quoted(fname))))\n"
             out += "        }\n"
         }
         out += "        return values\n"
@@ -1666,7 +1683,7 @@ struct SwiftEmitter {
         out += "    /// The `\(fname)` field as stored: any string, one of `\(shared)`'s\n"
         out += "    /// values or not. Assign `\(fname)` to change it.\n"
         out += "    \(access) private(set) var \(raw): \(stored) {\n"
-        out += "        didSet { _changedFields.insert(\(quoted(fname))) }\n"
+        out += "        didSet { _changedFields.insert(\(wireKey(fname, f))) }\n"
         out += "    }\n"
         out += "    /// The `\(fname)` field as the shared enum `\(shared)`: `nil` when the\n"
         out += "    /// field is absent or holds a value outside the enum (`\(raw)`\n"

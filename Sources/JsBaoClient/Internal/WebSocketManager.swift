@@ -53,11 +53,30 @@ protocol WebSocketManagerDelegate: AnyObject, Sendable {
     func webSocketManagerOnDisconnectInitiated()
     func webSocketManagerOnDisconnectResolved()
     func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool
+    /// Whether automatic connects are held: the server refused this client as
+    /// outdated and no policy fetch has released it. Asked inside the connect
+    /// decision, beside the token check, for every connect whose origin is
+    /// `.automatic`; a connect the app asked for itself is never held.
+    ///
+    /// Defaulted to `false`, so a delegate with no version policy — every test
+    /// double — is unaffected.
+    func webSocketManagerAutomaticConnectHeld() -> Bool
 }
 
 extension WebSocketManagerDelegate {
     func webSocketManagerWillDeliverDeliberateClose() {}
     func webSocketManagerOnSocketOpened() {}
+    func webSocketManagerAutomaticConnectHeld() -> Bool { false }
+}
+
+/// Who asked for a connect. `.caller` is the app itself, through the client's
+/// public connect, set-should-connect and force-reconnect calls; everything else the
+/// client starts on its own — a reconnect timer, a token, a network restore, a
+/// channel join, its own rebuilds — is `.automatic`, the default, so a connect
+/// site added later is held after a refusal unless it says otherwise.
+enum ConnectOrigin: Sendable {
+    case automatic
+    case caller
 }
 
 // MARK: - WebSocketManager
@@ -159,6 +178,9 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     private var session: URLSession?
     private var shouldConnect = true
     private var manualReconnectPending = false
+    /// Who asked for the pending manual reconnect; the connect that follows its
+    /// close carries it.
+    private var manualReconnectOrigin: ConnectOrigin = .automatic
     private var reconnectAttempts = 0
     private var lastCloseInitiator: String?
     private var reconnectTask: Task<Void, Never>?
@@ -417,8 +439,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Connect
 
-    func connect() async throws {
-        switch connectDecision() {
+    func connect(origin: ConnectOrigin = .automatic) async throws {
+        switch connectDecision(origin: origin) {
         case .alreadyConnected, .abort:
             return
         case .waitOnExisting:
@@ -432,7 +454,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// isolation is reentrant, so a suspension between the `_connecting` check
     /// and the `_connecting = true` commit would let a second caller take the
     /// same decision and open a second socket.
-    private func connectDecision() -> ConnectDecision {
+    private func connectDecision(origin: ConnectOrigin) -> ConnectDecision {
         // Already connected
         if task != nil && _connected {
             logger.debug("[WSM][debug] connect aborted: already connected")
@@ -462,6 +484,14 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
         if !delegate.webSocketManagerHasAccessToken() {
             logger.debug("[CONNECT] Skipping connect: no access token present")
+            return .abort
+        }
+
+        // After the server refused this client as outdated, nothing the client
+        // starts on its own reconnects until a policy fetch releases it. The
+        // standing wish (`shouldConnect`) is kept, so the release reconnects.
+        if origin == .automatic && delegate.webSocketManagerAutomaticConnectHeld() {
+            logger.debug("[CONNECT] Skipping connect: held after an update-required refusal")
             return .abort
         }
 
@@ -876,7 +906,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
         if manualPending {
             logger.debug("[WSM][debug] manual reconnect trigger fired")
-            Task { try? await self.connect() }
+            let origin = manualReconnectOrigin
+            Task { [weak self] in try? await self?.connect(origin: origin) }
             return
         }
 
@@ -1075,7 +1106,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// Callers that need a particular outcome must order the calls themselves
     /// — await one before making the next. The JS client's `setShouldConnect`
     /// follows the same rule, coalescing exception included.
-    func setDesiredConnection(shouldConnect: Bool) async {
+    func setDesiredConnection(shouldConnect: Bool, origin: ConnectOrigin = .automatic) async {
         logger.debug(
             "[WSM][debug] setDesiredConnection", shouldConnect,
             "connected:", _connected, "connecting:", _connecting
@@ -1091,7 +1122,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
             // connected, registers on the `pendingConnectWaiters` list if a
             // connect is already in flight, or starts a fresh connect.
             do {
-                try await connect()
+                try await connect(origin: origin)
             } catch {
                 logger.debug("[WSM][debug] connect failed in setDesiredConnection:", error.localizedDescription)
             }
@@ -1103,12 +1134,13 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Force Reconnect
 
-    func forceReconnect() {
-        manualReconnectPending = true
+    func forceReconnect(origin: ConnectOrigin = .automatic) {
         shouldConnect = true
         reconnectAttempts = 0
 
         if task != nil {
+            manualReconnectPending = true
+            manualReconnectOrigin = origin
             closeSocketNow(initiator: "forceReconnect")
             // The close lands as a channel event (`didCloseWith` /
             // `didCompleteWithError`, or the receive loop's failure), and the
@@ -1117,7 +1149,9 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        Task { try? await self.connect() }
+        // No socket, so no close is coming to spend a pending flag on: setting
+        // it here would make the next unrelated close reconnect as this one.
+        Task { [weak self] in try? await self?.connect(origin: origin) }
     }
 
     // MARK: - Send

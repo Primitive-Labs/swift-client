@@ -1,0 +1,13 @@
+[type]
+name = "tasks6023"
+
+[models.renamed_tasks]
+class_name = "RenamedTask6023"
+
+[models.renamed_tasks.fields.title]
+type = "string"
+
+[models.renamed_tasks.fields.dueAt]
+type = "number"
+storedAs = "due"
+unique = true

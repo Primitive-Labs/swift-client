@@ -63,6 +63,9 @@ public actor AnalyticsQueue {
     private let getUserId: (@Sendable () -> String?)?
     private let offlineStore: OfflineStore?
     private let appId: String
+    /// The client's version, stamped as `app_version` on events that carry
+    /// none of their own.
+    private let appVersion: String?
 
     /// Test-observability hook: invoked with the fully-prepared event right
     /// before it is buffered. Internal (visible only via `@testable import`)
@@ -86,10 +89,12 @@ public actor AnalyticsQueue {
         offlineStore: OfflineStore? = nil,
         sendMessage: (@Sendable (String) async throws -> Void)? = nil,
         getConnectionId: (@Sendable () -> String?)? = nil,
-        getUserId: (@Sendable () -> String?)? = nil
+        getUserId: (@Sendable () -> String?)? = nil,
+        appVersion: String? = nil
     ) {
         self.logger = logger.forScope(scope: "analytics")
         self.appId = appId
+        self.appVersion = appVersion
         self.offlineStore = offlineStore
         self.sendMessage = sendMessage
         self.getConnectionId = getConnectionId
@@ -196,7 +201,12 @@ public actor AnalyticsQueue {
 
         // Apply overrides
         if let plan = planOverride { preparedEvent["plan"] = .string(plan) }
-        if let version = appVersionOverride { preparedEvent["app_version"] = .string(version) }
+        // The override wins, then the event's own value, then the client's.
+        if let version = appVersionOverride {
+            preparedEvent["app_version"] = .string(version)
+        } else if preparedEvent["app_version"] == nil, let appVersion {
+            preparedEvent["app_version"] = .string(appVersion)
+        }
 
         // Trim context_json if too large
         if let context = preparedEvent["context_json"], context.objectValue != nil,

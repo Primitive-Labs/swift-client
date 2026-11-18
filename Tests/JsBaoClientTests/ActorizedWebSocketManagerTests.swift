@@ -443,7 +443,7 @@ final class ActorizedWebSocketManagerTests: XCTestCase {
         let regions: [(name: String, from: String, to: String, mustContain: String)] = [
             (
                 "connectDecision",
-                "private func connectDecision() -> ConnectDecision {",
+                "private func connectDecision(origin: ConnectOrigin) -> ConnectDecision {",
                 "private func waitForInFlightConnect() async throws {",
                 "_connecting = true"
             ),

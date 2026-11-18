@@ -1,0 +1,20 @@
+[type]
+name = "tasks6023"
+
+[models.tasks6023]
+class_name = "Task6023"
+
+[models.tasks6023.fields.title]
+type = "string"
+
+[models.tasks6023.fields.dueAt]
+type = "number"
+unique = true
+default = 3
+
+[models.tasks6023.fields.labels]
+type = "stringset"
+
+[[models.tasks6023.unique_constraints]]
+name = "title_due"
+fields = ["title", "dueAt"]

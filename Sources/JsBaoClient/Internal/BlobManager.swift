@@ -50,6 +50,11 @@ public actor BlobManager {
     nonisolated let getAppId: (@Sendable () -> String)?
     nonisolated let getToken: (@Sendable () -> String?)?
     nonisolated let getGlobalAdminAppId: (@Sendable () -> String)?
+    /// The client's version and platform, sent beside the tenant header on the
+    /// two requests this manager builds itself.
+    nonisolated let versionHeaders: ClientVersionHeaders
+    /// Told when the server refuses the client as outdated on one of them.
+    nonisolated let onUpdateRequired: (@Sendable () -> Void)?
 
     /// Emits the blob lifecycle events (`blobs:upload-*`, `blobs:queue-drained`).
     /// A closure rather than a `weak var emitter: EventEmitter?` — the exact
@@ -172,7 +177,9 @@ public actor BlobManager {
         networkingAllowed: (@Sendable () -> Bool)? = nil,
         pendingDb3Create: (@Sendable (String) -> Bool)? = nil,
         offlineStore: OfflineStore? = nil,
-        networkSession: URLSession = NetworkSession.uncached
+        networkSession: URLSession = NetworkSession.uncached,
+        versionHeaders: ClientVersionHeaders = .none,
+        onUpdateRequired: (@Sendable () -> Void)? = nil
     ) {
         self.logger = logger.forScope(scope: "blob")
         self.uploadConcurrency = uploadConcurrency
@@ -189,6 +196,8 @@ public actor BlobManager {
         self.pendingDb3Create = pendingDb3Create
         self.offlineStore = offlineStore
         self.networkSession = networkSession
+        self.versionHeaders = versionHeaders
+        self.onUpdateRequired = onUpdateRequired
     }
 
     static let defaultBackoffBaseMs = 2000
@@ -579,6 +588,7 @@ public actor BlobManager {
         if let adminAppId = getGlobalAdminAppId?() {
             request.setValue(adminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
         }
+        versionHeaders.apply(to: &request)
         return request
     }
 
@@ -642,6 +652,7 @@ public actor BlobManager {
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if ClientVersionRules.isUpdateRequiredRefusal(status: status, body: data) { onUpdateRequired?() }
             // #3403 — this one discarded the body outright, so a refusal the
             // server named reached the app as a bare status. The bytes of a
             // failed download ARE the error envelope.
@@ -1416,9 +1427,11 @@ public actor BlobManager {
         if let adminAppId = getGlobalAdminAppId?() {
             request.setValue(adminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
         }
+        versionHeaders.apply(to: &request)
         let (data, response) = try await NetworkSession.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else {
+            if ClientVersionRules.isUpdateRequiredRefusal(status: status, body: data) { onUpdateRequired?() }
             let error = HttpError.fromBytes(status: status, message: "Attachment download failed", body: data)
             // The session is gone for the identity that asked: its uploads fail too.
             if Self.isSessionGone(error) {

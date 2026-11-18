@@ -41,6 +41,7 @@ final class SignedOutInvokeLiveTests: XCTestCase {
     private static let whoBundle = #"""
     import { allow, defineFunction } from "primitive-functions";
     export default defineFunction({
+      input: [],
       authorize: async (input, auth) => allow({ role: auth.user ? auth.user.role : null }),
       handler: async (input, ctx) => ({ role: ctx.auth ? ctx.auth.role : null, signedIn: ctx.user !== null }),
     });

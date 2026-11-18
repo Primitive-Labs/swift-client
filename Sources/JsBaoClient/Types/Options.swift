@@ -38,6 +38,16 @@ public struct JsBaoClientOptions: Sendable {
     /// `accept`/`decline` decide one index whatever this says. A db3 that
     /// lives only on this device builds all of its indexes.
     public let deviceIndexes: Db3DeviceIndexes
+    /// The version this copy of the app reports, in place of the bundle's
+    /// `CFBundleShortVersionString`: one to three dot-separated numbers of one
+    /// to six digits, such as `"1.4"` or `"2.0.1"`. `nil` (the default) reads
+    /// the bundle. An illegal value stops construction.
+    public let appVersion: String?
+    /// The platform this copy of the app reports, in place of the OS default
+    /// (`ios` on iOS, `macos` on macOS): a lowercase letter followed by up to
+    /// 31 lowercase letters, digits or hyphens. An illegal value stops
+    /// construction.
+    public let platform: String?
 
     public init(
         apiUrl: String,
@@ -56,7 +66,9 @@ public struct JsBaoClientOptions: Sendable {
         commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff(),
         autoNetwork: Bool = true,
         analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
-        deviceIndexes: Db3DeviceIndexes = .all
+        deviceIndexes: Db3DeviceIndexes = .all,
+        appVersion: String? = nil,
+        platform: String? = nil
     ) {
         self.apiUrl = apiUrl
         self.wsUrl = wsUrl
@@ -75,6 +87,8 @@ public struct JsBaoClientOptions: Sendable {
         self.autoNetwork = autoNetwork
         self.analyticsAutoEvents = analyticsAutoEvents
         self.deviceIndexes = deviceIndexes
+        self.appVersion = appVersion
+        self.platform = platform
     }
 }
 

@@ -363,7 +363,7 @@ final class WebSocketManagerSyncSurfaceTests: XCTestCase {
     func testTheInternalCommandsConvertWithoutDeprecationCeremony() throws {
         let source = try ClientSourceText.clientSource(Self.managerFile)
         for declaration in [
-            "func forceReconnect() {",
+            "func forceReconnect(origin: ConnectOrigin = .automatic) {",
             "func setMaxReconnectDelay(_ ms: Int) {",
             "func closeSocket(initiator: String) {",
         ] {

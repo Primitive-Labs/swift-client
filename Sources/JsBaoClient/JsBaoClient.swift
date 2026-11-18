@@ -80,6 +80,10 @@ public final class JsBaoClient: @unchecked Sendable {
     private let _databaseTypeConfigs: DatabaseTypeConfigsAPI
     /// - Stability: production
     public let analytics: AnalyticsAPI
+    /// This copy of the app's version and platform, and its status against the
+    /// app's version policy. See ``AppVersionAPI``.
+    /// - Stability: beta
+    public let appVersion: AppVersionAPI
     /// Deep-link / universal-link routing. Set
     /// `links.appBaseURL` to your app's public web base URL to enable
     /// the `shareURL(...)` builders.
@@ -188,6 +192,11 @@ public final class JsBaoClient: @unchecked Sendable {
     /// reconnects with the new one. Driven from the transport delegate
     /// methods below; `JsBaoClient` is its `WsAuthRecoveryHost`.
     private let wsAuthRecovery: WsAuthRecovery
+    /// The version policy state behind `appVersion`. `internal` so the socket
+    /// delegate reads the refusal hold and tests can observe it.
+    let appVersionController: AppVersionController
+    /// The version and platform every request and socket connect reports.
+    let versionHeaders: ClientVersionHeaders
 
     private let lock = NSLock()
     /// A refresh triggered by an `auth_required` / `auth_failed` frame is
@@ -649,8 +658,27 @@ public final class JsBaoClient: @unchecked Sendable {
         options: JsBaoClientOptions,
         connectivityMonitor injectedMonitor: ConnectivityMonitor?,
         storageSetupHoldForTest: (@Sendable () async -> Void)? = nil,
-        storageBindHoldForTest: (@Sendable () async -> Void)? = nil
+        storageBindHoldForTest: (@Sendable () async -> Void)? = nil,
+        bundleVersionForTest: (@Sendable () -> Any?)? = nil
     ) {
+        // The version and platform this client reports, from its options, the
+        // bundle and the OS. An illegal one stops construction here, naming the
+        // value, where it came from and the fix. The bundle is read only when
+        // no `appVersion` option is given.
+        let readBundleVersion = bundleVersionForTest ?? { Bundle.main.infoDictionary?["CFBundleShortVersionString"] }
+        let resolvedIdentity = ClientVersionRules.resolveClientIdentity(
+            optionVersion: options.appVersion,
+            optionPlatform: options.platform,
+            bundleVersion: readBundleVersion(),
+            osPlatform: ClientVersionRules.osPlatform
+        )
+        precondition(resolvedIdentity.refusal == nil, resolvedIdentity.refusal ?? "")
+        let identity = resolvedIdentity.identity
+        let versionHeaders = ClientVersionHeaders(version: identity.version, platform: identity.platform)
+        self.versionHeaders = versionHeaders
+        // A refusal can arrive on any request, before the controller below
+        // exists; the relay hands it on once it does.
+        let refusalRelay = UpdateRequiredRelay()
         self.options = options
         self.storageSetupHoldForTest = storageSetupHoldForTest
         self.storageBindHoldForTest = storageBindHoldForTest
@@ -725,7 +753,9 @@ public final class JsBaoClient: @unchecked Sendable {
                 await authController?.refreshAccessToken(
                     cause: AuthController.httpRequestCause
                 ) ?? .network(nil)
-            }
+            },
+            versionHeaders: versionHeaders,
+            onUpdateRequired: { refusalRelay.fire() }
         ))
         self.httpClient = httpClient
         let gatedTransport = NetworkGatedTransport(base: httpClient)
@@ -765,7 +795,9 @@ public final class JsBaoClient: @unchecked Sendable {
             },
             networkingAllowed: { [weak gatedTransport] in gatedTransport?.networkingAllowed ?? true },
             pendingDb3Create: { [weak documentManager] db3Id in documentManager?.isPendingCreate(db3Id) ?? false },
-            offlineStore: offlineStore
+            offlineStore: offlineStore,
+            versionHeaders: versionHeaders,
+            onUpdateRequired: { refusalRelay.fire() }
         )
 
         // Analytics queue. Its collaborators are supplied here rather than
@@ -780,7 +812,8 @@ public final class JsBaoClient: @unchecked Sendable {
             offlineStore: offlineStore,
             sendMessage: { [weak wsManager] message in try await wsManager?.send(message) },
             getConnectionId: { [weak wsManager] in wsManager?.connectionId },
-            getUserId: { [weak authController] in authController?.getUserId() }
+            getUserId: { [weak authController] in authController?.getUserId() },
+            appVersion: identity.version
         )
         self.analyticsQueue = analyticsQueue
 
@@ -826,9 +859,26 @@ public final class JsBaoClient: @unchecked Sendable {
             queue: analyticsQueue,
             resolveUserUlid: { [weak authController] in authController?.getUserId() }
         )
+        // The version policy. Its fetch is a public read through the gated
+        // transport; the first ask waits for storage so the stored policy is
+        // read before the status is reported.
+        let storageReady = StorageReadyWaiter()
+        let appVersionController = AppVersionController(
+            identity: identity,
+            appId: options.appId,
+            transport: gatedTransport,
+            offlineStore: offlineStore,
+            logger: logger,
+            waitForStorage: { await storageReady.wait() }
+        )
+        self.appVersionController = appVersionController
+        self.appVersion = AppVersionAPI(controller: appVersionController)
+        refusalRelay.attach(appVersionController)
         // Wire up dependencies
         setupDependencies()
         setupSubApis()
+        storageReady.attach(self)
+        appVersionController.setReleaseHandler { [weak self] in self?.reconnectAfterVersionRelease() }
 
         // Bootstrap token synchronously so it's available for connect().
         // The async setupStorage() Task would set it too late.
@@ -924,6 +974,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Connect to the WebSocket server
     /// - Stability: production
     public func connect() async throws {
+        try await connect(origin: .caller)
+    }
+
+    /// `connect()` for any origin: the client's own connects pass
+    /// `.automatic`, which a refusal of this client holds.
+    private func connect(origin: ConnectOrigin) async throws {
         guard !isDestroyed else { return }
         // A caller-initiated connect is a fresh incident: it must not inherit
         // the auth-recovery attempt budget an earlier session spent, or the
@@ -935,7 +991,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // built: Foundation ignores it on a task that is already running, so
         // deciding it afterwards would cost a rebuilt socket.
         await ensureReceiveLimitForKnownDocuments()
-        try await wsManager.connect()
+        try await wsManager.connect(origin: origin)
     }
 
     /// Disconnect from the WebSocket server
@@ -947,14 +1003,14 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Set whether the client should maintain a WebSocket connection
     /// - Stability: production
     public func setShouldConnect(_ shouldConnect: Bool) async {
-        await wsManager.setDesiredConnection(shouldConnect: shouldConnect)
+        await wsManager.setDesiredConnection(shouldConnect: shouldConnect, origin: .caller)
     }
 
     /// Force reconnect the WebSocket, returning once the reconnect has been
     /// initiated.
     /// - Stability: production
     public func forceReconnectAsync() async {
-        await wsManager.forceReconnect()
+        await wsManager.forceReconnect(origin: .caller)
     }
 
     /// Check if WebSocket is connected: open, and receiving the user's events.
@@ -3332,7 +3388,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // serialized after the loss disconnect, and always wins. (JS runs the
         // handoff inline, so it can't hit this window.)
         guard networkingAllowed() else { return }
-        await setShouldConnect(true)
+        await wsManager.setDesiredConnection(shouldConnect: true)
 
         // Re-drive any documents created while offline. `createDocument` only
         // schedules the background server commit when already online, and
@@ -3857,7 +3913,7 @@ public final class JsBaoClient: @unchecked Sendable {
               !wsManager.isConnected,
               !wsManager.isConnecting else { return }
         Task { [weak self] in
-            try? await self?.connect()
+            try? await self?.connect(origin: .automatic)
         }
     }
 
@@ -4887,10 +4943,13 @@ public final class JsBaoClient: @unchecked Sendable {
     /// many documents are stalled on it. A document that still cannot sync on
     /// the fresh socket is left to the retry chain rather than reconnected in a
     /// loop.
-    private func rebuildConnectionForStalledSync(_ documentId: String) async {
+    func rebuildConnectionForStalledSync(_ documentId: String) async {
         // Nothing to rebuild on a transport that is already down: the reconnect
         // path owns that case and its sweep re-syncs on the way back up.
         guard wsManager.isSocketOpen else { return }
+        // A refused client keeps the socket it has: the rebuild's reconnect
+        // would be held, so it would only lose a working connection.
+        guard !appVersionController.isRefused else { return }
         let shouldRebuild: Bool = lock.withLock {
             guard !isDestroyed, !syncStallReconnectOnThisConnection else { return false }
             guard syncStallReconnectRequested.insert(documentId).inserted else { return false }
@@ -6291,6 +6350,8 @@ public final class JsBaoClient: @unchecked Sendable {
 
         // Idempotent; the monitor's own deinit also cancels as a safety net.
         connectivityMonitor?.cancel()
+        // No version policy fetch, timer or handler outlives the client.
+        appVersionController.destroy()
         // Unhook the applied-token handler and cancel whatever socket work it
         // has in flight: a token landing during or after teardown must not
         // re-authenticate or reopen the connection behind `disconnect()` below.
@@ -6329,6 +6390,8 @@ public final class JsBaoClient: @unchecked Sendable {
         await authController.awaitPendingPersistence()
         // The upload writes issued before the shutdown above, likewise.
         await blobManager.awaitPendingPersistence()
+        // And the version policy's load or write (its fetch was cancelled above).
+        await appVersionController.awaitPendingPersistence()
         await offlineStore.closeStorage()
         eventEmitter.removeAll()
         // End every open `stream(for:)` so a `for await` loop exits instead of
@@ -6804,7 +6867,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
             // Auto-connect if networking is allowed.
             if options.autoNetwork && networkingAllowed() {
-                try? await connect()
+                try? await connect(origin: .automatic)
             }
         }
     }
@@ -8577,10 +8640,13 @@ extension JsBaoClient: WebSocketManagerDelegate {
         if let token = authController.getToken() {
             queryItems.append(URLQueryItem(name: "token", value: token))
         }
-        components.queryItems = queryItems
 
         var headers = options.wsHeaders
         headers["X-Global-Admin-App-Id"] = options.globalAdminAppId
+        // The socket reports the version and platform as URL parameters, as a
+        // browser socket must.
+        queryItems.append(contentsOf: versionHeaders.queryItems)
+        components.queryItems = queryItems
 
         let url = components.url ?? URL(string: options.wsUrl)!
         return (url, headers)
@@ -8635,6 +8701,9 @@ extension JsBaoClient: WebSocketManagerDelegate {
         resubscribeChannelsOnConnect()
         // An index list owed by a failed read is read again (#5101).
         db3IndexRefresher?.socketOpened()
+        // Once the app has asked, each reconnect refetches the version policy
+        // after a random wait.
+        appVersionController.socketReconnected()
         // The bound db3s' vector models are fetched, trained or uploaded as they want (#5230).
         runDb3VectorModels()
         // Re-subscribe to all open documents — except the ones JS's connect
@@ -8696,6 +8765,11 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnClose(code: Int?, reason: String?) {
         logger.log("WebSocket closed:", code ?? 0, reason ?? "")
+        // The server refused this client as outdated. Recorded before the
+        // transport asks whether to reconnect, which it does right after this.
+        if code == WsAuthRecovery.updateRequiredCloseCode {
+            appVersionController.noteRefusal()
+        }
         // No syncComplete is coming for any in-flight cycle on a dead
         // transport; release every claim so the reconnect path's
         // `startNetworkSync` sweep isn't refused (JS parity: ws-close calls
@@ -8829,7 +8903,28 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // it was there to prevent. A token that is genuinely dead is refreshed
         // by the auth paths — the `auth_required` / `auth_failed` handling
         // above, and the handshake recovery — not by giving up on the socket.
-        return networkingAllowed()
+        // The one exception is a refusal of this client as outdated, which
+        // holds every automatic connect until a policy fetch releases it.
+        return networkingAllowed() && !appVersionController.isRefused
+    }
+
+    func webSocketManagerAutomaticConnectHeld() -> Bool {
+        appVersionController.isRefused
+    }
+}
+
+// MARK: - Version policy release
+
+extension JsBaoClient {
+    /// A policy fetch released a refusal: reconnect when the app still wants
+    /// a connection, networking is allowed and the socket is down.
+    func reconnectAfterVersionRelease() {
+        Task { [weak self] in
+            guard let self, !self.lock.withLock({ self.isDestroyed }) else { return }
+            guard await self.wsManager.desiredConnection, self.networkingAllowed(),
+                  !self.wsManager.isConnected, !self.wsManager.isConnecting else { return }
+            try? await self.wsManager.connect()
+        }
     }
 }
 

@@ -114,7 +114,43 @@ public final class DocumentRecords: Sendable {
     /// Record `id` of `model` as the local copy holds it, or `nil`.
     public func get(_ model: String, id: String) throws -> PrimitiveRow? {
         let binding = try readable()
-        return try binding.store.read(model: model, id: id).map { PrimitiveRow(raw: Self.decoded($0, model, binding)) }
+        let names = Self.fieldNames(binding, model)
+        return try binding.store.read(model: model, id: id).map {
+            PrimitiveRow(raw: PrimitiveFieldNames.currentKeys(Self.decoded($0, model, binding), in: names))
+        }
+    }
+
+    /// The renamed fields `model`'s calls translate: the owning client's
+    /// registered schema's `fieldNames`, on a db3 whose held type is one the
+    /// schema was generated from; empty otherwise (stored names, as on a
+    /// model the client never registered).
+    private static func fieldNames(_ binding: RecordLogDocumentBinding, _ model: String) -> [String: String] {
+        guard let schema = binding.registeredSchemas.first(where: { $0.name == model }), !schema.fieldNames.isEmpty,
+              let type = binding.declaredType?.name, schema.fieldNameTypes.contains(type)
+        else { return [:] }
+        return schema.fieldNames
+    }
+
+    /// Record data in stored names, refused `INVALID_ARGUMENT` when two keys name one field.
+    private static func storedData(
+        _ data: [String: DocumentRecordValue], model: String, names: [String: String]
+    ) throws -> [String: DocumentRecordValue] {
+        guard !names.isEmpty else { return data }
+        var out: [String: DocumentRecordValue] = [:]
+        var seen: [String: String] = [:]
+        for key in data.keys.sorted() {
+            let stored = PrimitiveFieldNames.stored(key, in: names)
+            if let earlier = seen[stored] {
+                let both = [earlier, key].sorted { a, _ in a == PrimitiveFieldNames.current(stored, in: names) }
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "\(model): the record data names one field twice, as \"\(both[0])\" and \"\(both[1])\" (stored as \"\(stored)\"); name it once"
+                )
+            }
+            seen[stored] = key
+            out[stored] = data[key]
+        }
+        return out
     }
 
     /// `row` with each vector field this device knows read as its numbers.
@@ -137,10 +173,16 @@ public final class DocumentRecords: Sendable {
         -> PagedQueryResult<PrimitiveRow>
     {
         let binding = try readable()
-        let page = try binding.store.queryView(model, filter ?? [:], options: options, cleared: binding.heldCleared)
+        let names = Self.fieldNames(binding, model)
+        let schema = PrimitiveSchema(name: model, fields: [:], fieldNames: names)
+        let page = try binding.store.queryView(
+            model, CodegenAPI.storedFilter(schema, filter) ?? [:], options: CodegenAPI.storedOptions(schema, options), cleared: binding.heldCleared
+        )
         let encodings = binding.vectorEncodings(model: model)
         return PagedQueryResult(
-            data: page.data.map { PrimitiveRow(raw: binding.decodedVectors($0, model: model, encodings: encodings)) },
+            data: page.data.map {
+                PrimitiveRow(raw: PrimitiveFieldNames.currentKeys(binding.decodedVectors($0, model: model, encodings: encodings), in: names))
+            },
             nextCursor: page.nextCursor, prevCursor: page.prevCursor, hasMore: page.hasMore, drift: page.drift
         )
     }
@@ -149,7 +191,9 @@ public final class DocumentRecords: Sendable {
     /// with `maxDrift`, refused as a query is.
     public func count(_ model: String, _ filter: DocumentFilter? = nil, maxDrift: Db3MaxDrift? = nil) throws -> Int {
         let binding = try readable()
-        return try binding.store.countView(model, filter ?? [:], maxDrift: maxDrift, cleared: binding.heldCleared)
+        let names = Self.fieldNames(binding, model)
+        let stored = names.isEmpty ? (filter ?? [:]) : PrimitiveFieldNames.storedFilter(filter ?? [:], in: names)
+        return try binding.store.countView(model, stored, maxDrift: maxDrift, cleared: binding.heldCleared)
     }
 
     /// Explain how this device answers a read of `model`: the read runs on the
@@ -215,12 +259,14 @@ public final class DocumentRecords: Sendable {
     ) throws -> Written {
         let binding = try resolve()
         let documentId = binding.documentId
+        let names = Self.fieldNames(binding, model)
+        let storedInput = try Self.storedData(data, model: model, names: names)
         let report: (DocumentWriteRefusedEvent) -> Void = { [logger] event in
             logger?.warn("[record-log] write refused locally —", documentId, model, id, event.error.code.rawValue)
             binding.reportRefused(event)
         }
-        try assertRecordLogRecordInput(documentId: documentId, model: model, id: id, kind: kind, data: data, report: report)
-        let data = try Self.encodedVectors(data, binding: binding, model: model, id: id, kind: kind)
+        try assertRecordLogRecordInput(documentId: documentId, model: model, id: id, kind: kind, data: storedInput, report: report)
+        let data = try Self.encodedVectors(storedInput, binding: binding, model: model, id: id, kind: kind)
         if binding.isReadOnly {
             // #5888 — the code the room's refusal of the same write carries.
             throw JsBaoError(
@@ -244,7 +290,12 @@ public final class DocumentRecords: Sendable {
                 documentId: documentId, mutations: mutations, enums: binding.declaredType?.enums ?? [:], report: report
             )
             let seq = try binding.commit([RecordLogWrite(mutations: mutations)]).last?.seq
-            return (kind == .delete ? nil : try binding.store.read(model: model, id: id).map { Self.decoded($0, model, binding) }, seq)
+            return (
+                kind == .delete ? nil : try binding.store.read(model: model, id: id).map {
+                    PrimitiveFieldNames.currentKeys(Self.decoded($0, model, binding), in: names)
+                },
+                seq
+            )
         }
         // The commit told the change listeners; the model's listeners hear it here.
         binding.notify([RecordLogRecordKey(model: model, id: id)], origin: nil)
