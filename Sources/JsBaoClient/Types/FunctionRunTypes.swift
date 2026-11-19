@@ -331,8 +331,9 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
     public let lastResetAt: Int?
     /// What named the most recent reset: `"code-updated"` when the platform
     /// build changed underneath the run, `"evicted"` when the runtime said the
-    /// isolate was reset, `"unknown"` when the platform saw a teardown it could
-    /// not attribute. `nil` until there has been one. A plain `String` for the
+    /// isolate was reset, `"storage-reset"` when the task runtime's own storage
+    /// was reset, `"unknown"` when the platform saw a teardown it could not
+    /// attribute. `nil` until there has been one. A plain `String` for the
     /// same reason `settledStatus` is one.
     public let lastResetCause: String?
     /// The newest instant the platform saw this run's slice do anything — its

@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "cards"
     public static let primitiveSchema = PrimitiveSchema(
         name: "cards",
@@ -20,6 +20,23 @@ public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
             "note":   FieldDescriptor(type: .string),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: EnumCardRecord._IdFieldToken = .init("id")
+        public let title: EnumCardRecord._StringFieldToken = .init("title")
+        public let points: EnumCardRecord._NumberFieldToken = .init("points")
+        public let ratio: EnumCardRecord._NumberFieldToken = .init("ratio")
+        public let done: EnumCardRecord._BooleanFieldToken = .init("done")
+        public let phase: EnumCardRecord._EnumFieldToken<Phase> = .init("phase")
+        public let rank: EnumCardRecord._NumberFieldToken = .init("rank")
+        public let tags: EnumCardRecord._StringSetFieldToken = .init("tags")
+        public let note: EnumCardRecord._StringFieldToken = .init("note")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     /// The `phase` field's values are the shared enum `Phase`.
     @available(*, deprecated, renamed: "Phase")

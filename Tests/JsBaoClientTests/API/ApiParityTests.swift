@@ -245,7 +245,6 @@ final class ApiParityTests: XCTestCase {
             bucketIdOrKey: "k",
             params: UpdateBlobBucketParams(
                 preset: .adminOnly,
-                ruleSetId: .clear,
                 name: "Renamed",
                 description: .clear
             )
@@ -256,7 +255,8 @@ final class ApiParityTests: XCTestCase {
         let body = r.body as? [String: Any]
         XCTAssertEqual(body?["preset"] as? String, "admin-only")
         XCTAssertEqual(body?["name"] as? String, "Renamed")
-        XCTAssertTrue(body?["ruleSetId"] is NSNull)
+        // #6243 — a bucket takes no rule set: the body never carries one.
+        XCTAssertNil(body?["ruleSetId"])
         XCTAssertTrue(body?["description"] is NSNull)
     }
 
@@ -274,7 +274,8 @@ final class ApiParityTests: XCTestCase {
             "blobId": "b1", "bucketId": "k", "numBytes": 12, "tags": [String](),
         ]
         _ = try await api.getMetadata(bucketIdOrKey: "k", blobId: "b1")
-        XCTAssertEqual(r.path, "/blob-buckets/k/blobs/b1/metadata")
+        // #6244 — the metadata is the bare blob path, as a db3 blob's is.
+        XCTAssertEqual(r.path, "/blob-buckets/k/blobs/b1")
     }
 
     func test_blobBuckets_delete_DELETE() async throws {

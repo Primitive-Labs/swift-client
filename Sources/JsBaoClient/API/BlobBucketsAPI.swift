@@ -70,8 +70,11 @@ public final class BlobBucketsAPI: @unchecked Sendable {
 
     // MARK: - Blob upload / list / metadata / download / delete
 
-    /// Upload a blob into a bucket. Returns the generated metadata
-    /// (including a server-minted `blobId`).
+    /// Upload a blob into a bucket under `blobId`, or a ULID the client
+    /// mints, with the bytes' size and SHA-256 (the db3 blob contract).
+    /// Uploading the same bytes under an id again stores nothing new and
+    /// answers `bytesTransferred == 0`; other bytes under the id throw 409, and
+    /// an id that is not a ULID throws 400.
     ///
     /// - Parameters:
     ///   - bucketIdOrKey: target bucket.
@@ -79,21 +82,26 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     ///   - filename: original filename for `Content-Disposition`.
     ///   - contentType: MIME type; defaults to `application/octet-stream`.
     ///   - tags: optional array of tag strings.
+    ///   - blobId: the blob's id, a ULID; minted when `nil`.
     /// - Stability: production
     public func upload(
         bucketIdOrKey: String,
         data: Data,
         filename: String,
         contentType: String = "application/octet-stream",
-        tags: [String]? = nil
+        tags: [String]? = nil,
+        blobId: String? = nil
     ) async throws -> BucketBlobInfo {
         let escaped = URLEncoding.encodeComponent(bucketIdOrKey)
-        let path = "/blob-buckets/\(escaped)/blobs"
+        let escapedBlob = URLEncoding.encodeComponent(blobId ?? ULID.generate())
+        let path = "/blob-buckets/\(escaped)/blobs/\(escapedBlob)"
 
         let encodedFilename = URLEncoding.encodeComponent(filename)
         var headers: [String: String] = [
             "Content-Type": contentType,
             "X-Blob-Filename": encodedFilename,
+            "X-Blob-Size": String(data.count),
+            "X-Blob-Sha256": hashSHA256Base64(data),
         ]
         if let tags, !tags.isEmpty,
            let tagsData = try? JSONCoding.encodeData(tags),
@@ -101,7 +109,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
             headers["X-Blob-Tags"] = tagsJSON
         }
         let (body, status) = try await transport.requestData(
-            method: .post,
+            method: .put,
             path: path,
             body: data,
             options: RequestOptions(customHeaders: headers)
@@ -140,7 +148,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
         let escapedBlob = URLEncoding.encodeComponent(blobId)
         return try await transport.request(
             method: .get,
-            path: "/blob-buckets/\(escaped)/blobs/\(escapedBlob)/metadata"
+            path: "/blob-buckets/\(escaped)/blobs/\(escapedBlob)"
         )
     }
 
@@ -152,7 +160,7 @@ public final class BlobBucketsAPI: @unchecked Sendable {
     ) async throws -> Data {
         let escaped = URLEncoding.encodeComponent(bucketIdOrKey)
         let escapedBlob = URLEncoding.encodeComponent(blobId)
-        let path = "/blob-buckets/\(escaped)/blobs/\(escapedBlob)"
+        let path = "/blob-buckets/\(escaped)/blobs/\(escapedBlob)/download"
         let (body, status) = try await transport.requestData(method: .get, path: path)
         guard (200..<300).contains(status) else {
             throw HttpError.fromBytes(status: status, message: "Blob download failed", body: body)

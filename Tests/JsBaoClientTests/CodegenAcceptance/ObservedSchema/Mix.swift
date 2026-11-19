@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct Mix: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct Mix: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "Mix"
     public static let primitiveSchema = PrimitiveSchema(
         name: "Mix",
@@ -18,6 +18,21 @@ public struct Mix: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, C
             "tags":    FieldDescriptor(type: .stringset),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: Mix._IdFieldToken = .init("id")
+        public let Title: Mix._StringFieldToken = .init("Title")
+        public let at: Mix._StringFieldToken = .init("at")
+        public let mixed: Mix._StringFieldToken = .init("mixed")
+        public let n: Mix._StringFieldToken = .init("n")
+        public let nothing: Mix._StringFieldToken = .init("nothing")
+        public let tags: Mix._StringSetFieldToken = .init("tags")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

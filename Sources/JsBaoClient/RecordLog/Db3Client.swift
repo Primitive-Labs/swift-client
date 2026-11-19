@@ -50,8 +50,22 @@ extension JsBaoClient {
             indexesSettled: { [weak self] id in self?.db3IndexRefresher?.settled(id) ?? true },
             lastUsedAt: { [weak self] id in self?.db3LastUsedAt(id) },
             title: { [weak self] id in self?.documentManager.getLocalMetadata(id)?.title },
+            heldType: { [weak self] id in await self?.db3HeldType(id) },
+            knownTypesOnly: { [weak self] in self?.db3KnownTypes.knownTypesOnly ?? false },
+            typeOpens: { [weak self] id, type in self?.db3KnownTypes.opens(id, type: type) ?? true },
+            isKnownType: { [weak self] type in self?.db3KnownTypes.isKnown(type) ?? true },
+            allowUnknownType: { [weak self] id in self?.db3KnownTypes.allow(id) },
             logger: logger
         )
+    }
+
+    /// The db3's type as this device holds it (#6024): its bound store's
+    /// marks, its stored copy's, else its metadata row's; `nil` when none says.
+    func db3HeldType(_ documentId: String) async -> String? {
+        if let marks = recordLogBinding(documentId)?.marks, marks.typed == .yes, let name = marks.db3Type?.name { return name }
+        if let name = await db3StoredTypeName(documentId) { return name }
+        if let type = documentManager.getLocalMetadata(documentId)?.db3Type, !type.isEmpty { return type }
+        return nil
     }
 
     /// When the db3 was last used here, in epoch ms: its metadata row's
@@ -742,6 +756,19 @@ extension JsBaoClient {
         let empty = state.cursor == 0 && state.rows == 0 && state.writers.isEmpty && state.lastCatchUpAt == nil && !state.replacing
             && !state.localOnly
         return empty ? nil : state
+    }
+
+    /// The db3's type name its store holds (#6024), bound or not, read under
+    /// the same rules as ``db3StoredState(_:)``; `nil` when none is held or
+    /// the store is nobody's to read.
+    func db3StoredTypeName(_ documentId: String) async -> String? {
+        if let binding = recordLogBinding(documentId), !binding.isClosed {
+            return try? binding.store.storedTypeName()
+        }
+        guard let userId = authController.getUserId(), !userId.isEmpty else { return nil }
+        guard let host = await db3Host(), (try? RecordLogStore.hasTables(host: host)) == true else { return nil }
+        guard (try? RecordLogStore.isVisible(host: host, documentId: documentId, userId: userId)) == true else { return nil }
+        return try? RecordLogStore(host: host, documentId: documentId, clientId: recordLogState.clientId, logger: logger).storedTypeName()
     }
 
     /// Clear the device's index policy for a db3 deleted by this client:

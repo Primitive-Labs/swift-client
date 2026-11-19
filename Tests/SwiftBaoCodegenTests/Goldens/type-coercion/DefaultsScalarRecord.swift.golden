@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "DefaultsScalar"
     public static let primitiveSchema = PrimitiveSchema(
         name: "DefaultsScalar",
@@ -24,6 +24,27 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
             "i_literal":   FieldDescriptor(type: .id, default: .scalar(.string("fixed-id-ulid"))),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: DefaultsScalarRecord._IdFieldToken = .init("id")
+        public let n_zero: DefaultsScalarRecord._NumberFieldToken = .init("n_zero")
+        public let n_one: DefaultsScalarRecord._NumberFieldToken = .init("n_one")
+        public let n_neg: DefaultsScalarRecord._NumberFieldToken = .init("n_neg")
+        public let n_float: DefaultsScalarRecord._NumberFieldToken = .init("n_float")
+        public let n_sci: DefaultsScalarRecord._NumberFieldToken = .init("n_sci")
+        public let b_true: DefaultsScalarRecord._BooleanFieldToken = .init("b_true")
+        public let b_false: DefaultsScalarRecord._BooleanFieldToken = .init("b_false")
+        public let s_bool_like: DefaultsScalarRecord._StringFieldToken = .init("s_bool_like")
+        public let s_int_like: DefaultsScalarRecord._StringFieldToken = .init("s_int_like")
+        public let s_empty: DefaultsScalarRecord._StringFieldToken = .init("s_empty")
+        public let d_iso: DefaultsScalarRecord._DateFieldToken = .init("d_iso")
+        public let i_literal: DefaultsScalarRecord._IdFieldToken = .init("i_literal")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

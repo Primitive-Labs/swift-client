@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct ImplicitIdNote: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct ImplicitIdNote: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "notes"
     public static let primitiveSchema = PrimitiveSchema(
         name: "notes",
@@ -14,6 +14,17 @@ public struct ImplicitIdNote: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
             "done":  FieldDescriptor(type: .boolean),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: ImplicitIdNote._IdFieldToken = .init("id")
+        public let title: ImplicitIdNote._StringFieldToken = .init("title")
+        public let done: ImplicitIdNote._BooleanFieldToken = .init("done")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

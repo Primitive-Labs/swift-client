@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct EnumStepRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct EnumStepRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "steps"
     public static let primitiveSchema = PrimitiveSchema(
         name: "steps",
@@ -13,6 +13,16 @@ public struct EnumStepRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
             "status": FieldDescriptor(type: .string, required: true),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: EnumStepRecord._IdFieldToken = .init("id")
+        public let status: EnumStepRecord._EnumFieldToken<Phase> = .init("status")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     /// The `status` field's values are the shared enum `Phase`.
     @available(*, deprecated, renamed: "Phase")

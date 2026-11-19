@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct Post: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct Post: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "posts"
     public static let primitiveSchema = PrimitiveSchema(
         name: "posts",
@@ -20,6 +20,18 @@ public struct Post: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, 
             "tags": RelationshipDescriptor(properties: ["type": "hasManyThrough", "model": "tags", "joinModel": "post_tag_links", "joinModelLocalField": "postId", "joinModelRelatedField": "tagId", "joinModelOrderByField": "position"]),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: Post._IdFieldToken = .init("id")
+        public let title: Post._StringFieldToken = .init("title")
+        public let userId: Post._StringFieldToken = .init("userId")
+        public let createdAt: Post._StringFieldToken = .init("createdAt")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

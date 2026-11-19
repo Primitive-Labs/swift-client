@@ -4,12 +4,13 @@
 import Foundation
 import JsBaoClient
 
-internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     internal static let modelName = "reserved_field_probe"
     internal static let primitiveSchema = PrimitiveSchema(
         name: "reserved_field_probe",
         fields: [
             "id":                               FieldDescriptor(type: .id, autoAssign: true),
+            "Fields":                           FieldDescriptor(type: .string),
             "aggregate":                        FieldDescriptor(type: .string),
             "applyAutoStampsForSave":           FieldDescriptor(type: .string),
             "applyStringSetChangeToYMap":       FieldDescriptor(type: .string),
@@ -21,6 +22,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
             "deleteRecordLog":                  FieldDescriptor(type: .string),
             "encode":                           FieldDescriptor(type: .string),
             "ensureLocalChanges":               FieldDescriptor(type: .string),
+            "fields":                           FieldDescriptor(type: .string),
             "find":                             FieldDescriptor(type: .string),
             "findAll":                          FieldDescriptor(type: .string),
             "findByUnique":                     FieldDescriptor(type: .string),
@@ -67,8 +69,76 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         ]
     )
 
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    internal struct FieldTokens: Sendable {
+        internal let id: ReservedFieldProbe._IdFieldToken = .init("id")
+        internal let Fields: ReservedFieldProbe._StringFieldToken = .init("Fields")
+        internal let aggregate: ReservedFieldProbe._StringFieldToken = .init("aggregate")
+        internal let applyAutoStampsForSave: ReservedFieldProbe._StringFieldToken = .init("applyAutoStampsForSave")
+        internal let applyStringSetChangeToYMap: ReservedFieldProbe._StringFieldToken = .init("applyStringSetChangeToYMap")
+        internal let autoStampFields: ReservedFieldProbe._StringFieldToken = .init("autoStampFields")
+        internal let clearLocalChanges: ReservedFieldProbe._StringFieldToken = .init("clearLocalChanges")
+        internal let constructor: ReservedFieldProbe._StringFieldToken = .init("constructor")
+        internal let count: ReservedFieldProbe._StringFieldToken = .init("count")
+        internal let delete: ReservedFieldProbe._StringFieldToken = .init("delete")
+        internal let deleteRecordLog: ReservedFieldProbe._StringFieldToken = .init("deleteRecordLog")
+        internal let encode: ReservedFieldProbe._StringFieldToken = .init("encode")
+        internal let ensureLocalChanges: ReservedFieldProbe._StringFieldToken = .init("ensureLocalChanges")
+        internal let fields: ReservedFieldProbe._StringFieldToken = .init("fields")
+        internal let find: ReservedFieldProbe._StringFieldToken = .init("find")
+        internal let findAll: ReservedFieldProbe._StringFieldToken = .init("findAll")
+        internal let findByUnique: ReservedFieldProbe._StringFieldToken = .init("findByUnique")
+        internal let getChangedFields: ReservedFieldProbe._StringFieldToken = .init("getChangedFields")
+        internal let getCurrentJSState: ReservedFieldProbe._StringFieldToken = .init("getCurrentJSState")
+        internal let getCurrentValue: ReservedFieldProbe._StringFieldToken = .init("getCurrentValue")
+        internal let getDocumentId: ReservedFieldProbe._StringFieldToken = .init("getDocumentId")
+        internal let getFromYjs: ReservedFieldProbe._StringFieldToken = .init("getFromYjs")
+        internal let getOrCreateStringSet: ReservedFieldProbe._StringFieldToken = .init("getOrCreateStringSet")
+        internal let getOriginalValue: ReservedFieldProbe._StringFieldToken = .init("getOriginalValue")
+        internal let getStringSetCurrentValues: ReservedFieldProbe._StringFieldToken = .init("getStringSetCurrentValues")
+        internal let getStringSetFromYjs: ReservedFieldProbe._StringFieldToken = .init("getStringSetFromYjs")
+        internal let getValue: ReservedFieldProbe._StringFieldToken = .init("getValue")
+        internal let hasFieldChanged: ReservedFieldProbe._StringFieldToken = .init("hasFieldChanged")
+        internal let hasLocalChange: ReservedFieldProbe._StringFieldToken = .init("hasLocalChange")
+        internal let hasOwnProperty: ReservedFieldProbe._StringFieldToken = .init("hasOwnProperty")
+        internal let hasUnsavedChanges: ReservedFieldProbe._StringFieldToken = .init("hasUnsavedChanges")
+        internal let hash: ReservedFieldProbe._StringFieldToken = .init("hash")
+        internal let increment: ReservedFieldProbe._StringFieldToken = .init("increment")
+        internal let isDirty: ReservedFieldProbe._StringFieldToken = .init("isDirty")
+        internal let isPrototypeOf: ReservedFieldProbe._StringFieldToken = .init("isPrototypeOf")
+        internal let markStringSetChange: ReservedFieldProbe._StringFieldToken = .init("markStringSetChange")
+        internal let modelName: ReservedFieldProbe._StringFieldToken = .init("modelName")
+        internal let normalizeNonStringSetValue: ReservedFieldProbe._StringFieldToken = .init("normalizeNonStringSetValue")
+        internal let primitiveSchema: ReservedFieldProbe._StringFieldToken = .init("primitiveSchema")
+        internal let propertyIsEnumerable: ReservedFieldProbe._StringFieldToken = .init("propertyIsEnumerable")
+        internal let query: ReservedFieldProbe._StringFieldToken = .init("query")
+        internal let queryOne: ReservedFieldProbe._StringFieldToken = .init("queryOne")
+        internal let queryPaged: ReservedFieldProbe._StringFieldToken = .init("queryPaged")
+        internal let resolveUnresolvedFormat2Document: ReservedFieldProbe._StringFieldToken = .init("resolveUnresolvedFormat2Document")
+        internal let save: ReservedFieldProbe._StringFieldToken = .init("save")
+        internal let saveRecordLog: ReservedFieldProbe._StringFieldToken = .init("saveRecordLog")
+        internal let schemaDefaultFor: ReservedFieldProbe._StringFieldToken = .init("schemaDefaultFor")
+        internal let setValue: ReservedFieldProbe._StringFieldToken = .init("setValue")
+        internal let subscribe: ReservedFieldProbe._StringFieldToken = .init("subscribe")
+        internal let syncState: ReservedFieldProbe._StringFieldToken = .init("syncState")
+        internal let toJSON: ReservedFieldProbe._StringFieldToken = .init("toJSON")
+        internal let toLocaleString: ReservedFieldProbe._StringFieldToken = .init("toLocaleString")
+        internal let toString: ReservedFieldProbe._StringFieldToken = .init("toString")
+        internal let upsertByUnique: ReservedFieldProbe._StringFieldToken = .init("upsertByUnique")
+        internal let validateBeforeSave: ReservedFieldProbe._StringFieldToken = .init("validateBeforeSave")
+        internal let validateFieldValue: ReservedFieldProbe._StringFieldToken = .init("validateFieldValue")
+        internal let valueOf: ReservedFieldProbe._StringFieldToken = .init("valueOf")
+    }
+
+    /// The model's field tokens.
+    internal static let fields = FieldTokens()
+
     internal var id: String {
         didSet { _changedFields.insert("id") }
+    }
+    internal var Fields: String? {
+        didSet { _changedFields.insert("Fields") }
     }
     internal var aggregate: String? {
         didSet { _changedFields.insert("aggregate") }
@@ -102,6 +172,9 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
     }
     internal var ensureLocalChanges: String? {
         didSet { _changedFields.insert("ensureLocalChanges") }
+    }
+    internal var fields: String? {
+        didSet { _changedFields.insert("fields") }
     }
     internal var find: String? {
         didSet { _changedFields.insert("find") }
@@ -283,6 +356,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
 
     internal init(
         id: String,
+        Fields: String? = nil,
         aggregate: String? = nil,
         applyAutoStampsForSave: String? = nil,
         applyStringSetChangeToYMap: String? = nil,
@@ -294,6 +368,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         deleteRecordLog: String? = nil,
         encode: String? = nil,
         ensureLocalChanges: String? = nil,
+        fields: String? = nil,
         find: String? = nil,
         findAll: String? = nil,
         findByUnique: String? = nil,
@@ -339,6 +414,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         valueOf: String? = nil
     ) {
         self.id = id
+        self.Fields = Fields
         self.aggregate = aggregate
         self.applyAutoStampsForSave = applyAutoStampsForSave
         self.applyStringSetChangeToYMap = applyStringSetChangeToYMap
@@ -350,6 +426,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.deleteRecordLog = deleteRecordLog
         self.encode = encode
         self.ensureLocalChanges = ensureLocalChanges
+        self.fields = fields
         self.find = find
         self.findAll = findAll
         self.findByUnique = findByUnique
@@ -403,6 +480,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
     /// throwing `UpsertError.explicitIdConflict`. Mirrors js-bao's
     /// id-less `new Model({...})` constructor.
     internal init(
+        Fields: String? = nil,
         aggregate: String? = nil,
         applyAutoStampsForSave: String? = nil,
         applyStringSetChangeToYMap: String? = nil,
@@ -414,6 +492,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         deleteRecordLog: String? = nil,
         encode: String? = nil,
         ensureLocalChanges: String? = nil,
+        fields: String? = nil,
         find: String? = nil,
         findAll: String? = nil,
         findByUnique: String? = nil,
@@ -459,6 +538,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         valueOf: String? = nil
     ) {
         self.id = PrimitiveSchemaRegistry.newId()
+        self.Fields = Fields
         self.aggregate = aggregate
         self.applyAutoStampsForSave = applyAutoStampsForSave
         self.applyStringSetChangeToYMap = applyStringSetChangeToYMap
@@ -470,6 +550,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.deleteRecordLog = deleteRecordLog
         self.encode = encode
         self.ensureLocalChanges = ensureLocalChanges
+        self.fields = fields
         self.find = find
         self.findAll = findAll
         self.findByUnique = findByUnique
@@ -520,6 +601,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
 
     internal init?(record: PrimitiveRecord) {
         self.id = record.id
+        self.Fields = record["Fields"]?.asString
         self.aggregate = record["aggregate"]?.asString
         self.applyAutoStampsForSave = record["applyAutoStampsForSave"]?.asString
         self.applyStringSetChangeToYMap = record["applyStringSetChangeToYMap"]?.asString
@@ -531,6 +613,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.deleteRecordLog = record["deleteRecordLog"]?.asString
         self.encode = record["encode"]?.asString
         self.ensureLocalChanges = record["ensureLocalChanges"]?.asString
+        self.fields = record["fields"]?.asString
         self.find = record["find"]?.asString
         self.findAll = record["findAll"]?.asString
         self.findByUnique = record["findByUnique"]?.asString
@@ -583,6 +666,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         guard let id = row["id"]?.stringValue
         else { return nil }
         self.id = id
+        self.Fields = row["Fields"]?.stringValue
         self.aggregate = row["aggregate"]?.stringValue
         self.applyAutoStampsForSave = row["applyAutoStampsForSave"]?.stringValue
         self.applyStringSetChangeToYMap = row["applyStringSetChangeToYMap"]?.stringValue
@@ -594,6 +678,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.deleteRecordLog = row["deleteRecordLog"]?.stringValue
         self.encode = row["encode"]?.stringValue
         self.ensureLocalChanges = row["ensureLocalChanges"]?.stringValue
+        self.fields = row["fields"]?.stringValue
         self.find = row["find"]?.stringValue
         self.findAll = row["findAll"]?.stringValue
         self.findByUnique = row["findByUnique"]?.stringValue
@@ -643,6 +728,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
 
     internal func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [:]
+        if let Fields { values["Fields"] = .string(Fields) }
         if let aggregate { values["aggregate"] = .string(aggregate) }
         if let applyAutoStampsForSave { values["applyAutoStampsForSave"] = .string(applyAutoStampsForSave) }
         if let applyStringSetChangeToYMap { values["applyStringSetChangeToYMap"] = .string(applyStringSetChangeToYMap) }
@@ -654,6 +740,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         if let deleteRecordLog { values["deleteRecordLog"] = .string(deleteRecordLog) }
         if let encode { values["encode"] = .string(encode) }
         if let ensureLocalChanges { values["ensureLocalChanges"] = .string(ensureLocalChanges) }
+        if let fields { values["fields"] = .string(fields) }
         if let find { values["find"] = .string(find) }
         if let findAll { values["findAll"] = .string(findAll) }
         if let findByUnique { values["findByUnique"] = .string(findByUnique) }
@@ -706,6 +793,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
     internal init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(String.self, forKey: .id)
+        self.Fields = try container.decodeIfPresent(String.self, forKey: .Fields)
         self.aggregate = try container.decodeIfPresent(String.self, forKey: .aggregate)
         self.applyAutoStampsForSave = try container.decodeIfPresent(String.self, forKey: .applyAutoStampsForSave)
         self.applyStringSetChangeToYMap = try container.decodeIfPresent(String.self, forKey: .applyStringSetChangeToYMap)
@@ -717,6 +805,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         self.deleteRecordLog = try container.decodeIfPresent(String.self, forKey: .deleteRecordLog)
         self.encode = try container.decodeIfPresent(String.self, forKey: .encode)
         self.ensureLocalChanges = try container.decodeIfPresent(String.self, forKey: .ensureLocalChanges)
+        self.fields = try container.decodeIfPresent(String.self, forKey: .fields)
         self.find = try container.decodeIfPresent(String.self, forKey: .find)
         self.findAll = try container.decodeIfPresent(String.self, forKey: .findAll)
         self.findByUnique = try container.decodeIfPresent(String.self, forKey: .findByUnique)
@@ -765,11 +854,12 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
     }
 
     internal enum CodingKeys: String, CodingKey {
-        case id, aggregate, applyAutoStampsForSave, applyStringSetChangeToYMap, autoStampFields, clearLocalChanges, constructor, count, delete, deleteRecordLog, encode, ensureLocalChanges, find, findAll, findByUnique, getChangedFields, getCurrentJSState, getCurrentValue, getDocumentId, getFromYjs, getOrCreateStringSet, getOriginalValue, getStringSetCurrentValues, getStringSetFromYjs, getValue, hasFieldChanged, hasLocalChange, hasOwnProperty, hasUnsavedChanges, hash, increment, isDirty, isPrototypeOf, markStringSetChange, modelName, normalizeNonStringSetValue, primitiveSchema, propertyIsEnumerable, query, queryOne, queryPaged, resolveUnresolvedFormat2Document, save, saveRecordLog, schemaDefaultFor, setValue, subscribe, syncState, toJSON, toLocaleString, toString, upsertByUnique, validateBeforeSave, validateFieldValue, valueOf
+        case id, Fields, aggregate, applyAutoStampsForSave, applyStringSetChangeToYMap, autoStampFields, clearLocalChanges, constructor, count, delete, deleteRecordLog, encode, ensureLocalChanges, fields, find, findAll, findByUnique, getChangedFields, getCurrentJSState, getCurrentValue, getDocumentId, getFromYjs, getOrCreateStringSet, getOriginalValue, getStringSetCurrentValues, getStringSetFromYjs, getValue, hasFieldChanged, hasLocalChange, hasOwnProperty, hasUnsavedChanges, hash, increment, isDirty, isPrototypeOf, markStringSetChange, modelName, normalizeNonStringSetValue, primitiveSchema, propertyIsEnumerable, query, queryOne, queryPaged, resolveUnresolvedFormat2Document, save, saveRecordLog, schemaDefaultFor, setValue, subscribe, syncState, toJSON, toLocaleString, toString, upsertByUnique, validateBeforeSave, validateFieldValue, valueOf
     }
 
     internal static func == (lhs: ReservedFieldProbe, rhs: ReservedFieldProbe) -> Bool {
         lhs.id == rhs.id &&
+        lhs.Fields == rhs.Fields &&
         lhs.aggregate == rhs.aggregate &&
         lhs.applyAutoStampsForSave == rhs.applyAutoStampsForSave &&
         lhs.applyStringSetChangeToYMap == rhs.applyStringSetChangeToYMap &&
@@ -781,6 +871,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         lhs.deleteRecordLog == rhs.deleteRecordLog &&
         lhs.encode == rhs.encode &&
         lhs.ensureLocalChanges == rhs.ensureLocalChanges &&
+        lhs.fields == rhs.fields &&
         lhs.find == rhs.find &&
         lhs.findAll == rhs.findAll &&
         lhs.findByUnique == rhs.findByUnique &&
@@ -828,6 +919,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
 
     internal func hash(into hasher: inout Hasher) {
         hasher.combine(id)
+        hasher.combine(Fields)
         hasher.combine(aggregate)
         hasher.combine(applyAutoStampsForSave)
         hasher.combine(applyStringSetChangeToYMap)
@@ -839,6 +931,7 @@ internal struct ReservedFieldProbe: PrimitiveModel, PrimitiveRowDecodable, Equat
         hasher.combine(deleteRecordLog)
         hasher.combine(encode)
         hasher.combine(ensureLocalChanges)
+        hasher.combine(fields)
         hasher.combine(find)
         hasher.combine(findAll)
         hasher.combine(findByUnique)

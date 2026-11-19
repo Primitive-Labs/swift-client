@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "Greeting"
     public static let primitiveSchema = PrimitiveSchema(
         name: "Greeting",
@@ -15,6 +15,18 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
             "accented": FieldDescriptor(type: .string, default: .scalar(.string("café"))),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: GreetingRecord._IdFieldToken = .init("id")
+        public let rocket: GreetingRecord._StringFieldToken = .init("rocket")
+        public let japanese: GreetingRecord._StringFieldToken = .init("japanese")
+        public let accented: GreetingRecord._StringFieldToken = .init("accented")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

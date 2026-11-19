@@ -87,6 +87,10 @@ public struct Db3Info: Decodable, Sendable, Equatable {
     /// When its public access last changed, beside `publicAccess`; `nil` otherwise.
     /// - Stability: beta
     public let publicAccessUpdatedAt: String?
+    /// `false` on a `client.db3.listMine` row whose type is not one the build
+    /// was generated with (`--known-types-only`); `nil` otherwise.
+    /// - Stability: beta
+    public internal(set) var knownType: Bool? = nil
 
     public init(
         id: String, title: String, createdBy: String, createdAt: String, modifiedAt: String, custodian: String?,
@@ -207,6 +211,10 @@ public struct Db3GetOrCreateWithAliasOptions: Sendable {
     /// The alias user's level on a db3 this call creates; `nil` means
     /// `.owner`. Ignored when the alias already names a db3.
     public var permission: Db3AliasPermission?
+    /// In a build generated with `--known-types-only`, send the call even
+    /// when `type` is not one the build was generated with. Never sent.
+    /// - Stability: beta
+    public var allowUnknownType: Bool = false
 
     public init(
         alias: AliasRef, title: String? = nil, tags: [String]? = nil, metadata: JSONValue? = nil, type: String? = nil,

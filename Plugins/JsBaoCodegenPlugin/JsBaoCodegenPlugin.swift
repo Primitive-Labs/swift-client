@@ -90,10 +90,13 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
             let barrel = "GeneratedModels.swift"
             let predicted = try files.map { try predictGeneratedFiles(at: $0) }
             let outputs = JsBaoCodegenInputs.outputs(predicted: predicted, barrel: barrel)
+            // `"knownTypesOnly": true` in the same config: `--known-types-only` (#6024).
+            let knownTypes = try JsBaoCodegenKnownTypes.arguments(targetDirectory: targetDirectory)
             return [.buildCommand(
                 displayName: "swift-bao-codegen \(configured.map { $0.lastPathComponent }.joined(separator: ", "))",
                 executable: tool.url,
-                arguments: JsBaoCodegenInputs.arguments(inputs: configured, outputDirectory: outputDir),
+                arguments: JsBaoCodegenInputs.arguments(inputs: configured, outputDirectory: outputDir)
+                    + knownTypes,
                 inputFiles: files,
                 outputFiles: outputs.map { outputDir.appending(path: $0) }
             )]
@@ -534,3 +537,55 @@ enum JsBaoCodegenConfig {
     }
 }
 // PLUGIN-CONFIG-MIRROR: END
+
+// MARK: - bao-codegen.json knownTypesOnly
+//
+// Mirrored verbatim in Tests/SwiftBaoCodegenTests/PluginKnownTypesHermeticTests.swift,
+// because SwiftPM does not let a test target import plugin code. That file's
+// `testPluginSourceMatchesTheMirror` compares these bytes against its copy, so
+// edit both — and keep the marker comments exactly as they are.
+// PLUGIN-KNOWN-TYPES-MIRROR: BEGIN
+/// `bao-codegen.json`'s optional `knownTypesOnly` key (#6024). `true` hands
+/// the codegen tool `--known-types-only`, so the `GeneratedModels` barrel
+/// carries `db3Types` and `register(on:)` turns the client's known-type
+/// guard on. It sits beside the `input` or `inputs` that names the schema:
+/// ```json
+/// { "inputs": ["../../primitive/dev/db3-types"], "knownTypesOnly": true }
+/// ```
+enum JsBaoCodegenKnownTypes {
+
+    /// The config's shape for this key alone; `JSONDecoder` reads only
+    /// `true` or `false` as a `Bool`.
+    private struct Shape: Decodable {
+        let knownTypesOnly: Bool?
+    }
+
+    /// Whether the target's `bao-codegen.json` says `"knownTypesOnly": true`.
+    /// `false` with no config file, or a config without the key. A value
+    /// that is not `true` or `false` throws, naming the config: it never
+    /// degrades to off. A config that cannot be read or parsed is left to
+    /// the schema resolver, which throws for it.
+    static func enabled(targetDirectory: URL) throws -> Bool {
+        let filename = JsBaoCodegenConfig.filename
+        let configURL = targetDirectory.appending(path: filename)
+        let configPath = configURL.path(percentEncoded: false)
+        guard FileManager.default.fileExists(atPath: configPath),
+              let data = try? Data(contentsOf: configURL),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let raw = object["knownTypesOnly"]
+        else { return false }
+        guard let shape = try? JSONDecoder().decode(Shape.self, from: data) else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) has a \"knownTypesOnly\" that is not "
+                    + "true or false (\(raw)); expected {\"knownTypesOnly\": true}."
+            )
+        }
+        return shape.knownTypesOnly == true
+    }
+
+    /// The codegen tool's arguments the key adds: `--known-types-only`, or none.
+    static func arguments(targetDirectory: URL) throws -> [String] {
+        try enabled(targetDirectory: targetDirectory) ? ["--known-types-only"] : []
+    }
+}
+// PLUGIN-KNOWN-TYPES-MIRROR: END

@@ -68,6 +68,12 @@ struct RecordLogSessionHost: Sendable {
     var scopedDeclarations: (@Sendable (_ documentId: String, _ held: [String]) -> [String: JSONValue])? = nil
     /// The clock a frame's receipt is stamped with, epoch ms.
     var now: @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
+    /// Whether the client opens a db3 of the named type (#6024). Asked at
+    /// every `record.opened` of a typed db3, when the room answers a
+    /// declaration as typed, and before an open of a store holding a type.
+    /// Answered `false`, the session applies nothing of that open and ends
+    /// with `DB3_TYPE_UNKNOWN_TO_CLIENT`. Every type opens without it.
+    var acceptsType: @Sendable (_ documentId: String, _ name: String) -> Bool = { _, _ in true }
 }
 
 /// Where a db3's session is in its conversation with the room: `idle` (no
@@ -455,6 +461,9 @@ actor RecordLogSession {
     /// The room refused this client's wire version (`DB3_CLIENT_OUTDATED`):
     /// the session does not open the document again.
     private var outdated = false
+    /// The client does not open the db3's type (`DB3_TYPE_UNKNOWN_TO_CLIENT`):
+    /// the session opens again only once its host accepts the type.
+    private var typeRefused = false
     /// When the first of the `building` answers in a row arrived; `nil` when the last answer was another form.
     private var buildingSince: Date?
     /// This session's stream ids: a prefix of its own and a count.
@@ -657,6 +666,16 @@ actor RecordLogSession {
             logger?.debug("[record-log]", documentId, "— not opened: the room needs a newer client (DB3_CLIENT_OUTDATED)")
             return
         }
+        if binding.marks.typed == .yes, let name = binding.marks.db3Type?.name, !host.acceptsType(documentId, name) {
+            // A type this client does not open: no open is sent, on a reconnect or otherwise.
+            logger?.debug("[record-log]", documentId, "— not opened: its type", name, "is not one this client opens (DB3_TYPE_UNKNOWN_TO_CLIENT)")
+            if !typeRefused {
+                typeRefused = true
+                host.syncFailed(documentId, JsBaoErrorCode.db3TypeUnknownToClient.rawValue)
+            }
+            return
+        }
+        typeRefused = false
         guard connected() else {
             host.syncFailed(documentId, "not connected")
             return
@@ -1134,6 +1153,13 @@ actor RecordLogSession {
         if let version = frame["wireVersion"]?.wholeNumber {
             logger?.debug("[record-log]", documentId, "— the room speaks wire version", version, "; this client", recordLogWireVersion)
         }
+        let said = typeOfOpened(frame)
+        if case .typed(let name, _, _, _, _, _)? = said, !host.acceptsType(documentId, name) {
+            // A type this client does not open: its name is kept, nothing of
+            // the open is applied, and the session ends.
+            try binding.setState(type: said)
+            return endForType(name)
+        }
         let epochs = frame["epochs"]?.objectValue ?? [:]
         let currentEpoch = epochs["current"]?.wholeNumber ?? RecordLogTransport.firstEpoch
         let high = epochs["high"]?.wholeNumber ?? currentEpoch
@@ -1145,7 +1171,7 @@ actor RecordLogSession {
             // refusal it answered before is over.
             permission: !current.orphan && binding.marks.permission == RecordLogPermission.refused ? .some(nil) : nil,
             // The room says whether the db3 is typed, and by what (#5020).
-            type: typeOfOpened(frame),
+            type: said,
             // Its head, to a client at wire version 3 (#5221).
             heard: Self.heard(frame, at: receivedAt)
         )
@@ -1942,6 +1968,17 @@ actor RecordLogSession {
         host.syncFailed(documentId, reason)
     }
 
+    /// End the conversation for a type this client does not open
+    /// (`DB3_TYPE_UNKNOWN_TO_CLIENT`): nothing more is sent, unsent writes
+    /// stay in the store, and the session opens again only once its host
+    /// accepts the type. The host closes the db3 on the socket.
+    private func endForType(_ name: String) {
+        logger?.debug("[record-log]", documentId, "— its type", name, "is not one this client opens; the session ends (DB3_TYPE_UNKNOWN_TO_CLIENT)")
+        typeRefused = true
+        disconnected()
+        host.syncFailed(documentId, JsBaoErrorCode.db3TypeUnknownToClient.rawValue)
+    }
+
     private func error(_ frame: [String: JSONValue]) throws {
         let code = frame["code"]?.stringValue ?? ""
         let messageType = frame["messageType"]?.stringValue
@@ -1956,6 +1993,8 @@ actor RecordLogSession {
             if let name = frame["db3Type"]?.stringValue, !name.isEmpty {
                 let held = binding.marks.db3Type
                 try binding.setState(type: .typed(name: name, hash: held?.name == name ? held?.hash : nil, models: nil))
+                // A type this client does not open, attached while the session was live.
+                if !host.acceptsType(documentId, name) { return endForType(name) }
             }
             host.declared(documentId)
             return

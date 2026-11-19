@@ -172,6 +172,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The `openDocument` network waits in flight, so a refusal the router
     /// handles can fail one instead of leaving it to time out.
     let awaitingOpens = AwaitingOpenRegistry()
+    /// The db3 types this build was generated with (`registerDb3Types`), and
+    /// the db3s let in through `allowUnknownType` (#6024).
+    let db3KnownTypes = Db3KnownTypeRegistry()
     let documentManager: DocumentManager
     /// `internal` so an agent session view reaches its attachments and
     /// artifacts through it rather than the public `documents`. Not public.

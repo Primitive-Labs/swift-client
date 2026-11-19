@@ -20,6 +20,109 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Added: typed filters, sorts and aggregate rows on generated models
+
+A model `swift-bao-codegen` writes now has `fields`, one token per field, and
+conforms to `TypedQueryModel`, which adds labelled reads checked against the
+model's fields:
+
+```swift
+let f = TaskRecord.fields
+let due = try TaskRecord.query(
+    where: .and([f.done.eq(false), f.dueDate.lt("2026-07-01")]),
+    sort: [.asc(f.dueDate), .desc(f.priority)]
+)
+let category = f.category.group, hours = f.hours.sum()
+for row in try TaskRecord.aggregate(groupBy: [category], operations: [hours]) {
+    _ = (row[category], row[hours]) // String?, Double?
+}
+```
+
+`query(where:)`, `queryPaged(where:)`, `queryOne(where:)`, `count(where:)` and
+`aggregate(groupBy:operations:)` build the same `DocumentFilter`, `sortOrder`
+and `AggregateOptions` the hand-written forms do. A field the model does not
+have, an operand of the wrong type or an operator the field's kind does not
+take fails to compile. A string set token matches members: `contains`, `all`
+and `size`, a count or comparisons (`f.tags.size(.gte(1), .lt(3))`).
+`ModelFilter(unchecked:)` wraps a `DocumentFilter` the tokens cannot say. The `DocumentFilter` reads and `aggregate(_:)` are
+unchanged, and models generated before this change keep compiling. Regenerate
+with this package's `swift-bao-codegen` to get the tokens.
+
+A model named like a token type (`ModelIdField`) still generates and compiles.
+`swift-bao-codegen` now refuses a model whose Swift name is `TypedQueryModel`,
+`PrimitiveModel` or `PrimitiveRowDecodable`: those are protocols every
+generated model conforms to, so the model would shadow them. Such a model
+already failed to compile under the last two names. Rename it with
+`class_name`.
+
+### Breaking: bucket blobs take the database-blob upload and download contract
+
+`BlobBucketsAPI.upload` takes `blobId: String? = nil` and stores the blob under
+that id, a ULID, or one it mints. It sends the bytes' size and SHA-256, so
+uploading the same bytes under an id again stores nothing new and answers
+`bytesTransferred == 0`; other bytes under the id throw `HttpError` 409, and an
+id that is not a ULID 400.
+
+```swift
+let info = try await client.blobBuckets.upload(
+    bucketIdOrKey: "avatars", data: data, filename: "alice.jpg",
+    contentType: "image/jpeg", blobId: blobId
+)
+```
+
+`BucketBlobInfo.uploaded` is now `BucketBlobInfo.createdAt`, and the upload's
+answer carries `bytesTransferred`. `getMetadata` and `download` keep their
+signatures. A bucket download is inline only for images other than SVG, audio
+and video, and a signed URL opens only the blob it was minted for.
+### Changed: a run's `slice.lastResetCause` can read `"storage-reset"`
+
+When the task runtime's own storage is reset under a run, so that a step is
+rejected before its body runs, the platform now counts it as a reset and keeps the run open for the runtime to resume, rather
+than settling it `failed`. The run's `slice.resets` counts it and
+`slice.lastResetCause` reads `"storage-reset"`. The field stays a plain string.
+
+### Breaking: a blob bucket's access is one of four presets
+
+A bucket no longer takes a rule set. `BlobBucketPreset` has no `.custom` case,
+and `BlobBucketInfo`, `CreateBlobBucketParams` and `UpdateBlobBucketParams`
+have no `ruleSetId` (the `ruleSetId:` initializer arguments are gone). The
+server refuses a create or update that sends a rule set with a 400 naming the
+presets.
+
+`BlobBucketInfo.convertedFromRuleSet` is `true` for a bucket that had a rule
+set; it is served as `.adminOnly` until `updateBucket` names a preset, which
+clears the mark. For access a preset cannot express, make the bucket
+`.adminOnly` and have a server function return read URLs from
+`ctx.api.blobBuckets.getSignedUrls`.
+### Fixed: a sent message no longer shows twice in an agent session view
+
+`view.messages` used to hold a sent message twice, its `.pending` entry and its
+synced row, from the moment the row synced until `send` returned. Now the
+pending entry leaves in the same change that brings the row in, so every change
+notification shows one entry per send. Another member's row with the same
+`clientMessageId` still never removes your entry.
+A send refused as a reuse of a `clientMessageId` (`AGENT_CLIENT_ID_CONFLICT`)
+stays `failed`, even when the earlier message's row syncs around the refusal.
+### Added: known db3 types (beta)
+
+`swift-bao-codegen --known-types-only` adds `GeneratedModels.db3Types`, which
+`GeneratedModels.register(on:)` registers through the new
+`JsBaoClient.registerDb3Types(_:)` (a `PrimitiveDb3Types`). The client then
+refuses to create a db3 of a type the build was not generated with, or one
+archived in it (`.invalidArgument`, `details["reason"]` `unknown-type`), and to
+open one (`.db3TypeUnknownToClient`). A new `create(…, allowUnknownType:)`
+overload and an `allowUnknownType` property on
+`Db3GetOrCreateWithAliasOptions` and `Db3SubscribeOptions` let a db3 through.
+`Db3StoredEntry` and `listMine` rows of such a type carry `knownType == false`.
+Nothing changes without the flag; no existing initializer or method changed.
+
+The SwiftPM codegen plugin passes the flag when the target's `bao-codegen.json`
+says `"knownTypesOnly": true` beside its `input` or `inputs`; a value other
+than `true` or `false` fails the build naming the file. A stored copy of an
+unknown type that the client bound from the device before
+`registerDb3Types(_:)` ran is unbound when it runs, so it is not readable
+under the registered build.
+
 ### Breaking: an illegal app version stops construction
 
 `JsBaoClient(options:)` now reads the app's version from the bundle's
@@ -54,6 +157,55 @@ with code `CLIENT_UPDATE_REQUIRED`, or a socket close with code 4426, sets
 `updateRequired` at once and holds the client's own reconnects until a later
 fetch moves the status; `connect()`, `setShouldConnect(true)` and
 `forceReconnectAsync()` still connect.
+
+### Added: `JsBaoClient.resolveBackend` (beta)
+
+`JsBaoClient.resolveBackend(options:timeout:)` reads the app's backend overrides
+(`[[clients.<platform>.backendOverrides]]` in `app.toml`) before a client
+exists and answers a `ResolvedBackend`: the `appId`, `apiUrl` and `wsUrl` to
+construct the client with, whether they came from an override (`overridden`),
+and whether the decision came from a fresh read, the stored policy or the
+build's own values (`source`: `.fresh`, `.stored`, `.build`).
+
+```swift
+let backend = await JsBaoClient.resolveBackend(options: options)
+let client = JsBaoClient(options: backend.applied(to: options))
+```
+
+- Pass the build's own options. The call sends one unauthenticated request to
+  the home app's `settings/client-versions`, never throws, and waits at most
+  `timeout` seconds (10 by default).
+- `applied(to:)` replaces the three backend values and keeps every other
+  option, except that an overridden answer drops `token`: sessions do not
+  follow an override. With an explicit `.sqlite(directory: path)`, an
+  overridden answer also gets a SQLite file of its own,
+  `<path>.<target app id>.sqlite`, because one file holds one session whatever
+  the app id. Every character of the app id other than a lower-case letter, a
+  digit, `-` or `_` is percent-encoded in that name, so two app ids that differ
+  only in letter case never share a file. The default `.sqlite()` is one file per app id, except that a
+  target app id that is not a plain name (letters, digits, `-`, `_`) or is the
+  home app's in other letter case, such as `./<home id>`, gets
+  `<home database file>.<target app id>.sqlite`, so it can never open the home
+  app's file. A session the target app's store already holds is
+  restored as usual; otherwise sign in, or, after
+  `await client.waitForStorageReady()`, call `client.updateToken(_:)` with a
+  token for the target app (a token given before the stored session is
+  restored can be replaced by it).
+- The resolver keeps the home policy and the targets this copy was sent to in
+  `<database file>.backend-resolver.json` beside the client's SQLite file
+  (nothing with `.memory` storage). The client never reads that file.
+- Each call logs one line at every `logLevel` but `.none`:
+  `[resolveBackend] home=<id> version=<v> platform=<p> appId=<id> apiUrl=<url> overridden=<bool> source=<fresh|stored|build>`.
+- Write an override `apiUrl` in canonical form, root slash included:
+  `apiUrl = "https://api.example.com/"`. `primitive config push` and
+  `PUT settings` refuse any other spelling and name the form to write. The
+  answer's `apiUrl` drops trailing slashes, and its `wsUrl` is that URL with
+  `wss` for `https` (or `ws` for `http`).
+
+A platform whose `[clients.<platform>]` table holds only `backendOverrides` now
+reads as no table in `client.appVersion` (`.unknown`, `getPolicy()` returns
+`nil`), and adding, changing or removing an override never calls a status
+listener.
 
 ### Added: `client.db3.cancelPendingCreate(_:evictLocal:)` (beta)
 

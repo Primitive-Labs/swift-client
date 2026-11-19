@@ -552,6 +552,11 @@ extension JsBaoClient {
                 // copy holds or its entries write, and those bound to it (#5160).
                 scopedDeclarations: { [weak self] documentId, held in
                     self?.recordLogDeclarations(for: documentId, held: held) ?? [:]
+                },
+                // #6024 — a build registered with known types opens only those
+                // (and the db3s let in through allowUnknownType).
+                acceptsType: { [weak self] documentId, name in
+                    self?.db3KnownTypes.opens(documentId, type: name) ?? true
                 }
             ),
             logger: logger,

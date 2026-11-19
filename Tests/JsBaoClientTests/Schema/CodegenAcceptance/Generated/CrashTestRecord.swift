@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "crashTest"
     public static let primitiveSchema = PrimitiveSchema(
         name: "crashTest",
@@ -23,6 +23,23 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
             "name_score_combo": ConstraintDescriptor(name: "name_score_combo", fields: ["boundedName", "score"]),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: CrashTestRecord._IdFieldToken = .init("id")
+        public let tags: CrashTestRecord._StringSetFieldToken = .init("tags")
+        public let requiredTags: CrashTestRecord._StringSetFieldToken = .init("requiredTags")
+        public let email: CrashTestRecord._StringFieldToken = .init("email")
+        public let boundedName: CrashTestRecord._StringFieldToken = .init("boundedName")
+        public let `default`: CrashTestRecord._StringFieldToken = .init("default")
+        public let `where`: CrashTestRecord._StringFieldToken = .init("where")
+        public let score: CrashTestRecord._NumberFieldToken = .init("score")
+        public let active: CrashTestRecord._BooleanFieldToken = .init("active")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

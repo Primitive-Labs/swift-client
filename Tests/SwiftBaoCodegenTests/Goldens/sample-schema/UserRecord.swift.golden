@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "User"
     public static let primitiveSchema = PrimitiveSchema(
         name: "User",
@@ -24,6 +24,20 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
             "tags": RelationshipDescriptor(properties: ["type": "hasManyThrough", "model": "Tag", "joinModel": "UserTag", "joinModelLocalField": "userId", "joinModelRelatedField": "tagId", "joinModelOrderByField": "position", "joinModelOrderDirection": "ASC"]),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: UserRecord._IdFieldToken = .init("id")
+        public let email: UserRecord._StringFieldToken = .init("email")
+        public let name: UserRecord._StringFieldToken = .init("name")
+        public let tenantId: UserRecord._IdFieldToken = .init("tenantId")
+        public let createdAt: UserRecord._DateFieldToken = .init("createdAt")
+        public let active: UserRecord._BooleanFieldToken = .init("active")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

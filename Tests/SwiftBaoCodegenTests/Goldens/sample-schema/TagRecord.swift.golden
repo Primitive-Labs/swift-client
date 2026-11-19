@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct TagRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct TagRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "Tag"
     public static let primitiveSchema = PrimitiveSchema(
         name: "Tag",
@@ -13,6 +13,16 @@ public struct TagRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hasha
             "name": FieldDescriptor(type: .string, unique: true),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: TagRecord._IdFieldToken = .init("id")
+        public let name: TagRecord._StringFieldToken = .init("name")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

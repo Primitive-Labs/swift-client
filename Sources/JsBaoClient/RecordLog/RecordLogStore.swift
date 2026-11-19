@@ -1778,6 +1778,13 @@ final class RecordLogStore: @unchecked Sendable {
     /// What the store holds of this document, without creating anything: its
     /// cursor, its view's row count, every writer with unjudged entries, and
     /// the marks residency is read from (``isResident(_:createdLocally:)``).
+    /// The type name a held type entry names for a typed db3, else `nil`.
+    static func heldTypeName(_ text: String?) -> String? {
+        guard let held = text.flatMap({ JSONValue(jsonText: $0) })?.objectValue, held["typed"]?.stringValue == "yes",
+              let name = held["name"]?.stringValue, !name.isEmpty else { return nil }
+        return name
+    }
+
     func storedState() throws -> RecordLogStoredState {
         try reading { sql in
             guard try tablesExist(sql) else { return RecordLogStoredState(cursor: 0, rows: 0, writers: [], replacing: false) }
@@ -1806,6 +1813,18 @@ final class RecordLogStore: @unchecked Sendable {
                 localOnly: state?["local_only"].intValue == 1,
                 knownHead: state?["known_head"].intValue,
                 knownHeadAt: state?["known_head"].intValue == nil ? nil : state?["known_head_at"].intValue.map { Int64($0) }
+            )
+        }
+    }
+
+    /// The db3's type name as the room last told this device, or `nil` when
+    /// it said the db3 is untyped or has not said (#6024). A read of its own,
+    /// made only by the known-type guard, so ``storedState()`` adds none.
+    func storedTypeName() throws -> String? {
+        try reading { sql in
+            guard try tablesExist(sql) else { return nil }
+            return Self.heldTypeName(
+                try sql.first("SELECT value FROM record_log_meta WHERE key = ?", [.text("db3_type:\(documentId)")])?["value"].stringValue
             )
         }
     }

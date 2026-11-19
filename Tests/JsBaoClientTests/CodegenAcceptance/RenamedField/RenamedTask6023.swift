@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct RenamedTask6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct RenamedTask6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "renamed_tasks"
     public static let primitiveSchema = PrimitiveSchema(
         name: "renamed_tasks",
@@ -16,6 +16,17 @@ public struct RenamedTask6023: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         fieldNames: ["dueAt": "due"],
         fieldNameTypes: ["tasks6023"]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: RenamedTask6023._IdFieldToken = .init("id")
+        public let title: RenamedTask6023._StringFieldToken = .init("title")
+        public let dueAt: RenamedTask6023._NumberFieldToken = .init("dueAt")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

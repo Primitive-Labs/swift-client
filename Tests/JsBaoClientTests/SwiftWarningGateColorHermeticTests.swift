@@ -120,7 +120,7 @@ final class SwiftWarningGateColorHermeticTests: XCTestCase {
 
         let run = try runGate(
             log: """
-            __ROOT__/packages/swift-primitive-app/Sources/PrimitiveApp/State/PrimitiveAppState.swift:407:26: \
+            __ROOT__/templates/primitive-swift-template/Sources/App/AppState.swift:407:26: \
             \(Self.coloredWarning)'signIn(email:password:)' is deprecated: Use signInAsync(email:password:).\(Self.reset)
             Build complete! (1.10s)
             """
@@ -133,7 +133,7 @@ final class SwiftWarningGateColorHermeticTests: XCTestCase {
         )
         XCTAssertTrue(
             run.stderr.contains(
-                "packages/swift-primitive-app/Sources/PrimitiveApp/State/PrimitiveAppState.swift:407:26"
+                "templates/primitive-swift-template/Sources/App/AppState.swift:407:26"
             ),
             "site not named:\n\(run.stderr)"
         )

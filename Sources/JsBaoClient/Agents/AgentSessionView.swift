@@ -8,8 +8,8 @@ import Foundation
 // messages by `seq` with their parts, calls, steps and turns, read by model
 // name from the db3's local copy; `loadOlder()` pages back. Your own messages
 // appear at once as pending entries, keyed by a client message id, and leave
-// once the row the server accepted is in the window; a refused send stays as
-// `.failed`.
+// once their own row is in the window, so a send is one entry at every
+// change; a refused send stays as `.failed`.
 //
 // Swift carries no `uiMessages()`: the AI SDK adapter is the JS client's.
 // Read a part's typed `content` instead.
@@ -114,7 +114,8 @@ public struct AgentSessionSyncedMessage: Sendable, Equatable {
 public struct AgentSessionPendingMessage: Sendable, Equatable {
     /// `.waiting` while a session upload the message names is still in
     /// `attachments.uploads()`; `.sending` until its row is in the window
-    /// (the entry then leaves); `.failed` when refused, or when an upload it
+    /// (the entry then leaves, in the same change that adds the row, even
+    /// before the send answers); `.failed` when refused, or when an upload it
     /// waited on failed.
     public enum State: Sendable, Equatable {
         case sending
@@ -217,6 +218,15 @@ public final class AgentSessionView: @unchecked Sendable {
     /// event came first): nothing more is read into the view.
     private var lost = false
     private var pendingEntries: [AgentSessionPendingMessage] = []
+    /// The newest `seq` the window held when each pending entry was added, by
+    /// client message ID: a row of yours above it carrying the entry's id is
+    /// that send's own row.
+    private var sentAfterSeq: [String: Double] = [:]
+    /// The attempt of a sending entry a row of yours removed before its send
+    /// answered, by client message ID: when that send is then refused as a
+    /// reuse (`AGENT_CLIENT_ID_CONFLICT`), the row was the earlier message's
+    /// and the entry comes back as `.failed` (CSO-6258-001).
+    private var takenByRow: [String: AgentSessionPendingMessage] = [:]
     private var view: [AgentSessionViewMessage] = []
     private var listeners: [UUID: @Sendable () -> Void] = [:]
     private var unsubscribes: [@Sendable () -> Void] = []
@@ -380,7 +390,8 @@ public final class AgentSessionView: @unchecked Sendable {
     // MARK: - Sending
 
     /// Send a message. A pending entry appears at once (`.sending`) and leaves
-    /// once the row the server accepted is in the window; on a refusal it
+    /// in the change that brings its row into the window, so `messages` holds
+    /// one entry for the send at every change; on a refusal it
     /// becomes `.failed` with the server's code and the call throws the same
     /// error. A `clientMessageId` is generated when none is given, so a
     /// `retry` is deduplicated.
@@ -1348,10 +1359,31 @@ public final class AgentSessionView: @unchecked Sendable {
                 )
             }
         // A pending entry leaves once the row its accepted id names is in the
-        // window.
-        pendingEntries.removeAll { entry in
-            entry.state == .sending && entry.messageId.map { window[$0] != nil } == true
+        // window, or, before the send answers (or after it failed in flight),
+        // once a row of yours newer than the window was at the send carries
+        // its client message id. Another author's row, or your earlier row a
+        // reuse refers to, never removes it.
+        var ownNewest: [String: Double] = [:]
+        if let me = host.currentUserId() {
+            for message in window.values where message.authorUserId == me {
+                guard let clientMessageId = message.clientMessageId else { continue }
+                ownNewest[clientMessageId] = max(ownNewest[clientMessageId] ?? message.seq, message.seq)
+            }
         }
+        var taken: [AgentSessionPendingMessage] = []
+        pendingEntries.removeAll { entry in
+            if entry.state == .sending && entry.messageId.map({ window[$0] != nil }) == true { return true }
+            if entry.state == .waiting { return false }
+            guard let rowSeq = ownNewest[entry.clientMessageId], let after = sentAfterSeq[entry.clientMessageId],
+                  rowSeq > after else {
+                return false
+            }
+            if entry.state == .sending && entry.messageId == nil { taken.append(entry) }
+            return true
+        }
+        for entry in taken { takenByRow[entry.clientMessageId] = entry }
+        let stillPending = Set(pendingEntries.map(\.clientMessageId))
+        sentAfterSeq = sentAfterSeq.filter { stillPending.contains($0.key) }
         let next = synced.map(AgentSessionViewMessage.synced) + pendingEntries.map(AgentSessionViewMessage.pending)
         let changed = next != view
         view = next
@@ -1372,6 +1404,8 @@ public final class AgentSessionView: @unchecked Sendable {
             // waiting one stops waiting.
             let displaced = waitingSends.removeValue(forKey: entry.clientMessageId)?.task
             pendingEntries.removeAll { $0.clientMessageId == entry.clientMessageId }
+            sentAfterSeq[entry.clientMessageId] = window.values.map(\.seq).max() ?? -Double.infinity
+            takenByRow[entry.clientMessageId] = nil
             pendingEntries.append(current)
             _ = rebuildLocked()
             return displaced
@@ -1402,12 +1436,42 @@ public final class AgentSessionView: @unchecked Sendable {
         do {
             result = try await host.sessions.send(sessionId: sessionId, body: entry.body)
         } catch {
-            replace(current, with: current.with(state: .failed, error: Self.sendError(of: error)))
+            refuse(current, with: Self.sendError(of: error))
             throw error
+        }
+        lock.withLock {
+            if takenByRow[entry.clientMessageId]?.attempt == current.attempt { takenByRow[entry.clientMessageId] = nil }
         }
         replace(current, with: current.with(state: .sending, messageId: result.messageId))
         return result
     }
+
+    /// Mark a sent entry `.failed`. A refused reuse (`AGENT_CLIENT_ID_CONFLICT`)
+    /// is never removed by a row, since the row under its id is another
+    /// message, and one a row removed before the refusal arrived comes back.
+    private func refuse(_ entry: AgentSessionPendingMessage, with error: AgentSessionSendError) {
+        let failed = entry.with(state: .failed, error: error)
+        let changed: Bool = lock.withLock {
+            let taken = takenByRow[entry.clientMessageId]?.attempt == entry.attempt
+            if taken { takenByRow[entry.clientMessageId] = nil }
+            if let at = pendingEntries.firstIndex(where: { $0.attempt == entry.attempt }) {
+                pendingEntries[at] = failed
+                if error.code == Self.clientIdConflict { sentAfterSeq[entry.clientMessageId] = nil }
+            } else if error.code == Self.clientIdConflict, taken,
+                      !pendingEntries.contains(where: { $0.clientMessageId == entry.clientMessageId }) {
+                pendingEntries.append(failed)
+            } else {
+                return false
+            }
+            _ = rebuildLocked()
+            return true
+        }
+        if changed { notify() }
+    }
+
+    /// The refusal of a send that reuses a client message ID with other content.
+    private static let clientIdConflict = "AGENT_CLIENT_ID_CONFLICT"
+
 
     /// Wait until every upload `blobIds` names lands, or the first fails. The
     /// wait is kept by client message id, so a newer send under that id ends

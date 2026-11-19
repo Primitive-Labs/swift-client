@@ -434,13 +434,15 @@ public actor OfflineStore {
         return provider
     }
 
-    /// The last version policy stored for `appId`, or `nil`.
+    /// The last version policy stored for `appId`, or `nil`. An entry that
+    /// sets none of the policy keys (stored before such entries were dropped)
+    /// reads as no table.
     func loadClientVersions(appId: String) async -> ClientVersionPolicyRecord? {
         guard let provider = try? await readyAuthProvider(appId: appId) else { return nil }
         let row: StorageRecord<ClientVersionPolicyRecord>? = try? await provider.get(
             store: Self.storeAuth, key: "\(Self.clientVersionsKey):\(appId)"
         )
-        return row?.value
+        return row?.value.droppingEmptyEntries()
     }
 
     /// Store `record` as the version policy for `appId`, replacing the last.

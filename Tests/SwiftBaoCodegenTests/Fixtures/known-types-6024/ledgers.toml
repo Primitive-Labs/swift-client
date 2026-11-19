@@ -1,0 +1,13 @@
+[type]
+name = "ledgers6024"
+archived = true
+create = "admins"
+
+[models.ledger6024]
+class_name = "Ledger6024"
+
+[models.ledger6024.fields.total]
+type = "number"
+
+[models.ledger6024.fields.memo]
+type = "string"

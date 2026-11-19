@@ -8,6 +8,12 @@ public struct Db3SubscribeOptions: Sendable {
     /// takes, and `0` throws at once unless the db3 is already live here.
     /// - Stability: beta
     public var readyTimeout: TimeInterval
+    /// In a build generated with `--known-types-only`, open the db3 even when
+    /// its type is not one the build was generated with; without it such a db3
+    /// throws `.db3TypeUnknownToClient`. Read on the device, never sent; the
+    /// db3 then opens on this client for its lifetime.
+    /// - Stability: beta
+    public var allowUnknownType: Bool = false
 
     public init(readyTimeout: TimeInterval = 30) {
         self.readyTimeout = readyTimeout
@@ -53,6 +59,14 @@ public struct Db3StoredEntry: Sendable, Equatable {
     /// connected with a direct grant), or a read; `nil` when the device holds none.
     /// - Stability: beta
     public let title: String?
+    /// `false` when the copy's type is not one the build was generated with
+    /// (`--known-types-only`), whether or not this client opened it through
+    /// `allowUnknownType`; `nil` otherwise.
+    /// - Stability: beta
+    public internal(set) var knownType: Bool? = nil
+    /// The copy's type, when ``knownType`` is `false`.
+    /// - Stability: beta
+    public internal(set) var type: String? = nil
 
     public init(
         id: String, rows: Int, cursor: Int, pendingWrites: Int, lastSyncAt: Date?, resident: Bool, localOnly: Bool = false,
@@ -263,15 +277,16 @@ public struct Db3CommitResult: Sendable, Equatable {
 /// subscribing to it, and its copy on this device.
 ///
 /// A db3 you create is on this device before the server has it. A call that
-/// asks the server about it by its id (`get`, the sync, type, app-access and
-/// custody calls, sharing, indexes and bulk loads) waits for that commit
+/// asks the server about it by its id (`get`, `delete`, the sync, type,
+/// app-access and custody calls, sharing, indexes and bulk loads) waits for that commit
 /// first, so it can follow `create` at once. The wait throws the create's
 /// refusal (its `HttpError`, `details.db3Id` in the body) when the server
 /// refused it, and `JsBaoError(.pendingCreate)` (`details["db3Id"]`) instead
 /// of waiting when the network mode is `.offline`, becomes `.offline`, or the
 /// commit has not landed within 30 seconds. `subscribe(_:)`, `state(_:)`,
-/// `evict(_:)`, `blobs(_:)` and `delete(_:)` do not wait; an upload made
-/// before the commit lands stays queued until it does.
+/// `evict(_:)` and `blobs(_:)` do not wait; an upload made before the commit
+/// lands stays queued until it does. To abandon a create that has not
+/// reached the server, use `cancelPendingCreate(_:evictLocal:)`.
 ///
 /// ```swift
 /// let created = try await client.db3.create(title: "Orders", type: "orders")
@@ -497,8 +512,48 @@ public final class Db3API: @unchecked Sendable {
         tags: [String]? = nil,
         metadata: JSONValue? = nil
     ) async throws -> Db3Info {
+        try await create(title: title, type: type, sync: sync, custodian: custodian, tags: tags, metadata: metadata, allowUnknownType: false)
+    }
+
+    /// ``create(title:type:sync:custodian:tags:metadata:)`` with
+    /// `allowUnknownType`. In a build generated with `--known-types-only`
+    /// (`GeneratedModels.register(on:)`), a `type` the build was not
+    /// generated with, or one archived in it, throws `.invalidArgument` with
+    /// `details["reason"]` `unknown-type` (`type`, `knownTypes`, and
+    /// `archived: true` for an archived one) before anything is created;
+    /// `allowUnknownType: true` creates it anyway, and the db3 then opens on
+    /// this client.
+    ///
+    /// ```swift
+    /// let legacy = try await client.db3.create(title: "Old", type: "legacy", allowUnknownType: true)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - title: The db3's title.
+    ///   - type: A db3 type of this app.
+    ///   - sync: `false` for a db3 no client opens over a socket (an app owner or admin only).
+    ///   - custodian: Who holds it (an app owner or admin only).
+    ///   - tags: Its tags.
+    ///   - metadata: An opaque metadata blob (at most 4 KB).
+    ///   - allowUnknownType: Create it whatever the build knows of `type`. Never sent.
+    /// - Stability: beta
+    public func create(
+        title: String,
+        type: String? = nil,
+        sync: Bool? = nil,
+        custodian: String? = nil,
+        tags: [String]? = nil,
+        metadata: JSONValue? = nil,
+        allowUnknownType: Bool
+    ) async throws -> Db3Info {
+        if let refusal = client?.db3KnownTypes.refusal(
+            method: "client.db3.create", type: type, allowUnknownType: allowUnknownType, archivedRefuses: true
+        ) {
+            throw refusal
+        }
+        let escaped = type != nil && allowUnknownType
         if custodian == nil && sync != false {
-            return try await createLocalFirst(title: title, type: type, tags: tags, metadata: metadata)
+            return try await createLocalFirst(title: title, type: type, tags: tags, metadata: metadata, escaped: escaped)
         }
         var body: [String: JSONValue] = ["title": .string(title)]
         if let type { body["type"] = .string(type) }
@@ -514,6 +569,7 @@ public final class Db3API: @unchecked Sendable {
             createFailed(error, title: title, type: type, id: nil)
             throw error
         }
+        if escaped { client?.db3KnownTypes.allow(info.id) }
         await adopt(info, session: session)
         client?.eventEmitter.emit(Db3CreatedEvent(id: info.id))
         return info
@@ -525,12 +581,14 @@ public final class Db3API: @unchecked Sendable {
     /// otherwise when it is back, and retries with backoff. A `Db3API` with no
     /// wired client has nowhere to keep it: it sends the `POST db3` under the
     /// minted id and answers as `create` answers.
-    private func createLocalFirst(title: String, type: String?, tags: [String]?, metadata: JSONValue?) async throws -> Db3Info {
+    private func createLocalFirst(title: String, type: String?, tags: [String]?, metadata: JSONValue?, escaped: Bool = false) async throws -> Db3Info {
         let id = ULID.generate()
         if let client {
             if (client.authController.getUserId() ?? "").isEmpty {
                 throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
             }
+            // Let in before it is kept, so its binding here already opens it.
+            if escaped { client.db3KnownTypes.allow(id) }
             return try await client.createPendingDb3(id, title: title, type: type, tags: tags, metadata: metadata, commitNow: true)
         }
         var body: [String: JSONValue] = ["title": .string(title), "id": .string(id)]
@@ -777,6 +835,11 @@ public final class Db3API: @unchecked Sendable {
     /// holder keeps its store, nothing removed. Either way this device's
     /// index policy for the db3 (``Db3IndexesAPI/decline(_:name:)``) is cleared.
     ///
+    /// Waits first for a pending create of the db3 to commit, then deletes it:
+    /// throws `.pendingCreate` offline or after 30 seconds, or the create's
+    /// refusal (see ``Db3API``), with nothing sent. To abandon a create that
+    /// has not reached the server, use ``cancelPendingCreate(_:evictLocal:)``.
+    ///
     /// ```swift
     /// _ = try await client.db3.delete(db3Id)
     /// ```
@@ -788,6 +851,9 @@ public final class Db3API: @unchecked Sendable {
             try await lifecycle.deleteLocalOnly(db3Id)
             return SuccessResult(success: true)
         }
+        // A create of it the server does not have yet commits first: a DELETE
+        // sent before it would miss the db3 and leave the create to land later.
+        try await awaitCreate(db3Id)
         let deleted: SuccessResult = try await transport.request(method: .delete, path: Self.path(db3Id))
         // The device's index policy for it goes with it (#5322); an evict keeps it.
         await client?.clearDb3IndexPolicy(db3Id)
@@ -840,7 +906,12 @@ public final class Db3API: @unchecked Sendable {
         let page: Db3Page = try await transport.request(
             method: .get, path: Self.listingPath(sources[index].path, limit: options.limit, cursor: at.cursor)
         )
-        let items = page.items.map { $0.listed(via: at.via) }
+        // #6024 — a row of a type the build was not generated with says so.
+        let items = page.items.map { row -> Db3Info in
+            var listed = row.listed(via: at.via)
+            if let type = row.type, !type.isEmpty, client?.db3KnownTypes.isKnown(type) == false { listed.knownType = false }
+            return listed
+        }
         let next: Db3ListMineCursor?
         if page.hasMore == true, let cursor = page.nextCursor {
             next = Db3ListMineCursor(via: at.via, cursor: cursor)
@@ -928,6 +999,11 @@ public final class Db3API: @unchecked Sendable {
     ///   `untypedDb3Create = "admins"` for an untyped db3).
     /// - Stability: beta
     public func getOrCreateWithAlias(_ options: Db3GetOrCreateWithAliasOptions) async throws -> Db3GetOrCreateWithAliasResult {
+        if let refusal = client?.db3KnownTypes.refusal(
+            method: "client.db3.getOrCreateWithAlias", type: options.type, allowUnknownType: options.allowUnknownType, archivedRefuses: false
+        ) {
+            throw refusal
+        }
         var alias: [String: JSONValue] = [
             "scope": .string(options.alias.scope.rawValue), "aliasKey": .string(options.alias.aliasKey),
         ]
@@ -946,6 +1022,7 @@ public final class Db3API: @unchecked Sendable {
             createFailed(error, title: options.title, type: options.type, id: nil)
             throw error
         }
+        if options.type != nil && options.allowUnknownType { client?.db3KnownTypes.allow(result.id) }
         if let created = result.db3 {
             await adopt(created, session: session, permission: options.permission ?? .owner)
             client?.eventEmitter.emit(Db3CreatedEvent(id: created.id))

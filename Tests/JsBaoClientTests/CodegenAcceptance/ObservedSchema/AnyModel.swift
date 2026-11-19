@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct AnyModel: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct AnyModel: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "any"
     public static let primitiveSchema = PrimitiveSchema(
         name: "any",
@@ -13,6 +13,16 @@ public struct AnyModel: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashab
             "label": FieldDescriptor(type: .string),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: AnyModel._IdFieldToken = .init("id")
+        public let label: AnyModel._StringFieldToken = .init("label")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

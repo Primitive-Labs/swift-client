@@ -271,6 +271,12 @@ public enum JsBaoErrorCode: String, Sendable {
     /// admins, owners and server functions create as before. A local-first
     /// create returns first and reports it as `Db3CreateFailedEvent`.
     case db3CreateRoleRequired = "DB3_CREATE_ROLE_REQUIRED"
+    /// A subscribe or refresh of a db3 whose type the build was not generated
+    /// with, in a build generated with `--known-types-only`
+    /// (`GeneratedModels.register(on:)`). `details["db3Id"]` and
+    /// `details["type"]` name them. Nothing of the db3 is applied and the
+    /// open is not retried; subscribe with `allowUnknownType` to open it anyway.
+    case db3TypeUnknownToClient = "DB3_TYPE_UNKNOWN_TO_CLIENT"
     /// A device read with `QueryOptions.maxDrift` whose db3 copy is further
     /// behind the server than the bound, or has not heard the server's
     /// position yet (`details["drift"]` is then `null`). `details` carry

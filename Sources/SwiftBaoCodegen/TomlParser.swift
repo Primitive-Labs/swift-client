@@ -30,6 +30,10 @@ enum CodegenError: Error, CustomStringConvertible {
     case swiftNameCollision(fileName: String, models: [String])
     /// A model whose resolved Swift name is the registration barrel's.
     case reservedBarrelName(fileName: String)
+    /// A model whose resolved Swift name is a library protocol every
+    /// generated model names in its conformance clause, which the model
+    /// would shadow.
+    case reservedProtocolName(model: String, name: String)
     /// An error raised reading one of several input files, naming the file.
     indirect case inFile(name: String, error: CodegenError)
     /// A `vector` field outside a db3 type file (#5225).
@@ -102,6 +106,8 @@ enum CodegenError: Error, CustomStringConvertible {
             return "\(fileName) would be written by multiple models: \(models.joined(separator: ", ")). Disambiguate with [models.<name>] class_name = \"...\"."
         case let .reservedBarrelName(fileName):
             return "a model resolves to the reserved barrel filename \(fileName). Disambiguate with [models.<name>] class_name = \"...\"."
+        case let .reservedProtocolName(model, name):
+            return "Model `\(model)` resolves to the Swift name `\(name)`, the JsBaoClient protocol every generated model conforms to. Disambiguate with [models.<name>] class_name = \"...\"."
         case let .inFile(name, error):
             return "\(name): \(error.description)"
         case let .vectorFieldOutsideDb3Type(model, field):

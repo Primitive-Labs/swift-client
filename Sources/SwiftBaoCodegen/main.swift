@@ -27,6 +27,11 @@ struct CLIArgs {
     /// `loadSchemaFromTomlString` strict mode; `--no-strict` opts into
     /// the legacy "silently drop unknown keys" behavior.
     var strict: Bool = true
+    /// `--known-types-only`: the barrel carries every input db3 type
+    /// (`GeneratedModels.db3Types`) and `register(on:)` registers it, so the
+    /// client refuses to create or open a db3 of a type the build was not
+    /// generated with.
+    var knownTypesOnly: Bool = false
 
     static func parse(_ argv: [String]) -> CLIArgs? {
         var a = CLIArgs()
@@ -53,6 +58,8 @@ struct CLIArgs {
                 a.check = true
             case "--no-strict":
                 a.strict = false
+            case "--known-types-only":
+                a.knownTypesOnly = true
             case "--help", "-h":
                 return nil
             default:
@@ -101,6 +108,11 @@ func usage() {
                               unique-constraint level fails codegen, mirroring
                               js-bao's tomlLoader. Pass this for legacy lenient
                               parsing (unknown keys silently dropped).
+      --known-types-only      Declare every input db3 type in the barrel
+                              (GeneratedModels.db3Types, registered by
+                              register(on:)), so the client refuses to create
+                              or open a db3 of a type this build was not
+                              generated with, or archived in it.
 
     Each run also emits a `GeneratedModels.swift` registration barrel that
     aggregates every model (`GeneratedModels.all` + `register(on:)`). A model
@@ -142,7 +154,8 @@ func run() -> Int32 {
             accessLevel: args.accessLevel,
             moduleImport: args.moduleImport,
             swiftNameSuffix: args.swiftNameSuffix,
-            strict: args.strict
+            strict: args.strict,
+            knownTypesOnly: args.knownTypesOnly
         )
     } catch let err as CodegenError {
         FileHandle.standardError.write(Data("swift-bao-codegen: \(err.description)\n".utf8))

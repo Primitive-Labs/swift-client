@@ -144,6 +144,19 @@ struct Db3LifecycleDeps: Sendable {
     var lastUsedAt: @Sendable (String) -> Int64? = { _ in nil }
     /// The db3's title as this device holds it (its metadata row's), or `nil` (#5890).
     var title: @Sendable (String) -> String? = { _ in nil }
+    /// The type the device holds for the db3: its bound store's, its stored
+    /// copy's, else its metadata row's; `nil` when untyped or unknown (#6024).
+    var heldType: @Sendable (String) async -> String? = { _ in nil }
+    /// Whether the known-type guard is on (#6024): a registered build was
+    /// generated with `--known-types-only`. Off, no held type is read.
+    var knownTypesOnly: @Sendable () -> Bool = { false }
+    /// Whether this client opens a db3 of the type (#6024): the build knows
+    /// it, or the db3 was let in. Every type without it.
+    var typeOpens: @Sendable (_ db3Id: String, _ type: String) -> Bool = { _, _ in true }
+    /// Whether the build knows the type (#6024); listings mark the others.
+    var isKnownType: @Sendable (String) -> Bool = { _ in true }
+    /// Let the db3 open whatever its type, for the life of the client (#6024).
+    var allowUnknownType: @Sendable (String) -> Void = { _ in }
     var logger: Logger?
 }
 
@@ -244,6 +257,10 @@ final class Db3Lifecycle: @unchecked Sendable {
     private var last: [String: Db3State] = [:]
     /// A db3's last failed open, cleared once it is live.
     private var errors: [String: Db3StateError] = [:]
+    /// The db3s refused here for their type (#6024), with the type: refused
+    /// and logged once. A held type this client does not open is refused
+    /// from ``typeRefusal(_:)`` whether or not it is listed here.
+    private var typeRefused: [String: String] = [:]
     /// Each db3's session status, as the session last reported it.
     private var statuses: [String: RecordLogSessionStatus] = [:]
     /// Reads of a db3's state in progress, and whether another is owed after.
@@ -326,6 +343,13 @@ final class Db3Lifecycle: @unchecked Sendable {
         }
         guard !db3Id.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "client.db3.subscribe: a db3 id is a non-empty string")
+        }
+        if options.allowUnknownType {
+            // Let in for the life of the client: a standing refusal is over.
+            deps.allowUnknownType(db3Id)
+            lock.withLock {
+                if typeRefused.removeValue(forKey: db3Id) != nil { errors[db3Id] = nil }
+            }
         }
         let subscription = Db3Subscription(id: db3Id, owner: self)
         let handle = lock.withLock { () -> Handle in
@@ -714,11 +738,17 @@ final class Db3Lifecycle: @unchecked Sendable {
         var out: [Db3StoredEntry] = []
         for id in ids {
             let state = try await read(id)
-            out.append(Db3StoredEntry(
+            var entry = Db3StoredEntry(
                 id: id, rows: state.rows, cursor: state.cursor, pendingWrites: state.pendingWrites,
                 lastSyncAt: state.lastSyncAt, resident: state.resident, localOnly: state.localOnly,
                 title: deps.title(id)
-            ))
+            )
+            // #6024 — a copy of a type the build does not know says so.
+            if deps.knownTypesOnly(), let type = await deps.heldType(id), !deps.isKnownType(type) {
+                entry.knownType = false
+                entry.type = type
+            }
+            out.append(entry)
         }
         return out.sorted { $0.id < $1.id }
     }
@@ -918,6 +948,8 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// started under (`openIdentity` answers it while the open is in flight).
     private func start(_ db3Id: String, identity: Int) async {
         if isLocalOnly(db3Id) { return await startLocal(db3Id) }
+        // #6024 — a type the device holds that this client does not open: refused without opening it.
+        if let held = await typeRefusal(db3Id) { return await refuseType(db3Id, held) }
         var format: Int?
         if deps.isBound(db3Id) || deps.isPendingCreate(db3Id) {
             format = RecordLogTransport.documentFormat
@@ -1008,6 +1040,87 @@ final class Db3Lifecycle: @unchecked Sendable {
     }
 
     /// An open of the db3 failed: it is told as `Db3ErrorEvent`, and every subscription fails with it.
+    // MARK: - Types this client does not open (#6024)
+
+    /// The held type that keeps the db3 from opening here, or `nil` when it opens.
+    private func typeRefusal(_ db3Id: String) async -> String? {
+        // The setting off costs nothing: no held type is read, and nothing awaited.
+        guard deps.knownTypesOnly() else { return nil }
+        guard let type = await deps.heldType(db3Id), !deps.typeOpens(db3Id, type) else { return nil }
+        return type
+    }
+
+    /// The build's db3 types were registered (`registerDb3Types`). A copy
+    /// bound before the guard turned on (start-up binds stored copies while
+    /// the app registers its types) whose held type this client does not open
+    /// is refused now, as start-up binding would have skipped it: it is
+    /// unbound, so neither models nor records read it, and is not resident.
+    func typesRegistered() async {
+        guard deps.knownTypesOnly() else { return }
+        for db3Id in deps.boundIds() {
+            guard let type = await typeRefusal(db3Id) else { continue }
+            await enqueue(db3Id) { [weak self] in await self?.refuseType(db3Id, type) }.value
+        }
+    }
+
+    private static func typeError(_ db3Id: String, _ type: String) -> JsBaoError {
+        JsBaoError(
+            code: .db3TypeUnknownToClient,
+            message: "the db3 '\(db3Id)' is of type '\(type)', not one this build was generated with; "
+                + "subscribe with allowUnknownType to open it anyway",
+            details: ["db3Id": .string(db3Id), "type": .string(type)]
+        )
+    }
+
+    /// Refuse the db3 for its type: its state carries the error (heard by its
+    /// subscriptions), every waiting subscription throws and is released, it
+    /// is closed on the socket and unbound, and one line is logged. Nothing
+    /// retries it; its copy and unsent writes stay until evicted. No
+    /// `Db3GoneEvent` and no `Db3ErrorEvent`.
+    private func refuseType(_ db3Id: String, _ type: String) async {
+        let error = Self.typeError(db3Id, type)
+        let first = lock.withLock { () -> Bool in
+            let first = typeRefused[db3Id] == nil
+            typeRefused[db3Id] = type
+            errors[db3Id] = Db3StateError(code: error.code.rawValue, message: error.message)
+            return first
+        }
+        if first {
+            deps.logger?.warn("[db3] \(db3Id): not opened: type '\(type)' is not one this build was generated with (DB3_TYPE_UNKNOWN_TO_CLIENT)")
+        }
+        // Rejected first, so neither `ready()` nor `available()` can succeed
+        // while the copy is closed and unbound; the subscriptions stay
+        // attached until they hear the final, non-resident state.
+        let refused = handlesOf(db3Id)
+        for handle in refused { handle.subscription.reject(error) }
+        let (wasActive, door) = lock.withLock { () -> (Bool, Bool) in
+            let wasActive = active.remove(db3Id) != nil
+            return (wasActive, doorHeld.contains(db3Id))
+        }
+        if wasActive {
+            do {
+                try await deps.close(db3Id)
+            } catch {
+                deps.logger?.warn("[db3] \(db3Id): closing it on the socket failed:", error.localizedDescription)
+            }
+        }
+        if deps.isBound(db3Id) && !door { await deps.unbind(db3Id) }
+        // Read and told now, while its subscriptions still hear it: the error
+        // and `resident == false`.
+        if let state = try? await read(db3Id) { apply(db3Id, state) }
+        // A subscription made meanwhile is refused the same way (rejecting
+        // twice does nothing), unless the escape let the db3 in meanwhile:
+        // then subscriptions made since are kept, and their open, queued
+        // behind this refusal, runs.
+        let stillRefused = lock.withLock { typeRefused[db3Id] != nil }
+        for handle in handlesOf(db3Id) {
+            if !stillRefused && !refused.contains(where: { $0 === handle }) { continue }
+            handle.subscription.reject(error)
+            releaseHandle(handle, reconcile: false)
+        }
+        await refreshState(db3Id)
+    }
+
     private func failOpen(_ db3Id: String, _ error: Error) {
         let typed = error as? JsBaoError
         let http = error as? HttpError
@@ -1147,6 +1260,16 @@ final class Db3Lifecycle: @unchecked Sendable {
             heardGrants[db3Id] = nil
             _ = cancelGrantAskLocked(db3Id)
         }
+        if reason == JsBaoErrorCode.db3TypeUnknownToClient.rawValue {
+            // #6024 — the room named a type this client does not open: its session ended.
+            _ = enqueue(db3Id) { [weak self] in
+                guard let self else { return }
+                let known = self.lock.withLock { self.typeRefused[db3Id] }
+                let held = await self.deps.heldType(db3Id)
+                await self.refuseType(db3Id, held ?? known ?? "")
+            }
+            return
+        }
         if reason == JsBaoErrorCode.db3ClientOutdated.rawValue {
             // The room needs a newer client: the db3 is gone for this client's
             // lifetime, its rows kept; nothing retries it.
@@ -1269,6 +1392,13 @@ final class Db3Lifecycle: @unchecked Sendable {
             // The user changed: these are the previous user's db3s.
             guard current() else { return }
             if deps.isBound(db3Id) || deps.isOpen(db3Id) { continue }
+            // #6024 — a copy of a type this client does not open is not bound: it is not resident.
+            if await typeRefusal(db3Id) != nil { continue }
+            // The type read awaited: a logout or another user's sign-in may
+            // have run meanwhile, or the db3 been bound or opened.
+            guard current() else { return }
+            if deps.isBound(db3Id) || deps.isOpen(db3Id) { continue }
+            let guarded = deps.knownTypesOnly()
             do {
                 try await deps.bind(db3Id)
             } catch {
@@ -1278,6 +1408,11 @@ final class Db3Lifecycle: @unchecked Sendable {
             guard current() else {
                 await deps.unbind(db3Id)
                 return
+            }
+            // The build's types were registered while it bound: refused as
+            // `typesRegistered()` refuses a copy bound before.
+            if !guarded, let type = await typeRefusal(db3Id) {
+                await enqueue(db3Id) { [weak self] in await self?.refuseType(db3Id, type) }.value
             }
         }
     }
@@ -1567,16 +1702,22 @@ final class Db3Lifecycle: @unchecked Sendable {
         // Resident means a model query answers now: the store is bound to
         // this client with its models attached (its marks read), and holds a
         // readable copy. A stored copy nothing binds answers no query.
-        let resident = bound && (marks?.resident ?? false) && !isReleasing(db3Id)
+        var resident = bound && (marks?.resident ?? false) && !isReleasing(db3Id)
         let phase = phaseOf(db3Id, subscribed: subscribed, marks: marks)
         let status = statusFor(db3Id)
         let progress = (phase == .loading || phase == .catchingUp) ? status.progress.map(Self.progress) : nil
         let permission = localOnly ? .owner : permissionOf(db3Id, marks)
         let gone = goneError(db3Id)
         let openError = lock.withLock { errors[db3Id] }
+        // #6024 — a held type this client does not open, refused or not yet asked.
+        let refusedType = localOnly || phase == .gone ? nil : await typeRefusal(db3Id)
+        let typeError = refusedType.map { Self.typeError(db3Id, $0) }
+        // A copy refused for its type is not resident, even while its unbind is on its way.
+        if refusedType != nil { resident = false }
         let error: Db3StateError? = phase == .gone
             ? Db3StateError(code: gone.code.rawValue, message: gone.message)
-            : openError ?? (pendingCreate ? deps.createRefusal(db3Id) : nil)
+            : typeError.map { Db3StateError(code: $0.code.rawValue, message: $0.message) }
+                ?? openError ?? (pendingCreate ? deps.createRefusal(db3Id) : nil)
         let cursor = stored?.cursor ?? marks?.cursor ?? 0
         let pendingWrites = stored?.writers.reduce(0) { $0 + $1.pending } ?? 0
         // How far behind the copy is (#5221), once the server's position was heard.

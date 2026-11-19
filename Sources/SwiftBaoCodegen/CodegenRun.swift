@@ -72,6 +72,19 @@ enum CodegenInputs {
         }
     }
 
+    /// Each type file's db3 type once, sorted by name, archived when any
+    /// file declaring it says `[type] archived = true`.
+    static func typeDeclarations(_ documents: [(sourceName: String, source: String)]) -> [(name: String, archived: Bool)] {
+        var archived: [String: Bool] = [:]
+        for document in documents {
+            guard let type = (try? TOMLTable(string: document.source))?["type"]?.table else { continue }
+            let name = type["name"]?.string.flatMap { $0.isEmpty ? nil : $0 }
+                ?? URL(fileURLWithPath: document.sourceName).deletingPathExtension().lastPathComponent
+            archived[name] = (archived[name] ?? false) || type["archived"]?.bool == true
+        }
+        return archived.keys.sorted().map { (name: $0, archived: archived[$0]!) }
+    }
+
     /// Read each file, named by its basename.
     static func read(_ paths: [String]) throws -> [CodegenInput] {
         try paths.map { path in
@@ -102,7 +115,8 @@ enum CodegenRun {
         accessLevel: String,
         moduleImport: String,
         swiftNameSuffix: String,
-        strict: Bool
+        strict: Bool,
+        knownTypesOnly: Bool = false
     ) throws -> [(fileName: String, source: String)] {
         // An authoring door, like js-bao-codegen-v2: a field name that
         // breaks a generated model on either client is refused here.
@@ -131,6 +145,11 @@ enum CodegenRun {
         if modelsByFile[SwiftEmitter.barrelFileName] != nil {
             throw CodegenError.reservedBarrelName(fileName: SwiftEmitter.barrelFileName)
         }
+        // A model named like a protocol its own declaration conforms to
+        // would shadow it; the token types are named through the model.
+        for schema in schemas where SwiftEmitter.conformedProtocolNames.contains(schema.swiftName) {
+            throw CodegenError.reservedProtocolName(model: schema.name, name: schema.swiftName)
+        }
         // A ref'd field's generated names must not be taken or shadowed (#5896).
         try SwiftEmitter.checkSharedEnums(schemas: schemas)
         // A JSON field's generated `<field>Raw` must not be taken (#5899).
@@ -155,7 +174,9 @@ enum CodegenRun {
         options.sourcePath = documents.isEmpty
             ? emptyLabel
             : documents.map(\.sourceName).joined(separator: ", ")
-        rendered.append((SwiftEmitter.barrelFileName, SwiftEmitter(options: options).emitBarrel(schemas: schemas)))
+        // `--known-types-only`: the barrel declares every input db3 type.
+        let db3Types = knownTypesOnly ? CodegenInputs.typeDeclarations(documents) : nil
+        rendered.append((SwiftEmitter.barrelFileName, SwiftEmitter(options: options).emitBarrel(schemas: schemas, db3Types: db3Types)))
         return rendered
     }
 }

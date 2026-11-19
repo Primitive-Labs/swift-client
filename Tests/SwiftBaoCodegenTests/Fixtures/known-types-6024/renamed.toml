@@ -1,0 +1,13 @@
+[type]
+name = "renamed6024"
+create = "members"
+
+[models.chore6024]
+class_name = "Chore6024"
+
+[models.chore6024.fields.title]
+type = "string"
+
+[models.chore6024.fields.dueAt]
+type = "number"
+storedAs = "due"

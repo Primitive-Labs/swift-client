@@ -23,7 +23,8 @@ struct ClientVersionPolicyRecord: Codable, Sendable, Equatable {
     /// Read a response body. A body that is not a JSON object is not a policy
     /// (`nil`); an object with no usable `clients` map is an empty policy, as
     /// the JS client reads it. Each entry is read key by key: a key of the
-    /// wrong type is unset, and an entry that is not an object is dropped.
+    /// wrong type is unset, and an entry that is not an object, or that holds
+    /// none of the five keys (only `backendOverrides`, say), is dropped.
     static func decode(from data: Data) -> ClientVersionPolicyRecord? {
         guard let object = (try? JSONDecoder().decode(JSONValue.self, from: data))?.objectValue else {
             return nil
@@ -39,7 +40,13 @@ struct ClientVersionPolicyRecord: Codable, Sendable, Equatable {
                 enforce: entry["enforce"]?.boolValue
             )
         }
-        return ClientVersionPolicyRecord(clients: clients)
+        return ClientVersionPolicyRecord(clients: clients).droppingEmptyEntries()
+    }
+
+    /// The policy without the entries that set none of the five keys, which
+    /// read as no table for their platform.
+    func droppingEmptyEntries() -> ClientVersionPolicyRecord {
+        ClientVersionPolicyRecord(clients: clients.filter { $0.value != ClientPlatformVersions() })
     }
 }
 

@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct RelTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct RelTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "relTest"
     public static let primitiveSchema = PrimitiveSchema(
         name: "relTest",
@@ -19,6 +19,17 @@ public struct RelTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, H
             "viaJoin": RelationshipDescriptor(properties: ["type": "hasManyThrough", "model": "user_profile", "joinModel": "barebones", "joinModelLocalField": "id", "joinModelRelatedField": "id"]),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: RelTestRecord._IdFieldToken = .init("id")
+        public let taskId: RelTestRecord._StringFieldToken = .init("taskId")
+        public let profileId: RelTestRecord._StringFieldToken = .init("profileId")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

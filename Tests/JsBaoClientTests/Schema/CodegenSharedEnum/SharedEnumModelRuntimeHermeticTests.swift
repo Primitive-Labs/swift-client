@@ -126,6 +126,25 @@ final class SharedEnumModelRuntimeHermeticTests: XCTestCase {
         XCTAssertEqual(try storedStatus(client, id: "p1"), .string("archived"))
     }
 
+    /// #6270: `min`/`max` of a shared-enum field answer its stored strings,
+    /// a value outside the enum included, as `aggregate(_:)` does.
+    func testTypedMinAndMaxOfASharedEnumFieldAnswerTheStoredStrings() async throws {
+        let client = try await client()
+        _ = try storePost(client, id: "p1", ["title": .string("a"), "status": .string("open")])
+        _ = try storePost(client, id: "p2", ["title": .string("a"), "status": .string("closed")])
+        _ = try storePost(client, id: "p3", ["title": .string("b"), "status": .string("archived")])
+        let f = EnumPostRecord.fields
+        let title = f.title.group, low = f.status.min(), high = f.status.max(as: "highest")
+        let rows = try EnumPostRecord.aggregate(groupBy: [title], operations: [low, high], db3: [Self.db3Id])
+        XCTAssertEqual(rows.map(\.raw), try EnumPostRecord.aggregate(AggregateOptions(
+            groupBy: ["title"],
+            operations: [AggregateOperation(type: .min, field: "status"), AggregateOperation(type: .max, field: "status", outputField: "highest")],
+            db3: [Self.db3Id])))
+        var spans: [String: [String]] = [:]
+        for row in rows { if let name = row[title], let lo = row[low], let hi = row[high] { spans[name] = [lo, hi] } }
+        XCTAssertEqual(spans, ["a": ["closed", "open"], "b": ["archived", "archived"]])
+    }
+
     func testAValueInTheEnumReadsAsItsCase() async throws {
         let client = try await client()
         let record = try storePost(client, id: "p2", ["status": .string("closed")])

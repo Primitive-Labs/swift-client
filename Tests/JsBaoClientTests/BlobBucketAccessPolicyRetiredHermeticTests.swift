@@ -1,7 +1,7 @@
 import XCTest
 @testable import JsBaoClient
 
-/// #3996 — a bucket's access is `preset` (or a `ruleSetId`), and nothing else.
+/// #3996 — a bucket's access is `preset`, and nothing else.
 ///
 /// The pre-#1020 `accessPolicy` spelling is retired on the wire: the server
 /// refuses it in a create/update body and no longer returns it. The Swift types
@@ -23,7 +23,6 @@ final class BlobBucketAccessPolicyRetiredHermeticTests: XCTestCase {
           "ttlTier": "permanent",
           "preset": "admin-only",
           \(extra)
-          "ruleSetId": null,
           "createdBy": "u1",
           "createdAt": "2026-10-01T00:00:00.000Z",
           "modifiedAt": "2026-10-01T00:00:00.000Z"

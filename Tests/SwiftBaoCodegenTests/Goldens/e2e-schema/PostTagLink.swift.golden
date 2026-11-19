@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct PostTagLink: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct PostTagLink: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "post_tag_links"
     public static let primitiveSchema = PrimitiveSchema(
         name: "post_tag_links",
@@ -15,6 +15,18 @@ public struct PostTagLink: PrimitiveModel, PrimitiveRowDecodable, Equatable, Has
             "position": FieldDescriptor(type: .number, required: true),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: PostTagLink._IdFieldToken = .init("id")
+        public let postId: PostTagLink._StringFieldToken = .init("postId")
+        public let tagId: PostTagLink._StringFieldToken = .init("tagId")
+        public let position: PostTagLink._NumberFieldToken = .init("position")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }

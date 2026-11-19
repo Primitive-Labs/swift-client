@@ -55,10 +55,12 @@ enum ReservedFieldNames {
     /// Names that are members on one client or the other but that a
     /// generated model declaring them compiles and runs with on both.
     static let exempt: Set<String> = [
+        "Fields",
         "aggregate",
         "autoStampFields",
         "count",
         "encode",
+        "fields",
         "find",
         "findAll",
         "findByUnique",
